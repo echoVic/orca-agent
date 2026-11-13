@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 const DEEPSEEK_ORIGIN: &str = "https://api.deepseek.com";
 const DEEPSEEK_HOST: &str = "api.deepseek.com";
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(25);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const CANCEL_POLL: Duration = Duration::from_millis(10);
 /// How much of DeepSeek's own error message an error carries.
 const ERROR_MESSAGE_CHARS: usize = 200;
@@ -165,6 +166,54 @@ fn publication_day(date: &str) -> Option<String> {
     chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
         .ok()
         .map(|_| day.to_string())
+}
+
+/// A page the Fetch API read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DeepSeekPage {
+    /// Empty when DeepSeek found no title.
+    pub(crate) title: String,
+    /// The page as Markdown; never blank.
+    pub(crate) content: String,
+}
+
+#[derive(Deserialize)]
+struct FetchResponse {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// Reads one page through the Fetch API. A page with no content counts as a
+/// failure.
+pub(crate) async fn fetch(
+    access: &DeepSeekWebAccess,
+    url: &str,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<DeepSeekPage, DeepSeekWebError> {
+    let body = json!({ "url": url });
+    let text = post_json(
+        access,
+        "/v1/tools/fetch",
+        &body,
+        FETCH_TIMEOUT,
+        should_cancel,
+    )
+    .await?;
+    let response: FetchResponse = serde_json::from_str(&text).map_err(|error| {
+        DeepSeekWebError::Failed(format!("invalid DeepSeek Fetch response: {error}"))
+    })?;
+    let content = response.content.unwrap_or_default();
+    if content.trim().is_empty() {
+        return Err(DeepSeekWebError::Failed(
+            "DeepSeek Fetch returned no content".to_string(),
+        ));
+    }
+    Ok(DeepSeekPage {
+        title: response.title.unwrap_or_default(),
+        content,
+    })
 }
 
 /// POSTs `body` to `path` on the access's origin and returns the response
@@ -329,5 +378,57 @@ mod tests {
             );
             assert_eq!(fixture.requests().len(), 1);
         }
+    }
+
+    #[test]
+    fn deepseek_fetch_posts_url_and_returns_markdown() {
+        let fixture = crate::test_http::serve(vec![(
+            200,
+            r##"{"title":"A","content":"# A\n\nbody"}"##.into(),
+        )]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let page = block_on(fetch(&access, "https://example.com/a", &|| false));
+
+        assert_eq!(
+            page,
+            Ok(DeepSeekPage {
+                title: "A".to_string(),
+                content: "# A\n\nbody".to_string(),
+            })
+        );
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(
+            request.starts_with("POST /v1/tools/fetch HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("\r\nauthorization: bearer sk-test\r\n"),
+            "{request}"
+        );
+        let body: Value =
+            serde_json::from_str(crate::test_http::body(request)).expect("JSON request body");
+        assert_eq!(body, json!({"url": "https://example.com/a"}));
+    }
+
+    #[test]
+    fn deepseek_fetch_without_content_is_a_failure() {
+        let fixture =
+            crate::test_http::serve(vec![(200, r#"{"title":"A","content":"  "}"#.into())]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let page = block_on(fetch(&access, "https://example.com/a", &|| false));
+
+        assert_eq!(
+            page,
+            Err(DeepSeekWebError::Failed(
+                "DeepSeek Fetch returned no content".to_string()
+            ))
+        );
+        fixture.requests();
     }
 }

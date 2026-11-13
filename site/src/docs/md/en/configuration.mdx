@@ -205,6 +205,29 @@ An invalid `ORCA_MODE` or reasoning-effort value prevents effective
 configuration from resolving. Run `orca doctor` after changing environment or
 TOML settings to catch it before a task run.
 
+## Web search and fetch
+
+`web_search` uses the first of these that is available:
+
+1. Brave, when the `BRAVE_SEARCH_API_KEY` environment variable is set.
+2. DeepSeek's Search API, when Orca runs against the official DeepSeek endpoint (see below).
+3. Exa, which needs no key. Exa also answers when a DeepSeek search fails, and the result says so.
+
+`web_fetch` always requests the page from your machine first. On the official DeepSeek endpoint, a failed request is tried again through DeepSeek's Fetch API, and the result begins with a line saying so. A page with no readable text counts as a failure. There is no second try when:
+
+- Orca's own rules refused the URL or a redirect, for example a redirect to another site;
+- the page answered 404 or 410;
+- the address is private: a LAN, loopback or link-local IP address, or a host name ending in `.local`, `.localhost`, `.internal`, `.lan` or `.home.arpa`.
+
+Orca calls DeepSeek's web APIs only when the provider is DeepSeek, an API key is set, and `base_url` is unset or points at `https://api.deepseek.com` on the default port, with any path. The key goes to that address and nowhere else. With any other `base_url`, such as a third-party gateway, `web_search` and `web_fetch` work as if the DeepSeek APIs did not exist.
+
+DeepSeek bills these calls separately from tokens: 0.75 US dollars per 1,000 successful searches, and the same per 1,000 successful fetches (November 2026 prices). Orca's cost estimate does not include them. To stop using them, turn them off in the user configuration; project `.orca/config.toml` cannot change this setting:
+
+```toml
+[tools]
+deepseek_web = false   # Brave or Exa for search, local requests only for fetch
+```
+
 ## Network and certificates
 
 Orca checks HTTPS certificates against the operating system's trust store: the keychain on macOS, the system certificate store on Windows, and the system CA bundle on Linux.

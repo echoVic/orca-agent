@@ -20,7 +20,7 @@ use serde::Deserialize;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
 
-use crate::deepseek_web::DeepSeekWebAccess;
+use crate::deepseek_web::{self, DeepSeekPage, DeepSeekWebAccess, DeepSeekWebError};
 
 // ── limits ─────────────────────────────────────────────────────────────────────
 
@@ -49,7 +49,7 @@ pub fn execute(request: &ToolRequest, max_bytes: usize) -> ToolResult {
 pub fn execute_or_cancel(
     request: &ToolRequest,
     max_bytes: usize,
-    _deepseek: Option<&DeepSeekWebAccess>,
+    deepseek: Option<&DeepSeekWebAccess>,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
     let args = match parse_args(request) {
@@ -75,11 +75,11 @@ pub fn execute_or_cancel(
         }
     };
 
-    let outcome = rt.block_on(fetch_or_cancel(&args, &should_cancel));
+    let outcome = rt.block_on(fetch_page(&args, deepseek, &should_cancel));
 
     match outcome {
-        Ok(text) => {
-            let text = apply_prompt_filter(&text, args.prompt.as_deref());
+        Ok(fetched) => {
+            let text = render(fetched, args.prompt.as_deref());
             let effective_max = max_bytes.min(MAX_OUTPUT_CHARS);
             let (output, truncated) = truncate_output(text, effective_max);
             ToolResult::completed(request, output, truncated)
@@ -87,7 +87,9 @@ pub fn execute_or_cancel(
         Err(FetchError::Cancelled) => {
             ToolResult::cancelled(request, "web fetch was cancelled", None)
         }
-        Err(FetchError::Failed(msg)) => ToolResult::failed(request, msg, None),
+        Err(FetchError::Rejected(message) | FetchError::Failed { message, .. }) => {
+            ToolResult::failed(request, message, None)
+        }
     }
 }
 
@@ -112,25 +114,191 @@ fn parse_args(request: &ToolRequest) -> Result<FetchArgs, String> {
 #[derive(Debug)]
 enum FetchError {
     Cancelled,
-    Failed(String),
+    /// Orca's own URL or redirect rules refused the request. It is never
+    /// retried elsewhere: the rules decide where a fetch may go.
+    Rejected(String),
+    /// The page could not be read.
+    Failed {
+        /// The full error, reported when nothing else answers.
+        message: String,
+        /// A few words for the retry note: `HTTP 403`, `timed out`, …
+        reason: String,
+        /// The HTTP status, when the server answered with one.
+        status: Option<u16>,
+    },
 }
 
-impl From<String> for FetchError {
-    fn from(s: String) -> Self {
-        FetchError::Failed(s)
+impl FetchError {
+    /// A failure without an HTTP status.
+    fn failed(message: impl Into<String>, reason: &str) -> Self {
+        Self::Failed {
+            message: message.into(),
+            reason: reason.to_string(),
+            status: None,
+        }
+    }
+
+    /// A response with an error status.
+    fn status(status: u16, message: String) -> Self {
+        Self::Failed {
+            message,
+            reason: format!("HTTP {status}"),
+            status: Some(status),
+        }
     }
 }
 
-async fn fetch_or_cancel(
+/// What `web_fetch` returns: the page text, and a note when the text did not
+/// come from the direct request.
+#[derive(Debug)]
+struct Fetched {
+    note: Option<String>,
+    text: String,
+}
+
+impl Fetched {
+    fn direct(text: String) -> Self {
+        Self { note: None, text }
+    }
+}
+
+/// The tool output: the `prompt` filter applies to the page text only, so the
+/// note always stays first.
+fn render(fetched: Fetched, prompt: Option<&str>) -> String {
+    let text = apply_prompt_filter(&fetched.text, prompt);
+    match fetched.note {
+        Some(note) => format!("{note}\n\n{text}"),
+        None => text,
+    }
+}
+
+async fn fetch_page(
     args: &FetchArgs,
+    deepseek: Option<&DeepSeekWebAccess>,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Fetched, FetchError> {
+    let url = normalise_url(&args.url)
+        .ok_or_else(|| FetchError::Rejected(format!("invalid or unsupported URL: {}", args.url)))?;
+    let local = fetch_or_cancel(&url, should_cancel).await;
+    finish_with_deepseek(&url, local, deepseek, should_cancel).await
+}
+
+async fn fetch_or_cancel(
+    url: &str,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<String, FetchError> {
-    let url = normalise_url(&args.url)
-        .ok_or_else(|| FetchError::Failed(format!("invalid or unsupported URL: {}", args.url)))?;
-
     let client = build_client()?;
-    let body = fetch_with_redirects(&client, &url, should_cancel, 0).await?;
+    let body = fetch_with_redirects(&client, url, should_cancel, 0).await?;
     Ok(html_to_text(&body))
+}
+
+/// The direct request's outcome, or DeepSeek's copy of the page when the
+/// direct request failed in a way DeepSeek may get past. A blank page counts
+/// as a failure here, but without a successful retry it is returned as is.
+async fn finish_with_deepseek(
+    url: &str,
+    local: Result<String, FetchError>,
+    deepseek: Option<&DeepSeekWebAccess>,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Fetched, FetchError> {
+    let Some(access) = deepseek else {
+        return local.map(Fetched::direct);
+    };
+    let reason = match &local {
+        Ok(text) if text.trim().is_empty() && is_public_host(url) => "no readable text".to_string(),
+        Err(error @ FetchError::Failed { reason, .. })
+            if should_retry_with_deepseek(error, url) =>
+        {
+            reason.clone()
+        }
+        _ => return local.map(Fetched::direct),
+    };
+    match deepseek_web::fetch(access, url, should_cancel).await {
+        Ok(page) => Ok(Fetched {
+            note: Some(format!(
+                "[The direct request failed ({reason}), so this page was fetched through the DeepSeek Fetch API.]"
+            )),
+            text: page_text(page),
+        }),
+        Err(DeepSeekWebError::Cancelled) => Err(FetchError::Cancelled),
+        Err(DeepSeekWebError::Failed(deepseek_error)) => match local {
+            Err(FetchError::Failed {
+                message,
+                reason,
+                status,
+            }) => Err(FetchError::Failed {
+                message: format!("{message}; DeepSeek Fetch also failed: {deepseek_error}"),
+                reason,
+                status,
+            }),
+            other => other.map(Fetched::direct),
+        },
+    }
+}
+
+/// Whether a failed direct request may be retried through DeepSeek. Orca's
+/// own refusals stand, a missing page stays missing, and a private or
+/// intranet address is neither reachable from DeepSeek nor its business.
+fn should_retry_with_deepseek(error: &FetchError, url: &str) -> bool {
+    match error {
+        FetchError::Cancelled | FetchError::Rejected(_) => false,
+        FetchError::Failed {
+            status: Some(404 | 410),
+            ..
+        } => false,
+        FetchError::Failed { .. } => is_public_host(url),
+    }
+}
+
+/// Host suffixes that only resolve inside a local network.
+const INTRANET_SUFFIXES: [&str; 5] = [".local", ".localhost", ".internal", ".lan", ".home.arpa"];
+
+fn is_public_host(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => is_public_ipv4(ip),
+        Some(url::Host::Ipv6(ip)) => match ip.to_ipv4_mapped() {
+            Some(mapped) => is_public_ipv4(mapped),
+            None => {
+                let first = ip.segments()[0];
+                let unique_local = first & 0xfe00 == 0xfc00;
+                let link_local = first & 0xffc0 == 0xfe80;
+                !(ip.is_loopback() || ip.is_unspecified() || unique_local || link_local)
+            }
+        },
+        Some(url::Host::Domain(domain)) => {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            !INTRANET_SUFFIXES
+                .iter()
+                .any(|suffix| domain.ends_with(suffix) || domain == suffix[1..])
+        }
+        None => false,
+    }
+}
+
+fn is_public_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [first, second, ..] = ip.octets();
+    // 100.64.0.0/10 is the carrier-grade NAT range.
+    let shared = first == 100 && second & 0xc0 == 64;
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || shared)
+}
+
+/// DeepSeek's Markdown, headed by the page title when the content has no
+/// heading of its own.
+fn page_text(page: DeepSeekPage) -> String {
+    if page.title.trim().is_empty() || page.content.trim_start().starts_with('#') {
+        page.content
+    } else {
+        format!("# {}\n\n{}", page.title.trim(), page.content)
+    }
 }
 
 /// Upgrade http → https, reject non-HTTP schemes and credentials, require ≥ 2 hostname parts.
@@ -181,7 +349,7 @@ async fn fetch_with_redirects(
     depth: usize,
 ) -> Result<String, FetchError> {
     if depth > MAX_REDIRECTS {
-        return Err(FetchError::Failed(format!(
+        return Err(FetchError::Rejected(format!(
             "too many redirects (exceeded {MAX_REDIRECTS})"
         )));
     }
@@ -194,7 +362,14 @@ async fn fetch_with_redirects(
         should_cancel,
     )
     .await?
-    .map_err(|e| FetchError::Failed(format!("fetch failed for {url}: {e}")))?;
+    .map_err(|e| {
+        let reason = if e.is_timeout() {
+            "timed out"
+        } else {
+            "the connection failed"
+        };
+        FetchError::failed(format!("fetch failed for {url}: {e}"), reason)
+    })?;
 
     let status = response.status();
 
@@ -220,7 +395,7 @@ async fn fetch_with_redirects(
                 ))
                 .await
             } else {
-                Err(FetchError::Failed(format!(
+                Err(FetchError::Rejected(format!(
                     "cross-origin redirect blocked: {resolved}"
                 )))
             };
@@ -228,12 +403,22 @@ async fn fetch_with_redirects(
     }
 
     if !status.is_success() {
-        return Err(FetchError::Failed(format!("HTTP {status} fetching {url}")));
+        return Err(FetchError::status(
+            status.as_u16(),
+            format!("HTTP {status} fetching {url}"),
+        ));
     }
 
     let bytes = await_or_cancel(response.bytes(), should_cancel)
         .await?
-        .map_err(|e| FetchError::Failed(format!("failed to read response body: {e}")))?;
+        .map_err(|e| {
+            let reason = if e.is_timeout() {
+                "timed out"
+            } else {
+                "the response could not be read"
+            };
+            FetchError::failed(format!("failed to read response body: {e}"), reason)
+        })?;
 
     // Enforce body cap before decoding.
     let slice = if bytes.len() > MAX_BODY_BYTES {
@@ -251,10 +436,13 @@ fn build_client() -> Result<reqwest::Client, FetchError> {
         .redirect(reqwest::redirect::Policy::none()) // we follow redirects manually
         .build()
         .map_err(|e| {
-            FetchError::Failed(format!(
-                "failed to build HTTP client: {}",
-                orca_mcp::http::build_error(&e)
-            ))
+            FetchError::failed(
+                format!(
+                    "failed to build HTTP client: {}",
+                    orca_mcp::http::build_error(&e)
+                ),
+                "the HTTP client could not start",
+            )
         })
 }
 
@@ -554,5 +742,171 @@ mod tests {
     fn apply_prompt_filter_noop_when_prompt_absent() {
         let text = "Some text here.";
         assert_eq!(apply_prompt_filter(text, None), text);
+    }
+
+    const PAGE_URL: &str = "https://example.com/a";
+    const LOCAL_403: &str = "HTTP 403 Forbidden fetching https://example.com/a";
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test fetch runtime")
+            .block_on(future)
+    }
+
+    fn page_json(title: &str, content: &str) -> String {
+        serde_json::json!({ "title": title, "content": content }).to_string()
+    }
+
+    fn failure_message(error: FetchError) -> String {
+        match error {
+            FetchError::Failed { message, .. } | FetchError::Rejected(message) => message,
+            FetchError::Cancelled => "cancelled".to_string(),
+        }
+    }
+
+    #[test]
+    fn retry_decision_skips_rejections_missing_pages_and_private_hosts() {
+        for rejected in [
+            "cross-origin redirect blocked: https://elsewhere.example/",
+            "too many redirects (exceeded 10)",
+        ] {
+            assert!(
+                !should_retry_with_deepseek(&FetchError::Rejected(rejected.into()), PAGE_URL),
+                "{rejected}"
+            );
+        }
+        for missing in [404, 410] {
+            assert!(
+                !should_retry_with_deepseek(&FetchError::status(missing, "gone".into()), PAGE_URL),
+                "HTTP {missing}"
+            );
+        }
+        for host in [
+            "10.0.0.5",
+            "192.168.1.10",
+            "172.16.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "[fd00::1]",
+            "[::1]",
+            "printer.local",
+            "svc.internal",
+            "nas.lan",
+            "router.home.arpa",
+        ] {
+            assert!(
+                !should_retry_with_deepseek(
+                    &FetchError::status(503, "down".into()),
+                    &format!("https://{host}/x")
+                ),
+                "{host}"
+            );
+        }
+        for status in [403, 429, 503] {
+            assert!(
+                should_retry_with_deepseek(&FetchError::status(status, "no".into()), PAGE_URL),
+                "HTTP {status}"
+            );
+        }
+        assert!(should_retry_with_deepseek(
+            &FetchError::failed("timed out fetching https://example.com/a", "timed out"),
+            PAGE_URL
+        ));
+    }
+
+    #[test]
+    fn empty_extraction_is_retried() {
+        let fixture = crate::test_http::serve(vec![(200, page_json("A", "# A\n\nbody"))]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let fetched = block_on(finish_with_deepseek(
+            PAGE_URL,
+            Ok("  \n".to_string()),
+            Some(&access),
+            &|| false,
+        ))
+        .expect("DeepSeek answers");
+
+        assert_eq!(
+            fetched.note.as_deref(),
+            Some(
+                "[The direct request failed (no readable text), so this page was fetched through the DeepSeek Fetch API.]"
+            )
+        );
+        assert_eq!(fetched.text, "# A\n\nbody");
+        assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[test]
+    fn fallback_output_starts_with_note_and_applies_prompt_filter() {
+        let fixture = crate::test_http::serve(vec![(
+            200,
+            page_json("A", "# A\n\nRust has ownership.\n\nPython is popular."),
+        )]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let fetched = block_on(finish_with_deepseek(
+            PAGE_URL,
+            Err(FetchError::status(403, LOCAL_403.into())),
+            Some(&access),
+            &|| false,
+        ))
+        .expect("DeepSeek answers");
+        let output = render(fetched, Some("rust ownership"));
+
+        assert!(
+            output.starts_with(
+                "[The direct request failed (HTTP 403), so this page was fetched through the DeepSeek Fetch API.]\n\n"
+            ),
+            "{output}"
+        );
+        assert!(output.contains("Rust has ownership."), "{output}");
+        assert!(!output.contains("Python is popular."), "{output}");
+        fixture.requests();
+    }
+
+    #[test]
+    fn both_failures_are_reported_together() {
+        let fixture =
+            crate::test_http::serve(vec![(500, r#"{"error":{"message":"boom"}}"#.into())]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let error = block_on(finish_with_deepseek(
+            PAGE_URL,
+            Err(FetchError::status(403, LOCAL_403.into())),
+            Some(&access),
+            &|| false,
+        ))
+        .expect_err("both requests fail");
+
+        assert_eq!(
+            failure_message(error),
+            format!("{LOCAL_403}; DeepSeek Fetch also failed: DeepSeek returned HTTP 500: boom")
+        );
+        fixture.requests();
+    }
+
+    #[test]
+    fn without_deepseek_access_errors_are_unchanged() {
+        let error = block_on(finish_with_deepseek(
+            PAGE_URL,
+            Err(FetchError::status(403, LOCAL_403.into())),
+            None,
+            &|| false,
+        ))
+        .expect_err("nothing retries");
+        assert_eq!(failure_message(error), LOCAL_403);
+
+        let blank = block_on(finish_with_deepseek(
+            PAGE_URL,
+            Ok(String::new()),
+            None,
+            &|| false,
+        ))
+        .expect("a blank page is returned as before");
+        assert_eq!(blank.note, None);
+        assert_eq!(blank.text, "");
     }
 }

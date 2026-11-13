@@ -182,6 +182,29 @@ export ORCA_API_KEY="sk-..."
 无效的 `ORCA_MODE` 或推理努力级别会导致生效配置无法解析。修改环境变量或 TOML 后，
 在执行任务前运行 `orca doctor`。
 
+## 联网搜索与网页抓取
+
+`web_search` 按下面的顺序，用第一个可用的服务：
+
+1. Brave：设置了环境变量 `BRAVE_SEARCH_API_KEY` 时使用。
+2. DeepSeek 的 Search API：Orca 连接的是 DeepSeek 官方 endpoint 时使用（见下文）。
+3. Exa：不需要 key。DeepSeek 搜索失败时也由 Exa 补上，结果里会写明。
+
+`web_fetch` 总是先从你的机器直接请求页面。连接的是 DeepSeek 官方 endpoint 时，直接请求失败会改用 DeepSeek 的 Fetch API 再试一次，结果第一行会写明这一点。页面抽不出可读文字也算失败。以下情况不会再试：
+
+- 网址或重定向被 Orca 自己的规则拒绝，比如重定向到了别的网站；
+- 页面返回 404 或 410；
+- 地址是私有的：局域网、本机回环或链路本地的 IP 地址，或以 `.local`、`.localhost`、`.internal`、`.lan`、`.home.arpa` 结尾的主机名。
+
+只有同时满足这几个条件，Orca 才会调用 DeepSeek 的联网接口：提供方是 DeepSeek，设置了 API key，并且 `base_url` 没有设置，或者指向默认端口上的 `https://api.deepseek.com`（路径不限）。key 只会发往这个地址。`base_url` 是其他地址时（比如第三方网关），`web_search` 和 `web_fetch` 的行为就和没有 DeepSeek 接口时一样。
+
+DeepSeek 对这些调用单独计费，不算在 token 费用里：每 1000 次成功的搜索 0.75 美元，每 1000 次成功的抓取也是 0.75 美元（2026 年 11 月的价格）。Orca 的成本估算不包含这部分。不想用的话，在用户配置里关掉；项目的 `.orca/config.toml` 改不了这一项：
+
+```toml
+[tools]
+deepseek_web = false   # 搜索改用 Brave 或 Exa，抓取只在本机直接请求
+```
+
 ## 网络与证书
 
 Orca 用操作系统的证书库验证 HTTPS 证书：macOS 用钥匙串，Windows 用系统证书存储，Linux 用系统的 CA 证书包。
