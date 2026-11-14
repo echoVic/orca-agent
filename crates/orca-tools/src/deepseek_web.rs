@@ -247,12 +247,19 @@ async fn post_json(
         should_cancel,
     )
     .await?
-    .map_err(|error| DeepSeekWebError::Failed(format!("DeepSeek request failed: {error}")))?;
+    .map_err(|error| DeepSeekWebError::Failed(describe_request_error(&error)))?;
     let status = response.status().as_u16();
     let text = await_or_cancel(response.text(), should_cancel)
         .await?
         .map_err(|error| {
-            DeepSeekWebError::Failed(format!("failed to read the DeepSeek response: {error}"))
+            if error.is_timeout() {
+                DeepSeekWebError::Failed("DeepSeek request timed out".to_string())
+            } else {
+                DeepSeekWebError::Failed(format!(
+                    "failed to read the DeepSeek response: {}",
+                    with_causes(&error)
+                ))
+            }
         })?;
     if !(200..300).contains(&status) {
         return Err(DeepSeekWebError::Failed(http_error_message(
@@ -293,6 +300,31 @@ fn http_error_message(status: u16, body: &str, api_key: &str) -> String {
             }
         }
     }
+}
+
+/// What went wrong with a request that got no response: a timeout, a failed
+/// connection, or something else, with the underlying causes. reqwest's own
+/// message names only the URL.
+fn describe_request_error(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "DeepSeek request timed out".to_string()
+    } else if error.is_connect() {
+        format!("could not connect to DeepSeek: {}", with_causes(error))
+    } else {
+        format!("DeepSeek request failed: {}", with_causes(error))
+    }
+}
+
+/// `error` followed by each of its sources.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 async fn await_or_cancel<T>(
@@ -485,5 +517,38 @@ mod tests {
             ))
         );
         fixture.requests();
+    }
+
+    #[test]
+    fn deepseek_network_errors_say_what_went_wrong() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port to free");
+        let closed_origin = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let access = DeepSeekWebAccess::for_test(&closed_origin, "sk-test");
+
+        let refused = block_on(search(&access, "rust", 3, &|| false));
+
+        assert!(
+            matches!(&refused, Err(DeepSeekWebError::Failed(message)) if message.starts_with("could not connect to DeepSeek: ")),
+            "{refused:?}"
+        );
+
+        let silent = crate::test_http::untouched();
+        let access = DeepSeekWebAccess::for_test(&silent.origin, "sk-test");
+
+        let stalled = block_on(post_json(
+            &access,
+            "/v1/tools/search",
+            &json!({}),
+            Duration::from_millis(200),
+            &|| false,
+        ));
+
+        assert_eq!(
+            stalled,
+            Err(DeepSeekWebError::Failed(
+                "DeepSeek request timed out".to_string()
+            ))
+        );
     }
 }
