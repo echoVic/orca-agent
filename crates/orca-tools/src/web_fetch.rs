@@ -256,7 +256,20 @@ fn should_retry_with_deepseek(error: &FetchError, url: &str) -> bool {
 }
 
 /// Host suffixes that only resolve inside a local network.
-const INTRANET_SUFFIXES: [&str; 5] = [".local", ".localhost", ".internal", ".lan", ".home.arpa"];
+/// Host suffixes that only resolve inside a local network (RFC 6762,
+/// appendix G, and common intranet names).
+const INTRANET_SUFFIXES: [&str; 10] = [
+    ".local",
+    ".localhost",
+    ".localdomain",
+    ".internal",
+    ".intranet",
+    ".private",
+    ".corp",
+    ".home",
+    ".lan",
+    ".home.arpa",
+];
 
 fn is_public_host(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
@@ -275,25 +288,39 @@ fn is_public_host(url: &str) -> bool {
         },
         Some(url::Host::Domain(domain)) => {
             let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-            !INTRANET_SUFFIXES
-                .iter()
-                .any(|suffix| domain.ends_with(suffix) || domain == suffix[1..])
+            label_count(&domain) >= 2
+                && !INTRANET_SUFFIXES
+                    .iter()
+                    .any(|suffix| domain.ends_with(suffix) || domain == suffix[1..])
         }
         None => false,
     }
 }
 
 fn is_public_ipv4(ip: std::net::Ipv4Addr) -> bool {
-    let [first, second, ..] = ip.octets();
+    let [first, second, third, _] = ip.octets();
+    // 0.0.0.0/8 means "this network".
+    let this_network = first == 0;
     // 100.64.0.0/10 is the carrier-grade NAT range.
     let shared = first == 100 && second & 0xc0 == 64;
+    // 192.0.0.0/24 is reserved for protocol assignments.
+    let protocol_assignments = first == 192 && second == 0 && third == 0;
+    // 198.18.0.0/15 is for benchmarking, and local proxies hand it out as fake IPs.
+    let benchmarking = first == 198 && second & 0xfe == 18;
+    // 240.0.0.0/4 is reserved for future use.
+    let reserved = first >= 240;
     !(ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
         || ip.is_unspecified()
         || ip.is_broadcast()
         || ip.is_documentation()
-        || shared)
+        || ip.is_multicast()
+        || this_network
+        || shared
+        || protocol_assignments
+        || benchmarking
+        || reserved)
 }
 
 /// DeepSeek's Markdown, headed by the page title when the content has no
@@ -320,10 +347,15 @@ fn normalise_url(raw: &str) -> Option<String> {
         _ => return None,
     }
     let host = parsed.host_str()?;
-    if host.split('.').count() < 2 {
+    if label_count(host) < 2 {
         return None;
     }
     Some(parsed.to_string())
+}
+
+/// The non-empty dot-separated labels of `host`, so `nas.` counts as one.
+fn label_count(host: &str) -> usize {
+    host.split('.').filter(|label| !label.is_empty()).count()
 }
 
 fn strip_www(h: &str) -> &str {
@@ -690,6 +722,12 @@ mod tests {
     }
 
     #[test]
+    fn normalise_url_rejects_single_label_host_with_trailing_dot() {
+        assert!(normalise_url("https://nas./").is_none());
+        assert!(normalise_url("https://example.com./a").is_some());
+    }
+
+    #[test]
     fn normalise_url_rejects_non_http_scheme() {
         assert!(normalise_url("ftp://example.com/file").is_none());
     }
@@ -828,12 +866,24 @@ mod tests {
             "172.16.0.1",
             "127.0.0.1",
             "169.254.1.1",
+            "0.1.2.3",
+            "100.64.0.1",
+            "192.0.0.8",
+            "198.18.0.5",
+            "224.0.0.1",
+            "240.0.0.1",
             "[fd00::1]",
             "[::1]",
             "printer.local",
             "svc.internal",
             "nas.lan",
             "router.home.arpa",
+            "box.localdomain",
+            "files.corp",
+            "nas.home",
+            "wiki.intranet",
+            "app.private",
+            "nas.",
         ] {
             assert!(
                 !should_retry_with_deepseek(
