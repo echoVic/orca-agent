@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.19";
+export const releaseVersion = "v0.5.20";
 
 export const releases = [
+  {
+    version: "v0.5.20",
+    date: "2026-11-15",
+    title: "Search, fetch and read documents through DeepSeek",
+    body: "When Orca runs against the official DeepSeek endpoint, web_search and web_fetch now use DeepSeek's Search and Fetch APIs: search keeps Brave first, falls back from a failed DeepSeek search to Exa, and web_fetch retries a failed local request through DeepSeek unless Orca's rules refused the URL, the page is missing, or the address is private. The new read_document tool reads PDF, Word, PowerPoint and image files as text through DeepSeek OCR, numbers pages as DeepSeek does, strips OCR layout tokens, and caches a whole recognition in memory and under ORCA_HOME/ocr_cache so chunks, copies, subagents and later sessions pay once. web_search now honours a fresh_days window counted from your local date and shows publication dates, while orca doctor --online checks the API key with one free GET /models, failing a 401 as a rejected key and a 403 as a refused request. Today's date reaches the model outside the system prompt so a session keeps its cached prefix across midnight, a stream that ends with an error chunk reports DeepSeek's own reason, and the built-in peak/off-peak pricing table now covers 2027's mainland China weekday holidays.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.20",
+  },
   {
     version: "v0.5.19",
     date: "2026-11-07",

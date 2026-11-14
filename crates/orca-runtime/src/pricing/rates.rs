@@ -36,8 +36,10 @@ const BEIJING_UTC_OFFSET_SECS: i32 = 8 * 60 * 60;
 const PEAK_HOURS: [(u32, u32); 2] = [(9, 12), (14, 18)];
 
 /// Weekdays that are days off in mainland China, so off-peak all day. From the
-/// State Council's yearly notice; 2026:
+/// State Council's yearly notices; 2026:
 /// https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm
+/// and 2027:
+/// https://www.gov.cn/zhengce/zhengceku/202611/content_7085102.htm
 const WEEKDAY_HOLIDAYS: &[(i32, u32, u32)] = &[
     (2026, 1, 1),
     (2026, 1, 2),
@@ -58,11 +60,29 @@ const WEEKDAY_HOLIDAYS: &[(i32, u32, u32)] = &[
     (2026, 10, 5),
     (2026, 10, 6),
     (2026, 10, 7),
+    (2027, 1, 1),
+    (2027, 2, 5),
+    (2027, 2, 8),
+    (2027, 2, 9),
+    (2027, 2, 10),
+    (2027, 2, 11),
+    (2027, 2, 12),
+    (2027, 4, 5),
+    (2027, 5, 3),
+    (2027, 5, 4),
+    (2027, 5, 5),
+    (2027, 6, 9),
+    (2027, 9, 15),
+    (2027, 10, 1),
+    (2027, 10, 4),
+    (2027, 10, 5),
+    (2027, 10, 6),
+    (2027, 10, 7),
 ];
 
 /// The day the built-in prices were checked against DeepSeek's pricing page.
 pub fn builtin_as_of() -> NaiveDate {
-    NaiveDate::from_ymd_opt(2026, 11, 5).expect("valid built-in date")
+    NaiveDate::from_ymd_opt(2026, 11, 15).expect("valid built-in date")
 }
 
 /// The built-in prices, by canonical model name.
@@ -206,7 +226,7 @@ mod tests {
     fn builtin_table_matches_the_published_off_peak_prices() {
         assert_eq!(
             builtin_as_of(),
-            NaiveDate::from_ymd_opt(2026, 11, 5).unwrap()
+            NaiveDate::from_ymd_opt(2026, 11, 15).unwrap()
         );
         let table = builtin_rates();
         assert_eq!(
@@ -242,7 +262,7 @@ mod tests {
                 "{date}"
             );
         }
-        assert_eq!(WEEKDAY_HOLIDAYS.len(), 19);
+        assert_eq!(WEEKDAY_HOLIDAYS.len(), 37);
     }
 
     #[test]
