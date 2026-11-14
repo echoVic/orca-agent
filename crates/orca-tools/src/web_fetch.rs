@@ -40,6 +40,10 @@ const MAX_REDIRECTS: usize = 10;
 /// Cancellation poll interval — same value used by web_search.
 const CANCEL_POLL: Duration = Duration::from_millis(10);
 
+/// Sent with every direct request. GitHub's API, crates.io and Wikipedia
+/// answer requests without a User-Agent with 403.
+const USER_AGENT: &str = "Orca (+https://github.com/echoVic/orca-agent)";
+
 // ── public entry points ────────────────────────────────────────────────────────
 
 pub fn execute(request: &ToolRequest, max_bytes: usize) -> ToolResult {
@@ -434,6 +438,7 @@ async fn fetch_with_redirects(
 fn build_client() -> Result<reqwest::Client, FetchError> {
     let builder = orca_mcp::http::client_builder()
         .timeout(FETCH_TIMEOUT)
+        .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::none()); // we follow redirects manually
     #[cfg(test)]
     let builder = builder.no_proxy();
@@ -953,6 +958,23 @@ mod tests {
         );
         deepseek.assert_untouched("DeepSeek");
         assert_eq!(site.requests().len(), MAX_REDIRECTS + 1);
+    }
+
+    #[test]
+    fn direct_requests_identify_orca() {
+        let site = crate::test_http::serve(vec![(200, "plain body".into())]);
+
+        let page = block_on(fetch_or_cancel(&format!("{}/a", site.origin), &|| false))
+            .expect("the fixture answers");
+
+        assert_eq!(page.text, "plain body");
+        let requests = site.requests();
+        let expected = format!("\r\nuser-agent: {USER_AGENT}\r\n").to_ascii_lowercase();
+        assert!(
+            requests[0].to_ascii_lowercase().contains(&expected),
+            "{}",
+            requests[0]
+        );
     }
 
     #[test]
