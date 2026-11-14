@@ -94,6 +94,7 @@ pub fn inspect_first_run_in(config: &RunConfig, config_dir: &Path) -> io::Result
         workspace_trusted: folder_trust::is_trusted_with_config_dir(&workspace, &config_dir),
         diagnostics: diagnostics::collect_doctor(DoctorOptions {
             cwd: Some(workspace),
+            online: false,
         }),
         config_dir,
     })

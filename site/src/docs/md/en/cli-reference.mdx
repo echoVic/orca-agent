@@ -58,18 +58,26 @@ compatibility aliases remain supported.
 ## `orca doctor`
 
 ```text
-orca doctor [--cwd PATH] [--json | --format text|json]
+orca doctor [--cwd PATH] [--json | --format text|json] [--online]
 ```
 
-`doctor` is a local, read-only preflight. It never contacts the provider,
-starts MCP, provisions sandbox capabilities, writes configuration, or changes
-folder trust. It reports typed `pass`, `warn`, and `fail` checks for:
+`doctor` is a read-only preflight. It never starts MCP, provisions sandbox
+capabilities, writes configuration, or changes folder trust, and it contacts
+the provider only with `--online`. It reports typed `pass`, `warn`, and
+`fail` checks for:
 
 - configuration syntax and source paths;
 - credential presence and source (never the credential value);
 - effective model and endpoint configuration;
 - the nearest folder-trust decision; and
 - the platform sandbox backend.
+
+`--online` adds a `credentials-online` check: one `GET /models` request to
+the configured endpoint with the configured key. Listing the models uses no
+model and is not billed. The check passes when the provider accepts the key,
+fails when it rejects it (HTTP 401 or 403), and warns when it cannot tell:
+another status (an endpoint may not serve `/models`), no answer within 10
+seconds, or no key to check. The report never shows the key.
 
 Warnings keep exit status `0`. A required failed check returns exit status `1`.
 Text is intended for people; JSON is stable machine-readable output with
@@ -78,6 +86,7 @@ camelCase fields such as `schemaVersion` and `folder-trust` check IDs.
 ```bash
 orca doctor
 orca doctor --cd ./project --json
+orca doctor --online
 ```
 
 ## `orca storage`
@@ -283,4 +292,5 @@ Supported environment overrides include `ORCA_API_KEY`/
 `ORCA_BASE_URL`/`DEEPSEEK_BASE_URL`, `ORCA_MODE`, and
 `ORCA_REASONING_EFFORT`/`DEEPSEEK_REASONING_EFFORT`. Keep credentials out of
 source control. `orca doctor --format json` reports only whether a credential
-is present and where it came from.
+is present and where it came from, plus, with `--online`, whether the provider
+accepts it; it never prints the credential.

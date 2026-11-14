@@ -277,3 +277,96 @@ fn doctor_json_shorthand_and_directory_alias_produce_the_stable_report() {
     assert_eq!(short, legacy);
     assert!(!home.exists(), "doctor must remain read-only");
 }
+
+#[test]
+fn doctor_online_reports_a_rejected_key_without_echoing_it() {
+    use std::io::{Read, Write};
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("workspace");
+    fs::create_dir(&cwd).unwrap();
+    let secret = "sk-test-online-secret";
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    // Polled, so that a doctor that never asks fails the test instead of
+    // leaving the fixture waiting forever.
+    let doctor_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exited = doctor_exited.clone();
+    let server = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if exited.load(std::sync::atomic::Ordering::SeqCst)
+                        || started.elapsed() > std::time::Duration::from_secs(60)
+                    {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept the models request: {error}"),
+            }
+        };
+        // An accepted stream inherits non-blocking mode on macOS.
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut request = [0_u8; 2048];
+        let read = stream.read(&mut request).unwrap_or(0);
+        let body = r#"{"error":{"message":"Authentication Fails","type":"authentication_error"}}"#;
+        let _ = write!(
+            stream,
+            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        Some(String::from_utf8_lossy(&request[..read]).into_owned())
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .env("ORCA_HOME", &home)
+        .env("ORCA_API_KEY", secret)
+        .env("ORCA_BASE_URL", &base_url)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .args([
+            "doctor",
+            "--online",
+            "--json",
+            "--cwd",
+            cwd.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run orca doctor --online");
+    doctor_exited.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let request = server
+        .join()
+        .unwrap()
+        .expect("doctor --online asks the endpoint for its models");
+    assert!(
+        request.starts_with("GET /v1/models HTTP/1.1\r\n"),
+        "{request}"
+    );
+    assert_eq!(output.status.code(), Some(1), "a rejected key fails");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains(secret),
+        "doctor must never print an API key"
+    );
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    let online = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "credentials-online")
+        .expect("credentials-online check");
+    assert_eq!(online["status"], "fail", "{online}");
+    assert!(
+        online["detail"].as_str().unwrap().contains("HTTP 401"),
+        "{online}"
+    );
+    assert!(!home.exists(), "doctor --online must remain read-only");
+}

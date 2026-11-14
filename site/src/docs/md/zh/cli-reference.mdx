@@ -54,12 +54,12 @@ orca [OPTIONS] COMMAND
 ## `orca doctor`
 
 ```text
-orca doctor [--cwd PATH] [--json | --format text|json]
+orca doctor [--cwd PATH] [--json | --format text|json] [--online]
 ```
 
-`doctor` 是本地只读的运行前检查。它不会连接模型服务、启动 MCP、配置沙箱
-capability、写入配置，也不会改变目录信任。它输出带类型的 `pass`、`warn`、
-`fail` 检查：
+`doctor` 是只读的运行前检查。它不会启动 MCP、配置沙箱 capability、写入配置，
+也不会改变目录信任；只有加上 `--online` 才会连接模型服务。它输出带类型的
+`pass`、`warn`、`fail` 检查：
 
 - 配置语法和来源路径；
 - 凭据是否存在及其来源（绝不输出凭据值）；
@@ -67,12 +67,18 @@ capability、写入配置，也不会改变目录信任。它输出带类型的 
 - 最近的目录信任决策；
 - 当前平台的沙箱后端。
 
+`--online` 会多一项 `credentials-online` 检查：用配置的 key 向配置的 endpoint
+发一次 `GET /models`。列模型不调用模型，也不计费。服务接受 key 时通过，拒绝时
+（HTTP 401 或 403）失败；判断不了时给出警告：返回其他状态码（有的 endpoint
+不提供 `/models`）、10 秒内没有响应，或者没有可检查的 key。报告里不会出现 key。
+
 只有存在 `fail` 时退出码才是 `1`；只有警告时退出码为 `0`。文本适合人工阅读，
 JSON 是稳定的机器接口，字段使用 camelCase，例如 `schemaVersion`。
 
 ```bash
 orca doctor
 orca doctor --cd ./project --json
+orca doctor --online
 ```
 
 ## `orca storage`
@@ -257,4 +263,5 @@ orca mcp remove docs
 支持的环境覆盖包括 `ORCA_API_KEY`/`DEEPSEEK_API_KEY`、
 `ORCA_MODEL`/`DEEPSEEK_MODEL`、`ORCA_BASE_URL`/`DEEPSEEK_BASE_URL`、`ORCA_MODE`
 和 `ORCA_REASONING_EFFORT`/`DEEPSEEK_REASONING_EFFORT`。不要把凭据提交到源码库；
-`orca doctor --format json` 只报告凭据是否存在及其来源。
+`orca doctor --format json` 只报告凭据是否存在及其来源；加上 `--online` 时还会报告
+服务是否接受它，但绝不输出凭据本身。

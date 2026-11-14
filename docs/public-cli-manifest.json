@@ -5,7 +5,7 @@
   "commands": {
     "root": ["doctor", "storage", "rewind", "exec", "app-server", "acp", "workflow", "trust", "mcp", "daemon", "acp-bridge", "attach"],
     "doctor": {
-      "options": ["--cwd", "--format", "--json"],
+      "options": ["--cwd", "--format", "--json", "--online"],
       "subcommands": []
     },
     "storage": {

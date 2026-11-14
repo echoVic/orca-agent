@@ -255,6 +255,10 @@ struct DoctorArgs {
     /// Output the stable JSON report (shorthand for --format json).
     #[arg(long, conflicts_with = "format")]
     json: bool,
+
+    /// Also check the API key with the provider (one GET /models request; not billed).
+    #[arg(long)]
+    online: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1315,6 +1319,7 @@ pub fn run() -> i32 {
             orca_runtime::diagnostics::run(orca_runtime::diagnostics::DoctorRequest {
                 cwd: args.cwd,
                 app_version: env!("CARGO_PKG_VERSION").to_string(),
+                online: args.online,
                 format: match args.format {
                     DoctorFormatArg::Json => orca_runtime::diagnostics::DoctorOutputFormat::Json,
                     DoctorFormatArg::Text => orca_runtime::diagnostics::DoctorOutputFormat::Text,
@@ -1795,6 +1800,16 @@ mod tests {
             panic!("doctor");
         };
         assert_eq!(args.format, DoctorFormatArg::Json);
+        assert!(!args.online, "doctor stays offline by default");
+    }
+
+    #[test]
+    fn doctor_online_parses() {
+        let cli = Cli::try_parse_from(["orca", "doctor", "--online", "--json"]).unwrap();
+        let Some(Command::Doctor(args)) = cli.command else {
+            panic!("doctor");
+        };
+        assert!(args.online);
     }
 
     #[test]
@@ -1994,7 +2009,7 @@ mod tests {
             .filter(|argument| !argument.is_hide_set())
             .filter_map(|argument| argument.get_long())
             .collect::<Vec<_>>();
-        assert_eq!(doctor_options, ["cwd", "format", "json"]);
+        assert_eq!(doctor_options, ["cwd", "format", "json", "online"]);
     }
 
     #[test]

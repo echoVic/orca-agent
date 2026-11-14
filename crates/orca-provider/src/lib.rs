@@ -4,6 +4,7 @@ pub mod context;
 pub mod deepseek_fixture;
 pub mod deepseek_http;
 pub mod http_client;
+pub mod key_check;
 pub mod prompt_cache;
 pub mod streaming;
 pub mod summary_cache;

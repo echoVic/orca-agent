@@ -1,13 +1,15 @@
-//! Offline, read-only diagnostics shared by the CLI and first-run surfaces.
+//! Read-only diagnostics shared by the CLI and first-run surfaces.
 //!
-//! The doctor command deliberately reports local facts only. It does not
-//! contact a provider, start MCP, provision sandbox capabilities, or mutate
-//! configuration/trust state.
+//! The doctor command reports local facts. It does not start MCP, provision
+//! sandbox capabilities, or mutate configuration/trust state, and it contacts
+//! the provider only when asked to (`--online`), with one free `GET /models`
+//! that checks the API key.
 
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(not(windows))]
 use orca_core::capability::{EnforcementState, SandboxEnforcementDecision};
@@ -15,11 +17,17 @@ use orca_core::config::file::{self, ConfigOverrides, FileConfig};
 use orca_core::config::folder_trust::{self, TrustLevel};
 use orca_core::config::toml_text::crlf_to_lf;
 use orca_platform::host::HostPlatform;
+use orca_provider::key_check::{self, KeyCheck};
 use serde::Serialize;
 
 pub const DOCTOR_SCHEMA_VERSION: u32 = 1;
 pub const CANONICAL_PACKAGE: &str = "@blade-ai/orca";
 pub const CANONICAL_WEBSITE: &str = "https://orcaagent.dev";
+
+/// The check `--online` adds.
+const CREDENTIALS_ONLINE: &str = "credentials-online";
+/// How long `--online` waits for the provider.
+const ONLINE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -104,6 +112,8 @@ impl DiagnosticReport {
 #[derive(Clone, Debug, Default)]
 pub struct DoctorOptions {
     pub cwd: Option<PathBuf>,
+    /// Also ask the provider whether it accepts the API key.
+    pub online: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,14 +127,21 @@ pub struct DoctorRequest {
     pub cwd: Option<PathBuf>,
     pub format: DoctorOutputFormat,
     pub app_version: String,
+    /// Also ask the provider whether it accepts the API key.
+    pub online: bool,
 }
 
-/// Render one local, read-only diagnostic report to stdout. Diagnostics are
+/// Render one read-only diagnostic report to stdout. Diagnostics are
 /// intentionally never emitted to stderr because callers can parse one
 /// complete text or JSON report without mixing it with progress output.
 pub fn run(request: DoctorRequest) -> i32 {
-    let report =
-        collect_doctor_with_version(DoctorOptions { cwd: request.cwd }, request.app_version);
+    let report = collect_doctor_with_version(
+        DoctorOptions {
+            cwd: request.cwd,
+            online: request.online,
+        },
+        request.app_version,
+    );
     let output = match request.format {
         DoctorOutputFormat::Json => match report.to_json() {
             Ok(json) => format!("{json}\n"),
@@ -171,6 +188,9 @@ pub fn collect_doctor_with_version(
     let config_is_usable = config_check.status != DiagnosticStatus::Fail;
     checks.push(config_check);
     checks.push(check_credentials(config_is_usable));
+    if options.online {
+        checks.push(check_credentials_online(effective_cwd, config_is_usable));
+    }
     checks.push(check_model(effective_cwd, config_is_usable));
     checks.push(check_pricing(effective_cwd, config_is_usable));
     checks.push(check_folder_trust(effective_cwd));
@@ -271,6 +291,72 @@ fn check_credentials(config_is_usable: bool) -> DiagnosticCheck {
         "no API key configured",
         Some("set ORCA_API_KEY or DEEPSEEK_API_KEY"),
     )
+}
+
+/// Whether the provider accepts the API key, from one `GET /models`: the
+/// list uses no model and is not billed. Only `--online` runs it.
+fn check_credentials_online(cwd: &Path, config_is_usable: bool) -> DiagnosticCheck {
+    if !config_is_usable {
+        return warn_check(
+            CREDENTIALS_ONLINE,
+            "not evaluated because the configuration is invalid",
+            Some("fix the config check first, then rerun `orca doctor --online`"),
+        );
+    }
+    match file::load_effective_config(cwd, ConfigOverrides::default()) {
+        Ok(config) => credentials_online_check_for(&config),
+        Err(error) => warn_check(
+            CREDENTIALS_ONLINE,
+            format!("not evaluated: cannot resolve effective configuration: {error}"),
+            Some("fix configuration errors, then rerun `orca doctor --online`"),
+        ),
+    }
+}
+
+/// The online key check with the key and endpoint `config` gives the
+/// provider.
+fn credentials_online_check_for(config: &FileConfig) -> DiagnosticCheck {
+    let Some(api_key) = config
+        .api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+    else {
+        return warn_check(
+            CREDENTIALS_ONLINE,
+            "skipped: no API key configured",
+            Some("set ORCA_API_KEY or DEEPSEEK_API_KEY, then rerun `orca doctor --online`"),
+        );
+    };
+    let base_url = config.base_url.as_deref();
+    key_check_result(
+        &key_check::models_url(base_url),
+        key_check::check_api_key(base_url, api_key, ONLINE_CHECK_TIMEOUT),
+    )
+}
+
+fn key_check_result(url: &str, outcome: KeyCheck) -> DiagnosticCheck {
+    match outcome {
+        KeyCheck::Valid => pass_check(CREDENTIALS_ONLINE, format!("{url} accepted the API key")),
+        KeyCheck::Rejected(status) => fail_check(
+            CREDENTIALS_ONLINE,
+            format!("{url} rejected the API key (HTTP {status})"),
+            Some(
+                "replace the key (ORCA_API_KEY, DEEPSEEK_API_KEY, api_key in config.toml, or auth.json), then rerun `orca doctor --online`",
+            ),
+        ),
+        KeyCheck::Unexpected(status) => warn_check(
+            CREDENTIALS_ONLINE,
+            format!("{url} answered HTTP {status}, which does not tell whether the key works"),
+            Some(
+                "the endpoint may not serve /models; if it does, rerun `orca doctor --online` later",
+            ),
+        ),
+        KeyCheck::Unreachable(reason) => warn_check(
+            CREDENTIALS_ONLINE,
+            format!("cannot reach {url}: {reason}"),
+            Some("check the network, any proxy and base_url, then rerun `orca doctor --online`"),
+        ),
+    }
 }
 
 fn check_model(cwd: &Path, config_is_usable: bool) -> DiagnosticCheck {
@@ -612,6 +698,116 @@ mod tests {
         assert!(!json.contains("DEEPSEEK_API_KEY=\""));
         assert_eq!(report.schema_version, DOCTOR_SCHEMA_VERSION);
         assert_eq!(report.package, CANONICAL_PACKAGE);
+    }
+
+    #[test]
+    fn doctor_stays_offline_without_online() {
+        let report = collect_doctor_with_version(DoctorOptions::default(), "test-version");
+
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| check.id != CREDENTIALS_ONLINE),
+            "{:?}",
+            report.checks
+        );
+    }
+
+    #[test]
+    fn every_key_check_outcome_maps_to_a_credentials_online_check() {
+        let url = "https://api.deepseek.com/models";
+        let cases = [
+            (KeyCheck::Valid, DiagnosticStatus::Pass, "accepted"),
+            (KeyCheck::Rejected(401), DiagnosticStatus::Fail, "HTTP 401"),
+            (
+                KeyCheck::Unexpected(502),
+                DiagnosticStatus::Warn,
+                "HTTP 502",
+            ),
+            (
+                KeyCheck::Unreachable("connection refused".to_string()),
+                DiagnosticStatus::Warn,
+                "connection refused",
+            ),
+        ];
+        for (outcome, status, phrase) in cases {
+            let check = key_check_result(url, outcome);
+
+            assert_eq!(check.id, CREDENTIALS_ONLINE);
+            assert_eq!(check.status, status, "{}", check.detail);
+            assert!(check.detail.contains(url), "{}", check.detail);
+            assert!(check.detail.contains(phrase), "{}", check.detail);
+            assert_eq!(
+                check.remediation.is_some(),
+                status != DiagnosticStatus::Pass,
+                "{check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_online_check_is_skipped_without_a_key() {
+        for api_key in [None, Some("  ".to_string())] {
+            let config = FileConfig {
+                api_key,
+                ..FileConfig::default()
+            };
+
+            let check = credentials_online_check_for(&config);
+
+            assert_eq!(check.status, DiagnosticStatus::Warn, "{}", check.detail);
+            assert!(check.detail.contains("no API key"), "{}", check.detail);
+        }
+    }
+
+    #[test]
+    fn the_online_check_asks_the_configured_endpoint_for_its_models() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0_u8; 2048];
+            let read = stream.read(&mut request).unwrap_or(0);
+            let body = r#"{"object":"list","data":[]}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        let config = FileConfig {
+            api_key: Some("sk-test".to_string()),
+            base_url: Some(base_url.clone()),
+            ..FileConfig::default()
+        };
+
+        let check = credentials_online_check_for(&config);
+
+        assert_eq!(check.status, DiagnosticStatus::Pass, "{}", check.detail);
+        assert!(
+            check.detail.contains(&format!("{base_url}/models")),
+            "{}",
+            check.detail
+        );
+        let request = server.join().unwrap();
+        assert!(
+            request.starts_with("GET /v1/models HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("\r\nauthorization: bearer sk-test\r\n"),
+            "{request}"
+        );
     }
 
     #[test]
