@@ -10,12 +10,19 @@ const TOOL_CALL_PROGRESS_ARGUMENT_BYTES_STEP: usize = 8 * 1024;
 const INVALID_SSE_DATA_JSON_PREFIX: &str = "invalid SSE data JSON";
 const INVALID_SSE_UTF8_PREFIX: &str = "invalid UTF-8 in SSE data";
 const PREMATURE_STREAM_EOF_ERROR: &str = "stream ended before terminal marker";
+/// Starts the message for a stream DeepSeek ended with an error chunk.
+pub(crate) const STREAM_ERROR_PREFIX: &str = "the stream ended with an error";
 
 #[derive(Debug, Deserialize)]
 pub struct StreamChunk {
     #[serde(default)]
     pub choices: Vec<StreamChoice>,
     pub usage: Option<StreamUsage>,
+    /// Set on the last chunk of a stream that failed after it started: the
+    /// response is already 200, so the failure arrives as data, with the
+    /// usage billed so far and no `[DONE]` after it.
+    #[serde(default)]
+    pub error: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +299,9 @@ impl StreamAccumulator {
         if let Some(chunk_usage) = chunk.usage {
             self.usage = Some(chunk_usage.into());
         }
+        if let Some(error) = chunk.error.as_ref() {
+            return Err(stream_error_message(error));
+        }
 
         for choice in &chunk.choices {
             if let Some(ref reason) = choice.finish_reason {
@@ -355,8 +365,33 @@ impl StreamAccumulator {
 
 pub(crate) fn is_stream_integrity_error(error: &str) -> bool {
     error == PREMATURE_STREAM_EOF_ERROR
+        || error.starts_with(STREAM_ERROR_PREFIX)
         || error.starts_with(INVALID_SSE_DATA_JSON_PREFIX)
         || error.starts_with(INVALID_SSE_UTF8_PREFIX)
+}
+
+/// The reason DeepSeek gave in an error chunk: an object with `message` and
+/// `type`, or a bare string.
+fn stream_error_message(error: &serde_json::Value) -> String {
+    let (message, kind) = match error {
+        serde_json::Value::Object(fields) => (
+            fields
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            fields.get("type").and_then(serde_json::Value::as_str),
+        ),
+        serde_json::Value::String(message) => (message.as_str(), None),
+        _ => ("", None),
+    };
+    let message = match message.trim() {
+        "" => "no details given",
+        message => message,
+    };
+    match kind.map(str::trim).filter(|kind| !kind.is_empty()) {
+        Some(kind) => format!("{STREAM_ERROR_PREFIX} ({kind}): {message}"),
+        None => format!("{STREAM_ERROR_PREFIX}: {message}"),
+    }
 }
 
 fn accumulate_tool_call(buf: &mut Vec<ToolCallAccumulator>, delta: &StreamToolCallDelta) {
@@ -519,6 +554,75 @@ mod tests {
             .expect_err("EOF without a finish reason or [DONE] must fail");
 
         assert_eq!(error, "stream ended before terminal marker");
+    }
+
+    /// DeepSeek ends a stream that fails after it started with a chunk that
+    /// carries `error` and `usage` and no choices, and sends no `[DONE]`.
+    const DEEPSEEK_ERROR_CHUNK: &str = "data: {\"choices\":[],\"error\":{\"message\":\"The model failed to generate a complete response. Please retry.\",\"type\":\"api_error\"},\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":4,\"prompt_cache_hit_tokens\":8}}\n\n";
+
+    #[test]
+    fn a_stream_error_chunk_reports_deepseeks_reason() {
+        let sse_data = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"partial\"}},\"finish_reason\":null}}]}}\n\n{DEEPSEEK_ERROR_CHUNK}"
+        );
+
+        let cancel = CancelToken::new();
+        let error = parse_sse_stream(sse_data.as_bytes(), &cancel, |_| {})
+            .expect_err("an error chunk ends the stream");
+
+        assert_eq!(
+            error,
+            "the stream ended with an error (api_error): The model failed to generate a complete response. Please retry."
+        );
+        assert!(is_stream_integrity_error(&error), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stream_error_chunk_keeps_usage_for_the_runtime_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind SSE server");
+        let address = listener.local_addr().expect("server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept SSE client");
+            stream.set_nonblocking(false).expect("blocking SSE stream");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read request");
+            let body = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n\
+                 data: {{\"choices\":[{{\"delta\":{{\"content\":\"partial\"}},\"finish_reason\":null}}]}}\n\n{DEEPSEEK_ERROR_CHUNK}"
+            );
+            stream
+                .write_all(body.as_bytes())
+                .expect("write failing stream");
+        });
+        let response = orca_mcp::http::client()
+            .expect("an HTTP client")
+            .get(format!("http://{address}/stream"))
+            .send()
+            .await
+            .expect("open SSE response");
+        let cancel = CancelToken::new();
+
+        let error =
+            parse_sse_response_with_partial(response, &cancel, Duration::from_secs(1), |_| {})
+                .await
+                .expect_err("an error chunk must fail the stream");
+
+        server.join().expect("SSE server");
+        assert!(
+            error
+                .message
+                .starts_with("the stream ended with an error (api_error): "),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            error.usage,
+            Some(Usage {
+                input_tokens: 13,
+                output_tokens: 4,
+                cache_tokens: 8,
+            })
+        );
     }
 
     #[tokio::test]

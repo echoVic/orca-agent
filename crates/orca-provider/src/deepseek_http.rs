@@ -99,6 +99,10 @@ fn classify_deepseek_error(message: &str) -> ProviderErrorKind {
         ProviderErrorKind::Timeout
     } else if lower.contains("stream ended before terminal marker") {
         ProviderErrorKind::StreamClosed
+    } else if lower.starts_with(crate::streaming::STREAM_ERROR_PREFIX) {
+        // DeepSeek failed a generation it had started; its message asks for a
+        // retry.
+        ProviderErrorKind::Server
     } else if lower.contains("invalid sse data json")
         || lower.contains("invalid utf-8 in sse data")
         || lower.contains("malformed response")
@@ -1412,6 +1416,12 @@ mod tests {
         assert_eq!(
             classify_deepseek_error("stream ended before terminal marker"),
             ProviderErrorKind::StreamClosed
+        );
+        assert_eq!(
+            classify_deepseek_error(
+                "the stream ended with an error (api_error): The model failed to generate a complete response. Please retry."
+            ),
+            ProviderErrorKind::Server
         );
         assert_eq!(
             classify_deepseek_error("invalid SSE data JSON: unexpected EOF"),
