@@ -296,9 +296,10 @@ pub struct ToolConfig {
     #[serde(default = "default_shell_timeout_secs")]
     pub shell_timeout_secs: u64,
     /// Whether `web_search` and `web_fetch` may use DeepSeek's Search and
-    /// Fetch APIs, billed per request, when the session runs against the
-    /// official DeepSeek endpoint. Off restores Brave/Exa search and
-    /// local-only fetching.
+    /// Fetch APIs, billed per request, and `read_file` its OCR API, billed per
+    /// page, when the session runs against the official DeepSeek endpoint.
+    /// Off restores Brave/Exa search and local-only fetching, and `read_file`
+    /// reads text files only.
     #[serde(default = "default_deepseek_web")]
     pub deepseek_web: bool,
     /// Runtime-captured host evidence. It is never loaded from or persisted to

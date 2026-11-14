@@ -46,6 +46,8 @@ pub(crate) struct RuntimeReadonlyToolInvocation {
     pub(crate) cwd: PathBuf,
     pub(crate) mcp_registry: McpRegistry,
     pub(crate) output_truncation: ToolOutputTruncation,
+    /// What `read_file` may use to read documents through DeepSeek OCR.
+    pub(crate) deepseek_web: Option<orca_tools::deepseek_web::DeepSeekWebAccess>,
 }
 
 pub(crate) struct RuntimeNormalToolInvocation {
@@ -336,9 +338,9 @@ impl RuntimeReadonlyToolExecutor for DefaultRuntimeReadonlyToolExecutor {
             READONLY_TOOL_TIMEOUT_SECS,
             None,
             orca_core::capability::ExecutionProfile::ReadOnly,
-            // web_search and web_fetch are not concurrent-safe, so they never
-            // reach this batch and need no DeepSeek web access here.
-            None,
+            // read_file reads documents through DeepSeek OCR with it; the web
+            // tools are not concurrent-safe and never reach this batch.
+            invocation.deepseek_web.clone(),
             || cancel.is_cancelled(),
         )
     }
@@ -1200,6 +1202,7 @@ pub(crate) mod tests {
             cwd: PathBuf::from("."),
             mcp_registry: McpRegistry::default(),
             output_truncation: ToolOutputTruncation::default(),
+            deepseek_web: None,
         }
     }
 

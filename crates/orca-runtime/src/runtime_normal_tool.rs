@@ -112,10 +112,10 @@ pub(crate) fn execute_runtime_normal_tool(
     )
 }
 
-/// The DeepSeek web API access this session's `web_search` and `web_fetch`
-/// may use: only on the official endpoint, with the session's key, while
-/// `[tools] deepseek_web` is on.
-fn deepseek_web_access(config: &RunConfig) -> Option<DeepSeekWebAccess> {
+/// The DeepSeek API access this session's `web_search`, `web_fetch` and
+/// `read_file` may use: only on the official endpoint, with the session's
+/// key, while `[tools] deepseek_web` is on.
+pub(crate) fn deepseek_web_access(config: &RunConfig) -> Option<DeepSeekWebAccess> {
     DeepSeekWebAccess::for_provider(
         config.provider,
         config.base_url.as_deref(),

@@ -862,6 +862,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         }
 
         if let RuntimeToolDispatch::ReadonlyBatch(dispatch_window) = dispatch {
+            let deepseek_web = crate::runtime_normal_tool::deepseek_web_access(config);
             let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
                 request: RuntimeReadonlyToolTurnRequest {
                     cwd,
@@ -870,6 +871,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     cancel,
                     output_truncation: config.tools.output_truncation,
                     max_parallel: config.tools.max_read_parallel,
+                    deepseek_web: deepseek_web.as_ref(),
                 },
                 io: RuntimeReadonlyToolTurnIo {
                     events,
@@ -2587,6 +2589,7 @@ mod tests {
                 cancel: &CancelToken::new(),
                 output_truncation: ToolConfig::default().output_truncation,
                 max_parallel: 2,
+                deepseek_web: None,
             },
             io: RuntimeReadonlyToolTurnIo {
                 events: &mut events,
@@ -2658,6 +2661,7 @@ mod tests {
                 cancel: &cancel,
                 output_truncation: ToolConfig::default().output_truncation,
                 max_parallel: 2,
+                deepseek_web: None,
             },
             io: RuntimeReadonlyToolTurnIo {
                 events: &mut events,
@@ -2728,6 +2732,7 @@ mod tests {
                 cancel: &cancel,
                 output_truncation: ToolConfig::default().output_truncation,
                 max_parallel: 2,
+                deepseek_web: None,
             },
             io: RuntimeReadonlyToolTurnIo {
                 events: &mut events,
@@ -2793,6 +2798,7 @@ mod tests {
                 cancel: &cancel,
                 output_truncation: ToolConfig::default().output_truncation,
                 max_parallel: 2,
+                deepseek_web: None,
             },
             io: RuntimeReadonlyToolTurnIo {
                 events: &mut events,
@@ -3392,6 +3398,105 @@ mod tests {
             } if terminal.status == ToolStatus::Cancelled
                 && terminal.started == ToolInvocationStarted::No
         ));
+    }
+
+    #[test]
+    fn readonly_batch_reads_documents_with_the_sessions_deepseek_access() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(cwd.path().join("one.txt"), "one\n").expect("write text fixture");
+        // Sparse and over DeepSeek's limit: with access, read_file refuses it
+        // before any upload; without access, it explains that it needs some.
+        std::fs::File::create(cwd.path().join("big.pdf"))
+            .and_then(|file| file.set_len(100 * 1024 * 1024 + 1))
+            .expect("size the document fixture");
+        let mut config = config_with_external(Vec::new());
+        config.provider = ProviderKind::DeepSeek;
+        config.api_key = Some("sk-test".to_string());
+        config.base_url = None;
+        config.tools.deepseek_web = true;
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.output_format = OutputFormat::Text;
+        config.tools.max_read_parallel = 2;
+        let mut events = EventFactory::new("tool-turn-readonly-ocr".to_string());
+        let mut sink = EventSink::new(io::sink(), OutputFormat::Text);
+        let mut conversation = Conversation::new();
+        let requests = ["big.pdf", "one.txt"]
+            .into_iter()
+            .map(|path| ToolRequest {
+                id: format!("read-{path}"),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some(path.to_string()),
+                raw_arguments: Some(format!(r#"{{"path":"{path}"}}"#)),
+            })
+            .collect::<Vec<_>>();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-turn-readonly-ocr".to_string());
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let policy = policy_for_tool_execution(&config);
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::unrestricted(),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        run_tool_turns(RuntimeToolTurnsContext {
+            step_context,
+            sampling_state: &mut sampling_state,
+            operation: None,
+            io: RuntimeToolTurnsIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
+            tool_requests: &requests,
+            checkpoint_observer: None,
+            executors: RuntimeToolTurnsExecutors {
+                workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                batch_child_executor: unused_child_executor::<io::Sink>,
+            },
+        })
+        .expect("read-only tool turn");
+
+        let document = conversation
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                    ..
+                } if tool_call_id == "read-big.pdf" => Some(content.as_str()),
+                _ => None,
+            })
+            .expect("the document read is recorded");
+        assert!(
+            document.contains("DeepSeek OCR reads files up to 100 MiB"),
+            "{document}"
+        );
     }
 
     #[test]

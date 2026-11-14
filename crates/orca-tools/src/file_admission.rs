@@ -119,7 +119,9 @@ pub fn read_text_file_with_limit(
     read_utf8_reader_with_limit(file, declared_bytes, max_bytes, should_cancel)
 }
 
-fn open_regular_file(path: &Path) -> Result<(File, u64), FileAdmissionError> {
+/// Opens the regular file at `path` without blocking on a FIFO or device,
+/// and returns it with its length.
+pub(crate) fn open_regular_file(path: &Path) -> Result<(File, u64), FileAdmissionError> {
     let path_metadata = path.symlink_metadata()?;
     if !path_metadata.is_file() && !path_metadata.file_type().is_symlink() {
         return Err(FileAdmissionError::NotRegularFile);

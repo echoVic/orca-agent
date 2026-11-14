@@ -478,7 +478,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         safe_local_read_builtin_spec(
             "read_file",
-            "Read the contents of a file at the given path relative to workspace root.",
+            "Read the contents of a file at the given path relative to workspace root. PDF, Word, PowerPoint and image files are read as the text DeepSeek OCR recognizes, with page markers.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1989,11 +1989,13 @@ impl Tool for BuiltinTool {
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
         match self.executor {
-            BuiltinExecutor::ReadFile => {
-                read_file::execute_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
-                    ctx.is_cancelled()
-                })
-            }
+            BuiltinExecutor::ReadFile => read_file::execute_or_cancel(
+                request,
+                ctx.cwd,
+                ctx.max_output_bytes(),
+                ctx.deepseek_web.as_ref(),
+                || ctx.is_cancelled(),
+            ),
             BuiltinExecutor::Glob if request.name.as_str() == "list_files" => {
                 list_files::execute(request, ctx.cwd, ctx.max_output_bytes())
             }
@@ -2687,6 +2689,37 @@ mod tests {
         assert_eq!(
             result.output.as_deref(),
             Some("1. T\nS\nhttps://example.com/")
+        );
+        assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[test]
+    fn registry_hands_deepseek_access_to_read_file() {
+        let cwd = tempfile::tempdir().expect("workspace");
+        std::fs::write(cwd.path().join("scan.png"), b"\x89PNG fixture").expect("image fixture");
+        let fixture = crate::test_http::serve(vec![(
+            200,
+            r#"{"pages":[{"index":0,"text":"invoice 42","finish_reason":"stop"}]}"#.into(),
+        )]);
+        let ctx = ToolContext::new(cwd.path()).with_deepseek_web(Some(
+            DeepSeekWebAccess::for_test(&fixture.origin, "sk-test"),
+        ));
+        let request = ToolRequest {
+            id: "read-1".to_string(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"path":"scan.png"}"#.to_string()),
+        };
+
+        let result = default_tool_registry().execute(&request, &ctx);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        assert_eq!(
+            result.output.as_deref(),
+            Some(
+                "[Text recognized by DeepSeek OCR from scan.png: 1 page(s)]\n\n--- Page 1 ---\ninvoice 42\n"
+            )
         );
         assert_eq!(fixture.requests().len(), 1);
     }

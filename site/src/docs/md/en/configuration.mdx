@@ -219,14 +219,22 @@ TOML settings to catch it before a task run.
 - the page answered 404 or 410;
 - the address is private: a LAN, loopback, link-local or otherwise reserved IP address, or a host name ending in `.local`, `.localhost`, `.localdomain`, `.internal`, `.intranet`, `.private`, `.corp`, `.home`, `.lan` or `.home.arpa`.
 
-Orca calls DeepSeek's web APIs only when the provider is DeepSeek, an API key is set, and `base_url` is unset or points at `https://api.deepseek.com` on the default port, with any path. The key goes to that address and nowhere else. With any other `base_url`, such as a third-party gateway, `web_search` and `web_fetch` work as if the DeepSeek APIs did not exist.
+Orca calls DeepSeek's web and OCR APIs only when the provider is DeepSeek, an API key is set, and `base_url` is unset or points at `https://api.deepseek.com` on the default port, with any path. The key goes to that address and nowhere else. With any other `base_url`, such as a third-party gateway, `web_search` and `web_fetch` work as if the DeepSeek APIs did not exist, and `read_file` reads text files only.
 
 DeepSeek bills these calls separately from tokens: 0.75 US dollars per 1,000 successful searches, and the same per 1,000 successful fetches (November 2026 prices). Orca's cost estimate does not include them. To stop using them, turn them off in the user configuration; project `.orca/config.toml` cannot change this setting:
 
 ```toml
 [tools]
-deepseek_web = false   # Brave or Exa for search, local requests only for fetch
+deepseek_web = false   # Brave or Exa for search, local requests only for fetch, no OCR
 ```
+
+## Reading documents and images
+
+Under the same conditions, `read_file` also reads PDF, Word (`.doc`, `.docx`), PowerPoint (`.ppt`, `.pptx`) and image files (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp`, `.tif`, `.tiff`). It uploads the file to DeepSeek's OCR API, which says it does not keep the file, and returns the recognized text with a `--- Page N ---` line before each page. `offset` and `limit` count the lines of that text. Without the official endpoint, an API key and `deepseek_web`, `read_file` says why it cannot read such a file.
+
+- A file over 100 MiB is refused before the upload, and DeepSeek reads at most 1,000 pages of a document. A recognition can take up to three minutes.
+- Orca keeps the text of the 8 documents it read most recently until it exits, so reading a long document in `offset`/`limit` chunks pays for it once. A file that changed is read again.
+- DeepSeek bills 0.225 US dollars per 1,000 pages (November 2026 prices), which Orca's cost estimate does not include either. Cancelling a read does not stop a recognition DeepSeek has started, and DeepSeek still bills it.
 
 ## Network and certificates
 

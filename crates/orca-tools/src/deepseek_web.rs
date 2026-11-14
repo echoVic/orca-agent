@@ -1,9 +1,10 @@
-//! DeepSeek's Search and Fetch APIs, which `web_search` and `web_fetch` use
-//! when Orca talks to the official DeepSeek endpoint.
+//! DeepSeek's Search, Fetch and OCR APIs, which `web_search`, `web_fetch`
+//! and `read_file` use when Orca talks to the official DeepSeek endpoint.
 
 use std::fmt;
 use std::future::Future;
-use std::time::Duration;
+use std::sync::LazyLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use orca_core::config::ProviderKind;
 use serde::Deserialize;
@@ -14,12 +15,17 @@ const DEEPSEEK_ORIGIN: &str = "https://api.deepseek.com";
 const DEEPSEEK_HOST: &str = "api.deepseek.com";
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(25);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// DeepSeek gives a recognition 180 s from the start of the upload.
+const OCR_TIMEOUT: Duration = Duration::from_secs(180);
+/// Word and PowerPoint text is extracted directly; everything else is
+/// recognized page by page.
+const OCR_PURPOSE: &str = "text_recognition";
 const CANCEL_POLL: Duration = Duration::from_millis(10);
 /// How much of DeepSeek's own error message an error carries.
 const ERROR_MESSAGE_CHARS: usize = 200;
 
-/// Permission for the web tools to call DeepSeek's web APIs with the
-/// session's API key.
+/// Permission for the web tools and `read_file` to call DeepSeek's web and
+/// OCR APIs with the session's API key.
 #[derive(Clone)]
 pub struct DeepSeekWebAccess {
     origin: String,
@@ -216,14 +222,163 @@ pub(crate) async fn fetch(
     })
 }
 
-/// POSTs `body` to `path` on the access's origin and returns the response
-/// body of a successful request.
+/// One page DeepSeek OCR recognized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OcrPage {
+    /// The page text without layout tokens.
+    pub(crate) text: String,
+    /// False when the page reached DeepSeek's output limit, so its text is
+    /// cut short.
+    pub(crate) complete: bool,
+}
+
+#[derive(Deserialize)]
+struct OcrResponse {
+    #[serde(default)]
+    pages: Vec<RawOcrPage>,
+}
+
+#[derive(Deserialize)]
+struct RawOcrPage {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+/// Recognizes the text of one document or image, page by page, in page
+/// order. DeepSeek bills each page, and does so even when the request is
+/// cancelled once the upload is done.
+pub(crate) async fn ocr(
+    access: &DeepSeekWebAccess,
+    file_name: &str,
+    bytes: Vec<u8>,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Vec<OcrPage>, DeepSeekWebError> {
+    let boundary = form_boundary(&bytes);
+    let form = ocr_form(&boundary, file_name, &bytes);
+    drop(bytes);
+    let text = post(
+        access,
+        "/v1/tools/ocr",
+        OCR_TIMEOUT,
+        should_cancel,
+        |request| {
+            request
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(form)
+        },
+    )
+    .await?;
+    // The keep-alive newlines before the result are JSON whitespace.
+    let value: Value = serde_json::from_str(&text).map_err(|error| {
+        DeepSeekWebError::Failed(format!("invalid DeepSeek OCR response: {error}"))
+    })?;
+    // A recognition that fails after it started still answers HTTP 200,
+    // with DeepSeek's reason, such as an unsupported format, in the body.
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        let message = deepseek_message(&text, &access.api_key);
+        return Err(DeepSeekWebError::Failed(if message.is_empty() {
+            "the recognition failed without a reason".to_string()
+        } else {
+            message
+        }));
+    }
+    let response: OcrResponse = serde_json::from_value(value).map_err(|error| {
+        DeepSeekWebError::Failed(format!("invalid DeepSeek OCR response: {error}"))
+    })?;
+    let mut pages = response.pages;
+    pages.sort_by_key(|page| page.index);
+    Ok(pages
+        .into_iter()
+        .map(|page| OcrPage {
+            text: ocr_text(page.text.as_deref().unwrap_or_default()),
+            complete: page.finish_reason.as_deref() != Some("length"),
+        })
+        .collect())
+}
+
+/// Layout spans: a region's coordinates, which mean nothing to a model.
+static LAYOUT_SPAN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?s)<[|｜](?:box|det)[|｜]>.*?<[|｜]/(?:box|det)[|｜]>")
+        .expect("layout span pattern")
+});
+/// The tags around a region's text, whose text stays.
+static REFERENCE_TAG: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"<[|｜]/?ref[|｜]>").expect("reference tag pattern"));
+
+/// A page's text without DeepSeek OCR's layout tokens: each
+/// `<｜box｜>[[x1, y1, x2, y2]]<｜/box｜>` span goes, and the `<｜ref｜>` tags
+/// around the text it locates are unwrapped.
+pub(crate) fn ocr_text(raw: &str) -> String {
+    REFERENCE_TAG
+        .replace_all(&LAYOUT_SPAN.replace_all(raw, ""), "")
+        .into_owned()
+}
+
+/// A form boundary that does not occur in `bytes`.
+fn form_boundary(bytes: &[u8]) -> String {
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    (0_u32..)
+        .map(|attempt| format!("orca-ocr-{seed:x}-{attempt}"))
+        .find(|boundary| {
+            regex::bytes::Regex::new(&regex::escape(boundary))
+                .is_ok_and(|pattern| !pattern.is_match(bytes))
+        })
+        .expect("a boundary that is not in the file")
+}
+
+/// The OCR request body: the `purpose` field and the `file` field, which
+/// are the only two DeepSeek accepts.
+fn ocr_form(boundary: &str, file_name: &str, bytes: &[u8]) -> Vec<u8> {
+    // A quote or a line break would end the header early, so they are
+    // percent-encoded the way browsers send them.
+    let file_name = file_name
+        .replace('"', "%22")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A");
+    let mut form = Vec::with_capacity(bytes.len() + 512);
+    form.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\n{OCR_PURPOSE}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    form.extend_from_slice(bytes);
+    form.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    form
+}
+
+/// POSTs `body` as JSON to `path` on the access's origin and returns the
+/// response body of a successful request.
 async fn post_json(
     access: &DeepSeekWebAccess,
     path: &str,
     body: &Value,
     timeout: Duration,
     should_cancel: &dyn Fn() -> bool,
+) -> Result<String, DeepSeekWebError> {
+    post(access, path, timeout, should_cancel, |request| {
+        request.json(body)
+    })
+    .await
+}
+
+/// POSTs to `path` on the access's origin, with the body `with_body` adds,
+/// and returns the response body of a successful request.
+async fn post(
+    access: &DeepSeekWebAccess,
+    path: &str,
+    timeout: Duration,
+    should_cancel: &dyn Fn() -> bool,
+    with_body: impl FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
 ) -> Result<String, DeepSeekWebError> {
     // A redirect would carry the request, and with it the key, somewhere
     // other than the fixed origin; it is reported as an error instead.
@@ -239,11 +394,12 @@ async fn post_json(
         ))
     })?;
     let response = await_or_cancel(
-        client
-            .post(format!("{}{path}", access.origin))
-            .bearer_auth(&access.api_key)
-            .json(body)
-            .send(),
+        with_body(
+            client
+                .post(format!("{}{path}", access.origin))
+                .bearer_auth(&access.api_key),
+        )
+        .send(),
         should_cancel,
     )
     .await?
@@ -279,20 +435,7 @@ fn http_error_message(status: u16, body: &str, api_key: &str) -> String {
         402 => "the DeepSeek account balance is too low (HTTP 402)".to_string(),
         429 => "DeepSeek rate limit reached (HTTP 429)".to_string(),
         _ => {
-            let raw = serde_json::from_str::<Value>(body)
-                .ok()
-                .as_ref()
-                .and_then(|value| value.pointer("/error/message"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let masked = if api_key.is_empty() {
-                raw
-            } else {
-                raw.replace(api_key, "<redacted>")
-            };
-            let message: String = masked.chars().take(ERROR_MESSAGE_CHARS).collect();
+            let message = deepseek_message(body, api_key);
             if message.is_empty() {
                 format!("DeepSeek returned HTTP {status}")
             } else {
@@ -300,6 +443,25 @@ fn http_error_message(status: u16, body: &str, api_key: &str) -> String {
             }
         }
     }
+}
+
+/// DeepSeek's own `error.message` in `body`, with the key masked and cut to
+/// a readable length; empty when there is none.
+fn deepseek_message(body: &str, api_key: &str) -> String {
+    let raw = serde_json::from_str::<Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(|value| value.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let masked = if api_key.is_empty() {
+        raw
+    } else {
+        raw.replace(api_key, "<redacted>")
+    };
+    masked.chars().take(ERROR_MESSAGE_CHARS).collect()
 }
 
 /// What went wrong with a request that got no response: a timeout, a failed
@@ -571,5 +733,177 @@ mod tests {
         assert!(!text.contains("sk-t"), "{text}");
         assert!(text.ends_with(" <red"), "{text}");
         fixture.requests();
+    }
+
+    /// The parts of a `multipart/form-data` request: each part's headers and
+    /// its content.
+    fn form_parts(request: &str) -> Vec<(String, String)> {
+        let boundary = request
+            .lines()
+            .find(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("content-type: multipart/form-data; boundary=")
+            })
+            .and_then(|line| line.split_once("boundary="))
+            .map(|(_, boundary)| boundary.trim().to_string())
+            .expect("a multipart/form-data content type with a boundary");
+        let delimiter = format!("--{boundary}");
+        let mut pieces = crate::test_http::body(request).split(delimiter.as_str());
+        assert_eq!(pieces.next(), Some(""), "the body starts with a delimiter");
+        let mut parts = Vec::new();
+        let mut closed = false;
+        for piece in pieces {
+            if piece == "--\r\n" {
+                closed = true;
+                break;
+            }
+            let piece = piece
+                .strip_prefix("\r\n")
+                .and_then(|piece| piece.strip_suffix("\r\n"))
+                .unwrap_or_else(|| panic!("a part framed by CRLFs: {piece:?}"));
+            let (headers, content) = piece
+                .split_once("\r\n\r\n")
+                .unwrap_or_else(|| panic!("a part with headers: {piece:?}"));
+            parts.push((headers.to_string(), content.to_string()));
+        }
+        assert!(closed, "the body ends with the closing delimiter");
+        parts
+    }
+
+    #[test]
+    fn ocr_posts_multipart_file_and_purpose() {
+        let result = json!({
+            "object": "ocr.result",
+            "purpose": "text_recognition",
+            "page_count": 1,
+            "pages": [{"index": 0, "text": "Hello", "finish_reason": "stop"}],
+        });
+        // DeepSeek sends newlines to keep the connection open until the
+        // result is ready.
+        let fixture = crate::test_http::serve(vec![(200, format!("\n\n\n{result}"))]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let pages = block_on(ocr(
+            &access,
+            "report.pdf",
+            b"%PDF-1.4 fixture".to_vec(),
+            &|| false,
+        ));
+
+        assert_eq!(
+            pages,
+            Ok(vec![OcrPage {
+                text: "Hello".to_string(),
+                complete: true,
+            }])
+        );
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(
+            request.starts_with("POST /v1/tools/ocr HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("\r\nauthorization: bearer sk-test\r\n"),
+            "{request}"
+        );
+        // DeepSeek refuses a form with any other field.
+        let parts = form_parts(request);
+        assert_eq!(
+            parts,
+            [
+                (
+                    "Content-Disposition: form-data; name=\"purpose\"".to_string(),
+                    "text_recognition".to_string(),
+                ),
+                (
+                    "Content-Disposition: form-data; name=\"file\"; filename=\"report.pdf\"\r\nContent-Type: application/octet-stream".to_string(),
+                    "%PDF-1.4 fixture".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn ocr_file_names_cannot_break_out_of_their_header() {
+        let fixture = crate::test_http::serve(vec![(200, r#"{"pages":[]}"#.into())]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let pages = block_on(ocr(&access, "a\"b\r\nc.pdf", b"%PDF".to_vec(), &|| false));
+
+        assert_eq!(pages, Ok(Vec::new()));
+        let parts = form_parts(&fixture.requests()[0]);
+        assert!(
+            parts[1].0.contains("filename=\"a%22b%0D%0Ac.pdf\""),
+            "{parts:?}"
+        );
+    }
+
+    #[test]
+    fn ocr_pages_keep_their_order_and_say_when_one_is_cut_short() {
+        let fixture = crate::test_http::serve(vec![(
+            200,
+            json!({"pages": [
+                {"index": 1, "text": "second", "finish_reason": "length"},
+                {"index": 0, "text": "first", "finish_reason": "stop"},
+            ]})
+            .to_string(),
+        )]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let pages = block_on(ocr(&access, "a.pdf", b"%PDF".to_vec(), &|| false));
+
+        assert_eq!(
+            pages,
+            Ok(vec![
+                OcrPage {
+                    text: "first".to_string(),
+                    complete: true,
+                },
+                OcrPage {
+                    text: "second".to_string(),
+                    complete: false,
+                },
+            ])
+        );
+        fixture.requests();
+    }
+
+    #[test]
+    fn ocr_reports_an_error_sent_after_the_status() {
+        // Once recognition starts the status is already 200, so a failure
+        // arrives as an error object in the body.
+        let fixture = crate::test_http::serve(vec![(
+            200,
+            "\n\n{\"error\":{\"message\":\"OCR did not finish in time\",\"type\":\"gateway_timeout_error\"}}"
+                .into(),
+        )]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let pages = block_on(ocr(&access, "a.pdf", b"%PDF".to_vec(), &|| false));
+
+        assert_eq!(
+            pages,
+            Err(DeepSeekWebError::Failed(
+                "OCR did not finish in time".to_string()
+            ))
+        );
+        fixture.requests();
+    }
+
+    #[test]
+    fn ocr_text_drops_layout_tokens() {
+        assert_eq!(
+            ocr_text("<｜ref｜>Title<｜/ref｜><｜box｜>[[52, 40, 948, 96]]<｜/box｜>"),
+            "Title"
+        );
+        assert_eq!(
+            ocr_text("<|ref|>Figure 1<|/ref|><|det|>[[1, 2, 3, 4]]<|/det|>\nbody"),
+            "Figure 1\nbody"
+        );
+        assert_eq!(ocr_text("plain\ntext"), "plain\ntext");
     }
 }
