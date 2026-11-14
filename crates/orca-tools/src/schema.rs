@@ -187,6 +187,7 @@ pub fn normalize_tool_arguments(name: &ToolName, value: Value) -> Result<Value, 
     let normalized = match name {
         ToolName::UpdatePlan => crate::update_plan::normalize_raw_arguments(&raw).unwrap_or(raw),
         ToolName::UpdateGoal => crate::update_goal::normalized_update_raw_arguments(&raw),
+        ToolName::WebSearch => crate::web_search::normalize_raw_arguments(&raw).unwrap_or(raw),
         _ => raw,
     };
     serde_json::from_str(&normalized)
@@ -504,6 +505,45 @@ mod tests {
                 .iter()
                 .any(|name| name == "report_blocker")
         );
+    }
+
+    #[test]
+    fn web_search_fresh_days_is_coerced_before_schema_validation() {
+        let registry = crate::registry::default_tool_registry();
+        for (sent, expected) in [
+            (serde_json::json!(7.0), Some(serde_json::json!(7))),
+            (serde_json::json!("7"), Some(serde_json::json!(7))),
+            (serde_json::json!("7.0"), Some(serde_json::json!(7))),
+            (serde_json::json!(7.6), Some(serde_json::json!(8))),
+            (serde_json::json!(0.3), Some(serde_json::json!(1))),
+            (serde_json::json!(1e30), Some(serde_json::json!(365))),
+            (serde_json::json!(30), Some(serde_json::json!(30))),
+            (serde_json::json!("abc"), None),
+            (serde_json::json!(0), None),
+        ] {
+            let request = ToolRequest {
+                id: "search-1".to_string(),
+                name: ToolName::WebSearch,
+                action: orca_core::approval_types::ActionKind::Read,
+                target: None,
+                raw_arguments: Some(
+                    serde_json::json!({"query": "x", "fresh_days": sent}).to_string(),
+                ),
+            };
+
+            let normalized = normalize_tool_request(&registry, &request).expect("normalizes");
+
+            crate::registry::validate_tool_request(&registry, &normalized)
+                .unwrap_or_else(|error| panic!("fresh_days {sent} fails validation: {error}"));
+            let arguments: serde_json::Value =
+                serde_json::from_str(normalized.raw_arguments.as_deref().expect("arguments"))
+                    .expect("JSON arguments");
+            assert_eq!(
+                arguments.get("fresh_days"),
+                expected.as_ref(),
+                "fresh_days {sent}"
+            );
+        }
     }
 
     #[test]

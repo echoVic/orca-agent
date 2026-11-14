@@ -566,23 +566,55 @@ fn default_count() -> usize {
     5
 }
 
-/// A positive number of days, sent as a number or a numeric string and
-/// rounded to whole days. Anything else is dropped rather than failing the
-/// call, and values above [`MAX_FRESH_DAYS`] are clamped.
+/// A positive number of days, sent as a number or a numeric string. Anything
+/// else is dropped rather than failing the call; see [`fresh_days_from`].
 fn deserialize_fresh_days<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let days = match Option::<Value>::deserialize(deserializer)? {
-        Some(Value::Number(number)) => number.as_f64(),
-        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
+    Ok(Option::<Value>::deserialize(deserializer)?
+        .as_ref()
+        .and_then(fresh_days_from))
+}
+
+/// Whole days from a number or a numeric string: rounded, with any positive
+/// value at least one day and at most [`MAX_FRESH_DAYS`]. Anything else is
+/// `None`.
+fn fresh_days_from(value: &Value) -> Option<u32> {
+    let days = match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse::<f64>().ok(),
         _ => None,
-    };
-    Ok(days
-        .filter(|days| days.is_finite())
-        .map(f64::round)
-        .filter(|days| *days >= 1.0)
-        .map(|days| days.min(f64::from(MAX_FRESH_DAYS)) as u32))
+    }?;
+    if !days.is_finite() || days <= 0.0 {
+        return None;
+    }
+    Some(days.round().clamp(1.0, f64::from(MAX_FRESH_DAYS)) as u32)
+}
+
+/// The arguments with `fresh_days` rewritten as the integer the schema asks
+/// for, or removed when it can't be read as days. Runs before schema
+/// validation, so a model that sends `7.0` or `"7"` gets its search instead of
+/// a validation error. `None` when nothing changes.
+pub(crate) fn normalize_raw_arguments(raw: &str) -> Option<String> {
+    let mut value: Value = serde_json::from_str(raw).ok()?;
+    let object = value.as_object_mut()?;
+    let sent = object.get("fresh_days")?;
+    let days = fresh_days_from(sent);
+    let unchanged =
+        matches!((days, sent.as_u64()), (Some(days), Some(sent)) if sent == u64::from(days));
+    if unchanged {
+        return None;
+    }
+    match days {
+        Some(days) => {
+            object.insert("fresh_days".to_string(), Value::from(days));
+        }
+        None => {
+            object.remove("fresh_days");
+        }
+    }
+    serde_json::to_string(&value).ok()
 }
 
 fn deserialize_legacy_freshness<'de, D>(deserializer: D) -> Result<Option<Recency>, D::Error>
@@ -827,7 +859,10 @@ mod tests {
             recency_of(r#"{"query":"x","fresh_days":1e30}"#),
             Some(Recency::LastDays(365))
         );
-        assert_eq!(recency_of(r#"{"query":"x","fresh_days":0.3}"#), None);
+        assert_eq!(
+            recency_of(r#"{"query":"x","fresh_days":0.3}"#),
+            Some(Recency::LastDays(1))
+        );
     }
 
     #[test]
