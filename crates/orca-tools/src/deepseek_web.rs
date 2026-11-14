@@ -303,22 +303,37 @@ pub(crate) async fn ocr(
         .collect())
 }
 
-/// Layout spans: a region's coordinates, which mean nothing to a model.
+/// A region's coordinates, which mean nothing to a model: the opening tag,
+/// the coordinate list, whole or cut short at the end of a page, and the
+/// closing tag when there is one. The list is bracketed, so an unclosed box
+/// takes nothing after it.
 static LAYOUT_SPAN: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?s)<[|｜](?:box|det)[|｜]>.*?<[|｜]/(?:box|det)[|｜]>")
-        .expect("layout span pattern")
+    regex::Regex::new(
+        r"<[|｜](?:box|det)[|｜]>(?:\s*(?:\[[\d\s,.\[\]]*\]|\[[\d\s,.\[\]]*\z))?(?:\s*<[|｜]/(?:box|det)[|｜]>)?",
+    )
+    .expect("layout span pattern")
+});
+/// A closing tag left without its opening tag.
+static STRAY_LAYOUT_CLOSE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"<[|｜]/(?:box|det)[|｜]>").expect("stray closing tag pattern")
 });
 /// The tags around a region's text, whose text stays.
 static REFERENCE_TAG: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"<[|｜]/?ref[|｜]>").expect("reference tag pattern"));
+/// The start of a token that a page cut short ended inside. Only the
+/// fullwidth bar counts: an ASCII `<|` can be code.
+static TRAILING_PARTIAL_TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"<｜/?[a-z]*｜?\z").expect("trailing partial token pattern")
+});
 
 /// A page's text without DeepSeek OCR's layout tokens: each
-/// `<｜box｜>[[x1, y1, x2, y2]]<｜/box｜>` span goes, and the `<｜ref｜>` tags
-/// around the text it locates are unwrapped.
+/// `<｜box｜>[[x1, y1, x2, y2]]<｜/box｜>` span goes, whole or cut short, and
+/// the `<｜ref｜>` tags around the text it locates are unwrapped.
 pub(crate) fn ocr_text(raw: &str) -> String {
-    REFERENCE_TAG
-        .replace_all(&LAYOUT_SPAN.replace_all(raw, ""), "")
-        .into_owned()
+    let text = LAYOUT_SPAN.replace_all(raw, "");
+    let text = STRAY_LAYOUT_CLOSE.replace_all(&text, "");
+    let text = REFERENCE_TAG.replace_all(&text, "");
+    TRAILING_PARTIAL_TOKEN.replace(&text, "").into_owned()
 }
 
 /// A form boundary that does not occur in `bytes`.
@@ -905,5 +920,29 @@ mod tests {
             "Figure 1\nbody"
         );
         assert_eq!(ocr_text("plain\ntext"), "plain\ntext");
+        // A page cut short inside the coordinates.
+        assert_eq!(ocr_text("Outlook<｜box｜>[[52, 120, 9"), "Outlook");
+        // An unclosed box keeps the text after it.
+        assert_eq!(
+            ocr_text(
+                "body <｜box｜>[[1, 2, 3, 4]] text <｜ref｜>X<｜/ref｜><｜box｜>[[5, 6, 7, 8]]<｜/box｜> tail"
+            ),
+            "body  text X tail"
+        );
+        // Several regions in one box.
+        assert_eq!(
+            ocr_text("<｜ref｜>A<｜/ref｜><｜box｜>[[1, 2, 3, 4], [5, 6, 7, 8]]<｜/box｜>"),
+            "A"
+        );
+        // A page cut short inside a tag.
+        assert_eq!(ocr_text("Outlook<｜bo"), "Outlook");
+        assert_eq!(ocr_text("Outlook<｜/re"), "Outlook");
+        // Real `<` and `[` next to a box stay.
+        assert_eq!(
+            ocr_text("x < y and [1, 2] <｜ref｜>A<｜/ref｜><｜box｜>[[1, 2, 3, 4]]<｜/box｜> z"),
+            "x < y and [1, 2] A z"
+        );
+        // An ASCII `<|` at the end can be code.
+        assert_eq!(ocr_text("a <|b and c<|"), "a <|b and c<|");
     }
 }
