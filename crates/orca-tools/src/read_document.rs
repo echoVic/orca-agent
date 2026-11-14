@@ -15,7 +15,7 @@ use serde::Deserialize;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind};
 
-use crate::deepseek_web::{self, DeepSeekWebAccess, DeepSeekWebError, OcrPage};
+use crate::deepseek_web::{self, DeepSeekWebAccess, DeepSeekWebError, OcrResult};
 use crate::file_admission::open_regular_file;
 use crate::read_file::render_lines;
 use crate::resolve_workspace_path;
@@ -126,8 +126,8 @@ pub fn execute_or_cancel(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(&key);
-    let pages = match cached {
-        Some(pages) => pages,
+    let result = match cached {
+        Some(result) => result,
         None => {
             let mut bytes = Vec::new();
             if let Err(error) = (&mut file).take(MAX_OCR_BYTES + 1).read_to_end(&mut bytes) {
@@ -151,13 +151,13 @@ pub fn execute_or_cancel(
                 }
             };
             match runtime.block_on(deepseek_web::ocr(access, &file_name, bytes, &should_cancel)) {
-                Ok(pages) => {
-                    let pages = Arc::new(pages);
+                Ok(result) => {
+                    let result = Arc::new(result);
                     OCR_CACHE
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .insert(key, Arc::clone(&pages));
-                    pages
+                        .insert(key, Arc::clone(&result));
+                    result
                 }
                 Err(DeepSeekWebError::Cancelled) => {
                     return ToolResult::cancelled(request, "read_document was cancelled", None);
@@ -173,7 +173,7 @@ pub fn execute_or_cancel(
         }
     };
     let (output, truncated) = render_lines(
-        &render_ocr(&file_name, &pages),
+        &render_ocr(&file_name, &result),
         args.offset,
         args.limit,
         max_bytes,
@@ -186,15 +186,19 @@ pub fn execute_or_cancel(
     ToolResult::completed_kind(request, output, truncated, kind)
 }
 
-/// The text `read_document` shows for a recognized document: a header, then
-/// each page under its marker.
-fn render_ocr(file_name: &str, pages: &[OcrPage]) -> String {
-    let mut text = format!(
-        "[Text recognized by DeepSeek OCR from {file_name}: {} page(s)]\n",
-        pages.len()
-    );
-    for (position, page) in pages.iter().enumerate() {
-        let number = position + 1;
+/// The text `read_document` shows for a recognized document: a header, which
+/// says when DeepSeek counted more pages than it returned, then each page
+/// under its marker, numbered as DeepSeek numbers it.
+fn render_ocr(file_name: &str, result: &OcrResult) -> String {
+    let returned = result.pages.len();
+    let mut text = match result.page_count {
+        Some(counted) if counted > returned => format!(
+            "[Text recognized by DeepSeek OCR from {file_name}: {returned} of {counted} page(s); DeepSeek returned no text for the rest]\n"
+        ),
+        _ => format!("[Text recognized by DeepSeek OCR from {file_name}: {returned} page(s)]\n"),
+    };
+    for page in &result.pages {
+        let number = page.number;
         let _ = write!(text, "\n--- Page {number} ---\n");
         let page_text = page.text.trim_matches(['\r', '\n']);
         if page_text.trim().is_empty() {
@@ -225,11 +229,11 @@ struct OcrKey {
 /// The documents recognized most recently, newest first.
 #[derive(Default)]
 struct OcrCache {
-    entries: VecDeque<(OcrKey, Arc<Vec<OcrPage>>)>,
+    entries: VecDeque<(OcrKey, Arc<OcrResult>)>,
 }
 
 impl OcrCache {
-    fn get(&mut self, key: &OcrKey) -> Option<Arc<Vec<OcrPage>>> {
+    fn get(&mut self, key: &OcrKey) -> Option<Arc<OcrResult>> {
         let position = self.entries.iter().position(|(cached, _)| cached == key)?;
         let entry = self.entries.remove(position)?;
         let pages = Arc::clone(&entry.1);
@@ -237,7 +241,7 @@ impl OcrCache {
         Some(pages)
     }
 
-    fn insert(&mut self, key: OcrKey, pages: Arc<Vec<OcrPage>>) {
+    fn insert(&mut self, key: OcrKey, pages: Arc<OcrResult>) {
         self.entries.retain(|(cached, _)| cached != &key);
         self.entries.push_front((key, pages));
         self.entries.truncate(OCR_CACHE_DOCUMENTS);
@@ -255,6 +259,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::deepseek_web::OcrPage;
 
     fn read_request(id: &str, raw_arguments: &str) -> ToolRequest {
         ToolRequest {
@@ -317,6 +322,38 @@ mod tests {
     }
 
     #[test]
+    fn read_document_says_when_pages_are_missing() {
+        let cwd = workspace_with("report.pdf", b"%PDF-1.4 gaps");
+        let fixture = crate::test_http::serve(vec![(
+            200,
+            json!({"object": "ocr.result", "page_count": 3, "pages": [
+                {"index": 0, "text": "A", "finish_reason": "stop"},
+                {"index": 2, "text": "C", "finish_reason": "stop"},
+            ]})
+            .to_string(),
+        )]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let result = execute_or_cancel(
+            &read_request("gaps", r#"{"path":"report.pdf"}"#),
+            cwd.path(),
+            64 * 1024,
+            Some(&access),
+            || false,
+        );
+
+        assert_eq!(
+            result.output.as_deref(),
+            Some(
+                "[Text recognized by DeepSeek OCR from report.pdf: 2 of 3 page(s); DeepSeek returned no text for the rest]\n\n--- Page 1 ---\nA\n\n--- Page 3 ---\nC\n"
+            ),
+            "{:?}",
+            result.error
+        );
+        fixture.requests();
+    }
+
+    #[test]
     fn read_document_is_cached() {
         let cwd = workspace_with("deck.pptx", b"PK fixture");
         let fixture = crate::test_http::serve(vec![ocr_reply(json!([
@@ -362,10 +399,14 @@ mod tests {
             modified: None,
         };
         let pages = |text: &str| {
-            Arc::new(vec![OcrPage {
-                text: text.to_string(),
-                complete: true,
-            }])
+            Arc::new(OcrResult {
+                pages: vec![OcrPage {
+                    number: 1,
+                    text: text.to_string(),
+                    complete: true,
+                }],
+                page_count: None,
+            })
         };
         let mut cache = OcrCache::default();
         for number in 0..OCR_CACHE_DOCUMENTS {

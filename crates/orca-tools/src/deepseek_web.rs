@@ -225,6 +225,8 @@ pub(crate) async fn fetch(
 /// One page DeepSeek OCR recognized.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OcrPage {
+    /// The page's number in the document, from 1.
+    pub(crate) number: usize,
     /// The page text without layout tokens.
     pub(crate) text: String,
     /// False when the page reached DeepSeek's output limit, so its text is
@@ -232,10 +234,22 @@ pub(crate) struct OcrPage {
     pub(crate) complete: bool,
 }
 
+/// What DeepSeek OCR recognized in one file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OcrResult {
+    /// The pages that came back, in page order.
+    pub(crate) pages: Vec<OcrPage>,
+    /// How many pages DeepSeek counted, when it said. More than `pages`
+    /// holds means some pages came back without text.
+    pub(crate) page_count: Option<usize>,
+}
+
 #[derive(Deserialize)]
 struct OcrResponse {
     #[serde(default)]
     pages: Vec<RawOcrPage>,
+    #[serde(default)]
+    page_count: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -256,7 +270,7 @@ pub(crate) async fn ocr(
     file_name: &str,
     bytes: Vec<u8>,
     should_cancel: &dyn Fn() -> bool,
-) -> Result<Vec<OcrPage>, DeepSeekWebError> {
+) -> Result<OcrResult, DeepSeekWebError> {
     let boundary = form_boundary(&bytes);
     let form = ocr_form(&boundary, file_name, &bytes);
     drop(bytes);
@@ -275,13 +289,20 @@ pub(crate) async fn ocr(
         },
     )
     .await?;
+    // DeepSeek sends newlines until the result is ready; nothing after them
+    // means the connection closed first.
+    if text.trim().is_empty() {
+        return Err(DeepSeekWebError::Failed(
+            "DeepSeek OCR closed the connection without a result".to_string(),
+        ));
+    }
     // The keep-alive newlines before the result are JSON whitespace.
     let value: Value = serde_json::from_str(&text).map_err(|error| {
         DeepSeekWebError::Failed(format!("invalid DeepSeek OCR response: {error}"))
     })?;
     // A recognition that fails after it started still answers HTTP 200,
     // with DeepSeek's reason, such as an unsupported format, in the body.
-    if value.get("error").is_some_and(|error| !error.is_null()) {
+    if value.get("error").is_some_and(reports_error) {
         let message = deepseek_message(&text, &access.api_key);
         return Err(DeepSeekWebError::Failed(if message.is_empty() {
             "the recognition failed without a reason".to_string()
@@ -294,13 +315,38 @@ pub(crate) async fn ocr(
     })?;
     let mut pages = response.pages;
     pages.sort_by_key(|page| page.index);
-    Ok(pages
-        .into_iter()
-        .map(|page| OcrPage {
-            text: ocr_text(page.text.as_deref().unwrap_or_default()),
-            complete: page.finish_reason.as_deref() != Some("length"),
-        })
-        .collect())
+    // DeepSeek counts pages from 0. Indices that repeat, as when they are
+    // missing, say nothing about the page, so then the position does.
+    let numbered_by_index = pages.windows(2).all(|pair| pair[0].index < pair[1].index);
+    Ok(OcrResult {
+        pages: pages
+            .into_iter()
+            .enumerate()
+            .map(|(position, page)| OcrPage {
+                number: if numbered_by_index {
+                    page.index.saturating_add(1)
+                } else {
+                    position + 1
+                },
+                text: ocr_text(page.text.as_deref().unwrap_or_default()),
+                complete: page.finish_reason.as_deref() != Some("length"),
+            })
+            .collect(),
+        page_count: response.page_count,
+    })
+}
+
+/// Whether an `error` field holds an error. `null`, `false`, `0`, a blank
+/// string and an empty object or array do not.
+fn reports_error(error: &Value) -> bool {
+    match error {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64() != Some(0.0),
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+    }
 }
 
 /// A region's coordinates, which mean nothing to a model: the opening tag,
@@ -460,14 +506,19 @@ fn http_error_message(status: u16, body: &str, api_key: &str) -> String {
     }
 }
 
-/// DeepSeek's own `error.message` in `body`, with the key masked and cut to
-/// a readable length; empty when there is none.
+/// DeepSeek's own message in `body` — `error.message`, or `error` itself
+/// when it is a string — with the key masked and cut to a readable length;
+/// empty when there is none.
 fn deepseek_message(body: &str, api_key: &str) -> String {
-    let raw = serde_json::from_str::<Value>(body)
-        .ok()
+    let value = serde_json::from_str::<Value>(body).ok();
+    let raw = value
         .as_ref()
-        .and_then(|value| value.pointer("/error/message"))
-        .and_then(Value::as_str)
+        .and_then(|value| value.get("error"))
+        .and_then(|error| {
+            error
+                .as_str()
+                .or_else(|| error.get("message").and_then(Value::as_str))
+        })
         .unwrap_or_default()
         .trim()
         .to_string();
@@ -601,6 +652,20 @@ mod tests {
             );
             assert_eq!(fixture.requests().len(), 1);
         }
+
+        let fixture = crate::test_http::serve(vec![(500, r#"{"error":"boom"}"#.into())]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let outcome = block_on(search(&access, "rust", 3, &|| false));
+
+        assert_eq!(
+            outcome,
+            Err(DeepSeekWebError::Failed(
+                "DeepSeek returned HTTP 500: boom".to_string()
+            )),
+            "a bare-string error is its own message"
+        );
+        fixture.requests();
     }
 
     #[test]
@@ -807,10 +872,14 @@ mod tests {
 
         assert_eq!(
             pages,
-            Ok(vec![OcrPage {
-                text: "Hello".to_string(),
-                complete: true,
-            }])
+            Ok(OcrResult {
+                pages: vec![OcrPage {
+                    number: 1,
+                    text: "Hello".to_string(),
+                    complete: true,
+                }],
+                page_count: Some(1),
+            })
         );
         let requests = fixture.requests();
         assert_eq!(requests.len(), 1);
@@ -849,7 +918,13 @@ mod tests {
 
         let pages = block_on(ocr(&access, "a\"b\r\nc.pdf", b"%PDF".to_vec(), &|| false));
 
-        assert_eq!(pages, Ok(Vec::new()));
+        assert_eq!(
+            pages,
+            Ok(OcrResult {
+                pages: Vec::new(),
+                page_count: None,
+            })
+        );
         let parts = form_parts(&fixture.requests()[0]);
         assert!(
             parts[1].0.contains("filename=\"a%22b%0D%0Ac.pdf\""),
@@ -873,17 +948,135 @@ mod tests {
 
         assert_eq!(
             pages,
-            Ok(vec![
-                OcrPage {
-                    text: "first".to_string(),
-                    complete: true,
-                },
-                OcrPage {
-                    text: "second".to_string(),
-                    complete: false,
-                },
-            ])
+            Ok(OcrResult {
+                pages: vec![
+                    OcrPage {
+                        number: 1,
+                        text: "first".to_string(),
+                        complete: true,
+                    },
+                    OcrPage {
+                        number: 2,
+                        text: "second".to_string(),
+                        complete: false,
+                    },
+                ],
+                page_count: None,
+            })
         );
+        fixture.requests();
+    }
+
+    #[test]
+    fn ocr_numbers_pages_by_their_index() {
+        let fixture = crate::test_http::serve(vec![
+            (
+                200,
+                json!({"page_count": 3, "pages": [
+                    {"index": 2, "text": "C", "finish_reason": "stop"},
+                    {"index": 0, "text": "A", "finish_reason": "stop"},
+                ]})
+                .to_string(),
+            ),
+            (
+                200,
+                json!({"pages": [
+                    {"text": "one", "finish_reason": "stop"},
+                    {"text": "two", "finish_reason": "stop"},
+                ]})
+                .to_string(),
+            ),
+        ]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+        let numbered = |result: &OcrResult| {
+            result
+                .pages
+                .iter()
+                .map(|page| (page.number, page.text.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let gapped = block_on(ocr(&access, "a.pdf", b"%PDF".to_vec(), &|| false))
+            .expect("a result with a gap");
+        let unindexed = block_on(ocr(&access, "b.pdf", b"%PDF".to_vec(), &|| false))
+            .expect("a result without indices");
+
+        assert_eq!(gapped.page_count, Some(3));
+        assert_eq!(
+            numbered(&gapped),
+            [(1, "A".to_string()), (3, "C".to_string())]
+        );
+        assert_eq!(
+            numbered(&unindexed),
+            [(1, "one".to_string()), (2, "two".to_string())],
+            "pages without indices are numbered by position"
+        );
+        fixture.requests();
+    }
+
+    #[test]
+    fn ocr_reports_a_bare_string_error() {
+        let fixture = crate::test_http::serve(vec![(
+            200,
+            r#"{"error":"OCR did not finish in time"}"#.into(),
+        )]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let outcome = block_on(ocr(&access, "a.pdf", b"%PDF".to_vec(), &|| false));
+
+        assert_eq!(
+            outcome,
+            Err(DeepSeekWebError::Failed(
+                "OCR did not finish in time".to_string()
+            ))
+        );
+        fixture.requests();
+    }
+
+    #[test]
+    fn ocr_reports_a_result_that_never_came() {
+        // The keep-alive newlines arrived, then the connection closed.
+        let fixture = crate::test_http::serve(vec![(200, "\n\n\n".into())]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let outcome = block_on(ocr(&access, "a.pdf", b"%PDF".to_vec(), &|| false));
+
+        assert_eq!(
+            outcome,
+            Err(DeepSeekWebError::Failed(
+                "DeepSeek OCR closed the connection without a result".to_string()
+            ))
+        );
+        fixture.requests();
+    }
+
+    #[test]
+    fn ocr_ignores_an_empty_error_field() {
+        let empty_errors = [json!(null), json!(false), json!(""), json!({})];
+        let fixture = crate::test_http::serve(
+            empty_errors
+                .iter()
+                .map(|error| {
+                    (
+                        200,
+                        json!({"error": error, "pages": [
+                            {"index": 0, "text": "ok", "finish_reason": "stop"},
+                        ]})
+                        .to_string(),
+                    )
+                })
+                .collect(),
+        );
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        for error in &empty_errors {
+            let outcome = block_on(ocr(&access, "a.pdf", b"%PDF".to_vec(), &|| false));
+
+            assert!(
+                outcome.as_ref().is_ok_and(|result| result.pages.len() == 1),
+                "error {error}: {outcome:?}"
+            );
+        }
         fixture.requests();
     }
 
