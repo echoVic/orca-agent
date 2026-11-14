@@ -235,7 +235,7 @@ Under the same conditions, the `read_document` tool reads PDF, Word (`.doc`, `.d
 The upload makes `read_document` a network call, like `web_search` and `web_fetch`: plan mode refuses it, and suggest mode asks before it runs. Without the official endpoint, an API key and `deepseek_web`, it says why it cannot read the file.
 
 - A file over 100 MiB is refused before the upload, and DeepSeek reads at most 1,000 pages of a document. A recognition can take up to three minutes.
-- Orca keeps recognized text in memory for the 8 documents it read most recently, and on disk in `ORCA_HOME/ocr_cache` (up to 64 MiB, least recently used first), keyed by the file's content. Reading a long document in `offset`/`limit` chunks, reading a copy of it, or reading it again from a subagent or a later session pays once; a file that changed is recognized again. The same text is already in the session history. Delete the directory to clear the cache.
+- Orca keeps recognized text in memory for the 8 documents it read most recently, and on disk in `ORCA_HOME/ocr_cache` (up to 64 MiB, least recently used first), keyed by the file's content. Reading a long document in `offset`/`limit` chunks, reading a copy of it, or reading it again from a subagent or a later session pays once; a file that changed is recognized again. The cache holds the whole recognized text of each document, readable by your user account only, and deleting a session does not remove it; delete the directory to clear it.
 - DeepSeek bills 0.225 US dollars per 1,000 pages (November 2026 prices), which Orca's cost estimate does not include either. Cancelling a read does not stop a recognition DeepSeek has started, and DeepSeek still bills it.
 
 ## Network and certificates
