@@ -29,6 +29,8 @@ pub(crate) struct Reply {
     /// Extra headers besides the content type, length and `connection: close`.
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: String,
+    /// How long the server waits after reading the request before it answers.
+    pub(crate) delay: Duration,
 }
 
 impl Reply {
@@ -38,6 +40,7 @@ impl Reply {
             status,
             headers: vec![("location".to_string(), location.to_string())],
             body: String::new(),
+            delay: Duration::ZERO,
         }
     }
 }
@@ -45,6 +48,11 @@ impl Reply {
 /// Serves one connection per `(status, body)` pair, in order, each with a
 /// JSON content type and `connection: close`.
 pub(crate) fn serve(responses: Vec<(u16, String)>) -> Fixture {
+    serve_slowly(Duration::ZERO, responses)
+}
+
+/// [`serve`], waiting `delay` before each answer, as a slow service does.
+pub(crate) fn serve_slowly(delay: Duration, responses: Vec<(u16, String)>) -> Fixture {
     serve_replies(
         responses
             .into_iter()
@@ -52,6 +60,7 @@ pub(crate) fn serve(responses: Vec<(u16, String)>) -> Fixture {
                 status,
                 headers: Vec::new(),
                 body,
+                delay,
             })
             .collect(),
     )
@@ -74,6 +83,7 @@ pub(crate) fn serve_replies(replies: Vec<Reply>) -> Fixture {
                 break;
             };
             requests.push(read_request(&mut stream));
+            std::thread::sleep(reply.delay);
             let extra: String = reply
                 .headers
                 .iter()

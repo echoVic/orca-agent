@@ -4,11 +4,11 @@
 //! The file is uploaded, so this is a network tool: plan mode refuses it and
 //! suggest mode asks first, as for the other DeepSeek APIs the tools call.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::time::SystemTime;
+use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
@@ -26,6 +26,9 @@ const MAX_OCR_BYTES: u64 = 100 * 1024 * 1024;
 /// How many recognized documents the process keeps, so that reading one in
 /// `offset`/`limit` chunks pays for its recognition once.
 const OCR_CACHE_DOCUMENTS: usize = 8;
+/// How often a read waiting for another read's recognition checks whether it
+/// was cancelled.
+const PENDING_POLL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Default, Deserialize)]
 struct ReadDocumentArgs {
@@ -123,13 +126,14 @@ pub fn execute_or_cancel(
             .ok()
             .and_then(|metadata| metadata.modified().ok()),
     };
-    let cached = OCR_CACHE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&key);
-    let result = match cached {
-        Some(result) => result,
-        None => {
+    let result = match claim_recognition(&key, &should_cancel) {
+        Claim::Done(result) => result,
+        Claim::Cancelled => {
+            return ToolResult::cancelled(request, "read_document was cancelled", None);
+        }
+        // The claim lives to the end of this arm, after the result is in the
+        // cache, so a read woken by its release finds the result there.
+        Claim::Yours(_recognizing) => {
             let upload = match OcrUpload::read(&file_name, &mut file, size, MAX_OCR_BYTES) {
                 Ok(upload) => upload,
                 Err(OcrUploadError::TooLarge(observed)) => return too_large(observed),
@@ -152,10 +156,7 @@ pub fn execute_or_cancel(
             match runtime.block_on(deepseek_web::ocr(access, upload, &should_cancel)) {
                 Ok(result) => {
                     let result = Arc::new(result);
-                    OCR_CACHE
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(key, Arc::clone(&result));
+                    lock_cache().insert(key, Arc::clone(&result));
                     result
                 }
                 Err(DeepSeekWebError::Cancelled) => {
@@ -218,17 +219,19 @@ fn render_ocr(file_name: &str, result: &OcrResult) -> String {
 
 /// A recognized file: where it is, and its size and modification time when
 /// it was read, so that a changed file is recognized again.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct OcrKey {
     path: PathBuf,
     size: u64,
     modified: Option<SystemTime>,
 }
 
-/// The documents recognized most recently, newest first.
+/// The documents recognized most recently, newest first, and the files whose
+/// recognition is under way.
 #[derive(Default)]
 struct OcrCache {
     entries: VecDeque<(OcrKey, Arc<OcrResult>)>,
+    pending: HashSet<OcrKey>,
 }
 
 impl OcrCache {
@@ -247,7 +250,58 @@ impl OcrCache {
     }
 }
 
-static OCR_CACHE: LazyLock<Mutex<OcrCache>> = LazyLock::new(Mutex::default);
+/// The cache, and the signal that a recognition under way has ended.
+static OCR_CACHE: LazyLock<(Mutex<OcrCache>, Condvar)> = LazyLock::new(Default::default);
+
+fn lock_cache() -> std::sync::MutexGuard<'static, OcrCache> {
+    OCR_CACHE.0.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What a read finds when it asks for a file's recognition.
+enum Claim {
+    /// Another read already recognized the file.
+    Done(Arc<OcrResult>),
+    /// The read was cancelled while another read's recognition went on.
+    Cancelled,
+    /// Nobody is recognizing the file: this read does, while it holds this.
+    Yours(PendingRecognition),
+}
+
+/// Waits while another read recognizes the same file, so that parallel reads
+/// of one document pay for one recognition.
+fn claim_recognition(key: &OcrKey, should_cancel: &dyn Fn() -> bool) -> Claim {
+    let (_, ended) = &*OCR_CACHE;
+    let mut cache = lock_cache();
+    loop {
+        if let Some(result) = cache.get(key) {
+            return Claim::Done(result);
+        }
+        if cache.pending.insert(key.clone()) {
+            return Claim::Yours(PendingRecognition { key: key.clone() });
+        }
+        if should_cancel() {
+            return Claim::Cancelled;
+        }
+        cache = ended
+            .wait_timeout(cache, PENDING_POLL)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+}
+
+/// A recognition under way. Dropping it, however the recognition ended,
+/// frees the file and wakes the reads waiting for it; when the recognition
+/// failed, one of them tries again.
+struct PendingRecognition {
+    key: OcrKey,
+}
+
+impl Drop for PendingRecognition {
+    fn drop(&mut self) {
+        lock_cache().pending.remove(&self.key);
+        OCR_CACHE.1.notify_all();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -259,6 +313,7 @@ mod tests {
 
     use super::*;
     use crate::deepseek_web::OcrPage;
+    use std::time::{Duration, Instant};
 
     fn read_request(id: &str, raw_arguments: &str) -> ToolRequest {
         ToolRequest {
@@ -350,6 +405,120 @@ mod tests {
             result.error
         );
         fixture.requests();
+    }
+
+    /// Reads `path` in `cwd` on a new thread, as a parallel tool call does.
+    fn read_in_thread(
+        id: &'static str,
+        cwd: &std::path::Path,
+        path: &str,
+        access: &DeepSeekWebAccess,
+    ) -> std::thread::JoinHandle<ToolResult> {
+        let cwd = cwd.to_path_buf();
+        let access = access.clone();
+        let raw_arguments = json!({ "path": path }).to_string();
+        std::thread::spawn(move || {
+            execute_or_cancel(
+                &read_request(id, &raw_arguments),
+                &cwd,
+                64 * 1024,
+                Some(&access),
+                || false,
+            )
+        })
+    }
+
+    #[test]
+    fn parallel_reads_of_one_document_share_one_recognition() {
+        let cwd = workspace_with("deck.pdf", b"%PDF parallel");
+        let fixture = crate::test_http::serve_slowly(
+            Duration::from_millis(600),
+            vec![ocr_reply(json!([
+                {"index": 0, "text": "shared", "finish_reason": "stop"},
+            ]))],
+        );
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let first = read_in_thread("first", cwd.path(), "deck.pdf", &access);
+        std::thread::sleep(Duration::from_millis(100));
+        let second = read_in_thread("second", cwd.path(), "deck.pdf", &access);
+        let first = first.join().expect("first read");
+        let second = second.join().expect("second read");
+
+        assert_eq!(first.status, ToolStatus::Completed, "{:?}", first.error);
+        assert_eq!(second.status, ToolStatus::Completed, "{:?}", second.error);
+        assert_eq!(first.output, second.output);
+        assert_eq!(
+            fixture.requests().len(),
+            1,
+            "one recognition for both reads"
+        );
+    }
+
+    #[test]
+    fn a_waiting_read_can_be_cancelled() {
+        let cwd = workspace_with("slow.pdf", b"%PDF waiting");
+        let fixture = crate::test_http::serve_slowly(
+            Duration::from_millis(800),
+            vec![ocr_reply(json!([
+                {"index": 0, "text": "slow", "finish_reason": "stop"},
+            ]))],
+        );
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+        let first = read_in_thread("first", cwd.path(), "slow.pdf", &access);
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+
+        let second = execute_or_cancel(
+            &read_request("second", r#"{"path":"slow.pdf"}"#),
+            cwd.path(),
+            64 * 1024,
+            Some(&access),
+            || started.elapsed() > Duration::from_millis(100),
+        );
+
+        assert_eq!(second.status, ToolStatus::Cancelled, "{:?}", second.error);
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "the wait ignored cancellation: {:?}",
+            started.elapsed()
+        );
+        let first = first.join().expect("first read");
+        assert_eq!(first.status, ToolStatus::Completed, "{:?}", first.error);
+        fixture.requests();
+    }
+
+    #[test]
+    fn a_failed_recognition_lets_the_next_read_try_again() {
+        let cwd = workspace_with("retry.pdf", b"%PDF retry");
+        let failing =
+            crate::test_http::serve(vec![(500, r#"{"error":{"message":"busy"}}"#.into())]);
+        let first = execute_or_cancel(
+            &read_request("first", r#"{"path":"retry.pdf"}"#),
+            cwd.path(),
+            64 * 1024,
+            Some(&DeepSeekWebAccess::for_test(&failing.origin, "sk-test")),
+            || false,
+        );
+        assert_eq!(first.status, ToolStatus::Failed, "{:?}", first.output);
+        failing.requests();
+        let working = crate::test_http::serve(vec![ocr_reply(json!([
+            {"index": 0, "text": "second try", "finish_reason": "stop"},
+        ]))]);
+        let started = Instant::now();
+
+        // A deadline, so that a file left pending fails the test instead of
+        // leaving the read waiting for good.
+        let second = execute_or_cancel(
+            &read_request("second", r#"{"path":"retry.pdf"}"#),
+            cwd.path(),
+            64 * 1024,
+            Some(&DeepSeekWebAccess::for_test(&working.origin, "sk-test")),
+            || started.elapsed() > Duration::from_secs(5),
+        );
+
+        assert_eq!(second.status, ToolStatus::Completed, "{:?}", second.error);
+        assert_eq!(working.requests().len(), 1);
     }
 
     #[test]
