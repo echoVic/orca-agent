@@ -6,7 +6,6 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::SystemTime;
@@ -15,7 +14,9 @@ use serde::Deserialize;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind};
 
-use crate::deepseek_web::{self, DeepSeekWebAccess, DeepSeekWebError, OcrResult};
+use crate::deepseek_web::{
+    self, DeepSeekWebAccess, DeepSeekWebError, OcrResult, OcrUpload, OcrUploadError,
+};
 use crate::file_admission::open_regular_file;
 use crate::read_file::render_lines;
 use crate::resolve_workspace_path;
@@ -129,14 +130,12 @@ pub fn execute_or_cancel(
     let result = match cached {
         Some(result) => result,
         None => {
-            let mut bytes = Vec::new();
-            if let Err(error) = (&mut file).take(MAX_OCR_BYTES + 1).read_to_end(&mut bytes) {
-                return failed(&error);
-            }
+            let upload = match OcrUpload::read(&file_name, &mut file, size, MAX_OCR_BYTES) {
+                Ok(upload) => upload,
+                Err(OcrUploadError::TooLarge(observed)) => return too_large(observed),
+                Err(OcrUploadError::Io(error)) => return failed(&error),
+            };
             drop(file);
-            if bytes.len() as u64 > MAX_OCR_BYTES {
-                return too_large(bytes.len() as u64);
-            }
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -150,7 +149,7 @@ pub fn execute_or_cancel(
                     );
                 }
             };
-            match runtime.block_on(deepseek_web::ocr(access, &file_name, bytes, &should_cancel)) {
+            match runtime.block_on(deepseek_web::ocr(access, upload, &should_cancel)) {
                 Ok(result) => {
                     let result = Arc::new(result);
                     OCR_CACHE

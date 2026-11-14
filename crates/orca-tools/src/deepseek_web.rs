@@ -3,8 +3,9 @@
 
 use std::fmt;
 use std::future::Future;
+use std::io::Read;
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use orca_core::config::ProviderKind;
 use serde::Deserialize;
@@ -267,13 +268,10 @@ struct RawOcrPage {
 /// cancelled once the upload is done.
 pub(crate) async fn ocr(
     access: &DeepSeekWebAccess,
-    file_name: &str,
-    bytes: Vec<u8>,
+    upload: OcrUpload,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<OcrResult, DeepSeekWebError> {
-    let boundary = form_boundary(&bytes);
-    let form = ocr_form(&boundary, file_name, &bytes);
-    drop(bytes);
+    let OcrUpload { form, boundary } = upload;
     let text = post(
         access,
         "/v1/tools/ocr",
@@ -382,39 +380,88 @@ pub(crate) fn ocr_text(raw: &str) -> String {
     TRAILING_PARTIAL_TOKEN.replace(&text, "").into_owned()
 }
 
-/// A form boundary that does not occur in `bytes`.
-fn form_boundary(bytes: &[u8]) -> String {
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    (0_u32..)
-        .map(|attempt| format!("orca-ocr-{seed:x}-{attempt}"))
-        .find(|boundary| {
-            regex::bytes::Regex::new(&regex::escape(boundary))
-                .is_ok_and(|pattern| !pattern.is_match(bytes))
-        })
-        .expect("a boundary that is not in the file")
+/// The OCR request body: the `purpose` field and the `file` field, which
+/// are the only two DeepSeek accepts. The file is read straight into it, so
+/// an upload holds the file in memory once.
+pub(crate) struct OcrUpload {
+    form: Vec<u8>,
+    boundary: String,
 }
 
-/// The OCR request body: the `purpose` field and the `file` field, which
-/// are the only two DeepSeek accepts.
-fn ocr_form(boundary: &str, file_name: &str, bytes: &[u8]) -> Vec<u8> {
-    // A quote or a line break would end the header early, so they are
-    // percent-encoded the way browsers send them.
-    let file_name = file_name
-        .replace('"', "%22")
-        .replace('\r', "%0D")
-        .replace('\n', "%0A");
-    let mut form = Vec::with_capacity(bytes.len() + 512);
-    form.extend_from_slice(
-        format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\n{OCR_PURPOSE}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-        )
-        .as_bytes(),
-    );
-    form.extend_from_slice(bytes);
-    form.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    form
+/// Why a file could not become an upload.
+#[derive(Debug)]
+pub(crate) enum OcrUploadError {
+    Io(std::io::Error),
+    /// The file holds more than the limit allows: this many bytes, or more.
+    TooLarge(u64),
+}
+
+impl OcrUpload {
+    /// Reads at most `max_len` bytes of `reader`, expected to hold
+    /// `expected_len`, into an upload named `file_name`.
+    pub(crate) fn read(
+        file_name: &str,
+        reader: impl Read,
+        expected_len: u64,
+        max_len: u64,
+    ) -> Result<Self, OcrUploadError> {
+        Self::read_with_boundaries(file_name, reader, expected_len, max_len, || {
+            format!("orca-ocr-{}", uuid::Uuid::new_v4().simple())
+        })
+    }
+
+    /// `read`, taking boundaries from `next_boundary` until one does not
+    /// occur in the file.
+    fn read_with_boundaries(
+        file_name: &str,
+        reader: impl Read,
+        expected_len: u64,
+        max_len: u64,
+        mut next_boundary: impl FnMut() -> String,
+    ) -> Result<Self, OcrUploadError> {
+        // A quote or a line break would end the header early, so they are
+        // percent-encoded the way browsers send them.
+        let file_name = file_name
+            .replace('"', "%22")
+            .replace('\r', "%0D")
+            .replace('\n', "%0A");
+        let headers = |boundary: &str| {
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\n{OCR_PURPOSE}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+        };
+        let mut boundary = next_boundary();
+        let mut head = headers(&boundary);
+        // The headers, the file, and the closing delimiter
+        // "\r\n--{boundary}--\r\n", with room for read_to_end's probe.
+        let expected = usize::try_from(expected_len.min(max_len)).unwrap_or(0);
+        let mut form = Vec::with_capacity(head.len() + expected + boundary.len() + 8 + 32);
+        form.extend_from_slice(head.as_bytes());
+        let read = reader
+            .take(max_len.saturating_add(1))
+            .read_to_end(&mut form)
+            .map_err(OcrUploadError::Io)?;
+        if read as u64 > max_len {
+            return Err(OcrUploadError::TooLarge(read as u64));
+        }
+        while holds(&form[head.len()..], &boundary) {
+            boundary = next_boundary();
+            let next_head = headers(&boundary);
+            if next_head.len() == head.len() {
+                form[..head.len()].copy_from_slice(next_head.as_bytes());
+            } else {
+                form.splice(..head.len(), next_head.bytes());
+            }
+            head = next_head;
+        }
+        form.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        Ok(Self { form, boundary })
+    }
+}
+
+/// Whether `needle` occurs in `haystack`.
+fn holds(haystack: &[u8], needle: &str) -> bool {
+    regex::bytes::Regex::new(&regex::escape(needle)).is_ok_and(|pattern| pattern.is_match(haystack))
 }
 
 /// POSTs `body` as JSON to `path` on the access's origin and returns the
@@ -815,6 +862,63 @@ mod tests {
         fixture.requests();
     }
 
+    /// An upload of `bytes` under `file_name`, as read_document builds one.
+    fn upload(file_name: &str, bytes: &[u8]) -> OcrUpload {
+        OcrUpload::read(file_name, bytes, bytes.len() as u64, u64::MAX).expect("an upload")
+    }
+
+    /// `upload` as the request that carries it.
+    fn upload_request(upload: &OcrUpload) -> String {
+        format!(
+            "POST /v1/tools/ocr HTTP/1.1\r\ncontent-type: multipart/form-data; boundary={}\r\n\r\n{}",
+            upload.boundary,
+            String::from_utf8_lossy(&upload.form)
+        )
+    }
+
+    #[test]
+    fn ocr_upload_picks_a_boundary_the_file_does_not_contain() {
+        let mut candidates = vec!["orca-ocr-A".to_string(), "orca-ocr-B".to_string()].into_iter();
+
+        let upload =
+            OcrUpload::read_with_boundaries("a.pdf", &b"x orca-ocr-A y"[..], 14, 100, || {
+                candidates.next().expect("a boundary candidate")
+            })
+            .expect("an upload");
+
+        assert_eq!(upload.boundary, "orca-ocr-B");
+        let parts = form_parts(&upload_request(&upload));
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(parts[1].1, "x orca-ocr-A y");
+    }
+
+    #[test]
+    fn ocr_upload_refuses_a_file_past_the_limit() {
+        let outcome = OcrUpload::read("a.pdf", &[0_u8; 11][..], 11, 10);
+
+        assert!(
+            matches!(outcome, Err(OcrUploadError::TooLarge(11))),
+            "{:?}",
+            outcome.err()
+        );
+    }
+
+    #[test]
+    fn ocr_upload_reads_into_one_buffer() {
+        let upload = OcrUpload::read("a.pdf", &[7_u8; 4096][..], 4096, 1 << 20).expect("an upload");
+
+        // The file went straight after the part headers: nothing grew, and
+        // no second copy was made.
+        assert!(
+            upload.form.capacity() < upload.form.len() + 64,
+            "capacity {} for {} bytes",
+            upload.form.capacity(),
+            upload.form.len()
+        );
+        let parts = form_parts(&upload_request(&upload));
+        assert_eq!(parts[1].1.len(), 4096);
+    }
+
     /// The parts of a `multipart/form-data` request: each part's headers and
     /// its content.
     fn form_parts(request: &str) -> Vec<(String, String)> {
@@ -865,8 +969,7 @@ mod tests {
 
         let pages = block_on(ocr(
             &access,
-            "report.pdf",
-            b"%PDF-1.4 fixture".to_vec(),
+            upload("report.pdf", b"%PDF-1.4 fixture"),
             &|| false,
         ));
 
@@ -916,7 +1019,7 @@ mod tests {
         let fixture = crate::test_http::serve(vec![(200, r#"{"pages":[]}"#.into())]);
         let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
 
-        let pages = block_on(ocr(&access, "a\"b\r\nc.pdf", b"%PDF".to_vec(), &|| false));
+        let pages = block_on(ocr(&access, upload("a\"b\r\nc.pdf", b"%PDF"), &|| false));
 
         assert_eq!(
             pages,
@@ -944,7 +1047,7 @@ mod tests {
         )]);
         let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
 
-        let pages = block_on(ocr(&access, "a.pdf", b"%PDF".to_vec(), &|| false));
+        let pages = block_on(ocr(&access, upload("a.pdf", b"%PDF"), &|| false));
 
         assert_eq!(
             pages,
@@ -996,9 +1099,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let gapped = block_on(ocr(&access, "a.pdf", b"%PDF".to_vec(), &|| false))
+        let gapped = block_on(ocr(&access, upload("a.pdf", b"%PDF"), &|| false))
             .expect("a result with a gap");
-        let unindexed = block_on(ocr(&access, "b.pdf", b"%PDF".to_vec(), &|| false))
+        let unindexed = block_on(ocr(&access, upload("b.pdf", b"%PDF"), &|| false))
             .expect("a result without indices");
 
         assert_eq!(gapped.page_count, Some(3));
@@ -1022,7 +1125,7 @@ mod tests {
         )]);
         let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
 
-        let outcome = block_on(ocr(&access, "a.pdf", b"%PDF".to_vec(), &|| false));
+        let outcome = block_on(ocr(&access, upload("a.pdf", b"%PDF"), &|| false));
 
         assert_eq!(
             outcome,
@@ -1039,7 +1142,7 @@ mod tests {
         let fixture = crate::test_http::serve(vec![(200, "\n\n\n".into())]);
         let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
 
-        let outcome = block_on(ocr(&access, "a.pdf", b"%PDF".to_vec(), &|| false));
+        let outcome = block_on(ocr(&access, upload("a.pdf", b"%PDF"), &|| false));
 
         assert_eq!(
             outcome,
@@ -1070,7 +1173,7 @@ mod tests {
         let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
 
         for error in &empty_errors {
-            let outcome = block_on(ocr(&access, "a.pdf", b"%PDF".to_vec(), &|| false));
+            let outcome = block_on(ocr(&access, upload("a.pdf", b"%PDF"), &|| false));
 
             assert!(
                 outcome.as_ref().is_ok_and(|result| result.pages.len() == 1),
@@ -1091,7 +1194,7 @@ mod tests {
         )]);
         let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
 
-        let pages = block_on(ocr(&access, "a.pdf", b"%PDF".to_vec(), &|| false));
+        let pages = block_on(ocr(&access, upload("a.pdf", b"%PDF"), &|| false));
 
         assert_eq!(
             pages,
