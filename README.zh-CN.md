@@ -71,6 +71,7 @@ orca acp                                  # 连接 ACP 客户端
 orca app-server                           # 提供 JSON-RPC app 协议
 orca --plan exec --json -C ./project "分析代码"  # 只读 JSONL 运行
 orca doctor                               # 在本地检查密钥、目录信任和沙箱
+orca doctor --online                      # 再向服务确认它是否接受这个密钥
 ```
 
 Windows PowerShell 使用 `$env:DEEPSEEK_API_KEY = "sk-..."` 设置密钥；后续 `orca` 命令相同。

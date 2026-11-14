@@ -40,6 +40,13 @@ orca doctor
 `doctor` 是本地只读检查。它检查配置语法、凭据是否存在、模型设置、目录信任和沙箱
 就绪状态；不会调用模型服务、启动 MCP、创建沙箱 capability，也不会改变信任或配置。
 
+想同时确认服务接受你的 API key，加上 `--online`：它会向配置的 endpoint 发一次
+`GET /models` 请求，不计费。
+
+```bash
+orca doctor --online
+```
+
 ```bash
 orca doctor --cwd ./my-project --format json
 ```

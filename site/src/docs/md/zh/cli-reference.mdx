@@ -68,9 +68,10 @@ orca doctor [--cwd PATH] [--json | --format text|json] [--online]
 - 当前平台的沙箱后端。
 
 `--online` 会多一项 `credentials-online` 检查：用配置的 key 向配置的 endpoint
-发一次 `GET /models`。列模型不调用模型，也不计费。服务接受 key 时通过，拒绝时
-（HTTP 401 或 403）失败；判断不了时给出警告：返回其他状态码（有的 endpoint
-不提供 `/models`）、10 秒内没有响应，或者没有可检查的 key。报告里不会出现 key。
+发一次 `GET /models`。列模型不调用模型，也不计费。服务接受 key 时通过。拒绝 key
+（HTTP 401）或拒绝请求（HTTP 403）时失败；403 也可能来自账户权限、防火墙、地区限制
+或中间的网关，所以这时不会建议你换 key。判断不了时给出警告：返回其他状态码（有的
+endpoint 不提供 `/models`）、10 秒内没有响应，或者没有可检查的 key。报告里不会出现 key。
 
 只有存在 `fail` 时退出码才是 `1`；只有警告时退出码为 `0`。文本适合人工阅读，
 JSON 是稳定的机器接口，字段使用 camelCase，例如 `schemaVersion`。

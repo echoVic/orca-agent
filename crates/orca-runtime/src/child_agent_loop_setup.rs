@@ -197,9 +197,12 @@ fn prepare_fresh_child_agent_conversation(
     conversation
 }
 
-/// Child agents don't go through the main turn opening, and they are
-/// short-lived, so the date they start with is the date they need. A restored
-/// child gets it after the restore, which requires an empty internal context.
+/// Gives a child today's date before its first request. A child started
+/// through `execute_child_agent_loop` → `run_agent_loop` gets the date again at
+/// every turn opening, which replaces this fragment; the
+/// `child_agent_loop_runner` path builds its own requests and keeps the date
+/// it starts with. A restored child gets it after the restore, which requires
+/// an empty internal context.
 fn tell_child_today(conversation: &mut Conversation) {
     conversation.set_today(chrono::Local::now().date_naive());
 }

@@ -43,6 +43,13 @@ orca doctor
 model settings, folder trust, and sandbox readiness. It does not call the
 provider, start MCP, create sandbox capabilities, or alter trust/configuration.
 
+To also check that the provider accepts your API key, add `--online`. It sends
+one `GET /models` request to the configured endpoint, which is not billed.
+
+```bash
+orca doctor --online
+```
+
 ```bash
 orca doctor --cwd ./my-project --format json
 ```

@@ -85,6 +85,7 @@ orca acp                                  # connect an ACP client
 orca app-server                           # serve the JSON-RPC app protocol
 orca --plan exec --json -C ./project "inspect it"  # read-only JSONL run
 orca doctor                               # check the key, trust, and sandbox locally
+orca doctor --online                      # also ask the provider whether it accepts the key
 ```
 
 On Windows PowerShell, set the key with `$env:DEEPSEEK_API_KEY = "sk-..."`;

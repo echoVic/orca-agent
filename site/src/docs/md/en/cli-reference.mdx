@@ -74,10 +74,12 @@ the provider only with `--online`. It reports typed `pass`, `warn`, and
 
 `--online` adds a `credentials-online` check: one `GET /models` request to
 the configured endpoint with the configured key. Listing the models uses no
-model and is not billed. The check passes when the provider accepts the key,
-fails when it rejects it (HTTP 401 or 403), and warns when it cannot tell:
-another status (an endpoint may not serve `/models`), no answer within 10
-seconds, or no key to check. The report never shows the key.
+model and is not billed. The check passes when the provider accepts the key.
+It fails when the provider rejects the key (HTTP 401) or refuses the request
+(HTTP 403, which can also come from the account, a firewall, a region block or
+a gateway in between, so the remedy does not ask for a new key). It warns when
+it cannot tell: another status (an endpoint may not serve `/models`), no answer
+within 10 seconds, or no key to check. The report never shows the key.
 
 Warnings keep exit status `0`. A required failed check returns exit status `1`.
 Text is intended for people; JSON is stable machine-readable output with

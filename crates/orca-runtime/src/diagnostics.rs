@@ -337,6 +337,17 @@ fn credentials_online_check_for(config: &FileConfig) -> DiagnosticCheck {
 fn key_check_result(url: &str, outcome: KeyCheck) -> DiagnosticCheck {
     match outcome {
         KeyCheck::Valid => pass_check(CREDENTIALS_ONLINE, format!("{url} accepted the API key")),
+        // A 403 can come from the account, a firewall, a region block or a
+        // gateway in between, so it does not send a good key away.
+        KeyCheck::Rejected(403) => fail_check(
+            CREDENTIALS_ONLINE,
+            format!(
+                "{url} refused the request (HTTP 403): the account may lack access, or a firewall, region block or gateway refused it"
+            ),
+            Some(
+                "check the key's account and any proxy or gateway in between, then rerun `orca doctor --online`",
+            ),
+        ),
         KeyCheck::Rejected(status) => fail_check(
             CREDENTIALS_ONLINE,
             format!("{url} rejected the API key (HTTP {status})"),
@@ -744,6 +755,31 @@ mod tests {
                 "{check:?}"
             );
         }
+
+        // A 401 means the key; a 403 may be the account, a firewall, a
+        // region block or a gateway, so it must not send a good key away.
+        let unauthorized = key_check_result(url, KeyCheck::Rejected(401));
+        assert!(
+            unauthorized
+                .remediation
+                .as_deref()
+                .is_some_and(|remedy| remedy.contains("replace the key")),
+            "{unauthorized:?}"
+        );
+        let forbidden = key_check_result(url, KeyCheck::Rejected(403));
+        assert_eq!(forbidden.status, DiagnosticStatus::Fail);
+        assert_eq!(
+            forbidden.detail,
+            format!(
+                "{url} refused the request (HTTP 403): the account may lack access, or a firewall, region block or gateway refused it"
+            )
+        );
+        assert_eq!(
+            forbidden.remediation.as_deref(),
+            Some(
+                "check the key's account and any proxy or gateway in between, then rerun `orca doctor --online`"
+            )
+        );
     }
 
     #[test]
