@@ -162,7 +162,9 @@ pub fn execute_or_cancel(
                     };
                     match runtime.block_on(deepseek_web::ocr(access, upload, &should_cancel)) {
                         Ok(result) => {
-                            ocr_disk_cache::store(&disk_key, &result);
+                            if keeps_on_disk(&result) {
+                                ocr_disk_cache::store(&disk_key, &result);
+                            }
                             result
                         }
                         Err(DeepSeekWebError::Cancelled) => {
@@ -202,6 +204,16 @@ pub fn execute_or_cancel(
         ToolResultKind::Success
     };
     ToolResult::completed_kind(request, output, truncated, kind)
+}
+
+/// Whether a recognition may outlive the process. One with no pages, or
+/// fewer than DeepSeek counted, may come out whole next time, so it stays in
+/// memory only and a later session tries again.
+fn keeps_on_disk(result: &OcrResult) -> bool {
+    !result.pages.is_empty()
+        && result
+            .page_count
+            .is_none_or(|counted| counted <= result.pages.len())
 }
 
 /// The text `read_document` shows for a recognized document: a header, which
@@ -593,6 +605,52 @@ mod tests {
             copy.error
         );
         assert_eq!(fixture.requests().len(), 1, "the copy came from disk");
+    }
+
+    #[test]
+    fn a_partial_or_empty_recognition_stays_off_disk() {
+        // Kept on disk, a recognition that came back short would stick
+        // across sessions; in memory it lasts until the process ends. (The
+        // memory cache is shared by every test in the process, so this test
+        // does not rely on what it still holds.)
+        let cwd = workspace_with("partial.pdf", b"%PDF partial");
+        fs::write(cwd.path().join("blank.png"), b"\x89PNG blank").expect("write the image");
+        let cache = tempfile::tempdir().expect("a cache dir");
+        crate::ocr_disk_cache::set_test_cache_root(Some(cache.path().to_path_buf()));
+        let fixture = crate::test_http::serve(vec![
+            (
+                200,
+                json!({"page_count": 3, "pages": [
+                    {"index": 0, "text": "A", "finish_reason": "stop"},
+                    {"index": 2, "text": "C", "finish_reason": "stop"},
+                ]})
+                .to_string(),
+            ),
+            (200, json!({"pages": []}).to_string()),
+        ]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+        let read = |path: &str| {
+            execute_or_cancel(
+                &read_request(path, &json!({ "path": path }).to_string()),
+                cwd.path(),
+                64 * 1024,
+                Some(&access),
+                || false,
+            )
+        };
+
+        let partial = read("partial.pdf");
+        let blank = read("blank.png");
+
+        crate::ocr_disk_cache::set_test_cache_root(None);
+        for result in [&partial, &blank] {
+            assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        }
+        assert_eq!(fixture.requests().len(), 2);
+        let entries = fs::read_dir(cache.path())
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(entries, 0, "nothing partial or empty reached the disk");
     }
 
     #[test]
