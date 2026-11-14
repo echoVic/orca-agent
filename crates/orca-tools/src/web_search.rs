@@ -129,7 +129,9 @@ pub fn execute_or_cancel(
         &args,
         backend,
         EXA_ENDPOINT,
-        chrono::Utc::now().date_naive(),
+        // The user's own calendar day: in UTC+8 the UTC date lags until 08:00,
+        // which would stretch every window by a day.
+        chrono::Local::now().date_naive(),
         &should_cancel,
     ));
 
