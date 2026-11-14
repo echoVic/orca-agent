@@ -2663,6 +2663,7 @@ mod tests {
         // A Brave key wins the backend choice; this test covers the DeepSeek
         // route, so it has nothing to check when one is set.
         if std::env::var("BRAVE_SEARCH_API_KEY").is_ok_and(|key| !key.trim().is_empty()) {
+            eprintln!("skipped: BRAVE_SEARCH_API_KEY is set, so web_search would use Brave");
             return;
         }
         let fixture = crate::test_http::serve(vec![(

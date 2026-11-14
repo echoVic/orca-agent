@@ -194,7 +194,7 @@ export ORCA_API_KEY="sk-..."
 
 - 网址或重定向被 Orca 自己的规则拒绝，比如重定向到了别的网站；
 - 页面返回 404 或 410；
-- 地址是私有的：局域网、本机回环、链路本地或其他保留用途的 IP 地址，只有一段的主机名，或以 `.local`、`.localhost`、`.localdomain`、`.internal`、`.intranet`、`.private`、`.corp`、`.home`、`.lan`、`.home.arpa` 结尾的主机名。
+- 地址是私有的：局域网、本机回环、链路本地或其他保留用途的 IP 地址，或以 `.local`、`.localhost`、`.localdomain`、`.internal`、`.intranet`、`.private`、`.corp`、`.home`、`.lan`、`.home.arpa` 结尾的主机名。
 
 只有同时满足这几个条件，Orca 才会调用 DeepSeek 的联网接口：提供方是 DeepSeek，设置了 API key，并且 `base_url` 没有设置，或者指向默认端口上的 `https://api.deepseek.com`（路径不限）。key 只会发往这个地址。`base_url` 是其他地址时（比如第三方网关），`web_search` 和 `web_fetch` 的行为就和没有 DeepSeek 接口时一样。
 

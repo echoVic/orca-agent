@@ -521,10 +521,10 @@ mod tests {
 
     #[test]
     fn deepseek_network_errors_say_what_went_wrong() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port to free");
-        let closed_origin = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
-        let access = DeepSeekWebAccess::for_test(&closed_origin, "sk-test");
+        // Nothing listens on the discard port, so connecting fails at once. A
+        // port bound and freed by the test could be held by a process another
+        // test spawns, which made the connect succeed.
+        let access = DeepSeekWebAccess::for_test("http://127.0.0.1:9", "sk-test");
 
         let refused = block_on(search(&access, "rust", 3, &|| false));
 
@@ -550,5 +550,26 @@ mod tests {
                 "DeepSeek request timed out".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn the_key_is_masked_before_the_message_is_cut() {
+        // The key starts at character 196 of DeepSeek's message, so cutting
+        // first would leave "sk-t" unmasked.
+        let message = format!("{} sk-test and more", "x".repeat(195));
+        let fixture = crate::test_http::serve(vec![(
+            500,
+            json!({"error": {"message": message}}).to_string(),
+        )]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let outcome = block_on(search(&access, "rust", 3, &|| false));
+
+        let Err(DeepSeekWebError::Failed(text)) = outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert!(!text.contains("sk-t"), "{text}");
+        assert!(text.ends_with(" <red"), "{text}");
+        fixture.requests();
     }
 }

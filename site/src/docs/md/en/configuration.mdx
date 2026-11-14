@@ -217,7 +217,7 @@ TOML settings to catch it before a task run.
 
 - Orca's own rules refused the URL or a redirect, for example a redirect to another site;
 - the page answered 404 or 410;
-- the address is private: a LAN, loopback, link-local or otherwise reserved IP address, a single-label host name, or a host name ending in `.local`, `.localhost`, `.localdomain`, `.internal`, `.intranet`, `.private`, `.corp`, `.home`, `.lan` or `.home.arpa`.
+- the address is private: a LAN, loopback, link-local or otherwise reserved IP address, or a host name ending in `.local`, `.localhost`, `.localdomain`, `.internal`, `.intranet`, `.private`, `.corp`, `.home`, `.lan` or `.home.arpa`.
 
 Orca calls DeepSeek's web APIs only when the provider is DeepSeek, an API key is set, and `base_url` is unset or points at `https://api.deepseek.com` on the default port, with any path. The key goes to that address and nowhere else. With any other `base_url`, such as a third-party gateway, `web_search` and `web_fetch` work as if the DeepSeek APIs did not exist.
 

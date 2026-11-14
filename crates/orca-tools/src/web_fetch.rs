@@ -265,7 +265,6 @@ fn should_retry_with_deepseek(error: &FetchError, url: &str) -> bool {
     }
 }
 
-/// Host suffixes that only resolve inside a local network.
 /// Host suffixes that only resolve inside a local network (RFC 6762,
 /// appendix G, and common intranet names).
 const INTRANET_SUFFIXES: [&str; 10] = [
