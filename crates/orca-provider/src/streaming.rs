@@ -299,7 +299,7 @@ impl StreamAccumulator {
         if let Some(chunk_usage) = chunk.usage {
             self.usage = Some(chunk_usage.into());
         }
-        if let Some(error) = chunk.error.as_ref() {
+        if let Some(error) = chunk.error.as_ref().filter(|error| reports_error(error)) {
             return Err(stream_error_message(error));
         }
 
@@ -372,6 +372,20 @@ pub(crate) fn is_stream_integrity_error(error: &str) -> bool {
 
 /// The reason DeepSeek gave in an error chunk: an object with `message` and
 /// `type`, or a bare string.
+/// Whether a chunk's `error` field holds an error. Some gateways put one on
+/// every chunk; `false`, `0`, a blank string and an empty object or array say
+/// nothing went wrong (`null` never reaches here).
+fn reports_error(error: &serde_json::Value) -> bool {
+    match error {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(flag) => *flag,
+        serde_json::Value::Number(number) => number.as_f64() != Some(0.0),
+        serde_json::Value::String(text) => !text.trim().is_empty(),
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(fields) => !fields.is_empty(),
+    }
+}
+
 fn stream_error_message(error: &serde_json::Value) -> String {
     let (message, kind) = match error {
         serde_json::Value::Object(fields) => (
@@ -575,6 +589,25 @@ mod tests {
             "the stream ended with an error (api_error): The model failed to generate a complete response. Please retry."
         );
         assert!(is_stream_integrity_error(&error), "{error}");
+    }
+
+    #[test]
+    fn a_stream_whose_chunks_carry_an_empty_error_field_completes() {
+        // Some gateways put an `error` field on every chunk; an empty one is
+        // no error.
+        let sse_data = concat!(
+            "data: {\"error\":false,\"choices\":[{\"delta\":{\"content\":\"one \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"error\":\"\",\"choices\":[{\"delta\":{\"content\":\"two \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"error\":{},\"choices\":[{\"delta\":{\"content\":\"three\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let cancel = CancelToken::new();
+        let result = parse_sse_stream(sse_data.as_bytes(), &cancel, |_| {})
+            .expect("empty error fields do not end the stream");
+
+        assert_eq!(result.content, "one two three");
+        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
     }
 
     #[tokio::test]
