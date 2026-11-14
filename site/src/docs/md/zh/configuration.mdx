@@ -207,12 +207,12 @@ deepseek_web = false   # 搜索改用 Brave 或 Exa，抓取只在本机直接�
 
 ## 读取文档和图片
 
-满足同样的条件时，`read_document` 工具能读 PDF、Word（`.doc`、`.docx`）、PowerPoint（`.ppt`、`.pptx`）和图片文件（`.png`、`.jpg`、`.jpeg`、`.webp`、`.gif`、`.bmp`、`.tif`、`.tiff`）。它把文件上传到 DeepSeek 的 OCR 接口，返回识别出的文字，每页前面有一行 `--- Page N ---`。DeepSeek 称文件不会存进它的 Files API，也不会交给对话模型。`offset` 和 `limit` 按这份文字的行数计算，和 `read_file` 数文件行数的方式一样。`read_file` 照旧读文本；遇到不是文本的文档，它会提示模型改用 `read_document`。
+满足同样的条件时，`read_document` 工具能读 PDF、Word（`.doc`、`.docx`）、PowerPoint（`.ppt`、`.pptx`）和图片文件（`.png`、`.jpg`、`.jpeg`、`.webp`、`.gif`、`.bmp`、`.tif`、`.tiff`）。它把文件上传到 DeepSeek 的 OCR 接口，返回识别出的文字，每页前面有一行 `--- Page N ---`，页码沿用 DeepSeek 的编号；有页面没有返回文字时，第一行会写明。DeepSeek 称文件不会存进它的 Files API，也不会交给对话模型。`offset` 和 `limit` 按这份文字的行数计算，和 `read_file` 数文件行数的方式一样。`read_file` 照旧读文本；遇到不是文本的文档，它会提示模型改用 `read_document`。
 
 因为要上传文件，`read_document` 和 `web_search`、`web_fetch` 一样算联网调用：plan 模式会拒绝，suggest 模式会先征求同意。没有官方 endpoint、API key 或 `deepseek_web` 时，它会说明为什么读不了这个文件。
 
 - 超过 100 MiB 的文件在上传前就会被拒绝；一份文档 DeepSeek 最多识别 1000 页。一次识别最长可能要三分钟。
-- Orca 在退出前会保留最近读过的 8 份文档的文字，所以按 `offset`/`limit` 分段读一份长文档只付一次钱。文件改动过就会重新识别。
+- Orca 会把识别出的文字保存在内存里（最近 8 份文档）和磁盘上的 `ORCA_HOME/ocr_cache`（最多 64 MiB，先删最久没用的），按文件内容作键。按 `offset`/`limit` 分段读长文档、读它的副本、在子代理或之后的会话里再读，都只付一次钱；文件改动过就会重新识别。这些文字本来就在会话历史里。删掉这个目录即可清空缓存。
 - DeepSeek 按页计费，每 1000 页 0.225 美元（2026 年 11 月的价格），同样不计入 Orca 的成本估算。取消读取不会停止 DeepSeek 已经开始的识别，这次识别照样计费。
 
 ## 网络与证书

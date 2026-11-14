@@ -16,6 +16,7 @@ pub mod git;
 pub mod glob;
 pub mod grep;
 pub mod list_files;
+mod ocr_disk_cache;
 pub mod process;
 pub mod read_document;
 pub mod read_file;

@@ -18,6 +18,7 @@ use crate::deepseek_web::{
     self, DeepSeekWebAccess, DeepSeekWebError, OcrResult, OcrUpload, OcrUploadError,
 };
 use crate::file_admission::open_regular_file;
+use crate::ocr_disk_cache;
 use crate::read_file::render_lines;
 use crate::resolve_workspace_path;
 
@@ -140,36 +141,53 @@ pub fn execute_or_cancel(
                 Err(OcrUploadError::Io(error)) => return failed(&error),
             };
             drop(file);
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    return ToolResult::failed(
-                        request,
-                        format!("failed to start the OCR runtime: {error}"),
-                        None,
-                    );
+            // A copy of the file, or a read in another process, may have
+            // recognized the same content already.
+            let disk_key = ocr_disk_cache::content_key(upload.file_bytes());
+            let result = match ocr_disk_cache::load(&disk_key) {
+                Some(result) => result,
+                None => {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            return ToolResult::failed(
+                                request,
+                                format!("failed to start the OCR runtime: {error}"),
+                                None,
+                            );
+                        }
+                    };
+                    match runtime.block_on(deepseek_web::ocr(access, upload, &should_cancel)) {
+                        Ok(result) => {
+                            ocr_disk_cache::store(&disk_key, &result);
+                            result
+                        }
+                        Err(DeepSeekWebError::Cancelled) => {
+                            return ToolResult::cancelled(
+                                request,
+                                "read_document was cancelled",
+                                None,
+                            );
+                        }
+                        Err(DeepSeekWebError::Failed(message)) => {
+                            return ToolResult::failed(
+                                request,
+                                format!(
+                                    "DeepSeek OCR could not read {}: {message}",
+                                    path.display()
+                                ),
+                                None,
+                            );
+                        }
+                    }
                 }
             };
-            match runtime.block_on(deepseek_web::ocr(access, upload, &should_cancel)) {
-                Ok(result) => {
-                    let result = Arc::new(result);
-                    lock_cache().insert(key, Arc::clone(&result));
-                    result
-                }
-                Err(DeepSeekWebError::Cancelled) => {
-                    return ToolResult::cancelled(request, "read_document was cancelled", None);
-                }
-                Err(DeepSeekWebError::Failed(message)) => {
-                    return ToolResult::failed(
-                        request,
-                        format!("DeepSeek OCR could not read {}: {message}", path.display()),
-                        None,
-                    );
-                }
-            }
+            let result = Arc::new(result);
+            lock_cache().insert(key, Arc::clone(&result));
+            result
         }
     };
     let (output, truncated) = render_lines(
@@ -519,6 +537,97 @@ mod tests {
 
         assert_eq!(second.status, ToolStatus::Completed, "{:?}", second.error);
         assert_eq!(working.requests().len(), 1);
+    }
+
+    #[test]
+    fn a_recognition_on_disk_serves_a_copy_of_the_file() {
+        let cwd = workspace_with("a.pdf", b"%PDF copied");
+        let fixture = crate::test_http::serve(vec![ocr_reply(json!([
+            {"index": 0, "text": "once", "finish_reason": "stop"},
+        ]))]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+        let read = |path: &str| {
+            execute_or_cancel(
+                &read_request(path, &json!({ "path": path }).to_string()),
+                cwd.path(),
+                64 * 1024,
+                Some(&access),
+                || false,
+            )
+        };
+        let first = read("a.pdf");
+        assert_eq!(first.status, ToolStatus::Completed, "{:?}", first.error);
+        fs::copy(cwd.path().join("a.pdf"), cwd.path().join("b.pdf")).expect("copy the file");
+
+        let copy = read("b.pdf");
+
+        assert_eq!(
+            copy.output.as_deref(),
+            Some(
+                "[Text recognized by DeepSeek OCR from b.pdf: 1 page(s)]\n\n--- Page 1 ---\nonce\n"
+            ),
+            "{:?}",
+            copy.error
+        );
+        assert_eq!(fixture.requests().len(), 1, "the copy came from disk");
+    }
+
+    #[test]
+    fn a_corrupt_disk_entry_is_recognized_again() {
+        let bytes = b"%PDF corrupt entry";
+        let cwd = workspace_with("report.pdf", bytes);
+        let cache = tempfile::tempdir().expect("a cache dir");
+        crate::ocr_disk_cache::set_test_cache_root(Some(cache.path().to_path_buf()));
+        let entry = crate::ocr_disk_cache::entry_path(
+            cache.path(),
+            &crate::ocr_disk_cache::content_key(bytes),
+        );
+        fs::write(&entry, "not json").expect("corrupt the entry");
+        let fixture = crate::test_http::serve(vec![ocr_reply(json!([
+            {"index": 0, "text": "again", "finish_reason": "stop"},
+        ]))]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let result = execute_or_cancel(
+            &read_request("corrupt", r#"{"path":"report.pdf"}"#),
+            cwd.path(),
+            64 * 1024,
+            Some(&access),
+            || false,
+        );
+
+        crate::ocr_disk_cache::set_test_cache_root(None);
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        assert_eq!(fixture.requests().len(), 1);
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&fs::read(&entry).expect("the entry"))
+                .expect("the entry parses");
+        assert_eq!(rewritten["pages"][0]["text"], "again");
+    }
+
+    #[test]
+    fn the_disk_cache_is_skipped_when_it_cannot_be_written() {
+        let cwd = workspace_with("report.pdf", b"%PDF unwritable cache");
+        let blocker = cwd.path().join("not-a-directory");
+        fs::write(&blocker, b"a file").expect("write the blocker");
+        crate::ocr_disk_cache::set_test_cache_root(Some(blocker.clone()));
+        let fixture = crate::test_http::serve(vec![ocr_reply(json!([
+            {"index": 0, "text": "fine", "finish_reason": "stop"},
+        ]))]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let result = execute_or_cancel(
+            &read_request("unwritable", r#"{"path":"report.pdf"}"#),
+            cwd.path(),
+            64 * 1024,
+            Some(&access),
+            || false,
+        );
+
+        crate::ocr_disk_cache::set_test_cache_root(None);
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        assert_eq!(fixture.requests().len(), 1);
+        assert_eq!(fs::read(&blocker).expect("the blocker"), b"a file");
     }
 
     #[test]

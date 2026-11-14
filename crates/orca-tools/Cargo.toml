@@ -21,6 +21,7 @@ url = { workspace = true }
 chrono = { workspace = true }
 libc = { workspace = true }
 similar = { workspace = true }
+sha2 = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

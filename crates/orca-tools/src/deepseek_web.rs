@@ -4,11 +4,12 @@
 use std::fmt;
 use std::future::Future;
 use std::io::Read;
+use std::ops::Range;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use orca_core::config::ProviderKind;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// The only origin the web tools ever send the DeepSeek API key to.
@@ -224,7 +225,7 @@ pub(crate) async fn fetch(
 }
 
 /// One page DeepSeek OCR recognized.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OcrPage {
     /// The page's number in the document, from 1.
     pub(crate) number: usize,
@@ -236,7 +237,7 @@ pub(crate) struct OcrPage {
 }
 
 /// What DeepSeek OCR recognized in one file.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OcrResult {
     /// The pages that came back, in page order.
     pub(crate) pages: Vec<OcrPage>,
@@ -271,7 +272,7 @@ pub(crate) async fn ocr(
     upload: OcrUpload,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<OcrResult, DeepSeekWebError> {
-    let OcrUpload { form, boundary } = upload;
+    let OcrUpload { form, boundary, .. } = upload;
     let text = post(
         access,
         "/v1/tools/ocr",
@@ -386,6 +387,8 @@ pub(crate) fn ocr_text(raw: &str) -> String {
 pub(crate) struct OcrUpload {
     form: Vec<u8>,
     boundary: String,
+    /// Where the file's bytes sit in `form`.
+    file: Range<usize>,
 }
 
 /// Why a file could not become an upload.
@@ -454,8 +457,18 @@ impl OcrUpload {
             }
             head = next_head;
         }
+        let file = head.len()..form.len();
         form.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        Ok(Self { form, boundary })
+        Ok(Self {
+            form,
+            boundary,
+            file,
+        })
+    }
+
+    /// The file's bytes, as they will be uploaded.
+    pub(crate) fn file_bytes(&self) -> &[u8] {
+        &self.form[self.file.clone()]
     }
 }
 
