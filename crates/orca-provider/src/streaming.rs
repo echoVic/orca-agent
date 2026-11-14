@@ -370,8 +370,6 @@ pub(crate) fn is_stream_integrity_error(error: &str) -> bool {
         || error.starts_with(INVALID_SSE_UTF8_PREFIX)
 }
 
-/// The reason DeepSeek gave in an error chunk: an object with `message` and
-/// `type`, or a bare string.
 /// Whether a chunk's `error` field holds an error. Some gateways put one on
 /// every chunk; `false`, `0`, a blank string and an empty object or array say
 /// nothing went wrong (`null` never reaches here).
@@ -386,6 +384,8 @@ fn reports_error(error: &serde_json::Value) -> bool {
     }
 }
 
+/// The reason DeepSeek gave in an error chunk: an object with `message` and
+/// `type`, or a bare string.
 fn stream_error_message(error: &serde_json::Value) -> String {
     let (message, kind) = match error {
         serde_json::Value::Object(fields) => (
