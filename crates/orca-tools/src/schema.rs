@@ -531,9 +531,9 @@ mod tests {
                 ),
             };
 
-            let normalized = normalize_tool_request(&registry, &request).expect("normalizes");
+            let normalized = normalize_tool_request(registry, &request).expect("normalizes");
 
-            crate::registry::validate_tool_request(&registry, &normalized)
+            crate::registry::validate_tool_request(registry, &normalized)
                 .unwrap_or_else(|error| panic!("fresh_days {sent} fails validation: {error}"));
             let arguments: serde_json::Value =
                 serde_json::from_str(normalized.raw_arguments.as_deref().expect("arguments"))
