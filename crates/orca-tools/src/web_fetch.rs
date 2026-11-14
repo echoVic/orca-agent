@@ -197,8 +197,9 @@ async fn fetch_or_cancel(
 }
 
 /// The direct request's outcome, or DeepSeek's copy of the page when the
-/// direct request failed in a way DeepSeek may get past. A blank page counts
-/// as a failure here, but without a successful retry it is returned as is.
+/// direct request failed in a way DeepSeek may get past. A page without
+/// readable text counts as a failure here; when the retry fails too, the page
+/// comes back with a note saying so.
 async fn finish_with_deepseek(
     url: &str,
     local: Result<LocalPage, FetchError>,
@@ -235,6 +236,15 @@ async fn finish_with_deepseek(
                 message: format!("{message}; DeepSeek Fetch also failed: {deepseek_error}"),
                 reason,
                 status,
+            }),
+            // The page came back without readable text: return it, and say
+            // that the retry didn't help, so it isn't mistaken for a page
+            // that really is empty.
+            Ok(page) => Ok(Fetched {
+                note: Some(format!(
+                    "[The page has no readable text, and the DeepSeek Fetch API could not read it either: {deepseek_error}.]"
+                )),
+                text: page.text,
             }),
             other => other.map(direct),
         },
@@ -1089,6 +1099,33 @@ mod tests {
         );
         assert!(output.contains("Rust has ownership."), "{output}");
         assert!(!output.contains("Python is popular."), "{output}");
+        fixture.requests();
+    }
+
+    #[test]
+    fn unreadable_page_notes_a_failed_retry() {
+        let fixture =
+            crate::test_http::serve(vec![(500, r#"{"error":{"message":"boom"}}"#.into())]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let fetched = block_on(finish_with_deepseek(
+            PAGE_URL,
+            Ok(LocalPage {
+                text: "# App".to_string(),
+                readable: false,
+            }),
+            Some(&access),
+            &|| false,
+        ))
+        .expect("the local page comes back");
+
+        assert_eq!(
+            fetched.note.as_deref(),
+            Some(
+                "[The page has no readable text, and the DeepSeek Fetch API could not read it either: DeepSeek returned HTTP 500: boom.]"
+            )
+        );
+        assert_eq!(fetched.text, "# App");
         fixture.requests();
     }
 
