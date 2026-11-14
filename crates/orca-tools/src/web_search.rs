@@ -566,21 +566,23 @@ fn default_count() -> usize {
     5
 }
 
-/// A positive whole number of days, sent as a number or a digit string.
-/// Anything else is dropped rather than failing the call, and values above
-/// [`MAX_FRESH_DAYS`] are clamped.
+/// A positive number of days, sent as a number or a numeric string and
+/// rounded to whole days. Anything else is dropped rather than failing the
+/// call, and values above [`MAX_FRESH_DAYS`] are clamped.
 fn deserialize_fresh_days<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let days = match Option::<Value>::deserialize(deserializer)? {
-        Some(Value::Number(number)) => number.as_i64(),
-        Some(Value::String(text)) => text.trim().parse::<i64>().ok(),
+        Some(Value::Number(number)) => number.as_f64(),
+        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
         _ => None,
     };
     Ok(days
-        .filter(|days| *days > 0)
-        .and_then(|days| u32::try_from(days.min(i64::from(MAX_FRESH_DAYS))).ok()))
+        .filter(|days| days.is_finite())
+        .map(f64::round)
+        .filter(|days| *days >= 1.0)
+        .map(|days| days.min(f64::from(MAX_FRESH_DAYS)) as u32))
 }
 
 fn deserialize_legacy_freshness<'de, D>(deserializer: D) -> Result<Option<Recency>, D::Error>
@@ -801,6 +803,31 @@ mod tests {
             brave_freshness(&range("2026-01-01", "2026-02-01"), today()),
             "2026-01-01to2026-02-01"
         );
+    }
+
+    #[test]
+    fn fresh_days_accepts_whole_and_fractional_numbers() {
+        assert_eq!(
+            recency_of(r#"{"query":"x","fresh_days":7.0}"#),
+            Some(Recency::LastDays(7))
+        );
+        assert_eq!(
+            recency_of(r#"{"query":"x","fresh_days":"7.0"}"#),
+            Some(Recency::LastDays(7))
+        );
+        assert_eq!(
+            recency_of(r#"{"query":"x","fresh_days":7.6}"#),
+            Some(Recency::LastDays(8))
+        );
+        assert_eq!(
+            recency_of(r#"{"query":"x","fresh_days":18446744073709551615}"#),
+            Some(Recency::LastDays(365))
+        );
+        assert_eq!(
+            recency_of(r#"{"query":"x","fresh_days":1e30}"#),
+            Some(Recency::LastDays(365))
+        );
+        assert_eq!(recency_of(r#"{"query":"x","fresh_days":0.3}"#), None);
     }
 
     #[test]
