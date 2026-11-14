@@ -225,7 +225,11 @@ async fn post_json(
     timeout: Duration,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<String, DeepSeekWebError> {
-    let builder = orca_mcp::http::client_builder().timeout(timeout);
+    // A redirect would carry the request, and with it the key, somewhere
+    // other than the fixed origin; it is reported as an error instead.
+    let builder = orca_mcp::http::client_builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
     #[cfg(test)]
     let builder = builder.no_proxy();
     let client = builder.build().map_err(|error| {
@@ -251,27 +255,37 @@ async fn post_json(
             DeepSeekWebError::Failed(format!("failed to read the DeepSeek response: {error}"))
         })?;
     if !(200..300).contains(&status) {
-        return Err(DeepSeekWebError::Failed(http_error_message(status, &text)));
+        return Err(DeepSeekWebError::Failed(http_error_message(
+            status,
+            &text,
+            &access.api_key,
+        )));
     }
     Ok(text)
 }
 
-fn http_error_message(status: u16, body: &str) -> String {
+/// A readable message for a failed status. DeepSeek's own message is shown
+/// with the key masked, since an error can echo what the request sent.
+fn http_error_message(status: u16, body: &str, api_key: &str) -> String {
     match status {
         401 => "DeepSeek rejected the API key (HTTP 401)".to_string(),
         402 => "the DeepSeek account balance is too low (HTTP 402)".to_string(),
         429 => "DeepSeek rate limit reached (HTTP 429)".to_string(),
         _ => {
-            let message: String = serde_json::from_str::<Value>(body)
+            let raw = serde_json::from_str::<Value>(body)
                 .ok()
                 .as_ref()
                 .and_then(|value| value.pointer("/error/message"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .trim()
-                .chars()
-                .take(ERROR_MESSAGE_CHARS)
-                .collect();
+                .to_string();
+            let masked = if api_key.is_empty() {
+                raw
+            } else {
+                raw.replace(api_key, "<redacted>")
+            };
+            let message: String = masked.chars().take(ERROR_MESSAGE_CHARS).collect();
             if message.is_empty() {
                 format!("DeepSeek returned HTTP {status}")
             } else {
@@ -427,6 +441,47 @@ mod tests {
             page,
             Err(DeepSeekWebError::Failed(
                 "DeepSeek Fetch returned no content".to_string()
+            ))
+        );
+        fixture.requests();
+    }
+
+    #[test]
+    fn deepseek_redirects_are_not_followed() {
+        let elsewhere = crate::test_http::untouched();
+        let fixture = crate::test_http::serve_replies(vec![crate::test_http::Reply::redirect(
+            302,
+            &format!("{}/collect", elsewhere.origin),
+        )]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let outcome = block_on(search(&access, "rust", 3, &|| false));
+
+        assert_eq!(
+            outcome,
+            Err(DeepSeekWebError::Failed(
+                "DeepSeek returned HTTP 302".to_string()
+            ))
+        );
+        elsewhere.assert_untouched("the redirect target");
+        fixture.requests();
+    }
+
+    #[test]
+    fn deepseek_error_messages_never_echo_the_key() {
+        let fixture = crate::test_http::serve(vec![(
+            500,
+            r#"{"error":{"message":"key sk-test is not valid for this account"}}"#.into(),
+        )]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let outcome = block_on(search(&access, "rust", 3, &|| false));
+
+        assert_eq!(
+            outcome,
+            Err(DeepSeekWebError::Failed(
+                "DeepSeek returned HTTP 500: key <redacted> is not valid for this account"
+                    .to_string()
             ))
         );
         fixture.requests();
