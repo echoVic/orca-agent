@@ -17,6 +17,7 @@ pub mod glob;
 pub mod grep;
 pub mod list_files;
 pub mod process;
+pub mod read_document;
 pub mod read_file;
 pub mod registry;
 pub mod report_blocker;

@@ -427,7 +427,9 @@ mod tests {
         // +200 (2026-11-01) for the blocker-honesty and untrusted-text rules.
         // +600 (2026-11-07) for the web_fetch tool; the measured prefix is
         // 28,440 chars with the subagent routing description restored.
-        let limit = if cfg!(windows) { 29_300 } else { 28_600 };
+        // +600 (2026-11-14) for the read_document tool (DeepSeek OCR); the
+        // measured prefix is 29,108 chars without the date line.
+        let limit = if cfg!(windows) { 29_900 } else { 29_200 };
         assert!(
             prefix <= limit,
             "system + tool prefix is {prefix} chars (limit {limit})"

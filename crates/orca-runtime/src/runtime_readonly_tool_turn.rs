@@ -8,7 +8,6 @@ use orca_core::event_sink::EventSink;
 use orca_core::hook_types::HookEvent;
 use orca_core::tool_types::{ToolOutputTruncation, ToolRequest, ToolResult, ToolStatus};
 use orca_mcp::McpRegistry;
-use orca_tools::deepseek_web::DeepSeekWebAccess;
 
 use crate::hooks::{HookContext, HookRunError, HookRunner};
 use crate::runtime_surface::RuntimeProviderResponseIngress;
@@ -34,8 +33,6 @@ pub(crate) struct RuntimeReadonlyBatchContext<'a, W: io::Write> {
     pub(crate) output_truncation: ToolOutputTruncation,
     pub(crate) max_parallel: usize,
     pub(crate) provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
-    /// What `read_file` may use to read documents through DeepSeek OCR.
-    pub(crate) deepseek_web: Option<&'a DeepSeekWebAccess>,
 }
 
 pub(crate) struct RuntimeReadonlyToolTurnContext<'a, W: io::Write> {
@@ -51,8 +48,6 @@ pub(crate) struct RuntimeReadonlyToolTurnRequest<'a> {
     pub(crate) cancel: &'a CancelToken,
     pub(crate) output_truncation: ToolOutputTruncation,
     pub(crate) max_parallel: usize,
-    /// What `read_file` may use to read documents through DeepSeek OCR.
-    pub(crate) deepseek_web: Option<&'a DeepSeekWebAccess>,
 }
 
 pub(crate) struct RuntimeReadonlyToolTurnIo<'a, W: io::Write> {
@@ -98,7 +93,6 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
         output_truncation,
         max_parallel,
         provider_response_ingress,
-        deepseek_web,
     } = context;
     let mut early_results: Vec<Option<ToolResult>> = vec![None; tool_requests.len()];
     let mut runnable = Vec::new();
@@ -180,7 +174,6 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
                     cwd: cwd.to_path_buf(),
                     mcp_registry: mcp_registry.clone(),
                     output_truncation,
-                    deepseek_web: deepseek_web.cloned(),
                 })
                 .collect(),
             max_parallel,
@@ -304,7 +297,6 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
         cancel,
         output_truncation,
         max_parallel,
-        deepseek_web,
     } = request;
     let RuntimeReadonlyToolTurnIo {
         events,
@@ -331,7 +323,6 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
         output_truncation,
         max_parallel,
         provider_response_ingress,
-        deepseek_web,
     })?;
     let cancelled_result = execution
         .results
@@ -422,7 +413,6 @@ mod tests {
             output_truncation: ToolOutputTruncation::default(),
             max_parallel: 2,
             provider_response_ingress: None,
-            deepseek_web: None,
         })
         .unwrap();
         assert!(execution.event_error.is_none());
@@ -514,7 +504,6 @@ mod tests {
             output_truncation: ToolOutputTruncation::default(),
             max_parallel: 2,
             provider_response_ingress: Some(&ingress),
-            deepseek_web: None,
         })
         .unwrap();
 
@@ -800,7 +789,6 @@ mod tests {
                 output_truncation: ToolOutputTruncation::default(),
                 max_parallel: 2,
                 provider_response_ingress: None,
-                deepseek_web: None,
             })?;
             let status = if execution
                 .results
@@ -945,7 +933,6 @@ mod tests {
                 output_truncation: ToolOutputTruncation::default(),
                 max_parallel: 1,
                 provider_response_ingress: None,
-                deepseek_web: None,
             })
             .expect("execute read-only batch");
             let _ = done_tx.send(execution.results);

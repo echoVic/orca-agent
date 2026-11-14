@@ -19,8 +19,8 @@ use orca_mcp::{McpElicitationHandler, McpRegistry, McpRequestError, client::McpC
 
 use crate::deepseek_web::DeepSeekWebAccess;
 use crate::{
-    edit, external, git, glob, grep, list_files, read_file, report_blocker, skills, update_goal,
-    update_plan, web_fetch, web_search, write_file,
+    edit, external, git, glob, grep, list_files, read_document, read_file, report_blocker, skills,
+    update_goal, update_plan, web_fetch, web_search, write_file,
 };
 
 #[cfg(test)]
@@ -75,8 +75,9 @@ pub struct ToolContext<'a> {
     pub mcp_elicitation_handler: Option<&'a dyn McpElicitationHandler>,
     pub should_cancel: Option<&'a dyn Fn() -> bool>,
     pub execution_profile: orca_core::capability::ExecutionProfile,
-    /// DeepSeek web API access for `web_search` and `web_fetch`; `None`
-    /// keeps them on Brave/Exa and local fetching.
+    /// DeepSeek API access for `web_search`, `web_fetch` and `read_document`;
+    /// `None` keeps the web tools on Brave/Exa and local fetching, and
+    /// `read_document` explains what it needs.
     pub deepseek_web: Option<DeepSeekWebAccess>,
 }
 
@@ -478,7 +479,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         safe_local_read_builtin_spec(
             "read_file",
-            "Read the contents of a file at the given path relative to workspace root. PDF, Word, PowerPoint and image files are read as the text DeepSeek OCR recognizes, with page markers.",
+            "Read the contents of a file at the given path relative to workspace root.",
             json!({
                 "type": "object",
                 "properties": {
@@ -787,6 +788,38 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
             false,
         ),
         BuiltinExecutor::WebFetch,
+    ));
+    registry.register(BuiltinTool::new(
+        cooperative_builtin_spec(
+            "read_document",
+            "Read a PDF, Word, PowerPoint or image file as text through DeepSeek OCR. Uploads the file (billed per page) and returns its pages; rereading the same file reuses the result. Use read_file for text files.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to workspace root"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-based line of the recognized text to start from."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Number of lines of the recognized text to read."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::network_search(),
+            ToolExposure::Direct,
+            RendererHint::Network,
+            false,
+        ),
+        BuiltinExecutor::ReadDocument,
     ));
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
@@ -1989,7 +2022,12 @@ impl Tool for BuiltinTool {
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
         match self.executor {
-            BuiltinExecutor::ReadFile => read_file::execute_or_cancel(
+            BuiltinExecutor::ReadFile => {
+                read_file::execute_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
+                    ctx.is_cancelled()
+                })
+            }
+            BuiltinExecutor::ReadDocument => read_document::execute_or_cancel(
                 request,
                 ctx.cwd,
                 ctx.max_output_bytes(),
@@ -2131,6 +2169,7 @@ enum BuiltinExecutor {
     GitStatus,
     WebSearch,
     WebFetch,
+    ReadDocument,
     Subagent,
     TaskList,
     TaskStop,
@@ -2694,7 +2733,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_hands_deepseek_access_to_read_file() {
+    fn registry_hands_deepseek_access_to_read_document() {
         let cwd = tempfile::tempdir().expect("workspace");
         std::fs::write(cwd.path().join("scan.png"), b"\x89PNG fixture").expect("image fixture");
         let fixture = crate::test_http::serve(vec![(
@@ -2706,7 +2745,7 @@ mod tests {
         ));
         let request = ToolRequest {
             id: "read-1".to_string(),
-            name: ToolName::ReadFile,
+            name: ToolName::ReadDocument,
             action: ActionKind::Read,
             target: None,
             raw_arguments: Some(r#"{"path":"scan.png"}"#.to_string()),
@@ -2722,6 +2761,34 @@ mod tests {
             )
         );
         assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[test]
+    fn read_document_is_a_network_tool_outside_the_read_batch() {
+        // Network is what makes plan mode refuse it and suggest mode ask, as
+        // for web_search's DeepSeek backend.
+        let request = ToolRequest {
+            id: "read-1".to_string(),
+            name: ToolName::ReadDocument,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"path":"report.pdf"}"#.to_string()),
+        };
+        let registry = default_tool_registry();
+        let tool = registry
+            .resolve("read_document")
+            .expect("read_document tool");
+
+        assert_eq!(crate::canonical_action_kind(&request), ActionKind::Network);
+        assert!(!crate::tool_is_available_readonly_concurrent(&request));
+        assert_eq!(
+            tool.spec.interrupt_semantics,
+            InterruptSemantics::CooperativeCancel
+        );
+        let normalized =
+            crate::schema::normalize_tool_request(&registry, &request).expect("normalized request");
+        assert_eq!(normalized.action, ActionKind::Network);
+        assert_eq!(normalized.target.as_deref(), Some("report.pdf"));
     }
 
     #[test]

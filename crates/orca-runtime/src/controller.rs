@@ -4637,7 +4637,6 @@ mod tests {
                 output_truncation: tool_types::ToolOutputTruncation::default(),
                 max_parallel: 2,
                 provider_response_ingress: None,
-                deepseek_web: None,
             },
         )
         .unwrap()

@@ -1,5 +1,5 @@
 //! DeepSeek's Search, Fetch and OCR APIs, which `web_search`, `web_fetch`
-//! and `read_file` use when Orca talks to the official DeepSeek endpoint.
+//! and `read_document` use when Orca talks to the official DeepSeek endpoint.
 
 use std::fmt;
 use std::future::Future;
@@ -24,8 +24,8 @@ const CANCEL_POLL: Duration = Duration::from_millis(10);
 /// How much of DeepSeek's own error message an error carries.
 const ERROR_MESSAGE_CHARS: usize = 200;
 
-/// Permission for the web tools and `read_file` to call DeepSeek's web and
-/// OCR APIs with the session's API key.
+/// Permission for the web tools and `read_document` to call DeepSeek's web
+/// and OCR APIs with the session's API key.
 #[derive(Clone)]
 pub struct DeepSeekWebAccess {
     origin: String,

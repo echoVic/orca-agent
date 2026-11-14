@@ -260,7 +260,7 @@ pub fn tool_request_target(request: &ToolRequest) -> Option<String> {
 
 fn tool_target(name: &ToolName, arguments: &Value) -> Option<String> {
     match name {
-        ToolName::ReadFile | ToolName::Edit | ToolName::WriteFile => {
+        ToolName::ReadFile | ToolName::ReadDocument | ToolName::Edit | ToolName::WriteFile => {
             arguments["path"].as_str().map(String::from)
         }
         ToolName::ListFiles | ToolName::Glob => arguments["path"]

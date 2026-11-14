@@ -196,7 +196,7 @@ export ORCA_API_KEY="sk-..."
 - 页面返回 404 或 410；
 - 地址是私有的：局域网、本机回环、链路本地或其他保留用途的 IP 地址，或以 `.local`、`.localhost`、`.localdomain`、`.internal`、`.intranet`、`.private`、`.corp`、`.home`、`.lan`、`.home.arpa` 结尾的主机名。
 
-只有同时满足这几个条件，Orca 才会调用 DeepSeek 的联网接口和 OCR 接口：提供方是 DeepSeek，设置了 API key，并且 `base_url` 没有设置，或者指向默认端口上的 `https://api.deepseek.com`（路径不限）。key 只会发往这个地址。`base_url` 是其他地址时（比如第三方网关），`web_search` 和 `web_fetch` 的行为就和没有 DeepSeek 接口时一样，`read_file` 也只读文本文件。
+只有同时满足这几个条件，Orca 才会调用 DeepSeek 的联网接口和 OCR 接口：提供方是 DeepSeek，设置了 API key，并且 `base_url` 没有设置，或者指向默认端口上的 `https://api.deepseek.com`（路径不限）。key 只会发往这个地址。`base_url` 是其他地址时（比如第三方网关），`web_search` 和 `web_fetch` 的行为就和没有 DeepSeek 接口时一样，`read_document` 会说明它需要什么。
 
 DeepSeek 对这些调用单独计费，不算在 token 费用里：每 1000 次成功的搜索 0.75 美元，每 1000 次成功的抓取也是 0.75 美元（2026 年 11 月的价格）。Orca 的成本估算不包含这部分。不想用的话，在用户配置里关掉；项目的 `.orca/config.toml` 改不了这一项：
 
@@ -207,7 +207,9 @@ deepseek_web = false   # 搜索改用 Brave 或 Exa，抓取只在本机直接�
 
 ## 读取文档和图片
 
-满足同样的条件时，`read_file` 还能读 PDF、Word（`.doc`、`.docx`）、PowerPoint（`.ppt`、`.pptx`）和图片文件（`.png`、`.jpg`、`.jpeg`、`.webp`、`.gif`、`.bmp`、`.tif`、`.tiff`）。它把文件上传到 DeepSeek 的 OCR 接口（DeepSeek 称不会保存文件），返回识别出的文字，每页前面有一行 `--- Page N ---`。`offset` 和 `limit` 按这份文字的行数计算。没有官方 endpoint、API key 或 `deepseek_web` 时，`read_file` 会说明为什么读不了这类文件。
+满足同样的条件时，`read_document` 工具能读 PDF、Word（`.doc`、`.docx`）、PowerPoint（`.ppt`、`.pptx`）和图片文件（`.png`、`.jpg`、`.jpeg`、`.webp`、`.gif`、`.bmp`、`.tif`、`.tiff`）。它把文件上传到 DeepSeek 的 OCR 接口，返回识别出的文字，每页前面有一行 `--- Page N ---`。DeepSeek 称文件不会存进它的 Files API，也不会交给对话模型。`offset` 和 `limit` 按这份文字的行数计算，和 `read_file` 数文件行数的方式一样。`read_file` 照旧读文本；遇到不是文本的文档，它会提示模型改用 `read_document`。
+
+因为要上传文件，`read_document` 和 `web_search`、`web_fetch` 一样算联网调用：plan 模式会拒绝，suggest 模式会先征求同意。没有官方 endpoint、API key 或 `deepseek_web` 时，它会说明为什么读不了这个文件。
 
 - 超过 100 MiB 的文件在上传前就会被拒绝；一份文档 DeepSeek 最多识别 1000 页。一次识别最长可能要三分钟。
 - Orca 在退出前会保留最近读过的 8 份文档的文字，所以按 `offset`/`limit` 分段读一份长文档只付一次钱。文件改动过就会重新识别。

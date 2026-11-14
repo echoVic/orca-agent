@@ -161,7 +161,7 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 
 | 能力 | 当前差距 | 建议优先级 |
 |------|----------|------------|
-| 图片/PDF/Notebook 读取 | `read_file` 仍以 UTF-8 文本为主 | P2 |
+| Notebook 读取 | `read_file` 读 UTF-8 文本；PDF、Word、PowerPoint 和图片由 `read_document` 经 DeepSeek OCR 读取（需要官方 endpoint），图片还不能直接交给模型看 | P2 |
 | apply_patch freeform | 仍以 JSON `edit` / `write_file` 为主 | P2 |
 
 ## 可靠性保证
