@@ -1103,6 +1103,42 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_local_fetch_is_not_retried() {
+        let (deepseek, access) = untouched_deepseek();
+
+        let outcome = block_on(finish_with_deepseek(
+            PAGE_URL,
+            Err(FetchError::Cancelled),
+            Some(&access),
+            &|| false,
+        ));
+
+        assert!(matches!(outcome, Err(FetchError::Cancelled)), "{outcome:?}");
+        deepseek.assert_untouched("DeepSeek");
+    }
+
+    #[test]
+    fn cancelling_during_the_deepseek_retry_cancels_the_fetch() {
+        // The listener never answers, so only cancellation ends the retry.
+        let (_deepseek, access) = untouched_deepseek();
+        let started = std::time::Instant::now();
+
+        let outcome = block_on(finish_with_deepseek(
+            PAGE_URL,
+            Err(FetchError::status(403, LOCAL_403.into())),
+            Some(&access),
+            &|| started.elapsed() > Duration::from_millis(200),
+        ));
+
+        assert!(matches!(outcome, Err(FetchError::Cancelled)), "{outcome:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancellation took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn unreadable_page_notes_a_failed_retry() {
         let fixture =
             crate::test_http::serve(vec![(500, r#"{"error":{"message":"boom"}}"#.into())]);

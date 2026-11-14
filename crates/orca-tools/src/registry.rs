@@ -2659,6 +2659,38 @@ mod tests {
     }
 
     #[test]
+    fn registry_hands_deepseek_access_to_web_search() {
+        // A Brave key wins the backend choice; this test covers the DeepSeek
+        // route, so it has nothing to check when one is set.
+        if std::env::var("BRAVE_SEARCH_API_KEY").is_ok_and(|key| !key.trim().is_empty()) {
+            return;
+        }
+        let fixture = crate::test_http::serve(vec![(
+            200,
+            r#"{"results":[{"title":"T","url":"https://example.com/","summary":"S"}]}"#.into(),
+        )]);
+        let ctx = ToolContext::new(Path::new(".")).with_deepseek_web(Some(
+            DeepSeekWebAccess::for_test(&fixture.origin, "sk-test"),
+        ));
+        let request = ToolRequest {
+            id: "search-1".to_string(),
+            name: ToolName::WebSearch,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"query":"rust"}"#.to_string()),
+        };
+
+        let result = default_tool_registry().execute(&request, &ctx);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        assert_eq!(
+            result.output.as_deref(),
+            Some("1. T\nS\nhttps://example.com/")
+        );
+        assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[test]
     fn web_search_schema_exposes_fresh_days() {
         let registry = default_tool_registry();
         let web_search = registry.resolve("web_search").expect("web search tool");
