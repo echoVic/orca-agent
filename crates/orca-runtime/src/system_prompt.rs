@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use chrono::Local;
 use orca_core::config::RunConfig;
 use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
 
@@ -61,7 +60,6 @@ fn build_system_prompt_with_shell_and_tools(
 - Working directory: {cwd}
 - Operating system: {os}
 - {shell_environment}
-- Today's date: {today}
 {git_environment}
 # How you work
 
@@ -155,7 +153,6 @@ When done, respond concisely — like a teammate summarizing a PR. Structure you
 If there's a logical next step you can help with, suggest it briefly."#,
         cwd = cwd.display(),
         os = std::env::consts::OS,
-        today = Local::now().format("%Y-%m-%d"),
         command_guidance = command_guidance,
     )
 }
@@ -361,6 +358,16 @@ mod tests {
         assert!(prompt.contains("Active shell: cmd"));
         assert!(prompt.contains("cmd.exe syntax"));
         assert!(prompt.contains("cmd quoting rules"));
+    }
+
+    #[test]
+    fn system_prompt_has_no_date() {
+        // The date rides in the internal context after the history, so the
+        // system prompt stays the same from one day to the next.
+        let prompt = build_system_prompt(std::path::Path::new("/repo"));
+
+        assert!(!prompt.contains("Today's date"), "{prompt}");
+        assert!(!prompt.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()));
     }
 
     #[test]

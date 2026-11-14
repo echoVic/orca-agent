@@ -304,8 +304,12 @@ pub const GOAL_CONTEXT_FRAGMENT_ID: &str = "goal";
 pub const PLAN_CONTEXT_FRAGMENT_ID: &str = "plan";
 pub const SKILL_CONTEXT_FRAGMENT_ID: &str = "skill";
 pub const MEMORY_CONTEXT_FRAGMENT_ID: &str = "memory";
+/// Today's date. It rides in the internal context rather than the system
+/// prompt, so the system prompt and the history stay the same across days.
+pub const DATE_CONTEXT_FRAGMENT_ID: &str = "date";
 
 pub const RUNTIME_CONTEXT_MAX_TOKENS: usize = 1_024;
+pub const DATE_CONTEXT_MAX_TOKENS: usize = 32;
 pub const MODE_CONTEXT_MAX_TOKENS: usize = 2_048;
 pub const GOAL_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const PLAN_CONTEXT_MAX_TOKENS: usize = 4_096;
@@ -570,6 +574,20 @@ impl Conversation {
                 .filter(|text| !text.trim().is_empty())
                 .map(|text| format!("[Runtime context]\n{text}")),
             RUNTIME_CONTEXT_MAX_TOKENS,
+        );
+    }
+
+    /// Tells the model today's date. Call it when a turn opens: the fragment
+    /// is rendered after the history on every request, so a session that
+    /// crosses midnight, or is resumed on a later day, sees the new date
+    /// without its cached prefix changing.
+    pub fn set_today(&mut self, today: chrono::NaiveDate) {
+        self.replace_internal_context(
+            DATE_CONTEXT_FRAGMENT_ID,
+            InternalContextKind::Runtime,
+            InternalContextOrigin::System,
+            Some(format!("[Date] Today's date is {today}.")),
+            DATE_CONTEXT_MAX_TOKENS,
         );
     }
 
@@ -991,6 +1009,26 @@ mod tests {
         conv.add_system("you are helpful".to_string());
         assert!(
             matches!(&conv.messages[0], Message::System { content, .. } if content == "you are helpful")
+        );
+    }
+
+    #[test]
+    fn set_today_keeps_one_date_fragment_outside_the_history() {
+        let mut conv = Conversation::new();
+        conv.set_today(chrono::NaiveDate::from_ymd_opt(2026, 11, 14).expect("date"));
+        conv.set_today(chrono::NaiveDate::from_ymd_opt(2026, 11, 15).expect("date"));
+
+        let dates: Vec<_> = conv
+            .internal_context
+            .rendered_fragments()
+            .into_iter()
+            .filter(|fragment| fragment.id == DATE_CONTEXT_FRAGMENT_ID)
+            .collect();
+        assert_eq!(dates.len(), 1);
+        assert_eq!(dates[0].content, "[Date] Today's date is 2026-11-15.");
+        assert!(
+            conv.messages.is_empty(),
+            "the date never enters the history"
         );
     }
 

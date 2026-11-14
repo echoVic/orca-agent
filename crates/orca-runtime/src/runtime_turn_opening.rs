@@ -175,6 +175,13 @@ impl RuntimeTurnOpeningStep {
             RuntimeTurnStartResult::Continue => {}
         }
 
+        // Today's date rides in the internal context, after the history, so a
+        // session that crosses midnight or resumes on a later day learns the
+        // new date without changing its cached prefix.
+        input
+            .conversation
+            .set_today(chrono::Local::now().date_naive());
+
         // Soft-land before a hard budget wall: inject a system reminder when
         // remaining budget crosses configured thresholds. Reminders come from
         // the controller and never mutate usage or success state.

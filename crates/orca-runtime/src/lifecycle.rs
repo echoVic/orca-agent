@@ -2255,6 +2255,83 @@ mod tests {
     }
 
     #[test]
+    fn turn_opening_tells_the_model_today() {
+        let mut lifecycle = RuntimeSessionLifecycle::new("turn-date".to_string());
+        let mut actor = RuntimeTaskActor::new(&mut lifecycle);
+        let mut cost_tracker = CostTracker::new(Some("deepseek-flash"));
+        let mut events = EventFactory::new("turn-date".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let provider_config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: None,
+            model: None,
+            reasoning_effort: orca_core::config::ReasoningEffort::Max,
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+            max_output_tokens: None,
+        };
+        let runtime = ModelRuntimeConfig::default();
+        let context_config = context::ContextConfig::for_model_with_runtime(
+            Some(orca_core::model::FLASH_MODEL),
+            &runtime,
+            orca_core::config::ReasoningEffort::default(),
+        );
+        let hooks = HookRunner::default();
+        let mut conversation = Conversation::new();
+        conversation.set_today(chrono::NaiveDate::from_ymd_opt(2001, 1, 1).expect("date"));
+        let model = ModelSelection::parse(None).expect("model");
+        let subagent_type = SubagentType::General;
+        let turn_context =
+            RuntimeTurnContext::new(Path::new("."), "continue", 0, false, &subagent_type);
+
+        let result = RuntimeTurnOpeningStep::new()
+            .open(RuntimeTurnOpeningInput {
+                cancel: &CancelToken::new(),
+                actor: &mut actor,
+                operation: &mut crate::operation_context::OperationContext::for_tests(
+                    orca_core::budget::BudgetSpec::default(),
+                    "turn-date",
+                ),
+                provider: ProviderKind::DeepSeek,
+                context_config: &context_config,
+                provider_config: &provider_config,
+                turn_context,
+                hooks: &hooks,
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                model: &model,
+                model_override: None,
+                cost_tracker: &mut cost_tracker,
+            })
+            .expect("open turn");
+
+        assert!(matches!(result, RuntimeTurnOpeningResult::Continue { .. }));
+        let expected = format!(
+            "[Date] Today's date is {}.",
+            chrono::Local::now().date_naive()
+        );
+        let dates: Vec<_> = conversation
+            .internal_context
+            .rendered_fragments()
+            .into_iter()
+            .filter(|fragment| fragment.id == orca_core::conversation::DATE_CONTEXT_FRAGMENT_ID)
+            .map(|fragment| fragment.content)
+            .collect();
+        assert_eq!(dates, vec![expected]);
+        assert!(
+            !conversation.messages.iter().any(|message| matches!(
+                message,
+                Message::System { content, .. } if content.contains("[Date]")
+            )),
+            "the date stays out of the history"
+        );
+    }
+
+    #[test]
     fn turn_opening_injects_pending_cost_soft_landing_once() {
         let mut lifecycle = RuntimeSessionLifecycle::new("cost-soft-landing".to_string());
         let mut actor = RuntimeTaskActor::new(&mut lifecycle);

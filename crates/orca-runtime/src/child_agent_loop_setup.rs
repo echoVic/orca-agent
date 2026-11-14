@@ -121,6 +121,7 @@ pub(crate) fn try_prepare_child_agent_conversation(
     };
     let next_turn = restore_child_agent_continuation(&mut conversation, &continuation.start)?;
     continuation.restored_next_turn = Some(next_turn);
+    tell_child_today(&mut conversation);
     conversation.add_user(request.prompt.clone());
     let turn = next_turn
         .checked_sub(1)
@@ -191,8 +192,16 @@ fn prepare_fresh_child_agent_conversation(
 ) -> Conversation {
     let mut conversation =
         prepare_child_agent_system_conversation(config, request, cwd, instructions, memory);
+    tell_child_today(&mut conversation);
     conversation.add_user(request.prompt.clone());
     conversation
+}
+
+/// Child agents don't go through the main turn opening, and they are
+/// short-lived, so the date they start with is the date they need. A restored
+/// child gets it after the restore, which requires an empty internal context.
+fn tell_child_today(conversation: &mut Conversation) {
+    conversation.set_today(chrono::Local::now().date_naive());
 }
 
 fn prepare_child_agent_system_conversation(
@@ -516,5 +525,31 @@ mod tests {
         assert!(prompt.contains("`read_file`, `glob`, and `grep`"));
         assert!(prompt.contains("Report source findings."));
         assert!(!prompt.contains("### computer"));
+    }
+
+    #[test]
+    fn a_fresh_child_conversation_knows_today() {
+        let (config, request) = computer_request();
+
+        let conversation = prepare_fresh_child_agent_conversation(
+            &config,
+            &request,
+            Path::new("/repo"),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+        );
+
+        let today = format!(
+            "[Date] Today's date is {}.",
+            chrono::Local::now().date_naive()
+        );
+        assert!(
+            conversation
+                .internal_context
+                .rendered_fragments()
+                .iter()
+                .any(|fragment| fragment.content == today),
+            "a fresh child must be told today's date"
+        );
     }
 }
