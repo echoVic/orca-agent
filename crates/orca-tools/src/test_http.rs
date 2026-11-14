@@ -23,9 +23,42 @@ impl Fixture {
     }
 }
 
+/// One canned response.
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    /// Extra headers besides the content type, length and `connection: close`.
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: String,
+}
+
+impl Reply {
+    /// An empty-bodied redirect to `location`.
+    pub(crate) fn redirect(status: u16, location: &str) -> Self {
+        Self {
+            status,
+            headers: vec![("location".to_string(), location.to_string())],
+            body: String::new(),
+        }
+    }
+}
+
 /// Serves one connection per `(status, body)` pair, in order, each with a
 /// JSON content type and `connection: close`.
 pub(crate) fn serve(responses: Vec<(u16, String)>) -> Fixture {
+    serve_replies(
+        responses
+            .into_iter()
+            .map(|(status, body)| Reply {
+                status,
+                headers: Vec::new(),
+                body,
+            })
+            .collect(),
+    )
+}
+
+/// Serves one connection per reply, in order.
+pub(crate) fn serve_replies(replies: Vec<Reply>) -> Fixture {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
     listener
         .set_nonblocking(true)
@@ -36,20 +69,55 @@ pub(crate) fn serve(responses: Vec<(u16, String)>) -> Fixture {
     );
     let handle = std::thread::spawn(move || {
         let mut requests = Vec::new();
-        for (status, body) in responses {
+        for reply in replies {
             let Some(mut stream) = accept_within(&listener, ACCEPT_TIMEOUT) else {
                 break;
             };
             requests.push(read_request(&mut stream));
-            let reply = format!(
-                "HTTP/1.1 {status} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
+            let extra: String = reply
+                .headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect();
+            let response = format!(
+                "HTTP/1.1 {} Fixture\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n{}",
+                reply.status,
+                reply.body.len(),
+                reply.body
             );
-            let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.write_all(response.as_bytes());
         }
         requests
     });
     Fixture { origin, handle }
+}
+
+/// A listener nothing is expected to reach; [`Untouched::assert_untouched`]
+/// fails the test if anything connected.
+pub(crate) struct Untouched {
+    pub(crate) origin: String,
+    listener: TcpListener,
+}
+
+impl Untouched {
+    pub(crate) fn assert_untouched(&self, what: &str) {
+        self.listener
+            .set_nonblocking(true)
+            .expect("non-blocking untouched listener");
+        assert!(
+            matches!(self.listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
+            "{what} must not be contacted"
+        );
+    }
+}
+
+pub(crate) fn untouched() -> Untouched {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind untouched listener");
+    let origin = format!(
+        "http://{}",
+        listener.local_addr().expect("untouched listener address")
+    );
+    Untouched { origin, listener }
 }
 
 /// The body of a raw HTTP request.

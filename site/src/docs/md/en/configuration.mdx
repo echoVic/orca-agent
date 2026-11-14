@@ -213,7 +213,7 @@ TOML settings to catch it before a task run.
 2. DeepSeek's Search API, when Orca runs against the official DeepSeek endpoint (see below).
 3. Exa, which needs no key. Exa also answers when a DeepSeek search fails, and the result says so.
 
-`web_fetch` always requests the page from your machine first. On the official DeepSeek endpoint, a failed request is tried again through DeepSeek's Fetch API, and the result begins with a line saying so. A page with no readable text counts as a failure. There is no second try when:
+`web_fetch` always requests the page from your machine first. On the official DeepSeek endpoint, a failed request is tried again through DeepSeek's Fetch API, and the result begins with a line saying so. A page whose body has no readable text, such as an app shell that only renders with JavaScript, also counts as a failure. The second try runs on DeepSeek's servers, which follow redirects by their own rules. There is no second try when:
 
 - Orca's own rules refused the URL or a redirect, for example a redirect to another site;
 - the page answered 404 or 410;

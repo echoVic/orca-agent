@@ -40,6 +40,10 @@ struct SearchArgs {
     query: String,
     count: usize,
     recency: Option<Recency>,
+    /// The recency was guessed from the query's wording, not sent by the
+    /// model. DeepSeek turns recency into a hard filter, so it gets only the
+    /// recency the model asked for.
+    recency_inferred: bool,
 }
 
 struct SearchResult {
@@ -158,7 +162,10 @@ async fn search_output(
             .await
             .map(format_results),
         SearchBackend::DeepSeek(access) => {
-            let query = deepseek_query(&args.query, args.recency.as_ref(), today);
+            let recency = (!args.recency_inferred)
+                .then_some(args.recency.as_ref())
+                .flatten();
+            let query = deepseek_query(&args.query, recency, today);
             match deepseek_web::search(access, &query, args.count, should_cancel).await {
                 Ok(hits) => Ok(format_results(
                     hits.into_iter().map(deepseek_result).collect(),
@@ -519,10 +526,14 @@ fn parse_args(request: &ToolRequest) -> Result<SearchArgs, String> {
             .target
             .as_deref()
             .filter(|query| !query.trim().is_empty())
-            .map(|query| SearchArgs {
-                query: query.to_string(),
-                count: default_count(),
-                recency: infer_recency(query),
+            .map(|query| {
+                let recency = infer_recency(query);
+                SearchArgs {
+                    query: query.to_string(),
+                    count: default_count(),
+                    recency_inferred: recency.is_some(),
+                    recency,
+                }
             })
             .ok_or_else(|| "web_search query is required".to_string());
     };
@@ -531,15 +542,20 @@ fn parse_args(request: &ToolRequest) -> Result<SearchArgs, String> {
     if args.query.trim().is_empty() {
         return Err("web_search query is required".to_string());
     }
-    let recency = args
-        .fresh_days
-        .map(Recency::LastDays)
-        .or(args.freshness)
-        .or_else(|| infer_recency(&args.query));
+    let (recency, recency_inferred) =
+        match args.fresh_days.map(Recency::LastDays).or(args.freshness) {
+            Some(sent) => (Some(sent), false),
+            None => {
+                let inferred = infer_recency(&args.query);
+                let recency_inferred = inferred.is_some();
+                (inferred, recency_inferred)
+            }
+        };
     Ok(SearchArgs {
         query: args.query,
         count: args.count,
         recency,
+        recency_inferred,
     })
 }
 
@@ -600,12 +616,12 @@ fn infer_recency(query: &str) -> Option<Recency> {
     let has_word = |words: &[&str]| tokens.iter().any(|token| words.contains(token));
     let has_phrase = |phrases: &[&str]| phrases.iter().any(|phrase| query.contains(phrase));
 
-    let days = if has_word(&["today"]) || has_phrase(&["今天", "今日"]) {
+    let days = if has_word(&["today"]) || has_phrase(&["今天"]) {
         1
     } else if has_phrase(&["本周", "这周"]) {
         7
     } else if has_word(&["latest", "current", "recent", "news", "updates", "update"])
-        || has_phrase(&["最新", "最近", "近期", "新闻"])
+        || has_phrase(&["最新", "近期", "新闻"])
     {
         31
     } else {
@@ -853,6 +869,7 @@ mod tests {
             query: "q".to_string(),
             count: 5,
             recency,
+            recency_inferred: false,
         };
         assert_eq!(
             exa_query(&args(Some(Recency::LastDays(1)))),
@@ -880,7 +897,39 @@ mod tests {
             query: query.to_string(),
             count,
             recency,
+            recency_inferred: false,
         }
+    }
+
+    #[test]
+    fn deepseek_ignores_inferred_recency() {
+        let fixture = crate::test_http::serve(vec![(200, r#"{"results":[]}"#.into())]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+        let args = parse_args(&request(
+            Some(r#"{"query":"rust std::env::current_dir","count":3}"#.to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            args.recency,
+            Some(Recency::LastDays(31)),
+            "Brave and Exa still get the inferred window"
+        );
+
+        search_with(SearchBackend::DeepSeek(&access), &args, UNREACHABLE_EXA)
+            .expect("search succeeds");
+
+        let requests = fixture.requests();
+        let body: Value =
+            serde_json::from_str(crate::test_http::body(&requests[0])).expect("JSON request body");
+        assert_eq!(body["query"], "rust std::env::current_dir");
+    }
+
+    #[test]
+    fn ambiguous_chinese_words_do_not_imply_recency() {
+        assert_eq!(infer_recency("最近邻 搜索 rust"), None);
+        assert_eq!(infer_recency("最近公共祖先 算法"), None);
+        assert_eq!(infer_recency("今日头条 开放平台 API"), None);
     }
 
     fn search_with(

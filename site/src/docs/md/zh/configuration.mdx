@@ -190,7 +190,7 @@ export ORCA_API_KEY="sk-..."
 2. DeepSeek 的 Search API：Orca 连接的是 DeepSeek 官方 endpoint 时使用（见下文）。
 3. Exa：不需要 key。DeepSeek 搜索失败时也由 Exa 补上，结果里会写明。
 
-`web_fetch` 总是先从你的机器直接请求页面。连接的是 DeepSeek 官方 endpoint 时，直接请求失败会改用 DeepSeek 的 Fetch API 再试一次，结果第一行会写明这一点。页面抽不出可读文字也算失败。以下情况不会再试：
+`web_fetch` 总是先从你的机器直接请求页面。连接的是 DeepSeek 官方 endpoint 时，直接请求失败会改用 DeepSeek 的 Fetch API 再试一次，结果第一行会写明这一点。正文里没有可读文字的页面（比如只靠 JavaScript 渲染的应用外壳）也算失败。第二次请求在 DeepSeek 的服务器上进行，按它自己的规则跟随重定向。以下情况不会再试：
 
 - 网址或重定向被 Orca 自己的规则拒绝，比如重定向到了别的网站；
 - 页面返回 404 或 410；

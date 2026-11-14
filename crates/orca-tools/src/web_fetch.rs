@@ -186,10 +186,10 @@ async fn fetch_page(
 async fn fetch_or_cancel(
     url: &str,
     should_cancel: &dyn Fn() -> bool,
-) -> Result<String, FetchError> {
+) -> Result<LocalPage, FetchError> {
     let client = build_client()?;
     let body = fetch_with_redirects(&client, url, should_cancel, 0).await?;
-    Ok(html_to_text(&body))
+    Ok(read_page(&body))
 }
 
 /// The direct request's outcome, or DeepSeek's copy of the page when the
@@ -197,21 +197,22 @@ async fn fetch_or_cancel(
 /// as a failure here, but without a successful retry it is returned as is.
 async fn finish_with_deepseek(
     url: &str,
-    local: Result<String, FetchError>,
+    local: Result<LocalPage, FetchError>,
     deepseek: Option<&DeepSeekWebAccess>,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<Fetched, FetchError> {
+    let direct = |page: LocalPage| Fetched::direct(page.text);
     let Some(access) = deepseek else {
-        return local.map(Fetched::direct);
+        return local.map(direct);
     };
     let reason = match &local {
-        Ok(text) if text.trim().is_empty() && is_public_host(url) => "no readable text".to_string(),
+        Ok(page) if !page.readable && is_public_host(url) => "no readable text".to_string(),
         Err(error @ FetchError::Failed { reason, .. })
             if should_retry_with_deepseek(error, url) =>
         {
             reason.clone()
         }
-        _ => return local.map(Fetched::direct),
+        _ => return local.map(direct),
     };
     match deepseek_web::fetch(access, url, should_cancel).await {
         Ok(page) => Ok(Fetched {
@@ -231,7 +232,7 @@ async fn finish_with_deepseek(
                 reason,
                 status,
             }),
-            other => other.map(Fetched::direct),
+            other => other.map(direct),
         },
     }
 }
@@ -431,19 +432,20 @@ async fn fetch_with_redirects(
 }
 
 fn build_client() -> Result<reqwest::Client, FetchError> {
-    orca_mcp::http::client_builder()
+    let builder = orca_mcp::http::client_builder()
         .timeout(FETCH_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none()) // we follow redirects manually
-        .build()
-        .map_err(|e| {
-            FetchError::failed(
-                format!(
-                    "failed to build HTTP client: {}",
-                    orca_mcp::http::build_error(&e)
-                ),
-                "the HTTP client could not start",
-            )
-        })
+        .redirect(reqwest::redirect::Policy::none()); // we follow redirects manually
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    builder.build().map_err(|e| {
+        FetchError::failed(
+            format!(
+                "failed to build HTTP client: {}",
+                orca_mcp::http::build_error(&e)
+            ),
+            "the HTTP client could not start",
+        )
+    })
 }
 
 async fn await_or_cancel<T>(
@@ -464,7 +466,23 @@ async fn await_or_cancel<T>(
 
 // ── HTML → readable text ───────────────────────────────────────────────────────
 
-/// Convert an HTML body to readable plain text.
+/// A page as the direct request read it.
+#[derive(Debug)]
+struct LocalPage {
+    /// The readable text: title, description and body.
+    text: String,
+    /// Whether the body has text of its own beyond the title and
+    /// description. An app shell that renders with JavaScript has none, even
+    /// when its `<noscript>` fallback says something.
+    readable: bool,
+}
+
+#[cfg(test)]
+fn html_to_text(body: &str) -> String {
+    read_page(body).text
+}
+
+/// Convert a response body to readable plain text.
 ///
 /// Strategy (no external HTML crate needed):
 /// 1. Extract `<title>` and `<meta name="description">` for a header.
@@ -474,15 +492,45 @@ async fn await_or_cancel<T>(
 /// 5. Collapse excessive blank lines.
 ///
 /// If the input does not look like HTML it is returned as-is.
-fn html_to_text(body: &str) -> String {
+fn read_page(body: &str) -> LocalPage {
     if !body.trim_start().starts_with('<') {
-        return body.to_string();
+        return LocalPage {
+            text: body.to_string(),
+            readable: !body.trim().is_empty(),
+        };
     }
 
     // -- 1. pull title and meta description -----------------------------------
     let title = extract_tag_inner(body, "title").unwrap_or_default();
     let description = extract_meta_description(body).unwrap_or_default();
 
+    let trimmed = html_body_text(body);
+    let without_noscript = remove_tag_block(body, "noscript");
+    let readable = if without_noscript.len() == body.len() {
+        !trimmed.is_empty()
+    } else {
+        !html_body_text(&without_noscript).is_empty()
+    };
+
+    // -- build final output ---------------------------------------------------
+    let mut parts: Vec<String> = Vec::new();
+    if !title.is_empty() {
+        parts.push(format!("# {}", title.trim()));
+    }
+    if !description.is_empty() {
+        parts.push(description.trim().to_string());
+    }
+    if !trimmed.is_empty() {
+        parts.push(trimmed);
+    }
+    LocalPage {
+        text: parts.join("\n\n"),
+        readable,
+    }
+}
+
+/// Steps 2–5 of [`read_page`]: the body's text without the head.
+fn html_body_text(body: &str) -> String {
     // -- 2. remove noisy blocks -----------------------------------------------
     let mut text = remove_tag_block(body, "script");
     text = remove_tag_block(&text, "style");
@@ -516,25 +564,11 @@ fn html_to_text(body: &str) -> String {
     text = blank_re.replace_all(&text, "\n\n").into_owned();
 
     // Trim each line.
-    let trimmed: String = text
-        .lines()
+    text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
-        .join("\n");
-
-    // -- build final output ---------------------------------------------------
-    let mut parts: Vec<String> = Vec::new();
-    if !title.is_empty() {
-        parts.push(format!("# {}", title.trim()));
-    }
-    if !description.is_empty() {
-        parts.push(description.trim().to_string());
-    }
-    if !trimmed.is_empty() {
-        parts.push(trimmed);
-    }
-    parts.join("\n\n")
+        .join("\n")
 }
 
 fn extract_tag_inner(html: &str, tag: &str) -> Option<String> {
@@ -823,7 +857,10 @@ mod tests {
 
         let fetched = block_on(finish_with_deepseek(
             PAGE_URL,
-            Ok("  \n".to_string()),
+            Ok(LocalPage {
+                text: "# App".to_string(),
+                readable: false,
+            }),
             Some(&access),
             &|| false,
         ))
@@ -837,6 +874,122 @@ mod tests {
         );
         assert_eq!(fetched.text, "# A\n\nbody");
         assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[test]
+    fn app_shell_page_has_no_readable_body() {
+        let shell = r#"<!doctype html><html><head><title>App</title><meta name="description" content="An app"></head><body><div id="root"></div><noscript>You need to enable JavaScript to run this app.</noscript><script>boot()</script></body></html>"#;
+
+        let page = read_page(shell);
+
+        assert!(!page.readable, "{}", page.text);
+        assert!(page.text.starts_with("# App"), "{}", page.text);
+        assert!(
+            read_page("<html><head><title>Post</title></head><body><p>Real words.</p><noscript>Enable JS</noscript></body></html>")
+                .readable
+        );
+        assert!(read_page("plain text").readable);
+        assert!(!read_page("  \n").readable);
+    }
+
+    fn untouched_deepseek() -> (crate::test_http::Untouched, DeepSeekWebAccess) {
+        let deepseek = crate::test_http::untouched();
+        let access = DeepSeekWebAccess::for_test(&deepseek.origin, "sk-test");
+        (deepseek, access)
+    }
+
+    #[test]
+    fn cross_origin_redirect_is_rejected_and_never_sent_to_deepseek() {
+        let site = crate::test_http::serve_replies(vec![crate::test_http::Reply::redirect(
+            302,
+            "http://elsewhere.example/landing",
+        )]);
+        let local = block_on(fetch_or_cancel(&format!("{}/a", site.origin), &|| false));
+        assert!(
+            matches!(&local, Err(FetchError::Rejected(message)) if message.starts_with("cross-origin redirect blocked")),
+            "{local:?}"
+        );
+        let (deepseek, access) = untouched_deepseek();
+
+        let outcome = block_on(finish_with_deepseek(
+            PAGE_URL,
+            local,
+            Some(&access),
+            &|| false,
+        ));
+
+        assert!(
+            matches!(outcome, Err(FetchError::Rejected(_))),
+            "{outcome:?}"
+        );
+        deepseek.assert_untouched("DeepSeek");
+        assert_eq!(site.requests().len(), 1);
+    }
+
+    #[test]
+    fn redirect_loop_is_rejected_and_never_sent_to_deepseek() {
+        let site = crate::test_http::serve_replies(
+            (0..=MAX_REDIRECTS)
+                .map(|_| crate::test_http::Reply::redirect(302, "/loop"))
+                .collect(),
+        );
+        let local = block_on(fetch_or_cancel(&format!("{}/loop", site.origin), &|| false));
+        assert!(
+            matches!(&local, Err(FetchError::Rejected(message)) if message.starts_with("too many redirects")),
+            "{local:?}"
+        );
+        let (deepseek, access) = untouched_deepseek();
+
+        let outcome = block_on(finish_with_deepseek(
+            PAGE_URL,
+            local,
+            Some(&access),
+            &|| false,
+        ));
+
+        assert!(
+            matches!(outcome, Err(FetchError::Rejected(_))),
+            "{outcome:?}"
+        );
+        deepseek.assert_untouched("DeepSeek");
+        assert_eq!(site.requests().len(), MAX_REDIRECTS + 1);
+    }
+
+    #[test]
+    fn missing_page_is_never_sent_to_deepseek() {
+        let site = crate::test_http::serve(vec![(404, "missing".into())]);
+        let local = block_on(fetch_or_cancel(&format!("{}/gone", site.origin), &|| false));
+        assert!(
+            matches!(
+                &local,
+                Err(FetchError::Failed {
+                    status: Some(404),
+                    ..
+                })
+            ),
+            "{local:?}"
+        );
+        let (deepseek, access) = untouched_deepseek();
+
+        let outcome = block_on(finish_with_deepseek(
+            PAGE_URL,
+            local,
+            Some(&access),
+            &|| false,
+        ));
+
+        assert!(
+            matches!(
+                outcome,
+                Err(FetchError::Failed {
+                    status: Some(404),
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+        deepseek.assert_untouched("DeepSeek");
+        site.requests();
     }
 
     #[test]
@@ -901,12 +1054,15 @@ mod tests {
 
         let blank = block_on(finish_with_deepseek(
             PAGE_URL,
-            Ok(String::new()),
+            Ok(LocalPage {
+                text: "# App".to_string(),
+                readable: false,
+            }),
             None,
             &|| false,
         ))
-        .expect("a blank page is returned as before");
+        .expect("a page without readable text is returned as before");
         assert_eq!(blank.note, None);
-        assert_eq!(blank.text, "");
+        assert_eq!(blank.text, "# App");
     }
 }
