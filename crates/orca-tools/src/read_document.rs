@@ -425,6 +425,29 @@ mod tests {
         fixture.requests();
     }
 
+    /// The key `read_document` claims for the file at `path`.
+    fn claim_key(path: &Path) -> OcrKey {
+        let metadata = fs::metadata(path).expect("the document");
+        OcrKey {
+            path: path.canonicalize().expect("a canonical path"),
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+
+    /// Waits until a read has claimed `key`, so that the next read finds the
+    /// recognition under way, however late the first thread started.
+    fn wait_until_claimed(key: &OcrKey) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !lock_cache().pending.contains(key) {
+            assert!(
+                Instant::now() < deadline,
+                "the first read never claimed the file"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Reads `path` in `cwd` on a new thread, as a parallel tool call does.
     fn read_in_thread(
         id: &'static str,
@@ -484,7 +507,7 @@ mod tests {
         );
         let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
         let first = read_in_thread("first", cwd.path(), "slow.pdf", &access);
-        std::thread::sleep(Duration::from_millis(100));
+        wait_until_claimed(&claim_key(&cwd.path().join("slow.pdf")));
         let started = Instant::now();
 
         let second = execute_or_cancel(
