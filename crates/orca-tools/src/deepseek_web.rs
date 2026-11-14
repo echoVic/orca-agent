@@ -350,12 +350,16 @@ fn reports_error(error: &Value) -> bool {
 
 /// A region's coordinates, which mean nothing to a model: the opening tag,
 /// the coordinate list, whole or cut short at the end of a page, and the
-/// closing tag when there is one. The list is bracketed, so an unclosed box
-/// takes nothing after it.
+/// closing tag when there is one. The list is matched by its shape, a list of
+/// `[x1, y1, x2, y2]` regions, so after an unclosed box the numbers and
+/// brackets of the text that follows stay.
 static LAYOUT_SPAN: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(
-        r"<[|｜](?:box|det)[|｜]>(?:\s*(?:\[[\d\s,.\[\]]*\]|\[[\d\s,.\[\]]*\z))?(?:\s*<[|｜]/(?:box|det)[|｜]>)?",
-    )
+    let region = r"\[[\d\s,.]*\]";
+    let whole = format!(r"\[\s*{region}(?:\s*,\s*{region})*\s*\]");
+    let cut = format!(r"\[(?:\s*{region}\s*,)*\s*(?:\[[\d\s,.]*\]?)?\s*\z");
+    regex::Regex::new(&format!(
+        r"<[|｜](?:box|det)[|｜]>(?:[ \t]*(?:{whole}|{cut}))?(?:\s*<[|｜]/(?:box|det)[|｜]>)?"
+    ))
     .expect("layout span pattern")
 });
 /// A closing tag left without its opening tag.
@@ -1253,5 +1257,22 @@ mod tests {
         );
         // An ASCII `<|` at the end can be code.
         assert_eq!(ocr_text("a <|b and c<|"), "a <|b and c<|");
+        // After an unclosed box, bracketed numbers and number lines are text.
+        assert_eq!(
+            ocr_text("<｜box｜>[[1, 2, 3, 4]] [12] cites"),
+            " [12] cites"
+        );
+        assert_eq!(
+            ocr_text("Total<｜box｜>[[1, 2, 3, 4]] 12, 34 [5]\nnext line"),
+            "Total 12, 34 [5]\nnext line"
+        );
+        assert_eq!(
+            ocr_text("values <｜box｜>[[1,2,3,4]]\n[1, 2, 3]"),
+            "values \n[1, 2, 3]"
+        );
+        assert_eq!(ocr_text("a <｜box｜> [1] b"), "a  [1] b");
+        // Cut short after a whole region, or inside the second one.
+        assert_eq!(ocr_text("Fig<｜box｜>[[1, 2, 3, 4], [5, 6"), "Fig");
+        assert_eq!(ocr_text("Fig<｜box｜>[[1, 2, 3, 4],"), "Fig");
     }
 }
