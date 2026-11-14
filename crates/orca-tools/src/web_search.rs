@@ -229,10 +229,13 @@ fn deepseek_query(query: &str, recency: Option<&Recency>, today: NaiveDate) -> S
 }
 
 fn deepseek_result(hit: DeepSeekSearchHit) -> SearchResult {
+    // Summaries are Markdown with blank lines, and results are separated by
+    // blank lines, so each summary becomes one line.
+    let summary = hit.summary.split_whitespace().collect::<Vec<_>>().join(" ");
     SearchResult {
         title: hit.title,
         url: hit.url,
-        description: truncate_chars(&hit.summary, DEEPSEEK_SUMMARY_CHARS),
+        description: truncate_chars(&summary, DEEPSEEK_SUMMARY_CHARS),
         published: hit.date,
     }
 }
@@ -980,6 +983,31 @@ mod tests {
         assert_eq!(
             body,
             serde_json::json!({"query": "rust release after:2026-11-07", "count": 3})
+        );
+    }
+
+    #[test]
+    fn deepseek_summaries_are_flattened_to_one_paragraph() {
+        let response = serde_json::json!({"results": [{
+            "title": "Title",
+            "url": "https://example.com/a",
+            "summary": "## What's new\n\n### Never type\n\nStable  now.\t"
+        }]})
+        .to_string();
+        let fixture = crate::test_http::serve(vec![(200, response)]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let output = search_with(
+            SearchBackend::DeepSeek(&access),
+            &search_args("rust", 5, None),
+            UNREACHABLE_EXA,
+        )
+        .expect("search succeeds");
+        fixture.requests();
+
+        assert_eq!(
+            output,
+            "1. Title\n## What's new ### Never type Stable now.\nhttps://example.com/a"
         );
     }
 
