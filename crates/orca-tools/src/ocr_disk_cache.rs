@@ -3,7 +3,6 @@
 //! process, or a later session does not pay for the recognition again.
 
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -59,12 +58,17 @@ fn store_in(dir: &Path, key: &str, result: &OcrResult, max_bytes: u64) {
     if fs::create_dir_all(dir).is_err() {
         return;
     }
-    // Written beside the entry and renamed into place, so that a reader in
-    // another process sees a whole entry or none.
-    let temp = dir.join(format!(".{key}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let written = fs::File::create(&temp).and_then(|mut file| file.write_all(&json));
-    if written.is_err() || fs::rename(&temp, entry_path(dir, key)).is_err() {
-        let _ = fs::remove_file(&temp);
+    // Through the platform layer, as every replace-in-place write: a reader
+    // in another process sees a whole entry or none, a link at the entry is
+    // not followed, and only the owner can read it, since the text is the
+    // user's document.
+    if orca_platform::fs::atomic_write_private(
+        &entry_path(dir, key),
+        &json,
+        orca_platform::fs::AtomicWritePolicy::NoFollow,
+    )
+    .is_err()
+    {
         return;
     }
     prune(dir, max_bytes);
@@ -186,24 +190,79 @@ mod tests {
         assert_eq!(names(dir.path()), ["c.json", "d.json"]);
     }
 
+    /// A result whose stored entry is about `text_len` bytes.
+    fn result_of_size(text_len: usize) -> OcrResult {
+        OcrResult {
+            pages: vec![OcrPage {
+                number: 1,
+                text: "x".repeat(text_len),
+                complete: true,
+            }],
+            page_count: Some(1),
+        }
+    }
+
     #[test]
     fn concurrent_stores_of_one_entry_leave_it_whole() {
-        let dir = tempfile::tempdir().expect("a cache dir");
-        let result = sample_result();
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
+        let dir = tempfile::tempdir().expect("a cache dir");
+        let done = Arc::new(AtomicBool::new(false));
+        // A reader in another process sees a whole entry or none, whatever
+        // size each writer's result has.
+        let reader = {
+            let path = entry_path(dir.path(), "key");
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let (mut seen, mut torn) = (0_usize, 0_usize);
+                while !done.load(Ordering::SeqCst) {
+                    if let Ok(bytes) = fs::read(&path) {
+                        seen += 1;
+                        if serde_json::from_slice::<OcrResult>(&bytes).is_err() {
+                            torn += 1;
+                        }
+                    }
+                }
+                (seen, torn)
+            })
+        };
         let writers = (0..8)
-            .map(|_| {
+            .map(|writer| {
                 let dir = dir.path().to_path_buf();
-                let result = result.clone();
-                std::thread::spawn(move || store_in(&dir, "key", &result, MAX_DISK_CACHE_BYTES))
+                std::thread::spawn(move || {
+                    for round in 0..25 {
+                        let size = (writer * 25 + round) % 7 * 4096 + 1;
+                        store_in(&dir, "key", &result_of_size(size), MAX_DISK_CACHE_BYTES);
+                    }
+                })
             })
             .collect::<Vec<_>>();
         for writer in writers {
             writer.join().expect("a writer");
         }
+        done.store(true, Ordering::SeqCst);
+        let (seen, torn) = reader.join().expect("the reader");
 
-        assert_eq!(load_in(dir.path(), "key"), Some(result));
+        assert_eq!(torn, 0, "{torn} of {seen} reads saw a partial entry");
+        assert!(load_in(dir.path(), "key").is_some());
         assert_eq!(names(dir.path()), ["key.json"], "no temp file is left");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_entries_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("a cache dir");
+        store_in(dir.path(), "key", &sample_result(), MAX_DISK_CACHE_BYTES);
+
+        let mode = fs::metadata(entry_path(dir.path(), "key"))
+            .expect("the entry")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "recognized text is the user's document");
     }
 
     #[test]
