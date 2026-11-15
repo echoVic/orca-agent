@@ -2044,6 +2044,17 @@ impl WorkflowRunner {
                     &child_task_id,
                     "workflow child cancelled before execution".into(),
                 );
+                // A child submitted after its workflow task started stopping
+                // is created cancelled, so this check can see a stop before
+                // the host loop does. Report it as the stop, like the checks
+                // before the call: the script rethrows this error, and any
+                // other message fails the stopped run.
+                if self.tasks.is_cancelled(workflow_task_id) {
+                    return Err(WorkflowChildAgentCallError {
+                        cancelled: true,
+                        ..workflow_continuation_error(STOP_REQUESTED_ERROR.to_string())
+                    });
+                }
                 return Err(workflow_continuation_error(
                     "workflow child cancelled before execution".into(),
                 ));
@@ -4246,6 +4257,70 @@ mod tests {
     }
 
     #[test]
+    fn workflow_child_submitted_after_its_workflow_started_stopping_reports_the_stop() {
+        // A host shutdown stops the workflow task, and a child submitted after
+        // that is created cancelled. Its error reaches the script, so it must
+        // be the stop: an ordinary failure fails the stopped run (#169).
+        let temp = tempdir().unwrap();
+        let script_path = temp.path().join("stopping-child.js");
+        fs::write(
+            &script_path,
+            "export const meta = { name: 'stopping-child', description: 'stopping child', phases: [] };\nexport default 'done';",
+        )
+        .unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().to_path_buf());
+        let tasks = TaskRegistry::new("workflow-stopping-child".to_string());
+        let runner =
+            WorkflowRunner::new(config, tasks.clone(), temp.path().join("workflow-session"))
+                .with_child_executor(unreachable_workflow_child_executor);
+        let prepared = runner
+            .prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+                script_path: Some(script_path.display().to_string()),
+                ..Default::default()
+            }))
+            .expect("prepare stopping workflow");
+        runner
+            .activate_prepared_run(&prepared.prepared)
+            .expect("activate stopping workflow");
+        tasks
+            .request_stop(&prepared.task_id)
+            .expect("stop the workflow task");
+        let call = AgentCall {
+            call_id: "call-stopping".to_string(),
+            call_path: "agent-stopping".to_string(),
+            phase: None,
+            prompt: "never runs".to_string(),
+            opts: serde_json::json!({}),
+        };
+        let policy = WorkflowAgentExecutionPolicy {
+            max_agent_retries: 0,
+            max_agent_tokens: None,
+            allowed_tools: None,
+            tool_policy_label: None,
+        };
+
+        let error = runner
+            .run_child_agent_call(
+                &prepared.task_id,
+                &call,
+                &WorkflowIpcContext::new(),
+                &policy,
+                &CancelToken::new(),
+                None,
+                None,
+            )
+            .expect_err("a child under a stopping workflow must not run");
+
+        assert!(
+            is_stop_requested_error(&error.message),
+            "child error must carry the stop: {}",
+            error.message
+        );
+        assert!(error.cancelled, "a child that never ran was cancelled");
+    }
+
+    #[test]
     fn workflow_agent_delay_observes_pause_and_resume_requests() {
         let temp = tempdir().unwrap();
         let workflow_dir = temp.path().join(".orca").join("workflows");
@@ -4327,6 +4402,15 @@ mod tests {
             error: None,
             budget_usage: None,
         })
+    }
+
+    fn unreachable_workflow_child_executor(
+        _config: &RunConfig,
+        _request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, SharedEventBuffer>,
+        _cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        panic!("a child submitted under a stopping workflow must not run");
     }
 
     fn budgeted_workflow_child_executor(
