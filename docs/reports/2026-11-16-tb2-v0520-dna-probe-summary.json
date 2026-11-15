@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-15T20:18:13Z",
+  "run": "jobs/probe-dna-v0520/dna-probe-v0520",
+  "protocol": {
+    "source_commit": "39ee9edc",
+    "binary": "static x86_64-unknown-linux-musl release build",
+    "harness": "Harbor 0.20.0",
+    "agent": "terminal_bench.orca_agent:OrcaInstalledAgent",
+    "model": "deepseek-flash",
+    "attempts_per_task": 2,
+    "concurrency": 2,
+    "excluded_tasks": [],
+    "environment_build_timeout_multiplier": null,
+    "note": "mean_reward uses every scheduled trial as the denominator (Harbor's own definition; a trial without a reward counts as 0); mean_reward_scored_only averages only the trials that produced a verifier reward."
+  },
+  "totals": {
+    "trials": 2,
+    "scored": 2,
+    "passed": 1,
+    "zeroed": 1,
+    "errored": 0,
+    "mean_reward": 0.5,
+    "mean_reward_scored_only": 0.5,
+    "pass_rate_of_all_trials": 0.5,
+    "exceptions": {}
+  },
+  "trials": [
+    {
+      "task": "terminal-bench/dna-assembly",
+      "trial": "dna-assembly__4fzjBm9",
+      "reward": 0.0,
+      "exception": null,
+      "exception_message": null,
+      "agent_exit_code": 0,
+      "agent_terminal": "success",
+      "trajectory_bytes": 1083827,
+      "turns": 29,
+      "agent_seconds": 442.5,
+      "verifier_seconds": 3.6
+    },
+    {
+      "task": "terminal-bench/dna-assembly",
+      "trial": "dna-assembly__rPZwPeY",
+      "reward": 1.0,
+      "exception": null,
+      "exception_message": null,
+      "agent_exit_code": 0,
+      "agent_terminal": "success",
+      "trajectory_bytes": 1248112,
+      "turns": 40,
+      "agent_seconds": 550.5,
+      "verifier_seconds": 33.8
+    }
+  ]
+}

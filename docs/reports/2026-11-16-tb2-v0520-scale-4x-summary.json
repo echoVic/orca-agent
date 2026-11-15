@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-15T20:09:28Z",
+  "run": "jobs/scale-4x-v0520/scale-4.0x-20261116-032212",
+  "protocol": {
+    "source_commit": "39ee9edc",
+    "binary": "static x86_64-unknown-linux-musl release build",
+    "harness": "Harbor 0.20.0",
+    "agent": "terminal_bench.orca_agent:OrcaInstalledAgent",
+    "model": "deepseek-flash",
+    "attempts_per_task": 1,
+    "concurrency": 3,
+    "excluded_tasks": [],
+    "environment_build_timeout_multiplier": null,
+    "note": "mean_reward uses every scheduled trial as the denominator (Harbor's own definition; a trial without a reward counts as 0); mean_reward_scored_only averages only the trials that produced a verifier reward."
+  },
+  "totals": {
+    "trials": 5,
+    "scored": 5,
+    "passed": 0,
+    "zeroed": 5,
+    "errored": 0,
+    "mean_reward": 0.0,
+    "mean_reward_scored_only": 0.0,
+    "pass_rate_of_all_trials": 0.0,
+    "exceptions": {}
+  },
+  "trials": [
+    {
+      "task": "terminal-bench/adaptive-rejection-sampler",
+      "trial": "adaptive-rejection-sampler__wpRSmsc",
+      "reward": 0.0,
+      "exception": null,
+      "exception_message": null,
+      "agent_exit_code": 0,
+      "agent_terminal": "success",
+      "trajectory_bytes": 1714171,
+      "turns": 39,
+      "agent_seconds": 958.0,
+      "verifier_seconds": 60.6
+    },
+    {
+      "task": "terminal-bench/dna-assembly",
+      "trial": "dna-assembly__CEaZ5ET",
+      "reward": 0.0,
+      "exception": null,
+      "exception_message": null,
+      "agent_exit_code": 0,
+      "agent_terminal": "success",
+      "trajectory_bytes": 1107017,
+      "turns": 25,
+      "agent_seconds": 506.3,
+      "verifier_seconds": 47.3
+    },
+    {
+      "task": "terminal-bench/filter-js-from-html",
+      "trial": "filter-js-from-html__jdZDyDq",
+      "reward": 0.0,
+      "exception": null,
+      "exception_message": null,
+      "agent_exit_code": 0,
+      "agent_terminal": "success",
+      "trajectory_bytes": 2889458,
+      "turns": 80,
+      "agent_seconds": 1662.6,
+      "verifier_seconds": 695.2
+    },
+    {
+      "task": "terminal-bench/make-doom-for-mips",
+      "trial": "make-doom-for-mips__DWH3x3M",
+      "reward": 0.0,
+      "exception": null,
+      "exception_message": null,
+      "agent_exit_code": 0,
+      "agent_terminal": "success",
+      "trajectory_bytes": 2540307,
+      "turns": 80,
+      "agent_seconds": 933.7,
+      "verifier_seconds": 38.0
+    },
+    {
+      "task": "terminal-bench/pytorch-model-cli",
+      "trial": "pytorch-model-cli__eM7pi6b",
+      "reward": 0.0,
+      "exception": null,
+      "exception_message": null,
+      "agent_exit_code": 0,
+      "agent_terminal": "success",
+      "trajectory_bytes": 463824,
+      "turns": 25,
+      "agent_seconds": 302.4,
+      "verifier_seconds": 133.7
+    }
+  ]
+}

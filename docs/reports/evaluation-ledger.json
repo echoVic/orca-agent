@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-10-28",
+  "updated_at": "2026-11-16",
   "definition": {
     "tb2_mean": "Harbor aggregation over every scheduled trial; a trial without a verifier reward counts as 0",
     "tb2_mean_scored_only": "mean over the trials that produced a verifier reward",
@@ -158,6 +158,63 @@
       ],
       "report": "docs/reports/2026-10-28-v0.5.14-evaluation.md",
       "summary": "docs/reports/2026-10-28-tb2-v0514-summary.json"
+    },
+    {
+      "date": "2026-11-16",
+      "source_commit": "39ee9edc",
+      "version": "v0.5.20",
+      "tasks": 87,
+      "excluded_tasks": [
+        "terminal-bench/qemu-startup",
+        "terminal-bench/qemu-alpine-ssh"
+      ],
+      "settings": {
+        "attempts": 1,
+        "concurrency": 5,
+        "environment_build_timeout_multiplier": 2.0,
+        "dataset_ref": "sha256:c6fc2e2382c1dbae99b2d5ecd2f4f4a60c3c01e0d84642d69b4afd92e99d078b",
+        "model": "deepseek-flash",
+        "reasoning_effort": "max",
+        "budget_scaling": {
+          "2x": 2,
+          "4x": 4
+        }
+      },
+      "tb2_mean": 0.7816,
+      "tb2_mean_scored_only": 0.8395,
+      "tb2_passed": 68,
+      "tb2_scored": 81,
+      "tb2_errored": 11,
+      "exceptions": {
+        "AgentTimeoutError": 5,
+        "AgentSetupTimeoutError": 3,
+        "VerifierTimeoutError": 3
+      },
+      "budget_scaling": {
+        "failures": 19,
+        "passed_at_2x": 14,
+        "passed_at_4x": 0,
+        "equivalent_mean_2x": 0.9425,
+        "equivalent_mean_4x": 0.9425,
+        "time_bound": 14,
+        "environment_timeouts_at_1x": 6,
+        "capability": 4,
+        "capability_tasks": [
+          "terminal-bench/adaptive-rejection-sampler",
+          "terminal-bench/filter-js-from-html",
+          "terminal-bench/make-doom-for-mips",
+          "terminal-bench/pytorch-model-cli"
+        ],
+        "flaky": 1,
+        "flaky_tasks": [
+          "terminal-bench/dna-assembly"
+        ]
+      },
+      "issues_filed": [
+        177
+      ],
+      "report": "docs/reports/2026-11-16-tb2-v0520-budget-scaling.md",
+      "summary": "docs/reports/2026-11-16-tb2-v0520-baseline-summary.json"
     }
   ]
 }
