@@ -20,8 +20,8 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// DeepSeek gives a recognition 180 s from the start of the upload.
 const OCR_TIMEOUT: Duration = Duration::from_secs(180);
 /// Word and PowerPoint text is extracted directly; everything else is
-/// recognized page by page.
-const OCR_PURPOSE: &str = "text_recognition";
+/// recognized page by page. The OCR disk cache keys entries by it too.
+pub(crate) const OCR_PURPOSE: &str = "text_recognition";
 const CANCEL_POLL: Duration = Duration::from_millis(10);
 /// How much of DeepSeek's own error message an error carries.
 const ERROR_MESSAGE_CHARS: usize = 200;
