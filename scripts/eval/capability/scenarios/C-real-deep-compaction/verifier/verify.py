@@ -82,18 +82,34 @@ if CODE not in str(snapshot.get("rolling_summary") or ""):
 if any(CODE in json.dumps(message) for message in snapshot.get("messages") or []):
     fail("a kept message still holds the code verbatim, so the summary was not what carried it")
 
-# 3. Recalled from the conversation, not read back from disk.
-wrote = False
-for event in events:
+# 3. Recalled from the conversation, not read back from disk. The answer
+#    write is the first successful tool call that names answer.txt and
+#    carries the code. Before it, no other tool output may hold the code; at
+#    no point may a call touch the saved transcript; and the deep compaction
+#    must come first, or the answer came from the unsummarized history.
+deep_line = next(index for index, event in enumerate(events)
+                 if event.get("type") == "context.compacted"
+                 and (event.get("payload") or {}).get("strategy") == "remote_summary")
+requested = {}
+answer_line = None
+for index, event in enumerate(events):
     kind, payload = event.get("type"), event.get("payload") or {}
     if kind == "tool.call.requested":
         call = json.dumps([payload.get("target"), payload.get("raw_arguments")])
         if home in call or SESSION_ID in call or "/sessions/" in call:
             fail("a tool call read the saved transcript: %s" % call[:200])
-        if CODE in call:
-            wrote = True
-    elif kind in ("tool.call.completed", "tool.output.delta") and not wrote and CODE in json.dumps(payload):
-        fail("the code showed up in a tool output before the agent wrote it, so it came from disk")
+        requested[payload.get("id")] = (index, call)
+    elif kind in ("tool.call.completed", "tool.output.delta") and answer_line is None:
+        line, call = requested.get(payload.get("id"), (None, ""))
+        answer_write = line is not None and "answer.txt" in call and CODE in call
+        if answer_write and kind == "tool.call.completed" and payload.get("status") == "completed":
+            answer_line = line
+        elif not answer_write and CODE in json.dumps(payload):
+            fail("the code showed up in a tool output before the agent wrote answer.txt, so it came from disk")
+if answer_line is None:
+    fail("no successful tool call wrote the code into answer.txt")
+if answer_line < deep_line:
+    fail("answer.txt was written before the remote_summary compaction, so the summary did not carry it")
 
 # 4. The answer and the run.
 answer = pathlib.Path("answer.txt")
