@@ -17,7 +17,7 @@
   "verify": [
     "python3 -B @verifier/verify.py"
   ],
-  "provider": "mock",
+  "provider": "deepseek",
   "evaluation": {
     "split": "holdout",
     "suite_id": "multi-constraint-v1",

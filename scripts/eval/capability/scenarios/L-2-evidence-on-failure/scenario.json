@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "L-2-evidence-on-failure",
+  "axis": "L",
+  "rung": 2,
+  "difficulty": {
+    "level": 2,
+    "kind": "failure-evidence"
+  },
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "prompts/task.md",
+  "verify": [
+    "python3 verify.py"
+  ],
+  "limits": {
+    "wall_seconds": 300,
+    "verify_seconds": 120
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "mock",
+  "exec_flags": [
+    "--save-history"
+  ]
+}

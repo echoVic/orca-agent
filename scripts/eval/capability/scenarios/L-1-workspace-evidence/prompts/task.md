@@ -1,0 +1,1 @@
+FIMODE=tool_script FITOOL=cmd FICMD64=cHJpbnRmICdzaGVsbCBjaGFuZ2VkXG4nID4gZmlsZS50eHQ7IHByaW50ZiAnbmV3XG4nID4gbmV3LnR4dA== change the files

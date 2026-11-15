@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "axis": "K",
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "prompts/task.md",
+  "verify": [
+    "python3 verify.py"
+  ],
+  "limits": {
+    "wall_seconds": 600,
+    "verify_seconds": 180
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "deepseek",
+  "id": "K-3-read-document-ocr",
+  "rung": 3,
+  "difficulty": {
+    "level": 3,
+    "kind": "ocr"
+  }
+}

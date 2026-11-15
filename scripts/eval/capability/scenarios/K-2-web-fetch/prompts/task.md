@@ -1,0 +1,1 @@
+Use the web_fetch tool on https://example.com and write the page title into title.txt using write_file.

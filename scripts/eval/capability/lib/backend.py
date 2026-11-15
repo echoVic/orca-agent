@@ -398,6 +398,8 @@ def run_local(
             **os.environ,
             "CAPABILITY_ORCA_BIN": str(binary),
             "CAPABILITY_GOAL_OUTCOME": str(attempt_dir / "goal-outcome.json"),
+            "CAPABILITY_ATTEMPT_DIR": str(attempt_dir),
+            "CAPABILITY_HOME": str(home),
             "PYTHONDONTWRITEBYTECODE": "1",
             **scenario.verify_env,
         }
@@ -468,7 +470,8 @@ def run_local(
             mock = MockProvider(attempt_dir / "provider-requests.jsonl")
         argv = (
             [str(binary), "exec", "--mode", "full-auto", "--output-format", "jsonl",
-             "--cwd", str(workspace), *evidence_lib.exec_options(config), "--", scenario.prompt]
+             "--cwd", str(workspace), *evidence_lib.exec_options(config), *scenario.exec_flags,
+             "--", scenario.prompt]
             if scenario.command == "exec"
             else [str(binary), "workflow", "run", str(workspace / scenario.script), "--cwd", str(workspace)]
         )
@@ -537,7 +540,13 @@ def run_local(
     verifier_results: list[dict] = []
     verifier_outputs: list[str] = []
     for index, command in enumerate(verifier_commands):
-        verify_process_env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "CAPABILITY_ORCA_BIN": str(binary), "CAPABILITY_EXTERNAL_DB": str(attempt_dir / "external-state.sqlite"), **scenario.verify_env}
+        verify_process_env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "CAPABILITY_ORCA_BIN": str(binary), "CAPABILITY_EXTERNAL_DB": str(attempt_dir / "external-state.sqlite"),
+                             "CAPABILITY_ATTEMPT_DIR": str(attempt_dir),
+                             "CAPABILITY_HOME": str(home),
+                             "CAPABILITY_PROVIDER_LOG": str(attempt_dir / "provider-requests.jsonl"),
+                             "CAPABILITY_AGENT_STDOUT": str(stdout_path),
+                             "CAPABILITY_AGENT_STDERR": str(stderr_path),
+                             **scenario.verify_env}
         try:
             result = subprocess.run(
                 ["bash", "-lc", command], cwd=workspace, capture_output=True, text=True,

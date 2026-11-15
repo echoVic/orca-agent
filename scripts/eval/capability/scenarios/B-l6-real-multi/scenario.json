@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "B-l6-real-multi",
+  "axis": "B",
+  "rung": 6,
+  "difficulty": {
+    "level": 6,
+    "files": "real-repo",
+    "functions": 2,
+    "context_tokens_approx": 50000
+  },
+  "backend": "docker",
+  "image": "messense/rust-musl-cross:x86_64-musl",
+  "fixture": "fixture",
+  "prepare": "../../generators/orca_real.py",
+  "prepare_env": {
+    "CAPABILITY_REAL_TASK": "multi"
+  },
+  "prompt": "prompts/task.md",
+  "verify": [
+    "mkdir -p crates/orca-file-search/tests && cp /artifacts/hidden_real_multi.rs crates/orca-file-search/tests/hidden_real_multi.rs && cargo test -p orca-file-search --test hidden_real_multi --quiet && cargo test -p orca-file-search --quiet"
+  ],
+  "limits": {
+    "wall_seconds": 1800,
+    "verify_seconds": 1200
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "deepseek"
+}

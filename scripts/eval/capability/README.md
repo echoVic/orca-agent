@@ -78,3 +78,23 @@ Read-only Docker checks found CLI 29.8.2 and configured context `orbstack`, but 
 Absolute system executables remain live. Relative and absolute interpreter scripts, including `env`-wrapped commands, use independent snapshots and protected-file hashes. Supported `env` forms include ignore-environment, unset, assignments and `--`; relocation, split-string and other unsupported options fail before agent execution. Actual execution regressions replace live scripts with a false-pass program and check that the frozen verifier still fails; the complete Python suite now has 97 tests. Locally retained historical test counts above are execution notes, not repository-hosted logs; rerun the test command or consult PR160 workflow evidence for reproducible checks.
 
 The agent environment disables Python bytecode writes during local execution, so running the Python skin's prescribed unittest command does not create files inside protected tests. Source additions, edits and permission changes remain guarded. Captured sampling values reject booleans and nonfinite floats, preserving strict JSON output and finite integer/float observations.
+
+## v0.5.20 coverage additions
+
+- **I — rewind.** `I-1` asserts that `exec --save-history` + a tracked `write_file` can be restored by
+  `orca rewind --last --mode both`; `I-2`–`I-4` cover conversation-only rewind, dry runs and the
+  prune/rollback/empty-home CLI contract. The headless checkpoint gap this found is issue #163.
+- **J — retry and cooldown.** The scripted provider can return `429`/`503` with `Retry-After` before a
+  scripted tool flow (`FIMODE=http_429_retry_after_once` + `FITOOL=`), and can fail persistently. The axis
+  asserts the observed retry gap, the 5-send cap, and a clean provider error rather than a hang.
+- **K — DeepSeek web and OCR (real API).** `web_search`, `web_fetch`, `read_document` (with its disk cache)
+  and `doctor --online` are exercised against the official endpoint; these spend real per-call money that
+  the token estimate does not cover.
+- **L — harness evidence.** `session.completed` evidence is asserted directly: workspace observation
+  (complete/changed/changes), `writes_applied`, `resumable`/`resume.command`, completion proof state and
+  the structured `blocked` status with its blockers.
+- **Harder rung.** `B-l6-real-multi` asks for two public functions in the real `orca-file-search` crate and
+  verifies hidden integration tests plus the existing crate suite.
+- **Credential scan.** Every run directory must pass
+  `python3 -B scripts/eval/capability/tools/scan_secrets.py <run-root>`; it fails on the exact provider key
+  and reports Authorization/`sk-` matches for review.

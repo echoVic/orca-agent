@@ -445,6 +445,36 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._stream(reasoning=False, content=True, terminal=True)
             return
+        if tool == "write":
+            # Write a workspace file through the tracked write_file tool:
+            # FIWPATH=<path> FIWCONTENT64=<base64 content>.
+            import base64
+
+            path = "written.txt"
+            content = "written by the mock\n"
+            for token in prompt.replace("\n", " ").split():
+                if token.startswith("FIWPATH="):
+                    path = token.split("=", 1)[1]
+                elif token.startswith("FIWCONTENT64="):
+                    try:
+                        content = base64.b64decode(token.split("=", 1)[1]).decode()
+                    except Exception:  # noqa: BLE001 - keep the scenario running
+                        content = "written by the mock\n"
+            if step == 0:
+                self._stream_tool_call("write_file", {"path": path, "content": content})
+            else:
+                self._stream(reasoning=False, content=True, terminal=True)
+            return
+        if tool == "blocker":
+            if step == 0:
+                self._stream_tool_call("report_blocker", {
+                    "kind": "user_decision",
+                    "summary": "the fixture cannot be completed without a user decision",
+                    "question": "Which of the two options should be applied?",
+                })
+            else:
+                self._stream(reasoning=False, content=True, terminal=True)
+            return
         if tool == "cmd":
             # Run an arbitrary command supplied by the caller: FICMD64=<base64>.
             import base64
@@ -521,11 +551,13 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._stream(reasoning=False, content=True, terminal=True)
 
-    def _json_error(self, status: int) -> None:
+    def _json_error(self, status: int, retry_after: int | None = None) -> None:
         body = json.dumps({"error": {"message": f"injected HTTP {status}", "type": "fi"}}).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if retry_after is not None:
+            self.send_header("Retry-After", str(retry_after))
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
@@ -563,6 +595,24 @@ class Handler(BaseHTTPRequestHandler):
             message.get("role") == "tool" for message in payload.get("messages") or []
         )
         if mode in ("tool_bash", "tool_script"):
+            self._handle_tool_script(payload, prompt)
+            return
+        if mode == "http_429_retry_after_once" and first:
+            self._json_error(429, retry_after=1)
+            return
+        if mode == "http_503_retry_after_once" and first:
+            self._json_error(503, retry_after=1)
+            return
+        if mode == "http_429_always":
+            self._json_error(429, retry_after=1)
+            return
+        if mode == "http_503_always":
+            self._json_error(503, retry_after=1)
+            return
+        tool_hint = any(token.startswith("FITOOL=") for token in prompt.replace("\n", " ").split())
+        if tool_hint:
+            # A retry/cooldown fault can precede a scripted tool flow: the first
+            # request fails, later attempts drive the tool script.
             self._handle_tool_script(payload, prompt)
             return
         if mode == "http_429_once" and first:
