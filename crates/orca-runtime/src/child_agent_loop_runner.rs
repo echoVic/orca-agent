@@ -727,7 +727,8 @@ where
                 })?;
             }
             let tool_execution = execute_tool(&tool_context, &child_cancel, tool_request);
-            let had_child_cost = tool_execution.child_cost.is_some();
+            let had_child_cost = tool_execution.child_cost.is_some()
+                || !tool_execution.result.service_usage.is_empty();
             if let Some(observer) = observer {
                 observer.publish_activity(ChildAgentActivity::ToolCompleted {
                     call_id: tool_request.id.clone(),
