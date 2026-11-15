@@ -174,7 +174,11 @@ mod tests {
 
         assert_eq!(
             (after.input_tokens, after.output_tokens, after.cache_tokens),
-            (before.input_tokens, before.output_tokens, before.cache_tokens)
+            (
+                before.input_tokens,
+                before.output_tokens,
+                before.cache_tokens
+            )
         );
         let fee = after.estimated_cost_usd - before.estimated_cost_usd;
         assert!((fee - 0.0045).abs() < 1e-12, "{fee}");

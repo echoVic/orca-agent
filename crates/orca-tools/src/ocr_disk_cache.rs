@@ -335,8 +335,7 @@ mod tests {
 
     #[test]
     fn what_an_entry_holds_is_pinned_to_the_cache_version() {
-        const BUMP: &str =
-            "this changes what a cache entry holds: update the expectation and bump OCR_CACHE_VERSION";
+        const BUMP: &str = "this changes what a cache entry holds: update the expectation and bump OCR_CACHE_VERSION";
         assert_eq!(OCR_CACHE_VERSION, "orca-ocr-v1", "{BUMP}");
         for (raw, stored) in [
             (

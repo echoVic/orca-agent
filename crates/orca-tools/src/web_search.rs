@@ -1079,7 +1079,10 @@ mod tests {
         .expect("search succeeds");
 
         assert_eq!(output.text, "(no web search results)");
-        assert_eq!(output.deepseek_searches, 0, "DeepSeek bills no empty search");
+        assert_eq!(
+            output.deepseek_searches, 0,
+            "DeepSeek bills no empty search"
+        );
         fixture.requests();
     }
 
@@ -1118,7 +1121,11 @@ mod tests {
         )
         .expect("the Exa fallback succeeds");
 
-        assert!(output.text.contains("These results come from Exa."), "{}", output.text);
+        assert!(
+            output.text.contains("These results come from Exa."),
+            "{}",
+            output.text
+        );
         assert_eq!(output.deepseek_searches, 0);
         deepseek.requests();
         exa.requests();

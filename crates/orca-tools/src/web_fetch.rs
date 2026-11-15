@@ -1251,7 +1251,10 @@ mod tests {
         ))
         .expect("the local page comes back");
 
-        assert_eq!(fetched.deepseek_fetches, 0, "DeepSeek bills no failed fetch");
+        assert_eq!(
+            fetched.deepseek_fetches, 0,
+            "DeepSeek bills no failed fetch"
+        );
         fixture.requests();
     }
 
