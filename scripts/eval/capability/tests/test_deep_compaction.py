@@ -81,7 +81,26 @@ if MODE == "grep":
     emit("tool.call.requested", {"id": "t2", "name": "bash", "target": None,
                                   "raw_arguments": json.dumps({"command": "grep -R " + code + " .."})})
     emit("tool.call.completed", {"id": "t2", "status": "completed", "output": found})
-if MODE != "early":
+if MODE == "combined":
+    # One call that searches the transcript and writes the answer; grep
+    # prefixes each match with the file it came from.
+    relative = os.path.relpath(path, Path.cwd())
+    found = "\n".join(relative + ":" + line for line in path.read_text().splitlines() if code in line)
+    command = "grep -R " + code + " ..; printf %%s " + code + " > answer.txt"
+    emit("tool.call.requested", {"id": "t3", "name": "bash", "target": None,
+                                  "raw_arguments": json.dumps({"command": command})})
+    Path("answer.txt").write_text(code)
+    emit("tool.call.completed", {"id": "t3", "status": "completed", "output": found})
+if MODE == "split":
+    # The code arrives split across two streamed chunks; the completion is truncated.
+    text = next(line for line in path.read_text().splitlines() if code in line)
+    cut = text.index(code) + len(code) // 2
+    emit("tool.call.requested", {"id": "t4", "name": "bash", "target": None,
+                                  "raw_arguments": json.dumps({"command": "grep -rh deployment .."})})
+    emit("tool.output.delta", {"id": "t4", "chunk": text[:cut]})
+    emit("tool.output.delta", {"id": "t4", "chunk": text[cut:]})
+    emit("tool.call.completed", {"id": "t4", "status": "completed", "output": "", "truncated": True})
+if MODE not in ("early", "combined"):
     write_answer()
 emit("session.completed", {"status": "success"})
 '''
@@ -135,6 +154,17 @@ class DeepCompactionRungTests(unittest.TestCase):
         result, log = self.attempt("early")
         self.assertEqual(result.final_verification, "failed", log)
         self.assertIn("before", log)
+
+    def test_a_call_that_reads_the_transcript_and_writes_the_answer_fails(self):
+        # The output shows the transcript's file name, whatever the call looks like.
+        result, log = self.attempt("combined")
+        self.assertEqual(result.final_verification, "failed", log)
+        self.assertIn("transcript", log)
+
+    def test_a_code_split_across_output_chunks_is_still_caught(self):
+        result, log = self.attempt("split")
+        self.assertEqual(result.final_verification, "failed", log)
+        self.assertIn("tool output", log)
 
     def test_the_seeded_session_hides_the_code_in_one_old_unpinned_reply(self):
         home, workspace = self.root / "home", self.root / "workspace"

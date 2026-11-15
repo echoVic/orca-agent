@@ -128,14 +128,16 @@ The agent environment disables Python bytecode writes during local execution, so
     estimate, and whose summary requests all succeeded with usage;
   - the session's `context.manual_compaction_snapshot` with the code in `rolling_summary` and in no kept
     message, so the original reply was dropped (what the optional "second needle" in #172 was for);
-  - no tool call touching the saved transcript, and the code in no tool output before the answer write
-    (the first successful call that names `answer.txt` and carries the code), which must come after the
+  - no tool call naming the saved transcript and no tool output showing it (its path or session id), and
+    the code in no tool output before the answer write (the first successful call that names `answer.txt`
+    and carries the code), with streamed chunks joined per call; the answer write must come after the
     `remote_summary` compaction;
   - exactly the code in `answer.txt`, and `session.completed` success.
 - **Offline:** `tests/test_deep_compaction.py` drives the real prepare script and verifier with a fake
   agent. A summary that kept the code passes. These fail: a summary that lost it, a no-shrink compaction,
-  a transcript read, a search that names the code and reads it back via `..`, and an answer written
-  before the summary. With `--provider mock`, the real runtime collapses 8 messages (18 → 10, 25,142 →
+  a transcript read, a search that names the code and reads it back via `..`, one call that searches the
+  transcript and writes the answer, a code split across two output chunks, and an answer written before
+  the summary. With `--provider mock`, the real runtime collapses 8 messages (18 → 10, 25,142 →
   6,780 tokens est, 9 summary requests). That attempt fails only on the summary check, because the mock's
   summary cannot contain the code.
 - **Live (2026-11-15, binary built from main f4c8a9d3, k=3):** 3/3 pass, 26–32 s per attempt. Each run
