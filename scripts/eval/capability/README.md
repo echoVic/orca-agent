@@ -148,4 +148,8 @@ The agent environment disables Python bytecode writes during local execution, so
   seed state such as a prior session. Docker prepare scripts don't get it: the container sees the
   workspace at another path, so a seeded session's paths would not match.
 - **Not covered:** this rung compacts once, before the measured turn's first request. Compaction forced
-  later in a turn by tool-output growth is not exercised.
+  later in a turn by tool-output growth is not exercised. The answer write's own output is exempt from the
+  code check, because a real `write_file` completion echoes the code in its diff. So a call that already
+  spells out the code can also read the transcript in a form that shows no path, session id or record
+  marker. Such a read cannot be where the code came from, and the summary check still requires the code
+  in `rolling_summary`. Closing it fully would take a sandbox that denies reads outside the workspace.

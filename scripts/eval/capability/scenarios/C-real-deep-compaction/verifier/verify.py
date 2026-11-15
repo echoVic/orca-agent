@@ -91,6 +91,13 @@ if any(CODE in json.dumps(message) for message in snapshot.get("messages") or []
 #      answer.txt and carries the code. Before it, no other call's output may
 #      hold the code. Streamed chunks are joined per call, so a code split
 #      across chunks still counts.
+#    - The answer write's own output is exempt from the code check (still not
+#      from the transcript marks): a real write_file completion echoes the
+#      written code in its diff, and a call that spells out the code shows the
+#      agent had it before the call ran. What this leaves open: a call that
+#      already spells out the code may also read the transcript in a form that
+#      shows no mark. That read cannot be where the code came from, and check 2
+#      already requires the code in the summary.
 #    - The deep compaction must come before the answer write, or the answer
 #      came from the unsummarized history.
 TRANSCRIPT_MARKS = (home, SESSION_ID, "/sessions/", "conversation.message", "session.meta")
