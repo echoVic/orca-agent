@@ -15,6 +15,48 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[4]
 SKIP = {"target", "jobs", ".git", ".superpowers", "node_modules", ".worktrees", "site/node_modules"}
 
+PR_TEST = '''use std::path::PathBuf;
+
+use orca_file_search::{rank_matches, MatchKind, RankedFile, SearchMatch};
+
+fn hit(path: &str, score: u32) -> SearchMatch {
+    SearchMatch {
+        root: PathBuf::from("/workspace"),
+        path: path.to_string(),
+        kind: MatchKind::File,
+        score,
+        indices: Vec::new(),
+    }
+}
+
+#[test]
+fn aggregates_per_path_and_sorts() {
+    let out = rank_matches(&[hit("b", 1), hit("a", 2), hit("b", 3)], 10);
+    assert_eq!(
+        out,
+        vec![
+            RankedFile { path: "b".to_string(), score: 4, hits: 2 },
+            RankedFile { path: "a".to_string(), score: 2, hits: 1 },
+        ]
+    );
+}
+
+#[test]
+fn respects_the_limit_and_zero() {
+    assert!(rank_matches(&[hit("a", 1)], 0).is_empty());
+    let out = rank_matches(&[hit("a", 1), hit("b", 2)], 1);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].path, "b");
+}
+
+#[test]
+fn ties_sort_by_path() {
+    let out = rank_matches(&[hit("z", 5), hit("a", 5)], 5);
+    let paths: Vec<&str> = out.iter().map(|ranked| ranked.path.as_str()).collect();
+    assert_eq!(paths, vec!["a", "z"]);
+}
+'''
+
 MULTI_TEST = '''use orca_file_search::{normalize_query_path, normalize_query_paths};
 
 #[test]
@@ -82,6 +124,9 @@ def main() -> int:
     if variant == "multi":
         hidden = Path("..") / "hidden_real_multi.rs"
         hidden.write_text(MULTI_TEST, encoding="utf-8")
+    elif variant == "pr":
+        hidden = Path("..") / "hidden_real_pr.rs"
+        hidden.write_text(PR_TEST, encoding="utf-8")
     else:
         hidden = Path("..") / "hidden_real.rs"
         hidden.write_text(HIDDEN_TEST, encoding="utf-8")

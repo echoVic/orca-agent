@@ -98,3 +98,19 @@ The agent environment disables Python bytecode writes during local execution, so
 - **Credential scan.** Every run directory must pass
   `python3 -B scripts/eval/capability/tools/scan_secrets.py <run-root>`; it fails on the exact provider key
   and reports Authorization/`sk-` matches for review.
+
+## Harder rungs (v0.5.20 follow-up)
+
+- **B-l7-real-pr** — real-repo PR-sized change: a new `src/rank.rs` module plus a `lib.rs` re-export in
+  `orca-file-search`, verified by hidden acceptance tests (aggregation, ordering, ties, zero limit) and
+  the existing crate suite.
+- **D-8-disk-full** — docker backend with `--tmpfs /workspace/data:size=64k`; the requested 800,000-byte
+  write cannot succeed. The oracle accepts a partial file but requires a non-zero exit and a terminal
+  that names the failure; a `report_blocker` (`environment_contradiction`) is the expected honest path.
+- **C-real-context-limit** — real provider with `[model_runtime] auto_compact_token_limit = 16000` and
+  an 80 k-character prompt; asserts real `context.compacted` events (`reason = exceeded_context_limit`,
+  token observation present) and exact needle recall. **Boundary:** the observed compactions are
+  `strategy = none` no-shrink attempts because the threshold is checked at turn opening with only two
+  messages; deep summary compaction is not covered (issue #172).
+- **`home_config`** — scenario field appended to the attempt's `$ORCA_HOME/config.toml` (local and
+  docker), used to set the `[model_runtime]` compaction thresholds above.
