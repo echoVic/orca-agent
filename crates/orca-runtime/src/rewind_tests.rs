@@ -1003,3 +1003,66 @@ fn pending_journal_blocks_file_restores_and_is_surfaced() {
             .any(|warning| warning.kind == "pending_journal")
     );
 }
+
+/// Starts a pinned-prompt capture for a workspace spelled as `cwd`, exactly
+/// as a turn does with its configured working directory, writes `file.txt`
+/// through `write_file`, and returns the finished record.
+fn capture_with_cwd(fixture: &mut Fixture, cwd: &Path) -> Option<FileSnapshotRecord> {
+    fixture.writer.enter_turn(TurnId::new());
+    fixture
+        .writer
+        .append_message(&Message::pinned_user("update the file".to_string()))
+        .expect("pinned user message");
+    let mut config = orca_core::config::RunConfig::default();
+    config.cwd = Some(cwd.to_path_buf());
+    config.history_mode = orca_core::config::HistoryMode::Record;
+    let mut conversation = Conversation::new();
+    conversation.add_system("system".to_string());
+    conversation.add_user_pinned("update the file".to_string());
+    let turn = crate::rewind::begin_turn(
+        &config,
+        cwd,
+        "turn-spelled",
+        &conversation,
+        Some(&mut fixture.writer),
+    )
+    .expect("a recorded session opens a checkpoint");
+
+    fixture.write_workspace_file("file.txt", "original\n");
+    turn.capture_pre_image(cwd, &write_request("file.txt"));
+    fixture.write_workspace_file("file.txt", "changed\n");
+    turn.finish_record().expect("snapshot")
+}
+
+/// `orca exec --cwd` keeps the directory as given, and that need not be the
+/// canonical path the capture's root is stored as (#163). On Unix the test
+/// reaches the workspace through a symlink, as macOS reaches `/tmp` and
+/// `/var/folders`; on Windows a plain path is not the verbatim `\\?\` form
+/// `canonicalize` returns.
+#[test]
+fn turn_capture_accepts_the_workspace_as_configured() {
+    let mut fixture = Fixture::new();
+    #[cfg(unix)]
+    let links = tempfile::tempdir().expect("a directory for the link");
+    #[cfg(unix)]
+    let configured = {
+        let linked = links.path().join("workspace");
+        std::os::unix::fs::symlink(fixture.cwd(), &linked).expect("a symlink to the workspace");
+        linked
+    };
+    #[cfg(not(unix))]
+    let configured = fixture.cwd().to_path_buf();
+
+    let record = capture_with_cwd(&mut fixture, &configured)
+        .expect("a write inside the workspace is captured whatever the cwd's spelling");
+
+    assert!(record.files["file.txt"].pre.is_some(), "{record:?}");
+    assert!(
+        !record
+            .limitations
+            .iter()
+            .any(|limitation| limitation == "outside_root"),
+        "{:?}",
+        record.limitations
+    );
+}
