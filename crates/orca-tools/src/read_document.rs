@@ -183,10 +183,9 @@ pub fn execute_or_cancel(
                                 ocr_disk_cache::store(&disk_key, &result);
                             }
                             // DeepSeek bills the pages it counted.
-                            let billed_pages = u32::try_from(
-                                result.page_count.unwrap_or(result.pages.len()),
-                            )
-                            .unwrap_or(u32::MAX);
+                            let billed_pages =
+                                u32::try_from(result.page_count.unwrap_or(result.pages.len()))
+                                    .unwrap_or(u32::MAX);
                             (result, billed_pages)
                         }
                         Err(DeepSeekWebError::Cancelled) => {
@@ -606,7 +605,11 @@ mod tests {
         let first = read("first");
         let again = read("again");
 
-        assert_eq!(first.service_usage.deepseek_ocr_pages, 1, "{:?}", first.error);
+        assert_eq!(
+            first.service_usage.deepseek_ocr_pages, 1,
+            "{:?}",
+            first.error
+        );
         assert_eq!(again.status, ToolStatus::Completed, "{:?}", again.error);
         assert_eq!(
             again.service_usage.deepseek_ocr_pages, 0,
@@ -645,6 +648,17 @@ mod tests {
         path: &str,
         access: &DeepSeekWebAccess,
     ) -> std::thread::JoinHandle<ToolResult> {
+        read_gated_in_thread(id, cwd, path, access, || false)
+    }
+
+    /// [`read_in_thread`], asking `should_cancel` whether to stop.
+    fn read_gated_in_thread(
+        id: &'static str,
+        cwd: &std::path::Path,
+        path: &str,
+        access: &DeepSeekWebAccess,
+        should_cancel: impl Fn() -> bool + Send + 'static,
+    ) -> std::thread::JoinHandle<ToolResult> {
         let cwd = cwd.to_path_buf();
         let access = access.clone();
         let raw_arguments = json!({ "path": path }).to_string();
@@ -654,7 +668,7 @@ mod tests {
                 &cwd,
                 64 * 1024,
                 Some(&access),
-                || false,
+                should_cancel,
             )
         })
     }
@@ -757,16 +771,54 @@ mod tests {
         assert_eq!(working.requests().len(), 1);
     }
 
+    /// A `should_cancel` for the read that recognizes `key`. It lets the claim
+    /// through, then, once the file is loaded and before anything is sent,
+    /// holds until another read waits for the recognition, so the two reads
+    /// meet however the threads are scheduled. From then on it answers
+    /// `cancelled`.
+    fn hold_until_a_read_waits(key: OcrKey, cancelled: bool) -> impl Fn() -> bool + Send + 'static {
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        move || {
+            let check = checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // The first check is the claim's, made under the cache lock.
+            if check == 0 {
+                return false;
+            }
+            if check == 1 {
+                // A waiting read holds a clone of the attempt, besides the
+                // pending entry and this read's own claim.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !lock_cache()
+                    .pending
+                    .get(&key)
+                    .is_some_and(|attempt| Arc::strong_count(attempt) >= 3)
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "no read came to wait for the recognition"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            cancelled
+        }
+    }
+
     #[test]
     fn a_read_waiting_on_a_failed_recognition_gets_its_failure() {
         let cwd = workspace_with("busy.pdf", b"%PDF busy");
-        let fixture = crate::test_http::serve_slowly(
-            Duration::from_millis(400),
-            vec![(500, r#"{"error":{"message":"busy"}}"#.into())],
-        );
+        let key = claim_key(&cwd.path().join("busy.pdf"));
+        let fixture =
+            crate::test_http::serve(vec![(500, r#"{"error":{"message":"busy"}}"#.into())]);
         let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
-        let first = read_in_thread("first", cwd.path(), "busy.pdf", &access);
-        wait_until_claimed(&claim_key(&cwd.path().join("busy.pdf")));
+        let first = read_gated_in_thread(
+            "first",
+            cwd.path(),
+            "busy.pdf",
+            &access,
+            hold_until_a_read_waits(key.clone(), false),
+        );
+        wait_until_claimed(&key);
         let second = read_in_thread("second", cwd.path(), "busy.pdf", &access);
 
         let first = first.join().expect("first read");
@@ -786,29 +838,19 @@ mod tests {
     #[test]
     fn a_waiting_read_takes_over_when_the_recognizing_read_is_cancelled() {
         let cwd = workspace_with("handover.pdf", b"%PDF handover");
-        let fixture = crate::test_http::serve_slowly(
-            Duration::from_millis(400),
-            vec![
-                ocr_reply(json!([{"index": 0, "text": "A", "finish_reason": "stop"}])),
-                ocr_reply(json!([{"index": 0, "text": "B", "finish_reason": "stop"}])),
-            ],
-        );
+        let key = claim_key(&cwd.path().join("handover.pdf"));
+        let fixture = crate::test_http::serve(vec![ocr_reply(json!([
+            {"index": 0, "text": "taken over", "finish_reason": "stop"},
+        ]))]);
         let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
-        let owner = {
-            let cwd = cwd.path().to_path_buf();
-            let access = access.clone();
-            std::thread::spawn(move || {
-                let started = Instant::now();
-                execute_or_cancel(
-                    &read_request("owner", r#"{"path":"handover.pdf"}"#),
-                    &cwd,
-                    64 * 1024,
-                    Some(&access),
-                    || started.elapsed() > Duration::from_millis(100),
-                )
-            })
-        };
-        wait_until_claimed(&claim_key(&cwd.path().join("handover.pdf")));
+        let owner = read_gated_in_thread(
+            "owner",
+            cwd.path(),
+            "handover.pdf",
+            &access,
+            hold_until_a_read_waits(key.clone(), true),
+        );
+        wait_until_claimed(&key);
         let waiter = read_in_thread("waiter", cwd.path(), "handover.pdf", &access);
 
         let owner = owner.join().expect("recognizing read");
@@ -816,10 +858,21 @@ mod tests {
 
         assert_eq!(owner.status, ToolStatus::Cancelled, "{:?}", owner.error);
         // The waiter recognizes the file itself rather than inherit the
-        // cancellation. Which canned reply it gets depends on whether the
-        // cancelled read's request reached the server first.
+        // cancellation; the cancelled read never sent its upload.
         assert_eq!(waiter.status, ToolStatus::Completed, "{:?}", waiter.error);
-        fixture.requests();
+        assert!(
+            waiter
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("taken over")),
+            "{:?}",
+            waiter.output
+        );
+        assert_eq!(
+            fixture.requests().len(),
+            1,
+            "only the waiting read uploaded"
+        );
     }
 
     #[test]
