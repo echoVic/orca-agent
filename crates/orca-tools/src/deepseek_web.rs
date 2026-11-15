@@ -301,7 +301,10 @@ pub(crate) async fn ocr(
     })?;
     // A recognition that fails after it started still answers HTTP 200,
     // with DeepSeek's reason, such as an unsupported format, in the body.
-    if value.get("error").is_some_and(reports_error) {
+    if value
+        .get("error")
+        .is_some_and(orca_core::provider_types::error_field_reports_error)
+    {
         let message = deepseek_message(&text, &access.api_key);
         return Err(DeepSeekWebError::Failed(if message.is_empty() {
             "the recognition failed without a reason".to_string()
@@ -333,19 +336,6 @@ pub(crate) async fn ocr(
             .collect(),
         page_count: response.page_count,
     })
-}
-
-/// Whether an `error` field holds an error. `null`, `false`, `0`, a blank
-/// string and an empty object or array do not.
-fn reports_error(error: &Value) -> bool {
-    match error {
-        Value::Null => false,
-        Value::Bool(flag) => *flag,
-        Value::Number(number) => number.as_f64() != Some(0.0),
-        Value::String(text) => !text.trim().is_empty(),
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(fields) => !fields.is_empty(),
-    }
 }
 
 /// A region's coordinates, which mean nothing to a model: the opening tag,
