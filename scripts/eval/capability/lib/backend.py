@@ -356,7 +356,11 @@ def run_local(
     if not (workspace / ".git").exists():
         subprocess.run(["git", "init", "-q", str(workspace)], capture_output=True, timeout=30)
     if scenario.prepare is not None:
-        prepare_process_env = {**os.environ, "CAPABILITY_EXTERNAL_DB": str(attempt_dir / "external-state.sqlite"), **scenario.prepare_env}
+        # CAPABILITY_HOME lets a scenario seed the attempt's ORCA_HOME, e.g. a
+        # prior session the agent resumes (local backend only: a docker
+        # attempt sees the workspace at another path).
+        prepare_process_env = {**os.environ, "CAPABILITY_EXTERNAL_DB": str(attempt_dir / "external-state.sqlite"),
+                               "CAPABILITY_HOME": str(home), **scenario.prepare_env}
         prepared = subprocess.run(
             [sys.executable, str(scenario.prepare)], cwd=workspace, capture_output=True, text=True,
             timeout=120, env=prepare_process_env,
