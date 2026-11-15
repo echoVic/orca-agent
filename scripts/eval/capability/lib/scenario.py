@@ -55,6 +55,7 @@ class Scenario:
     path: Path | None = None
     execution: dict = field(default_factory=dict)
     exec_flags: list = field(default_factory=list)
+    home_config: str = ""
     evaluation: dict = field(default_factory=dict)
     evidence: list[dict] = field(default_factory=list)
     readonly_inputs: list[str] = field(default_factory=list)
@@ -113,6 +114,9 @@ def load(path: Path) -> Scenario:
         prepare = prepare_path
     execution = dict(raw.get("execution") or {})
     exec_flags = [str(flag) for flag in (raw.get("exec_flags") or [])]
+    home_config = raw.get("home_config") or ""
+    if not isinstance(home_config, str):
+        raise ScenarioError(f"{path}: home_config must be a string")
     from .evidence import validate_execution
     try:
         validate_execution(execution)
@@ -160,7 +164,8 @@ def load(path: Path) -> Scenario:
         workspace_mode=str(raw.get("workspace_mode") or "rw"),
         command=command,
         script=script,
-        path=path, execution=execution, exec_flags=exec_flags, evaluation=evaluation, evidence=constraints,
+        path=path, execution=execution, exec_flags=exec_flags, home_config=home_config,
+        evaluation=evaluation, evidence=constraints,
         readonly_inputs=list(readonly_inputs), verifier_root=verifier_root,
     )
 

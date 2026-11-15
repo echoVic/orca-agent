@@ -351,7 +351,8 @@ def run_local(
     home = attempt_dir / "home"
     home.mkdir(parents=True, exist_ok=True)
     shutil.copytree(scenario.fixture, workspace)
-    (home / "config.toml").write_text("auto_memory = false\n", encoding="utf-8")
+    home_config = "auto_memory = false\n" + (scenario.home_config or "")
+    (home / "config.toml").write_text(home_config, encoding="utf-8")
     if not (workspace / ".git").exists():
         subprocess.run(["git", "init", "-q", str(workspace)], capture_output=True, timeout=30)
     if scenario.prepare is not None:
@@ -659,7 +660,8 @@ def run_docker(scenario, attempt_dir: Path, binary: Path = DEFAULT_BINARY, provi
     workspace = attempt_dir / "workspace"
     home = attempt_dir / "home"
     home.mkdir(parents=True, exist_ok=True)
-    (home / "config.toml").write_text("auto_memory = false\n", encoding="utf-8")
+    home_config = "auto_memory = false\n" + (scenario.home_config or "")
+    (home / "config.toml").write_text(home_config, encoding="utf-8")
     shutil.copytree(scenario.fixture, workspace)
     if scenario.prepare is not None:
         prepared = subprocess.run([sys.executable, str(scenario.prepare)], cwd=workspace, capture_output=True,

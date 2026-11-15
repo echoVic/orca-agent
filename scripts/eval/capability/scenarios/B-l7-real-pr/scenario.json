@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "B-l7-real-pr",
+  "axis": "B",
+  "rung": 7,
+  "difficulty": {
+    "level": 7,
+    "files": "real-repo",
+    "scope": "module+lib",
+    "context_tokens_approx": 50000
+  },
+  "backend": "docker",
+  "image": "messense/rust-musl-cross:x86_64-musl",
+  "fixture": "fixture",
+  "prepare": "../../generators/orca_real.py",
+  "prepare_env": {
+    "CAPABILITY_REAL_TASK": "pr"
+  },
+  "prompt": "prompts/task.md",
+  "verify": [
+    "mkdir -p crates/orca-file-search/tests && cp /artifacts/hidden_real_pr.rs crates/orca-file-search/tests/hidden_real_pr.rs && cargo test -p orca-file-search --test hidden_real_pr --quiet && cargo test -p orca-file-search --quiet"
+  ],
+  "limits": {
+    "wall_seconds": 1800,
+    "verify_seconds": 1200
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "deepseek"
+}

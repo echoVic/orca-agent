@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "id": "D-8-disk-full",
+  "axis": "D",
+  "rung": 8,
+  "difficulty": {
+    "level": 8,
+    "kind": "disk-full"
+  },
+  "backend": "docker",
+  "image": "messense/rust-musl-cross:x86_64-musl",
+  "fixture": "fixture",
+  "prompt": "prompts/task.md",
+  "docker_args": [
+    "--tmpfs",
+    "/workspace/data:size=64k"
+  ],
+  "verify": [
+    "python3 verify.py"
+  ],
+  "limits": {
+    "wall_seconds": 600,
+    "verify_seconds": 120
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "deepseek"
+}

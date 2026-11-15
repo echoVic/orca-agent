@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "C-real-context-limit",
+  "axis": "C",
+  "rung": 8,
+  "difficulty": {
+    "level": 8,
+    "kind": "runtime-context-limit",
+    "prompt_chars": 80162
+  },
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "prompts/task.md",
+  "verify": [
+    "python3 verify.py"
+  ],
+  "limits": {
+    "wall_seconds": 600,
+    "verify_seconds": 120
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "deepseek",
+  "home_config": "[model_runtime]\nauto_compact_token_limit = 16000\nsoft_compact_token_limit = 12000\n",
+  "evaluation": {
+    "split": "holdout",
+    "suite_id": "context-runtime-v1"
+  }
+}
