@@ -664,6 +664,20 @@
       "windows-test-portability"
     ],
     [
+      "rewind-capture-test-symlink",
+      "crates/orca-runtime/src/rewind_tests.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "exec-rewind-test-symlink",
+      "tests/exec_jsonl.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "bwrap-sandbox-test-symlink",
       "crates/orca-tools/src/sandbox/bwrap.rs",
       "unix_std_api",

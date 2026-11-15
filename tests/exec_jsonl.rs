@@ -222,6 +222,84 @@ fn exec_session_completed_reports_writes_applied_true_after_a_write() {
     );
 }
 
+/// #163: a headless run that records history keeps file checkpoints, so
+/// `orca rewind` can undo its writes, even when `--cwd` spells the workspace
+/// another way than its canonical path and the process runs from elsewhere,
+/// as harnesses run it. On Unix the workspace is reached through a symlink, as
+/// macOS reaches `/tmp` and `/var/folders`; on Windows a plain path is not the
+/// verbatim `\\?\` form `canonicalize` returns.
+#[test]
+fn exec_with_saved_history_can_rewind_its_writes() {
+    let workspace = TempDir::new().expect("temporary workspace");
+    let home = TempDir::new().expect("temporary ORCA_HOME");
+    std::fs::write(workspace.path().join("note.txt"), "before").unwrap();
+    #[cfg(unix)]
+    let links = TempDir::new().expect("a directory for the link");
+    #[cfg(unix)]
+    let configured = {
+        let linked = links.path().join("workspace");
+        std::os::unix::fs::symlink(workspace.path(), &linked).expect("a symlink to the workspace");
+        linked
+    };
+    #[cfg(not(unix))]
+    let configured = workspace.path().to_path_buf();
+    let output = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(home.path())
+        .env("ORCA_HOME", home.path())
+        .args([
+            "exec",
+            "--output-format",
+            "jsonl",
+            "--provider",
+            "mock",
+            "--save-history",
+            "--mode",
+            "full-auto",
+            "--cwd",
+        ])
+        .arg(&configured)
+        .arg("edit note.txt :: before => after")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run orca exec");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+        "after"
+    );
+
+    let rewind = Command::new(env!("CARGO_BIN_EXE_orca"))
+        .current_dir(workspace.path())
+        .env("ORCA_HOME", home.path())
+        .args(["rewind", "--last", "--mode", "both"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run orca rewind");
+
+    assert_eq!(rewind.status.code(), Some(0), "{rewind:?}");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+        "before",
+        "the code rewind restores the file"
+    );
+    let records = session_documents(home.path())
+        .into_iter()
+        .flat_map(|(_, records)| records)
+        .collect::<Vec<_>>();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["type"] == "session.snapshot"),
+        "the headless turn recorded a file checkpoint"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["type"] == "session.rewind"),
+        "the rewind is recorded in the transcript"
+    );
+}
+
 #[test]
 fn exec_session_completed_includes_subagent_writes() {
     for mode in ["sync", "async", "sync subagent sync"] {
