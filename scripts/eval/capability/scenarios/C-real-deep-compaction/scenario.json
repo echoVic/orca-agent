@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "C-real-deep-compaction",
+  "axis": "C",
+  "rung": 9,
+  "difficulty": {
+    "level": 9,
+    "kind": "runtime-deep-compaction",
+    "prior_turns": 8
+  },
+  "backend": "local",
+  "fixture": "fixture",
+  "prepare": "prepare.py",
+  "prompt": "prompts/task.md",
+  "exec_flags": [
+    "--resume",
+    "5e5c0172-0000-4000-8000-00000000c172"
+  ],
+  "verify": [
+    "python3 -B @verifier/verify.py"
+  ],
+  "verifier_root": "verifier",
+  "limits": {
+    "wall_seconds": 600,
+    "verify_seconds": 120
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "deepseek",
+  "home_config": "[model_runtime]\nauto_compact_token_limit = 16000\nsoft_compact_token_limit = 12000\n",
+  "evaluation": {
+    "split": "holdout",
+    "suite_id": "context-runtime-v1"
+  }
+}

@@ -413,6 +413,18 @@ for script in Path('.').rglob('*.py'):
         result=self.local(item,"Path('result.txt').write_text('correct')")
         self.assertEqual(result.final_verification,"passed")
 
+    def test_prepare_can_seed_the_attempt_home(self):
+        # A scenario that resumes a prepared session writes it into the
+        # attempt's ORCA_HOME before the agent starts (#172).
+        item=self.item(verify=["diff result.txt expected.txt"],readonly_inputs=["expected.txt"])
+        (item.fixture/"expected.txt").write_text("seeded")
+        prepare=item.path.parent/"prepare.py"
+        prepare.write_text("import os\nfrom pathlib import Path\nPath(os.environ['CAPABILITY_HOME'],'seed.txt').write_text('seeded')\n")
+        item.prepare=prepare
+        result=self.local(item,"Path('result.txt').write_text(Path(os.environ['ORCA_HOME'],'seed.txt').read_text())")
+        self.assertEqual(result.outcome,"pass",result.environment_error)
+        self.assertEqual(result.final_verification,"passed")
+
     def test_unknown_run_path_alias_loaded_once_without_collapsing_distinct_runs(self):
         directory=self.root/"runs/one";directory.mkdir(parents=True)
         sample=self.sample("unknown");(directory/"run.json").write_text(json.dumps(sample))

@@ -88,8 +88,8 @@ The agent environment disables Python bytecode writes during local execution, so
   scripted tool flow (`FIMODE=http_429_retry_after_once` + `FITOOL=`), and can fail persistently. The axis
   asserts the observed retry gap, the 5-send cap, and a clean provider error rather than a hang.
 - **K — DeepSeek web and OCR (real API).** `web_search`, `web_fetch`, `read_document` (with its disk cache)
-  and `doctor --online` are exercised against the official endpoint; these spend real per-call money that
-  the token estimate does not cover.
+  and `doctor --online` are exercised against the official endpoint; these spend real per-call money. Since
+  #167 the runtime's cost estimate includes those fees, so `--max-usd` and cost-per-pass count them.
 - **L — harness evidence.** `session.completed` evidence is asserted directly: workspace observation
   (complete/changed/changes), `writes_applied`, `resumable`/`resume.command`, completion proof state and
   the structured `blocked` status with its blockers.
@@ -109,8 +109,38 @@ The agent environment disables Python bytecode writes during local execution, so
   that names the failure; a `report_blocker` (`environment_contradiction`) is the expected honest path.
 - **C-real-context-limit** — real provider with `[model_runtime] auto_compact_token_limit = 16000` and
   an 80 k-character prompt; asserts real `context.compacted` events (`reason = exceeded_context_limit`,
-  token observation present) and exact needle recall. **Boundary:** the observed compactions are
-  `strategy = none` no-shrink attempts because the threshold is checked at turn opening with only two
-  messages; deep summary compaction is not covered (issue #172).
+  token observation present) and exact needle recall. **Boundary:** every observed compaction is a
+  `strategy = none` no-shrink attempt, one before each model request of the turn. The oversized prompt is
+  the turn's user message, which is saved pinned and kept verbatim, and there are no older turns to
+  collapse. The rung covers the exceeded-context path only; deep summary compaction is
+  `C-real-deep-compaction` below, and the repeated no-op attempts are issue #175.
 - **`home_config`** — scenario field appended to the attempt's `$ORCA_HOME/config.toml` (local and
   docker), used to set the `[model_runtime]` compaction thresholds above.
+
+## Deep compaction rung (#172)
+
+- **C-real-deep-compaction** — resumes a prepared 8-turn session (`exec --resume <id>`) under the same
+  16 k / 12 k thresholds. `prepare.py` writes the session into the attempt's `$ORCA_HOME`. The short user
+  asks are saved pinned, so compaction keeps them verbatim; the ~9 k-character assistant notes are not
+  pinned. The deployment code appears once, in turn 1's reply, so the measured turn can get it only from
+  the summary that replaces the old replies. The verifier (under `verifier_root`) requires:
+  - a `remote_summary` compaction that collapsed messages, lowered both the message count and the token
+    estimate, and whose summary requests all succeeded with usage;
+  - the session's `context.manual_compaction_snapshot` with the code in `rolling_summary` and in no kept
+    message, so the original reply was dropped (what the optional "second needle" in #172 was for);
+  - no tool call touching the saved transcript, and the code in no tool output before the agent writes it;
+  - exactly the code in `answer.txt`, and `session.completed` success.
+- **Offline:** `tests/test_deep_compaction.py` drives the real prepare script and verifier with a fake
+  agent. A summary that kept the code passes; a summary that lost it, a no-shrink compaction and a
+  transcript read fail. With `--provider mock`, the real runtime collapses 8 messages (18 → 10, 25,142 →
+  6,780 tokens est, 9 summary requests). That attempt fails only on the summary check, because the mock's
+  summary cannot contain the code.
+- **Live (2026-11-15, binary built from main f4c8a9d3, k=3):** 3/3 pass, 26–32 s per attempt. Each run
+  collapsed 8 messages, 25,142 → ~7,160 tokens est, over 9 summary requests (23–27 s of the wall time).
+  Every summary kept the code as an exact constraint. Turn cost was $0.0015–0.0017 per attempt, plus
+  $0.0025–0.0052 for its summary requests.
+- **`CAPABILITY_HOME`** — set for local prepare scripts to the attempt's `$ORCA_HOME`, so a scenario can
+  seed state such as a prior session. Docker prepare scripts don't get it: the container sees the
+  workspace at another path, so a seeded session's paths would not match.
+- **Not covered:** this rung compacts once, before the measured turn's first request. Compaction forced
+  later in a turn by tool-output growth is not exercised.
