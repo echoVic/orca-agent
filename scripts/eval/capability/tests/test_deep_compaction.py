@@ -94,8 +94,9 @@ if MODE in ("combined", "combined_h"):
     Path("answer.txt").write_text(code)
     emit("tool.call.completed", {"id": "t3", "status": "completed", "output": found})
 if MODE == "split":
-    # The code arrives split across two streamed chunks; the completion is truncated.
-    text = next(line for line in path.read_text().splitlines() if code in line)
+    # Marker-free text with the code, split across two streamed chunks, and
+    # a truncated completion: only joining the chunks per call can catch it.
+    text = fact + "."
     cut = text.index(code) + len(code) // 2
     emit("tool.call.requested", {"id": "t4", "name": "bash", "target": None,
                                   "raw_arguments": json.dumps({"command": "grep -rh deployment .."})})
@@ -172,7 +173,7 @@ class DeepCompactionRungTests(unittest.TestCase):
     def test_a_code_split_across_output_chunks_is_still_caught(self):
         result, log = self.attempt("split")
         self.assertEqual(result.final_verification, "failed", log)
-        self.assertIn("tool output", log)
+        self.assertIn("tool output before the agent wrote answer.txt", log)
 
     def test_the_seeded_session_hides_the_code_in_one_old_unpinned_reply(self):
         home, workspace = self.root / "home", self.root / "workspace"
