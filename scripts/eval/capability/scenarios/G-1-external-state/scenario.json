@@ -13,7 +13,7 @@
   "verify": [
     "python3 verify.py"
   ],
-  "provider": "mock",
+  "provider": "deepseek",
   "evaluation": {
     "split": "holdout",
     "suite_id": "external-state-v1"

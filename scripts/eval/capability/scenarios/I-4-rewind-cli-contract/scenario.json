@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "axis": "I",
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "prompts/task.md",
+  "verify": [
+    "python3 verify.py"
+  ],
+  "limits": {
+    "wall_seconds": 600,
+    "verify_seconds": 240
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "mock",
+  "id": "I-4-rewind-cli-contract",
+  "rung": 4,
+  "difficulty": {
+    "level": 4,
+    "kind": "cli-contract"
+  },
+  "exec_flags": [
+    "--save-history"
+  ]
+}

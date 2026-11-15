@@ -1,0 +1,1 @@
+Use the read_document tool on doc.docx and write the recognized marker token (the one starting with ORCA-) into ocr.txt using write_file.

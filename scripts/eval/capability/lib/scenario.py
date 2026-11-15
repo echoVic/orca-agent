@@ -23,7 +23,7 @@ REQUIRED = {
     "verify": list,
 }
 BACKENDS = {"local", "harbor", "docker"}
-AXES = {"A", "B", "C", "D", "E", "F", "G", "H", "S"}
+AXES = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "S"}
 
 
 class ScenarioError(ValueError):
@@ -54,6 +54,7 @@ class Scenario:
     script: str = "workflow.js"
     path: Path | None = None
     execution: dict = field(default_factory=dict)
+    exec_flags: list = field(default_factory=list)
     evaluation: dict = field(default_factory=dict)
     evidence: list[dict] = field(default_factory=list)
     readonly_inputs: list[str] = field(default_factory=list)
@@ -111,6 +112,7 @@ def load(path: Path) -> Scenario:
             raise ScenarioError(f"{path}: prepare script not found: {prepare_path}")
         prepare = prepare_path
     execution = dict(raw.get("execution") or {})
+    exec_flags = [str(flag) for flag in (raw.get("exec_flags") or [])]
     from .evidence import validate_execution
     try:
         validate_execution(execution)
@@ -158,7 +160,7 @@ def load(path: Path) -> Scenario:
         workspace_mode=str(raw.get("workspace_mode") or "rw"),
         command=command,
         script=script,
-        path=path, execution=execution, evaluation=evaluation, evidence=constraints,
+        path=path, execution=execution, exec_flags=exec_flags, evaluation=evaluation, evidence=constraints,
         readonly_inputs=list(readonly_inputs), verifier_root=verifier_root,
     )
 

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "axis": "I",
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "prompts/task.md",
+  "verify": [
+    "python3 verify.py"
+  ],
+  "limits": {
+    "wall_seconds": 600,
+    "verify_seconds": 240
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "mock",
+  "id": "I-2-rewind-conversation",
+  "rung": 2,
+  "difficulty": {
+    "level": 2,
+    "kind": "conversation"
+  },
+  "exec_flags": [
+    "--save-history"
+  ]
+}

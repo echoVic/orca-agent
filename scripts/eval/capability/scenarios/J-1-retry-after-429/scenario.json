@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "id": "J-1-retry-after-429",
+  "axis": "J",
+  "rung": 1,
+  "difficulty": {
+    "level": 1,
+    "kind": "retry-after",
+    "status": 429
+  },
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "prompts/task.md",
+  "verify": [
+    "python3 verify.py"
+  ],
+  "limits": {
+    "wall_seconds": 300,
+    "verify_seconds": 120
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "mock"
+}

@@ -13,8 +13,8 @@ try:
 except json.JSONDecodeError:
     print(f"workflow list is not JSON: {result.stdout[:200]} {result.stderr[:200]}")
     sys.exit(2)
-cwd = os.getcwd()
-local = [run for run in runs if run.get("cwd") == cwd]
+cwd = os.path.realpath(os.getcwd())
+local = [run for run in runs if os.path.realpath(run.get("cwd") or "") == cwd]
 if not local:
     print("no workflow run recorded for this workspace")
     sys.exit(1)

@@ -1,0 +1,1 @@
+FIMODE=tool_script FITOOL=write FIWPATH=file.txt FIWCONTENT64=Y2hhbmdlZCBieSB0aGUgcmV3aW5kIGZpeHR1cmUK update the file

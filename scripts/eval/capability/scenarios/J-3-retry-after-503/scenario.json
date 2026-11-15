@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "id": "J-3-retry-after-503",
+  "axis": "J",
+  "rung": 3,
+  "difficulty": {
+    "level": 3,
+    "kind": "retry-after",
+    "status": 503
+  },
+  "backend": "local",
+  "fixture": "fixture",
+  "prompt": "prompts/task.md",
+  "verify": [
+    "python3 verify.py"
+  ],
+  "limits": {
+    "wall_seconds": 300,
+    "verify_seconds": 120
+  },
+  "anti_cheat": [],
+  "diagnostics": [
+    "test_log",
+    "trajectory"
+  ],
+  "provider": "mock"
+}
