@@ -447,6 +447,9 @@ fn resolve_request_path(root: &Path, cwd: &Path, raw: &str) -> Result<(String, P
     if relative.as_os_str().is_empty() {
         return Err("outside_root".to_string());
     }
+    // `root` is canonicalised when the turn starts; the cwd handed to tool dispatch may not be
+    // (for example macOS `/tmp` versus `/private/tmp`), so compare canonical forms.
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let relative_from_root = if cwd == root {
         relative
     } else {
@@ -1633,6 +1636,21 @@ mod tests {
                 .contains("does not match the checkpoint workspace"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn resolves_a_relative_path_through_a_non_canonical_cwd() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let root = workspace.path().canonicalize().expect("canonical root");
+        std::fs::create_dir(root.join("nested")).expect("nested directory");
+        std::fs::write(root.join("file.txt"), b"x").expect("fixture file");
+        // `nested/..` resolves to the workspace but is not lexically rooted at it: the raw cwd
+        // fails `strip_prefix`, which is what used to suppress headless checkpoint capture.
+        let alias = root.join("nested").join("..");
+        let (relative, absolute) =
+            resolve_request_path(&root, &alias, "file.txt").expect("path under the aliased cwd");
+        assert_eq!(relative, "file.txt");
+        assert_eq!(absolute, root.join("file.txt"));
     }
 
     #[test]
