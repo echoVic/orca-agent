@@ -1,5 +1,7 @@
 # TB2 预算缩放（A 轴）执行计划与预算 — v0.5.20
 
+> 执行结果：[`2026-11-16-tb2-v0520-budget-scaling.md`](2026-11-16-tb2-v0520-budget-scaling.md)（87 题 1× → 2×/4×，capability 4 + flaky 1）。
+
 日期：2026-11-15 · 目标：回答「v0.5.20 在 TB2 上剩下的失败，有多少是 wall-clock 预算问题，多少是真实
 能力缺口」。这是能力评测 A 轴的独立运行计划；不在 capability harness（B–L）内，也不与 TB2 mean 合并。
 
