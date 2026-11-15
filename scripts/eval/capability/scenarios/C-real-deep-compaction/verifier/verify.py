@@ -84,16 +84,16 @@ if any(CODE in json.dumps(message) for message in snapshot.get("messages") or []
 
 # 3. Recalled from the conversation, not read back from disk.
 #    - No tool call may name the saved transcript, and no tool output may
-#      show it: its path or session id in an output means a tool read or
-#      listed it, whatever the call looked like (`grep -R <code> ..` prints
-#      the file name; the transcript itself carries the session id).
+#      show it: its path, its session id or a raw transcript record in an
+#      output means a tool read or listed it, whatever the call looked like
+#      (`grep -R` prints the file name, `grep -rh` the raw record).
 #    - The answer write is the first successful tool call that names
 #      answer.txt and carries the code. Before it, no other call's output may
 #      hold the code. Streamed chunks are joined per call, so a code split
 #      across chunks still counts.
 #    - The deep compaction must come before the answer write, or the answer
 #      came from the unsummarized history.
-TRANSCRIPT_MARKS = (home, SESSION_ID, "/sessions/")
+TRANSCRIPT_MARKS = (home, SESSION_ID, "/sessions/", "conversation.message", "session.meta")
 deep_line = next(index for index, event in enumerate(events)
                  if event.get("type") == "context.compacted"
                  and (event.get("payload") or {}).get("strategy") == "remote_summary")

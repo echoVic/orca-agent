@@ -81,12 +81,14 @@ if MODE == "grep":
     emit("tool.call.requested", {"id": "t2", "name": "bash", "target": None,
                                   "raw_arguments": json.dumps({"command": "grep -R " + code + " .."})})
     emit("tool.call.completed", {"id": "t2", "status": "completed", "output": found})
-if MODE == "combined":
-    # One call that searches the transcript and writes the answer; grep
-    # prefixes each match with the file it came from.
-    relative = os.path.relpath(path, Path.cwd())
-    found = "\n".join(relative + ":" + line for line in path.read_text().splitlines() if code in line)
-    command = "grep -R " + code + " ..; printf %%s " + code + " > answer.txt"
+if MODE in ("combined", "combined_h"):
+    # One call that searches the transcript and writes the answer. grep -R
+    # prefixes each match with the file it came from; grep -rh does not, but
+    # still prints the raw transcript record.
+    relative = os.path.relpath(path, Path.cwd()) + ":" if MODE == "combined" else ""
+    found = "\n".join(relative + line for line in path.read_text().splitlines() if code in line)
+    search = "grep -R " + code + " .." if MODE == "combined" else "grep -rh deployment .."
+    command = search + "; printf %%s " + code + " > answer.txt"
     emit("tool.call.requested", {"id": "t3", "name": "bash", "target": None,
                                   "raw_arguments": json.dumps({"command": command})})
     Path("answer.txt").write_text(code)
@@ -100,7 +102,7 @@ if MODE == "split":
     emit("tool.output.delta", {"id": "t4", "chunk": text[:cut]})
     emit("tool.output.delta", {"id": "t4", "chunk": text[cut:]})
     emit("tool.call.completed", {"id": "t4", "status": "completed", "output": "", "truncated": True})
-if MODE not in ("early", "combined"):
+if MODE not in ("early", "combined", "combined_h"):
     write_answer()
 emit("session.completed", {"status": "success"})
 '''
@@ -158,6 +160,12 @@ class DeepCompactionRungTests(unittest.TestCase):
     def test_a_call_that_reads_the_transcript_and_writes_the_answer_fails(self):
         # The output shows the transcript's file name, whatever the call looks like.
         result, log = self.attempt("combined")
+        self.assertEqual(result.final_verification, "failed", log)
+        self.assertIn("transcript", log)
+
+    def test_a_filename_less_transcript_read_in_the_answer_call_fails(self):
+        # grep -rh hides the file name but prints the raw transcript record.
+        result, log = self.attempt("combined_h")
         self.assertEqual(result.final_verification, "failed", log)
         self.assertIn("transcript", log)
 
