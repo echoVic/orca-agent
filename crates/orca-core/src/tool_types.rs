@@ -775,6 +775,25 @@ fn terminal_status_matches_kind(status: ToolStatus, kind: ToolResultKind) -> boo
         )
 }
 
+/// Paid calls a tool made to a service that bills them apart from tokens. A
+/// tool reports what it was billed for; the runtime prices it into the cost
+/// estimate and the cost budget when the call returns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ToolServiceUsage {
+    /// DeepSeek Search API requests that returned results.
+    pub deepseek_searches: u32,
+    /// DeepSeek Fetch API requests that returned a page.
+    pub deepseek_fetches: u32,
+    /// Pages DeepSeek OCR recognized for this call.
+    pub deepseek_ocr_pages: u32,
+}
+
+impl ToolServiceUsage {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolResult {
     pub id: String,
@@ -786,6 +805,10 @@ pub struct ToolResult {
     pub images: Vec<ImageInput>,
     #[serde(skip)]
     pub file_change_preview: Option<Arc<FileChangePreview>>,
+    /// What this call was billed for apart from tokens. It is charged once,
+    /// when the call returns, so it never enters a transcript.
+    #[serde(skip)]
+    pub service_usage: ToolServiceUsage,
 }
 
 impl Deref for ToolResult {
@@ -845,6 +868,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            service_usage: ToolServiceUsage::default(),
         }
     }
 
@@ -864,6 +888,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            service_usage: ToolServiceUsage::default(),
         }
     }
 
@@ -898,6 +923,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            service_usage: ToolServiceUsage::default(),
         }
     }
 
@@ -950,6 +976,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            service_usage: ToolServiceUsage::default(),
         }
     }
 
@@ -969,6 +996,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            service_usage: ToolServiceUsage::default(),
         }
     }
 
@@ -988,6 +1016,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            service_usage: ToolServiceUsage::default(),
         }
     }
 
@@ -1020,6 +1049,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            service_usage: ToolServiceUsage::default(),
         }
     }
 
@@ -1063,11 +1093,17 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            service_usage: ToolServiceUsage::default(),
         }
     }
 
     pub fn with_file_change_preview(mut self, preview: FileChangePreview) -> Self {
         self.file_change_preview = Some(Arc::new(preview));
+        self
+    }
+
+    pub fn with_service_usage(mut self, usage: ToolServiceUsage) -> Self {
+        self.service_usage = usage;
         self
     }
 
@@ -1219,6 +1255,31 @@ mod tests {
         let mut done = ToolResult::completed(&request, "ok".into(), false);
         done.append_error_note("stop now");
         assert_eq!(done.error, None);
+    }
+
+    #[test]
+    fn service_usage_never_enters_a_transcript() {
+        // The runtime charges a call's fee once, when the call returns; a
+        // result read back from a transcript must not carry it again.
+        let request = ToolRequest {
+            id: "search-1".into(),
+            name: ToolName::WebSearch,
+            action: ActionKind::Network,
+            target: None,
+            raw_arguments: None,
+        };
+        let billed = ToolResult::completed(&request, "1. T".into(), false).with_service_usage(
+            ToolServiceUsage {
+                deepseek_searches: 1,
+                ..ToolServiceUsage::default()
+            },
+        );
+        assert_eq!(billed.service_usage.deepseek_searches, 1);
+
+        let json = serde_json::to_value(&billed).expect("a serialized result");
+        assert!(json.get("service_usage").is_none(), "{json}");
+        let read_back: ToolResult = serde_json::from_value(json).expect("a result");
+        assert!(read_back.service_usage.is_empty());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
-use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind};
+use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, ToolServiceUsage};
 
 use crate::deepseek_web::{
     self, DeepSeekWebAccess, DeepSeekWebError, OcrResult, OcrUpload, OcrUploadError,
@@ -127,8 +127,10 @@ pub fn execute_or_cancel(
             .ok()
             .and_then(|metadata| metadata.modified().ok()),
     };
-    let result = match claim_recognition(&key, &should_cancel) {
-        Claim::Done(result) => result,
+    // Only a recognition this read asked DeepSeek for is billed to it; a
+    // cached one, or one another read made, costs it nothing.
+    let (result, billed_pages) = match claim_recognition(&key, &should_cancel) {
+        Claim::Done(result) => (result, 0),
         Claim::Failed(message) => {
             return ToolResult::failed(
                 request,
@@ -159,8 +161,8 @@ pub fn execute_or_cancel(
             // A copy of the file, or a read in another process, may have
             // recognized the same content already.
             let disk_key = ocr_disk_cache::content_key(upload.file_bytes());
-            let result = match ocr_disk_cache::load(&disk_key) {
-                Some(result) => result,
+            let (result, billed_pages) = match ocr_disk_cache::load(&disk_key) {
+                Some(result) => (result, 0),
                 None => {
                     let runtime = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -180,7 +182,12 @@ pub fn execute_or_cancel(
                             if keeps_on_disk(&result) {
                                 ocr_disk_cache::store(&disk_key, &result);
                             }
-                            result
+                            // DeepSeek bills the pages it counted.
+                            let billed_pages = u32::try_from(
+                                result.page_count.unwrap_or(result.pages.len()),
+                            )
+                            .unwrap_or(u32::MAX);
+                            (result, billed_pages)
                         }
                         Err(DeepSeekWebError::Cancelled) => {
                             return ToolResult::cancelled(
@@ -203,7 +210,7 @@ pub fn execute_or_cancel(
             let result = Arc::new(result);
             lock_cache().insert(key, Arc::clone(&result));
             recognizing.finish(AttemptOutcome::Recognized(Arc::clone(&result)));
-            result
+            (result, billed_pages)
         }
     };
     let (output, truncated) = render_lines(
@@ -217,7 +224,12 @@ pub fn execute_or_cancel(
     } else {
         ToolResultKind::Success
     };
-    ToolResult::completed_kind(request, output, truncated, kind)
+    ToolResult::completed_kind(request, output, truncated, kind).with_service_usage(
+        ToolServiceUsage {
+            deepseek_ocr_pages: billed_pages,
+            ..ToolServiceUsage::default()
+        },
+    )
 }
 
 /// Whether a recognition may outlive the process. One with no pages, or
@@ -528,6 +540,81 @@ mod tests {
         fixture.requests();
     }
 
+    #[test]
+    fn read_document_reports_the_pages_deepseek_bills() {
+        let cwd = tempfile::tempdir().expect("temp workspace");
+        fs::write(cwd.path().join("counted.pdf"), b"%PDF counted").expect("a document");
+        fs::write(cwd.path().join("listed.pdf"), b"%PDF listed").expect("a document");
+        let fixture = crate::test_http::serve(vec![
+            (
+                200,
+                json!({"object": "ocr.result", "page_count": 3, "pages": [
+                    {"index": 0, "text": "A", "finish_reason": "stop"},
+                    {"index": 2, "text": "C", "finish_reason": "stop"},
+                ]})
+                .to_string(),
+            ),
+            ocr_reply(json!([
+                {"index": 0, "text": "A", "finish_reason": "stop"},
+                {"index": 1, "text": "B", "finish_reason": "stop"},
+            ])),
+        ]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+        let read = |id: &str, path: &str| {
+            execute_or_cancel(
+                &read_request(id, &json!({ "path": path }).to_string()),
+                cwd.path(),
+                64 * 1024,
+                Some(&access),
+                || false,
+            )
+        };
+
+        let counted = read("counted", "counted.pdf");
+        let listed = read("listed", "listed.pdf");
+
+        assert_eq!(
+            counted.service_usage.deepseek_ocr_pages, 3,
+            "DeepSeek bills the pages it counted: {:?}",
+            counted.error
+        );
+        assert_eq!(
+            listed.service_usage.deepseek_ocr_pages, 2,
+            "without a count, the pages it returned: {:?}",
+            listed.error
+        );
+        fixture.requests();
+    }
+
+    #[test]
+    fn a_cached_read_is_not_billed() {
+        let cwd = workspace_with("again.pdf", b"%PDF again");
+        let fixture = crate::test_http::serve(vec![ocr_reply(json!([
+            {"index": 0, "text": "once", "finish_reason": "stop"},
+        ]))]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+        let read = |id: &str| {
+            execute_or_cancel(
+                &read_request(id, r#"{"path":"again.pdf"}"#),
+                cwd.path(),
+                64 * 1024,
+                Some(&access),
+                || false,
+            )
+        };
+
+        let first = read("first");
+        let again = read("again");
+
+        assert_eq!(first.service_usage.deepseek_ocr_pages, 1, "{:?}", first.error);
+        assert_eq!(again.status, ToolStatus::Completed, "{:?}", again.error);
+        assert_eq!(
+            again.service_usage.deepseek_ocr_pages, 0,
+            "a read served from the cache costs nothing"
+        );
+        assert_eq!(fixture.requests().len(), 1);
+    }
+
     /// The key `read_document` claims for the file at `path`.
     fn claim_key(path: &Path) -> OcrKey {
         let metadata = fs::metadata(path).expect("the document");
@@ -592,6 +679,11 @@ mod tests {
         assert_eq!(first.status, ToolStatus::Completed, "{:?}", first.error);
         assert_eq!(second.status, ToolStatus::Completed, "{:?}", second.error);
         assert_eq!(first.output, second.output);
+        assert_eq!(
+            first.service_usage.deepseek_ocr_pages + second.service_usage.deepseek_ocr_pages,
+            1,
+            "only the read that recognized the page pays for it"
+        );
         assert_eq!(
             fixture.requests().len(),
             1,
@@ -835,6 +927,10 @@ mod tests {
             ),
             "{:?}",
             copy.error
+        );
+        assert_eq!(
+            copy.service_usage.deepseek_ocr_pages, 0,
+            "a read served from disk costs nothing"
         );
         assert_eq!(fixture.requests().len(), 1, "the copy came from disk");
     }

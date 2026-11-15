@@ -2729,7 +2729,34 @@ mod tests {
             result.output.as_deref(),
             Some("1. T\nS\nhttps://example.com/")
         );
+        assert_eq!(
+            result.service_usage.deepseek_searches, 1,
+            "the result says DeepSeek billed one search"
+        );
         assert_eq!(fixture.requests().len(), 1);
+    }
+
+    #[test]
+    fn billed_tools_stay_outside_the_read_batch() {
+        for (name, arguments) in [
+            (ToolName::WebSearch, r#"{"query":"rust"}"#),
+            (ToolName::WebFetch, r#"{"url":"https://example.com/"}"#),
+            (ToolName::ReadDocument, r#"{"path":"report.pdf"}"#),
+        ] {
+            let request = ToolRequest {
+                id: "billed".to_string(),
+                name: name.clone(),
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(arguments.to_string()),
+            };
+
+            assert!(
+                !crate::tool_is_available_readonly_concurrent(&request),
+                "{}: the runtime charges tool fees only on the normal dispatch path; charge the read batch before batching this tool",
+                name.as_str()
+            );
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::future::Future;
 use std::time::Duration;
 
-use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
+use orca_core::tool_types::{ToolRequest, ToolResult, ToolServiceUsage, truncate_output};
 
 use crate::deepseek_web::{self, DeepSeekSearchHit, DeepSeekWebAccess, DeepSeekWebError};
 
@@ -137,13 +137,33 @@ pub fn execute_or_cancel(
 
     match output {
         Ok(output) => {
-            let (output, truncated) = truncate_output(output, max_bytes);
-            ToolResult::completed(request, output, truncated)
+            let usage = ToolServiceUsage {
+                deepseek_searches: output.deepseek_searches,
+                ..ToolServiceUsage::default()
+            };
+            let (text, truncated) = truncate_output(output.text, max_bytes);
+            ToolResult::completed(request, text, truncated).with_service_usage(usage)
         }
         Err(SearchError::Cancelled) => {
             ToolResult::cancelled(request, "web search was cancelled", None)
         }
         Err(SearchError::Failed(error)) => ToolResult::failed(request, error, None),
+    }
+}
+
+/// A search's rendered results, and how many DeepSeek searches it was billed
+/// for.
+struct SearchOutput {
+    text: String,
+    deepseek_searches: u32,
+}
+
+impl SearchOutput {
+    fn unbilled(text: String) -> Self {
+        Self {
+            text,
+            deepseek_searches: 0,
+        }
     }
 }
 
@@ -155,30 +175,31 @@ async fn search_output(
     exa_endpoint: &str,
     today: NaiveDate,
     should_cancel: &dyn Fn() -> bool,
-) -> Result<String, SearchError> {
+) -> Result<SearchOutput, SearchError> {
     match backend {
         SearchBackend::Brave(key) => search_brave_or_cancel(args, key, today, should_cancel)
             .await
-            .map(format_results),
+            .map(|results| SearchOutput::unbilled(format_results(results))),
         SearchBackend::Exa => search_exa_at_or_cancel_async(args, exa_endpoint, should_cancel)
             .await
-            .map(format_results),
+            .map(|results| SearchOutput::unbilled(format_results(results))),
         SearchBackend::DeepSeek(access) => {
             let recency = (!args.recency_inferred)
                 .then_some(args.recency.as_ref())
                 .flatten();
             let query = deepseek_query(&args.query, recency, today);
             match deepseek_web::search(access, &query, args.count, should_cancel).await {
-                Ok(hits) => Ok(format_results(
-                    hits.into_iter().map(deepseek_result).collect(),
-                )),
+                Ok(search) => Ok(SearchOutput {
+                    text: format_results(search.hits.into_iter().map(deepseek_result).collect()),
+                    deepseek_searches: u32::from(search.billed),
+                }),
                 Err(DeepSeekWebError::Cancelled) => Err(SearchError::Cancelled),
                 Err(DeepSeekWebError::Failed(reason)) => {
                     match search_exa_at_or_cancel_async(args, exa_endpoint, should_cancel).await {
-                        Ok(results) => Ok(format!(
+                        Ok(results) => Ok(SearchOutput::unbilled(format!(
                             "[DeepSeek search failed: {reason}. These results come from Exa.]\n\n{}",
                             format_results(results)
-                        )),
+                        ))),
                         Err(SearchError::Cancelled) => Err(SearchError::Cancelled),
                         Err(SearchError::Failed(exa_error)) => Err(SearchError::Failed(format!(
                             "DeepSeek search failed: {reason}; {exa_error}"
@@ -1004,6 +1025,15 @@ mod tests {
         args: &SearchArgs,
         exa_endpoint: &str,
     ) -> Result<String, String> {
+        search_usage_with(backend, args, exa_endpoint).map(|output| output.text)
+    }
+
+    /// [`search_with`], keeping the DeepSeek calls the search was billed for.
+    fn search_usage_with(
+        backend: SearchBackend<'_>,
+        args: &SearchArgs,
+        exa_endpoint: &str,
+    ) -> Result<SearchOutput, String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1015,6 +1045,83 @@ mod tests {
             Err(SearchError::Cancelled) => Err("cancelled".to_string()),
             Err(SearchError::Failed(error)) => Err(error),
         }
+    }
+
+    #[test]
+    fn deepseek_search_with_results_is_one_billed_search() {
+        let fixture = crate::test_http::serve(vec![(
+            200,
+            r#"{"results":[{"title":"T","url":"https://example.com/","summary":"S"}]}"#.into(),
+        )]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let output = search_usage_with(
+            SearchBackend::DeepSeek(&access),
+            &search_args("rust", 3, None),
+            UNREACHABLE_EXA,
+        )
+        .expect("search succeeds");
+
+        assert_eq!(output.deepseek_searches, 1);
+        fixture.requests();
+    }
+
+    #[test]
+    fn an_empty_deepseek_search_is_not_billed() {
+        let fixture = crate::test_http::serve(vec![(200, r#"{"results":[]}"#.into())]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let output = search_usage_with(
+            SearchBackend::DeepSeek(&access),
+            &search_args("rust", 3, None),
+            UNREACHABLE_EXA,
+        )
+        .expect("search succeeds");
+
+        assert_eq!(output.text, "(no web search results)");
+        assert_eq!(output.deepseek_searches, 0, "DeepSeek bills no empty search");
+        fixture.requests();
+    }
+
+    #[test]
+    fn deepseek_search_counts_results_it_drops() {
+        // DeepSeek billed a search whose results array was not empty, even
+        // when none of the results had the URL Orca needs to show it.
+        let fixture = crate::test_http::serve(vec![(
+            200,
+            r#"{"results":[{"title":"T","summary":"S"}]}"#.into(),
+        )]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let output = search_usage_with(
+            SearchBackend::DeepSeek(&access),
+            &search_args("rust", 3, None),
+            UNREACHABLE_EXA,
+        )
+        .expect("search succeeds");
+
+        assert_eq!(output.text, "(no web search results)");
+        assert_eq!(output.deepseek_searches, 1);
+        fixture.requests();
+    }
+
+    #[test]
+    fn a_failed_deepseek_search_answered_by_exa_is_not_billed() {
+        let deepseek = crate::test_http::serve(vec![(500, DEEPSEEK_BOOM.into())]);
+        let exa = crate::test_http::serve(vec![(200, EXA_ONE_RESULT.into())]);
+        let access = DeepSeekWebAccess::for_test(&deepseek.origin, "sk-test");
+
+        let output = search_usage_with(
+            SearchBackend::DeepSeek(&access),
+            &search_args("rust", 3, None),
+            &format!("{}/mcp", exa.origin),
+        )
+        .expect("the Exa fallback succeeds");
+
+        assert!(output.text.contains("These results come from Exa."), "{}", output.text);
+        assert_eq!(output.deepseek_searches, 0);
+        deepseek.requests();
+        exa.requests();
     }
 
     #[test]

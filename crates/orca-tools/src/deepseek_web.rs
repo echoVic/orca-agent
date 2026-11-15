@@ -128,6 +128,15 @@ struct RawSearchHit {
     date: Option<String>,
 }
 
+/// What one Search API request found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DeepSeekSearch {
+    pub(crate) hits: Vec<DeepSeekSearchHit>,
+    /// DeepSeek bills a search that returned results, counted before Orca
+    /// drops the ones it cannot show; an empty search is free.
+    pub(crate) billed: bool,
+}
+
 /// Runs one Search API request. `query` must already fit DeepSeek's
 /// 128-character limit, operators included.
 pub(crate) async fn search(
@@ -135,7 +144,7 @@ pub(crate) async fn search(
     query: &str,
     count: usize,
     should_cancel: &dyn Fn() -> bool,
-) -> Result<Vec<DeepSeekSearchHit>, DeepSeekWebError> {
+) -> Result<DeepSeekSearch, DeepSeekWebError> {
     let body = json!({ "query": query, "count": count.clamp(1, 10) });
     let text = post_json(
         access,
@@ -148,7 +157,8 @@ pub(crate) async fn search(
     let response: SearchResponse = serde_json::from_str(&text).map_err(|error| {
         DeepSeekWebError::Failed(format!("invalid DeepSeek search response: {error}"))
     })?;
-    Ok(response
+    let billed = !response.results.is_empty();
+    let hits = response
         .results
         .into_iter()
         .filter_map(|hit| {
@@ -165,7 +175,8 @@ pub(crate) async fn search(
                 date: hit.date.as_deref().and_then(publication_day),
             })
         })
-        .collect())
+        .collect();
+    Ok(DeepSeekSearch { hits, billed })
 }
 
 /// `YYYY-MM-DD` from the front of an RFC 3339 timestamp.
