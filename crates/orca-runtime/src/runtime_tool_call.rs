@@ -239,6 +239,41 @@ impl RuntimeNormalToolHandler for DefaultRuntimeNormalToolHandler {
     }
 }
 
+/// The handler the dispatch path's per-call runtime uses: the real one, or in
+/// tests the one [`with_test_normal_handler`] installed on this thread.
+fn default_normal_handler() -> Arc<dyn RuntimeNormalToolHandler> {
+    #[cfg(test)]
+    if let Some(handler) = TEST_NORMAL_HANDLER.with(|slot| slot.borrow().clone()) {
+        return handler;
+    }
+    Arc::new(DefaultRuntimeNormalToolHandler)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NORMAL_HANDLER: std::cell::RefCell<Option<Arc<dyn RuntimeNormalToolHandler>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `test` with `handler` executing the normal tools this thread
+/// dispatches, so a test can drive the full tool turn with a tool result it
+/// chooses, such as one a paid service billed.
+#[cfg(test)]
+pub(crate) fn with_test_normal_handler<T>(
+    handler: Arc<dyn RuntimeNormalToolHandler>,
+    test: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_NORMAL_HANDLER.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    TEST_NORMAL_HANDLER.with(|slot| *slot.borrow_mut() = Some(handler));
+    let _reset = Reset;
+    test()
+}
+
 #[derive(Clone)]
 struct RuntimeNormalToolWorkerBridge {
     sender: SyncSender<RuntimeNormalToolMessage>,
@@ -416,7 +451,7 @@ impl RuntimeToolCallRuntime {
         Self {
             handle: None,
             executor: Arc::new(DefaultRuntimeReadonlyToolExecutor),
-            normal_handler: Arc::new(DefaultRuntimeNormalToolHandler),
+            normal_handler: default_normal_handler(),
             _owned_runtime: None,
         }
     }

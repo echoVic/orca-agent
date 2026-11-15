@@ -31,6 +31,12 @@ applies Monday to Friday from 09:00 to 12:00 and from 14:00 to 18:00 Beijing
 time, except on Chinese public holidays. Weekends and public holidays are
 off-peak all day.
 
+DeepSeek's fees for web search, web fetch and OCR, which it bills apart from
+tokens (per search or fetch, and per OCR page), count too. Orca builds these
+prices in: they are the same at every hour, and neither pricing refresh nor
+`[models."<name>".pricing]` changes them. See [Web search and fetch](configuration.md#web-search-and-fetch)
+and [Reading documents and images](configuration.md#reading-documents-and-images).
+
 Orca ships with built-in prices last verified on 2026-10-20. The first session
 in each process checks whether cached prices are missing or at least 24 hours old
 and, if needed, refreshes them from models.dev in the background. Refreshing

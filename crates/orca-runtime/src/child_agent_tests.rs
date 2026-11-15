@@ -1257,6 +1257,114 @@ fn run_child_agent_loop_with_tool_executor_runs_tools_until_provider_completes()
     assert_eq!(budget_usage.tool_calls, 1);
 }
 
+/// What a `bash echo child` child costs when its one tool call was billed
+/// `fee`.
+fn child_cost_with_tool_fee(fee: orca_core::tool_types::ToolServiceUsage) -> f64 {
+    let request = ChildAgentRequest::new(
+        "bash echo child".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let runtime_config = config(None);
+    let mut tracker = CostTracker::new(None);
+    run_child_agent_loop_with_tool_executor(
+        &runtime_config,
+        ChildAgentLoopContext {
+            request: &request,
+            cwd: std::env::temp_dir().as_path(),
+            instructions: &instructions,
+            memory: &memory,
+            hooks: &HookRunner::default(),
+            child_cost_tracker: &mut tracker,
+            lease: None,
+        },
+        |_setup, _cancel, tool_request| ChildAgentToolExecution {
+            should_stop: false,
+            result: ToolResult::completed(tool_request, "child tool ran".to_string(), false)
+                .with_service_usage(fee),
+            child_cost: None,
+        },
+    )
+    .expect("child loop runner should complete");
+    tracker.totals().estimated_cost_usd
+}
+
+#[test]
+fn a_child_tool_fee_reaches_the_child_cost() {
+    let unbilled = child_cost_with_tool_fee(orca_core::tool_types::ToolServiceUsage::default());
+    let billed = child_cost_with_tool_fee(orca_core::tool_types::ToolServiceUsage {
+        deepseek_searches: 1,
+        ..orca_core::tool_types::ToolServiceUsage::default()
+    });
+
+    // One DeepSeek search: $0.75 per 1,000.
+    assert!(
+        (billed - unbilled - 0.00075).abs() < 1e-12,
+        "{billed} vs {unbilled}"
+    );
+}
+
+#[test]
+fn an_observed_child_publishes_its_tool_fee_at_once() {
+    let request = ChildAgentRequest::new(
+        "bash echo child".to_string(),
+        SubagentType::General,
+        None,
+        2,
+        false,
+    );
+    let instructions = ProjectInstructions::default();
+    let memory = MemoryBlock::default();
+    let runtime_config = config(None);
+    let mut tracker = CostTracker::new(None);
+    let activities = RefCell::new(Vec::new());
+    let observer = ChildAgentActivityObserver::new(|activity| {
+        activities.borrow_mut().push(activity.clone());
+    });
+
+    run_child_agent_loop_with_tool_executor_observed(
+        &runtime_config,
+        ChildAgentLoopContext {
+            request: &request,
+            cwd: std::env::temp_dir().as_path(),
+            instructions: &instructions,
+            memory: &memory,
+            hooks: &HookRunner::default(),
+            child_cost_tracker: &mut tracker,
+            lease: None,
+        },
+        Some(&observer),
+        |_setup, _cancel, tool_request| ChildAgentToolExecution {
+            should_stop: false,
+            result: ToolResult::completed(tool_request, "searched".to_string(), false)
+                .with_service_usage(orca_core::tool_types::ToolServiceUsage {
+                    deepseek_searches: 1,
+                    ..orca_core::tool_types::ToolServiceUsage::default()
+                }),
+            child_cost: None,
+        },
+    )
+    .expect("child loop runner should complete");
+
+    drop(observer);
+    let activities = activities.into_inner();
+    let completed = activities
+        .iter()
+        .position(|activity| matches!(activity, ChildAgentActivity::ToolCompleted { .. }))
+        .expect("the tool completed");
+    assert!(
+        matches!(
+            activities.get(completed + 1),
+            Some(ChildAgentActivity::Usage(totals)) if totals.estimated_cost_usd >= 0.00075 - 1e-12
+        ),
+        "the fee is not reported right after the call: {activities:?}"
+    );
+}
+
 #[test]
 fn read_only_child_converges_to_a_tool_free_summary_turn() {
     let request = ChildAgentRequest::new(

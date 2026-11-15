@@ -18,7 +18,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde::Deserialize;
 
-use orca_core::tool_types::{ToolRequest, ToolResult, truncate_output};
+use orca_core::tool_types::{ToolRequest, ToolResult, ToolServiceUsage, truncate_output};
 
 use crate::deepseek_web::{self, DeepSeekPage, DeepSeekWebAccess, DeepSeekWebError};
 
@@ -83,10 +83,14 @@ pub fn execute_or_cancel(
 
     match outcome {
         Ok(fetched) => {
+            let usage = ToolServiceUsage {
+                deepseek_fetches: fetched.deepseek_fetches,
+                ..ToolServiceUsage::default()
+            };
             let text = render(fetched, args.prompt.as_deref());
             let effective_max = max_bytes.min(MAX_OUTPUT_CHARS);
             let (output, truncated) = truncate_output(text, effective_max);
-            ToolResult::completed(request, output, truncated)
+            ToolResult::completed(request, output, truncated).with_service_usage(usage)
         }
         Err(FetchError::Cancelled) => {
             ToolResult::cancelled(request, "web fetch was cancelled", None)
@@ -152,17 +156,23 @@ impl FetchError {
     }
 }
 
-/// What `web_fetch` returns: the page text, and a note when the text did not
-/// come from the direct request.
+/// What `web_fetch` returns: the page text, a note when the text did not
+/// come from the direct request, and how many DeepSeek fetches it was billed
+/// for.
 #[derive(Debug)]
 struct Fetched {
     note: Option<String>,
     text: String,
+    deepseek_fetches: u32,
 }
 
 impl Fetched {
     fn direct(text: String) -> Self {
-        Self { note: None, text }
+        Self {
+            note: None,
+            text,
+            deepseek_fetches: 0,
+        }
     }
 }
 
@@ -225,6 +235,8 @@ async fn finish_with_deepseek(
                 "[The direct request failed ({reason}), so this page was fetched through the DeepSeek Fetch API.]"
             )),
             text: page_text(page),
+            // DeepSeek bills a fetch that returned the page.
+            deepseek_fetches: 1,
         }),
         Err(DeepSeekWebError::Cancelled) => Err(FetchError::Cancelled),
         Err(DeepSeekWebError::Failed(deepseek_error)) => match local {
@@ -245,6 +257,7 @@ async fn finish_with_deepseek(
                     "[The page has no readable text, and the DeepSeek Fetch API could not read it either: {deepseek_error}.]"
                 )),
                 text: page.text,
+                deepseek_fetches: 0,
             }),
             other => other.map(direct),
         },
@@ -1181,6 +1194,66 @@ mod tests {
         assert_eq!(
             failure_message(error),
             format!("{LOCAL_403}; DeepSeek Fetch also failed: DeepSeek returned HTTP 500: boom")
+        );
+        fixture.requests();
+    }
+
+    #[test]
+    fn a_page_from_deepseek_is_one_billed_fetch() {
+        let fixture = crate::test_http::serve(vec![(200, page_json("A", "# A\n\nbody"))]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let fetched = block_on(finish_with_deepseek(
+            PAGE_URL,
+            Err(FetchError::status(403, LOCAL_403.into())),
+            Some(&access),
+            &|| false,
+        ))
+        .expect("DeepSeek answers");
+
+        assert_eq!(fetched.deepseek_fetches, 1);
+        fixture.requests();
+    }
+
+    #[test]
+    fn a_direct_page_is_not_billed() {
+        let (deepseek, access) = untouched_deepseek();
+
+        let fetched = block_on(finish_with_deepseek(
+            PAGE_URL,
+            Ok(LocalPage {
+                text: "# Page\n\nReal words.".to_string(),
+                readable: true,
+            }),
+            Some(&access),
+            &|| false,
+        ))
+        .expect("the direct page");
+
+        assert_eq!(fetched.deepseek_fetches, 0);
+        deepseek.assert_untouched("DeepSeek");
+    }
+
+    #[test]
+    fn a_failed_deepseek_retry_is_not_billed() {
+        let fixture =
+            crate::test_http::serve(vec![(500, r#"{"error":{"message":"boom"}}"#.into())]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+
+        let fetched = block_on(finish_with_deepseek(
+            PAGE_URL,
+            Ok(LocalPage {
+                text: "# App".to_string(),
+                readable: false,
+            }),
+            Some(&access),
+            &|| false,
+        ))
+        .expect("the local page comes back");
+
+        assert_eq!(
+            fetched.deepseek_fetches, 0,
+            "DeepSeek bills no failed fetch"
         );
         fixture.requests();
     }

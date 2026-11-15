@@ -16,6 +16,20 @@ impl Usage {
     }
 }
 
+/// Whether the `error` field of a provider or tool API response holds an
+/// error. Some gateways attach one to every stream chunk: `null`, `false`,
+/// `0`, a blank string and an empty object or array say nothing went wrong.
+pub fn error_field_reports_error(error: &serde_json::Value) -> bool {
+    match error {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(flag) => *flag,
+        serde_json::Value::Number(number) => number.as_f64() != Some(0.0),
+        serde_json::Value::String(text) => !text.trim().is_empty(),
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(fields) => !fields.is_empty(),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderReplayState {
     pub provider: &'static str,
@@ -110,4 +124,37 @@ pub struct ProviderResponse {
     pub assistant_reasoning: Option<String>,
     pub tool_calls: Vec<RawToolCall>,
     pub usage: Option<Usage>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::error_field_reports_error;
+
+    #[test]
+    fn error_field_reports_error_only_for_real_errors() {
+        for empty in [
+            json!(null),
+            json!(false),
+            json!(0),
+            json!(0.0),
+            json!(""),
+            json!("  "),
+            json!({}),
+            json!([]),
+        ] {
+            assert!(!error_field_reports_error(&empty), "{empty} is no error");
+        }
+        for error in [
+            json!(true),
+            json!(1),
+            json!(-1),
+            json!("boom"),
+            json!({"message": "x"}),
+            json!([1]),
+        ] {
+            assert!(error_field_reports_error(&error), "{error} is an error");
+        }
+    }
 }

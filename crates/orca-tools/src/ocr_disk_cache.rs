@@ -4,22 +4,30 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-use crate::deepseek_web::OcrResult;
+use crate::deepseek_web::{OCR_PURPOSE, OcrResult};
 
 #[cfg(not(test))]
 const CACHE_SUBDIR: &str = "ocr_cache";
 /// The most the cache keeps on disk. The least recently used entries go first.
 const MAX_DISK_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+/// How long a writer's temp file may sit unwritten before pruning takes it for
+/// one a killed process left. Writing an entry takes far less than this.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
+/// The version of what an entry holds: the text `ocr_text` makes of a page,
+/// in the shape `OcrResult` serializes to. Bump it whenever either changes,
+/// so that entries written before the change miss instead of serving text the
+/// current code would no longer produce.
+pub(crate) const OCR_CACHE_VERSION: &str = "orca-ocr-v1";
 
 /// The key of a recognition of `file_bytes`. It comes from the content, not
 /// the path, so a copy of a file hits and a changed file misses.
 pub(crate) fn content_key(file_bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"orca-ocr-v1\npurpose:text_recognition\n");
+    hasher.update(format!("{OCR_CACHE_VERSION}\npurpose:{OCR_PURPOSE}\n").as_bytes());
     hasher.update(file_bytes);
     orca_core::hex::lower(&hasher.finalize())
 }
@@ -74,31 +82,43 @@ fn store_in(dir: &Path, key: &str, result: &OcrResult, max_bytes: u64) {
     prune(dir, max_bytes);
 }
 
-/// Removes the least recently used entries until the rest fit in
-/// `max_bytes`.
+/// Removes the temp files killed writers left, then the least recently used
+/// entries until the rest fit in `max_bytes`.
 fn prune(dir: &Path, max_bytes: u64) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    let mut files = entries
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.ends_with(".json") && !name.starts_with('.'))
-        })
-        .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
-            metadata.is_file().then(|| {
-                (
-                    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                    metadata.len(),
-                    entry.path(),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
+    let now = SystemTime::now();
+    let mut files = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        if is_writer_temp(name) {
+            // A live writer renames its temp file into place within moments,
+            // so one nobody has written for this long lost its writer.
+            let stale = metadata.modified().ok().is_some_and(|modified| {
+                now.duration_since(modified)
+                    .is_ok_and(|age| age > STALE_TEMP_AGE)
+            });
+            if stale {
+                let _ = fs::remove_file(entry.path());
+            }
+        } else if name.ends_with(".json") && !name.starts_with('.') {
+            files.push((
+                metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                metadata.len(),
+                entry.path(),
+            ));
+        }
+    }
     let mut total = files.iter().map(|(_, len, _)| len).sum::<u64>();
     files.sort_by_key(|(modified, _, _)| *modified);
     for (_, len, path) in files {
@@ -109,6 +129,12 @@ fn prune(dir: &Path, max_bytes: u64) {
             total = total.saturating_sub(len);
         }
     }
+}
+
+/// Whether `name` is a temp file `orca_platform::fs::atomic_write` makes for
+/// an entry: `.<key>.json.orca-<pid>-<sequence>.tmp`.
+fn is_writer_temp(name: &str) -> bool {
+    name.starts_with('.') && name.ends_with(".tmp") && name.contains(".json.orca-")
 }
 
 #[cfg(not(test))]
@@ -294,5 +320,67 @@ mod tests {
         assert_eq!(content_key(upload.file_bytes()), content_key(original));
         assert_ne!(content_key(original), content_key(b"%PDF-1.4 other bytes"));
         assert_eq!(content_key(original).len(), 64);
+    }
+
+    #[test]
+    fn the_cache_key_keeps_its_v1_bytes() {
+        // Entries v0.5.20 wrote must keep hitting: the prefix bytes are part
+        // of every key on disk.
+        let expected = orca_core::hex::lower(&Sha256::digest(
+            b"orca-ocr-v1\npurpose:text_recognition\nabc",
+        ));
+
+        assert_eq!(content_key(b"abc"), expected);
+    }
+
+    #[test]
+    fn what_an_entry_holds_is_pinned_to_the_cache_version() {
+        const BUMP: &str = "this changes what a cache entry holds: update the expectation and bump OCR_CACHE_VERSION";
+        assert_eq!(OCR_CACHE_VERSION, "orca-ocr-v1", "{BUMP}");
+        for (raw, stored) in [
+            (
+                "<｜ref｜>Title<｜/ref｜><｜box｜>[[52, 40, 948, 96]]<｜/box｜>",
+                "Title",
+            ),
+            ("Outlook<｜box｜>[[52, 120, 9", "Outlook"),
+            ("a<｜/box｜>b", "ab"),
+        ] {
+            assert_eq!(crate::deepseek_web::ocr_text(raw), stored, "{BUMP}");
+        }
+        let entry = OcrResult {
+            pages: vec![OcrPage {
+                number: 1,
+                text: "A".to_string(),
+                complete: true,
+            }],
+            page_count: Some(1),
+        };
+        assert_eq!(
+            serde_json::to_string(&entry).expect("an entry"),
+            r#"{"pages":[{"number":1,"text":"A","complete":true}],"page_count":1}"#,
+            "{BUMP}"
+        );
+    }
+
+    #[test]
+    fn prune_removes_temp_files_a_killed_writer_left() {
+        let dir = tempfile::tempdir().expect("a cache dir");
+        fs::write(dir.path().join("k.json"), b"{}").expect("an entry");
+        let stale = dir.path().join(".k.json.orca-1-1.tmp");
+        fs::write(&stale, b"{").expect("a stale temp file");
+        fs::File::options()
+            .write(true)
+            .open(&stale)
+            .and_then(|file| file.set_modified(SystemTime::now() - Duration::from_secs(2 * 3600)))
+            .expect("date the stale temp file");
+        fs::write(dir.path().join(".k.json.orca-1-2.tmp"), b"{").expect("a fresh temp file");
+
+        prune(dir.path(), u64::MAX);
+
+        assert_eq!(
+            names(dir.path()),
+            [".k.json.orca-1-2.tmp", "k.json"],
+            "only the temp file nobody has written for an hour goes"
+        );
     }
 }

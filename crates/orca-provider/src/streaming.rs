@@ -299,7 +299,11 @@ impl StreamAccumulator {
         if let Some(chunk_usage) = chunk.usage {
             self.usage = Some(chunk_usage.into());
         }
-        if let Some(error) = chunk.error.as_ref().filter(|error| reports_error(error)) {
+        if let Some(error) = chunk
+            .error
+            .as_ref()
+            .filter(|error| orca_core::provider_types::error_field_reports_error(error))
+        {
             return Err(stream_error_message(error));
         }
 
@@ -368,20 +372,6 @@ pub(crate) fn is_stream_integrity_error(error: &str) -> bool {
         || error.starts_with(STREAM_ERROR_PREFIX)
         || error.starts_with(INVALID_SSE_DATA_JSON_PREFIX)
         || error.starts_with(INVALID_SSE_UTF8_PREFIX)
-}
-
-/// Whether a chunk's `error` field holds an error. Some gateways put one on
-/// every chunk; `false`, `0`, a blank string and an empty object or array say
-/// nothing went wrong (`null` never reaches here).
-fn reports_error(error: &serde_json::Value) -> bool {
-    match error {
-        serde_json::Value::Null => false,
-        serde_json::Value::Bool(flag) => *flag,
-        serde_json::Value::Number(number) => number.as_f64() != Some(0.0),
-        serde_json::Value::String(text) => !text.trim().is_empty(),
-        serde_json::Value::Array(items) => !items.is_empty(),
-        serde_json::Value::Object(fields) => !fields.is_empty(),
-    }
 }
 
 /// The reason DeepSeek gave in an error chunk: an object with `message` and

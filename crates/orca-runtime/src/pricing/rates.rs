@@ -4,6 +4,7 @@
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Timelike, Utc, Weekday};
 use orca_core::model::{FLASH_MODEL, PRO_MODEL};
 use orca_core::provider_types::Usage;
+use orca_core::tool_types::ToolServiceUsage;
 use serde::{Deserialize, Serialize};
 
 /// Prices in US dollars per million tokens.
@@ -28,6 +29,22 @@ pub const PRO_RATES: Rates = Rates {
 };
 
 pub const PEAK_MULTIPLIER: f64 = 2.0;
+
+/// What DeepSeek bills per use for its tool APIs, apart from tokens, from
+/// https://api-docs.deepseek.com/quick_start/pricing as checked on 2026-11-15:
+/// $0.75 per 1,000 searches, the same per 1,000 fetches, and $0.225 per
+/// 1,000 pages of file parsing or OCR. Unlike token prices they are the same
+/// at every hour.
+pub const DEEPSEEK_SEARCH_USD_PER_CALL: f64 = 0.75 / 1000.0;
+pub const DEEPSEEK_FETCH_USD_PER_CALL: f64 = 0.75 / 1000.0;
+pub const DEEPSEEK_OCR_USD_PER_PAGE: f64 = 0.225 / 1000.0;
+
+/// The fee, in US dollars, for what a tool call was billed for.
+pub fn service_cost_usd(usage: ToolServiceUsage) -> f64 {
+    f64::from(usage.deepseek_searches) * DEEPSEEK_SEARCH_USD_PER_CALL
+        + f64::from(usage.deepseek_fetches) * DEEPSEEK_FETCH_USD_PER_CALL
+        + f64::from(usage.deepseek_ocr_pages) * DEEPSEEK_OCR_USD_PER_PAGE
+}
 
 /// DeepSeek states its peak hours and holidays in Beijing time (UTC+8, no DST).
 const BEIJING_UTC_OFFSET_SECS: i32 = 8 * 60 * 60;
@@ -140,6 +157,24 @@ pub fn peak_instant() -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_usage_is_priced_at_flat_tool_rates() {
+        let usage = orca_core::tool_types::ToolServiceUsage {
+            deepseek_searches: 2,
+            deepseek_fetches: 1,
+            deepseek_ocr_pages: 10,
+        };
+
+        // $0.75 per 1,000 searches or fetches, $0.225 per 1,000 pages.
+        let cost = service_cost_usd(usage);
+        assert!((cost - 0.0045).abs() < 1e-12, "{cost}");
+        assert_eq!(crate::cost::usd_to_micros(cost), 4_500);
+        assert_eq!(
+            service_cost_usd(orca_core::tool_types::ToolServiceUsage::default()),
+            0.0
+        );
+    }
 
     fn utc(text: &str) -> DateTime<Utc> {
         text.parse().expect("valid UTC instant")

@@ -9,7 +9,7 @@ use orca_core::conversation::Conversation;
 use orca_core::conversation::Message;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
-use orca_core::tool_types::{ToolRequest, ToolResult};
+use orca_core::tool_types::{ToolRequest, ToolResult, ToolServiceUsage};
 use orca_mcp::{McpElicitationHandler, McpRegistry};
 
 use crate::agent_child::ChildAgentExecutor;
@@ -106,12 +106,18 @@ pub(crate) struct RuntimeNormalToolTurnExecution {
     /// The subagent child's consumed budget receipt, when this tool ran a
     /// child agent that reported one.
     child_budget_usage: Option<orca_core::budget::BudgetUsage>,
+    /// What the call paid a service for, apart from tokens, for the caller
+    /// to charge.
+    service_usage: ToolServiceUsage,
 }
 
 #[derive(Debug)]
 pub(crate) struct RuntimeNormalToolTurnFailure {
     error: io::Error,
     child_budget_usage: Option<orca_core::budget::BudgetUsage>,
+    /// What the call paid for when it ran before the failure; it is billed
+    /// whatever happened afterwards.
+    service_usage: ToolServiceUsage,
 }
 
 impl From<io::Error> for RuntimeNormalToolTurnFailure {
@@ -119,6 +125,7 @@ impl From<io::Error> for RuntimeNormalToolTurnFailure {
         Self {
             error,
             child_budget_usage: None,
+            service_usage: ToolServiceUsage::default(),
         }
     }
 }
@@ -1105,6 +1112,19 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             Ok(execution) => execution,
             Err(failure) => {
                 settle_child_lease(&mut child_lease, failure.child_budget_usage, &mut operation)?;
+                // The call ran before the failure, so what it paid for is
+                // billed; the usage stream is skipped, since this path is
+                // already leaving with an error.
+                let _ = charge_tool_service_usage(
+                    failure.service_usage,
+                    &tool_request.id,
+                    cost_tracker,
+                    operation.as_deref_mut(),
+                    events,
+                    sink,
+                    None,
+                    false,
+                );
                 let error = failure.error;
                 if is_semantic_commit_failure(&error) {
                     return Err(error);
@@ -1177,6 +1197,16 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 execution.child_budget_usage,
                 &mut operation,
             )?;
+            let _ = charge_tool_service_usage(
+                execution.service_usage,
+                &tool_request.id,
+                cost_tracker,
+                operation.as_deref_mut(),
+                events,
+                sink,
+                None,
+                false,
+            );
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
@@ -1199,6 +1229,38 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                 conversation_tool_settlement(conversation, &tool_request.id).0,
                 conversation_tool_settlement(conversation, &tool_request.id).1,
             )?;
+        }
+        if let Err(error) = charge_tool_service_usage(
+            execution.service_usage,
+            &tool_request.id,
+            cost_tracker,
+            operation.as_deref_mut(),
+            events,
+            sink,
+            history_writer.as_deref_mut(),
+            emit_deltas,
+        ) {
+            // The fee is in the tracker and the journal; only reporting it
+            // failed. As for any event I/O error, the calls that never
+            // started still get a terminal result before the error returns.
+            settle_child_lease(
+                &mut child_lease,
+                execution.child_budget_usage,
+                &mut operation,
+            )?;
+            close_unstarted_tool_requests(
+                sampling_state,
+                tool_requests,
+                &event_registry,
+                events,
+                sink,
+                conversation,
+                history_writer.as_deref_mut(),
+                emit_deltas,
+                provider_response_ingress,
+                "an earlier tool invocation completed before its fee could be reported",
+            )?;
+            return Err(error);
         }
         if matches!(outcome, ToolTurnOutcome::Return { .. }) {
             settle_child_lease(
@@ -1485,6 +1547,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             },
             event_error,
             child_budget_usage: None,
+            service_usage: ToolServiceUsage::default(),
         });
     }
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
@@ -1529,6 +1592,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         workflow_child_executor,
     )?;
     let child_budget_usage = execution.child_budget_usage;
+    let service_usage = execution.result.service_usage;
     if execution
         .event_error
         .as_ref()
@@ -1540,6 +1604,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
                 .take()
                 .expect("semantic commit failure remains available"),
             child_budget_usage,
+            service_usage,
         });
     }
 
@@ -1558,6 +1623,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             .map_err(|error| RuntimeNormalToolTurnFailure {
                 error,
                 child_budget_usage,
+                service_usage,
             })?;
         let totals = cost_tracker.totals();
         if emit_deltas {
@@ -1594,6 +1660,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             .map_err(|error| RuntimeNormalToolTurnFailure {
                 error,
                 child_budget_usage,
+                service_usage,
             })?;
         if execution.disposition == RuntimeToolTurnDisposition::StopTurn {
             ToolTurnOutcome::Return {
@@ -1615,12 +1682,55 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
     .map_err(|error| RuntimeNormalToolTurnFailure {
         error,
         child_budget_usage,
+        service_usage,
     })?;
     Ok(RuntimeNormalToolTurnExecution {
         outcome,
         event_error,
         child_budget_usage,
+        service_usage,
     })
+}
+
+/// Prices what a tool call paid a service for, apart from tokens: the cost
+/// goes into the tracker, the operation's cost budget and the usage stream.
+/// The call has already run, so a budget the fee passes stops the run at the
+/// next turn or tool admission, as a provider response's cost does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn charge_tool_service_usage<W: io::Write>(
+    usage: ToolServiceUsage,
+    tool_call_id: &str,
+    cost_tracker: &mut CostTracker,
+    operation: Option<&mut OperationContext>,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+    history_writer: Option<&mut SessionWriter>,
+    emit_deltas: bool,
+) -> io::Result<()> {
+    if usage.is_empty() {
+        return Ok(());
+    }
+    let spent_before = crate::cost::usd_to_micros(cost_tracker.totals().estimated_cost_usd);
+    let totals = cost_tracker.add_service_usage(usage);
+    let delta = crate::cost::usd_to_micros(totals.estimated_cost_usd).saturating_sub(spent_before);
+    if delta > 0
+        && let Some(operation) = operation
+    {
+        // Every call is a bill of its own, as every image analysis is.
+        let accounting_id = format!(
+            "tool-service:{tool_call_id}:{}",
+            orca_core::thread_identity::ConversationItemId::new()
+        );
+        // A stop latches in the controller; the next admission reports it.
+        let _ = operation.record_cost_usd_micros(delta, &accounting_id)?;
+    }
+    if emit_deltas {
+        sink.emit(events.usage_updated(totals))?;
+        if let Some(writer) = history_writer {
+            writer.append_usage(totals)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn record_root_task_output_truncation<W: io::Write>(
@@ -1788,6 +1898,378 @@ mod tests {
             String::from_utf8(output)
                 .expect("event output")
                 .contains("outputTruncated")
+        );
+    }
+
+    fn parsed_events(output: Vec<u8>) -> Vec<serde_json::Value> {
+        String::from_utf8(output)
+            .expect("event output")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON event"))
+            .collect()
+    }
+
+    /// $0.0045 of DeepSeek tool fees.
+    fn a_searches_fetch_and_ocr_fee() -> orca_core::tool_types::ToolServiceUsage {
+        orca_core::tool_types::ToolServiceUsage {
+            deepseek_searches: 2,
+            deepseek_fetches: 1,
+            deepseek_ocr_pages: 10,
+        }
+    }
+
+    fn tool_service_accounting_ids(operation: &OperationContext) -> Vec<String> {
+        operation
+            .journal
+            .committed()
+            .iter()
+            .filter_map(|record| match record {
+                crate::execution_journal::JournalRecord::BudgetUsage {
+                    accounting_id: Some(id),
+                    ..
+                } if id.starts_with("tool-service:") => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_service_usage_is_charged_to_tracker_budget_and_usage_stream() {
+        let mut operation = OperationContext::for_tests(
+            orca_core::budget::BudgetSpec {
+                max_cost_usd_micros: Some(1_000_000),
+                ..orca_core::budget::BudgetSpec::default()
+            },
+            "op-tool-service",
+        );
+        let mut cost_tracker = CostTracker::new(None);
+        let mut events = EventFactory::new("tool-service".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+
+        charge_tool_service_usage(
+            a_searches_fetch_and_ocr_fee(),
+            "call-1",
+            &mut cost_tracker,
+            Some(&mut operation),
+            &mut events,
+            &mut sink,
+            None,
+            true,
+        )
+        .expect("charge the fee");
+        drop(sink);
+
+        let total = cost_tracker.totals().estimated_cost_usd;
+        assert!((total - 0.0045).abs() < 1e-12, "{total}");
+        assert_eq!(operation.controller.usage().cost_usd_micros, 4_500);
+        let usage_events = parsed_events(output)
+            .into_iter()
+            .filter(|event| event["type"] == "usage.updated")
+            .collect::<Vec<_>>();
+        assert_eq!(usage_events.len(), 1, "{usage_events:?}");
+        let reported = usage_events[0]["payload"]["estimated_cost_usd"]
+            .as_f64()
+            .expect("a cost");
+        assert!((reported - 0.0045).abs() < 1e-12, "{reported}");
+        let ids = tool_service_accounting_ids(&operation);
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        assert!(ids[0].starts_with("tool-service:call-1:"), "{ids:?}");
+    }
+
+    #[test]
+    fn empty_service_usage_charges_nothing() {
+        let mut operation = OperationContext::for_tests(
+            orca_core::budget::BudgetSpec::default(),
+            "op-no-tool-service",
+        );
+        let mut cost_tracker = CostTracker::new(None);
+        let mut events = EventFactory::new("no-tool-service".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+
+        charge_tool_service_usage(
+            orca_core::tool_types::ToolServiceUsage::default(),
+            "call-1",
+            &mut cost_tracker,
+            Some(&mut operation),
+            &mut events,
+            &mut sink,
+            None,
+            true,
+        )
+        .expect("nothing to charge");
+        drop(sink);
+
+        assert_eq!(cost_tracker.totals().estimated_cost_usd, 0.0);
+        assert!(parsed_events(output).is_empty());
+        assert!(tool_service_accounting_ids(&operation).is_empty());
+    }
+
+    #[test]
+    fn a_service_fee_over_the_budget_stops_the_next_tool_admission() {
+        let mut operation = OperationContext::for_tests(
+            orca_core::budget::BudgetSpec {
+                max_cost_usd_micros: Some(1_000),
+                ..orca_core::budget::BudgetSpec::default()
+            },
+            "op-tool-service-over-budget",
+        );
+        let mut cost_tracker = CostTracker::new(None);
+        let mut events = EventFactory::new("tool-service-over-budget".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+
+        // The call already ran, so its 4,500 micros are recorded even though
+        // they pass the 1,000-micro budget.
+        charge_tool_service_usage(
+            a_searches_fetch_and_ocr_fee(),
+            "call-1",
+            &mut cost_tracker,
+            Some(&mut operation),
+            &mut events,
+            &mut sink,
+            None,
+            true,
+        )
+        .expect("charge the fee");
+
+        let admission = operation
+            .admit_tool_call("turn-1", "call-2", "web_search")
+            .expect("journal ok");
+        let stop = admission.expect_err("the fee used up the budget");
+        assert!(
+            matches!(
+                stop.reason,
+                orca_core::budget::StopReason::CostBudget {
+                    max_cost_usd_micros: 1_000
+                }
+            ),
+            "{:?}",
+            stop.reason
+        );
+    }
+
+    /// A normal-tool handler that answers every call as a DeepSeek search
+    /// that returned results, so DeepSeek billed it.
+    struct BilledSearchHandler;
+
+    impl crate::runtime_tool_call::RuntimeNormalToolHandler for BilledSearchHandler {
+        fn execute(
+            &self,
+            invocation: &crate::runtime_tool_call::RuntimeNormalToolInvocation,
+            _context: &mut crate::runtime_tool_call::RuntimeNormalToolWorkerContext<'_>,
+        ) -> ToolResult {
+            ToolResult::completed(
+                &invocation.request,
+                "1. T\nS\nhttps://example.com/".into(),
+                false,
+            )
+            .with_service_usage(orca_core::tool_types::ToolServiceUsage {
+                deepseek_searches: 1,
+                ..orca_core::tool_types::ToolServiceUsage::default()
+            })
+        }
+    }
+
+    fn web_search_request(id: &str) -> ToolRequest {
+        ToolRequest {
+            id: id.to_string(),
+            name: ToolName::WebSearch,
+            action: ActionKind::Network,
+            target: None,
+            raw_arguments: Some(r#"{"query":"rust"}"#.to_string()),
+        }
+    }
+
+    /// Runs one tool turn over `requests` as the provider turn does, with
+    /// every normal tool answered by [`BilledSearchHandler`].
+    fn run_billed_tool_turn<W: io::Write>(
+        requests: &[ToolRequest],
+        sink: &mut EventSink<W>,
+        operation: Option<&mut OperationContext>,
+        cost_tracker: &mut CostTracker,
+        conversation: &mut Conversation,
+    ) -> io::Result<ToolTurnOutcome> {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.output_format = OutputFormat::Jsonl;
+        config.tools.max_read_parallel = 1;
+        let mut events = EventFactory::new("tool-turn-billed".to_string());
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("tool-turn-billed".to_string());
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+        let policy = policy_for_tool_execution(&config);
+        let step_context = RuntimeStepContext::new(
+            &config,
+            cwd.path(),
+            AgentToolPolicyContext::unrestricted(),
+            0,
+            true,
+            &policy,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        crate::runtime_tool_call::with_test_normal_handler(Arc::new(BilledSearchHandler), || {
+            run_tool_turns(RuntimeToolTurnsContext {
+                step_context,
+                sampling_state: &mut sampling_state,
+                operation,
+                io: RuntimeToolTurnsIo {
+                    events: &mut events,
+                    sink,
+                    conversation,
+                    history_writer: None,
+                    cost_tracker,
+                    background_workflows: &mut background_workflows,
+                },
+                tool_requests: requests,
+                checkpoint_observer: None,
+                executors: RuntimeToolTurnsExecutors {
+                    workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                    batch_child_executor: unused_child_executor::<io::Sink>,
+                },
+            })
+        })
+    }
+
+    #[test]
+    fn run_tool_turns_charges_a_billed_tool_call() {
+        let mut operation = OperationContext::for_tests(
+            orca_core::budget::BudgetSpec {
+                max_cost_usd_micros: Some(1_000_000),
+                ..orca_core::budget::BudgetSpec::default()
+            },
+            "op-billed-call",
+        );
+        let mut cost_tracker = CostTracker::new(None);
+        let mut conversation = Conversation::new();
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+
+        run_billed_tool_turn(
+            &[web_search_request("search-1")],
+            &mut sink,
+            Some(&mut operation),
+            &mut cost_tracker,
+            &mut conversation,
+        )
+        .expect("tool turn");
+        drop(sink);
+
+        // One DeepSeek search: $0.75 per 1,000.
+        let total = cost_tracker.totals().estimated_cost_usd;
+        assert!((total - 0.00075).abs() < 1e-12, "{total}");
+        assert_eq!(operation.controller.usage().cost_usd_micros, 750);
+        let ids = tool_service_accounting_ids(&operation);
+        assert!(
+            ids.len() == 1 && ids[0].starts_with("tool-service:search-1:"),
+            "{ids:?}"
+        );
+        assert!(
+            parsed_events(output)
+                .iter()
+                .any(|event| event["type"] == "usage.updated"
+                    && (event["payload"]["estimated_cost_usd"]
+                        .as_f64()
+                        .unwrap_or_default()
+                        - 0.00075)
+                        .abs()
+                        < 1e-12),
+            "the fee reaches the usage stream"
+        );
+    }
+
+    /// Accepts every write except the `usage.updated` event.
+    struct FailOnUsageUpdate;
+
+    impl io::Write for FailOnUsageUpdate {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if String::from_utf8_lossy(buffer).contains("usage.updated") {
+                return Err(io::Error::other("usage consumer disconnected"));
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn run_tool_turns_closes_unstarted_siblings_when_a_fee_cannot_be_reported() {
+        let mut cost_tracker = CostTracker::new(None);
+        let mut conversation = Conversation::new();
+        let mut sink = EventSink::new(FailOnUsageUpdate, OutputFormat::Jsonl);
+        let requests = vec![
+            web_search_request("search-1"),
+            ToolRequest {
+                id: "never-run".to_string(),
+                name: ToolName::Bash,
+                action: ActionKind::Shell,
+                target: Some("printf never".to_string()),
+                raw_arguments: Some(r#"{"command":"printf never"}"#.to_string()),
+            },
+        ];
+
+        let error = match run_billed_tool_turn(
+            &requests,
+            &mut sink,
+            None,
+            &mut cost_tracker,
+            &mut conversation,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the fee's event I/O error must stay visible to the caller"),
+        };
+
+        assert!(
+            error.to_string().contains("usage consumer disconnected"),
+            "{error}"
+        );
+        let total = cost_tracker.totals().estimated_cost_usd;
+        assert!(
+            (total - 0.00075).abs() < 1e-12,
+            "the billed call stays charged: {total}"
+        );
+        assert_eq!(
+            conversation.messages.len(),
+            2,
+            "{:?}",
+            conversation.messages
+        );
+        assert!(matches!(
+            &conversation.messages[0],
+            Message::Tool {
+                terminal: Some(terminal),
+                ..
+            } if terminal.status == ToolStatus::Completed
+        ));
+        assert!(
+            matches!(
+                &conversation.messages[1],
+                Message::Tool {
+                    terminal: Some(terminal),
+                    ..
+                } if terminal.status == ToolStatus::Cancelled
+                    && terminal.started == ToolInvocationStarted::No
+            ),
+            "the call that never started has a terminal result: {:?}",
+            conversation.messages
         );
     }
 

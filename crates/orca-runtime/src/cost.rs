@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use orca_core::cost_types::UsageTotals;
 use orca_core::model::{ModelPriceOverride, canonical_model_name};
 use orca_core::provider_types::Usage;
+use orca_core::tool_types::ToolServiceUsage;
 
 use crate::pricing::book;
 use crate::pricing::rates::{self, Rates};
@@ -74,6 +75,13 @@ impl CostTracker {
         self.totals.output_tokens += usage.output_tokens;
         self.totals.cache_tokens += usage.cache_tokens;
         self.totals.estimated_cost_usd += self.estimate(usage);
+        self.totals
+    }
+
+    /// Adds what a tool call paid a service for, apart from tokens. The fee
+    /// does not depend on the model or the hour.
+    pub fn add_service_usage(&mut self, usage: ToolServiceUsage) -> UsageTotals {
+        self.totals.estimated_cost_usd += rates::service_cost_usd(usage);
         self.totals
     }
 
@@ -150,6 +158,30 @@ mod tests {
     fn cost(tracker: CostTracker, usage: Usage) -> f64 {
         let mut tracker = tracker;
         tracker.add_usage(usage).estimated_cost_usd
+    }
+
+    #[test]
+    fn service_usage_adds_cost_without_tokens() {
+        // Peak hours double token prices, never tool prices.
+        let mut tracker = CostTracker::new(Some(FLASH_MODEL)).with_clock(peak_instant);
+        let before = tracker.add_usage(usage(1_000, 100, 0));
+
+        let after = tracker.add_service_usage(orca_core::tool_types::ToolServiceUsage {
+            deepseek_searches: 2,
+            deepseek_fetches: 1,
+            deepseek_ocr_pages: 10,
+        });
+
+        assert_eq!(
+            (after.input_tokens, after.output_tokens, after.cache_tokens),
+            (
+                before.input_tokens,
+                before.output_tokens,
+                before.cache_tokens
+            )
+        );
+        let fee = after.estimated_cost_usd - before.estimated_cost_usd;
+        assert!((fee - 0.0045).abs() < 1e-12, "{fee}");
     }
 
     #[test]

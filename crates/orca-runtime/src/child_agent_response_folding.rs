@@ -90,6 +90,9 @@ pub fn fold_child_agent_tool_result(
     if let Some(cost) = child_cost {
         child_cost_tracker.merge(&cost);
     }
+    // What the call paid a service for, apart from tokens; the loop's next
+    // lease sync turns it into budget cost.
+    child_cost_tracker.add_service_usage(result.service_usage);
 
     let result_content = agent_common::format_tool_result_for_model(&result);
     setup

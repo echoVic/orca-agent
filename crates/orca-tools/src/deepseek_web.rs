@@ -20,8 +20,8 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// DeepSeek gives a recognition 180 s from the start of the upload.
 const OCR_TIMEOUT: Duration = Duration::from_secs(180);
 /// Word and PowerPoint text is extracted directly; everything else is
-/// recognized page by page.
-const OCR_PURPOSE: &str = "text_recognition";
+/// recognized page by page. The OCR disk cache keys entries by it too.
+pub(crate) const OCR_PURPOSE: &str = "text_recognition";
 const CANCEL_POLL: Duration = Duration::from_millis(10);
 /// How much of DeepSeek's own error message an error carries.
 const ERROR_MESSAGE_CHARS: usize = 200;
@@ -128,6 +128,15 @@ struct RawSearchHit {
     date: Option<String>,
 }
 
+/// What one Search API request found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DeepSeekSearch {
+    pub(crate) hits: Vec<DeepSeekSearchHit>,
+    /// DeepSeek bills a search that returned results, counted before Orca
+    /// drops the ones it cannot show; an empty search is free.
+    pub(crate) billed: bool,
+}
+
 /// Runs one Search API request. `query` must already fit DeepSeek's
 /// 128-character limit, operators included.
 pub(crate) async fn search(
@@ -135,7 +144,7 @@ pub(crate) async fn search(
     query: &str,
     count: usize,
     should_cancel: &dyn Fn() -> bool,
-) -> Result<Vec<DeepSeekSearchHit>, DeepSeekWebError> {
+) -> Result<DeepSeekSearch, DeepSeekWebError> {
     let body = json!({ "query": query, "count": count.clamp(1, 10) });
     let text = post_json(
         access,
@@ -148,7 +157,8 @@ pub(crate) async fn search(
     let response: SearchResponse = serde_json::from_str(&text).map_err(|error| {
         DeepSeekWebError::Failed(format!("invalid DeepSeek search response: {error}"))
     })?;
-    Ok(response
+    let billed = !response.results.is_empty();
+    let hits = response
         .results
         .into_iter()
         .filter_map(|hit| {
@@ -165,7 +175,8 @@ pub(crate) async fn search(
                 date: hit.date.as_deref().and_then(publication_day),
             })
         })
-        .collect())
+        .collect();
+    Ok(DeepSeekSearch { hits, billed })
 }
 
 /// `YYYY-MM-DD` from the front of an RFC 3339 timestamp.
@@ -301,7 +312,10 @@ pub(crate) async fn ocr(
     })?;
     // A recognition that fails after it started still answers HTTP 200,
     // with DeepSeek's reason, such as an unsupported format, in the body.
-    if value.get("error").is_some_and(reports_error) {
+    if value
+        .get("error")
+        .is_some_and(orca_core::provider_types::error_field_reports_error)
+    {
         let message = deepseek_message(&text, &access.api_key);
         return Err(DeepSeekWebError::Failed(if message.is_empty() {
             "the recognition failed without a reason".to_string()
@@ -333,19 +347,6 @@ pub(crate) async fn ocr(
             .collect(),
         page_count: response.page_count,
     })
-}
-
-/// Whether an `error` field holds an error. `null`, `false`, `0`, a blank
-/// string and an empty object or array do not.
-fn reports_error(error: &Value) -> bool {
-    match error {
-        Value::Null => false,
-        Value::Bool(flag) => *flag,
-        Value::Number(number) => number.as_f64() != Some(0.0),
-        Value::String(text) => !text.trim().is_empty(),
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(fields) => !fields.is_empty(),
-    }
 }
 
 /// A region's coordinates, which mean nothing to a model: the opening tag,
