@@ -118,6 +118,29 @@ pub fn clear_current_process_std_handle_inheritance() -> io::Result<()> {
     platform::clear_current_process_std_handle_inheritance()
 }
 
+/// Environment variables that hold a credential Orca itself runs with: the
+/// provider key under either name, and the Brave key `web_search` reads. The
+/// shells and commands an agent starts must never inherit them, or a task
+/// that prints its environment shows the key (#178).
+pub const CREDENTIAL_ENV_VARS: [&str; 3] =
+    ["ORCA_API_KEY", "DEEPSEEK_API_KEY", "BRAVE_SEARCH_API_KEY"];
+
+/// Removes Orca's credentials from the environment `command` would inherit.
+/// Call it before applying any variable the caller sets on purpose.
+pub fn remove_credential_env(command: &mut Command) {
+    for name in CREDENTIAL_ENV_VARS {
+        command.env_remove(name);
+    }
+}
+
+/// Whether `name` is one of Orca's credential variables. Matching ignores
+/// ASCII case, as Windows does for environment names.
+pub fn is_credential_env(name: &std::ffi::OsStr) -> bool {
+    CREDENTIAL_ENV_VARS
+        .iter()
+        .any(|credential| name.eq_ignore_ascii_case(credential))
+}
+
 /// Detaches the current process stdout from a one-shot launcher handshake.
 ///
 /// Long-lived workers use stdout only to publish their initial launch receipt.
@@ -740,6 +763,49 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_credential_env_strips_every_orca_credential() {
+        let mut command = Command::new("orca-test-noop");
+        for name in CREDENTIAL_ENV_VARS {
+            command.env(name, "sk-test-credential");
+        }
+        command.env("KEEP_ME", "1");
+
+        remove_credential_env(&mut command);
+
+        let envs = command.get_envs().collect::<Vec<_>>();
+        for name in CREDENTIAL_ENV_VARS {
+            assert!(
+                envs.contains(&(std::ffi::OsStr::new(name), None)),
+                "{name} must be removed: {envs:?}"
+            );
+        }
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("KEEP_ME"),
+            Some(std::ffi::OsStr::new("1"))
+        )));
+    }
+
+    #[test]
+    fn credential_env_names_match_ignoring_case() {
+        for name in [
+            "DEEPSEEK_API_KEY",
+            "deepseek_api_key",
+            "Orca_Api_Key",
+            "BRAVE_SEARCH_API_KEY",
+        ] {
+            assert!(is_credential_env(std::ffi::OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "GITHUB_TOKEN",
+            "DEEPSEEK_MODEL",
+            "PATH",
+            "DEEPSEEK_API_KEY_FILE",
+        ] {
+            assert!(!is_credential_env(std::ffi::OsStr::new(name)), "{name}");
+        }
+    }
 
     #[test]
     fn open_url_opens_only_web_urls() {
