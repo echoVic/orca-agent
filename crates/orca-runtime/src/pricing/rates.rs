@@ -31,7 +31,7 @@ pub const PRO_RATES: Rates = Rates {
 pub const PEAK_MULTIPLIER: f64 = 2.0;
 
 /// What DeepSeek bills per use for its tool APIs, apart from tokens, from
-/// https://api-docs.deepseek.com/quick_start/pricing as checked on 2026-11-15:
+/// https://api-docs.deepseek.com/quick_start/pricing as checked on 2026-11-16:
 /// $0.75 per 1,000 searches, the same per 1,000 fetches, and $0.225 per
 /// 1,000 pages of file parsing or OCR. Unlike token prices they are the same
 /// at every hour.
@@ -99,7 +99,7 @@ const WEEKDAY_HOLIDAYS: &[(i32, u32, u32)] = &[
 
 /// The day the built-in prices were checked against DeepSeek's pricing page.
 pub fn builtin_as_of() -> NaiveDate {
-    NaiveDate::from_ymd_opt(2026, 11, 15).expect("valid built-in date")
+    NaiveDate::from_ymd_opt(2026, 11, 16).expect("valid built-in date")
 }
 
 /// The built-in prices, by canonical model name.
@@ -261,7 +261,7 @@ mod tests {
     fn builtin_table_matches_the_published_off_peak_prices() {
         assert_eq!(
             builtin_as_of(),
-            NaiveDate::from_ymd_opt(2026, 11, 15).unwrap()
+            NaiveDate::from_ymd_opt(2026, 11, 16).unwrap()
         );
         let table = builtin_rates();
         assert_eq!(

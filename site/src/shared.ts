@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.20";
+export const releaseVersion = "v0.5.21";
 
 export const releases = [
+  {
+    version: "v0.5.21",
+    date: "2026-11-16",
+    title: "Tool fees in the budget, keys out of agent shells",
+    body: "DeepSeek's per-use fees for web search, web fetch and OCR now count toward Orca's cost estimate and the --max-cost-usd budget: a search counts when DeepSeek returns results, a fetch when DeepSeek returns the page, and an OCR read the pages DeepSeek counted, while a cached read or one served by a shared recognition costs nothing, and the built-in rates are flat at every hour and unaffected by the pricing refresh or per-model price overrides. ORCA_API_KEY, DEEPSEEK_API_KEY and BRAVE_SEARCH_API_KEY are removed from every agent shell, agent command and Orca helper process — including full-access shell sessions and the Windows sandbox environment block — so a command that prints its environment cannot reveal them, and Terminal-Bench runs no longer carry the key in their environment, command lines or persisted artifacts. orca exec --save-history sessions and native Windows capture rewind checkpoints again when the tool cwd is not canonical, pressure compaction keeps a reduction only when it reaches the soft limit or saves a tenth (leaving recent tool results intact otherwise), a workflow stop that reaches a child before the host loop settles as stopped, and OCR reads share a failed recognition instead of retrying one after another while the disk cache prunes temp files killed writers leave.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.21",
+  },
   {
     version: "v0.5.20",
     date: "2026-11-15",

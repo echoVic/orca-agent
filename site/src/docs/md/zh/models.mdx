@@ -22,7 +22,7 @@ DeepSeek-V4.1-Flash，支持图像理解并采用 Flash 价格。旧名称
 
 DeepSeek 的联网搜索、网页抓取和 OCR 在 token 之外单独计费（搜索和抓取按次，OCR 按页），同样计入估算。这几项是 Orca 内置的价格，不分时段，也不受价格刷新和 `[models."<名称>".pricing]` 影响，见[联网搜索与网页抓取](configuration.md#联网搜索与网页抓取)和[读取文档和图片](configuration.md#读取文档和图片)。
 
-Orca 自带的价格上次核对日期是 2026-10-20。进程中的第一个会话会检查缓存是否缺失或已满 24 小时，满足条件就在后台从 models.dev 刷新。刷新不阻塞启动，失败时继续使用已有价格。开发构建默认不刷新，除非把 `ORCA_PRICING_URL` 设为 URL。`ORCA_PRICING_URL=off` 可在任何构建中关闭刷新，不区分大小写并忽略首尾空白。运行 `orca doctor`，可以在 `pricing` 行查看价格来源、刷新开关和当前 DeepSeek 高峰或空闲时段。不想联网刷新价格，或者想自己给模型定价，在用户配置里添加：
+Orca 自带的价格上次核对日期是 2026-11-16。进程中的第一个会话会检查缓存是否缺失或已满 24 小时，满足条件就在后台从 models.dev 刷新。刷新不阻塞启动，失败时继续使用已有价格。开发构建默认不刷新，除非把 `ORCA_PRICING_URL` 设为 URL。`ORCA_PRICING_URL=off` 可在任何构建中关闭刷新，不区分大小写并忽略首尾空白。运行 `orca doctor`，可以在 `pricing` 行查看价格来源、刷新开关和当前 DeepSeek 高峰或空闲时段。不想联网刷新价格，或者想自己给模型定价，在用户配置里添加：
 
 ~~~toml
 [pricing]
