@@ -169,6 +169,10 @@ export ORCA_API_KEY="sk-..."
 不要提交凭据。`orca doctor --format json` 只报告凭据是否存在和其来源，绝不会输出
 凭据值。
 
+智能体运行的 shell 和命令不会继承 `ORCA_API_KEY`、`DEEPSEEK_API_KEY` 或
+`BRAVE_SEARCH_API_KEY`，所以打印环境变量的命令也看不到它们。如果你自己项目的测试要读
+其中某个变量，请换一种方式提供，比如项目的 `.env` 文件或另一个名字的变量。
+
 ## 环境变量覆盖
 
 | 用途 | 变量 |

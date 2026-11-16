@@ -885,8 +885,20 @@ impl Drop for PipeSet {
 }
 
 fn environment_block(overrides: &BTreeMap<String, Option<String>>) -> Vec<u16> {
-    let mut values = std::env::vars_os().collect::<Vec<_>>();
-    values.retain(|(key, _)| !key.eq_ignore_ascii_case("ORCA_API_KEY"));
+    environment_block_from(std::env::vars_os(), overrides)
+}
+
+/// `inherited` is the environment the child would otherwise get. Orca's own
+/// credentials never pass to it (#178); an override sets exactly what the
+/// caller asked for.
+fn environment_block_from(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    overrides: &BTreeMap<String, Option<String>>,
+) -> Vec<u16> {
+    let mut values = inherited
+        .into_iter()
+        .filter(|(key, _)| !orca_platform::process::is_credential_env(key))
+        .collect::<Vec<_>>();
     for (key, value) in overrides {
         values.retain(|(existing, _)| !existing.to_string_lossy().eq_ignore_ascii_case(key));
         if let Some(value) = value {
@@ -1080,6 +1092,25 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn environment_block_drops_orca_credentials_but_keeps_overrides() {
+        let inherited = [
+            ("Path", r"C:\Windows"),
+            ("DEEPSEEK_API_KEY", "sk-test-credential-178"),
+            ("orca_api_key", "sk-test-credential-178"),
+            ("BRAVE_SEARCH_API_KEY", "sk-test-credential-178"),
+        ]
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)));
+        let overrides = BTreeMap::from([("EXPLICIT".to_string(), Some("1".to_string()))]);
+
+        let block = String::from_utf16(&environment_block_from(inherited, &overrides))
+            .expect("environment block is UTF-16");
+
+        assert!(!block.contains("sk-test-credential-178"), "{block:?}");
+        assert!(block.contains(r"Path=C:\Windows"), "{block:?}");
+        assert!(block.contains("EXPLICIT=1"), "{block:?}");
+    }
 
     #[test]
     fn windows_argument_quoting_matches_create_process_contract() {

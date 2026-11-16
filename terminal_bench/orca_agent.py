@@ -52,6 +52,20 @@ PROVIDER_ENV = (
 #: variable with `docker compose exec -e`, on the host, out of the task's reach.
 INSTRUCTION_ENV = "ORCA_INSTRUCTION"
 
+#: The key never travels in the run's environment: a task that prints its
+#: environment put it in a trajectory (#178). A setup command writes it to the
+#: agent's `~/.orca/auth.json` (0600), where Orca reads it, and gets it through
+#: this variable of its own exec only.
+AUTH_SETUP_ENV = "ORCA_ADAPTER_AUTH_JSON"
+AUTH_SETUP_COMMAND = (
+    'umask 077 && mkdir -p "$HOME/.orca" && '
+    f'printf \'%s\' "${AUTH_SETUP_ENV}" > "$HOME/.orca/auth.json"'
+)
+
+#: What replaces the key in every artifact the adapter persists, in case a
+#: tool still read it (for example from the auth file).
+REDACTED_KEY = "<REDACTED_DEEPSEEK_API_KEY>"
+
 #: Usage counters reported in `execution_metadata.json` for post-mortems.
 USAGE_FIELDS = ("turns", "output_tokens", "input_tokens", "cache_tokens", "cost_usd_micros")
 
@@ -90,6 +104,11 @@ def _load_api_key() -> str:
         if key := data.get("DEEPSEEK_API_KEY"):
             return key
     return os.environ.get("ORCA_API_KEY", "")
+
+
+def _redact(text: str, key: str) -> str:
+    """`text` with every copy of `key` replaced by `REDACTED_KEY`."""
+    return text.replace(key, REDACTED_KEY) if key else text
 
 
 def _host_ca_bundle() -> str | None:
@@ -254,8 +273,8 @@ class OrcaInstalledAgent(BaseInstalledAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
+        key = _load_api_key()
         env = {
-            "DEEPSEEK_API_KEY": _load_api_key(),
             "ORCA_BASE_URL": os.environ.get("ORCA_BASE_URL", "https://api.deepseek.com"),
             "ORCA_MODEL": os.environ.get("ORCA_MODEL", "deepseek-flash"),
             INSTRUCTION_ENV: instruction,
@@ -314,6 +333,13 @@ class OrcaInstalledAgent(BaseInstalledAgent):
         failure = None
         started = time.monotonic()
         try:
+            # Orca reports a missing key itself; the run never falls back to
+            # passing the key in its environment.
+            auth = await environment.exec(
+                command=AUTH_SETUP_COMMAND,
+                env={AUTH_SETUP_ENV: json.dumps({"DEEPSEEK_API_KEY": key})},
+            )
+            metadata["auth_setup_exit_code"] = getattr(auth, "return_code", None)
             # `environment.exec` rather than `exec_as_agent`: the helper raises
             # `NonZeroAgentExitCodeError` and throws the `ExecResult` away, so
             # the output of a crashed or budget-stopped run never reaches the
@@ -326,27 +352,30 @@ class OrcaInstalledAgent(BaseInstalledAgent):
             )
         except Exception as error:  # noqa: BLE001 - persist everything on failure
             failure = error
-            metadata["error"] = str(error)
+            metadata["error"] = _redact(str(error), key)
         finally:
             # Always persist stdout, stderr, exit code, terminal metadata, and
             # the raw trajectory on every exit path (including non-zero exits
-            # and timeouts, where `result` is None).
+            # and timeouts, where `result` is None). Each artifact is redacted.
             metadata["duration_seconds"] = round(time.monotonic() - started, 3)
-            output = result.stdout if result is not None else ""
-            stderr = result.stderr if result is not None else ""
+            output = _redact(result.stdout if result is not None else "", key)
+            stderr = _redact(result.stderr if result is not None else "", key)
             if result is not None:
                 metadata["exit_code"] = result.return_code
+            trajectory = logs_dir / "trajectory.jsonl"
             persisted = 0
             try:
-                await environment.download_file(
-                    trajectory_in_container, logs_dir / "trajectory.jsonl"
-                )
-                persisted = (logs_dir / "trajectory.jsonl").stat().st_size
+                await environment.download_file(trajectory_in_container, trajectory)
+                persisted = trajectory.stat().st_size
             except Exception as error:  # noqa: BLE001 - evidence is best effort
-                metadata["trajectory_download_error"] = str(error)
+                metadata["trajectory_download_error"] = _redact(str(error), key)
             if not persisted:
-                (logs_dir / "trajectory.jsonl").write_text(output, encoding="utf-8")
-                persisted = len(output.encode("utf-8"))
+                trajectory.write_text(output, encoding="utf-8")
+            elif key:
+                downloaded = trajectory.read_text(encoding="utf-8", errors="replace")
+                if key in downloaded:
+                    trajectory.write_text(_redact(downloaded, key), encoding="utf-8")
+            persisted = trajectory.stat().st_size
             metadata["trajectory_bytes"] = persisted
             metadata["trajectory_persisted"] = persisted > 0
             (logs_dir / "stderr.txt").write_text(stderr or "", encoding="utf-8")

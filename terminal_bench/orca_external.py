@@ -59,14 +59,21 @@ class OrcaExternalAgent(BaseAgent):
 
         # The instruction travels in a variable, not in the command line, where
         # a task's `pkill -f` could match it and kill the run (issue #126); the
-        # shell unsets it so Orca and its tools do not inherit it.
+        # shell unsets it so Orca and its tools do not inherit it. The key
+        # takes the same path (#178): out of every argv, where a task listing
+        # processes would see it, and handed to orca alone, whose own tools
+        # never inherit it.
         cmd = (
             'orca_instruction="$ORCA_INSTRUCTION"; unset ORCA_INSTRUCTION; '
+            'orca_key="$DEEPSEEK_API_KEY"; unset DEEPSEEK_API_KEY; '
             "printf '%s' \"$orca_instruction\" |"
-            f" DEEPSEEK_API_KEY={shlex.quote(_load_api_key())}"
+            ' DEEPSEEK_API_KEY="$orca_key"'
             f" {shlex.quote(orca_bin)} exec"
             f" --mode full-auto"
             f" --output-format jsonl"
         )
 
-        result = await environment.exec(cmd, env={"ORCA_INSTRUCTION": instruction})
+        result = await environment.exec(
+            cmd,
+            env={"ORCA_INSTRUCTION": instruction, "DEEPSEEK_API_KEY": _load_api_key()},
+        )

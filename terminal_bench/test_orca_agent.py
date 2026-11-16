@@ -537,17 +537,114 @@ class OrcaInstalledAgentTests(unittest.TestCase):
         )
         context = orca_external.AgentContext()
 
-        asyncio.run(
-            orca_external.OrcaExternalAgent().run(
-                "finish the task", environment, context
+        with patch.object(orca_external, "_load_api_key", return_value="sk-test-key-178"):
+            asyncio.run(
+                orca_external.OrcaExternalAgent().run(
+                    "finish the task", environment, context
+                )
             )
-        )
 
         self.assertFalse(hasattr(context, "output"))
         command = captured["command"]
-        self.assertEqual(captured["env"], {"ORCA_INSTRUCTION": "finish the task"})
+        self.assertEqual(
+            captured["env"],
+            {"ORCA_INSTRUCTION": "finish the task", "DEEPSEEK_API_KEY": "sk-test-key-178"},
+        )
         self.assertIn('''printf '%s' "$orca_instruction" |''', command)
         self.assertNotIn("finish the task", command)
+
+    def test_external_run_keeps_the_key_out_of_the_command_line(self) -> None:
+        # #178: a task can list processes; the key must not be in any argv,
+        # and only orca itself may receive it.
+        captured = {}
+
+        async def fake_exec(command, env):
+            captured["command"] = command
+            captured["env"] = env
+            return SimpleNamespace(stdout="")
+
+        with patch.object(orca_external, "_load_api_key", return_value="sk-test-key-178"):
+            asyncio.run(
+                orca_external.OrcaExternalAgent().run(
+                    "finish the task", SimpleNamespace(exec=fake_exec), orca_external.AgentContext()
+                )
+            )
+        command = captured["command"]
+        self.assertNotIn("sk-test-key-178", command)
+        with tempfile.TemporaryDirectory() as directory:
+            bin_dir = Path(directory) / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "orca").write_text(
+                "#!/bin/sh\n"
+                'printf %s "${DEEPSEEK_API_KEY-unset}" > "$OUT/key"\n'
+                'printf %s "$*" > "$OUT/argv"\n'
+            )
+            (bin_dir / "orca").chmod(0o755)
+            subprocess.run(
+                ["bash", "-c", command],
+                check=True,
+                env={
+                    "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                    "OUT": directory,
+                    "ORCA_BIN": "orca",
+                    **captured["env"],
+                },
+            )
+            out = Path(directory)
+            self.assertEqual((out / "key").read_text(), "sk-test-key-178")
+            self.assertNotIn("sk-test-key-178", (out / "argv").read_text())
+
+    def test_run_keeps_the_key_out_of_the_agent_environment(self) -> None:
+        # #178: a task that prints its environment put the key in a trajectory.
+        # The key now lives only in the agent's auth file, written 0600 by a
+        # setup command that gets it through its own environment.
+        calls = []
+
+        async def fake_exec(command, env):
+            calls.append((command, env))
+            return SimpleNamespace(stdout="", stderr="", return_code=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            agent = orca_agent.OrcaInstalledAgent()
+            agent.logs_dir = Path(directory)
+            with patch.object(orca_agent, "_load_api_key", return_value="sk-test-key-178"):
+                asyncio.run(
+                    agent.run("finish the task", SimpleNamespace(exec=fake_exec), orca_agent.AgentContext())
+                )
+
+        self.assertEqual(len(calls), 2, calls)
+        (setup, setup_env), (command, env) = calls
+        self.assertNotIn("sk-test-key-178", setup)
+        self.assertNotIn("sk-test-key-178", command)
+        self.assertNotIn("DEEPSEEK_API_KEY", env)
+        self.assertFalse(any("sk-test-key-178" in value for value in env.values()))
+        self.assertIn("orca exec", command)
+        with tempfile.TemporaryDirectory() as home:
+            subprocess.run(["bash", "-c", setup], check=True, env={"HOME": home, **setup_env})
+            auth = Path(home) / ".orca" / "auth.json"
+            self.assertEqual(json.loads(auth.read_text()), {"DEEPSEEK_API_KEY": "sk-test-key-178"})
+            self.assertEqual(auth.stat().st_mode & 0o777, 0o600)
+
+    def test_run_redacts_the_key_from_persisted_artifacts(self) -> None:
+        leaked = 'tool output: DEEPSEEK_API_KEY=sk-test-key-178\n'
+
+        async def fake_exec(command, env):
+            return SimpleNamespace(stdout=leaked, stderr=leaked, return_code=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            agent = orca_agent.OrcaInstalledAgent()
+            agent.logs_dir = Path(directory)
+            with patch.object(orca_agent, "_load_api_key", return_value="sk-test-key-178"):
+                asyncio.run(
+                    agent.run("finish the task", SimpleNamespace(exec=fake_exec), orca_agent.AgentContext())
+                )
+            for name in ("trajectory.jsonl", "stderr.txt", "execution_metadata.json"):
+                text = (Path(directory) / name).read_text(encoding="utf-8")
+                self.assertNotIn("sk-test-key-178", text, name)
+            self.assertIn(
+                orca_agent.REDACTED_KEY,
+                (Path(directory) / "trajectory.jsonl").read_text(encoding="utf-8"),
+            )
 
     def test_readme_uses_supported_harbor_filters(self) -> None:
         readme = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")

@@ -274,11 +274,15 @@ fn spawn_with_broker(
         })
 }
 
+/// Starts one of Orca's own helper processes (git, ripgrep, the clipboard
+/// tools). They never need Orca's credentials, and a repository's git hooks
+/// run inside git, so the credentials are removed first (#178).
 pub fn spawn_user_trusted(
-    command: Command,
+    mut command: Command,
     request_id: impl Into<String>,
     cwd: &Path,
 ) -> io::Result<(Child, ProcessJob, CapabilityReceipt)> {
+    orca_platform::process::remove_credential_env(&mut command);
     spawn_with_capability(
         command,
         request_id,
@@ -933,6 +937,33 @@ mod tests {
     use orca_platform::host::{Architecture, HostPlatform, OperatingSystem};
     use orca_platform::shell::ShellResolver;
     use std::path::PathBuf;
+
+    #[test]
+    fn orca_helper_processes_do_not_inherit_orca_credentials() {
+        // #178: git, ripgrep and the clipboard helpers run as Orca's own
+        // helpers, and a repository's git hooks run inside git.
+        let cwd = tempfile::tempdir().unwrap();
+        let shell = ShellResolver::for_current_host()
+            .resolve_from_environment()
+            .expect("resolve host test shell");
+        let script = if cfg!(windows) {
+            "[Console]::Out.Write(((@('ORCA_API_KEY','DEEPSEEK_API_KEY','BRAVE_SEARCH_API_KEY') | ForEach-Object { if ([Environment]::GetEnvironmentVariable($_)) { 'set' } else { 'unset' } }) -join '|'))"
+        } else {
+            "printf '%s|%s|%s' \"${ORCA_API_KEY-unset}\" \"${DEEPSEEK_API_KEY-unset}\" \"${BRAVE_SEARCH_API_KEY-unset}\""
+        };
+        let mut command = shell_command(&shell, script);
+        prepare_non_interactive_command(&mut command);
+        for name in ["ORCA_API_KEY", "DEEPSEEK_API_KEY", "BRAVE_SEARCH_API_KEY"] {
+            command.env(name, "sk-test-credential-178");
+        }
+        command.stdout(Stdio::piped());
+
+        let (child, _job, _receipt) =
+            spawn_user_trusted(command, "test:credentials", cwd.path()).expect("spawn helper");
+        let output = child.wait_with_output().expect("wait for helper");
+
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "unset|unset|unset");
+    }
 
     #[test]
     fn unavailable_sandbox_error_includes_backend_and_probe_reason() {

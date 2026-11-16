@@ -555,7 +555,9 @@ impl RuntimeShellSessionManager {
                 ),
                 ShellSandboxMode::DangerFullAccess => session_command(&shell, &command),
             };
-            process.env_remove("ORCA_API_KEY");
+            // Before the session's own variables: a key the caller passes on
+            // purpose is its choice, an inherited one is not.
+            orca_platform::process::remove_credential_env(&mut process);
             for (key, value) in &command.env {
                 match value {
                     Some(value) => {

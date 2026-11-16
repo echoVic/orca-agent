@@ -191,6 +191,12 @@ The local auth file can contain a JSON object with a `DEEPSEEK_API_KEY` member:
 Do not commit credentials. `orca doctor --format json` reports credential
 presence and source only; it never emits the credential value.
 
+The shells and commands the agent runs never inherit `ORCA_API_KEY`,
+`DEEPSEEK_API_KEY` or `BRAVE_SEARCH_API_KEY`, so a command that prints its
+environment cannot reveal them. If your own project's tests read one of these
+variables, give them the value another way, such as a project `.env` file or a
+differently named variable.
+
 ## Environment overrides
 
 | Purpose | Variables |

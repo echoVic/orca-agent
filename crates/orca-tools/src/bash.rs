@@ -199,8 +199,8 @@ fn execute_command_with_policy_or_cancel_with_profile(
     execution_profile: orca_core::capability::ExecutionProfile,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
+    orca_platform::process::remove_credential_env(&mut process_command);
     process_command
-        .env_remove("ORCA_API_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let (child, process_job, _receipt) = match process::spawn_with_enforcement_decision_profile(
@@ -406,10 +406,8 @@ pub fn execute_streaming_command_or_cancel(
     on_output: &mut dyn FnMut(&str),
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
-    command
-        .env_remove("ORCA_API_KEY")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    orca_platform::process::remove_credential_env(&mut command);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let (mut child, process_job, _receipt) = match process::spawn_with_enforcement_decision_profile(
         command,
         format!("tool:bash-stream:{}", request.id),
@@ -798,6 +796,52 @@ mod tests {
             on_output,
             should_cancel,
         )
+    }
+
+    #[test]
+    fn shell_children_do_not_inherit_orca_credentials() {
+        // #178: an agent shell printing its environment must not reveal the
+        // key Orca itself runs with, whichever variable it came from.
+        if !sandbox_enforcement_available() {
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let names = ["ORCA_API_KEY", "DEEPSEEK_API_KEY", "BRAVE_SEARCH_API_KEY"];
+        let script = platform_script(
+            "printf '%s|%s|%s' \"${ORCA_API_KEY-unset}\" \"${DEEPSEEK_API_KEY-unset}\" \"${BRAVE_SEARCH_API_KEY-unset}\"",
+            "[Console]::Out.Write(((@('ORCA_API_KEY','DEEPSEEK_API_KEY','BRAVE_SEARCH_API_KEY') | ForEach-Object { if ([Environment]::GetEnvironmentVariable($_)) { 'set' } else { 'unset' } }) -join '|'))",
+        );
+        let request = bash_request(&script);
+        let inheriting = || {
+            let mut command = host_test_command(&script, dir.path());
+            for name in names {
+                command.env(name, "sk-test-credential-178");
+            }
+            command
+        };
+
+        let result = execute_command_with_policy_or_cancel(
+            &request,
+            inheriting(),
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(120),
+            || false,
+        );
+        let streamed = execute_streaming_command_or_cancel(
+            &request,
+            inheriting(),
+            dir.path(),
+            ToolOutputTruncation::bytes(1024),
+            Duration::from_secs(120),
+            &mut |_| {},
+            || false,
+        );
+
+        for result in [result, streamed] {
+            assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+            assert_eq!(result.output.as_deref(), Some("unset|unset|unset"));
+        }
     }
 
     #[test]
