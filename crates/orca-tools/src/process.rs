@@ -938,16 +938,21 @@ mod tests {
     use orca_platform::shell::ShellResolver;
     use std::path::PathBuf;
 
-    #[cfg(unix)]
     #[test]
     fn orca_helper_processes_do_not_inherit_orca_credentials() {
         // #178: git, ripgrep and the clipboard helpers run as Orca's own
         // helpers, and a repository's git hooks run inside git.
         let cwd = tempfile::tempdir().unwrap();
-        let mut command = Command::new("sh");
-        command.arg("-c").arg(
-            "printf '%s|%s|%s' \"${ORCA_API_KEY-unset}\" \"${DEEPSEEK_API_KEY-unset}\" \"${BRAVE_SEARCH_API_KEY-unset}\"",
-        );
+        let shell = ShellResolver::for_current_host()
+            .resolve_from_environment()
+            .expect("resolve host test shell");
+        let script = if cfg!(windows) {
+            "[Console]::Out.Write(((@('ORCA_API_KEY','DEEPSEEK_API_KEY','BRAVE_SEARCH_API_KEY') | ForEach-Object { if ([Environment]::GetEnvironmentVariable($_)) { 'set' } else { 'unset' } }) -join '|'))"
+        } else {
+            "printf '%s|%s|%s' \"${ORCA_API_KEY-unset}\" \"${DEEPSEEK_API_KEY-unset}\" \"${BRAVE_SEARCH_API_KEY-unset}\""
+        };
+        let mut command = shell_command(&shell, script);
+        prepare_non_interactive_command(&mut command);
         for name in ["ORCA_API_KEY", "DEEPSEEK_API_KEY", "BRAVE_SEARCH_API_KEY"] {
             command.env(name, "sk-test-credential-178");
         }

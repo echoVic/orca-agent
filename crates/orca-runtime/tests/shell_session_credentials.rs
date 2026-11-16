@@ -18,6 +18,11 @@ fn shell_sessions_do_not_inherit_orca_credentials() {
         // variables before it starts any thread.
         unsafe { std::env::set_var(name, "sk-test-credential-178") };
     }
+    if cfg!(windows) {
+        // Without pwsh the default shell is cmd.exe; the probe is PowerShell.
+        // SAFETY: as above.
+        unsafe { std::env::set_var("ORCA_SHELL", "powershell.exe") };
+    }
     let cwd = tempfile::tempdir().expect("tempdir");
     let mut manager =
         RuntimeShellSessionManager::new(TaskRegistry::new("shell-credentials".to_string()));

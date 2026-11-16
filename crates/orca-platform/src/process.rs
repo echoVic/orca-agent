@@ -125,8 +125,9 @@ pub fn clear_current_process_std_handle_inheritance() -> io::Result<()> {
 pub const CREDENTIAL_ENV_VARS: [&str; 3] =
     ["ORCA_API_KEY", "DEEPSEEK_API_KEY", "BRAVE_SEARCH_API_KEY"];
 
-/// Removes Orca's credentials from the environment `command` would inherit.
-/// Call it before applying any variable the caller sets on purpose.
+/// Removes Orca's credentials from `command`'s environment, whether inherited
+/// or already set on it: agent shells and Orca's helpers never need them. A
+/// caller that does mean to pass one sets it after this call.
 pub fn remove_credential_env(command: &mut Command) {
     for name in CREDENTIAL_ENV_VARS {
         command.env_remove(name);
