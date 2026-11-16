@@ -109,11 +109,12 @@ The agent environment disables Python bytecode writes during local execution, so
   that names the failure; a `report_blocker` (`environment_contradiction`) is the expected honest path.
 - **C-real-context-limit** — real provider with `[model_runtime] auto_compact_token_limit = 16000` and
   an 80 k-character prompt; asserts real `context.compacted` events (`reason = exceeded_context_limit`,
-  token observation present) and exact needle recall. **Boundary:** every observed compaction is a
-  `strategy = none` no-shrink attempt, one before each model request of the turn. The oversized prompt is
-  the turn's user message, which is saved pinned and kept verbatim, and there are no older turns to
-  collapse. The rung covers the exceeded-context path only; deep summary compaction is
-  `C-real-deep-compaction` below, and the repeated no-op attempts are issue #175.
+  token observation present) and exact needle recall. **Boundary:** the oversized prompt is the turn's
+  user message, which is saved pinned and kept verbatim, and there are no older turns to collapse, so the
+  first compaction is a `strategy = none` no-shrink attempt. Before #175 the runtime then retried before
+  every model request and adopted `remote_summary` folds of the previous tool exchange that saved 6–800
+  tokens of ~24 k. Now it keeps the history and waits until the prompt has grown by a tenth. The rung
+  covers the exceeded-context path only; deep summary compaction is `C-real-deep-compaction` below.
 - **`home_config`** — scenario field appended to the attempt's `$ORCA_HOME/config.toml` (local and
   docker), used to set the `[model_runtime]` compaction thresholds above.
 
