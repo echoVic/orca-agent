@@ -356,6 +356,24 @@ fn calibrated_prompt_tokens(estimated: usize, reference: context::PromptMeasurem
     usize::try_from(scaled).unwrap_or(usize::MAX)
 }
 
+/// A pressure compaction is kept only when it brings the prompt under the soft
+/// line or cuts it by at least this share. Under a pinned prompt that alone is
+/// past the line, folding one small tool exchange saves a few percent and only
+/// discards the agent's recent results (#175). Emergencies keep any reduction.
+const PRESSURE_COMPACTION_MIN_GAIN_PERCENT: usize = 10;
+
+/// After a pressure compaction found nothing worth keeping, the next one waits
+/// until the prompt has grown by this share past where it was tried.
+const PRESSURE_COMPACTION_RETRY_GROWTH_PERCENT: usize = 10;
+
+fn pressure_compaction_held(conversation: &Conversation, measured_tokens: usize) -> bool {
+    conversation.compaction_hold.is_some_and(|hold| {
+        measured_tokens
+            < hold
+                .saturating_add(hold.saturating_mul(PRESSURE_COMPACTION_RETRY_GROWTH_PERCENT) / 100)
+    })
+}
+
 pub(crate) struct RuntimeCompactionPolicy<'a> {
     context_config: &'a context::ContextConfig,
     provider_config: &'a ProviderConfig,
@@ -686,6 +704,12 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         let Some(trigger) = policy.decide(conversation) else {
             return Ok(false);
         };
+        if pressure_compaction_held(
+            conversation,
+            context::measure_prompt(conversation, self.provider_config).tokens,
+        ) {
+            return Ok(false);
+        }
         self.emit_compaction_started(trigger, conversation.messages.len())?;
         Ok(self
             .compact_with_budget_hooks(conversation, trigger)?
@@ -711,6 +735,10 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         let Some(trigger) = trigger else {
             return Ok(Ok(()));
         };
+        // The emergency path must make room and is never held back.
+        if !trigger.is_emergency() && pressure_compaction_held(conversation, measured) {
+            return Ok(Ok(()));
+        }
         self.emit_compaction_started(trigger, conversation.messages.len())?;
         let adoption = self.compact_with_budget_hooks(conversation, trigger)?;
         Ok(
@@ -864,8 +892,12 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             )
         };
         let after = context::measure_prompt(&compaction.conversation, self.provider_config);
-        if after.estimated >= before.estimated {
-            // Nothing shrank: keep the history as it was, and persist nothing.
+        if !self.worth_adopting(trigger, before, after) {
+            // Nothing worth keeping: keep the history as it was, persist
+            // nothing, and hold pressure compaction until the prompt grows.
+            if !trigger.is_emergency() {
+                conversation.compaction_hold = Some(before.tokens);
+            }
             compaction.observation.measure_retained_history(
                 conversation,
                 conversation,
@@ -906,6 +938,9 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         }
         conversation.adopt(compaction.conversation);
         conversation.clear_usage_anchor();
+        // The compacted copy may carry an earlier hold; a kept compaction
+        // starts afresh.
+        conversation.compaction_hold = None;
         Ok((
             outcome,
             RuntimeCompactionAdoption {
@@ -913,6 +948,28 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
                 prompt_tokens: calibrated_prompt_tokens(after.estimated, before),
             },
         ))
+    }
+
+    /// An emergency keeps any reduction. A pressure compaction is kept when it
+    /// gets the prompt under the soft line or saves a real share of it (#175).
+    fn worth_adopting(
+        &self,
+        trigger: RuntimeCompactionTrigger,
+        before: context::PromptMeasurement,
+        after: context::PromptMeasurement,
+    ) -> bool {
+        if after.estimated >= before.estimated {
+            return false;
+        }
+        if trigger.is_emergency() {
+            return true;
+        }
+        let saved = before.estimated - after.estimated;
+        calibrated_prompt_tokens(after.estimated, before) <= self.context_config.soft_limit()
+            || saved.saturating_mul(100)
+                >= before
+                    .estimated
+                    .saturating_mul(PRESSURE_COMPACTION_MIN_GAIN_PERCENT)
     }
 
     fn emit_compaction_completed(&mut self, outcome: &RuntimeCompactionOutcome) -> io::Result<()> {
@@ -1750,6 +1807,169 @@ mod tests {
                 "soft {soft}, hard {hard}"
             );
         }
+    }
+
+    // The shape of the eval rung behind #175: the newest prompt is pinned and
+    // far past the soft line on its own, and one stale tool exchange is all
+    // compaction could fold away.
+    fn pinned_prompt_with_a_small_stale_exchange() -> Conversation {
+        let mut conversation = Conversation::new();
+        conversation.add_system("immutable instructions".to_string());
+        conversation.add_user_pinned("brief ".repeat(8_000));
+        tool_exchange(&mut conversation, "call-1", "evidence ".repeat(300));
+        tool_exchange(&mut conversation, "call-2", "done".to_string());
+        conversation
+    }
+
+    fn tool_exchange(conversation: &mut Conversation, id: &str, output: String) {
+        conversation.add_assistant(
+            None,
+            None,
+            vec![orca_core::conversation::RawToolCall {
+                id: id.to_string(),
+                function_name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            }],
+        );
+        conversation.add_tool_result(id.to_string(), output);
+    }
+
+    /// One pressure compaction step under a 2 k soft line: whether it adopted,
+    /// and the events it emitted.
+    fn pressure_step(
+        conversation: &mut Conversation,
+        writer: Option<&mut SessionWriter>,
+    ) -> (bool, Vec<serde_json::Value>) {
+        let config = context::ContextConfig {
+            max_tokens: 200_000,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: Some(100_000),
+            soft_compact_token_limit: Some(2_000),
+        };
+        let provider_config = bare_provider_config();
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("pressure-compaction".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let subagent_type = SubagentType::General;
+        let adopted = RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &config,
+            &provider_config,
+            RuntimeTurnContext::new(std::path::Path::new("."), "", 0, true, &subagent_type),
+            &hooks,
+            &mut events,
+            &mut sink,
+            writer,
+        )
+        .compact_if_needed(conversation)
+        .expect("compaction");
+        drop(sink);
+        let emitted = String::from_utf8(output)
+            .expect("jsonl is utf8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event is json"))
+            .collect();
+        (adopted, emitted)
+    }
+
+    fn compacted(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        events
+            .iter()
+            .filter(|event| event["type"] == "context.compacted")
+            .collect()
+    }
+
+    #[test]
+    fn pressure_compaction_that_barely_shrinks_is_not_adopted() {
+        // #175: folding the stale exchange saves a few percent and leaves the
+        // history far over the line. Adopting it would only discard the
+        // agent's recent tool result and rewrite the session snapshot.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("context.jsonl");
+        let meta = crate::history::create_meta(temp.path(), "mock", None, "barely shrinks");
+        let mut record = serde_json::to_value(meta).unwrap();
+        record["type"] = serde_json::json!("session.meta");
+        fs::write(&path, format!("{record}\n")).unwrap();
+        let mut writer = SessionWriter::append_to_existing(path.clone()).unwrap();
+        let mut conversation = pinned_prompt_with_a_small_stale_exchange();
+        let before = format!("{:?}", conversation.messages);
+
+        let (adopted, events) = pressure_step(&mut conversation, Some(&mut writer));
+
+        assert!(!adopted, "{events:?}");
+        assert_eq!(format!("{:?}", conversation.messages), before);
+        let compacted = compacted(&events);
+        assert_eq!(compacted.len(), 1, "{events:?}");
+        assert_eq!(compacted[0]["payload"]["strategy"], "none");
+        drop(writer);
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"type\":\"context.manual_compaction_snapshot\"")
+        );
+    }
+
+    #[test]
+    fn a_discarded_pressure_compaction_waits_for_the_prompt_to_grow() {
+        let mut conversation = pinned_prompt_with_a_small_stale_exchange();
+        let (adopted, first) = pressure_step(&mut conversation, None);
+        assert!(!adopted);
+        assert_eq!(compacted(&first).len(), 1, "{first:?}");
+
+        // The next request adds a little: nothing new to gain, no attempt.
+        tool_exchange(&mut conversation, "call-3", "ok".to_string());
+        let (adopted, second) = pressure_step(&mut conversation, None);
+        assert!(!adopted);
+        assert!(second.is_empty(), "{second:?}");
+
+        // A large result goes stale: that is worth folding, so it is tried
+        // and adopted.
+        tool_exchange(&mut conversation, "call-4", "evidence ".repeat(4_000));
+        tool_exchange(&mut conversation, "call-5", "ok".to_string());
+        let (adopted, third) = pressure_step(&mut conversation, None);
+        assert_eq!(compacted(&third).len(), 1, "{third:?}");
+        assert!(adopted, "{third:?}");
+    }
+
+    #[test]
+    fn a_held_compaction_still_lets_an_overflow_make_room() {
+        let mut conversation = pinned_prompt_with_a_small_stale_exchange();
+        let (adopted, _) = pressure_step(&mut conversation, None);
+        assert!(!adopted);
+        assert!(conversation.compaction_hold.is_some());
+        let before = format!("{:?}", conversation.messages);
+
+        // No room is left for a reply: the emergency path compacts and keeps
+        // even a small reduction, hold or not.
+        let provider_config = bare_provider_config();
+        let measured = context::measure_prompt(&conversation, &provider_config).tokens;
+        let config = context::ContextConfig {
+            max_tokens: measured + 64,
+            compaction_threshold: 1.0,
+            reserved_for_response: 4_096,
+            auto_compact_token_limit: Some(100_000),
+            soft_compact_token_limit: Some(2_000),
+        };
+        let hooks = HookRunner::default();
+        let mut events = EventFactory::new("overflow-compaction".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let subagent_type = SubagentType::General;
+        let _ = RuntimeCompactionStep::new(
+            orca_core::config::ProviderKind::Mock,
+            &config,
+            &provider_config,
+            RuntimeTurnContext::new(std::path::Path::new("."), "", 0, true, &subagent_type),
+            &hooks,
+            &mut events,
+            &mut sink,
+            None,
+        )
+        .prepare_request(&mut conversation)
+        .expect("compaction");
+
+        assert_ne!(format!("{:?}", conversation.messages), before);
     }
 
     #[test]

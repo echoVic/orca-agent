@@ -16,6 +16,13 @@ compaction boundary. Treat those events as observations: they explain why an
 older detail may no longer be in the immediate prompt, not a license to discard
 durable conversation or tool records.
 
+Automatic compaction keeps its result only when it brings the conversation
+under the compaction limit or shrinks it by at least a tenth. Otherwise the
+history stays as it was, with recent tool results intact, and Orca does not try
+again until the conversation has grown by a tenth. This matters when the current
+prompt alone is larger than the limit. When a request no longer leaves room for
+a reply, compaction always runs and keeps any reduction.
+
 For a task that needs a precise earlier fact, include the file path, test name,
 or session boundary in the next prompt rather than relying on an implicit
 context guess.

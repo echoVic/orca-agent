@@ -482,6 +482,10 @@ pub struct Conversation {
     /// Not persisted: a resumed conversation measures from a full estimate
     /// until its first response.
     pub usage_anchor: Option<UsageAnchor>,
+    /// Not persisted: the prompt size, in measured tokens, at which a
+    /// pressure compaction last found nothing worth keeping. The runtime does
+    /// not try again until the prompt has grown well past it (#175).
+    pub compaction_hold: Option<usize>,
     retained_tool_images: Option<RetainedToolImages>,
 }
 
@@ -495,6 +499,7 @@ impl Clone for Conversation {
             rolling_summary: self.rolling_summary.clone(),
             summary: self.summary.clone(),
             usage_anchor: self.usage_anchor,
+            compaction_hold: self.compaction_hold,
             retained_tool_images: None,
         }
     }
@@ -508,6 +513,7 @@ impl Conversation {
             rolling_summary: None,
             summary: SummaryState::default(),
             usage_anchor: None,
+            compaction_hold: None,
             retained_tool_images: None,
         }
     }
