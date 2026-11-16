@@ -614,9 +614,13 @@ schema = { env = { type = "string", description = "environment" } }
             description: "failing tool".to_string(),
             action_kind: ActionKind::Shell,
             command: platform_script(
-                format!("printf {stdout:?}; printf {stderr:?} >&2; exit 7"),
+                // Consume stdin before printing: the tool runner writes the raw
+                // arguments to the child's stdin right after spawning it, and a
+                // child that exits without reading them can lose that race under
+                // load and trip the runner's fail-closed stdin-error path.
+                format!("cat >/dev/null; printf {stdout:?}; printf {stderr:?} >&2; exit 7"),
                 format!(
-                    "[Console]::Out.Write('{}'); [Console]::Error.Write('{}'); exit 7",
+                    "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('{}'); [Console]::Error.Write('{}'); exit 7",
                     stdout.replace('\'', "''"),
                     stderr.replace('\'', "''"),
                 ),
