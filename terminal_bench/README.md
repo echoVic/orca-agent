@@ -54,6 +54,14 @@ harbor run \
 
 The API key is read from `~/.orca/auth.json` (`DEEPSEEK_API_KEY` field). Falls back to `ORCA_API_KEY` env var.
 
+The key never reaches the task's environment (#178). `OrcaInstalledAgent` writes it to the agent
+user's `~/.orca/auth.json` in the container (mode `0600`) with a one-shot setup command, so neither
+the run's environment nor any command line carries it. It also replaces the key with
+`<REDACTED_DEEPSEEK_API_KEY>` in `trajectory.jsonl`, `stderr.txt` and `execution_metadata.json`.
+`OrcaExternalAgent` passes it only to the `orca` process, never in an argv. Orca itself keeps its
+credentials out of every shell and command the agent runs. Scan run roots anyway with
+`python3 -B scripts/eval/capability/tools/scan_secrets.py <run-root>`.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ORCA_BASE_URL` | `https://api.deepseek.com` | API endpoint |
