@@ -244,6 +244,26 @@ The upload makes `read_document` a network call, like `web_search` and `web_fetc
 - Orca keeps recognized text in memory for the 8 documents it read most recently, and on disk in `ORCA_HOME/ocr_cache` (up to 64 MiB, least recently used first), keyed by the file's content. Reading a long document in `offset`/`limit` chunks, reading a copy of it, or reading it again from a subagent or a later session pays once; a file that changed is recognized again. The cache holds the whole recognized text of each document, readable by your user account only, and deleting a session does not remove it; delete the directory to clear it.
 - DeepSeek bills 0.225 US dollars per 1,000 pages it recognized (November 2026 prices), and Orca adds that to its cost estimate and budget too. A read served from the cache, or one that waited for another read of the same file, costs nothing. Cancelling a read does not stop a recognition DeepSeek has started, and DeepSeek still bills it; Orca never learns how many pages that recognition had, so the estimate leaves it out.
 
+## Scripts that call tools (experimental)
+
+`run_script` lets the model write a short JavaScript program that calls read-only tools itself and returns only what it computes. A question that would take a search, several file reads and some filtering, each a separate model round with its full output in the context, becomes one round and one short result. It is off by default:
+
+```toml
+[tools.script]
+enabled = true
+timeout_secs = 60      # how long one script may run
+max_tool_calls = 100   # how many tool calls one script may make
+```
+
+A script can call `read_file`, `glob`, `grep` and `git_status`, and nothing else. It cannot write, run commands or reach the network, so it needs no approval and works in plan mode, the same as calling those four tools directly. `PreToolUse` hooks run for each call a script makes.
+
+- The script runs in a separate Node.js process that has no access to your files; every read goes through Orca's own tools. The tool is offered only when Node.js is installed.
+- Nothing is kept between scripts.
+- While a script runs, Orca shows each call it makes and how it ended. The model sees only the script's result, cut at the usual tool output limit.
+- A script counts as one tool call in a budget, however many calls it makes itself.
+
+The setting is read from the user configuration; a project's `.orca/config.toml` cannot turn it on.
+
 ## Network and certificates
 
 Orca checks HTTPS certificates against the operating system's trust store: the keychain on macOS, the system certificate store on Windows, and the system CA bundle on Linux.
