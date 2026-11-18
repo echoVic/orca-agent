@@ -141,13 +141,16 @@ impl<'a> ScriptToolCalls<'a> {
 
         let result = self.executor.execute(invocation.effective);
         match result.status {
-            ToolStatus::Completed => {
-                let mut output = result.output.clone().unwrap_or_default();
-                if result.truncated {
-                    output.push_str("\n[output truncated]");
-                }
-                Ok(output)
-            }
+            // A script counts and searches what it is given. Part of a result
+            // handed over as the result would give it a wrong answer with no
+            // sign that anything is missing, so it gets an error to act on.
+            ToolStatus::Completed if result.truncated => Err(format!(
+                "{} returned more than {} KiB, the most a script is given at once; ask for less: \
+                 read_file takes offset and limit, grep takes head_limit and a narrower path",
+                call.tool,
+                SCRIPT_TOOL_OUTPUT_BYTES / 1024
+            )),
+            ToolStatus::Completed => Ok(result.output.clone().unwrap_or_default()),
             _ => Err(failure_text(&result)),
         }
     }
@@ -398,6 +401,38 @@ mod tests {
         let answer = calls.answer(call("read_file", json!({ "path": "a.txt" })));
 
         assert_eq!(answer.expect_err("the tool failed"), "a.txt does not exist");
+    }
+
+    #[test]
+    fn a_result_cut_short_is_an_error_not_a_partial_answer() {
+        struct CutShort;
+        impl ScriptToolExecutor for CutShort {
+            fn execute(&self, request: ToolRequest) -> ToolResult {
+                ToolResult::completed(&request, "the first part".to_string(), true)
+            }
+        }
+        let fixture = Fixture::new(Vec::new());
+        let mut calls = ScriptToolCalls::new(
+            "outer",
+            fixture.cwd.path(),
+            &fixture.mcp_registry,
+            &fixture.hooks,
+            &fixture.cancel,
+            &CutShort,
+            10,
+        );
+
+        let answer = calls.answer(call("read_file", json!({ "path": "big.rs" })));
+
+        // A script that counts or searches what it read must not be handed
+        // part of a file as if it were the file.
+        let error = answer.expect_err("a cut result is not an answer");
+        assert!(error.contains("256 KiB"), "{error}");
+        assert!(
+            error.contains("offset") && error.contains("limit"),
+            "{error}"
+        );
+        assert!(!error.contains("the first part"), "{error}");
     }
 
     #[test]

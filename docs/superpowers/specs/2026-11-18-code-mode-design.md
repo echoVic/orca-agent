@@ -115,7 +115,7 @@ script may start several at once; they are answered in order.
 |---|---|---|
 | Wall clock for one script | 60 s | process tree killed; tool fails with "script ran longer than 60s" |
 | Inner tool calls per script | 100 | the call over the limit rejects in the script; later calls reject too |
-| Bytes of one inner result | 256 KiB | the tool's own truncation applies at this size |
+| Bytes of one inner result | 256 KiB | the call rejects, telling the script to ask for less; a script is never handed part of a result as the whole |
 | One protocol line | 1 MiB | process tree killed; tool fails |
 | Result returned to the model | `tools.output_truncation` (8 KiB) | truncated like any tool output |
 
