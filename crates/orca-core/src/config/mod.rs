@@ -302,6 +302,9 @@ pub struct ToolConfig {
     /// `read_document` explains that it needs the setting.
     #[serde(default = "default_deepseek_web")]
     pub deepseek_web: bool,
+    /// The experimental `run_script` tool.
+    #[serde(default)]
+    pub script: ScriptToolConfig,
     /// Runtime-captured host evidence. It is never loaded from or persisted to
     /// user configuration.
     #[serde(skip)]
@@ -309,6 +312,29 @@ pub struct ToolConfig {
     /// Advertisement only: an exec run without an interactive input transport.
     #[serde(skip)]
     pub headless_exec: bool,
+}
+
+/// `run_script`: JavaScript the model writes that calls read-only tools
+/// directly and returns only what it computes. Off unless turned on.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ScriptToolConfig {
+    /// Whether `run_script` is offered to the model and may run.
+    pub enabled: bool,
+    /// How long one script may run, in seconds, before it is stopped.
+    pub timeout_secs: u64,
+    /// How many tool calls one script may make.
+    pub max_tool_calls: u32,
+}
+
+impl Default for ScriptToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: 60,
+            max_tool_calls: 100,
+        }
+    }
 }
 
 fn default_deepseek_web() -> bool {
@@ -322,6 +348,7 @@ impl Default for ToolConfig {
             output_truncation: ToolOutputTruncation::default(),
             shell_timeout_secs: default_shell_timeout_secs(),
             deepseek_web: default_deepseek_web(),
+            script: ScriptToolConfig::default(),
             shell_enforcement_decision: None,
             headless_exec: false,
         }
@@ -894,6 +921,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
             "output_truncation = \"{}\"\n",
             "shell_timeout_secs = {}\n",
             "deepseek_web = {}\n",
+            "script = {}\n",
             "\n",
             "[subagents]\n",
             "max_depth = {}\n",
@@ -959,6 +987,7 @@ pub fn format_config_show(config: &RunConfig) -> String {
         config.tools.output_truncation,
         config.tools.shell_timeout_secs,
         config.tools.deepseek_web,
+        config.tools.script.enabled,
         config.subagents.max_depth,
         config.subagents.delegation.as_str(),
         config.subagents.max_running(),

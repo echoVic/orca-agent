@@ -2385,6 +2385,43 @@ decision = "allow"
     }
 
     #[test]
+    fn script_tool_is_off_with_its_documented_limits_by_default() {
+        assert!(
+            crate::config::format_config_show(&crate::config::RunConfig::default())
+                .contains("script = false")
+        );
+        assert_eq!(
+            ToolConfig::default().script,
+            crate::config::ScriptToolConfig {
+                enabled: false,
+                timeout_secs: 60,
+                max_tool_calls: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn tools_script_table_is_read_from_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user.toml");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(project_dir.join(".orca")).unwrap();
+        std::fs::write(
+            &user_path,
+            "[tools.script]\nenabled = true\nmax_tool_calls = 7\n",
+        )
+        .unwrap();
+
+        let script = load_layered_config_from_paths(&user_path, &project_dir)
+            .tools
+            .script;
+
+        assert!(script.enabled);
+        assert_eq!(script.max_tool_calls, 7);
+        assert_eq!(script.timeout_secs, 60, "an unset key keeps its default");
+    }
+
+    #[test]
     fn tools_deepseek_web_defaults_on_and_parses_off() {
         assert!(ToolConfig::default().deepseek_web);
         assert!(
