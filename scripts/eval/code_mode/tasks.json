@@ -1,0 +1,22 @@
+[
+  {
+    "id": "user-trusted-launches",
+    "prompt": "In this repository, which Rust source files under crates/orca-runtime/src call `launch_user_trusted(`? Answer with one line per file: the path and how many calls it contains. Do not change any file."
+  },
+  {
+    "id": "workflow-events",
+    "prompt": "In crates/orca-core/src/event_schema.rs, which event type strings start with `workflow.`? List them alphabetically, one per line, and give the total. Do not change any file."
+  },
+  {
+    "id": "network-tools",
+    "prompt": "Which built-in tools registered in crates/orca-tools/src/registry.rs are network tools, declared with `CapabilitySet::network_search()`? Answer with the model-facing tool names only. Do not change any file."
+  },
+  {
+    "id": "largest-test-files",
+    "prompt": "Among the Rust files directly under the top-level tests/ directory, which five contain the most `#[test]` functions? Give each file with its count, largest first. Do not change any file."
+  },
+  {
+    "id": "credential-scrub-sites",
+    "prompt": "Find every place in this repository's Rust code that calls `remove_credential_env(`. For each call site give the file path and, in a few words, which kind of process is being started there. Do not change any file."
+  }
+]
