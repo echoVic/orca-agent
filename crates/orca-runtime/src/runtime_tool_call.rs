@@ -29,7 +29,7 @@ use crate::runtime_state::PermissionRuntimeState;
 use crate::tasks::TaskRegistry;
 use crate::terminal_service::TerminalService;
 
-const READONLY_TOOL_TIMEOUT_SECS: u64 = 120;
+pub(crate) const READONLY_TOOL_TIMEOUT_SECS: u64 = 120;
 /// A configured shell timeout of zero means "use the built-in cap", never
 /// "run forever": a command blocked in an uninterruptible network syscall must
 /// still expire. Ten minutes mirrors the long-but-bounded default used by the

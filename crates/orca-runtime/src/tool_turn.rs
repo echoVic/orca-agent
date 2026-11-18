@@ -2963,6 +2963,224 @@ mod tests {
         );
     }
 
+    /// Runs one `run_script` call through the normal tool turn in `cwd` and
+    /// returns the tool message the model would get and the events emitted.
+    fn run_script_turn(
+        config: &RunConfig,
+        cwd: &std::path::Path,
+        script: &str,
+    ) -> (String, Vec<serde_json::Value>) {
+        let mut events = EventFactory::new("run-script-turn".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let request = request(
+            ToolName::RunScript,
+            ActionKind::Read,
+            None,
+            Some(json!({ "script": script }).to_string().as_str()),
+        );
+        let policy = policy_for_tool_execution(config);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new("run-script-turn".to_string());
+        let mut background_workflows = Vec::new();
+        let mut sampling_state = RuntimeSamplingRequestState::new();
+
+        run_normal_tool_turn(RuntimeNormalToolTurnContext {
+            sampling_state: &mut sampling_state,
+            request: RuntimeNormalToolTurnRequest {
+                config,
+                cwd,
+                tool_request: &request,
+                subagent_depth: 0,
+                emit_deltas: true,
+                goal_mode: false,
+                headless: false,
+                policy: &policy,
+                root_task_id: None,
+                child_budget: None,
+            },
+            io: RuntimeNormalToolTurnIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+                cost_tracker: &mut cost_tracker,
+                background_workflows: &mut background_workflows,
+            },
+            services: RuntimeNormalToolTurnServices {
+                instructions: &instructions,
+                memory: &memory,
+                mcp_registry: &registry,
+                hooks: &hooks,
+            },
+            runtime: RuntimeNormalToolTurnRuntime {
+                cancel: &cancel,
+                task_registry: &task_registry,
+                workflow_ipc: None,
+                workflow_lifecycle_ingress: None,
+                wait_for_background_workflows: true,
+            },
+            interactions: RuntimeNormalToolTurnInteractions {
+                approval_handler: None,
+                permission_handler: None,
+                permission_handler_owned: None,
+                user_input_handler: None,
+                mcp_elicitation_handler: None,
+                provider_response_ingress: None,
+            },
+            extensions: None,
+            executors: RuntimeNormalToolTurnExecutors {
+                subagent_child_executor: unused_child_executor::<io::Sink>,
+                workflow_child_executor: unused_child_executor,
+            },
+        })
+        .expect("run the run_script turn");
+
+        let message = match conversation.messages.as_slice() {
+            [Message::Tool { content, .. }] => content.clone(),
+            other => panic!("expected one tool message, got {other:?}"),
+        };
+        drop(sink);
+        (message, parsed_events(output))
+    }
+
+    fn config_with_scripts_on() -> RunConfig {
+        let mut config = config_with_external(Vec::new());
+        // Plan is the mode that allows the least: a script must run in it.
+        config.approval_mode = ApprovalMode::Plan;
+        config.tools.script.enabled = true;
+        config
+    }
+
+    fn output_deltas(events: &[serde_json::Value]) -> String {
+        events
+            .iter()
+            .filter(|event| event["type"] == "tool.output.delta")
+            .filter_map(|event| event["payload"]["chunk"].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn run_script_reads_a_real_file_and_returns_only_what_the_script_computed() {
+        if !crate::script::node_available() {
+            return;
+        }
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(cwd.path().join("notes.txt"), "alpha\nbeta marker\ngamma\n")
+            .expect("write file");
+
+        let (message, events) = run_script_turn(
+            &config_with_scripts_on(),
+            cwd.path(),
+            r#"const text = await tools.read_file({ path: "notes.txt" });
+               return text.includes("beta marker") ? "found it" : "not there";"#,
+        );
+
+        assert_eq!(message, "found it");
+        let deltas = output_deltas(&events);
+        assert!(deltas.contains("read_file notes.txt · ok"), "{deltas}");
+        assert!(deltas.ends_with("1 tool call\n"), "{deltas}");
+    }
+
+    #[test]
+    fn run_script_says_when_it_is_turned_off() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = config_with_scripts_on();
+        config.tools.script.enabled = false;
+
+        let (message, _) = run_script_turn(&config, cwd.path(), "return 1;");
+
+        assert!(
+            message.contains("run_script is turned off") && message.contains("tools.script"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_script_cannot_write_or_read_outside_the_workspace() {
+        if !crate::script::node_available() {
+            return;
+        }
+        let parent = tempfile::tempdir().expect("parent");
+        let cwd = parent.path().join("workspace");
+        std::fs::create_dir(&cwd).expect("workspace");
+        let outside = parent.path().join("outside.txt");
+        std::fs::write(&outside, "private").expect("write outside file");
+
+        let (message, _) = run_script_turn(
+            &config_with_scripts_on(),
+            &cwd,
+            &format!(
+                r#"const seen = {{ write: typeof tools.write_file, shell: typeof tools.bash }};
+                   try {{ seen.outside = await tools.read_file({{ path: {path} }}); }}
+                   catch (error) {{ seen.outside = "refused"; }}
+                   return seen;"#,
+                path = json!(outside.display().to_string())
+            ),
+        );
+
+        let seen: serde_json::Value = serde_json::from_str(&message).expect("the script's JSON");
+        assert_eq!(
+            seen,
+            json!({ "write": "undefined", "shell": "undefined", "outside": "refused" })
+        );
+    }
+
+    #[test]
+    fn a_long_script_result_is_cut_like_any_tool_output() {
+        if !crate::script::node_available() {
+            return;
+        }
+        let cwd = tempfile::tempdir().expect("cwd");
+
+        let (message, _) = run_script_turn(
+            &config_with_scripts_on(),
+            cwd.path(),
+            r#"return "x".repeat(200000);"#,
+        );
+
+        assert!(
+            message.len() < 20_000,
+            "{} bytes reached the model",
+            message.len()
+        );
+        assert!(message.contains("[output truncated]"), "the cut is marked");
+    }
+
+    #[test]
+    fn a_script_stops_at_its_tool_call_limit_and_can_still_answer() {
+        if !crate::script::node_available() {
+            return;
+        }
+        let cwd = tempfile::tempdir().expect("cwd");
+        std::fs::write(cwd.path().join("a.txt"), "a").expect("write file");
+        let mut config = config_with_scripts_on();
+        config.tools.script.max_tool_calls = 2;
+
+        let (message, events) = run_script_turn(
+            &config,
+            cwd.path(),
+            r#"let read = 0; let refused = "";
+               for (let i = 0; i < 5; i += 1) {
+                 try { await tools.read_file({ path: "a.txt" }); read += 1; }
+                 catch (error) { refused = error.message; }
+               }
+               return `${read} read; ${refused}`;"#,
+        );
+
+        assert_eq!(
+            message,
+            "2 read; the script reached its limit of 2 tool calls"
+        );
+        assert!(output_deltas(&events).ends_with("2 tool calls\n"));
+    }
+
     #[test]
     fn run_normal_tool_turn_preserves_root_task_cancellation_scope() {
         let cwd = tempfile::tempdir().expect("cwd");

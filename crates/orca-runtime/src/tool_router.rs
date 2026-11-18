@@ -286,6 +286,19 @@ impl<'a> RuntimeToolRouter<'a> {
                 workflow_lifecycle_ingress,
                 task_registry.take_child_budget(root_task_id, &execution_request.id),
             ),
+            RuntimeSpecialToolDispatch::RunScript => Ok(crate::script::execute_run_script_tool(
+                crate::script::RunScriptContext {
+                    config,
+                    cwd,
+                    events,
+                    sink,
+                    request: execution_request,
+                    mcp_registry,
+                    hooks,
+                    cancel,
+                    emit_deltas,
+                },
+            )),
             RuntimeSpecialToolDispatch::Subagent => {
                 let (result, child_budget_usage) = execute_subagent_tool_with_activity_ingress(
                     Some(crate::subagent::session_agent_catalog(
