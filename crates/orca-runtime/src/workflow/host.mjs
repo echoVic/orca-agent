@@ -1,13 +1,18 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { dirname } from "node:path";
 import vm from "node:vm";
 
 const scriptPath = process.argv[2];
 const argsJson = process.argv[3] ?? "null";
 const mailboxPath = process.argv[4] ?? null;
 const taskListsPath = process.argv[5] ?? null;
-const workflowArgs = JSON.parse(argsJson);
+JSON.parse(argsJson);
+
+// The source scan below turns the obvious ways out of a workflow script into a
+// clear error. It is not what keeps a script in: any name can be spelled in a
+// way a scan cannot see. What keeps a script in is that it runs in a realm of
+// its own, where nothing it can hold belongs to this realm (see
+// `installWorkflowApi`), in a process started with only the access it needs.
 const FORBIDDEN_IDENTIFIERS = new Set([
   "process",
   "require",
@@ -28,10 +33,11 @@ const FORBIDDEN_MODULE_SPECIFIERS = new Set(["node:fs", "child_process"]);
 const MODULE_SPECIFIER_CALLEES = new Set(["import", "require", "getBuiltinModule"]);
 
 let callSeq = 0;
-let currentPhase = null;
-let activeMarkerPhase = null;
 let stdinBuffer = "";
-const pendingAgentResolvers = new Map();
+// Agent calls the script is still waiting on. The script's realm holds what
+// resumes each one; `scriptRealm` is how this realm reaches it.
+const pendingCalls = new Set();
+let scriptRealm = null;
 const mailboxState = loadMailboxState();
 let messageSeq = mailboxState.nextSeq;
 const messageChannels = new Map(Object.entries(mailboxState.channels));
@@ -44,139 +50,164 @@ let workflowTerminal = false;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   stdinBuffer += chunk;
-  flushStdinResolvers();
+  flushStdin();
 });
 process.stdin.on("end", () => {
   stdinClosed = true;
   if (workflowTerminal) {
-    pendingAgentResolvers.clear();
+    pendingCalls.clear();
     return;
   }
-  flushStdinResolvers();
+  flushStdin();
 });
 
 function emit(value) {
   writeFileSync(1, `${JSON.stringify(value)}\n`);
 }
 
-async function agent(prompt, opts = {}) {
-  callSeq += 1;
-  const callId = `agent-${callSeq}`;
-  const callPath = `${currentPhase ?? "root"}:${callSeq}`;
-  const resultPromise = readProtocolMessage(callId);
-  emit({
-    type: "agent_call",
-    call_id: callId,
-    call_path: callPath,
-    phase: currentPhase,
-    prompt,
-    opts,
-  });
+// Everything a workflow script can ask of this process, by name. A request and
+// its answer cross between the realms as JSON text.
+const HOST_OPERATIONS = {
+  agent_call({ prompt, opts, phase }) {
+    callSeq += 1;
+    const callId = `agent-${callSeq}`;
+    pendingCalls.add(callId);
+    emit({
+      type: "agent_call",
+      call_id: callId,
+      call_path: `${phase ?? "root"}:${callSeq}`,
+      phase: phase ?? null,
+      prompt,
+      opts: opts ?? null,
+    });
+    if (stdinClosed) {
+      // No answer can come. Say so once the script is waiting for it.
+      queueMicrotask(flushStdin);
+    }
+    return callId;
+  },
 
-  const message = await resultPromise;
-  if (message.type === "agent_result") {
-    return message.result;
-  }
-  if (message.type === "agent_error") {
-    throw new Error(message.error ?? `Agent ${callId} failed`);
-  }
+  phase_started({ name }) {
+    emit({ type: "phase_started", name });
+  },
 
-  throw new Error(`Unexpected workflow host protocol message: ${message.type}`);
-}
+  phase_completed({ name }) {
+    emit({ type: "phase_completed", name });
+  },
 
-async function parallel(items) {
-  const results = await Promise.allSettled(items);
-  const firstError = results.find((r) => r.status === "rejected");
-  if (firstError) {
-    throw firstError.reason;
-  }
-  return results.map((r) => r.value);
-}
+  phase_failed({ name, error, fallback }) {
+    emit({ type: "phase_failed", name, error, fallback });
+  },
 
-async function pipeline(items) {
-  let previous;
-  for (const item of items) {
-    previous = typeof item === "function" ? await item(previous) : await item;
-  }
-  return previous;
-}
-
-function sendMessage(channel, message, opts = {}) {
-  const channelName = normalizeMessageChannel(channel);
-  messageSeq += 1;
-  const entry = {
-    seq: messageSeq,
-    channel: channelName,
-    from: normalizeMessageSender(opts?.from),
-    phase: currentPhase,
-    message: cloneMessageValue(message),
-  };
-  const messages = messageChannels.get(channelName) ?? [];
-  messages.push(entry);
-  messageChannels.set(channelName, messages);
-  persistMailboxState();
-  return cloneMessageValue(entry);
-}
-
-function readMessages(channel) {
-  const channelName = normalizeMessageChannel(channel);
-  return (messageChannels.get(channelName) ?? []).map(cloneMessageValue);
-}
-
-function clearMessages(channel) {
-  const channelName = normalizeMessageChannel(channel);
-  const count = (messageChannels.get(channelName) ?? []).length;
-  messageChannels.delete(channelName);
-  persistMailboxState();
-  return count;
-}
-
-function createTaskList(name, items = []) {
-  const listName = normalizeTaskListName(name);
-  if (!Array.isArray(items)) {
-    throw new Error("Workflow task list items must be an array");
-  }
-
-  const tasks = items.map((item) => {
-    taskSeq += 1;
-    return {
-      id: `workflow-task-${taskSeq}`,
-      status: "pending",
-      value: cloneMessageValue(item),
-      claimedBy: null,
-      completedBy: null,
-      result: null,
+  send_message({ channel, message, from, phase }) {
+    const channelName = normalizeMessageChannel(channel);
+    messageSeq += 1;
+    const entry = {
+      seq: messageSeq,
+      channel: channelName,
+      from: normalizeMessageSender(from, phase),
+      phase: phase ?? null,
+      message: message ?? null,
     };
-  });
-  taskLists.set(listName, tasks);
-  persistTaskListState();
-  return listTasks(listName);
-}
+    const messages = messageChannels.get(channelName) ?? [];
+    messages.push(entry);
+    messageChannels.set(channelName, messages);
+    persistMailboxState();
+    return entry;
+  },
 
-function claimTask(name, opts = {}) {
-  const tasks = taskLists.get(normalizeTaskListName(name)) ?? [];
-  const task = tasks.find((item) => item.status === "pending");
-  if (!task) {
-    return null;
+  read_messages({ channel }) {
+    return messageChannels.get(normalizeMessageChannel(channel)) ?? [];
+  },
+
+  clear_messages({ channel }) {
+    const channelName = normalizeMessageChannel(channel);
+    const count = (messageChannels.get(channelName) ?? []).length;
+    messageChannels.delete(channelName);
+    persistMailboxState();
+    return count;
+  },
+
+  create_task_list({ name, items }) {
+    const listName = normalizeTaskListName(name);
+    if (!Array.isArray(items)) {
+      throw new Error("Workflow task list items must be an array");
+    }
+
+    const tasks = items.map((item) => {
+      taskSeq += 1;
+      return {
+        id: `workflow-task-${taskSeq}`,
+        status: "pending",
+        value: item ?? null,
+        claimedBy: null,
+        completedBy: null,
+        result: null,
+      };
+    });
+    taskLists.set(listName, tasks);
+    persistTaskListState();
+    return tasks;
+  },
+
+  claim_task({ name, by, phase }) {
+    const tasks = taskLists.get(normalizeTaskListName(name)) ?? [];
+    const task = tasks.find((item) => item.status === "pending");
+    if (!task) {
+      return null;
+    }
+
+    task.status = "running";
+    task.claimedBy = normalizeTaskWorker(by, phase);
+    persistTaskListState();
+    return task;
+  },
+
+  complete_task({ name, taskId, result, by, phase }) {
+    const task = findTask(name, taskId);
+    task.status = "completed";
+    task.completedBy = normalizeTaskWorker(by, phase);
+    task.result = result ?? null;
+    persistTaskListState();
+    return task;
+  },
+
+  list_tasks({ name }) {
+    return taskLists.get(normalizeTaskListName(name)) ?? [];
+  },
+
+  completed({ result }) {
+    workflowTerminal = true;
+    emit({ type: "workflow_completed", result: result ?? null });
+  },
+
+  failed({ error }) {
+    workflowTerminal = true;
+    emit({ type: "workflow_failed", error });
+    process.exitCode = 1;
+  },
+};
+
+// The one function of this realm the script's realm is given. It takes text
+// and returns text, and it never throws: an error raised here would be an
+// object of this realm in the script's hands.
+function hostCall(operation, requestJson) {
+  try {
+    if (typeof operation !== "string" || typeof requestJson !== "string") {
+      throw new Error("Workflow host calls take text");
+    }
+    if (!Object.prototype.hasOwnProperty.call(HOST_OPERATIONS, operation)) {
+      throw new Error(`Unknown workflow host operation: ${operation}`);
+    }
+    const value = HOST_OPERATIONS[operation](JSON.parse(requestJson));
+    return JSON.stringify({ value: value ?? null });
+  } catch (error) {
+    try {
+      return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
+    } catch {
+      return '{"error":"Workflow host call failed"}';
+    }
   }
-
-  task.status = "running";
-  task.claimedBy = normalizeTaskWorker(opts?.by ?? opts?.from);
-  persistTaskListState();
-  return cloneMessageValue(task);
-}
-
-function completeTask(name, taskId, result = null, opts = {}) {
-  const task = findTask(name, taskId);
-  task.status = "completed";
-  task.completedBy = normalizeTaskWorker(opts?.by ?? opts?.from);
-  task.result = cloneMessageValue(result);
-  persistTaskListState();
-  return cloneMessageValue(task);
-}
-
-function listTasks(name) {
-  return (taskLists.get(normalizeTaskListName(name)) ?? []).map(cloneMessageValue);
 }
 
 function normalizeMessageChannel(channel) {
@@ -187,8 +218,8 @@ function normalizeMessageChannel(channel) {
   return channelName;
 }
 
-function normalizeMessageSender(from) {
-  const sender = String(from ?? currentPhase ?? "workflow").trim();
+function normalizeMessageSender(from, phase) {
+  const sender = String(from ?? phase ?? "workflow").trim();
   return sender.length === 0 ? "workflow" : sender;
 }
 
@@ -200,8 +231,8 @@ function normalizeTaskListName(name) {
   return listName;
 }
 
-function normalizeTaskWorker(worker) {
-  const workerName = String(worker ?? currentPhase ?? "workflow").trim();
+function normalizeTaskWorker(worker, phase) {
+  const workerName = String(worker ?? phase ?? "workflow").trim();
   return workerName.length === 0 ? "workflow" : workerName;
 }
 
@@ -217,13 +248,6 @@ function findTask(name, taskId) {
     throw new Error(`Workflow task not found: ${id}`);
   }
   return task;
-}
-
-function cloneMessageValue(value) {
-  if (typeof value === "undefined") {
-    return null;
-  }
-  return JSON.parse(JSON.stringify(value));
 }
 
 function loadMailboxState() {
@@ -268,9 +292,11 @@ function persistTaskListState() {
   });
 }
 
+// Replaces `path` in one step. The directory is the launcher's to make, and
+// the name written first is one it knows: this process may be allowed to
+// write these two names and no others.
 function writeJsonAtomic(path, value) {
-  mkdirSync(dirname(path), { recursive: true });
-  const tempPath = `${path}.tmp-${process.pid}-${Date.now()}`;
+  const tempPath = `${path}.host-tmp`;
   writeFileSync(tempPath, JSON.stringify(value, null, 2));
   try {
     renameSync(tempPath, path);
@@ -284,122 +310,313 @@ function writeJsonAtomic(path, value) {
   }
 }
 
-async function runWorkflowPhases(phaseDefinitions) {
-  let previousPhaseResults = [];
-  const allPhaseResults = [];
+// Builds what a workflow script sees: `args` and the workflow functions. This
+// function never runs in this realm. Its text is compiled in the script's
+// realm, so every function, promise, error and value it makes belongs there,
+// and a script that walks from one of them to its constructor finds its own
+// realm's, which cannot compile code from text.
+//
+// It may use nothing from this file but its two arguments. `hostCall` is the
+// only thing of the host's realm it holds. It stays a local here: it is never
+// stored on, passed to or returned to anything the script can touch.
+function installWorkflowApi(hostCall, argsJson) {
+  "use strict";
 
-  for (const phaseDefinition of phaseDefinitions) {
-    const phaseName = String(phaseDefinition?.name ?? phaseDefinition?.description ?? `phase-${allPhaseResults.length + 1}`);
-    const tasks = Array.isArray(phaseDefinition?.tasks) ? phaseDefinition.tasks : [];
-    const phaseResults = await phase(
-      phaseName,
-      async () => runWorkflowTasks(tasks, previousPhaseResults, phaseDefinition),
-      phaseDefinition
-    );
-    previousPhaseResults = phaseResults;
-    allPhaseResults.push({ name: phaseName, results: phaseResults });
+  const { parse, stringify } = JSON;
+  const RealmError = Error;
+  const waiting = new Map();
+  let currentPhase = null;
+  let activeMarkerPhase = null;
+
+  function ask(operation, request) {
+    const requestJson = stringify(request);
+    let answerJson;
+    try {
+      answerJson = hostCall(operation, requestJson);
+    } catch {
+      // Whatever was thrown belongs to the host's realm. Leave it there.
+      throw new RealmError("Workflow host call failed");
+    }
+    const answer = parse(answerJson);
+    if (typeof answer.error === "string") {
+      throw new RealmError(answer.error);
+    }
+    return answer.value;
   }
 
-  return { phases: allPhaseResults };
-}
+  async function agent(prompt, opts = {}) {
+    const callId = ask("agent_call", { prompt, opts, phase: currentPhase });
+    const message = await new Promise((resolve, reject) => {
+      waiting.set(callId, { resolve, reject });
+    });
+    if (message.type === "agent_result") {
+      return message.result;
+    }
+    if (message.type === "agent_error") {
+      throw new RealmError(message.error ?? `Agent ${callId} failed`);
+    }
 
-async function runWorkflowTasks(tasks, previousPhaseResults, phaseDefinition) {
-  if (tasks.length === 0) {
-    return [];
+    throw new RealmError(`Unexpected workflow host protocol message: ${message.type}`);
   }
 
-  if (phaseDefinition?.parallel === true) {
-    return Promise.all(tasks.map((task) => runWorkflowTask(task, previousPhaseResults)));
+  async function parallel(items) {
+    const results = await Promise.allSettled(items);
+    const firstError = results.find((r) => r.status === "rejected");
+    if (firstError) {
+      throw firstError.reason;
+    }
+    return results.map((r) => r.value);
   }
 
-  const results = [];
-  for (const task of tasks) {
-    results.push(await runWorkflowTask(task, previousPhaseResults));
-  }
-  return results;
-}
-
-async function runWorkflowTask(task, previousPhaseResults) {
-  if (task?.type && task.type !== "agent") {
-    throw new Error(`Unsupported workflow task type: ${task.type}`);
-  }
-  const prompt = task?.prompt;
-  if (typeof prompt !== "string" || prompt.trim().length === 0) {
-    throw new Error("Workflow task missing `prompt`");
+  async function pipeline(items) {
+    let previous;
+    for (const item of items) {
+      previous = typeof item === "function" ? await item(previous) : await item;
+    }
+    return previous;
   }
 
-  const opts = Object.assign(Object.create(null), task);
-  delete opts.type;
-  delete opts.prompt;
-
-  return agent(enrichTaskPrompt(prompt, previousPhaseResults), opts);
-}
-
-function enrichTaskPrompt(prompt, previousPhaseResults) {
-  if (!Array.isArray(previousPhaseResults) || previousPhaseResults.length === 0) {
-    return prompt;
+  function sendMessage(channel, message, opts = {}) {
+    return ask("send_message", { channel, message, from: opts?.from, phase: currentPhase });
   }
 
-  return `${prompt}\n\n[Previous phase outputs]\n${JSON.stringify(previousPhaseResults, null, 2)}`;
-}
+  function readMessages(channel) {
+    return ask("read_messages", { channel });
+  }
 
-async function phase(name, body, opts = {}) {
-  if (typeof body !== "function") {
-    if (activeMarkerPhase === name) {
+  function clearMessages(channel) {
+    return ask("clear_messages", { channel });
+  }
+
+  function createTaskList(name, items = []) {
+    return ask("create_task_list", { name, items });
+  }
+
+  function claimTask(name, opts = {}) {
+    return ask("claim_task", { name, by: opts?.by ?? opts?.from, phase: currentPhase });
+  }
+
+  function completeTask(name, taskId, result = null, opts = {}) {
+    return ask("complete_task", {
+      name,
+      taskId,
+      result,
+      by: opts?.by ?? opts?.from,
+      phase: currentPhase,
+    });
+  }
+
+  function listTasks(name) {
+    return ask("list_tasks", { name });
+  }
+
+  async function runWorkflowPhases(phaseDefinitions) {
+    let previousPhaseResults = [];
+    const allPhaseResults = [];
+
+    for (const phaseDefinition of phaseDefinitions) {
+      const phaseName = String(phaseDefinition?.name ?? phaseDefinition?.description ?? `phase-${allPhaseResults.length + 1}`);
+      const tasks = Array.isArray(phaseDefinition?.tasks) ? phaseDefinition.tasks : [];
+      const phaseResults = await phase(
+        phaseName,
+        async () => runWorkflowTasks(tasks, previousPhaseResults, phaseDefinition),
+        phaseDefinition
+      );
+      previousPhaseResults = phaseResults;
+      allPhaseResults.push({ name: phaseName, results: phaseResults });
+    }
+
+    return { phases: allPhaseResults };
+  }
+
+  async function runWorkflowTasks(tasks, previousPhaseResults, phaseDefinition) {
+    if (tasks.length === 0) {
+      return [];
+    }
+
+    if (phaseDefinition?.parallel === true) {
+      return Promise.all(tasks.map((task) => runWorkflowTask(task, previousPhaseResults)));
+    }
+
+    const results = [];
+    for (const task of tasks) {
+      results.push(await runWorkflowTask(task, previousPhaseResults));
+    }
+    return results;
+  }
+
+  async function runWorkflowTask(task, previousPhaseResults) {
+    if (task?.type && task.type !== "agent") {
+      throw new RealmError(`Unsupported workflow task type: ${task.type}`);
+    }
+    const prompt = task?.prompt;
+    if (typeof prompt !== "string" || prompt.trim().length === 0) {
+      throw new RealmError("Workflow task missing `prompt`");
+    }
+
+    const opts = Object.assign(Object.create(null), task);
+    delete opts.type;
+    delete opts.prompt;
+
+    return agent(enrichTaskPrompt(prompt, previousPhaseResults), opts);
+  }
+
+  function enrichTaskPrompt(prompt, previousPhaseResults) {
+    if (!Array.isArray(previousPhaseResults) || previousPhaseResults.length === 0) {
+      return prompt;
+    }
+
+    return `${prompt}\n\n[Previous phase outputs]\n${stringify(previousPhaseResults, null, 2)}`;
+  }
+
+  async function phase(name, body, opts = {}) {
+    if (typeof body !== "function") {
+      if (activeMarkerPhase === name) {
+        currentPhase = name;
+        return undefined;
+      }
+      completeActiveMarkerPhase();
       currentPhase = name;
+      activeMarkerPhase = name;
+      ask("phase_started", { name });
       return undefined;
     }
-    completeActiveMarkerPhase();
+
+    const prior = currentPhase;
     currentPhase = name;
-    activeMarkerPhase = name;
-    emit({ type: "phase_started", name });
-    return undefined;
+    ask("phase_started", { name });
+    try {
+      const result = await body();
+      ask("phase_completed", { name });
+      return result;
+    } catch (error) {
+      const message = error instanceof RealmError ? error.message : String(error);
+      if (opts?.fallback === "continue") {
+        ask("phase_failed", { name, error: message, fallback: "continue" });
+        return { fallback: "continue", error: message };
+      }
+      if (opts?.fallback && Object.prototype.hasOwnProperty.call(opts.fallback, "value")) {
+        ask("phase_failed", { name, error: message, fallback: "value" });
+        return opts.fallback.value;
+      }
+      if (typeof opts?.fallback === "function") {
+        ask("phase_failed", { name, error: message, fallback: "function" });
+        return await opts.fallback({ name, error: message });
+      }
+      throw error;
+    } finally {
+      currentPhase = prior;
+    }
   }
 
-  const prior = currentPhase;
-  currentPhase = name;
-  emit({ type: "phase_started", name });
-  try {
-    const result = typeof body === "function" ? await body() : undefined;
-    emit({ type: "phase_completed", name });
-    return result;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (opts?.fallback === "continue") {
-      emit({ type: "phase_failed", name, error: message, fallback: "continue" });
-      return { fallback: "continue", error: message };
+  function completeActiveMarkerPhase() {
+    if (activeMarkerPhase === null) {
+      return;
     }
-    if (opts?.fallback && Object.prototype.hasOwnProperty.call(opts.fallback, "value")) {
-      emit({ type: "phase_failed", name, error: message, fallback: "value" });
-      return opts.fallback.value;
-    }
-    if (typeof opts?.fallback === "function") {
-      emit({ type: "phase_failed", name, error: message, fallback: "function" });
-      return await opts.fallback({ name, error: message });
-    }
-    throw error;
-  } finally {
-    currentPhase = prior;
+    const name = activeMarkerPhase;
+    activeMarkerPhase = null;
+    ask("phase_completed", { name });
   }
-}
 
-function completeActiveMarkerPhase() {
-  if (activeMarkerPhase === null) {
-    return;
+  function describe(error) {
+    try {
+      return String(error?.stack ?? error);
+    } catch {
+      return "Workflow script failed";
+    }
   }
-  const name = activeMarkerPhase;
-  activeMarkerPhase = null;
-  emit({ type: "phase_completed", name });
-}
 
-function readProtocolMessage(callId) {
-  return new Promise((resolve, reject) => {
-    pendingAgentResolvers.set(callId, { resolve, reject });
-    flushStdinResolvers();
+  Object.assign(globalThis, {
+    args: parse(argsJson),
+    agent,
+    parallel,
+    pipeline,
+    phase,
+    sendMessage,
+    readMessages,
+    clearMessages,
+    createTaskList,
+    claimTask,
+    completeTask,
+    listTasks,
   });
+
+  // What the host's realm may call. It passes text only, and it reads nothing
+  // back: a value returned to it, or a promise it waited on, would run the
+  // script's code with the host's objects in reach.
+  return {
+    // Runs the script, compiled in this realm as `load`, and tells the host
+    // how it ended.
+    async run(load) {
+      try {
+        const namespace = await load();
+        const phaseDefinitions = Array.isArray(namespace.phases)
+          ? namespace.phases
+          : Array.isArray(namespace.meta?.phases)
+            ? namespace.meta.phases
+            : null;
+        const result = namespace.defaultSet
+          ? namespace.default
+          : Array.isArray(phaseDefinitions) && phaseDefinitions.some((phaseDefinition) => typeof phaseDefinition === "object")
+            ? await runWorkflowPhases(phaseDefinitions)
+            : null;
+        completeActiveMarkerPhase();
+        ask("completed", { result: result ?? null });
+      } catch (error) {
+        ask("failed", { error: describe(error) });
+      }
+    },
+
+    // Hands an agent call its answer, as the JSON text the host received.
+    deliver(callId, messageJson) {
+      const call = waiting.get(callId);
+      if (call === undefined) {
+        return;
+      }
+      waiting.delete(callId);
+      call.resolve(parse(messageJson));
+    },
+
+    // Ends an agent call that will get no answer.
+    fail(callId, reason) {
+      const call = waiting.get(callId);
+      if (call === undefined) {
+        return;
+      }
+      waiting.delete(callId);
+      call.reject(new RealmError(reason));
+    },
+
+    refuseImport() {
+      throw new RealmError("Dynamic import is not available in workflow scripts");
+    },
+  };
 }
 
-function flushStdinResolvers() {
+// Calls into the script's realm. A script can break its own realm's built-ins
+// and make such a call throw; what it throws is the script's, so it is not
+// looked at here.
+function tellScriptRealm(call) {
+  try {
+    call();
+  } catch {
+    workflowTerminal = true;
+    pendingCalls.clear();
+    emit({ type: "workflow_failed", error: "Workflow script broke the workflow functions it runs on" });
+    process.exit(1);
+  }
+}
+
+function failPendingCalls(reasonFor) {
+  const callIds = [...pendingCalls];
+  pendingCalls.clear();
+  for (const callId of callIds) {
+    const reason = reasonFor(callId);
+    tellScriptRealm(() => scriptRealm.fail(callId, reason));
+  }
+}
+
+function flushStdin() {
   while (true) {
     const newlineIndex = stdinBuffer.indexOf("\n");
     if (newlineIndex === -1) {
@@ -409,14 +626,11 @@ function flushStdinResolvers() {
 
       const trailing = stdinBuffer.trim();
       stdinBuffer = "";
-      for (const [callId, pending] of pendingAgentResolvers) {
-        if (trailing.length > 0) {
-          pending.reject(new Error(`Workflow host protocol ended with partial JSON: ${trailing}`));
-        } else {
-          pending.reject(new Error(`Workflow host protocol closed before result for ${callId}`));
-        }
-      }
-      pendingAgentResolvers.clear();
+      failPendingCalls((callId) =>
+        trailing.length > 0
+          ? `Workflow host protocol ended with partial JSON: ${trailing}`
+          : `Workflow host protocol closed before result for ${callId}`,
+      );
       return;
     }
 
@@ -426,51 +640,40 @@ function flushStdinResolvers() {
       continue;
     }
 
+    let callId;
     try {
-      const message = JSON.parse(line);
-      const pending = pendingAgentResolvers.get(message.call_id);
-      if (!pending) {
-        throw new Error(`Workflow host protocol received result for unknown call ${message.call_id}`);
+      callId = JSON.parse(line).call_id;
+      if (!pendingCalls.has(callId)) {
+        throw new Error(`Workflow host protocol received result for unknown call ${callId}`);
       }
-      pendingAgentResolvers.delete(message.call_id);
-      pending.resolve(message);
     } catch (error) {
-      for (const pending of pendingAgentResolvers.values()) {
-        pending.reject(error);
-      }
-      pendingAgentResolvers.clear();
+      const reason = error instanceof Error ? error.message : String(error);
+      failPendingCalls(() => reason);
+      continue;
     }
+    pendingCalls.delete(callId);
+    tellScriptRealm(() => scriptRealm.deliver(callId, line));
   }
 }
 
-async function loadWorkflowModule() {
-  const source = await readFile(scriptPath, "utf8");
+function startWorkflow(source) {
   guardWorkflowSource(source);
   const transformed = transformWorkflowSource(source);
 
-  const context = vm.createContext(
-    Object.assign(Object.create(null), {
-      args: workflowArgs,
-      agent,
-      parallel,
-      pipeline,
-      phase,
-      sendMessage,
-      readMessages,
-      clearMessages,
-      createTaskList,
-      claimTask,
-      completeTask,
-      listTasks,
-    }),
-    {
-      codeGeneration: {
-        strings: false,
-        wasm: false,
-      },
+  // The context starts empty: `installWorkflowApi` fills it from inside.
+  const context = vm.createContext(Object.create(null), {
+    codeGeneration: {
+      strings: false,
+      wasm: false,
     },
-  );
-  const runner = vm.compileFunction(
+  });
+  const install = vm.runInContext(`(${installWorkflowApi})`, context, {
+    filename: "orca-workflow-api.js",
+  });
+  const realm = install(hostCall, argsJson);
+  scriptRealm = { deliver: realm.deliver, fail: realm.fail };
+  const refuseImport = realm.refuseImport;
+  const load = vm.compileFunction(
     `
       "use strict";
       return (async () => {
@@ -490,12 +693,14 @@ async function loadWorkflowModule() {
       parsingContext: context,
       filename: scriptPath,
       importModuleDynamically() {
-        throw new Error("Dynamic import is not available in workflow scripts");
+        // Thrown by the script's realm, so the script gets an error of its own.
+        return refuseImport();
       },
     },
   );
 
-  return runner();
+  // Not awaited: the script's realm reports the end itself, through `hostCall`.
+  realm.run(load);
 }
 
 function transformWorkflowSource(source) {
@@ -974,20 +1179,7 @@ function isIdentifierPart(char) {
 }
 
 try {
-  const namespace = await loadWorkflowModule();
-  const phaseDefinitions = Array.isArray(namespace.phases)
-    ? namespace.phases
-    : Array.isArray(namespace.meta?.phases)
-      ? namespace.meta.phases
-      : null;
-  const result = namespace.defaultSet
-    ? namespace.default
-    : Array.isArray(phaseDefinitions) && phaseDefinitions.some((phaseDefinition) => typeof phaseDefinition === "object")
-      ? await runWorkflowPhases(phaseDefinitions)
-      : null;
-  completeActiveMarkerPhase();
-  workflowTerminal = true;
-  emit({ type: "workflow_completed", result: result ?? null });
+  startWorkflow(await readFile(scriptPath, "utf8"));
 } catch (error) {
   workflowTerminal = true;
   emit({ type: "workflow_failed", error: error?.stack ?? String(error) });

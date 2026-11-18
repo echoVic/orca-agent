@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -27,6 +29,7 @@ const WORKFLOW_HOST_FRAME_CHANNEL_CAPACITY: usize = 8;
 const DEFAULT_WORKFLOW_HOST_AGENT_WORKERS: usize = 16;
 const WORKFLOW_HOST_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const WORKFLOW_HOST_EXIT_GRACE: Duration = Duration::from_secs(2);
+const NODE_PERMISSION_PROBE_DEADLINE: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -290,8 +293,23 @@ impl WorkflowHost {
         let args_json = String::from_utf8(args_json)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
+        let node = PathBuf::from(command.get_program());
+        command.args(node_confinement_args(
+            &node,
+            &host_path,
+            script_path,
+            ipc_paths,
+        ));
+        orca_platform::process::remove_credential_env(&mut command);
         command.arg(&host_path).arg(script_path).arg(args_json);
         if let Some(ipc_paths) = ipc_paths {
+            // The host may write these two files and nothing beside them, so
+            // the directory they go in has to be there already.
+            for path in [&ipc_paths.mailbox_path, &ipc_paths.task_lists_path] {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
             command
                 .arg(&ipc_paths.mailbox_path)
                 .arg(&ipc_paths.task_lists_path);
@@ -956,7 +974,173 @@ fn ensure_host_file() -> io::Result<PathBuf> {
         std::process::id()
     ));
     fs::write(&path, include_str!("host.mjs"))?;
-    Ok(path)
+    Ok(node_entry_path(path))
+}
+
+/// `path` as Node can load it as its entry module under the permission model.
+/// Node resolves the links in an entry module's path, and needs read access
+/// to each one it follows; a path with no links needs access to the file only.
+fn node_entry_path(path: PathBuf) -> PathBuf {
+    if cfg!(unix) {
+        fs::canonicalize(&path).unwrap_or(path)
+    } else {
+        path
+    }
+}
+
+/// The Node flags the workflow host is started with. A workflow script runs in
+/// a realm of its own inside the host and is given nothing of the host's; these
+/// flags are for the script that gets something anyway.
+///
+/// - The host's own realm cannot compile code from text, so an object of that
+///   realm in a script's hands does not become code running there.
+/// - Where Node has a permission model, the process reads the host module, the
+///   script and its two IPC files, writes the IPC files, and starts nothing.
+///
+/// A Node without a permission model is given the first flag only.
+fn node_confinement_args(
+    node: &Path,
+    host_path: &Path,
+    script_path: &Path,
+    ipc_paths: Option<&WorkflowHostIpcPaths>,
+) -> Vec<OsString> {
+    let mut args = vec![OsString::from("--disallow-code-generation-from-strings")];
+    if node_has_permission_model(node) {
+        args.extend(permission_model_args(host_path, script_path, ipc_paths));
+    }
+    args
+}
+
+/// The flags that let a Node with a permission model read `host_path` and
+/// `script_path`, read and replace the IPC files, and do nothing else.
+fn permission_model_args(
+    host_path: &Path,
+    script_path: &Path,
+    ipc_paths: Option<&WorkflowHostIpcPaths>,
+) -> Vec<OsString> {
+    let allow = |access: &str, path: &Path| {
+        let mut flag = OsString::from(format!("--allow-fs-{access}="));
+        flag.push(path);
+        flag
+    };
+    let mut args = vec![
+        OsString::from("--permission"),
+        allow("read", host_path),
+        allow("read", script_path),
+    ];
+    if let Some(ipc_paths) = ipc_paths {
+        for path in [&ipc_paths.mailbox_path, &ipc_paths.task_lists_path] {
+            // Node asks for read access to a file it renames.
+            for path in [path.clone(), host_replacement_path(path)] {
+                args.push(allow("read", &path));
+                args.push(allow("write", &path));
+            }
+        }
+    }
+    args
+}
+
+/// Where the host writes an IPC file's next contents before renaming them into
+/// place. `host.mjs` builds the same name.
+fn host_replacement_path(path: &Path) -> PathBuf {
+    let mut replacement = path.as_os_str().to_os_string();
+    replacement.push(".host-tmp");
+    PathBuf::from(replacement)
+}
+
+/// Whether `node` can be started with `--permission`. Asked of each executable
+/// until it answers: an older Node refuses to start when given a flag it does
+/// not know.
+fn node_has_permission_model(node: &Path) -> bool {
+    static KNOWN: Mutex<BTreeMap<PathBuf, bool>> = Mutex::new(BTreeMap::new());
+
+    if let Some(known) = KNOWN.lock().ok().and_then(|known| known.get(node).copied()) {
+        return known;
+    }
+    let answer = probe_node_permission_model(node);
+    if let (Some(answer), Ok(mut known)) = (answer, KNOWN.lock()) {
+        known.insert(node.to_path_buf(), answer);
+    }
+    answer.unwrap_or(false)
+}
+
+/// Starts `node` the way the workflow host is started, on a module that does
+/// what the host does with its files and says whether it may start a process.
+/// "No" is the permission model at work. Anything else — an older Node, a
+/// platform where a permitted file still cannot be loaded or replaced — means
+/// the host runs without the permission model rather than not at all. `None`
+/// is a `node` that said nothing in time.
+fn probe_node_permission_model(node: &Path) -> Option<bool> {
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    const ANSWER: &[u8] = b"false";
+    const MODULE: &str = r#"import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+const file = process.argv[2];
+writeFileSync(`${file}.host-tmp`, "{}");
+renameSync(`${file}.host-tmp`, file);
+readFileSync(file);
+rmSync(file);
+process.stdout.write(String(process.permission.has("child")));
+"#;
+
+    let module = env::temp_dir().join(format!(
+        "orca-workflow-permission-probe-{}-{}.mjs",
+        std::process::id(),
+        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&module, MODULE).ok()?;
+    let module = node_entry_path(module);
+    let _module_file = WorkflowHostFileGuard::new(module.clone());
+    let ipc_paths = WorkflowHostIpcPaths {
+        mailbox_path: module.with_extension("mailbox"),
+        task_lists_path: module.with_extension("task-lists"),
+    };
+    let _replaced_file = WorkflowHostFileGuard::new(ipc_paths.mailbox_path.clone());
+    let _replacement_file =
+        WorkflowHostFileGuard::new(host_replacement_path(&ipc_paths.mailbox_path));
+
+    let mut command = Command::new(node);
+    command
+        .args(permission_model_args(&module, &module, Some(&ipc_paths)))
+        .arg(&module)
+        .arg(&ipc_paths.mailbox_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let broker = ExecutionBroker::with_backend(
+        orca_core::capability::EnforcementState::Advisory,
+        "workflow-node-probe",
+    );
+    let launched = broker
+        .launch_user_trusted(
+            command,
+            "workflow-node-permission-probe",
+            cwd,
+            CapabilitySet::read_only(),
+        )
+        .ok()?;
+    // Whatever this is, it does not outlive the question: the child and
+    // anything it started are stopped when `child` is dropped.
+    let mut child = WorkflowHostChild::new(launched.child, launched.process_job);
+    let stdout = child.child_mut().ok()?.stdout.take()?;
+
+    // A Node with the permission model prints the answer and exits. Reading a
+    // little past it tells anything that prints more from Node without
+    // waiting for it to finish.
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut printed = Vec::new();
+        let _ = stdout
+            .take(ANSWER.len() as u64 + 1)
+            .read_to_end(&mut printed);
+        let _ = sender.send(printed);
+    });
+    receiver
+        .recv_timeout(NODE_PERMISSION_PROBE_DEADLINE)
+        .ok()
+        .map(|printed| printed == ANSWER)
 }
 
 fn node_command() -> PathBuf {
@@ -1518,6 +1702,197 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("command frame"));
         assert!(writer.lock().expect("writer").is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_workflow_host_does_not_inherit_orcas_credentials() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let seen = temp.path().join("environment");
+        let node = write_fake_node_script(
+            temp.path(),
+            "#!/bin/sh\nenv > \"$ORCA_WORKFLOW_TEST_ENV\"\n",
+        );
+        let mut command = Command::new(&node);
+        command
+            .env("ORCA_WORKFLOW_TEST_ENV", &seen)
+            .env("DEEPSEEK_API_KEY", "sk-workflow-test")
+            .env("ORCA_API_KEY", "sk-workflow-test")
+            .env("BRAVE_SEARCH_API_KEY", "sk-workflow-test");
+
+        let _ = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
+            command,
+            &temp.path().join("unused-workflow.js"),
+            serde_json::json!(null),
+            None,
+            WorkflowHostRunPolicy::collecting(),
+            |_| unreachable!("fixture does not emit agent calls"),
+            |_| Ok(()),
+            || Ok(false),
+            || {},
+        );
+
+        let environment = fs::read_to_string(&seen).expect("the fake node ran");
+        assert!(environment.contains("ORCA_WORKFLOW_TEST_ENV="));
+        assert!(
+            !environment.contains("sk-workflow-test"),
+            "the workflow host was started with a credential:\n{environment}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_node_without_the_permission_model_is_not_given_its_flags() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let node = write_fake_node(temp.path());
+
+        let args = node_confinement_args(
+            &node,
+            Path::new("/host.mjs"),
+            Path::new("/workflow.js"),
+            None,
+        );
+
+        assert_eq!(args, ["--disallow-code-generation-from-strings"]);
+    }
+
+    /// `node --version`, as (major, minor).
+    #[cfg(unix)]
+    fn node_version(node: &Path) -> Option<(u32, u32)> {
+        let output = Command::new(node).arg("--version").output().ok()?;
+        let version = String::from_utf8(output.stdout).ok()?;
+        let mut parts = version.trim().strip_prefix('v')?.split('.');
+        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+    }
+
+    // Unix only: whether a Windows temp directory's path suits Node's
+    // permission model has not been checked, and there the host falls back
+    // to running without it.
+    #[test]
+    #[cfg(unix)]
+    fn a_node_that_has_the_permission_model_is_started_with_it() {
+        let node = WorkflowHost::node_executable();
+        // `--permission` is in Node 22 from 22.13, in 23 from 23.5, and in
+        // every later line.
+        let has_flag = match node_version(&node) {
+            Some((22, minor)) => minor >= 13,
+            Some((23, minor)) => minor >= 5,
+            Some((major, _)) => major >= 24,
+            None => false,
+        };
+        if !has_flag {
+            return;
+        }
+
+        assert!(
+            node_has_permission_model(&node),
+            "the workflow host would run on this Node without the permission model"
+        );
+    }
+
+    /// Runs `module` as the workflow host would be run, with `readable` as the
+    /// workflow script, and returns what it printed.
+    fn run_confined(module: &str, readable: &Path, ipc: Option<&WorkflowHostIpcPaths>) -> String {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let entry = temp.path().join("entry.mjs");
+        fs::write(&entry, module).expect("write entry module");
+        let entry = node_entry_path(entry);
+        let node = WorkflowHost::node_executable();
+        let output = Command::new(&node)
+            .args(node_confinement_args(&node, &entry, readable, ipc))
+            .arg(&entry)
+            .arg(readable)
+            .output()
+            .expect("run node");
+        assert!(
+            output.status.success(),
+            "node failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("utf8 output")
+    }
+
+    #[test]
+    fn the_workflow_host_process_reads_its_script_and_nothing_else() {
+        let node = WorkflowHost::node_executable();
+        if !WorkflowHost::node_available() || !node_has_permission_model(&node) {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("workflow.js");
+        let private = temp.path().join("private.txt");
+        fs::write(&script, "script").expect("write script");
+        fs::write(&private, "private").expect("write private file");
+
+        let seen = run_confined(
+            r#"
+import { readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { dirname, join } from "node:path";
+const script = process.argv[2];
+const attempt = (action) => { try { action(); return "allowed"; } catch (error) { return error.code; } };
+console.log(JSON.stringify({
+  script: attempt(() => readFileSync(script)),
+  neighbour: attempt(() => readFileSync(join(dirname(script), "private.txt"))),
+  write: attempt(() => writeFileSync(join(dirname(script), "made.txt"), "x")),
+  command: attempt(() => execFileSync(process.execPath, ["--version"])),
+  code: attempt(() => Function("return 1")()),
+}));
+"#,
+            &script,
+            None,
+        );
+
+        let seen: Value = serde_json::from_str(seen.trim()).expect("json report");
+        assert_eq!(seen["script"], "allowed");
+        assert_eq!(seen["neighbour"], "ERR_ACCESS_DENIED");
+        assert_eq!(seen["write"], "ERR_ACCESS_DENIED");
+        assert_eq!(seen["command"], "ERR_ACCESS_DENIED");
+        assert_ne!(seen["code"], "allowed");
+        assert!(!temp.path().join("made.txt").exists());
+    }
+
+    #[test]
+    fn the_workflow_host_process_writes_only_its_mailbox_and_task_lists() {
+        let node = WorkflowHost::node_executable();
+        if !WorkflowHost::node_available() || !node_has_permission_model(&node) {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("workflow.js");
+        fs::write(&script, "script").expect("write script");
+        fs::write(temp.path().join("state.json"), "{}").expect("write run state");
+        let ipc = WorkflowHostIpcPaths {
+            mailbox_path: temp.path().join("mailbox.json"),
+            task_lists_path: temp.path().join("task-lists.json"),
+        };
+
+        let seen = run_confined(
+            r#"
+import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+const run = dirname(process.argv[2]);
+const attempt = (action) => { try { action(); return "allowed"; } catch (error) { return error.code; } };
+console.log(JSON.stringify({
+  mailbox: attempt(() => writeFileSync(join(run, "mailbox.json"), "{}")),
+  tasks: attempt(() => writeFileSync(join(run, "task-lists.json"), "{}")),
+  readBack: attempt(() => readFileSync(join(run, "mailbox.json"))),
+  state: attempt(() => writeFileSync(join(run, "state.json"), "tampered")),
+}));
+"#,
+            &script,
+            Some(&ipc),
+        );
+
+        let seen: Value = serde_json::from_str(seen.trim()).expect("json report");
+        assert_eq!(seen["mailbox"], "allowed");
+        assert_eq!(seen["tasks"], "allowed");
+        assert_eq!(seen["readBack"], "allowed");
+        assert_eq!(seen["state"], "ERR_ACCESS_DENIED");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("state.json")).expect("read run state"),
+            "{}"
+        );
     }
 
     #[cfg(unix)]

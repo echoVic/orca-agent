@@ -1037,3 +1037,154 @@ fn host_reports_workflow_failed_for_partial_trailing_json_on_stdin_eof() {
         line.contains("\"type\":\"workflow_failed\"") && line.contains("partial JSON")
     }));
 }
+
+/// Runs a workflow script whose body is `route` and returns what it pushed to
+/// `seen`. The script has two ways to look at a value it holds:
+///
+/// - `realmOf(value)` is `"own"` when the value was made in the script's
+///   realm and `"host"` when it was made in the host's;
+/// - `processThrough(value)` tries to run code in the realm the value came
+///   from, and is `"object"` when that code saw the host's `process`.
+fn workflow_script_sees(route: &str) -> Vec<String> {
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        format!(
+            r#"export const meta = {{ name: 'realm-test', description: 'Realm test', phases: [] }};
+const key = 'construct' + 'or';
+const seen = [];
+const makerOf = (value) => {{
+  let maker = value;
+  for (let hop = 0; hop < 3; hop += 1) maker = maker[key];
+  return maker;
+}};
+const ownMaker = makerOf(() => {{}});
+const realmOf = (value) => (makerOf(value) === ownMaker ? 'own' : 'host');
+const processThrough = (value) => {{
+  try {{
+    return makerOf(value)('return typeof process')();
+  }} catch (error) {{
+    return 'refused';
+  }}
+}};
+{route}
+export default seen;
+"#
+        ),
+    )
+    .unwrap();
+
+    let events = WorkflowHost::run_collecting_events_with_agent(
+        &script,
+        serde_json::json!({"topic": "realm"}),
+        |call| {
+            if call.prompt == "fail" {
+                Ok(orca_runtime::workflow::host::HostCommand::AgentError {
+                    call_id: call.call_id,
+                    error: "agent failed".to_string(),
+                })
+            } else {
+                Ok(orca_runtime::workflow::host::HostCommand::AgentResult {
+                    call_id: call.call_id,
+                    result: serde_json::json!({"summary": "done"}),
+                })
+            }
+        },
+    )
+    .unwrap();
+
+    let seen = events
+        .iter()
+        .find_map(|event| match event {
+            HostEvent::WorkflowCompleted { result } => Some(result.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the realm test script did not finish: {events:?}"));
+    serde_json::from_value(seen).expect("the script reports strings")
+}
+
+#[test]
+fn everything_a_workflow_script_is_given_belongs_to_its_own_realm() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    let mut from_the_host = Vec::new();
+    for (what, values) in [
+        ("an API function", "sendMessage, agent, parallel, phase"),
+        ("the workflow arguments", "args"),
+        (
+            "a value an API call returns",
+            "sendMessage('c', { a: 1 }), readMessages('c'), createTaskList('t', [1]), \
+             claimTask('t'), completeTask('t', listTasks('t')[0].id), listTasks('t')",
+        ),
+        (
+            "a promise an API call returns",
+            "parallel([]), pipeline([]), phase('p', () => 1), agent('x')",
+        ),
+        ("an agent's result", "await agent('x')"),
+        (
+            "an agent's failure",
+            "await agent('fail').catch((error) => error)",
+        ),
+        (
+            "an error an API call throws",
+            "(() => { try { readMessages(''); } catch (error) { return error; } })()",
+        ),
+        (
+            "a phase fallback's argument",
+            "await phase('p', () => { throw new Error('x'); }, { fallback: (info) => info })",
+        ),
+    ] {
+        let seen = workflow_script_sees(&format!(
+            "for (const value of [{values}]) seen.push(realmOf(value));"
+        ));
+        assert!(!seen.is_empty(), "{what}: the script looked at nothing");
+        if seen.iter().any(|realm| realm != "own") {
+            from_the_host.push(format!("{what}: {seen:?}"));
+        }
+    }
+
+    assert!(
+        from_the_host.is_empty(),
+        "a workflow script was handed objects of the host's realm:\n{}",
+        from_the_host.join("\n")
+    );
+}
+
+#[test]
+fn a_blocked_name_spelled_another_way_still_finds_the_scripts_own_realm() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    // Each of these gets past the source scan, so the realm has to hold.
+    for (what, lookup) in [
+        ("a unicode escape", "sendMessage.\\u0063onstructor"),
+        ("a joined string", "sendMessage['con' + 'structor']"),
+        ("a template literal", "sendMessage[`constructor`]"),
+    ] {
+        let seen = workflow_script_sees(&format!(
+            "seen.push(({lookup}) === ownMaker ? 'own' : 'host');"
+        ));
+        assert_eq!(seen, ["own"], "{what} reached the host's realm");
+    }
+}
+
+#[test]
+fn a_host_object_in_a_workflow_scripts_hands_does_not_run_code_in_the_host() {
+    if !WorkflowHost::node_available() {
+        return;
+    }
+
+    // Node refuses a dynamic import with an error of its own, made in the
+    // host's realm, before the host can answer with one of the script's. The
+    // source scan stops `import(`; a comment in between gets past it.
+    let seen = workflow_script_sees(
+        "try { await import/**/('node:os'); seen.push('imported'); } \
+         catch (error) { seen.push(processThrough(error)); }",
+    );
+
+    assert_eq!(seen, ["refused"]);
+}
