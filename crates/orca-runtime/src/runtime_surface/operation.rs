@@ -871,12 +871,100 @@ pub enum OperationTerminal {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_tokens: u64,
+    /// Everything the usage cost: tokens plus the per-use service fees.
     pub estimated_cost_usd_micros: u64,
+    /// The part of the cost that is per-use service fees, and what was billed.
+    /// Absent from a record with no fees, so those records are unchanged.
+    #[serde(default, skip_serializing_if = "ServiceUsageTotals::is_empty")]
+    pub service: ServiceUsageTotals,
+}
+
+/// What services billed per use, apart from tokens: the fees, already counted
+/// in [`UsageTotals::estimated_cost_usd_micros`], and the billed units.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServiceUsageTotals {
+    pub cost_usd_micros: u64,
+    pub deepseek_searches: u64,
+    pub deepseek_fetches: u64,
+    pub deepseek_ocr_pages: u64,
+}
+
+impl ServiceUsageTotals {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl UsageTotals {
+    pub fn from_core(usage: orca_core::cost_types::UsageTotals) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_tokens: usage.cache_tokens,
+            estimated_cost_usd_micros: crate::cost::usd_to_micros(usage.estimated_cost_usd),
+            service: ServiceUsageTotals {
+                cost_usd_micros: crate::cost::usd_to_micros(usage.service.cost_usd),
+                deepseek_searches: usage.service.deepseek_searches,
+                deepseek_fetches: usage.service.deepseek_fetches,
+                deepseek_ocr_pages: usage.service.deepseek_ocr_pages,
+            },
+        }
+    }
+
+    pub fn to_core(&self) -> orca_core::cost_types::UsageTotals {
+        orca_core::cost_types::UsageTotals {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_tokens: self.cache_tokens,
+            estimated_cost_usd: self.estimated_cost_usd_micros as f64 / 1_000_000.0,
+            service: orca_core::cost_types::ServiceUsageTotals {
+                cost_usd: self.service.cost_usd_micros as f64 / 1_000_000.0,
+                deepseek_searches: self.service.deepseek_searches,
+                deepseek_fetches: self.service.deepseek_fetches,
+                deepseek_ocr_pages: self.service.deepseek_ocr_pages,
+            },
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Both usages together.
+    pub fn plus(&self, other: &Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cache_tokens: self.cache_tokens.saturating_add(other.cache_tokens),
+            estimated_cost_usd_micros: self
+                .estimated_cost_usd_micros
+                .saturating_add(other.estimated_cost_usd_micros),
+            service: ServiceUsageTotals {
+                cost_usd_micros: self
+                    .service
+                    .cost_usd_micros
+                    .saturating_add(other.service.cost_usd_micros),
+                deepseek_searches: self
+                    .service
+                    .deepseek_searches
+                    .saturating_add(other.service.deepseek_searches),
+                deepseek_fetches: self
+                    .service
+                    .deepseek_fetches
+                    .saturating_add(other.service.deepseek_fetches),
+                deepseek_ocr_pages: self
+                    .service
+                    .deepseek_ocr_pages
+                    .saturating_add(other.service.deepseek_ocr_pages),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1156,4 +1244,75 @@ pub enum RuntimeSettingsPatch {
     ApplyPermissionUpdate {
         update: SurfacePermissionUpdate,
     },
+}
+
+#[cfg(test)]
+mod usage_totals_tests {
+    use super::{ServiceUsageTotals, UsageTotals};
+
+    fn billed_core() -> orca_core::cost_types::UsageTotals {
+        orca_core::cost_types::UsageTotals {
+            input_tokens: 10,
+            output_tokens: 4,
+            cache_tokens: 2,
+            estimated_cost_usd: 0.5,
+            service: orca_core::cost_types::ServiceUsageTotals {
+                cost_usd: 0.004_5,
+                deepseek_searches: 2,
+                deepseek_fetches: 1,
+                deepseek_ocr_pages: 10,
+            },
+        }
+    }
+
+    fn billed() -> UsageTotals {
+        UsageTotals {
+            input_tokens: 10,
+            output_tokens: 4,
+            cache_tokens: 2,
+            estimated_cost_usd_micros: 500_000,
+            service: ServiceUsageTotals {
+                cost_usd_micros: 4_500,
+                deepseek_searches: 2,
+                deepseek_fetches: 1,
+                deepseek_ocr_pages: 10,
+            },
+        }
+    }
+
+    #[test]
+    fn service_fees_cross_between_core_and_surface_totals() {
+        assert_eq!(UsageTotals::from_core(billed_core()), billed());
+        assert_eq!(billed().to_core(), billed_core());
+    }
+
+    #[test]
+    fn plus_adds_the_service_fees() {
+        let sum = billed().plus(&billed());
+        assert_eq!(sum.estimated_cost_usd_micros, 1_000_000);
+        assert_eq!(sum.service.cost_usd_micros, 9_000);
+        assert_eq!(sum.service.deepseek_searches, 4);
+        assert_eq!(sum.service.deepseek_fetches, 2);
+        assert_eq!(sum.service.deepseek_ocr_pages, 20);
+    }
+
+    #[test]
+    fn totals_without_service_fees_keep_their_wire_form() {
+        let totals = UsageTotals {
+            service: ServiceUsageTotals::default(),
+            ..billed()
+        };
+        let wire = r#"{"input_tokens":10,"output_tokens":4,"cache_tokens":2,"estimated_cost_usd_micros":500000}"#;
+        assert_eq!(serde_json::to_string(&totals).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<UsageTotals>(wire).unwrap(), totals);
+    }
+
+    #[test]
+    fn service_fees_survive_the_wire() {
+        let wire = serde_json::to_string(&billed()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<UsageTotals>(&wire).unwrap(),
+            billed()
+        );
+    }
 }

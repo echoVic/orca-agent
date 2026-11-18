@@ -73,12 +73,7 @@ fn snapshot(next_seq: u64) -> SurfaceSnapshot {
         },
         usage: SurfaceUsageSnapshot {
             revision: UsageRevision::try_new(1).unwrap(),
-            thread_total: UsageTotals {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_tokens: 0,
-                estimated_cost_usd_micros: 0,
-            },
+            thread_total: UsageTotals::default(),
             active_operation: None,
             goal: None,
             workflow: Vec::new(),

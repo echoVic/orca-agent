@@ -6247,10 +6247,7 @@ fn apply_operation_patch(
                         usage_delta,
                     }) if stopped_fence == fence
                         && stopped_message == message
-                        && usage_delta.input_tokens == 0
-                        && usage_delta.output_tokens == 0
-                        && usage_delta.cache_tokens == 0
-                        && usage_delta.estimated_cost_usd_micros == 0
+                        && usage_delta.is_empty()
                 )
             });
             let paired_finalization = batch.events.as_slice().iter().any(|event| {
@@ -6652,11 +6649,7 @@ fn apply_operation_patch(
             // usage updates, the TUI status bar, `/status`) sees cumulative
             // accounting. Recovery stops carry a zero delta, which must not move
             // the revision.
-            if usage_delta.input_tokens != 0
-                || usage_delta.output_tokens != 0
-                || usage_delta.cache_tokens != 0
-                || usage_delta.estimated_cost_usd_micros != 0
-            {
+            if !usage_delta.is_empty() {
                 let next_revision = snapshot
                     .usage
                     .revision
@@ -6670,15 +6663,7 @@ fn apply_operation_patch(
                             "usage revision is exhausted",
                         )
                     })?;
-                let total = &mut snapshot.usage.thread_total;
-                total.input_tokens = total.input_tokens.saturating_add(usage_delta.input_tokens);
-                total.output_tokens = total
-                    .output_tokens
-                    .saturating_add(usage_delta.output_tokens);
-                total.cache_tokens = total.cache_tokens.saturating_add(usage_delta.cache_tokens);
-                total.estimated_cost_usd_micros = total
-                    .estimated_cost_usd_micros
-                    .saturating_add(usage_delta.estimated_cost_usd_micros);
+                snapshot.usage.thread_total = snapshot.usage.thread_total.plus(usage_delta);
                 snapshot.usage.revision = next_revision;
             }
             Ok(())
@@ -9711,12 +9696,7 @@ pub(crate) mod tests {
     pub(crate) fn reducer_snapshot() -> SurfaceSnapshot {
         let incarnation = SurfaceIncarnation::try_from_bytes(uuid_v7_bytes(5)).unwrap();
         let path = super::super::identity::test_canonical_path("orca-surface");
-        let usage = UsageTotals {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_tokens: 0,
-            estimated_cost_usd_micros: 0,
-        };
+        let usage = UsageTotals::default();
         SurfaceSnapshot {
             cursor: SurfaceCursor {
                 thread_id: thread_id(),
@@ -10846,12 +10826,7 @@ pub(crate) mod tests {
                 reason: GenerationStopReason::Completed {
                     status: GenerationCompletionStatus::Success,
                 },
-                usage_delta: UsageTotals {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_tokens: 0,
-                    estimated_cost_usd_micros: 0,
-                },
+                usage_delta: UsageTotals::default(),
             }),
         );
         assert!(matches!(
@@ -10879,12 +10854,7 @@ pub(crate) mod tests {
                 reason: GenerationStopReason::Completed {
                     status: GenerationCompletionStatus::Success,
                 },
-                usage_delta: UsageTotals {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_tokens: 0,
-                    estimated_cost_usd_micros: 0,
-                },
+                usage_delta: UsageTotals::default(),
             }),
         );
         let SurfaceReduceResult::Applied { state: stopped } =
@@ -10935,19 +10905,9 @@ pub(crate) mod tests {
                     operation_id: fence.operation_id,
                     finalize_intent_id,
                     terminal: OperationTerminal::Succeeded {
-                        usage: UsageTotals {
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_tokens: 0,
-                            estimated_cost_usd_micros: 0,
-                        },
+                        usage: UsageTotals::default(),
                     },
-                    usage: UsageTotals {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cache_tokens: 0,
-                        estimated_cost_usd_micros: 0,
-                    },
+                    usage: UsageTotals::default(),
                     source_diagnostic_digest: None,
                     settlement_receipts: Vec::new(),
                     completion_proof: super::super::SurfaceOperationCompletionProof::unverified(

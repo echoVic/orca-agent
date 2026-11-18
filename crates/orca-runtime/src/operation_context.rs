@@ -832,12 +832,7 @@ mod tests {
             .expect("journal ok")
             .expect("admitted");
         let stop = context.controller.admit_turn().expect_err("exhausted");
-        let budget_consumed = orca_core::cost_types::UsageTotals {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_tokens: 0,
-            estimated_cost_usd: 0.0,
-        };
+        let budget_consumed = orca_core::cost_types::UsageTotals::default();
         let terminal = context
             .commit_budget_stop_with_boundary(
                 "turn-1",

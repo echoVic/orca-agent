@@ -103,12 +103,7 @@ fn snapshot() -> SurfaceSnapshot {
         },
         usage: SurfaceUsageSnapshot {
             revision: UsageRevision::try_new(1).unwrap(),
-            thread_total: UsageTotals {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_tokens: 0,
-                estimated_cost_usd_micros: 0,
-            },
+            thread_total: UsageTotals::default(),
             active_operation: None,
             goal: None,
             workflow: Vec::new(),
@@ -1575,12 +1570,7 @@ fn recover_retries_prepared_terminal_batch_before_classifying_operation() {
                 terminal: OperationTerminal::NotAdmitted {
                     reason: NotAdmittedReason::RuntimeRestart,
                 },
-                usage: UsageTotals {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_tokens: 0,
-                    estimated_cost_usd_micros: 0,
-                },
+                usage: UsageTotals::default(),
                 source_diagnostic_digest: None,
                 settlement_receipts: Vec::new(),
                 completion_proof: SurfaceOperationCompletionProof::unverified(
@@ -1696,12 +1686,7 @@ fn later_successor_recovers_prepared_terminal_before_any_owner_transition() {
                 terminal: OperationTerminal::NotAdmitted {
                     reason: NotAdmittedReason::RuntimeRestart,
                 },
-                usage: UsageTotals {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_tokens: 0,
-                    estimated_cost_usd_micros: 0,
-                },
+                usage: UsageTotals::default(),
                 source_diagnostic_digest: None,
                 settlement_receipts: Vec::new(),
                 completion_proof: SurfaceOperationCompletionProof::unverified(

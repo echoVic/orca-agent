@@ -1380,16 +1380,7 @@ pub(crate) fn transcript_from_records(
                 usage: Some(record),
                 ..
             } => {
-                background_usage.input_tokens = background_usage
-                    .input_tokens
-                    .saturating_add(record.input_tokens);
-                background_usage.output_tokens = background_usage
-                    .output_tokens
-                    .saturating_add(record.output_tokens);
-                background_usage.cache_tokens = background_usage
-                    .cache_tokens
-                    .saturating_add(record.cache_tokens);
-                background_usage.estimated_cost_usd += record.estimated_cost_usd;
+                background_usage = background_usage.plus(record);
                 has_background_usage = true;
             }
             SessionRecord::BackgroundTaskProviderResponse { usage: None, .. } => {}
@@ -1630,10 +1621,7 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
 }
 
 fn add_usage_totals(totals: &mut UsageTotals, usage: UsageTotals) {
-    totals.input_tokens = totals.input_tokens.saturating_add(usage.input_tokens);
-    totals.output_tokens = totals.output_tokens.saturating_add(usage.output_tokens);
-    totals.cache_tokens = totals.cache_tokens.saturating_add(usage.cache_tokens);
-    totals.estimated_cost_usd += usage.estimated_cost_usd;
+    *totals = totals.plus(usage);
 }
 
 fn redact_stored_message(message: &mut StoredMessage) {
@@ -2581,6 +2569,7 @@ mod tests {
             output_tokens,
             cache_tokens,
             estimated_cost_usd: cost,
+            service: Default::default(),
         }
     }
 

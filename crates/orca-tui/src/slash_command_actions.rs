@@ -308,9 +308,13 @@ fn dispatch_slash_command(
         },
         SlashCommand::Cost => {
             let usage = state.usage();
+            // Per-use tool fees are part of the estimate; name them apart.
+            let breakdown = tool_fee_summary(*usage)
+                .map(|fees| format!(" (tokens ${:.6}, tool fees {fees})", usage.token_cost_usd()))
+                .unwrap_or_default();
             state.push_message(ChatMessage::System {
                 text: format!(
-                    "Session usage: {} input, {} output, {} cache tokens, estimated ${:.6}.",
+                    "Session usage: {} input, {} output, {} cache tokens, estimated ${:.6}{breakdown}.",
                     usage.input_tokens,
                     usage.output_tokens,
                     usage.cache_tokens,
@@ -629,7 +633,34 @@ fn normalize_base_url_argument(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+/// The per-use tool fees in a usage and what was billed for them:
+/// "$0.001725: 2 searches, 1 OCR page". `None` when there are no fees.
+fn tool_fee_summary(usage: orca_core::cost_types::UsageTotals) -> Option<String> {
+    tool_fee_parts(usage).map(|(fees, units)| match units {
+        Some(units) => format!("{fees}: {units}"),
+        None => fees,
+    })
+}
+
+/// The fees as "$0.001725", and the billed units when any were counted.
+fn tool_fee_parts(usage: orca_core::cost_types::UsageTotals) -> Option<(String, Option<String>)> {
+    if usage.service.is_empty() {
+        return None;
+    }
+    let units = usage.service.billed_units();
+    Some((
+        format!("${:.6}", usage.service.cost_usd),
+        (!units.is_empty()).then_some(units),
+    ))
+}
+
 fn format_status(state: &AppState, config: &RunConfig) -> String {
+    let tool_fees = tool_fee_parts(*state.usage())
+        .map(|(fees, units)| match units {
+            Some(units) => format!("tool fees: {fees} ({units}), included in cost\n"),
+            None => format!("tool fees: {fees}, included in cost\n"),
+        })
+        .unwrap_or_default();
     let session_id = state.current_session_id().unwrap_or("-");
     let title = state.current_session_title().unwrap_or("-");
     let context_used_tokens = state.context_used_tokens();
@@ -712,6 +743,7 @@ fn format_status(state: &AppState, config: &RunConfig) -> String {
          context: {context}\n\
          usage: {} input, {} output, {} cache\n\
          cost: ${:.6}\n\
+         {tool_fees}\
          goal: {goal}\n\
          active tasks: {active_tasks}\n\
          recoverable: {}",
@@ -988,6 +1020,7 @@ mod tests {
                     output_tokens: 50,
                     cache_tokens: 25,
                     estimated_cost_usd: 0.125,
+                    service: Default::default(),
                 },
                 context_revision: 1,
                 context_used_tokens: 250,
@@ -1031,6 +1064,104 @@ mod tests {
         ] {
             assert!(status.contains(expected), "missing {expected}: {status}");
         }
+    }
+
+    fn state_with_usage(usage: orca_core::cost_types::UsageTotals) -> AppState {
+        let mut state = state();
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState {
+                cursor: crate::surface_projection::test_surface_cursor(1),
+                session_id: Some("session-1".to_string()),
+                title: "Release triage".to_string(),
+                usage_revision: 1,
+                usage,
+                context_revision: 1,
+                context_used_tokens: 250,
+                context_limit_tokens: 1_000,
+                workflow_tasks: Vec::new(),
+                current_goal: None,
+                foreground_operation_id: None,
+                recoverable_operation_id: None,
+                goal_presentation: None,
+                session_presentation: None,
+                mcp_catalog: Default::default(),
+            },
+        )));
+        state
+    }
+
+    fn last_system_text(state: &AppState) -> String {
+        let Some(ChatMessage::System { text, .. }) = state.transcript.messages.last() else {
+            panic!("no system message was appended");
+        };
+        text.clone()
+    }
+
+    fn run_slash_command(command: &str, state: &mut AppState) -> String {
+        let mut config = test_run_config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let (action_tx, _) = mpsc::unbounded();
+        handle_slash_command(command, &mut config, &shared, state, &action_tx);
+        last_system_text(state)
+    }
+
+    fn tokens_only_usage() -> orca_core::cost_types::UsageTotals {
+        orca_core::cost_types::UsageTotals {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_tokens: 25,
+            estimated_cost_usd: 0.125,
+            service: Default::default(),
+        }
+    }
+
+    fn usage_with_tool_fees() -> orca_core::cost_types::UsageTotals {
+        orca_core::cost_types::UsageTotals {
+            estimated_cost_usd: 0.126725,
+            service: orca_core::cost_types::ServiceUsageTotals {
+                cost_usd: 0.001725,
+                deepseek_searches: 2,
+                deepseek_fetches: 0,
+                deepseek_ocr_pages: 1,
+            },
+            ..tokens_only_usage()
+        }
+    }
+
+    #[test]
+    fn cost_command_without_tool_fees_reports_one_figure() {
+        let mut state = state_with_usage(tokens_only_usage());
+        assert_eq!(
+            run_slash_command("/cost", &mut state),
+            "Session usage: 100 input, 50 output, 25 cache tokens, estimated $0.125000."
+        );
+    }
+
+    #[test]
+    fn cost_command_lists_tool_fees_apart_from_tokens() {
+        let mut state = state_with_usage(usage_with_tool_fees());
+        assert_eq!(
+            run_slash_command("/cost", &mut state),
+            "Session usage: 100 input, 50 output, 25 cache tokens, estimated $0.126725 \
+             (tokens $0.125000, tool fees $0.001725: 2 searches, 1 OCR page)."
+        );
+    }
+
+    #[test]
+    fn status_names_tool_fees_only_when_there_are_some() {
+        let mut state = state_with_usage(tokens_only_usage());
+        let status = run_slash_command("/status", &mut state);
+        assert!(status.contains("cost: $0.125000\n"), "{status}");
+        assert!(!status.contains("tool fees"), "{status}");
+
+        let mut state = state_with_usage(usage_with_tool_fees());
+        let status = run_slash_command("/status", &mut state);
+        assert!(
+            status.contains(
+                "cost: $0.126725\ntool fees: $0.001725 (2 searches, 1 OCR page), included in cost\n"
+            ),
+            "{status}"
+        );
     }
 
     #[test]

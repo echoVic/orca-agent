@@ -163,7 +163,15 @@ impl<W: Write> EventSink<W> {
             EventType::UsageUpdated => {
                 let total = event.payload["total_tokens"].as_u64().unwrap_or(0);
                 let cost = event.payload["estimated_cost_usd"].as_f64().unwrap_or(0.0);
-                writeln!(self.writer, "usage: {total} tokens (${cost:.6})")
+                let fees = event.payload["service_cost_usd"].as_f64().unwrap_or(0.0);
+                if fees > 0.0 {
+                    writeln!(
+                        self.writer,
+                        "usage: {total} tokens (${cost:.6}, tool fees ${fees:.6})"
+                    )
+                } else {
+                    writeln!(self.writer, "usage: {total} tokens (${cost:.6})")
+                }
             }
             EventType::ContextUpdated => {
                 let used = event.payload["used_tokens"].as_u64().unwrap_or_default();
@@ -436,6 +444,42 @@ mod tests {
 
     fn model_response_identity() -> ModelResponseIdentity {
         ModelResponseIdentity::new(TurnId::new())
+    }
+
+    fn human_usage_line(usage: crate::cost_types::UsageTotals) -> String {
+        let mut written = Vec::new();
+        let mut events = EventFactory::new("run-1".to_string());
+        let mut sink = EventSink::new(&mut written, OutputFormat::Text);
+        sink.emit(events.usage_updated(usage)).unwrap();
+        drop(sink);
+        String::from_utf8(written).unwrap()
+    }
+
+    #[test]
+    fn human_usage_line_names_tool_fees_only_when_there_are_some() {
+        let tokens_only = crate::cost_types::UsageTotals {
+            input_tokens: 10,
+            output_tokens: 4,
+            cache_tokens: 0,
+            estimated_cost_usd: 0.5,
+            service: crate::cost_types::ServiceUsageTotals::default(),
+        };
+        assert_eq!(
+            human_usage_line(tokens_only),
+            "usage: 14 tokens ($0.500000)\n"
+        );
+        let with_fees = crate::cost_types::UsageTotals {
+            service: crate::cost_types::ServiceUsageTotals {
+                cost_usd: 0.00075,
+                deepseek_searches: 1,
+                ..Default::default()
+            },
+            ..tokens_only
+        };
+        assert_eq!(
+            human_usage_line(with_fees),
+            "usage: 14 tokens ($0.500000, tool fees $0.000750)\n"
+        );
     }
 
     fn coalescing_sink(writer: &mut Vec<u8>) -> EventSink<&mut Vec<u8>> {

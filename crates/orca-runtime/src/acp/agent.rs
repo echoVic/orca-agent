@@ -3848,12 +3848,7 @@ mod tests {
                 fingerprint: "port".into(),
                 evidence: Vec::new(),
             },
-            usage: crate::surface::UsageTotals {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_tokens: 0,
-                estimated_cost_usd_micros: 0,
-            },
+            usage: crate::surface::UsageTotals::default(),
         };
         assert_eq!(terminal_to_stop_reason(&terminal), Ok(StopReason::EndTurn));
     }

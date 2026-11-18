@@ -595,12 +595,7 @@ impl ThreadActor {
                 .as_ref()
                 .filter(|(active_id, _)| active_id == &operation_id)
                 .map(|(_, usage)| usage.clone())
-                .unwrap_or(surface::UsageTotals {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_tokens: 0,
-                    estimated_cost_usd_micros: 0,
-                });
+                .unwrap_or(surface::UsageTotals::default());
             let terminal = match &finalization.selected_cause {
                 surface::OperationFinalizationCause::GenerationStop(reason) => {
                     surface::terminal_from_generation_stop(&operation, reason, &usage).map_err(

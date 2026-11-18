@@ -1767,6 +1767,7 @@ fn actor_owned_start_preserves_preloaded_session_usage_and_injected_mcp_registry
         output_tokens: 30,
         cache_tokens: 40,
         estimated_cost_usd: 0.25,
+        service: Default::default(),
     };
     let transcript = SessionTranscript {
         meta,

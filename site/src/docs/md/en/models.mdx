@@ -37,6 +37,13 @@ prices in: they are the same at every hour, and neither pricing refresh nor
 `[models."<name>".pricing]` changes them. See [Web search and fetch](configuration.md#web-search-and-fetch)
 and [Reading documents and images](configuration.md#reading-documents-and-images).
 
+The estimate is one figure, and the fees are also listed apart from it. `/cost`
+and `/status` show the tool fees and the searches, fetches and OCR pages billed
+for them once there are any, and each `usage.updated` event carries
+`service_cost_usd` (the part of `estimated_cost_usd` that is fees) and
+`service_usage` (the billed `deepseek_searches`, `deepseek_fetches` and
+`deepseek_ocr_pages`).
+
 Orca ships with built-in prices last verified on 2026-11-16. The first session
 in each process checks whether cached prices are missing or at least 24 hours old
 and, if needed, refreshes them from models.dev in the background. Refreshing

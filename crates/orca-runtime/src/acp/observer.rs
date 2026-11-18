@@ -323,8 +323,8 @@ impl Observer {
                                 usage_delta,
                                 ..
                             }) => {
-                                if !batch_reports_usage && !usage_is_empty(usage_delta) {
-                                    usage = accumulate_usage(usage, usage_delta);
+                                if !batch_reports_usage && !usage_delta.is_empty() {
+                                    usage = usage.plus(usage_delta);
                                     let _ = emit_usage(&sender, &id, &context, &usage);
                                 }
                                 state(&sender, &id, "active", true)
@@ -411,26 +411,6 @@ fn emit_usage(
         )
         .meta(metadata(json!({"version": 1, "usage": usage}))),
     )
-}
-
-fn accumulate_usage(
-    mut total: crate::surface::UsageTotals,
-    delta: &crate::surface::UsageTotals,
-) -> crate::surface::UsageTotals {
-    total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
-    total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
-    total.cache_tokens = total.cache_tokens.saturating_add(delta.cache_tokens);
-    total.estimated_cost_usd_micros = total
-        .estimated_cost_usd_micros
-        .saturating_add(delta.estimated_cost_usd_micros);
-    total
-}
-
-fn usage_is_empty(usage: &crate::surface::UsageTotals) -> bool {
-    usage.input_tokens == 0
-        && usage.output_tokens == 0
-        && usage.cache_tokens == 0
-        && usage.estimated_cost_usd_micros == 0
 }
 
 pub(super) fn emit_user_images(

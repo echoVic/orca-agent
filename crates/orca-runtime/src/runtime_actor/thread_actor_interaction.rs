@@ -3945,12 +3945,7 @@ impl ThreadActor {
                                         surface::OperationPatch::GenerationStopped {
                                             fence: generation.fence.clone(),
                                             reason: stop_reason,
-                                            usage_delta: surface::UsageTotals {
-                                                input_tokens: 0,
-                                                output_tokens: 0,
-                                                cache_tokens: 0,
-                                                estimated_cost_usd_micros: 0,
-                                            },
+                                            usage_delta: surface::UsageTotals::default(),
                                         },
                                     ),
                                 ),
@@ -5316,12 +5311,7 @@ impl ThreadActor {
             operation_id: operation.operation_id.clone(),
             finalize_intent_id: finalize_intent_id.clone(),
             terminal: terminal.clone(),
-            usage: surface::UsageTotals {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_tokens: 0,
-                estimated_cost_usd_micros: 0,
-            },
+            usage: surface::UsageTotals::default(),
             source_diagnostic_digest: None,
             settlement_receipts: Vec::new(),
             completion_proof,

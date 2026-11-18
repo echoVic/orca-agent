@@ -2154,12 +2154,7 @@ fn workflow_agent_status(status: SurfaceWorkflowAgentStatus) -> WorkflowAgentSta
 }
 
 fn core_usage_totals(usage: &orca_runtime::surface::UsageTotals) -> UsageTotals {
-    UsageTotals {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_tokens: usage.cache_tokens,
-        estimated_cost_usd: usage.estimated_cost_usd_micros as f64 / 1_000_000.0,
-    }
+    usage.to_core()
 }
 
 pub(crate) fn thread_goal_from_surface(
@@ -2515,12 +2510,7 @@ mod tests {
             },
             usage: SurfaceUsageSnapshot {
                 revision: UsageRevision::try_new(1).unwrap(),
-                thread_total: SurfaceUsageTotals {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_tokens: 0,
-                    estimated_cost_usd_micros: 0,
-                },
+                thread_total: SurfaceUsageTotals::default(),
                 active_operation: None,
                 goal: None,
                 workflow: Vec::new(),
@@ -3862,6 +3852,26 @@ mod tests {
     }
 
     #[test]
+    fn surface_usage_keeps_its_service_fees_in_the_tui() {
+        let usage = core_usage_totals(&orca_runtime::surface::UsageTotals {
+            input_tokens: 8_000,
+            output_tokens: 900,
+            cache_tokens: 450,
+            estimated_cost_usd_micros: 35_000,
+            service: orca_runtime::surface::ServiceUsageTotals {
+                cost_usd_micros: 1_725,
+                deepseek_searches: 2,
+                deepseek_fetches: 0,
+                deepseek_ocr_pages: 1,
+            },
+        });
+        assert_eq!(usage.estimated_cost_usd, 0.035);
+        assert_eq!(usage.service.cost_usd, 0.001725);
+        assert_eq!(usage.service.deepseek_searches, 2);
+        assert_eq!(usage.service.deepseek_ocr_pages, 1);
+    }
+
+    #[test]
     fn typed_usage_projection_waits_for_commit_snapshot() {
         let before = cursor(0, 1);
         let commit_class = CommitClass::Recorded {
@@ -3881,6 +3891,7 @@ mod tests {
                     output_tokens: 900,
                     cache_tokens: 450,
                     estimated_cost_usd_micros: 35_000,
+                    service: Default::default(),
                 },
                 active_operation: None,
                 goal: None,
@@ -3987,12 +3998,7 @@ mod tests {
                         )
                         .unwrap(),
                     },
-                    usage: SurfaceUsageTotals {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cache_tokens: 0,
-                        estimated_cost_usd_micros: 0,
-                    },
+                    usage: SurfaceUsageTotals::default(),
                     source_diagnostic_digest: None,
                     settlement_receipts: Vec::new(),
                     completion_proof: SurfaceOperationCompletionProof::unverified(

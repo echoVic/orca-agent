@@ -921,14 +921,7 @@ impl LegacyTerminalTaskReconciliationReceipt {
                     workflow_run_id: None,
                     subagent_id: None,
                     pending_interaction_id: None,
-                    usage: record.usage.map(|usage| SurfaceUsageTotals {
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                        cache_tokens: usage.cache_tokens,
-                        estimated_cost_usd_micros: crate::cost::usd_to_micros(
-                            usage.estimated_cost_usd,
-                        ),
-                    }),
+                    usage: record.usage.map(SurfaceUsageTotals::from_core),
                     result: record.result.as_deref().map(DisplayText::new),
                     error: record.error.as_deref().map(DisplayText::new),
                     retry_count: record.retry_count,
@@ -10555,6 +10548,7 @@ while :; do :; done
             output_tokens: 30,
             cache_tokens: 10,
             estimated_cost_usd: 0.0000252,
+            service: Default::default(),
         };
 
         registry
@@ -11164,6 +11158,7 @@ while :; do :; done
             output_tokens: 2,
             cache_tokens: 1,
             estimated_cost_usd: 0.01,
+            service: Default::default(),
         };
 
         let transition = registry

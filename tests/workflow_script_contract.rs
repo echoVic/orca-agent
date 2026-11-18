@@ -407,6 +407,7 @@ fn workflow_evidence_bundle_round_trips_state_and_agent_rows() {
                     output_tokens: 20,
                     cache_tokens: 3,
                     estimated_cost_usd: 0.001,
+                    service: Default::default(),
                 }),
                 task: None,
                 tool_events: Vec::new(),

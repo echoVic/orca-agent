@@ -687,12 +687,7 @@ mod tests {
                 fingerprint: "port".into(),
                 evidence: Vec::new(),
             },
-            usage: orca_runtime::surface::UsageTotals {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_tokens: 0,
-                estimated_cost_usd_micros: 0,
-            },
+            usage: orca_runtime::surface::UsageTotals::default(),
         }
     }
 

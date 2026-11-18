@@ -10041,12 +10041,7 @@ mod tests {
                 fingerprint: "port".into(),
                 evidence: Vec::new(),
             },
-            usage: orca_runtime::surface::UsageTotals {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_tokens: 0,
-                estimated_cost_usd_micros: 0,
-            },
+            usage: orca_runtime::surface::UsageTotals::default(),
         };
         let diagnostic = TuiDiagnostic::from_surface_terminal(&terminal).unwrap();
         let text = message_text(None, &ChatMessage::Diagnostic(diagnostic));
@@ -12614,6 +12609,7 @@ mod tests {
                 output_tokens: 664,
                 cache_tokens: 0,
                 estimated_cost_usd: 0.003852,
+                service: Default::default(),
             },
         );
         state.cwd = "~/Documents/GitHub/blade-deepseek".to_string();
@@ -12788,6 +12784,7 @@ mod tests {
                 output_tokens: 664,
                 cache_tokens: 0,
                 estimated_cost_usd: 0.003852,
+                service: Default::default(),
             },
         );
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
@@ -13924,6 +13921,7 @@ mod tests {
                 output_tokens: 30,
                 cache_tokens: 10,
                 estimated_cost_usd: 0.0000252,
+                service: Default::default(),
             }),
             subagent_current_activity: Some("bash: cargo test".to_string()),
             subagent_activity_history: Vec::new(),
@@ -14012,6 +14010,7 @@ mod tests {
                     output_tokens: 30,
                     cache_tokens: 10,
                     estimated_cost_usd: 0.0000252,
+                    service: Default::default(),
                 }),
                 continuation: None,
             }],
@@ -14191,6 +14190,7 @@ mod tests {
             output_tokens: 30,
             cache_tokens: 10,
             estimated_cost_usd: 0.0000252,
+            service: Default::default(),
         });
         running.publication_revision = Some(9);
         running.continuation = Some(orca_core::task_types::TaskContinuationSummary {
@@ -15115,6 +15115,7 @@ mod tests {
                     output_tokens: 30,
                     cache_tokens: 10,
                     estimated_cost_usd: 0.0000252,
+                    service: Default::default(),
                 }),
                 continuation: None,
             }],

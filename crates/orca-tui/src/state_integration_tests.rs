@@ -2351,18 +2351,21 @@ fn usage_projection_allows_compaction_drop_and_rejects_stale_revision() {
         output_tokens: 800,
         cache_tokens: 400,
         estimated_cost_usd: 0.03,
+        service: Default::default(),
     };
     let after_compaction = UsageTotals {
         input_tokens: 8_000,
         output_tokens: 900,
         cache_tokens: 450,
         estimated_cost_usd: 0.035,
+        service: Default::default(),
     };
     let stale = UsageTotals {
         input_tokens: 60_000,
         output_tokens: 700,
         cache_tokens: 350,
         estimated_cost_usd: 0.025,
+        service: Default::default(),
     };
 
     let projection = |usage_revision, usage| SurfaceProjectionState {
@@ -2844,6 +2847,7 @@ fn surface_projection_consistency_current_goal_reconciles_session_scoped_state()
             output_tokens: 70,
             cache_tokens: 7,
             estimated_cost_usd: 0.007,
+            service: Default::default(),
         },
         context_revision: 1,
         context_used_tokens: 700,

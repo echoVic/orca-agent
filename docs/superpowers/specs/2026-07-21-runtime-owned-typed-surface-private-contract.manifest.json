@@ -10581,7 +10581,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "1f4cdf91c1895db8587cfa99978650a20445bb73b260ce4711a073334fef885a",
+    "private_contract_sha256": "13bec2ea091e5aae3be40d1a47dd05c7982a6fc3346f9e6244aae4a0d50502d4",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",
@@ -13671,6 +13671,7 @@
       "ReservationLease",
       "RuntimeSettingsPatch",
       "SURFACE_RESERVATION_LEASE_MS",
+      "ServiceUsageTotals",
       "StaleLiveCapsuleDescriptor",
       "SurfaceActivePermissionProfile",
       "SurfaceAdditionalWorkingDirectory",

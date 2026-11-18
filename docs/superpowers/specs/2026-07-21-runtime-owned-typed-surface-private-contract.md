@@ -2662,7 +2662,18 @@ UsageTotals {
   input_tokens: u64,
   output_tokens: u64,
   cache_tokens: u64,
+  // Tokens plus the per-use service fees.
   estimated_cost_usd_micros: u64,
+  // The service-fee part of the cost and what was billed. Omitted from
+  // the wire when empty, so a total with no fees keeps its earlier form.
+  service: ServiceUsageTotals,
+}
+
+ServiceUsageTotals {
+  cost_usd_micros: u64,
+  deepseek_searches: u64,
+  deepseek_fetches: u64,
+  deepseek_ocr_pages: u64,
 }
 
 SurfaceUsageSnapshot {

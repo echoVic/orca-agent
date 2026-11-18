@@ -79,9 +79,12 @@ impl CostTracker {
     }
 
     /// Adds what a tool call paid a service for, apart from tokens. The fee
-    /// does not depend on the model or the hour.
+    /// does not depend on the model or the hour. It joins the cost estimate
+    /// and is also kept apart, with the calls and pages that were billed.
     pub fn add_service_usage(&mut self, usage: ToolServiceUsage) -> UsageTotals {
-        self.totals.estimated_cost_usd += rates::service_cost_usd(usage);
+        let fee = rates::service_cost_usd(usage);
+        self.totals.estimated_cost_usd += fee;
+        self.totals.service.record(usage, fee);
         self.totals
     }
 
@@ -101,29 +104,11 @@ impl CostTracker {
     }
 
     pub fn merge(&mut self, other: &CostTracker) {
-        self.totals.input_tokens = self
-            .totals
-            .input_tokens
-            .saturating_add(other.totals.input_tokens);
-        self.totals.output_tokens = self
-            .totals
-            .output_tokens
-            .saturating_add(other.totals.output_tokens);
-        self.totals.cache_tokens = self
-            .totals
-            .cache_tokens
-            .saturating_add(other.totals.cache_tokens);
-        self.totals.estimated_cost_usd += other.totals.estimated_cost_usd;
+        self.totals = self.totals.plus(other.totals);
     }
 
     pub fn merge_totals(&mut self, usage: UsageTotals) {
-        self.totals.input_tokens = self.totals.input_tokens.saturating_add(usage.input_tokens);
-        self.totals.output_tokens = self
-            .totals
-            .output_tokens
-            .saturating_add(usage.output_tokens);
-        self.totals.cache_tokens = self.totals.cache_tokens.saturating_add(usage.cache_tokens);
-        self.totals.estimated_cost_usd += usage.estimated_cost_usd;
+        self.totals = self.totals.plus(usage);
     }
 
     pub fn totals(&self) -> UsageTotals {
@@ -182,6 +167,56 @@ mod tests {
         );
         let fee = after.estimated_cost_usd - before.estimated_cost_usd;
         assert!((fee - 0.0045).abs() < 1e-12, "{fee}");
+    }
+
+    fn billed_tool_calls() -> orca_core::tool_types::ToolServiceUsage {
+        orca_core::tool_types::ToolServiceUsage {
+            deepseek_searches: 2,
+            deepseek_fetches: 1,
+            deepseek_ocr_pages: 10,
+        }
+    }
+
+    #[test]
+    fn service_usage_is_counted_apart_from_the_total_it_adds_to() {
+        let mut tracker = CostTracker::new(Some(FLASH_MODEL));
+        let tokens_only = tracker.add_usage(usage(1_000, 100, 0));
+        assert!(tokens_only.service.is_empty());
+
+        tracker.add_service_usage(billed_tool_calls());
+        let after = tracker.add_service_usage(billed_tool_calls());
+
+        assert!((after.service.cost_usd - 0.009).abs() < 1e-12, "{after:?}");
+        assert_eq!(after.service.deepseek_searches, 4);
+        assert_eq!(after.service.deepseek_fetches, 2);
+        assert_eq!(after.service.deepseek_ocr_pages, 20);
+        assert!(
+            (after.token_cost_usd() - tokens_only.estimated_cost_usd).abs() < 1e-12,
+            "{after:?}"
+        );
+    }
+
+    #[test]
+    fn a_merged_child_brings_its_service_fees() {
+        let mut child = CostTracker::new(Some(FLASH_MODEL));
+        child.add_usage(usage(1_000, 100, 0));
+        child.add_service_usage(billed_tool_calls());
+
+        let mut by_tracker = CostTracker::new(Some(FLASH_MODEL));
+        by_tracker.add_service_usage(billed_tool_calls());
+        by_tracker.merge(&child);
+        let mut by_totals = CostTracker::new(Some(FLASH_MODEL));
+        by_totals.add_service_usage(billed_tool_calls());
+        by_totals.merge_totals(child.totals());
+
+        for merged in [by_tracker.totals(), by_totals.totals()] {
+            assert!(
+                (merged.service.cost_usd - 0.009).abs() < 1e-12,
+                "{merged:?}"
+            );
+            assert_eq!(merged.service.deepseek_searches, 4);
+            assert_eq!(merged.service.deepseek_ocr_pages, 20);
+        }
     }
 
     #[test]

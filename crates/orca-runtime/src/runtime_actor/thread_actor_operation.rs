@@ -233,12 +233,7 @@ impl ThreadActor {
                     operation_id: operation_id.clone(),
                     finalize_intent_id: pending.finalize_intent_id.clone(),
                     terminal: pending.terminal.clone(),
-                    usage: surface::UsageTotals {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cache_tokens: 0,
-                        estimated_cost_usd_micros: 0,
-                    },
+                    usage: surface::UsageTotals::default(),
                     source_diagnostic_digest: None,
                     settlement_receipts: Vec::new(),
                     completion_proof: surface::SurfaceOperationCompletionProof::unverified(
@@ -4821,12 +4816,7 @@ impl ThreadActor {
             surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStopped {
                 fence: fence.clone(),
                 reason: stop_reason.clone(),
-                usage_delta: surface::UsageTotals {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_tokens: 0,
-                    estimated_cost_usd_micros: 0,
-                },
+                usage_delta: surface::UsageTotals::default(),
             }),
         ));
         events.push((
@@ -4884,12 +4874,7 @@ impl ThreadActor {
                 });
             return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
         }
-        let usage = surface::UsageTotals {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_tokens: 0,
-            estimated_cost_usd_micros: 0,
-        };
+        let usage = surface::UsageTotals::default();
         let terminal_batch = self.surface_operation_batch_with_commit_id(
             &fence.operation_id,
             vec![surface::OperationPatch::Terminal {
@@ -5018,12 +5003,7 @@ impl ThreadActor {
                                         reason: surface::GenerationStopReason::NotStarted {
                                             reason: surface::NotStartedReason::RuntimeRestart,
                                         },
-                                        usage_delta: surface::UsageTotals {
-                                            input_tokens: 0,
-                                            output_tokens: 0,
-                                            cache_tokens: 0,
-                                            estimated_cost_usd_micros: 0,
-                                        },
+                                        usage_delta: surface::UsageTotals::default(),
                                     },
                                 ),
                             ),
@@ -5055,12 +5035,7 @@ impl ThreadActor {
                                     surface::OperationPatch::GenerationStopped {
                                         fence: fence.clone(),
                                         reason: surface::GenerationStopReason::RuntimeRestart,
-                                        usage_delta: surface::UsageTotals {
-                                            input_tokens: 0,
-                                            output_tokens: 0,
-                                            cache_tokens: 0,
-                                            estimated_cost_usd_micros: 0,
-                                        },
+                                        usage_delta: surface::UsageTotals::default(),
                                     },
                                 ),
                             ),
@@ -5524,12 +5499,7 @@ impl ThreadActor {
                     operation_id: operation_id.clone(),
                     finalize_intent_id: finalize_intent_id.clone(),
                     terminal: terminal.clone(),
-                    usage: surface::UsageTotals {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cache_tokens: 0,
-                        estimated_cost_usd_micros: 0,
-                    },
+                    usage: surface::UsageTotals::default(),
                     source_diagnostic_digest: None,
                     settlement_receipts: Vec::new(),
                     completion_proof: surface::SurfaceOperationCompletionProof::unverified(
@@ -6122,12 +6092,7 @@ impl ThreadActor {
             surface::SurfaceEvent::Operation(surface::OperationPatch::GenerationStopped {
                 fence: fence.clone(),
                 reason: stop_reason.clone(),
-                usage_delta: surface::UsageTotals {
-                    input_tokens: surface_usage.input_tokens,
-                    output_tokens: surface_usage.output_tokens,
-                    cache_tokens: surface_usage.cache_tokens,
-                    estimated_cost_usd_micros: surface_usage.estimated_cost_usd_micros,
-                },
+                usage_delta: surface_usage.clone(),
             }),
         ));
         stop_and_finalization_events.push((
@@ -7708,12 +7673,7 @@ impl ThreadActor {
                     operation_id: operation_id.clone(),
                     finalize_intent_id: finalize_intent_id.clone(),
                     terminal: terminal.clone(),
-                    usage: surface::UsageTotals {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cache_tokens: 0,
-                        estimated_cost_usd_micros: 0,
-                    },
+                    usage: surface::UsageTotals::default(),
                     source_diagnostic_digest: None,
                     settlement_receipts: Vec::new(),
                     completion_proof: surface::SurfaceOperationCompletionProof::unverified(

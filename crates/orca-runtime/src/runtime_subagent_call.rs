@@ -203,16 +203,9 @@ impl EventObserver for ChildEventActivityObserver {
                     },
                 })
             }
-            EventType::UsageUpdated => {
-                Some(crate::agent_child::ChildAgentActivity::Usage(UsageTotals {
-                    input_tokens: event.payload["input_tokens"].as_u64().unwrap_or_default(),
-                    output_tokens: event.payload["output_tokens"].as_u64().unwrap_or_default(),
-                    cache_tokens: event.payload["cache_tokens"].as_u64().unwrap_or_default(),
-                    estimated_cost_usd: event.payload["estimated_cost_usd"]
-                        .as_f64()
-                        .unwrap_or_default(),
-                }))
-            }
+            EventType::UsageUpdated => Some(crate::agent_child::ChildAgentActivity::Usage(
+                UsageTotals::from_event_payload(&event.payload),
+            )),
             _ => None,
         };
         if let Some(activity) = activity {
@@ -1428,28 +1421,16 @@ fn run_threaded_agent_worker(
                 Ok(())
             } else {
                 match (status.clone(), registry_task_id.as_deref()) {
-                    (RunStatus::Success, Some(task_id)) => task_registry.complete_with_usage(
-                        task_id,
-                        output.clone(),
-                        Some(orca_core::cost_types::UsageTotals {
-                            input_tokens: usage.input_tokens,
-                            output_tokens: usage.output_tokens,
-                            cache_tokens: usage.cache_tokens,
-                            estimated_cost_usd: usage.estimated_cost_usd,
-                        }),
-                    ),
+                    (RunStatus::Success, Some(task_id)) => {
+                        task_registry.complete_with_usage(task_id, output.clone(), Some(usage))
+                    }
                     (RunStatus::Cancelled, Some(task_id)) => task_registry.stop_with_usage(
                         task_id,
                         launch
                             .error
                             .clone()
                             .unwrap_or_else(|| "subagent cancelled".to_string()),
-                        Some(orca_core::cost_types::UsageTotals {
-                            input_tokens: usage.input_tokens,
-                            output_tokens: usage.output_tokens,
-                            cache_tokens: usage.cache_tokens,
-                            estimated_cost_usd: usage.estimated_cost_usd,
-                        }),
+                        Some(usage),
                     ),
                     (RunStatus::Blocked { blocker }, Some(task_id)) => task_registry
                         .block_summary_with_usage(task_id, blocker.clone(), Some(usage)),
@@ -1459,12 +1440,7 @@ fn run_threaded_agent_worker(
                             .error
                             .clone()
                             .unwrap_or_else(|| status.as_str().to_string()),
-                        Some(orca_core::cost_types::UsageTotals {
-                            input_tokens: usage.input_tokens,
-                            output_tokens: usage.output_tokens,
-                            cache_tokens: usage.cache_tokens,
-                            estimated_cost_usd: usage.estimated_cost_usd,
-                        }),
+                        Some(usage),
                     ),
                     (_, None) => Ok(()),
                 }

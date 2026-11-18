@@ -528,16 +528,7 @@ impl EventFactory {
     }
 
     pub fn usage_updated(&mut self, usage: UsageTotals) -> EventDraft {
-        self.make(
-            EventType::UsageUpdated,
-            json!({
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cache_tokens": usage.cache_tokens,
-                "total_tokens": usage.total_tokens(),
-                "estimated_cost_usd": usage.estimated_cost_usd
-            }),
-        )
+        self.make(EventType::UsageUpdated, usage.event_payload())
     }
 
     pub fn context_updated(&mut self, used_tokens: usize, limit_tokens: usize) -> EventDraft {
@@ -914,13 +905,7 @@ impl EventFactory {
                 "description": description,
                 "activity": activity,
                 "turn": turn,
-                "usage": usage.map(|usage| json!({
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "cache_tokens": usage.cache_tokens,
-                    "total_tokens": usage.total_tokens(),
-                    "estimated_cost_usd": usage.estimated_cost_usd
-                }))
+                "usage": usage.map(UsageTotals::event_payload)
             }),
         )
     }
@@ -1458,6 +1443,33 @@ mod tests {
             events.iter().map(|event| event.seq).collect::<Vec<_>>(),
             [0, 1, 2]
         );
+    }
+
+    #[test]
+    fn usage_events_carry_the_service_fees() {
+        let usage = UsageTotals {
+            input_tokens: 10,
+            output_tokens: 4,
+            cache_tokens: 2,
+            estimated_cost_usd: 0.5,
+            service: crate::cost_types::ServiceUsageTotals {
+                cost_usd: 0.25,
+                deepseek_searches: 3,
+                deepseek_fetches: 2,
+                deepseek_ocr_pages: 7,
+            },
+        };
+        let mut f = EventFactory::new("run-1".to_string());
+        let updated = f.usage_updated(usage);
+        assert_eq!(UsageTotals::from_event_payload(&updated.payload), usage);
+        assert_eq!(updated.payload["service_cost_usd"], 0.25);
+        let progress = f.subagent_progress("a", "d", "working", Some(1), Some(usage));
+        assert_eq!(
+            UsageTotals::from_event_payload(&progress.payload["usage"]),
+            usage
+        );
+        let idle = f.subagent_progress("a", "d", "working", Some(1), None);
+        assert!(idle.payload["usage"].is_null());
     }
 
     #[test]

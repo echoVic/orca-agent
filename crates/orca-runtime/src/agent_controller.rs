@@ -807,14 +807,7 @@ impl AgentSurfacePublisher {
                 },
             }),
             EventType::UsageUpdated => Some(ChildAgentActivity::Usage(
-                orca_core::cost_types::UsageTotals {
-                    input_tokens: event.payload["input_tokens"].as_u64().unwrap_or_default(),
-                    output_tokens: event.payload["output_tokens"].as_u64().unwrap_or_default(),
-                    cache_tokens: event.payload["cache_tokens"].as_u64().unwrap_or_default(),
-                    estimated_cost_usd: event.payload["estimated_cost_usd"]
-                        .as_f64()
-                        .unwrap_or_default(),
-                },
+                orca_core::cost_types::UsageTotals::from_event_payload(&event.payload),
             )),
             _ => None,
         };
@@ -1151,6 +1144,7 @@ mod tests {
                     output_tokens: 13,
                     cache_tokens: 17,
                     estimated_cost_usd: 0.000021,
+                    service: Default::default(),
                 },
             )
             .expect("publish child terminal");

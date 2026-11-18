@@ -8705,12 +8705,7 @@ fn reconcile_terminal_main_session_tasks(
             }
         }
 
-        let legacy_usage = UsageTotals {
-            input_tokens: terminal.usage.input_tokens,
-            output_tokens: terminal.usage.output_tokens,
-            cache_tokens: terminal.usage.cache_tokens,
-            estimated_cost_usd: terminal.usage.estimated_cost_usd_micros as f64 / 1_000_000.0,
-        };
+        let legacy_usage = terminal.usage.to_core();
         match status {
             surface::SurfaceTaskStatus::Completed => {
                 let _ = task_registry.apply_main_session_terminal_update(
@@ -8870,12 +8865,7 @@ fn mirror_main_session_task_terminal_projection(
     terminal: &surface::OperationTerminalRecord,
     projection: &PreparedMainSessionTaskTerminalProjection,
 ) {
-    let legacy_usage = UsageTotals {
-        input_tokens: terminal.usage.input_tokens,
-        output_tokens: terminal.usage.output_tokens,
-        cache_tokens: terminal.usage.cache_tokens,
-        estimated_cost_usd: terminal.usage.estimated_cost_usd_micros as f64 / 1_000_000.0,
-    };
+    let legacy_usage = terminal.usage.to_core();
     match projection.status {
         surface::SurfaceTaskStatus::Completed => {
             let _ = task_registry.apply_main_session_terminal_update(
@@ -8956,12 +8946,7 @@ fn reconcile_main_session_task_mirror(task_registry: &TaskRegistry, task: &surfa
     ) {
         return;
     }
-    let usage = task.usage.as_ref().map(|usage| UsageTotals {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_tokens: usage.cache_tokens,
-        estimated_cost_usd: usage.estimated_cost_usd_micros as f64 / 1_000_000.0,
-    });
+    let usage = task.usage.as_ref().map(surface::UsageTotals::to_core);
     let result = match task.status {
         surface::SurfaceTaskStatus::Completed => task_registry
             .apply_main_session_terminal_update(
@@ -9311,14 +9296,7 @@ fn adopt_legacy_active_main_session_tasks_on_start(
                     workflow_run_id: None,
                     subagent_id: None,
                     pending_interaction_id: None,
-                    usage: record.usage().map(|usage| surface::UsageTotals {
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                        cache_tokens: usage.cache_tokens,
-                        estimated_cost_usd_micros: crate::cost::usd_to_micros(
-                            usage.estimated_cost_usd,
-                        ),
-                    }),
+                    usage: record.usage().copied().map(surface::UsageTotals::from_core),
                     result: None,
                     error: None,
                     retry_count: record.retry_count(),
@@ -11738,12 +11716,7 @@ fn initial_surface_snapshot(
         },
         usage: surface::SurfaceUsageSnapshot {
             revision: surface::UsageRevision::try_new(1).expect("one is a valid revision"),
-            thread_total: surface::UsageTotals {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_tokens: 0,
-                estimated_cost_usd_micros: 0,
-            },
+            thread_total: surface::UsageTotals::default(),
             active_operation: None,
             goal: None,
             workflow: Vec::new(),
@@ -21257,12 +21230,7 @@ impl ThreadActor {
                             surface::OperationPatch::GenerationStopped {
                                 fence: fence.clone(),
                                 reason: surface::GenerationStopReason::InterruptedResumable,
-                                usage_delta: surface::UsageTotals {
-                                    input_tokens: 0,
-                                    output_tokens: 0,
-                                    cache_tokens: 0,
-                                    estimated_cost_usd_micros: 0,
-                                },
+                                usage_delta: surface::UsageTotals::default(),
                             },
                             surface::OperationPatch::Suspended {
                                 operation_id: operation_id.clone(),
@@ -24221,30 +24189,15 @@ fn goal_continuation_reject_name(code: GoalContinuationRejectCode) -> &'static s
 }
 
 fn usage_totals_delta(before: UsageTotals, after: UsageTotals) -> UsageTotals {
-    UsageTotals {
-        input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
-        output_tokens: after.output_tokens.saturating_sub(before.output_tokens),
-        cache_tokens: after.cache_tokens.saturating_sub(before.cache_tokens),
-        estimated_cost_usd: (after.estimated_cost_usd - before.estimated_cost_usd).max(0.0),
-    }
+    after.minus(before)
 }
 
 fn subtract_usage_totals(total: UsageTotals, credit: UsageTotals) -> UsageTotals {
-    UsageTotals {
-        input_tokens: total.input_tokens.saturating_sub(credit.input_tokens),
-        output_tokens: total.output_tokens.saturating_sub(credit.output_tokens),
-        cache_tokens: total.cache_tokens.saturating_sub(credit.cache_tokens),
-        estimated_cost_usd: (total.estimated_cost_usd - credit.estimated_cost_usd).max(0.0),
-    }
+    total.minus(credit)
 }
 
 fn surface_usage_totals(usage: UsageTotals) -> surface::UsageTotals {
-    surface::UsageTotals {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_tokens: usage.cache_tokens,
-        estimated_cost_usd_micros: crate::cost::usd_to_micros(usage.estimated_cost_usd),
-    }
+    surface::UsageTotals::from_core(usage)
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -24456,19 +24409,9 @@ mod tests {
             .unwrap(),
             terminal: surface::OperationTerminal::Blocked {
                 blocker: blocker.clone(),
-                usage: surface::UsageTotals {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_tokens: 0,
-                    estimated_cost_usd_micros: 0,
-                },
+                usage: surface::UsageTotals::default(),
             },
-            usage: surface::UsageTotals {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_tokens: 0,
-                estimated_cost_usd_micros: 0,
-            },
+            usage: surface::UsageTotals::default(),
             source_diagnostic_digest: None,
             settlement_receipts: Vec::new(),
             completion_proof: Default::default(),
@@ -28117,6 +28060,7 @@ mod tests {
                     output_tokens: 2,
                     cache_tokens: 3,
                     estimated_cost_usd_micros: 5,
+                    service: Default::default(),
                 },
             },
             pause_message: "pause after finish".to_string(),
@@ -33356,6 +33300,7 @@ mod tests {
                 output_tokens: 5,
                 cache_tokens: 1,
                 estimated_cost_usd_micros: 7,
+                service: Default::default(),
             }),
             result: Some(surface::DisplayText::new("done")),
             error: None,
@@ -42040,6 +41985,7 @@ mod tests {
                 output_tokens: 10_260,
                 cache_tokens: 893_696,
                 estimated_cost_usd: 0.063661744,
+                service: Default::default(),
             })
             .expect("append penultimate usage snapshot");
         writer
@@ -42048,6 +41994,7 @@ mod tests {
                 output_tokens: 10_627,
                 cache_tokens: 935_040,
                 estimated_cost_usd: 0.065860634,
+                service: Default::default(),
             })
             .expect("append latest usage snapshot");
         drop(writer);
@@ -42112,6 +42059,7 @@ mod tests {
                 output_tokens: 10_000,
                 cache_tokens: 790_000,
                 estimated_cost_usd: 0.05,
+                service: Default::default(),
             })
             .expect("append legacy usage snapshot");
         drop(writer);

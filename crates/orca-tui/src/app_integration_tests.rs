@@ -1855,6 +1855,7 @@ fn stale_attachment_events_do_not_mutate_switched_session() {
                 output_tokens: 50,
                 cache_tokens: 0,
                 estimated_cost_usd: 0.25,
+                service: Default::default(),
             },
             context_revision: 1,
             context_used_tokens: 200,
@@ -1912,6 +1913,7 @@ fn stale_attachment_events_do_not_mutate_switched_session() {
                 output_tokens: 9_999,
                 cache_tokens: 0,
                 estimated_cost_usd: 99.0,
+                service: Default::default(),
             },
             context_revision: 99,
             context_used_tokens: 9_999,
@@ -5329,6 +5331,7 @@ fn resumed_legacy_usage_projects_context_before_next_turn() {
                 output_tokens: 10_260,
                 cache_tokens: 893_696,
                 estimated_cost_usd: 0.063661744,
+                service: Default::default(),
             })
             .expect("append penultimate usage snapshot");
         writer
@@ -5337,6 +5340,7 @@ fn resumed_legacy_usage_projects_context_before_next_turn() {
                 output_tokens: 10_627,
                 cache_tokens: 935_040,
                 estimated_cost_usd: 0.065860634,
+                service: Default::default(),
             })
             .expect("append latest usage snapshot");
         drop(writer);

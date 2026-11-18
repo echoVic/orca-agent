@@ -1978,6 +1978,45 @@ mod tests {
     }
 
     #[test]
+    fn the_usage_stream_lists_tool_fees_apart_from_the_total() {
+        let mut cost_tracker = CostTracker::new(None);
+        let mut events = EventFactory::new("tool-service".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+
+        charge_tool_service_usage(
+            a_searches_fetch_and_ocr_fee(),
+            "call-1",
+            &mut cost_tracker,
+            None,
+            &mut events,
+            &mut sink,
+            None,
+            true,
+        )
+        .expect("charge the fee");
+        drop(sink);
+
+        let usage_events = parsed_events(output)
+            .into_iter()
+            .filter(|event| event["type"] == "usage.updated")
+            .collect::<Vec<_>>();
+        assert_eq!(usage_events.len(), 1, "{usage_events:?}");
+        let payload = &usage_events[0]["payload"];
+        let fees = payload["service_cost_usd"].as_f64().expect("the fees");
+        assert!((fees - 0.0045).abs() < 1e-12, "{payload}");
+        assert_eq!(
+            payload["service_usage"]["deepseek_searches"], 2,
+            "{payload}"
+        );
+        assert_eq!(payload["service_usage"]["deepseek_fetches"], 1, "{payload}");
+        assert_eq!(
+            payload["service_usage"]["deepseek_ocr_pages"], 10,
+            "{payload}"
+        );
+    }
+
+    #[test]
     fn empty_service_usage_charges_nothing() {
         let mut operation = OperationContext::for_tests(
             orca_core::budget::BudgetSpec::default(),

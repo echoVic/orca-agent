@@ -137,7 +137,10 @@ Only opted-in clients receive `session/update.params._meta["orca.dev/projection"
   cancellation, and shutdown reasons survive transport.
 - `phase: "reload_required"`: abandon the replica and reconnect/load.
 - `usage`: cumulative surface input/output/cache token counts and
-  `estimated_cost_usd_micros`. Standard SDK `usage_update` still carries context
+  `estimated_cost_usd_micros`. When DeepSeek billed per-use tool fees, `service`
+  lists the part of that cost they account for (`cost_usd_micros`) and what was
+  billed (`deepseek_searches`, `deepseek_fetches`, `deepseek_ocr_pages`); it is
+  absent when there were none. Standard SDK `usage_update` still carries context
   used/size and cost.
 
 These fields augment ACP content and state notifications; they never replace

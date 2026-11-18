@@ -3637,12 +3637,7 @@ mod tests {
                 },
             },
             terminal: crate::runtime_surface::OperationTerminal::Succeeded {
-                usage: crate::runtime_surface::UsageTotals {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_tokens: 0,
-                    estimated_cost_usd_micros: 0,
-                },
+                usage: crate::runtime_surface::UsageTotals::default(),
             },
             pause_message: pause_message.clone(),
             finished_at: 2,

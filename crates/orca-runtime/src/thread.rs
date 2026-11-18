@@ -917,6 +917,7 @@ mod tests {
                 output_tokens: 3,
                 cache_tokens: 0,
                 estimated_cost_usd: 0.000_001_5,
+                service: Default::default(),
             },
         );
 

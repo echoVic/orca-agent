@@ -719,21 +719,11 @@ impl ThreadTurnMainSessionTask {
 }
 
 fn task_usage_delta(before: UsageTotals, after: UsageTotals) -> UsageTotals {
-    UsageTotals {
-        input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
-        output_tokens: after.output_tokens.saturating_sub(before.output_tokens),
-        cache_tokens: after.cache_tokens.saturating_sub(before.cache_tokens),
-        estimated_cost_usd: (after.estimated_cost_usd - before.estimated_cost_usd).max(0.0),
-    }
+    after.minus(before)
 }
 
 fn add_task_usage(base: UsageTotals, delta: UsageTotals) -> UsageTotals {
-    UsageTotals {
-        input_tokens: base.input_tokens.saturating_add(delta.input_tokens),
-        output_tokens: base.output_tokens.saturating_add(delta.output_tokens),
-        cache_tokens: base.cache_tokens.saturating_add(delta.cache_tokens),
-        estimated_cost_usd: base.estimated_cost_usd + delta.estimated_cost_usd,
-    }
+    base.plus(delta)
 }
 
 impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {

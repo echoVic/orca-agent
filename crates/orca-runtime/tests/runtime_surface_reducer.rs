@@ -37,12 +37,7 @@ fn path() -> CanonicalPath {
 }
 
 fn usage() -> UsageTotals {
-    UsageTotals {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_tokens: 0,
-        estimated_cost_usd_micros: 0,
-    }
+    UsageTotals::default()
 }
 
 fn settings() -> SurfaceSettingsSnapshot {
@@ -2040,6 +2035,7 @@ fn usage_context_settings_catalog_and_pinned_families_require_exact_revisions() 
                     output_tokens: 5,
                     cache_tokens: 1,
                     estimated_cost_usd_micros: 7,
+                    service: Default::default(),
                 },
                 active_operation: None,
                 goal: None,
@@ -2186,6 +2182,41 @@ fn generation_stop_accumulates_usage_into_the_thread_total() {
     assert_eq!(initial.snapshot().usage.revision.get(), 1);
 
     let delta = vector_usage();
+    let stopped = batch(
+        &initial,
+        14_500,
+        vec![(
+            generation_scope(&generation),
+            SurfaceEvent::Operation(OperationPatch::GenerationStopped {
+                fence: generation.fence.clone(),
+                reason: GenerationStopReason::Completed {
+                    status: GenerationCompletionStatus::Success,
+                },
+                usage_delta: delta.clone(),
+            }),
+        )],
+    );
+    let next = applied(reduce_batch(SurfaceReduceMode::Live, &initial, &stopped));
+
+    assert_eq!(next.snapshot().usage.thread_total, delta);
+    assert_eq!(next.snapshot().usage.revision.get(), 2);
+}
+
+#[test]
+fn generation_stop_accumulates_service_fees_into_the_thread_total() {
+    let operation = operation_record();
+    let generation = generation_at(&operation, 0, GenerationPhase::Started, None);
+    let initial = foreground_generation_state(operation, generation.clone());
+    let delta = UsageTotals {
+        estimated_cost_usd_micros: 4_500,
+        service: ServiceUsageTotals {
+            cost_usd_micros: 4_500,
+            deepseek_searches: 2,
+            deepseek_fetches: 1,
+            deepseek_ocr_pages: 10,
+        },
+        ..UsageTotals::default()
+    };
     let stopped = batch(
         &initial,
         14_500,
@@ -4005,6 +4036,7 @@ fn vector_usage() -> UsageTotals {
         output_tokens: 7,
         cache_tokens: 3,
         estimated_cost_usd_micros: 19,
+        service: Default::default(),
     }
 }
 

@@ -3002,12 +3002,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                             terminal: super::OperationTerminal::NotAdmitted {
                                 reason: super::NotAdmittedReason::RuntimeRestart,
                             },
-                            usage: super::UsageTotals {
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                cache_tokens: 0,
-                                estimated_cost_usd_micros: 0,
-                            },
+                            usage: super::UsageTotals::default(),
                             source_diagnostic_digest: None,
                             settlement_receipts: Vec::new(),
                             completion_proof: recovered_completion_proof(
@@ -3036,12 +3031,7 @@ impl<'owner, L: SurfaceCommitLedger> RuntimeCommitCoordinator<'owner, L> {
                             reason: super::GenerationStopReason::NotStarted {
                                 reason: super::NotStartedReason::RuntimeRestart,
                             },
-                            usage_delta: super::UsageTotals {
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                cache_tokens: 0,
-                                estimated_cost_usd_micros: 0,
-                            },
+                            usage_delta: super::UsageTotals::default(),
                         },
                         super::OperationPatch::Suspended {
                             operation_id: operation_id.clone(),
@@ -5763,12 +5753,7 @@ fn active_task_adoption_record_matches_task(
     record: &LegacyActiveTaskAdoptionRecord,
     task: &super::SurfaceTask,
 ) -> bool {
-    let expected_usage = record.usage().map(|usage| super::UsageTotals {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_tokens: usage.cache_tokens,
-        estimated_cost_usd_micros: crate::cost::usd_to_micros(usage.estimated_cost_usd),
-    });
+    let expected_usage = record.usage().copied().map(super::UsageTotals::from_core);
     task.task_id.as_str() == record.id()
         && task.description == super::DisplayText::new(record.description())
         && task.created_at == super::UnixMillis::new(record.created_at_ms())
@@ -12225,12 +12210,7 @@ fn commit_id(class: &CommitClass) -> &SurfaceCommitId {
 }
 
 fn zero_usage() -> super::UsageTotals {
-    super::UsageTotals {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_tokens: 0,
-        estimated_cost_usd_micros: 0,
-    }
+    super::UsageTotals::default()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13273,6 +13253,7 @@ mod tests {
             output_tokens: 23,
             cache_tokens: 7,
             estimated_cost_usd_micros: 456,
+            service: Default::default(),
         };
         let blocker = orca_core::goal_runtime::BlockerSummary {
             question: None,
@@ -13305,12 +13286,7 @@ mod tests {
     #[test]
     fn generation_stop_terminal_mapping_preserves_not_started_reasons() {
         let operation = started_operation();
-        let usage = super::super::UsageTotals {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_tokens: 0,
-            estimated_cost_usd_micros: 0,
-        };
+        let usage = super::super::UsageTotals::default();
         let message = super::super::SafeDiagnosticText::try_new("start failed").unwrap();
         let cases = [
             (

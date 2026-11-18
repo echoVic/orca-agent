@@ -318,12 +318,7 @@ impl Projection {
         self.metrics.context_used_tokens = usize::try_from(update.used).unwrap_or(usize::MAX);
         self.metrics.context_limit_tokens = usize::try_from(update.size).unwrap_or(usize::MAX);
         if let Some(usage) = &meta.usage {
-            self.metrics.usage = orca_core::cost_types::UsageTotals {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_tokens: usage.cache_tokens,
-                estimated_cost_usd: usage.estimated_cost_usd_micros as f64 / 1_000_000.0,
-            };
+            self.metrics.usage = usage.to_core();
         } else if let Some(cost) = update.cost
             && cost.currency == "USD"
             && cost.amount.is_finite()
@@ -1833,6 +1828,12 @@ mod tests {
             output_tokens: 700,
             cache_tokens: 6000,
             estimated_cost_usd_micros: 125_000,
+            service: orca_runtime::surface::ServiceUsageTotals {
+                cost_usd_micros: 1_725,
+                deepseek_searches: 2,
+                deepseek_fetches: 0,
+                deepseek_ocr_pages: 1,
+            },
         };
         client
             .session_notification(note(
@@ -1857,6 +1858,9 @@ mod tests {
         assert_eq!(renderer.state.usage().output_tokens, 700);
         assert_eq!(renderer.state.usage().cache_tokens, 6000);
         assert_eq!(renderer.state.usage().estimated_cost_usd, 0.125);
+        assert_eq!(renderer.state.usage().service.cost_usd, 0.001725);
+        assert_eq!(renderer.state.usage().service.deepseek_searches, 2);
+        assert_eq!(renderer.state.usage().service.deepseek_ocr_pages, 1);
         assert_eq!(renderer.state.status, crate::types::AppStatus::Running);
         assert!(renderer.state.transcript.messages.iter().any(
             |message| matches!(message, ChatMessage::System { text, .. } if text == "shell unavailable")

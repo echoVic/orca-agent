@@ -4811,6 +4811,7 @@ mod closed_command_domain_tests {
                     output_tokens: 2,
                     cache_tokens: 0,
                     estimated_cost_usd_micros: 3,
+                    service: Default::default(),
                 },
             },
             completion_proof: super::super::SurfaceOperationCompletionProof::unverified(

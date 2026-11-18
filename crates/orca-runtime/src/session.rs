@@ -617,22 +617,7 @@ impl InteractiveSession {
     }
 
     pub fn aggregate_usage_totals(&self) -> UsageTotals {
-        let current = self.cost_tracker.totals();
-        UsageTotals {
-            input_tokens: self
-                .usage_baseline
-                .input_tokens
-                .saturating_add(current.input_tokens),
-            output_tokens: self
-                .usage_baseline
-                .output_tokens
-                .saturating_add(current.output_tokens),
-            cache_tokens: self
-                .usage_baseline
-                .cache_tokens
-                .saturating_add(current.cache_tokens),
-            estimated_cost_usd: self.usage_baseline.estimated_cost_usd + current.estimated_cost_usd,
-        }
+        self.usage_baseline.plus(self.cost_tracker.totals())
     }
 
     pub fn mcp_registry(&self) -> &McpRegistry {

@@ -51,10 +51,7 @@ impl RuntimeUsageLedger {
             .totals
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        totals.input_tokens = totals.input_tokens.saturating_add(usage.input_tokens);
-        totals.output_tokens = totals.output_tokens.saturating_add(usage.output_tokens);
-        totals.cache_tokens = totals.cache_tokens.saturating_add(usage.cache_tokens);
-        totals.estimated_cost_usd += usage.estimated_cost_usd;
+        *totals = totals.plus(usage);
         *totals
     }
 
@@ -78,6 +75,7 @@ mod tests {
             output_tokens: 2,
             cache_tokens: 3,
             estimated_cost_usd: 0.25,
+            service: Default::default(),
         });
 
         let totals = ledger.add(UsageTotals {
@@ -85,6 +83,7 @@ mod tests {
             output_tokens: 4,
             cache_tokens: 5,
             estimated_cost_usd: 0.5,
+            service: Default::default(),
         });
 
         assert_eq!(totals.input_tokens, u64::MAX);

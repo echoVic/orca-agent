@@ -207,6 +207,7 @@ fn operation_generation_and_terminal_algebras_are_closed() {
         output_tokens: 2,
         cache_tokens: 3,
         estimated_cost_usd_micros: 4,
+        service: Default::default(),
     };
 
     let phases = [
@@ -300,12 +301,7 @@ fn operation_generation_and_terminal_algebras_are_closed() {
                 fingerprint: "blocked-terminal".to_string(),
                 evidence: vec![],
             },
-            usage: UsageTotals {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_tokens: 0,
-                estimated_cost_usd_micros: 0,
-            },
+            usage: UsageTotals::default(),
         },
     ];
     assert_eq!(terminals.len(), 10);

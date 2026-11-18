@@ -801,6 +801,7 @@ fn duplicate_surface_owner_rejects_resume_before_transcript_append_or_materializ
                 output_tokens: 1,
                 cache_tokens: 0,
                 estimated_cost_usd: 0.0,
+                service: Default::default(),
             })
             .expect("seed usage so an erroneous resume append changes transcript bytes");
         let thread_id = seed.thread_id().to_string();
