@@ -1,6 +1,7 @@
 //! `run_script`: JavaScript the model writes that calls read-only tools
 //! itself, so one model round does the work of several.
 
+pub(crate) mod calls;
 pub mod host;
 
 use std::sync::OnceLock;
