@@ -570,12 +570,12 @@ struct WorkflowHostExit {
     forced: bool,
 }
 
-struct WorkflowHostFileGuard {
+pub(crate) struct WorkflowHostFileGuard {
     path: PathBuf,
 }
 
 impl WorkflowHostFileGuard {
-    fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self { path }
     }
 }
@@ -586,14 +586,14 @@ impl Drop for WorkflowHostFileGuard {
     }
 }
 
-struct WorkflowHostChild {
+pub(crate) struct WorkflowHostChild {
     child: Option<Child>,
     process_job: ProcessJob,
     exit_status: Option<ExitStatus>,
 }
 
 impl WorkflowHostChild {
-    fn new(child: Child, process_job: ProcessJob) -> Self {
+    pub(crate) fn new(child: Child, process_job: ProcessJob) -> Self {
         Self {
             child: Some(child),
             process_job,
@@ -601,7 +601,7 @@ impl WorkflowHostChild {
         }
     }
 
-    fn child_mut(&mut self) -> io::Result<&mut Child> {
+    pub(crate) fn child_mut(&mut self) -> io::Result<&mut Child> {
         self.child
             .as_mut()
             .ok_or_else(|| io::Error::other("workflow host child already reaped"))
@@ -627,7 +627,7 @@ impl WorkflowHostChild {
         self.force_terminate_and_wait()
     }
 
-    fn force_terminate_and_wait(&mut self) -> io::Result<ExitStatus> {
+    pub(crate) fn force_terminate_and_wait(&mut self) -> io::Result<ExitStatus> {
         if let Some(status) = self.exit_status {
             return Ok(status);
         }
@@ -720,7 +720,7 @@ where
     })
 }
 
-fn read_bounded_workflow_frame<R: BufRead>(
+pub(crate) fn read_bounded_workflow_frame<R: BufRead>(
     reader: &mut R,
     max_bytes: usize,
 ) -> io::Result<Option<Vec<u8>>> {
@@ -763,7 +763,7 @@ fn workflow_frame_too_large(max_bytes: usize) -> io::Error {
     )
 }
 
-fn spawn_retained_reader<R>(
+pub(crate) fn spawn_retained_reader<R>(
     mut reader: R,
     retained_bytes: usize,
     stream: &'static str,
@@ -980,7 +980,7 @@ fn ensure_host_file() -> io::Result<PathBuf> {
 /// `path` as Node can load it as its entry module under the permission model.
 /// Node resolves the links in an entry module's path, and needs read access
 /// to each one it follows; a path with no links needs access to the file only.
-fn node_entry_path(path: PathBuf) -> PathBuf {
+pub(crate) fn node_entry_path(path: PathBuf) -> PathBuf {
     if cfg!(unix) {
         fs::canonicalize(&path).unwrap_or(path)
     } else {
@@ -998,7 +998,7 @@ fn node_entry_path(path: PathBuf) -> PathBuf {
 ///   script and its two IPC files, writes the IPC files, and starts nothing.
 ///
 /// A Node without a permission model is given the first flag only.
-fn node_confinement_args(
+pub(crate) fn node_confinement_args(
     node: &Path,
     host_path: &Path,
     script_path: &Path,
