@@ -23,6 +23,7 @@ pub enum ToolName {
     Edit,
     WriteFile,
     GitStatus,
+    RunScript,
     Subagent,
     TaskList,
     TaskStop,
@@ -78,6 +79,7 @@ impl ToolName {
             "edit" => Self::Edit,
             "write_file" => Self::WriteFile,
             "git_status" => Self::GitStatus,
+            "run_script" => Self::RunScript,
             "subagent" => Self::Subagent,
             "task_list" => Self::TaskList,
             "task_stop" => Self::TaskStop,
@@ -145,6 +147,7 @@ impl ToolName {
             Self::Edit => "edit",
             Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
+            Self::RunScript => "run_script",
             Self::Subagent => "subagent",
             Self::TaskList => "task_list",
             Self::TaskStop => "task_stop",
@@ -198,6 +201,7 @@ impl ToolName {
             Self::Edit => "edit",
             Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
+            Self::RunScript => "run_script",
             Self::Subagent => "subagent",
             Self::TaskList => "task_list",
             Self::TaskStop => "task_stop",
@@ -253,6 +257,7 @@ impl ToolName {
             "edit" => Self::Edit,
             "write_file" => Self::WriteFile,
             "git_status" => Self::GitStatus,
+            "run_script" => Self::RunScript,
             "subagent" => Self::Subagent,
             "task_list" => Self::TaskList,
             "task_stop" => Self::TaskStop,
@@ -298,6 +303,7 @@ impl ToolName {
                 | Self::Glob
                 | Self::Grep
                 | Self::GitStatus
+                | Self::RunScript
                 | Self::TaskList
                 | Self::WorkflowReadMessages
                 | Self::WorkflowListTasks

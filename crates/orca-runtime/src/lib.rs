@@ -363,6 +363,7 @@ mod runtime_turn_start;
 pub(crate) mod runtime_user_input;
 pub mod sandbox_denial;
 pub mod schema_validation;
+pub mod script;
 pub mod server;
 pub mod session;
 pub mod shell_session;

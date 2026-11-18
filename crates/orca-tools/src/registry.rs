@@ -736,6 +736,35 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::GitStatus,
     ));
     registry.register(BuiltinTool::new(
+        // A script is a process that may run for a while: an interrupt stops
+        // it rather than waiting it out.
+        cooperative_builtin_spec(
+            "run_script",
+            "Run JavaScript that calls read-only tools itself and returns only what it computes. Use it when one question takes several searches or reads whose raw output you do not need: search, read the hits, keep the lines that matter, return those. `script` is the body of an async function. In it, `await tools.read_file(args)`, `tools.glob(args)`, `tools.grep(args)` and `tools.git_status()` take the same arguments as the tools of those names and resolve to the same text; a call that fails rejects with an Error. `console.log(...)` adds a line to the result and `return value` ends it (objects are returned as JSON). Nothing else exists in the script: no modules, no network, no timers, and nothing kept from an earlier call. It cannot change anything.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "script": {
+                        "type": "string",
+                        "description": "Body of an async JavaScript function, e.g. `const hits = await tools.grep({ pattern: \"TODO\" }); return hits.split(\"\\n\").length;`"
+                    }
+                },
+                "required": ["script"]
+            }),
+            CapabilitySet::new(vec![
+                ToolCapability::FsRead,
+                ToolCapability::FsList,
+                ToolCapability::FsSearch,
+                ToolCapability::GitInspect,
+            ]),
+            ToolExposure::Direct,
+            RendererHint::State,
+            // It starts a process and waits on it: never one of a read batch.
+            false,
+        ),
+        BuiltinExecutor::RunScript,
+    ));
+    registry.register(BuiltinTool::new(
         cooperative_builtin_spec(
             "web_search",
             "Search the web for current information. Returns the top results with title, URL, publication date when known, and a summary.",
@@ -2113,6 +2142,9 @@ impl Tool for BuiltinTool {
                 "Workflow must be executed by the runtime controller",
                 None,
             ),
+            BuiltinExecutor::RunScript => {
+                ToolResult::failed(request, "run_script must be executed by the runtime", None)
+            }
             BuiltinExecutor::WorkflowSendMessage
             | BuiltinExecutor::WorkflowReadMessages
             | BuiltinExecutor::WorkflowClearMessages
@@ -2167,6 +2199,7 @@ enum BuiltinExecutor {
     Edit,
     WriteFile,
     GitStatus,
+    RunScript,
     WebSearch,
     WebFetch,
     ReadDocument,
@@ -3147,6 +3180,49 @@ mod tests {
             result
                 .expect_err("anyOf should reject missing branch")
                 .contains("expected at least one anyOf schema to match")
+        );
+    }
+
+    #[test]
+    fn run_script_is_a_read_only_tool_the_read_batch_never_takes() {
+        let registry = default_tool_registry();
+        let resolved = registry.resolve("run_script").expect("run_script tool");
+
+        assert_eq!(ToolName::from_str("run_script"), Some(ToolName::RunScript));
+        assert_eq!(ToolName::RunScript.as_str(), "run_script");
+        assert!(resolved.spec.capabilities.is_read_only());
+        assert_eq!(resolved.spec.capabilities.action_kind(), ActionKind::Read);
+        // It runs a process and waits on it, so it must not be dispatched as
+        // one of a batch of plain reads.
+        assert!(!resolved.spec.concurrent_safe);
+        assert!(!crate::tool_is_available_readonly_concurrent(&request(
+            ToolName::RunScript,
+            r#"{"script":"return 1;"}"#,
+        )));
+    }
+
+    #[test]
+    fn run_script_outside_the_runtime_says_so() {
+        let cwd = tempfile::tempdir().unwrap();
+
+        let result =
+            crate::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_profile(
+                &request(ToolName::RunScript, r#"{"script":"return 1;"}"#),
+                cwd.path(),
+                &[],
+                &orca_mcp::McpRegistry::default(),
+                &[],
+                ToolOutputTruncation::default(),
+                0,
+                None,
+                orca_core::capability::ExecutionProfile::ReadOnly,
+                None,
+                || false,
+            );
+
+        assert_eq!(
+            result.error.as_deref(),
+            Some("run_script must be executed by the runtime")
         );
     }
 
