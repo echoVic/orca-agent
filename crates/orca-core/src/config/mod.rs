@@ -325,6 +325,20 @@ pub struct ScriptToolConfig {
     pub timeout_secs: u64,
     /// How many tool calls one script may make.
     pub max_tool_calls: u32,
+    /// How much memory one script may hold, in MiB.
+    pub memory_limit_mb: u64,
+}
+
+impl ScriptToolConfig {
+    /// The least a script is given whatever the setting says: under this the
+    /// engine cannot hold its own functions and one tool result.
+    pub const MIN_MEMORY_LIMIT_MB: u64 = 8;
+
+    /// The memory limit in bytes, never under the least the engine needs.
+    pub fn memory_limit_bytes(&self) -> usize {
+        let mib = self.memory_limit_mb.max(Self::MIN_MEMORY_LIMIT_MB);
+        usize::try_from(mib.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
+    }
 }
 
 impl Default for ScriptToolConfig {
@@ -333,6 +347,7 @@ impl Default for ScriptToolConfig {
             enabled: false,
             timeout_secs: 60,
             max_tool_calls: 100,
+            memory_limit_mb: 64,
         }
     }
 }
