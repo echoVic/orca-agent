@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.21";
+export const releaseVersion = "v0.5.22";
 
 export const releases = [
+  {
+    version: "v0.5.22",
+    date: "2026-11-19",
+    title: "Scripts that call tools, fees named apart",
+    body: "New experimental run_script tool: the model writes one JavaScript program that awaits tools.read_file, tools.glob, tools.grep and tools.git_status with the same arguments as those tools, logs lines and returns a value, so a search, several reads and a filter cost one model round and one short result instead of a full tool output per call. It is off by default, needs Node.js, and its [tools.script] setting is user-owned. A script declares only read capabilities, so it asks for no approval and works in plan mode; each call it makes is checked by the runtime against the four-name list, the read-only check, the tool schema and PreToolUse hooks, and runs in the read-only profile. It runs in a confined Node process with its own realm, no code generation from strings and no Orca credentials, and one tool result may not exceed 256 KiB — a result that would arrive cut is refused with advice to read in parts. A call over the 100-call limit rejects along with every later one, a script over its 60-second clock, a host line over 1 MiB or a cancelled turn is stopped with its process tree, it counts as one tool call in a budget, and its inner calls are shown as they end. Usage now names DeepSeek's per-use tool fees apart from token cost: /cost and /status show the fee and the searches, fetches and OCR pages billed, usage.updated and subagent usage events add service_cost_usd and service_usage, and estimated_cost_usd still means tokens plus fees. Workflow scripts now run fully inside their own realm, so a script can no longer reach the host's process, files or DEEPSEEK_API_KEY through an object the host handed it.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.22",
+  },
   {
     version: "v0.5.21",
     date: "2026-11-16",
