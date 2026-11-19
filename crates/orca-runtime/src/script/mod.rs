@@ -159,6 +159,20 @@ pub fn shown_size(bytes: usize) -> String {
     }
 }
 
+/// One line of what a script did, safe to show: each control character (C0,
+/// DEL, C1) and each line or paragraph separator becomes `�`, a tab a space.
+/// Nothing is cut and no other character changes.
+pub fn shown_line(text: &str) -> String {
+    text.chars()
+        .map(|character| match character {
+            '\t' => ' ',
+            '\u{2028}' | '\u{2029}' => char::REPLACEMENT_CHARACTER,
+            character if character.is_control() => char::REPLACEMENT_CHARACTER,
+            character => character,
+        })
+        .collect()
+}
+
 /// The tools a script may call.
 pub fn script_tools() -> &'static [&'static str] {
     &calls::SCRIPT_TOOLS
@@ -210,6 +224,16 @@ impl ScriptToolExecutor for ReadOnlyToolExecutor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shown_line_has_no_control_character_and_keeps_every_other() {
+        assert_eq!(
+            shown_line("a\x1b[1m\r\n\x00\x7f\u{85}\u{9b}\u{2028}\u{2029}\tz"),
+            "a\u{fffd}[1m\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd} z"
+        );
+        let clean = "  2 ┬ read_file {\"path\":\"a\"} · ok · 3ms · 1.2 KiB │ … é 中";
+        assert_eq!(shown_line(clean), clean);
+    }
 
     #[test]
     fn a_scripts_wall_clock_is_at_least_a_second_and_at_most_a_day() {

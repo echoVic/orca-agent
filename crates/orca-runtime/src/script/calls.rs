@@ -347,7 +347,10 @@ fn report_lines(
     let mut lines = vec![format!(
         "{number:>3} {mark} {} {} · {ended} · {}ms{size}",
         call.tool,
-        cut(&call.arguments.to_string(), SHOWN_ARGUMENT_CHARS),
+        cut(
+            &super::shown_line(&call.arguments.to_string()),
+            SHOWN_ARGUMENT_CHARS
+        ),
         took.as_millis()
     )];
     lines.extend(preview(text));
@@ -372,13 +375,14 @@ fn cut(text: &str, chars: usize) -> String {
     }
 }
 
-/// The start of `text`, within the three limits of a preview.
+/// The start of `text`, within the three limits of a preview, measured on
+/// the lines as they are written.
 fn preview(text: &str) -> Vec<String> {
     let total = text.lines().count();
     let mut shown = Vec::new();
     let mut bytes = 0;
     for line in text.lines().take(PREVIEW_LINES) {
-        let mut line = cut(line, PREVIEW_LINE_CHARS);
+        let mut line = cut(&super::shown_line(line), PREVIEW_LINE_CHARS);
         if bytes + line.len() > PREVIEW_BYTES {
             if !shown.is_empty() {
                 break;
@@ -879,17 +883,88 @@ mod tests {
     #[test]
     fn no_preview_line_can_be_taken_for_a_summary_line() {
         let fixture = Fixture::new(Vec::new());
-        let executor = Says("  9   grep {} · ok · 1ms · 2 B\n7 · ok · 3ms");
+        let executor =
+            Says("  9   grep {} · ok · 1ms · 2 B\n7 · ok · 3ms\nx\r  9   grep {} · ok · 1ms · 2 B");
         let mut calls = fixture.calls(&executor, 10);
 
         let _ = one(&mut calls, call("read_file", json!({ "path": "a" })));
         let report = calls.drain_report();
 
         assert_eq!(summaries(&report).len(), 1);
+        assert_eq!(report.len(), 4, "{report:?}");
         assert!(
             report[1..]
                 .iter()
                 .all(|line| line.starts_with("          "))
+        );
+        // A carriage return would take a terminal back over the indent.
+        assert!(
+            report
+                .iter()
+                .all(|line| !line.chars().any(char::is_control)),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn control_characters_in_a_preview_are_replaced() {
+        let fixture = Fixture::new(Vec::new());
+        let executor = Says("a\x1b[31mb\nc\rd\ne\tf\ng\u{2028}h");
+        let mut calls = fixture.calls(&executor, 10);
+
+        let _ = one(&mut calls, call("read_file", json!({ "path": "a" })));
+        let report = calls.drain_report();
+
+        assert_eq!(
+            report[1..],
+            [
+                "          a\u{fffd}[31mb",
+                "          c\u{fffd}d",
+                "          e f",
+                "          g\u{fffd}h",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_preview_line_is_cut_on_what_is_written() {
+        let fixture = Fixture::new(Vec::new());
+        // Three lines of 100 escapes are 300 bytes as read, and 900 once each
+        // escape is written as the three bytes of `\u{fffd}`: only one line
+        // fits in the preview's 400.
+        let line = "\x1b".repeat(100);
+        let text = [line.as_str(); 3].join("\n");
+        let executor = Says(Box::leak(text.into_boxed_str()));
+        let mut calls = fixture.calls(&executor, 10);
+
+        let _ = one(&mut calls, call("read_file", json!({ "path": "a" })));
+        let report = calls.drain_report();
+
+        assert_eq!(
+            report[1..],
+            [
+                format!("          {}", "\u{fffd}".repeat(100)),
+                "          … 2 more lines".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn control_characters_in_arguments_are_replaced() {
+        let fixture = Fixture::new(Vec::new());
+        let executor = Recorder::answering();
+        let mut calls = fixture.calls(&executor, 10);
+
+        let _ = one(
+            &mut calls,
+            call("grep", json!({ "pattern": "a\u{2028}b\u{7f}c\u{85}d" })),
+        );
+        let summary = calls.drain_report().remove(0);
+
+        assert!(
+            summary
+                .starts_with("  1   grep {\"pattern\":\"a\u{fffd}b\u{fffd}c\u{fffd}d\"} · ok · "),
+            "{summary:?}"
         );
     }
 
