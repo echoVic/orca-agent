@@ -45,8 +45,11 @@ pulldown-cmark = { version = "0.13", default-features = false }
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 zstd = "0.14"
-# QuickJS, for `run_script`. Default features only: `rust-alloc` and
-# `allocator` turn the engine's memory limit into a no-op.
+# QuickJS, for `run_script`. The engine gives QuickJS an allocator of its own
+# (`Runtime::new_with_alloc`, wrapping the binding's `RustAllocator`), which
+# enforces a script's memory limit and records each refusal. That interface
+# is in the default features of 0.14; the `allocator` feature is deprecated
+# there and adds nothing, so no feature is enabled.
 rquickjs = "0.14"
 similar = "3.1.1"
 tempfile = "3.27.0"

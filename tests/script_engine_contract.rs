@@ -383,10 +383,19 @@ fn an_error_that_only_mentions_memory_is_the_scripts_own_error() {
         r#"throw new Error("out of memory");"#,
         |_| Ok(String::new()),
     );
+    // The engine's own refusal reads like this, but none was made.
+    let (internal, _) = run(r#"throw new InternalError("out of memory");"#, |_| {
+        Ok(String::new())
+    });
 
     let error = error_of(outcome);
     assert!(error.contains("Error: out of memory"), "{error}");
     assert!(!error.contains("used more than"), "{error}");
+    let internal = error_of(internal);
+    assert!(
+        internal.starts_with("InternalError: out of memory (script.js:1:"),
+        "{internal}"
+    );
 }
 
 #[test]
@@ -531,4 +540,59 @@ fn a_panic_while_answering_is_a_failed_script_and_the_next_one_runs() {
         "run_script failed inside the script engine"
     );
     assert_eq!(output_of(after), "2");
+}
+
+#[test]
+fn small_allocations_past_the_memory_limit_name_the_limit() {
+    let small = ScriptEngineLimits {
+        memory_bytes: 8 * 1024 * 1024,
+        ..limits()
+    };
+    // When QuickJS cannot allocate the error itself it throws `null`.
+    for script in [
+        "const held = []; for (let i = 0; ; i++) held.push({ i });",
+        r#"const held = []; for (let n = 0; ; n++) held.push("line " + n);"#,
+        r#"let text = ""; for (let i = 0; ; i++) text += "line " + i + "\n";"#,
+        r#"const held = new Map(); for (let i = 0; ; i++) held.set("k" + i, [i]);"#,
+    ] {
+        let (outcome, _) = run_batches(script, small, |_| Ok(String::new()));
+        assert_eq!(
+            error_of(outcome),
+            "the script used more than 8 MiB",
+            "{script}"
+        );
+    }
+}
+
+#[test]
+fn a_script_that_catches_a_refused_allocation_and_returns_has_completed() {
+    let (outcome, _) = run_batches(
+        r#"try { const held = []; for (;;) held.push("x".repeat(1024) + held.length); }
+           catch (error) {}
+           return "recovered";"#,
+        ScriptEngineLimits {
+            memory_bytes: 8 * 1024 * 1024,
+            ..limits()
+        },
+        |_| Ok(String::new()),
+    );
+
+    assert_eq!(output_of(outcome), "recovered");
+}
+
+#[test]
+fn running_out_of_memory_while_results_are_delivered_names_the_limit() {
+    let big = "y".repeat(256 * 1024);
+    let (outcome, batches) = run_batches(
+        r#"const all = await Promise.all(Array.from({ length: 40 }, (_, i) => tools.read_file({ path: `p${i}` })));
+           return all.length;"#,
+        ScriptEngineLimits {
+            memory_bytes: 8 * 1024 * 1024,
+            ..limits()
+        },
+        |_| Ok(big.clone()),
+    );
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(error_of(outcome), "the script used more than 8 MiB");
 }
