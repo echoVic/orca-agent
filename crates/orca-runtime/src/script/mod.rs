@@ -78,6 +78,7 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
         _ => return ToolResult::invalid_input(request, "run_script needs a non-empty `script`"),
     };
 
+    let started = Instant::now();
     let wall_clock = script_wall_clock(settings.timeout_secs);
     let executor = ReadOnlyToolExecutor {
         cwd,
@@ -123,8 +124,9 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
     );
     let made = calls.made();
     show(format!(
-        "{made} tool call{}",
-        if made == 1 { "" } else { "s" }
+        "{made} tool call{} · {}ms",
+        if made == 1 { "" } else { "s" },
+        started.elapsed().as_millis()
     ));
 
     match outcome {
@@ -147,6 +149,25 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
 
 /// The longest a script may run, whatever `timeout_secs` says.
 const MAX_SCRIPT_WALL_CLOCK_SECS: u64 = 24 * 60 * 60;
+
+/// A size as the person watching reads it: `312 B`, `2.1 KiB`.
+pub fn shown_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    }
+}
+
+/// The tools a script may call.
+pub fn script_tools() -> &'static [&'static str] {
+    &calls::SCRIPT_TOOLS
+}
+
+/// The most of one tool result a script is handed.
+pub fn script_result_limit_bytes() -> usize {
+    SCRIPT_TOOL_OUTPUT_BYTES
+}
 
 /// How long a script may run: `timeout_secs`, at least a second and at most a
 /// day, so that adding it to now cannot overflow.

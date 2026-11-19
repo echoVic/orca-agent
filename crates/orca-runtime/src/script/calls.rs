@@ -25,6 +25,14 @@ pub(crate) const SCRIPT_TOOLS: [&str; 4] = ["read_file", "glob", "grep", "git_st
 /// reads, so it gets far more than a model would be shown.
 pub(crate) const SCRIPT_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
 
+/// How much of a call the person watching is shown.
+const SHOWN_ARGUMENT_CHARS: usize = 200;
+const PREVIEW_LINES: usize = 5;
+const PREVIEW_LINE_CHARS: usize = 120;
+const PREVIEW_BYTES: usize = 400;
+/// Deeper than any summary line starts, so the two are never mistaken.
+const PREVIEW_INDENT: &str = "          ";
+
 /// What a call of a batch is answered with when the script was stopped before
 /// the call could start.
 const NOT_STARTED: &str = "the script was stopped before this call started";
@@ -62,9 +70,14 @@ enum Checked {
     /// Past the call limit: not counted, not run, not reported.
     OverLimit(String),
     /// Counted, and refused before it ran.
-    Refused { error: String, checking: Duration },
+    Refused {
+        number: u32,
+        error: String,
+        checking: Duration,
+    },
     /// Counted and allowed: the request to run.
     Allowed {
+        number: u32,
         request: ToolRequest,
         checking: Duration,
     },
@@ -122,24 +135,39 @@ impl<'a> ScriptToolCalls<'a> {
             .collect();
         let mut ran = run_together(self.executor, allowed, self.max_parallel).into_iter();
 
+        // Calls past the limit are not written, so they take no place in the
+        // batch as the person watching sees it.
+        let written = checked
+            .iter()
+            .filter(|checked| !matches!(checked, Checked::OverLimit(_)))
+            .count();
+        let mut place = 0;
         let mut answers = Vec::with_capacity(calls.len());
         for (call, checked) in calls.iter().zip(checked) {
-            let (answer, took) = match checked {
+            let (number, answer, took) = match checked {
                 Checked::OverLimit(error) => {
                     answers.push(Err(error));
                     continue;
                 }
-                Checked::Refused { error, checking } => (Err(error), checking),
-                Checked::Allowed { checking, .. } => {
+                Checked::Refused {
+                    number,
+                    error,
+                    checking,
+                } => (number, Err(error), checking),
+                Checked::Allowed {
+                    number, checking, ..
+                } => {
                     let (result, running) = ran.next().expect("each allowed call was run");
-                    (answer_from(call, &result), checking + running)
+                    (number, answer_from(call, &result), checking + running)
                 }
             };
-            self.report.push(format!(
-                "{} · {} · {}ms",
-                describe(call),
-                if answer.is_ok() { "ok" } else { "failed" },
-                took.as_millis()
+            place += 1;
+            self.report.extend(report_lines(
+                number,
+                batch_mark(place, written),
+                call,
+                &answer,
+                took,
             ));
             answers.push(answer);
         }
@@ -157,10 +185,12 @@ impl<'a> ScriptToolCalls<'a> {
         let started = Instant::now();
         match self.allowed_request(call) {
             Ok(request) => Checked::Allowed {
+                number: self.made,
                 request,
                 checking: started.elapsed(),
             },
             Err(error) => Checked::Refused {
+                number: self.made,
                 error,
                 checking: started.elapsed(),
             },
@@ -301,15 +331,76 @@ fn failure_text(result: &ToolResult) -> String {
         .unwrap_or_else(|| "the tool call failed".to_string())
 }
 
-/// A call as one reads it in a list: the tool and what it was pointed at.
-fn describe(call: &ScriptToolCall) -> String {
-    let pointed_at = ["path", "pattern"]
-        .iter()
-        .find_map(|key| call.arguments.get(key).and_then(|value| value.as_str()));
-    match pointed_at {
-        Some(pointed_at) => format!("{} {pointed_at}", call.tool),
-        None => call.tool.clone(),
+/// What is written for one call: how it ended, then the start of what came
+/// back or of why nothing did.
+fn report_lines(
+    number: u32,
+    mark: char,
+    call: &ScriptToolCall,
+    answer: &Result<String, String>,
+    took: Duration,
+) -> Vec<String> {
+    let (ended, size, text) = match answer {
+        Ok(text) => ("ok", format!(" · {}", super::shown_size(text.len())), text),
+        Err(error) => ("failed", String::new(), error),
+    };
+    let mut lines = vec![format!(
+        "{number:>3} {mark} {} {} · {ended} · {}ms{size}",
+        call.tool,
+        cut(&call.arguments.to_string(), SHOWN_ARGUMENT_CHARS),
+        took.as_millis()
+    )];
+    lines.extend(preview(text));
+    lines
+}
+
+/// Joins the calls of one batch: `┬` opens it, `└` closes it, `├` between.
+fn batch_mark(place: usize, of: usize) -> char {
+    match (place, of) {
+        (_, 0 | 1) => ' ',
+        (1, _) => '┬',
+        (place, of) if place == of => '└',
+        _ => '├',
     }
+}
+
+/// The first `chars` characters of `text`, marked when more were left out.
+fn cut(text: &str, chars: usize) -> String {
+    match text.char_indices().nth(chars) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+/// The start of `text`, within the three limits of a preview.
+fn preview(text: &str) -> Vec<String> {
+    let total = text.lines().count();
+    let mut shown = Vec::new();
+    let mut bytes = 0;
+    for line in text.lines().take(PREVIEW_LINES) {
+        let mut line = cut(line, PREVIEW_LINE_CHARS);
+        if bytes + line.len() > PREVIEW_BYTES {
+            if !shown.is_empty() {
+                break;
+            }
+            // One line of wide characters can pass the byte limit by itself.
+            let mut end = PREVIEW_BYTES - '…'.len_utf8();
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line = format!("{}…", &line[..end]);
+        }
+        bytes += line.len();
+        shown.push(format!("{PREVIEW_INDENT}{line}"));
+    }
+    if total > shown.len() {
+        let more = total - shown.len();
+        shown.push(format!(
+            "{PREVIEW_INDENT}… {more} more line{}",
+            if more == 1 { "" } else { "s" }
+        ));
+    }
+    shown
 }
 
 #[cfg(test)]
@@ -586,6 +677,31 @@ mod tests {
         assert!(!error.contains("the first part"), "{error}");
     }
 
+    /// The report's summary lines, each cut after `ok` or `failed`.
+    fn summaries(report: &[String]) -> Vec<String> {
+        report
+            .iter()
+            .filter(|line| !line.starts_with("      "))
+            .map(|line| {
+                let end = line
+                    .find(" · ok")
+                    .map(|at| at + " · ok".len())
+                    .or_else(|| line.find(" · failed").map(|at| at + " · failed".len()))
+                    .expect("a summary line says how the call ended");
+                line[..end].to_string()
+            })
+            .collect()
+    }
+
+    /// Answers every request with the text it was built with.
+    struct Says(&'static str);
+
+    impl ScriptToolExecutor for Says {
+        fn execute(&self, request: ToolRequest) -> ToolResult {
+            ToolResult::completed(&request, self.0.to_string(), false)
+        }
+    }
+
     #[test]
     fn each_call_is_reported_once_with_how_it_ended() {
         let fixture = Fixture::new(Vec::new());
@@ -601,20 +717,180 @@ mod tests {
         let _ = one(&mut calls, call("bash", json!({ "command": "true" })));
         let report = calls.drain_report();
 
-        let without_time: Vec<&str> = report
-            .iter()
-            .map(|line| line.rsplit_once(" · ").expect("a duration").0)
-            .collect();
         assert_eq!(
-            without_time,
+            summaries(&report),
             [
-                "read_file src/a.rs · ok",
-                "grep src · ok",
-                "git_status · ok",
-                "bash · failed",
+                r#"  1   read_file {"path":"src/a.rs"} · ok"#,
+                r#"  2   grep {"pattern":"TODO","path":"src"} · ok"#,
+                r#"  3   git_status {} · ok"#,
+                r#"  4   bash {"command":"true"} · failed"#,
             ]
         );
         assert!(calls.drain_report().is_empty());
+    }
+
+    #[test]
+    fn a_call_that_ran_says_how_long_it_took_and_how_much_came_back() {
+        let fixture = Fixture::new(Vec::new());
+        let executor = Says("one\ntwo");
+        let mut calls = fixture.calls(&executor, 10);
+
+        let _ = one(&mut calls, call("read_file", json!({ "path": "a" })));
+        let report = calls.drain_report();
+
+        let summary = &report[0];
+        let after = summary
+            .rsplit_once(" · ok · ")
+            .expect("ok, then time and size")
+            .1;
+        let (time, size) = after.split_once(" · ").expect("time, then size");
+        assert!(
+            time.ends_with("ms") && time[..time.len() - 2].parse::<u64>().is_ok(),
+            "{time}"
+        );
+        assert_eq!(size, "7 B");
+        assert_eq!(&report[1..], ["          one", "          two"]);
+    }
+
+    #[test]
+    fn calls_of_one_batch_are_joined_and_a_lone_call_is_not() {
+        let fixture = Fixture::new(Vec::new());
+        let executor = Recorder::answering();
+        let mut calls = fixture.calls(&executor, 10);
+
+        let _ = calls.answer(reads(&["a", "b", "c"]));
+        let _ = calls.answer(reads(&["d"]));
+        let _ = calls.answer(reads(&["e", "f"]));
+
+        assert_eq!(
+            summaries(&calls.drain_report()),
+            [
+                r#"  1 ┬ read_file {"path":"a"} · ok"#,
+                r#"  2 ├ read_file {"path":"b"} · ok"#,
+                r#"  3 └ read_file {"path":"c"} · ok"#,
+                r#"  4   read_file {"path":"d"} · ok"#,
+                r#"  5 ┬ read_file {"path":"e"} · ok"#,
+                r#"  6 └ read_file {"path":"f"} · ok"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_batch_cut_by_the_call_limit_joins_only_the_calls_it_counted() {
+        let fixture = Fixture::new(Vec::new());
+        let executor = Recorder::answering();
+        let mut calls = fixture.calls(&executor, 1);
+
+        let _ = calls.answer(reads(&["a", "b", "c"]));
+
+        assert_eq!(
+            summaries(&calls.drain_report()),
+            [r#"  1   read_file {"path":"a"} · ok"#]
+        );
+    }
+
+    #[test]
+    fn long_arguments_are_cut() {
+        let fixture = Fixture::new(Vec::new());
+        let executor = Recorder::answering();
+        let mut calls = fixture.calls(&executor, 10);
+
+        let _ = one(
+            &mut calls,
+            call("grep", json!({ "pattern": "x".repeat(400) })),
+        );
+        let summary = calls.drain_report().remove(0);
+
+        let arguments = summary
+            .strip_prefix("  1   grep ")
+            .and_then(|rest| rest.split(" · ok").next())
+            .expect("the arguments");
+        assert_eq!(arguments.chars().count(), 201);
+        assert!(arguments.ends_with('…'));
+    }
+
+    #[test]
+    fn a_result_is_previewed_within_its_three_limits() {
+        let fixture = Fixture::new(Vec::new());
+        let many_lines = (1..=9)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let long_line = "y".repeat(300);
+        let heavy = (1..=5)
+            .map(|_| "z".repeat(110))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let preview_of = |text: &'static str| {
+            let executor = Says(text);
+            let mut calls = fixture.calls(&executor, 10);
+            let _ = one(&mut calls, call("read_file", json!({ "path": "a" })));
+            calls.drain_report()[1..].to_vec()
+        };
+        let many = preview_of(Box::leak(many_lines.into_boxed_str()));
+        let long = preview_of(Box::leak(long_line.into_boxed_str()));
+        let heavy = preview_of(Box::leak(heavy.into_boxed_str()));
+        let empty = preview_of("");
+
+        assert_eq!(
+            many,
+            [
+                "          line 1",
+                "          line 2",
+                "          line 3",
+                "          line 4",
+                "          line 5",
+                "          … 4 more lines",
+            ]
+        );
+        assert_eq!(long.len(), 1);
+        assert_eq!(
+            long[0].trim_start().chars().count(),
+            121,
+            "120 characters and the mark"
+        );
+        // Five lines of 110 bytes are 550: only three fit in 400.
+        assert_eq!(heavy.len(), 4);
+        assert_eq!(heavy[3], "          … 2 more lines");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn a_failed_or_refused_call_is_previewed_by_its_error_and_has_no_size() {
+        let fixture = Fixture::new(Vec::new());
+        let executor = Recorder::failing("a.txt does not exist");
+        let mut calls = fixture.calls(&executor, 10);
+
+        let _ = one(&mut calls, call("read_file", json!({ "path": "a.txt" })));
+        let _ = one(&mut calls, call("bash", json!({ "command": "true" })));
+        let report = calls.drain_report();
+
+        assert!(
+            report[0].ends_with("ms"),
+            "no size after the time: {}",
+            report[0]
+        );
+        assert_eq!(report[1], "          a.txt does not exist");
+        assert!(report[2].contains(" · failed · "));
+        assert!(report[3].contains("is not available to scripts"));
+    }
+
+    #[test]
+    fn no_preview_line_can_be_taken_for_a_summary_line() {
+        let fixture = Fixture::new(Vec::new());
+        let executor = Says("  9   grep {} · ok · 1ms · 2 B\n7 · ok · 3ms");
+        let mut calls = fixture.calls(&executor, 10);
+
+        let _ = one(&mut calls, call("read_file", json!({ "path": "a" })));
+        let report = calls.drain_report();
+
+        assert_eq!(summaries(&report).len(), 1);
+        assert!(
+            report[1..]
+                .iter()
+                .all(|line| line.starts_with("          "))
+        );
     }
 
     /// Holds every request until `together` of them are running at once.
@@ -721,12 +997,14 @@ mod tests {
                 Ok("outer:3".to_string())
             ]
         );
-        let reported: Vec<String> = calls
-            .drain_report()
-            .iter()
-            .map(|line| line.split(" · ").next().unwrap().to_string())
-            .collect();
-        assert_eq!(reported, ["read_file a", "read_file b", "read_file c"]);
+        assert_eq!(
+            summaries(&calls.drain_report()),
+            [
+                r#"  1 ┬ read_file {"path":"a"} · ok"#,
+                r#"  2 ├ read_file {"path":"b"} · ok"#,
+                r#"  3 └ read_file {"path":"c"} · ok"#,
+            ]
+        );
     }
 
     #[test]
@@ -805,19 +1083,38 @@ mod tests {
         let not_started = answers.iter().filter(|answer| answer.is_err()).count();
         assert_eq!(not_started, 6 - ran);
         let report = calls.drain_report();
-        let reported: Vec<&str> = report
-            .iter()
-            .map(|line| line.rsplit_once(" · ").expect("a duration").0)
-            .collect();
         let expected: Vec<String> = answers
             .iter()
             .zip(["a", "b", "c", "d", "e", "f"])
-            .map(|(answer, path)| {
+            .enumerate()
+            .map(|(at, (answer, path))| {
                 let ended = if answer.is_ok() { "ok" } else { "failed" };
-                format!("read_file {path} · {ended}")
+                let mark = match at {
+                    0 => '┬',
+                    5 => '└',
+                    _ => '├',
+                };
+                format!(
+                    "{:>3} {mark} read_file {{\"path\":\"{path}\"}} · {ended}",
+                    at + 1
+                )
             })
             .collect();
-        assert_eq!(reported, expected, "one line per call, in start order");
+        assert_eq!(
+            summaries(&report),
+            expected,
+            "one line per call, in start order"
+        );
+        let previews: Vec<&String> = report.iter().filter(|l| l.starts_with("      ")).collect();
+        assert_eq!(previews.len(), 6, "each call, started or not, is previewed");
+        assert_eq!(
+            previews
+                .iter()
+                .filter(|line| line.trim() == NOT_STARTED)
+                .count(),
+            not_started,
+            "a call not started says why"
+        );
         assert_eq!(calls.made(), 6, "a call not started still counts");
     }
 
@@ -908,7 +1205,7 @@ mod tests {
         assert_eq!(executor.requests().len(), 2);
         assert_eq!(calls.made(), 2);
         assert_eq!(
-            calls.drain_report().len(),
+            summaries(&calls.drain_report()).len(),
             2,
             "a call over the limit is not reported"
         );

@@ -3081,8 +3081,19 @@ mod tests {
 
         assert_eq!(message, "found it");
         let deltas = output_deltas(&events);
-        assert!(deltas.contains("read_file notes.txt · ok"), "{deltas}");
-        assert!(deltas.ends_with("1 tool call\n"), "{deltas}");
+        assert!(
+            deltas.contains(r#"  1   read_file {"path":"notes.txt"} · ok · "#),
+            "{deltas}"
+        );
+        assert!(
+            deltas.contains("          alpha"),
+            "the result is previewed: {deltas}"
+        );
+        let last = deltas.lines().last().expect("a last line");
+        assert!(
+            last.starts_with("1 tool call · ") && last.ends_with("ms"),
+            "{last}"
+        );
     }
 
     #[test]
@@ -3166,7 +3177,12 @@ mod tests {
             message,
             "2 read; the script reached its limit of 2 tool calls"
         );
-        assert!(output_deltas(&events).ends_with("2 tool calls\n"));
+        let deltas = output_deltas(&events);
+        let last = deltas.lines().last().expect("a last line");
+        assert!(
+            last.starts_with("2 tool calls · ") && last.ends_with("ms"),
+            "{last}"
+        );
     }
 
     #[test]

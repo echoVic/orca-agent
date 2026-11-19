@@ -3,6 +3,7 @@
 Run with: python3 -m unittest scripts/eval/code_mode/test_run.py
 """
 
+import json
 import shutil
 import sys
 import tempfile
@@ -124,6 +125,24 @@ class MakeHome(unittest.TestCase):
                     parsed = tomllib.loads(text)
                     self.assertEqual(parsed["tools"]["script"], {"enabled": scripts_on})
                     self.assertEqual(parsed["tools"]["max_read_parallel"], 4)
+
+
+class Summarize(unittest.TestCase):
+    def test_a_scripts_calls_are_its_summary_lines_not_its_preview_lines(self):
+        chunks = [
+            '  1   grep {"pattern":"TODO"} · ok · 12ms · 2.1 KiB\n',
+            "          src/a.rs:3: // a · b · ok · 5ms\n",
+            "          … 40 more lines\n",
+            '  2 ┬ read_file {"path":"a.rs"} · ok · 3ms · 1.2 KiB\n',
+            '  3 └ read_file {"path":"c.rs"} · failed · 1ms\n',
+            "          c.rs does not exist\n",
+            "3 tool calls · 412ms\n",
+        ]
+        jsonl = "\n".join(
+            json.dumps({"type": "tool.output.delta", "payload": {"chunk": chunk}}) for chunk in chunks
+        )
+
+        self.assertEqual(run.summarize(jsonl)["script_tool_calls"], 3)
 
 
 if __name__ == "__main__":

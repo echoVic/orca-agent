@@ -35,6 +35,10 @@ sys.path.insert(0, str(HERE))
 
 import expected  # noqa: E402
 
+# One call of a script as the runtime writes it: number, batch mark, tool,
+# arguments, how it ended, how long it took.
+SCRIPT_CALL = re.compile(r"^\s*\d+ . \S+ .* · (ok|failed) · \d+ms")
+
 
 def make_home(source: Path, scripts_on: bool) -> Path:
     home = Path(tempfile.mkdtemp(prefix="orca-code-mode-eval-"))
@@ -100,7 +104,7 @@ def summarize(jsonl: str) -> dict:
             answer = []
         elif kind == "tool.output.delta":
             chunk = str(payload.get("chunk", ""))
-            script_calls += sum(1 for part in chunk.splitlines() if " · " in part)
+            script_calls += sum(1 for part in chunk.splitlines() if SCRIPT_CALL.match(part))
         elif kind == "usage.updated":
             usage = payload
         elif kind == "assistant.message.delta":
