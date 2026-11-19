@@ -2967,13 +2967,26 @@ mod tests {
             while !server_done.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
+                        // Windows accepts inherit the listener's non-blocking
+                        // mode, and a read before the request arrives would
+                        // fail with WouldBlock; read the request blocking.
+                        socket.set_nonblocking(false).unwrap();
                         socket
                             .set_read_timeout(Some(Duration::from_secs(1)))
                             .unwrap();
                         let mut bytes = Vec::new();
                         let mut chunk = [0; 4096];
                         while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-                            let n = socket.read(&mut chunk).unwrap();
+                            let n = match socket.read(&mut chunk) {
+                                Ok(n) => n,
+                                Err(e)
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                                {
+                                    break;
+                                }
+                                Err(e) => panic!("{e}"),
+                            };
                             if n == 0 {
                                 break;
                             }
