@@ -31,12 +31,12 @@ Each later stage has its own design. Nothing in this one decides them.
 
 ## What the model sees
 
-Unchanged. One tool, `run_script`, taking `script`, the body of an async
-function. In it `tools.read_file`, `tools.glob`, `tools.grep` and
-`tools.git_status` take the arguments of the tools of those names and
-resolve to the text those tools return; `console.log` adds a line; `return`
-ends the script. The tool description loses nothing but the reason it could
-be missing.
+The same tool. `run_script` takes `script`, the body of an async function.
+In it `tools.read_file`, `tools.glob`, `tools.grep` and `tools.git_status`
+take the arguments of the tools of those names and resolve to the text those
+tools return; `console.log` adds a line; `return` ends the script. The tool
+description gains one sentence, so the model uses what this stage adds:
+calls started together, as with `Promise.all`, run at the same time.
 
 One difference a script can observe: `eval` and `Function` exist. The Node
 host turned them off because every object the host handed a script led back
@@ -86,9 +86,11 @@ A cancelled script is an `Interrupted` error, as it is today.
 
 For one script the engine:
 
-1. creates a runtime and a context on the calling thread, sets the memory
-   limit, and installs an interrupt handler that stops the script when `stop`
-   says so or the wall clock has passed;
+1. creates a runtime on the calling thread, sets the memory limit, installs
+   an interrupt handler that stops the script when `stop` says so or the wall
+   clock has passed, and creates a context holding the language's own
+   built-ins and none of the engine's extras (`performance`, `atob`, `btoa`,
+   `DOMException`);
 2. evaluates the prelude (below);
 3. compiles the script as the body of an async function in a file named
    `script.js`, the body starting on line 1, so an error names the line of
@@ -103,8 +105,10 @@ network, process or timer API to take away.
 
 `script/prelude.js`, compiled into the binary, is what `installScriptApi` in
 `host.mjs` is today, without the realm boundary it existed to hold. It is one
-function expression called with two native functions and it leaves `tools`
-and `console` on the global object and nothing else.
+function expression called with two native functions. It leaves `tools` and
+`console` on the global object and removes `queueMicrotask`, the one name
+the engine adds to the language's own that the context cannot be built
+without.
 
 - `tools.<name>(args)` turns `args` into JSON text, hands the name and the
   text to the native `start_call`, which records the call and returns its
@@ -173,7 +177,7 @@ script's time is up.
 | Inner tool calls per script | 100 (`max_tool_calls`) | the call over the limit rejects in the script; later calls reject too |
 | Bytes of one inner result | 256 KiB | the call rejects, telling the script to ask for less |
 | Memory of one script | 64 MiB (`memory_limit_mb`) | the allocation fails in the script as an out-of-memory error; uncaught, the tool fails with "the script used more than 64 MiB" |
-| Stack of one script | 256 KiB (QuickJS's default) | a stack-overflow error in the script |
+| Stack of one script | 256 KiB (QuickJS's default) | a `RangeError` in the script, which it may catch |
 | Result returned to the model | `tools.output_truncation` | truncated like any tool output |
 
 The 1 MiB protocol line limit is gone with the protocol. What it bounded, a
@@ -188,10 +192,10 @@ The interrupt handler is what stops code that never yields: a `while (true)`,
 a promise chain that reschedules itself forever, a regular expression that
 backtracks without end. Stopping is not catchable by the script.
 
-That the handler is consulted inside a regular-expression match is not
-stated by the binding's documentation. The hostile-script test for it
-settles the question; if it fails, the default does not change until a
-script can no longer hold the turn past its wall clock that way.
+The binding's documentation does not say that the handler is consulted
+inside a regular-expression match. A prototype of this engine settled it:
+`/^(a+)+$/` against forty `a`s and a `!`, with a 400 ms wall clock, was
+stopped at 400 ms. The same script is one of the hostile-script tests.
 
 ## What in-process costs
 
@@ -209,6 +213,10 @@ functions the prelude calls only record what they are given.
 
 A failed or stopped script has nothing to undo: every tool it can call is
 read-only.
+
+Measured on the prototype, on the development machine: 200 scripts created,
+run and dropped in 143 ms in a debug build, and a release binary that only
+evaluates one expression is 1.1 MB larger with the engine than without.
 
 ## Configuration
 
@@ -241,11 +249,10 @@ is read at session start and the offered list does not change mid-session.
 
 The workflow host is not touched. Workflows still need Node.
 
-Three reviewed manifests change with this and are updated in the same
-change: the runtime surface contract (`script::host` leaves the surface and
-`script::engine` enters it), the Windows platform boundary manifest (the
-script host's process API registration goes), and the execution broker
-boundary list (one `launch_user_trusted` call site fewer).
+The Windows platform boundary manifest loses its
+`script-host-unix-process-api` row in the same change. The runtime surface
+contract and the execution broker boundary name nothing of the script host;
+their validators are run to confirm it.
 
 ## Failure behaviour
 
