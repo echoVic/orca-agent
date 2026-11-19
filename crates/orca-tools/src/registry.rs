@@ -736,8 +736,8 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         BuiltinExecutor::GitStatus,
     ));
     registry.register(BuiltinTool::new(
-        // A script is a process that may run for a while: an interrupt stops
-        // it rather than waiting it out.
+        // A script may run for a while: an interrupt stops it rather than
+        // waiting it out.
         cooperative_builtin_spec(
             "run_script",
             "Run JavaScript that calls read-only tools itself and returns only what it computes. Use it when one question takes several searches or reads whose raw output you do not need: search, read the hits, keep the lines that matter, return those. `script` is the body of an async function. In it, `await tools.read_file(args)`, `tools.glob(args)`, `tools.grep(args)` and `tools.git_status()` take the same arguments as the tools of those names and resolve to the same text; a call that fails rejects with an Error, and so does one whose result is over 256 KiB (read a large file in parts with `offset` and `limit`). Calls started together, as with `Promise.all`, run at the same time. `console.log(...)` adds a line to the result and `return value` ends it (objects are returned as JSON). Nothing else exists in the script: no modules, no network, no timers, and nothing kept from an earlier call. It cannot change anything.",
@@ -759,7 +759,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
             ]),
             ToolExposure::Direct,
             RendererHint::State,
-            // It starts a process and waits on it: never one of a read batch.
+            // It runs its own calls and their hooks: never one of a read batch.
             false,
         ),
         BuiltinExecutor::RunScript,
@@ -3192,8 +3192,8 @@ mod tests {
         assert_eq!(ToolName::RunScript.as_str(), "run_script");
         assert!(resolved.spec.capabilities.is_read_only());
         assert_eq!(resolved.spec.capabilities.action_kind(), ActionKind::Read);
-        // It runs a process and waits on it, so it must not be dispatched as
-        // one of a batch of plain reads.
+        // It runs calls and hooks of its own, so it must not be dispatched
+        // as one of a batch of plain reads.
         assert!(!resolved.spec.concurrent_safe);
         assert!(!crate::tool_is_available_readonly_concurrent(&request(
             ToolName::RunScript,

@@ -199,13 +199,7 @@ pub(crate) fn provider_config_for_agent_loop(
         &config.external_tools,
     );
     if let Some(tools) = tools_override.as_mut() {
-        omit_unavailable_session_tools(
-            tools,
-            config,
-            tool_policy.workflow_child,
-            // Asked only of a session that turned the tool on.
-            config.tools.script.enabled && crate::script::node_available(),
-        );
+        omit_unavailable_session_tools(tools, config, tool_policy.workflow_child);
         omit_unavailable_shell_launch_tools(tools, &shell_readiness);
         if !crate::workspace_git::is_git_work_tree(cwd) {
             tools.retain(|tool| tool.name != "git_status");
@@ -249,10 +243,9 @@ pub(crate) fn omit_unavailable_session_tools(
     tools: &mut Vec<ProviderToolDefinition>,
     config: &RunConfig,
     workflow_child: bool,
-    node_available: bool,
 ) {
     tools.retain(|tool| match tool.name.as_str() {
-        "run_script" => config.tools.script.enabled && node_available,
+        "run_script" => config.tools.script.enabled,
         "workflow_send_message"
         | "workflow_read_messages"
         | "workflow_clear_messages"
@@ -770,13 +763,8 @@ mod tests {
     }
 
     #[test]
-    fn run_script_is_advertised_only_when_enabled_and_node_is_there() {
-        for (enabled, node_available, offered) in [
-            (true, true, true),
-            (true, false, false),
-            (false, true, false),
-            (false, false, false),
-        ] {
+    fn run_script_is_advertised_exactly_when_it_is_enabled() {
+        for enabled in [true, false] {
             let mut config = config_with_external(Vec::new());
             config.tools.script.enabled = enabled;
             let mut tools = provider_tool_schema_override(
@@ -788,12 +776,12 @@ mod tests {
             )
             .expect("tool definitions");
 
-            super::omit_unavailable_session_tools(&mut tools, &config, false, node_available);
+            super::omit_unavailable_session_tools(&mut tools, &config, false);
 
             assert_eq!(
                 tools.iter().any(|tool| tool.name == "run_script"),
-                offered,
-                "enabled={enabled} node_available={node_available}"
+                enabled,
+                "enabled={enabled}"
             );
             assert!(tools.iter().any(|tool| tool.name == "read_file"));
         }

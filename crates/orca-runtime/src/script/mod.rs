@@ -9,11 +9,10 @@
 
 pub(crate) mod calls;
 pub mod engine;
-pub mod host;
 
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use orca_core::cancel::CancelToken;
@@ -30,14 +29,6 @@ use self::calls::{SCRIPT_TOOL_OUTPUT_BYTES, ScriptToolCalls, ScriptToolExecutor}
 use self::engine::{ScriptEngine, ScriptEngineLimits, ScriptOutcome};
 use crate::hooks::HookRunner;
 use crate::runtime_tool_call::READONLY_TOOL_TIMEOUT_SECS;
-use crate::workflow::host::WorkflowHost;
-
-/// Whether this machine has a Node. Scripts no longer need one; this is still
-/// what decides whether the tool is offered until that is taken out too.
-pub(crate) fn node_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(WorkflowHost::node_available)
-}
 
 #[derive(Deserialize)]
 struct RunScriptArguments {
