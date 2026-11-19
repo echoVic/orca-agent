@@ -268,6 +268,21 @@ fn permission_kind(
     orca_runtime::runtime_permission::RuntimePermissionRequestKind::CapabilityBoundary
 }
 
+/// The script of a `run_script` request, to follow the request's own event.
+fn runtime_event_script(event: &EventEnvelope) -> Option<TuiEvent> {
+    if event.event_type != EventType::ToolCallRequested {
+        return None;
+    }
+    let string = |key: &str| event.payload.get(key).and_then(|value| value.as_str());
+    if string("name")? != crate::script_run::SCRIPT_TOOL {
+        return None;
+    }
+    Some(TuiEvent::ToolScript {
+        id: string("id")?.to_string(),
+        script: crate::script_run::script_from_arguments(string("raw_arguments")?)?,
+    })
+}
+
 fn runtime_event_to_tui(event: &EventEnvelope) -> Option<TuiEvent> {
     let string = |key: &str| event.payload.get(key).and_then(|value| value.as_str());
     match event.event_type {
@@ -448,8 +463,11 @@ pub(crate) fn announce_runtime_ready(
     });
     let runtime_events = event_tx.clone();
     thread.set_prompt_queue_event_observer(Arc::new(move |event: &EventEnvelope| {
-        if let Some(event) = runtime_event_to_tui(event) {
-            let _ = runtime_events.send(event);
+        if let Some(projected) = runtime_event_to_tui(event) {
+            let _ = runtime_events.send(projected);
+            if let Some(script) = runtime_event_script(event) {
+                let _ = runtime_events.send(script);
+            }
         }
         Ok(())
     }));
@@ -811,6 +829,9 @@ pub(crate) fn chat_messages_from_history(message: Message) -> Vec<ChatMessage> {
 #[derive(Default)]
 pub(crate) struct HistoryReplay {
     tool_names: HashMap<String, (String, Option<String>)>,
+    /// The script of each `run_script` call not yet answered, if its
+    /// arguments held one.
+    scripts: HashMap<String, Option<String>>,
 }
 
 fn tool_target_from_arguments(name: &str, arguments: &str) -> Option<String> {
@@ -829,6 +850,12 @@ impl HistoryReplay {
     pub(crate) fn convert(&mut self, message: Message) -> Vec<ChatMessage> {
         if let Message::Assistant { tool_calls, .. } = &message {
             for call in tool_calls {
+                if call.function_name == crate::script_run::SCRIPT_TOOL {
+                    self.scripts.insert(
+                        call.id.clone(),
+                        crate::script_run::script_from_arguments(&call.arguments),
+                    );
+                }
                 self.tool_names.insert(
                     call.id.clone(),
                     (
@@ -843,7 +870,7 @@ impl HistoryReplay {
             _ => None,
         };
         let mut messages = chat_messages_from_history(message);
-        if let Some(id) = tool_call_id
+        if let Some(id) = tool_call_id.clone()
             && let Some((name, target)) = self.tool_names.remove(&id)
             && let Some(ChatMessage::ToolCall {
                 name: slot,
@@ -853,6 +880,23 @@ impl HistoryReplay {
         {
             *slot = name;
             *target_slot = target;
+        }
+        if let Some(id) = tool_call_id
+            && let Some(source) = self.scripts.remove(&id)
+            && let Some(ChatMessage::ToolCall {
+                target,
+                status,
+                output,
+                ..
+            }) = messages.first_mut()
+        {
+            let end = crate::script_run::ScriptEnd {
+                completed: status == "completed",
+                text: output.take().unwrap_or_default(),
+            };
+            let body = crate::script_run::ScriptRun::saved(source, end).body();
+            *output = (!body.is_empty()).then_some(body);
+            *target = None;
         }
         messages
     }
@@ -1118,6 +1162,151 @@ mod tests {
                 if attached.attachment == Some(attachment)
                     && matches!(attached.event, TuiEvent::HistoryLoaded { .. })
         ));
+    }
+
+    fn replayed_script_row(arguments: &str, content: &str, status: &str) -> ChatMessage {
+        use orca_core::conversation::{Message, RawToolCall};
+        let mut replay = HistoryReplay::default();
+        let _ = replay.convert(Message::Assistant {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![RawToolCall {
+                id: "call_1".into(),
+                function_name: "run_script".into(),
+                arguments: arguments.into(),
+            }],
+            pinned: false,
+        });
+        let terminal = (status != "completed").then(|| {
+            serde_json::from_value::<orca_core::tool_types::ToolTerminal>(serde_json::json!({
+                "status": status,
+                "error": null,
+                "exit_code": null,
+                "truncated": false,
+            }))
+            .expect("terminal")
+        });
+        let mut rows = replay.convert(Message::Tool {
+            tool_call_id: "call_1".into(),
+            content: content.into(),
+            images: Vec::new(),
+            terminal,
+            pinned: false,
+        });
+        rows.remove(0)
+    }
+
+    #[test]
+    fn history_replay_rebuilds_a_script_row_from_its_arguments_and_result() {
+        let row = replayed_script_row(r#"{"script":"return 1;"}"#, "1", "completed");
+        let ChatMessage::ToolCall {
+            name,
+            target,
+            output,
+            ..
+        } = row
+        else {
+            panic!("tool call")
+        };
+        assert_eq!(name, "run_script");
+        assert_eq!(target, None);
+        assert_eq!(
+            output.as_deref(),
+            Some(concat!(
+                "Script\n 1 │ return 1;\n",
+                "Calls are shown only in the session that ran the script\n",
+                "Returned to the model · 1 B\n",
+                " 1",
+            ))
+        );
+    }
+
+    #[test]
+    fn history_replay_rebuilds_a_failed_script_row() {
+        let row = replayed_script_row(r#"{"script":"return 1;"}"#, "Error: boom", "failed");
+        let ChatMessage::ToolCall { output, .. } = row else {
+            panic!("tool call")
+        };
+        let output = output.expect("output");
+        assert!(output.ends_with("Failed\n Error: boom"), "{output}");
+    }
+
+    #[test]
+    fn a_run_script_request_event_is_followed_by_its_script() {
+        let event = EventEnvelope {
+            version: "1".to_string(),
+            run_id: "run".to_string(),
+            seq: 1,
+            timestamp_ms: 0,
+            event_type: EventType::ToolCallRequested,
+            payload: serde_json::json!({
+                "id": "s1",
+                "name": "run_script",
+                "raw_arguments": r#"{"script":"return 1;"}"#,
+            }),
+        };
+        assert!(matches!(
+            runtime_event_to_tui(&event),
+            Some(TuiEvent::ToolRequested { id, name, .. }) if id == "s1" && name == "run_script"
+        ));
+        assert!(matches!(
+            runtime_event_script(&event),
+            Some(TuiEvent::ToolScript { id, script }) if id == "s1" && script == "return 1;"
+        ));
+
+        let other = EventEnvelope {
+            payload: serde_json::json!({
+                "id": "b1",
+                "name": "read_file",
+                "raw_arguments": r#"{"script":"return 1;"}"#,
+            }),
+            ..event.clone()
+        };
+        assert!(runtime_event_script(&other).is_none());
+        let not_json = EventEnvelope {
+            payload: serde_json::json!({
+                "id": "s2",
+                "name": "run_script",
+                "raw_arguments": "not json",
+            }),
+            ..event
+        };
+        assert!(runtime_event_script(&not_json).is_none());
+    }
+
+    #[test]
+    fn history_replay_converts_a_read_file_pair_as_before() {
+        use orca_core::conversation::{Message, RawToolCall};
+        let mut replay = HistoryReplay::default();
+        let _ = replay.convert(Message::Assistant {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![RawToolCall {
+                id: "call_2".into(),
+                function_name: "read_file".into(),
+                arguments: r#"{"path":"a.rs","script":"x"}"#.into(),
+            }],
+            pinned: false,
+        });
+        let rows = replay.convert(Message::Tool {
+            tool_call_id: "call_2".into(),
+            content: "text".into(),
+            images: Vec::new(),
+            terminal: None,
+            pinned: false,
+        });
+        let ChatMessage::ToolCall {
+            name,
+            target,
+            output,
+            ..
+        } = &rows[0]
+        else {
+            panic!("tool call")
+        };
+        assert_eq!(name, "read_file");
+        assert_eq!(target.as_deref(), Some("a.rs"));
+        assert_eq!(output.as_deref(), Some("text"));
     }
 
     #[test]

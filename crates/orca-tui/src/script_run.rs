@@ -5,8 +5,6 @@
 //! only arranges what it is given. It reads one thing out of that text, the
 //! last line, which says how many calls were made and how long the run took.
 
-#![allow(dead_code)]
-
 pub(crate) const SCRIPT_TOOL: &str = "run_script";
 
 const SCRIPT_TITLE: &str = "Script";

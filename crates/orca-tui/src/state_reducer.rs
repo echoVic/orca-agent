@@ -12,6 +12,7 @@ use crate::protocol::{
     PendingTuiInput, PendingWorkflowNotification, TaskTranscriptRequest, TaskTranscriptResult,
     TuiEvent, TuiMcpElicitationMode, UserAction,
 };
+use crate::script_run::{SCRIPT_TOOL, ScriptEnd, ScriptRun};
 use crate::streaming_markdown::{StreamingMarkdownAction, StreamingMarkdownAssembler};
 use crate::surface_projection::{
     SurfaceGoalProjectionEffect, SurfaceOperationProjectionApply, SurfaceOperationProjectionEffect,
@@ -55,6 +56,26 @@ fn format_goal_notice(goal: &orca_core::goal_types::ThreadGoal) -> String {
 }
 
 impl AppState {
+    /// Rewrites a `run_script` row from its run's parts.
+    fn refresh_script_row(&mut self, id: &str) {
+        let Some(run) = self.transcript.script_runs.get(id) else {
+            return;
+        };
+        let body = run.body();
+        let summary = run.summary().map(str::to_string);
+        if let Some(index) = self.transcript.messages.iter().rposition(|message| {
+            matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == id)
+        }) {
+            self.mutate_message(index, |message| {
+                let ChatMessage::ToolCall { target, output, .. } = message else {
+                    unreachable!();
+                };
+                *output = (!body.is_empty()).then_some(body);
+                *target = summary;
+            });
+        }
+    }
+
     pub fn update(&mut self, event: TuiEvent) {
         self.reconcile_message_tracking();
         match event {
@@ -408,6 +429,17 @@ impl AppState {
                     expanded: false,
                 });
             }
+            TuiEvent::ToolScript { id, script } => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
+                self.transcript
+                    .script_runs
+                    .entry(id.clone())
+                    .or_insert_with(ScriptRun::live)
+                    .source = Some(script);
+                self.refresh_script_row(&id);
+            }
             TuiEvent::ToolCallProgress {
                 id,
                 name,
@@ -459,6 +491,20 @@ impl AppState {
             }
             TuiEvent::ToolOutputDelta { id, chunk } => {
                 if self.suppress_background_main_session_output {
+                    return;
+                }
+                let is_script = self.transcript.messages.iter().rev().any(|message| {
+                    matches!(message, ChatMessage::ToolCall { id: existing_id, name, .. }
+                        if existing_id == &id && name == SCRIPT_TOOL)
+                });
+                if is_script {
+                    self.transcript
+                        .script_runs
+                        .entry(id.clone())
+                        .or_insert_with(ScriptRun::live)
+                        .calls
+                        .push_str(&chunk);
+                    self.refresh_script_row(&id);
                     return;
                 }
                 if let Some(index) = self.transcript.messages.iter().rposition(|message| {
@@ -558,6 +604,17 @@ impl AppState {
                     });
                     index
                 };
+                if name == SCRIPT_TOOL {
+                    self.transcript
+                        .script_runs
+                        .entry(id.clone())
+                        .or_insert_with(ScriptRun::live)
+                        .end = Some(ScriptEnd {
+                        completed: status == "completed",
+                        text: output.clone(),
+                    });
+                    self.refresh_script_row(&id);
+                }
                 self.learn_command_ends_from_result(&name, &output);
                 self.show_known_command_end(message_index);
                 if status == "completed" {

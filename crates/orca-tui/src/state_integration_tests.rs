@@ -3089,6 +3089,192 @@ fn tool_output_delta_updates_matching_tool_id() {
     }
 }
 
+fn script_row(state: &AppState) -> (Option<String>, String, Option<String>) {
+    state
+        .transcript
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            ChatMessage::ToolCall {
+                target,
+                status,
+                output,
+                ..
+            } => Some((target.clone(), status.clone(), output.clone())),
+            _ => None,
+        })
+        .expect("a tool row")
+}
+
+fn script_request(state: &mut AppState, id: &str, script: Option<&str>) {
+    state.update(TuiEvent::ToolRequested {
+        id: id.to_string(),
+        name: "run_script".to_string(),
+        target: None,
+    });
+    if let Some(script) = script {
+        state.update(TuiEvent::ToolScript {
+            id: id.to_string(),
+            script: script.to_string(),
+        });
+    }
+}
+
+fn script_chunk(state: &mut AppState, id: &str, chunk: &str) {
+    state.update(TuiEvent::ToolOutputDelta {
+        id: id.to_string(),
+        chunk: chunk.to_string(),
+    });
+}
+
+fn script_end(state: &mut AppState, id: &str, status: &str, output: &str) {
+    state.update(TuiEvent::ToolCompleted {
+        id: id.to_string(),
+        name: "run_script".to_string(),
+        status: status.to_string(),
+        output: output.to_string(),
+        diff: None,
+        kind: None,
+    });
+}
+
+const SCRIPT_CALL_LINE: &str = "  1   git_status {} · ok · 4ms · 9 B\n";
+
+#[test]
+fn a_script_row_keeps_its_script_and_calls_after_it_ends() {
+    let mut state = state();
+    script_request(&mut state, "s1", Some("return 1;"));
+    script_chunk(&mut state, "s1", SCRIPT_CALL_LINE);
+    script_chunk(&mut state, "s1", "1 tool call · 5ms\n");
+    script_end(&mut state, "s1", "completed", "1");
+
+    assert_eq!(
+        script_row(&state),
+        (
+            Some("1 tool call · 5ms".to_string()),
+            "completed".to_string(),
+            Some(
+                "Script\n 1 │ return 1;\nCalls\n  1   git_status {} · ok · 4ms · 9 B\nReturned to the model · 1 B\n 1"
+                    .to_string()
+            ),
+        )
+    );
+}
+
+#[test]
+fn a_running_script_row_shows_what_has_arrived() {
+    let mut state = state();
+    script_request(&mut state, "s1", Some("return 1;"));
+    script_chunk(&mut state, "s1", SCRIPT_CALL_LINE);
+
+    assert_eq!(
+        script_row(&state),
+        (
+            None,
+            "running".to_string(),
+            Some("Script\n 1 │ return 1;\nCalls\n  1   git_status {} · ok · 4ms · 9 B".to_string()),
+        )
+    );
+}
+
+#[test]
+fn a_failed_script_row_says_failed() {
+    let mut state = state();
+    script_request(&mut state, "s1", Some("return 1;"));
+    script_chunk(&mut state, "s1", SCRIPT_CALL_LINE);
+    script_chunk(&mut state, "s1", "1 tool call · 5ms\n");
+    script_end(&mut state, "s1", "failed", "Error: boom (script.js:1:7)");
+
+    let (_, status, output) = script_row(&state);
+    assert_eq!(status, "failed");
+    let output = output.expect("output");
+    assert!(
+        output.ends_with("Failed\n Error: boom (script.js:1:7)"),
+        "{output}"
+    );
+}
+
+#[test]
+fn a_script_row_without_its_script_still_shows_calls_and_result() {
+    let mut state = state();
+    script_request(&mut state, "s1", None);
+    script_chunk(&mut state, "s1", SCRIPT_CALL_LINE);
+    script_chunk(&mut state, "s1", "1 tool call · 5ms\n");
+    script_end(&mut state, "s1", "completed", "1");
+
+    assert_eq!(
+        script_row(&state).2.as_deref(),
+        Some("Calls\n  1   git_status {} · ok · 4ms · 9 B\nReturned to the model · 1 B\n 1")
+    );
+}
+
+#[test]
+fn a_script_result_with_no_request_still_gets_its_body() {
+    let mut state = state();
+    script_end(&mut state, "late", "completed", "1");
+
+    assert_eq!(
+        script_row(&state).2.as_deref(),
+        Some("Returned to the model · 1 B\n 1")
+    );
+}
+
+#[test]
+fn chunks_of_another_tool_still_go_to_its_output() {
+    let mut state = state();
+    state.update(TuiEvent::ToolRequested {
+        id: "b1".to_string(),
+        name: "read_file".to_string(),
+        target: Some("a.rs".to_string()),
+    });
+    script_chunk(&mut state, "b1", "partial");
+
+    let (target, _, output) = script_row(&state);
+    assert_eq!(output.as_deref(), Some("partial"));
+    assert_eq!(target.as_deref(), Some("a.rs"));
+}
+
+#[test]
+fn two_script_rows_do_not_share_their_calls() {
+    let mut state = state();
+    script_request(&mut state, "s1", Some("return 1;"));
+    script_request(&mut state, "s2", Some("return 2;"));
+    script_chunk(&mut state, "s1", "  1   one {} · ok · 1ms · 1 B\n");
+    script_chunk(&mut state, "s2", "  1   two {} · ok · 2ms · 2 B\n");
+
+    let outputs: Vec<String> = state
+        .transcript
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            ChatMessage::ToolCall { output, .. } => output.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        outputs,
+        [
+            "Script\n 1 │ return 1;\nCalls\n  1   one {} · ok · 1ms · 1 B",
+            "Script\n 1 │ return 2;\nCalls\n  1   two {} · ok · 2ms · 2 B",
+        ]
+    );
+}
+
+#[test]
+fn clearing_the_transcript_forgets_script_runs() {
+    let mut state = state();
+    script_request(&mut state, "s1", Some("return 1;"));
+    assert_eq!(state.transcript.script_runs.len(), 1);
+
+    state.clear_messages();
+    assert!(state.transcript.script_runs.is_empty());
+
+    script_request(&mut state, "s2", Some("return 2;"));
+    state.replace_messages(Vec::new());
+    assert!(state.transcript.script_runs.is_empty());
+}
+
 #[test]
 fn completed_tool_event_replaces_live_preview_with_canonical_output() {
     let mut state = state();

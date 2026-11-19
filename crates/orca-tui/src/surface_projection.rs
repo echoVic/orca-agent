@@ -1451,6 +1451,15 @@ impl TuiSurfaceProjection {
                             .as_ref()
                             .map(|target| target.as_str().to_string()),
                     });
+                    if request.name.as_str() == crate::script_run::SCRIPT_TOOL
+                        && let Some(script) =
+                            crate::script_run::script_from_arguments(request.raw_arguments.as_str())
+                    {
+                        projected.push(TuiEvent::ToolScript {
+                            id: request.tool_call_id.as_str().to_string(),
+                            script,
+                        });
+                    }
                 }
                 SurfaceEvent::Tool(ToolPatch::ArgumentsProgress {
                     tool_call_id,
@@ -3319,6 +3328,90 @@ mod tests {
             capability_calls: Vec::new(),
             terminal_leases: Vec::new(),
         }
+    }
+
+    fn tool_request_events(name: &str, raw_arguments: &str) -> Vec<TuiEvent> {
+        let before = cursor(0, 1);
+        let commit_class = CommitClass::Recorded {
+            thread_owner_epoch: ThreadOwnerEpoch::new(1),
+            durable_revision: DurableRevision::try_new(2).unwrap(),
+            commit_id: SurfaceCommitId::try_from_bytes(uuid_v7_bytes(61)).unwrap(),
+        };
+        let event = SurfaceEventEnvelope {
+            ordinal: 0,
+            event_id: SurfaceEventId::try_from_bytes(uuid_v7_bytes(62)).unwrap(),
+            commit_class: commit_class.clone(),
+            scope: SurfaceScope::Generation {
+                fence: operation_fence(63),
+            },
+            event: SurfaceEvent::Tool(ToolPatch::Requested {
+                request: orca_runtime::surface::SurfaceToolRequest {
+                    tool_call_id: orca_runtime::surface::SurfaceToolCallId::try_new("call-1")
+                        .unwrap(),
+                    source_response_id: None,
+                    turn_id: SurfaceTurnId::new(),
+                    name: NonEmptyText::try_new(name).unwrap(),
+                    action: orca_runtime::surface::SurfaceToolAction::Read,
+                    target: None,
+                    raw_arguments: DisplayText::new(raw_arguments),
+                    arguments_digest: Sha256Digest::digest(raw_arguments),
+                },
+            }),
+        };
+        let batch = SurfaceCommitBatch {
+            cursor_before: before.clone(),
+            cursor_after: SurfaceCursor {
+                next_seq: SequenceNumber::new(1),
+                source_revision: CursorSourceRevision::Recorded {
+                    durable_revision: DurableRevision::try_new(2).unwrap(),
+                },
+                ..before.clone()
+            },
+            commit_class,
+            event_count: 1,
+            batch_digest: Sha256Digest::new([0; 32]),
+            events: NonEmptyVec::try_new(vec![event]).unwrap(),
+        };
+        TuiSurfaceProjection::from_snapshot(before, &[])
+            .reduce_typed_batch(&batch)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_run_script_request_projects_its_script_after_the_request() {
+        let events = tool_request_events("run_script", r#"{"script":"return 1;"}"#);
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    TuiEvent::ToolRequested { id, name, .. },
+                    TuiEvent::ToolScript { id: script_id, script },
+                ] if id == "call-1" && name == "run_script" && script_id == "call-1"
+                    && script == "return 1;"
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_for_another_tool_projects_no_script() {
+        let events = tool_request_events("read_file", r#"{"script":"return 1;"}"#);
+
+        assert!(
+            matches!(events.as_slice(), [TuiEvent::ToolRequested { .. }]),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_script_request_whose_arguments_are_not_json_projects_no_script() {
+        let events = tool_request_events("run_script", "not json");
+
+        assert!(
+            matches!(events.as_slice(), [TuiEvent::ToolRequested { .. }]),
+            "{events:?}"
+        );
     }
 
     #[test]

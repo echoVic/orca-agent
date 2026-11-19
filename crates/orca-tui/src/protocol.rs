@@ -307,6 +307,12 @@ pub enum TuiEvent {
         name: String,
         target: Option<String>,
     },
+    /// The script a `run_script` request was made with. Follows the
+    /// request's `ToolRequested`.
+    ToolScript {
+        id: String,
+        script: String,
+    },
     ToolCallProgress {
         id: String,
         name: Option<String>,

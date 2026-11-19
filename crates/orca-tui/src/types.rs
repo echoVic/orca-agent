@@ -1403,6 +1403,11 @@ impl AppState {
                     .or_insert(index);
             }
         }
+        // A run belongs to its row: once the row is gone, so is the run.
+        let indices = &self.transcript.tool_call_indices;
+        self.transcript
+            .script_runs
+            .retain(|id, _| indices.contains_key(id));
     }
 
     pub(crate) fn tool_call_message_index(&self, id: &str) -> Option<usize> {
@@ -1523,6 +1528,7 @@ impl AppState {
         self.turn_diagnostic_seen = false;
         self.transcript.message_revisions.clear();
         self.transcript.tool_call_indices.clear();
+        self.transcript.script_runs.clear();
         self.transcript.render_cache.clear();
         self.clear_applied_edit_highlights();
         self.clear_pending_edit_highlights();
