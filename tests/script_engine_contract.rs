@@ -542,61 +542,6 @@ fn a_panic_while_answering_is_a_failed_script_and_the_next_one_runs() {
     assert_eq!(output_of(after), "2");
 }
 
-#[test]
-fn small_allocations_past_the_memory_limit_name_the_limit() {
-    let small = ScriptEngineLimits {
-        memory_bytes: 8 * 1024 * 1024,
-        ..limits()
-    };
-    // When QuickJS cannot allocate the error itself it throws `null`.
-    for script in [
-        "const held = []; for (let i = 0; ; i++) held.push({ i });",
-        r#"const held = []; for (let n = 0; ; n++) held.push("line " + n);"#,
-        r#"let text = ""; for (let i = 0; ; i++) text += "line " + i + "\n";"#,
-        r#"const held = new Map(); for (let i = 0; ; i++) held.set("k" + i, [i]);"#,
-    ] {
-        let (outcome, _) = run_batches(script, small, |_| Ok(String::new()));
-        assert_eq!(
-            error_of(outcome),
-            "the script used more than 8 MiB",
-            "{script}"
-        );
-    }
-}
-
-#[test]
-fn a_script_that_catches_a_refused_allocation_and_returns_has_completed() {
-    let (outcome, _) = run_batches(
-        r#"try { const held = []; for (;;) held.push("x".repeat(1024) + held.length); }
-           catch (error) {}
-           return "recovered";"#,
-        ScriptEngineLimits {
-            memory_bytes: 8 * 1024 * 1024,
-            ..limits()
-        },
-        |_| Ok(String::new()),
-    );
-
-    assert_eq!(output_of(outcome), "recovered");
-}
-
-#[test]
-fn running_out_of_memory_while_results_are_delivered_names_the_limit() {
-    let big = "y".repeat(256 * 1024);
-    let (outcome, batches) = run_batches(
-        r#"const all = await Promise.all(Array.from({ length: 40 }, (_, i) => tools.read_file({ path: `p${i}` })));
-           return all.length;"#,
-        ScriptEngineLimits {
-            memory_bytes: 8 * 1024 * 1024,
-            ..limits()
-        },
-        |_| Ok(big.clone()),
-    );
-
-    assert_eq!(batches.len(), 1);
-    assert_eq!(error_of(outcome), "the script used more than 8 MiB");
-}
-
 /// Says to stop once `after` has passed: a cancel that comes while the
 /// script runs, without a thread to send it.
 fn cancel_after(after: Duration) -> Arc<dyn Fn() -> bool + Send + Sync> {
@@ -671,6 +616,61 @@ fn a_script_in_a_long_native_loop_is_stopped_at_its_wall_clock() {
 }
 
 #[test]
+fn small_allocations_past_the_memory_limit_name_the_limit() {
+    let small = ScriptEngineLimits {
+        memory_bytes: 8 * 1024 * 1024,
+        ..limits()
+    };
+    // When QuickJS cannot allocate the error itself it throws `null`.
+    for script in [
+        "const held = []; for (let i = 0; ; i++) held.push({ i });",
+        r#"const held = []; for (let n = 0; ; n++) held.push("line " + n);"#,
+        r#"let text = ""; for (let i = 0; ; i++) text += "line " + i + "\n";"#,
+        r#"const held = new Map(); for (let i = 0; ; i++) held.set("k" + i, [i]);"#,
+    ] {
+        let (outcome, _) = run_batches(script, small, |_| Ok(String::new()));
+        assert_eq!(
+            error_of(outcome),
+            "the script used more than 8 MiB",
+            "{script}"
+        );
+    }
+}
+
+#[test]
+fn a_script_that_catches_a_refused_allocation_and_returns_has_completed() {
+    let (outcome, _) = run_batches(
+        r#"try { const held = []; for (;;) held.push("x".repeat(1024) + held.length); }
+           catch (error) {}
+           return "recovered";"#,
+        ScriptEngineLimits {
+            memory_bytes: 8 * 1024 * 1024,
+            ..limits()
+        },
+        |_| Ok(String::new()),
+    );
+
+    assert_eq!(output_of(outcome), "recovered");
+}
+
+#[test]
+fn running_out_of_memory_while_results_are_delivered_names_the_limit() {
+    let big = "y".repeat(256 * 1024);
+    let (outcome, batches) = run_batches(
+        r#"const all = await Promise.all(Array.from({ length: 40 }, (_, i) => tools.read_file({ path: `p${i}` })));
+           return all.length;"#,
+        ScriptEngineLimits {
+            memory_bytes: 8 * 1024 * 1024,
+            ..limits()
+        },
+        |_| Ok(big.clone()),
+    );
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(error_of(outcome), "the script used more than 8 MiB");
+}
+
+#[test]
 fn a_scripts_stack_does_not_depend_on_the_callers() {
     // The engine runs on a thread of its own, so a caller with a small stack
     // still gets a `RangeError` in the script rather than an overflow of its
@@ -730,6 +730,52 @@ fn a_script_that_replaces_object_prototype_members_breaks_only_itself() {
         output_of(after),
         "[\n  \"fine\",\n  \"[object Object]\",\n  \"{\\\"a\\\":1}\"\n]"
     );
+}
+
+#[test]
+fn a_call_whose_arguments_are_over_1_mib_rejects_in_the_script() {
+    let (outcome, calls) = run(
+        r#"const big = "x".repeat(1024 * 1024);
+           let refused;
+           try { await tools.read_file({ path: big }); } catch (error) { refused = `${error instanceof Error} ${error.message}`; }
+           const small = await tools.read_file({ path: "a" });
+           return [refused, small];"#,
+        |call| Ok(format!("<{}>", call.arguments["path"].as_str().unwrap())),
+    );
+
+    let seen: Vec<String> = serde_json::from_str(&output_of(outcome)).unwrap();
+    assert_eq!(
+        seen,
+        ["true a tool call's arguments are limited to 1 MiB", "<a>"]
+    );
+    assert_eq!(calls.len(), 1, "the refused call is not handed over");
+}
+
+#[test]
+fn too_many_waiting_calls_reject_in_the_script() {
+    let (outcome, batches) = run_batches(
+        r#"const started = [];
+           for (let i = 0; i < 1001; i++) {
+             started.push(tools.read_file({ path: "a" }).then(() => "ok", (error) => error.message));
+           }
+           const settled = await Promise.all(started);
+           const later = await tools.read_file({ path: "b" });
+           return [settled.filter((one) => one === "ok").length, settled[1000], later];"#,
+        limits(),
+        |_| Ok("read".to_string()),
+    );
+
+    let seen: serde_json::Value = serde_json::from_str(&output_of(outcome)).unwrap();
+    assert_eq!(
+        seen,
+        json!([
+            1000,
+            "too many tool calls are waiting; await some before starting more",
+            "read"
+        ])
+    );
+    let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [1000, 1]);
 }
 
 /// A script that closes the function it is the body of and loops at the top

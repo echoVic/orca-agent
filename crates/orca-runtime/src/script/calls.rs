@@ -25,10 +25,20 @@ pub(crate) const SCRIPT_TOOLS: [&str; 4] = ["read_file", "glob", "grep", "git_st
 /// reads, so it gets far more than a model would be shown.
 pub(crate) const SCRIPT_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
 
+/// What a call of a batch is answered with when the script was stopped before
+/// the call could start.
+const NOT_STARTED: &str = "the script was stopped before this call started";
+
 /// Runs one read-only tool request to its result. The calls a script started
 /// together are run at the same time, so this is called from several threads.
 pub(crate) trait ScriptToolExecutor: Sync {
     fn execute(&self, request: ToolRequest) -> ToolResult;
+
+    /// Whether the script the calls belong to has been stopped: a call of a
+    /// batch that has not started by then is not started.
+    fn stopped(&self) -> bool {
+        false
+    }
 }
 
 /// Answers the tool calls of one script.
@@ -222,13 +232,21 @@ fn answer_from(call: &ScriptToolCall, result: &ToolResult) -> Result<String, Str
 }
 
 /// Runs the requests at the same time, at most `max_parallel` at once, and
-/// returns each one's result and how long it took, in the order given.
+/// returns each one's result and how long it took, in the order given. Once
+/// the script is stopped, a request not yet started fails without running;
+/// those already running are left to finish.
 fn run_together(
     executor: &dyn ScriptToolExecutor,
     requests: Vec<ToolRequest>,
     max_parallel: usize,
 ) -> Vec<(ToolResult, Duration)> {
     let run = |request: ToolRequest| {
+        if executor.stopped() {
+            return (
+                ToolResult::failed(&request, NOT_STARTED, None),
+                Duration::ZERO,
+            );
+        }
         let started = Instant::now();
         let result = executor.execute(request);
         (result, started.elapsed())
@@ -745,6 +763,131 @@ mod tests {
         assert_eq!(answers[2].as_deref(), Ok("ran read_file"));
         // The refused call was the second the script made, and keeps its number.
         assert_eq!(executor.ids(), ["outer:1", "outer:3"]);
+    }
+
+    /// Counts the requests that ran to their end, and says the script is
+    /// stopped once two have.
+    struct StopsAfterTwo {
+        ended: AtomicUsize,
+    }
+
+    impl ScriptToolExecutor for StopsAfterTwo {
+        fn execute(&self, request: ToolRequest) -> ToolResult {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            self.ended.fetch_add(1, Ordering::SeqCst);
+            ToolResult::completed(&request, request.id.clone(), false)
+        }
+
+        fn stopped(&self) -> bool {
+            self.ended.load(Ordering::SeqCst) >= 2
+        }
+    }
+
+    #[test]
+    fn calls_of_a_batch_that_have_not_started_when_the_script_stops_do_not_start() {
+        let fixture = Fixture::new(Vec::new());
+        let executor = StopsAfterTwo {
+            ended: AtomicUsize::new(0),
+        };
+        let mut calls = fixture.calls_at_once(&executor, 10, 2);
+
+        let answers = calls.answer(reads(&["a", "b", "c", "d", "e", "f"]));
+
+        let ran = executor.ended.load(Ordering::SeqCst);
+        assert!((2..6).contains(&ran), "{ran} of the six calls ran");
+        assert_eq!(answers.len(), 6, "every call is answered");
+        for (number, answer) in answers.iter().enumerate() {
+            match answer {
+                Ok(id) => assert_eq!(id, &format!("outer:{}", number + 1)),
+                Err(error) => assert_eq!(error, NOT_STARTED),
+            }
+        }
+        let not_started = answers.iter().filter(|answer| answer.is_err()).count();
+        assert_eq!(not_started, 6 - ran);
+        let report = calls.drain_report();
+        let reported: Vec<&str> = report
+            .iter()
+            .map(|line| line.rsplit_once(" · ").expect("a duration").0)
+            .collect();
+        let expected: Vec<String> = answers
+            .iter()
+            .zip(["a", "b", "c", "d", "e", "f"])
+            .map(|(answer, path)| {
+                let ended = if answer.is_ok() { "ok" } else { "failed" };
+                format!("read_file {path} · {ended}")
+            })
+            .collect();
+        assert_eq!(reported, expected, "one line per call, in start order");
+        assert_eq!(calls.made(), 6, "a call not started still counts");
+    }
+
+    /// Panics on the second request it is given.
+    struct PanicsOnTheSecond;
+
+    impl ScriptToolExecutor for PanicsOnTheSecond {
+        fn execute(&self, request: ToolRequest) -> ToolResult {
+            if request.id.ends_with(":2") {
+                panic!("the tool panicked");
+            }
+            ToolResult::completed(&request, request.id.clone(), false)
+        }
+    }
+
+    #[test]
+    fn a_tool_that_panics_in_a_batch_panics_the_batch() {
+        let fixture = Fixture::new(Vec::new());
+        let mut calls = fixture.calls(&PanicsOnTheSecond, 10);
+
+        let answered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            calls.answer(reads(&["a", "b", "c"]))
+        }));
+
+        assert!(answered.is_err(), "{answered:?}");
+    }
+
+    #[test]
+    fn a_tool_that_panics_in_a_batch_fails_the_script_and_the_next_one_runs() {
+        use std::sync::Arc;
+
+        use super::super::engine::{ScriptEngine, ScriptEngineLimits, ScriptOutcome};
+
+        let fixture = Fixture::new(Vec::new());
+        let limits = ScriptEngineLimits {
+            wall_clock: std::time::Duration::from_secs(20),
+            memory_bytes: 64 * 1024 * 1024,
+        };
+        let never: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| false);
+
+        let mut calls = fixture.calls(&PanicsOnTheSecond, 10);
+        let panicked = ScriptEngine::run(
+            r#"return await Promise.all(["a", "b", "c"].map((path) => tools.read_file({ path })));"#,
+            limits,
+            &mut |batch| calls.answer(batch),
+            Arc::clone(&never),
+        )
+        .expect("the script engine ran");
+        let executor = Recorder::answering();
+        let mut calls = fixture.calls(&executor, 10);
+        let next = ScriptEngine::run(
+            r#"return await tools.read_file({ path: "a" });"#,
+            limits,
+            &mut |batch| calls.answer(batch),
+            never,
+        )
+        .expect("the script engine ran");
+
+        assert_eq!(
+            panicked,
+            ScriptOutcome::Failed {
+                error: "run_script failed inside the script engine".to_string()
+            }
+        );
+        assert_eq!(
+            next,
+            ScriptOutcome::Completed {
+                output: "ran read_file".to_string()
+            }
+        );
     }
 
     #[test]

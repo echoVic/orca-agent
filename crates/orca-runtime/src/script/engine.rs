@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use rquickjs::allocator::{Allocator, RustAllocator};
 use rquickjs::context::{EvalOptions, intrinsic};
 use rquickjs::promise::PromiseState;
-use rquickjs::{Context, Ctx, Function, Object, Promise, Runtime, Value as JsValue};
+use rquickjs::{Context, Ctx, Exception, Function, Object, Promise, Runtime, Value as JsValue};
 use serde_json::Value;
 
 const PRELUDE: &str = include_str!("prelude.js");
@@ -46,9 +46,17 @@ const WATCH_STEP: Duration = Duration::from_millis(20);
 /// behind.
 const STOP_GRACE: Duration = Duration::from_millis(200);
 
+/// The most text one call's arguments may be. Arguments are held outside the
+/// script's memory until they are handed over.
+const MAX_CALL_ARGUMENTS_BYTES: usize = 1024 * 1024;
+/// The most calls that may wait to be handed over at once.
+const MAX_WAITING_CALLS: usize = 1000;
+
 const FAILED_INSIDE_THE_ENGINE: &str = "run_script failed inside the script engine";
 const BROKE_ITS_FUNCTIONS: &str = "The script broke the functions it runs on";
 const WAITING_ON_NOTHING: &str = "the script is waiting on a promise that nothing will resolve";
+const ARGUMENTS_TOO_LONG: &str = "a tool call's arguments are limited to 1 MiB";
+const TOO_MANY_WAITING: &str = "too many tool calls are waiting; await some before starting more";
 
 const RUNNING: u8 = 0;
 const CANCELLED: u8 = 1;
@@ -375,14 +383,21 @@ fn natives<'js>(
 ) -> rquickjs::Result<(Function<'js>, Function<'js>)> {
     let start_call = Function::new(ctx.clone(), {
         let told = Rc::clone(told);
-        move |tool: String, arguments: String| -> u32 {
+        move |ctx: Ctx<'js>, tool: String, arguments: String| -> rquickjs::Result<u32> {
             let mut told = told.borrow_mut();
+            // A refused call is not kept: its promise rejects in the script.
+            if told.started.len() >= MAX_WAITING_CALLS {
+                return Err(Exception::throw_message(&ctx, TOO_MANY_WAITING));
+            }
+            if arguments.len() > MAX_CALL_ARGUMENTS_BYTES {
+                return Err(Exception::throw_message(&ctx, ARGUMENTS_TOO_LONG));
+            }
             told.numbered += 1;
             let number = told.numbered;
             let arguments = serde_json::from_str(&arguments).unwrap_or(Value::Null);
             told.started
                 .push((number, ScriptToolCall { tool, arguments }));
-            number
+            Ok(number)
         }
     })?;
     let finish = Function::new(ctx.clone(), {

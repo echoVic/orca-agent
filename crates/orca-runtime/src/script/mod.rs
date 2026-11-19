@@ -177,8 +177,12 @@ impl ScriptToolExecutor for ReadOnlyToolExecutor<'_> {
             None,
             orca_core::capability::ExecutionProfile::ReadOnly,
             None,
-            || self.cancel.is_cancelled() || Instant::now() >= self.deadline,
+            || self.stopped(),
         )
+    }
+
+    fn stopped(&self) -> bool {
+        self.cancel.is_cancelled() || Instant::now() >= self.deadline
     }
 }
 
