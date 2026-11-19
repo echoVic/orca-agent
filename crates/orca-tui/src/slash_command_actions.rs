@@ -527,6 +527,13 @@ fn dispatch_slash_command(
                 expanded: true,
             });
         }
+        SlashCommand::Scripts => {
+            // Asked for on purpose, like `/status`: show all of it.
+            state.push_message(ChatMessage::System {
+                text: crate::script_prompt::format_scripts(config),
+                expanded: true,
+            });
+        }
         SlashCommand::Copy(argument) => {
             let position = match argument.as_deref() {
                 None => Some(1),

@@ -11,6 +11,7 @@ pub enum SlashCommand {
     Side(Option<String>),
     Rename(Option<String>),
     Status,
+    Scripts,
     Copy(Option<String>),
     CancelOperation,
     Cost,
@@ -174,6 +175,7 @@ fn parse_static(input: &str) -> Option<SlashCommand> {
         "side" => Some(SlashCommand::Side(optional_argument(parts))),
         "rename" => Some(SlashCommand::Rename(optional_argument(parts))),
         "status" => no_arguments(parts).then_some(SlashCommand::Status),
+        "scripts" => no_arguments(parts).then_some(SlashCommand::Scripts),
         "copy" => Some(SlashCommand::Copy(optional_argument(parts))),
         "cancel-operation" => no_arguments(parts).then_some(SlashCommand::CancelOperation),
         "cost" => no_arguments(parts).then_some(SlashCommand::Cost),
@@ -246,6 +248,7 @@ pub fn all_commands() -> &'static [(&'static str, &'static str)] {
         ("/side", "Ask without disrupting the main conversation"),
         ("/rename", "Rename this conversation"),
         ("/status", "Show session status"),
+        ("/scripts", "Show what the model is told about run_script"),
         ("/copy", "Copy an assistant response"),
         ("/cancel-operation", "Cancel a recoverable operation"),
         ("/cost", "Show session cost"),
@@ -731,6 +734,10 @@ mod tests {
             Some(SlashCommand::Rename(Some("release triage".to_string())))
         );
         assert_eq!(parse("/status"), Some(SlashCommand::Status));
+        assert_eq!(parse("/scripts"), Some(SlashCommand::Scripts));
+        assert!(
+            all_commands().contains(&("/scripts", "Show what the model is told about run_script"))
+        );
         assert_eq!(parse("/copy"), Some(SlashCommand::Copy(None)));
         assert_eq!(
             parse("/copy 2"),

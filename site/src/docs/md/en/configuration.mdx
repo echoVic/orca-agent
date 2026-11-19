@@ -262,7 +262,8 @@ A script can call `read_file`, `glob`, `grep` and `git_status`, and nothing else
 - Calls a script starts together, as with `Promise.all`, run at the same time, up to `max_read_parallel` at once.
 - A script can run past `timeout_secs` while a call it made is still running: `read_file` stops when the time is up, but `glob`, `grep` and `git_status` run to their end (`grep` and `git_status` have 120-second limits of their own), and the script is stopped when they return. Calls not yet started when the time is up are not started.
 - Nothing is kept between scripts.
-- While a script runs, Orca shows each call it makes and how it ended. The model sees only the script's result, cut at the usual tool output limit.
+- In the terminal UI, a `run_script` row opens with a click or ctrl+o to show the script the model wrote, each call it made (its arguments, how it ended, the first lines of what came back, and which calls ran together) and what went back to the model. The model sees only the script's result, cut at the usual tool output limit. After a session is resumed, the script and the result are still shown; the calls are shown only in the session that ran the script.
+- `/scripts` prints whether the tool is on, its limits, and the description and parameters the model is sent for it.
 - A script counts as one tool call in a budget, however many calls it makes itself.
 
 The setting is read from the user configuration; a project's `.orca/config.toml` cannot turn it on.
