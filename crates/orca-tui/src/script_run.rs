@@ -5,6 +5,8 @@
 //! only arranges what it is given. It reads one thing out of that text, the
 //! last line, which says how many calls were made and how long the run took.
 
+use orca_runtime::script::shown_line;
+
 pub(crate) const SCRIPT_TOOL: &str = "run_script";
 
 const SCRIPT_TITLE: &str = "Script";
@@ -62,7 +64,9 @@ impl ScriptRun {
             .filter(|line| is_run_summary(line))
     }
 
-    /// Everything the expanded row shows under its first line.
+    /// Everything the expanded row shows under its first line. Each line
+    /// has its control characters replaced, so none can move the terminal
+    /// back over what the line starts with.
     pub(crate) fn body(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
         if let Some(source) = &self.source {
@@ -72,20 +76,23 @@ impl ScriptRun {
                 source
                     .lines()
                     .enumerate()
-                    .map(|(index, line)| format!("{:>width$} │ {line}", index + 1)),
+                    .map(|(index, line)| format!("{:>width$} │ {}", index + 1, shown_line(line))),
             );
         }
         if !self.calls_kept {
             lines.push(CALLS_NOT_KEPT.to_string());
         } else {
-            let calls: Vec<&str> = self
+            // Written clean by the runtime; cleaned again for a stream an
+            // older runtime recorded.
+            let calls: Vec<String> = self
                 .calls
                 .lines()
                 .filter(|line| !is_run_summary(line))
+                .map(shown_line)
                 .collect();
             if !calls.is_empty() {
                 lines.push(CALLS_TITLE.to_string());
-                lines.extend(calls.into_iter().map(str::to_string));
+                lines.extend(calls);
             }
         }
         if let Some(end) = &self.end {
@@ -97,7 +104,11 @@ impl ScriptRun {
             } else {
                 FAILED_TITLE.to_string()
             });
-            lines.extend(end.text.lines().map(|line| format!(" {line}")));
+            lines.extend(
+                end.text
+                    .lines()
+                    .map(|line| format!(" {}", shown_line(line))),
+            );
         }
         lines.join("\n")
     }
@@ -110,7 +121,8 @@ pub(crate) fn script_from_arguments(raw_arguments: &str) -> Option<String> {
 }
 
 /// Whether `line` of a run's body names a section. Every other line of a
-/// body starts with a space or a digit, so none can be taken for one.
+/// body starts with a space or a digit, and holds no carriage return that
+/// could draw over that start, so none can be taken for one.
 pub(crate) fn is_section_title(line: &str) -> bool {
     line == SCRIPT_TITLE
         || line == CALLS_TITLE
@@ -287,6 +299,96 @@ mod tests {
         assert_eq!(script_from_arguments(r#"{"script":7}"#), None);
         assert_eq!(script_from_arguments("not json"), None);
         assert_eq!(script_from_arguments("{}"), None);
+    }
+
+    #[test]
+    fn a_carriage_return_cannot_turn_a_line_into_a_title() {
+        let run = ScriptRun::saved(
+            Some("x\rScript".to_string()),
+            ScriptEnd {
+                completed: true,
+                text: "x\rScript".to_string(),
+            },
+        );
+
+        let body = run.body();
+        assert_eq!(
+            body,
+            concat!(
+                "Script\n 1 │ x\u{fffd}Script\n",
+                "Calls are shown only in the session that ran the script\n",
+                "Returned to the model · 8 B\n x\u{fffd}Script",
+            )
+        );
+        // As the row draws it, where a carriage return goes back to the
+        // start of the line.
+        let drawn = crate::terminal_output::printable_output(&body);
+        let titles: Vec<&str> = drawn
+            .lines()
+            .filter(|line| is_section_title(line))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "Script",
+                "Calls are shown only in the session that ran the script",
+                "Returned to the model · 8 B",
+            ]
+        );
+    }
+
+    #[test]
+    fn control_characters_in_a_script_and_a_result_are_replaced() {
+        let run = ScriptRun {
+            source: Some("a\x1b[2Jb\tc\u{2028}d\r\nnext".to_string()),
+            end: Some(ScriptEnd {
+                completed: false,
+                text: "\x07bell\x7f\u{9b}".to_string(),
+            }),
+            ..ScriptRun::live()
+        };
+
+        assert_eq!(
+            run.body(),
+            concat!(
+                "Script\n",
+                " 1 │ a\u{fffd}[2Jb c\u{fffd}d\n",
+                " 2 │ next\n",
+                "Failed\n",
+                " \u{fffd}bell\u{fffd}\u{fffd}",
+            )
+        );
+    }
+
+    #[test]
+    fn clean_calls_are_shown_as_they_came_and_older_ones_are_made_safe() {
+        let clean = concat!(
+            "  1 ┬ read_file {\"path\":\"a.rs\"} · ok · 3ms · 1.2 KiB\n",
+            "          fn main() { │ }\n",
+            "          … 30 more lines\n",
+            "  2 ├ grep {\"pattern\":\"x\"} · ok · 1ms · 9 B\n",
+            "  3 └ glob {\"pattern\":\"*\"} · failed · 1ms\n",
+            "          no match\n",
+            "3 tool calls · 9ms\n",
+        );
+        let shown = |calls: &str| {
+            ScriptRun {
+                calls: calls.to_string(),
+                ..ScriptRun::live()
+            }
+            .body()
+        };
+
+        let expected = format!(
+            "Calls\n{}",
+            clean.lines().take(6).collect::<Vec<_>>().join("\n")
+        );
+        assert_eq!(shown(clean), expected);
+        // A stream recorded by a runtime that wrote previews as they were.
+        assert_eq!(
+            shown("grep x · ok · 1ms\n          \x1b[31mred\r  9 x · ok · 1ms\n1 tool call\n"),
+            "Calls\ngrep x · ok · 1ms\n          \u{fffd}[31mred\u{fffd}  9 x · ok · 1ms"
+        );
     }
 
     #[test]

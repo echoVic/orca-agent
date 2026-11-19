@@ -10017,17 +10017,37 @@ mod tests {
 
     #[test]
     fn a_script_row_draws_no_raw_escape_or_carriage_return() {
-        let body = "Script\n 1 │ \x1b[31mred\x1b[0m\n 2 │ a\rb";
-        for expanded in [false, true] {
-            let lines = script_row_lines(&script_row("completed", Some(body), expanded), false);
-            for span in lines.iter().flat_map(|line| line.spans.iter()) {
-                assert!(
-                    !span.content.contains('\x1b') && !span.content.contains('\r'),
-                    "{:?}",
-                    span.content
-                );
+        let raw = "Script\n 1 │ \x1b[31mred\x1b[0m\n 2 │ a\rb";
+        // What a row is given: its run's body, composed from the parts.
+        let composed = crate::script_run::ScriptRun {
+            source: Some("\x1b[31mred\x1b[0m\na\rb".to_string()),
+            ..crate::script_run::ScriptRun::live()
+        }
+        .body();
+        for body in [raw, composed.as_str()] {
+            for expanded in [false, true] {
+                let lines = script_row_lines(&script_row("completed", Some(body), expanded), false);
+                for span in lines.iter().flat_map(|line| line.spans.iter()) {
+                    assert!(
+                        !span.content.contains('\x1b') && !span.content.contains('\r'),
+                        "{:?}",
+                        span.content
+                    );
+                }
             }
         }
+
+        let shown = |body: &str| message_text(None, &script_row("completed", Some(body), true));
+        assert_eq!(shown(raw)[1..3], ["    │ Script", "    │  1 │ red"]);
+        assert_eq!(
+            shown(&composed)[1..],
+            [
+                "    │ Script",
+                "    │  1 │ \u{fffd}[31mred\u{fffd}[0m",
+                "    │  2 │ a\u{fffd}b",
+                "    └ 3 lines · ctrl+o to collapse",
+            ]
+        );
     }
 
     fn shell_result(output: &str, exit_code: i64) -> String {
