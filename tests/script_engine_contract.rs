@@ -358,6 +358,69 @@ fn cancelling_stops_a_running_script() {
 }
 
 #[test]
+fn cancelling_during_the_last_tool_call_is_still_a_cancelled_script() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let result = ScriptEngine::run(
+        r#"return await tools.read_file({ path: "a" });"#,
+        limits(),
+        &mut |calls| {
+            cancelled.store(true, Ordering::Relaxed);
+            calls.iter().map(|_| Ok(String::new())).collect()
+        },
+        Arc::new({
+            let cancelled = Arc::clone(&cancelled);
+            move || cancelled.load(Ordering::Relaxed)
+        }),
+    );
+
+    let error = result.expect_err("a cancelled script is not an outcome");
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+}
+
+#[test]
+fn an_error_that_only_mentions_memory_is_the_scripts_own_error() {
+    let (outcome, _) = run(
+        r#"throw new Error("out of memory");"#,
+        |_| Ok(String::new()),
+    );
+
+    let error = error_of(outcome);
+    assert!(error.contains("Error: out of memory"), "{error}");
+    assert!(!error.contains("used more than"), "{error}");
+}
+
+#[test]
+fn running_out_of_memory_while_reporting_an_error_names_the_limit() {
+    let small = ScriptEngineLimits {
+        memory_bytes: 8 * 1024 * 1024,
+        ..limits()
+    };
+    let (outcome, _) = run_batches(
+        r#"for (let i = 0; i < 6; i++) { console.log("x".repeat(1024 * 1024) + i); }
+           throw new Error("after the log");"#,
+        small,
+        |_| Ok(String::new()),
+    );
+
+    assert_eq!(error_of(outcome), "the script used more than 8 MiB");
+}
+
+#[test]
+fn a_script_that_breaks_the_reporting_path_ends_as_having_broken_the_engine() {
+    let (outcome, _) = run(
+        r#"console.log("seen");
+           Array.prototype.join = () => { throw new Error("no join"); };
+           throw new Error("after the log");"#,
+        |_| Ok(String::new()),
+    );
+
+    assert_eq!(
+        error_of(outcome),
+        "The script broke the functions it runs on"
+    );
+}
+
+#[test]
 fn a_script_has_the_language_and_its_tools_and_nothing_else() {
     let (outcome, _) = run(
         r#"let imported = "refused";

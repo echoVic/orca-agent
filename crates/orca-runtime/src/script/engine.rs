@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use rquickjs::context::{EvalOptions, intrinsic};
-use rquickjs::{Context, Ctx, Function, Object, Runtime, Value as JsValue};
+use rquickjs::promise::PromiseState;
+use rquickjs::{Context, Ctx, Function, Object, Promise, Runtime, Value as JsValue};
 use serde_json::Value;
 
 const PRELUDE: &str = include_str!("prelude.js");
@@ -22,6 +23,9 @@ const SCRIPT_FILE: &str = "script.js";
 /// line, so the lines of an error are the lines of the script.
 const MAIN_OPEN: &str = "(async function main() {";
 const MAIN_CLOSE: &str = "\n})";
+
+/// How the prelude's `describe` renders the engine's own refused allocation.
+const ENGINE_OUT_OF_MEMORY: &str = "InternalError: out of memory";
 
 const RUNNING: u8 = 0;
 const CANCELLED: u8 = 1;
@@ -97,6 +101,7 @@ fn run(
     let deadline = Instant::now() + limits.wall_clock;
     runtime.set_interrupt_handler(Some(Box::new({
         let stopped = Arc::clone(&stopped);
+        let stop = Arc::clone(&stop);
         move || {
             if stopped.load(Ordering::Relaxed) != RUNNING {
                 return true;
@@ -125,7 +130,8 @@ fn run(
         intrinsic::WeakRef,
     )>(&runtime)
     .map_err(engine_error)?;
-    let outcome = context.with(|ctx| drive(&ctx, script, limits, answer, &stopped, deadline));
+    let outcome =
+        context.with(|ctx| drive(&ctx, script, limits, answer, &stopped, deadline, &*stop));
     // Nothing of the script may outlive this call.
     drop(context);
     drop(runtime);
@@ -139,6 +145,7 @@ fn drive<'js>(
     answer: &mut dyn FnMut(Vec<ScriptToolCall>) -> Vec<Result<String, String>>,
     stopped: &AtomicU8,
     deadline: Instant,
+    stop: &dyn Fn() -> bool,
 ) -> io::Result<ScriptOutcome> {
     let told = Rc::new(RefCell::new(Told::default()));
 
@@ -189,9 +196,9 @@ fn drive<'js>(
                 return Ok(ScriptOutcome::Failed { error });
             }
         };
-    if run.call::<_, JsValue>((main,)).is_err() {
+    let Ok(running) = run.call::<_, Promise>((main,)) else {
         return ended_early(ctx, stopped, limits);
-    }
+    };
 
     loop {
         while ctx.execute_pending_job() {
@@ -208,12 +215,19 @@ fn drive<'js>(
         let batch = std::mem::take(&mut told.borrow_mut().started);
         if batch.is_empty() {
             return Ok(ScriptOutcome::Failed {
-                error: "the script is waiting on a promise that nothing will resolve".to_string(),
+                error: why_nothing_is_left(ctx, &running, limits),
             });
         }
 
         let (numbers, calls): (Vec<u32>, Vec<ScriptToolCall>) = batch.into_iter().unzip();
         let answers = answer(calls);
+        // A cancel takes precedence over the deadline, as in the interrupt
+        // handler.
+        if stop() {
+            stopped
+                .compare_exchange(RUNNING, CANCELLED, Ordering::Relaxed, Ordering::Relaxed)
+                .ok();
+        }
         if Instant::now() >= deadline {
             stopped
                 .compare_exchange(RUNNING, OUT_OF_TIME, Ordering::Relaxed, Ordering::Relaxed)
@@ -232,6 +246,39 @@ fn drive<'js>(
             }
         }
     }
+}
+
+/// The script has no outcome and no call waiting. If the prelude's `run`
+/// rejected, the prelude itself failed while reporting; otherwise the script is
+/// waiting on something that will never settle.
+fn why_nothing_is_left(ctx: &Ctx<'_>, running: &Promise<'_>, limits: ScriptEngineLimits) -> String {
+    if running.state() != PromiseState::Rejected {
+        return "the script is waiting on a promise that nothing will resolve".to_string();
+    }
+    let reason: JsValue = match running.result::<JsValue>() {
+        Some(Err(_)) => ctx.catch(),
+        _ => return "The script broke the functions it runs on".to_string(),
+    };
+    let out_of_memory = reason.as_object().is_some_and(|error| {
+        error
+            .get::<_, String>("name")
+            .is_ok_and(|name| name == "InternalError")
+            && error
+                .get::<_, String>("message")
+                .is_ok_and(|message| message == "out of memory")
+    });
+    if out_of_memory {
+        memory_message(limits)
+    } else {
+        "The script broke the functions it runs on".to_string()
+    }
+}
+
+fn memory_message(limits: ScriptEngineLimits) -> String {
+    format!(
+        "the script used more than {} MiB",
+        limits.memory_bytes / (1024 * 1024)
+    )
 }
 
 /// The script was stopped: say why.
@@ -274,12 +321,9 @@ fn ended_early(
 /// it was.
 fn name_the_memory_limit(outcome: ScriptOutcome, limits: ScriptEngineLimits) -> ScriptOutcome {
     match outcome {
-        ScriptOutcome::Failed { error } if error.contains("out of memory") => {
+        ScriptOutcome::Failed { error } if error.starts_with(ENGINE_OUT_OF_MEMORY) => {
             ScriptOutcome::Failed {
-                error: format!(
-                    "the script used more than {} MiB",
-                    limits.memory_bytes / (1024 * 1024)
-                ),
+                error: memory_message(limits),
             }
         }
         other => other,
