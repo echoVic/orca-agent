@@ -92,7 +92,9 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
         cwd,
         mcp_registry,
         cancel,
-        // The script's time is up inside a tool call as much as outside one.
+        // A tool that asks whether to stop is told to once the script's time
+        // is up. Of the four, only `read_file` asks; the others run to their
+        // own end, so the script is stopped when such a call returns.
         deadline: Instant::now() + wall_clock,
     };
     let mut calls = ScriptToolCalls::new(
