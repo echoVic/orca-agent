@@ -3783,7 +3783,9 @@ fn append_message_lines(
                     theme,
                 );
             } else if let Some(out) = output {
-                if name == crate::script_run::SCRIPT_TOOL {
+                // While its arguments arrive, a script's row is any tool's:
+                // its output says how much has come.
+                if name == crate::script_run::SCRIPT_TOOL && status != "receiving" {
                     append_script_run_lines(lines, out, *expanded, force_expand, theme);
                 } else if !is_workflow_draft_tool(name)
                     || !append_workflow_draft_preview_lines(
@@ -4255,7 +4257,7 @@ fn append_script_run_lines(
     let tail = if total > shown {
         format!("{shown} of {total} lines shown · ctrl+o to collapse")
     } else {
-        format!("{total} lines · ctrl+o to collapse")
+        format!("{} · ctrl+o to collapse", line_count(total))
     };
     lines.push(Line::from(vec![
         Span::styled(TAIL_ROW.to_string(), theme.dim_style()),
@@ -9911,7 +9913,6 @@ mod tests {
     #[test]
     fn a_collapsed_script_row_is_its_first_line_and_a_way_to_open_it() {
         let text = message_text(None, &script_row("completed", Some(SCRIPT_BODY), false));
-        eprintln!("{}", text.join("\n"));
         assert_eq!(text.len(), 2, "{text:?}");
         assert!(
             text[0].contains("run_script") && text[0].contains("3 tool calls · 412ms"),
@@ -9930,7 +9931,6 @@ mod tests {
     #[test]
     fn an_expanded_script_row_shows_every_section() {
         let text = message_text(None, &script_row("completed", Some(SCRIPT_BODY), true));
-        eprintln!("{}", text.join("\n"));
         let wanted = [
             "Script",
             " 1 │ const a = 1;",
@@ -10048,6 +10048,32 @@ mod tests {
                 "    └ 3 lines · ctrl+o to collapse",
             ]
         );
+    }
+
+    #[test]
+    fn a_script_row_receiving_its_arguments_is_drawn_as_any_tools_row() {
+        let output = "receiving arguments... 1 KB";
+        let script = message_text(
+            None,
+            &tool_call("run_script", None, "receiving", Some(output), false),
+        );
+        let other = message_text(
+            None,
+            &tool_call("read_file", None, "receiving", Some(output), false),
+        );
+
+        assert_eq!(script[1..], ["    │ receiving arguments... 1 KB"]);
+        assert_eq!(script[1..], other[1..]);
+    }
+
+    #[test]
+    fn an_expanded_one_line_script_row_says_one_line() {
+        let text = message_text(
+            None,
+            &script_row("completed", Some("Returned to the model · 0 B"), true),
+        );
+
+        assert_eq!(text.last().unwrap(), "    └ 1 line · ctrl+o to collapse");
     }
 
     fn shell_result(output: &str, exit_code: i64) -> String {
