@@ -7,6 +7,7 @@
 //! ([`calls`]). Only what the script returns goes back to the model.
 
 pub(crate) mod calls;
+pub mod engine;
 pub mod host;
 
 use std::io;

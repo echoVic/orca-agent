@@ -45,6 +45,9 @@ pulldown-cmark = { version = "0.13", default-features = false }
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 zstd = "0.14"
+# QuickJS, for `run_script`. Default features only: `rust-alloc` and
+# `allocator` turn the engine's memory limit into a no-op.
+rquickjs = "0.14"
 similar = "3.1.1"
 tempfile = "3.27.0"
 sha2 = "0.11"
