@@ -78,7 +78,7 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
         _ => return ToolResult::invalid_input(request, "run_script needs a non-empty `script`"),
     };
 
-    let wall_clock = Duration::from_secs(settings.timeout_secs.max(1));
+    let wall_clock = script_wall_clock(settings.timeout_secs);
     let executor = ReadOnlyToolExecutor {
         cwd,
         mcp_registry,
@@ -145,6 +145,15 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
     }
 }
 
+/// The longest a script may run, whatever `timeout_secs` says.
+const MAX_SCRIPT_WALL_CLOCK_SECS: u64 = 24 * 60 * 60;
+
+/// How long a script may run: `timeout_secs`, at least a second and at most a
+/// day, so that adding it to now cannot overflow.
+fn script_wall_clock(timeout_secs: u64) -> Duration {
+    Duration::from_secs(timeout_secs.clamp(1, MAX_SCRIPT_WALL_CLOCK_SECS))
+}
+
 /// Runs a script's tool call the way a read the model asked for is run in a
 /// read-only batch: no extra roots, no external tools, the read-only profile.
 struct ReadOnlyToolExecutor<'a> {
@@ -170,5 +179,19 @@ impl ScriptToolExecutor for ReadOnlyToolExecutor<'_> {
             None,
             || self.cancel.is_cancelled() || Instant::now() >= self.deadline,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scripts_wall_clock_is_at_least_a_second_and_at_most_a_day() {
+        assert_eq!(script_wall_clock(0), Duration::from_secs(1));
+        assert_eq!(script_wall_clock(60), Duration::from_secs(60));
+        assert_eq!(script_wall_clock(u64::MAX), Duration::from_secs(86_400));
+        // The largest setting still makes a deadline.
+        let _ = Instant::now() + script_wall_clock(u64::MAX);
     }
 }

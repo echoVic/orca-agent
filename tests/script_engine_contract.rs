@@ -596,3 +596,231 @@ fn running_out_of_memory_while_results_are_delivered_names_the_limit() {
     assert_eq!(batches.len(), 1);
     assert_eq!(error_of(outcome), "the script used more than 8 MiB");
 }
+
+/// Says to stop once `after` has passed: a cancel that comes while the
+/// script runs, without a thread to send it.
+fn cancel_after(after: Duration) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    let started = Instant::now();
+    Arc::new(move || started.elapsed() >= after)
+}
+
+/// Runs `script` with no tool calls and returns how it ended and how long
+/// that took.
+fn run_timed(
+    script: &str,
+    limits: ScriptEngineLimits,
+    stop: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> (io::Result<ScriptOutcome>, Duration) {
+    let started = Instant::now();
+    let result = ScriptEngine::run(
+        script,
+        limits,
+        &mut |calls| calls.iter().map(|_| Ok(String::new())).collect(),
+        stop,
+    );
+    (result, started.elapsed())
+}
+
+/// Each script loops inside one of QuickJS's native functions, where the
+/// interrupt handler is never asked, and asserts it is still stopped at its
+/// wall clock and by a cancel.
+fn assert_native_loop_is_stopped(script: &str) {
+    let (timed_out, took) = run_timed(
+        script,
+        ScriptEngineLimits {
+            wall_clock: Duration::from_millis(400),
+            ..limits()
+        },
+        never(),
+    );
+    assert_eq!(
+        error_of(timed_out.expect("the script engine ran")),
+        "the script ran longer than 400ms and was stopped",
+        "{script}"
+    );
+    assert!(took < Duration::from_secs(5), "{script}: {took:?}");
+
+    let (cancelled, took) = run_timed(script, limits(), cancel_after(Duration::from_millis(300)));
+    let error = cancelled.expect_err("a cancelled script is not an outcome");
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{script}");
+    assert!(took < Duration::from_secs(5), "{script}: {took:?}");
+
+    let (after, _) = run("return 1 + 1;", |_| Ok(String::new()));
+    assert_eq!(output_of(after), "2", "after {script}");
+}
+
+#[test]
+fn a_script_in_a_native_loop_that_never_ends_is_stopped_and_left_behind() {
+    // These loops run for hours or longer (`indexOf` at these sizes compares
+    // about 2**46 characters), and QuickJS does not ask the interrupt handler
+    // inside them. Each script is stopped and its engine thread is left
+    // behind, busy, for the rest of this test process: six threads in all.
+    for script in [
+        r#"return Array.prototype.join.call({ length: 2 ** 53 - 1 }, "");"#,
+        "return [].reverse.call({ length: 2 ** 53 - 1 });",
+        r#"return "a".repeat(2 ** 24).indexOf("a".repeat(2 ** 23) + "b");"#,
+    ] {
+        assert_native_loop_is_stopped(script);
+    }
+}
+
+#[test]
+fn a_script_in_a_long_native_loop_is_stopped_at_its_wall_clock() {
+    // This one ends after some seconds, and its engine thread with it.
+    assert_native_loop_is_stopped(r#"return new Array(2 ** 26).join("").length;"#);
+}
+
+#[test]
+fn a_scripts_stack_does_not_depend_on_the_callers() {
+    // The engine runs on a thread of its own, so a caller with a small stack
+    // still gets a `RangeError` in the script rather than an overflow of its
+    // own stack.
+    let outcome = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            run(
+                "const down = () => down(); try { down(); return \"returned\"; } catch (error) { return String(error); }",
+                |_| Ok(String::new()),
+            )
+            .0
+        })
+        .expect("a thread with a small stack")
+        .join()
+        .expect("the caller's thread did not overflow");
+
+    let caught = output_of(outcome);
+    assert!(caught.contains("RangeError"), "{caught}");
+    assert!(caught.contains("call stack"), "{caught}");
+}
+
+#[test]
+fn a_script_that_replaces_object_prototype_members_breaks_only_itself() {
+    let (unshowable, _) = run(
+        r#"Object.prototype.toString = () => { throw new Error("mine"); };
+           throw {};"#,
+        |_| Ok(String::new()),
+    );
+    let (never_settles, _) = run(
+        r#"Object.prototype.then = function () {};
+           return { ok: true };"#,
+        |_| Ok(String::new()),
+    );
+    let (replaced_json, calls) = run(
+        r#"Object.prototype.toJSON = function () { return "replaced"; };
+           const text = await tools.read_file({ path: "a" });
+           return { text };"#,
+        |_| Ok("fine".to_string()),
+    );
+    let (after, _) = run(
+        r#"return [await tools.read_file({ path: "a" }), String({}), JSON.stringify({ a: 1 })];"#,
+        |_| Ok("fine".to_string()),
+    );
+
+    assert_eq!(
+        error_of(unshowable),
+        "The script threw a value that cannot be shown"
+    );
+    assert_eq!(
+        error_of(never_settles),
+        "the script is waiting on a promise that nothing will resolve"
+    );
+    assert_eq!(output_of(replaced_json), "\"replaced\"");
+    assert_eq!(calls[0].arguments, json!("replaced"));
+    assert_eq!(
+        output_of(after),
+        "[\n  \"fine\",\n  \"[object Object]\",\n  \"{\\\"a\\\":1}\"\n]"
+    );
+}
+
+/// A script that closes the function it is the body of and loops at the top
+/// level, where it runs while it is compiled and evaluated.
+const BREAKS_OUT_AND_LOOPS: &str = "}); while (true) {} (async function () {";
+
+#[test]
+fn a_script_that_breaks_out_of_its_function_is_still_stopped_at_the_wall_clock() {
+    let (outcome, took) = run_timed(
+        BREAKS_OUT_AND_LOOPS,
+        ScriptEngineLimits {
+            wall_clock: Duration::from_millis(400),
+            ..limits()
+        },
+        never(),
+    );
+
+    assert_eq!(
+        error_of(outcome.expect("the script engine ran")),
+        "the script ran longer than 400ms and was stopped"
+    );
+    assert!(took < Duration::from_secs(5), "{took:?}");
+}
+
+#[test]
+fn a_script_that_breaks_out_of_its_function_is_still_cancelled() {
+    let (result, took) = run_timed(
+        BREAKS_OUT_AND_LOOPS,
+        limits(),
+        cancel_after(Duration::from_millis(300)),
+    );
+
+    let error = result.expect_err("a cancelled script is not an outcome");
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert!(took < Duration::from_secs(5), "{took:?}");
+}
+
+#[test]
+fn a_script_cannot_replace_how_stacks_are_prepared() {
+    // A function set here would be handed every frame beneath an error, the
+    // engine's own functions among them.
+    let (outcome, _) = run(
+        r#"let frames = null;
+           Error.prepareStackTrace = (error, callSites) => { frames = callSites; return "replaced"; };
+           const stack = new Error("x").stack;
+           return [typeof Error.prepareStackTrace, frames === null, stack !== "replaced", stack.includes("script.js")];"#,
+        |_| Ok(String::new()),
+    );
+    let (thrown, _) = run(
+        "Error.prepareStackTrace = () => \"replaced\";\nthrow new Error(\"boom\");",
+        |_| Ok(String::new()),
+    );
+
+    assert_eq!(
+        output_of(outcome),
+        "[\n  \"undefined\",\n  true,\n  true,\n  true\n]"
+    );
+    let thrown = error_of(thrown);
+    assert!(thrown.starts_with("Error: boom (script.js:2:"), "{thrown}");
+}
+
+#[test]
+fn returning_ends_the_script_even_while_a_chain_it_started_goes_on() {
+    let started = Instant::now();
+    let (outcome, _) = run(
+        r#"(async () => { for (;;) await 0; })(); return "done";"#,
+        |_| Ok(String::new()),
+    );
+
+    assert_eq!(output_of(outcome), "done");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn a_script_that_finishes_after_a_cancel_or_its_time_is_stopped() {
+    // Too short for QuickJS to ask the interrupt handler: the script reaches
+    // its end, but the cancel, or the end of its time, came first.
+    let (cancelled, _) = run_timed("return 1 + 1;", limits(), Arc::new(|| true));
+    let (late, _) = run_timed(
+        "return 1 + 1;",
+        ScriptEngineLimits {
+            wall_clock: Duration::ZERO,
+            ..limits()
+        },
+        never(),
+    );
+
+    let error = cancelled.expect_err("a cancelled script is not an outcome");
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(
+        error_of(late.expect("the script engine ran")),
+        "the script ran longer than 0s and was stopped"
+    );
+}

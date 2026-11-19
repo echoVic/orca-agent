@@ -1,6 +1,16 @@
 (function (startCall, finish, firstLineShift) {
   "use strict";
 
+  // A function set here is handed the frames of the calls beneath the error,
+  // and each frame's function: the prelude's own among them. Nothing else in
+  // the engine hands out frames.
+  Object.defineProperty(Error, "prepareStackTrace", {
+    value: undefined,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+
   // Taken before the script runs: a script that replaces these breaks only
   // what it does with them itself.
   const { stringify } = JSON;
