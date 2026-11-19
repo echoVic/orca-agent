@@ -1,10 +1,11 @@
 //! `run_script`: JavaScript the model writes that calls read-only tools
 //! itself, so one model round does the work of several.
 //!
-//! The script runs in a confined Node process ([`host`]). It has no access of
-//! its own: each tool call it makes comes to the runtime, which decides
-//! whether to run it and runs it the way it runs a read the model asked for
-//! ([`calls`]). Only what the script returns goes back to the model.
+//! The script runs inside Orca, in a QuickJS created for it and dropped after
+//! it ([`engine`]). It has no access of its own: each tool call it makes
+//! comes to the runtime, which decides whether to run it and runs it the way
+//! it runs a read the model asked for ([`calls`]). Only what the script
+//! returns goes back to the model.
 
 pub(crate) mod calls;
 pub mod engine;
@@ -12,8 +13,8 @@ pub mod host;
 
 use std::io;
 use std::path::Path;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
@@ -26,16 +27,13 @@ use orca_mcp::McpRegistry;
 use serde::Deserialize;
 
 use self::calls::{SCRIPT_TOOL_OUTPUT_BYTES, ScriptToolCalls, ScriptToolExecutor};
-use self::host::{ScriptHost, ScriptHostLimits, ScriptHostOutcome};
+use self::engine::{ScriptEngine, ScriptEngineLimits, ScriptOutcome};
 use crate::hooks::HookRunner;
 use crate::runtime_tool_call::READONLY_TOOL_TIMEOUT_SECS;
 use crate::workflow::host::WorkflowHost;
 
-/// The longest line the script host may send: one tool call or the result.
-const MAX_SCRIPT_HOST_LINE_BYTES: usize = 1024 * 1024;
-
-/// Whether this machine has a Node to run scripts on. Asked once: the answer
-/// decides what a session advertises, and that must not change mid-session.
+/// Whether this machine has a Node. Scripts no longer need one; this is still
+/// what decides whether the tool is offered until that is taken out too.
 pub(crate) fn node_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(WorkflowHost::node_available)
@@ -82,13 +80,6 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
             None,
         );
     }
-    if !node_available() {
-        return ToolResult::failed(
-            request,
-            "run_script needs Node.js, which was not found on this machine",
-            None,
-        );
-    }
     let script = match serde_json::from_str::<RunScriptArguments>(
         request.raw_arguments.as_deref().unwrap_or("{}"),
     ) {
@@ -96,10 +87,13 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
         _ => return ToolResult::invalid_input(request, "run_script needs a non-empty `script`"),
     };
 
+    let wall_clock = Duration::from_secs(settings.timeout_secs.max(1));
     let executor = ReadOnlyToolExecutor {
         cwd,
         mcp_registry,
         cancel,
+        // The script's time is up inside a tool call as much as outside one.
+        deadline: Instant::now() + wall_clock,
     };
     let mut calls = ScriptToolCalls::new(
         &request.id,
@@ -109,6 +103,7 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
         cancel,
         &executor,
         settings.max_tool_calls,
+        config.tools.max_read_parallel,
     );
     // What the person watching sees of the script: its calls, as they end.
     let mut show = |line: String| {
@@ -117,18 +112,21 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
         }
     };
 
-    let outcome = ScriptHost::run(
+    let outcome = ScriptEngine::run(
         &script,
-        ScriptHostLimits {
-            wall_clock: Duration::from_secs(settings.timeout_secs.max(1)),
-            max_line_bytes: MAX_SCRIPT_HOST_LINE_BYTES,
+        ScriptEngineLimits {
+            wall_clock,
+            memory_bytes: settings.memory_limit_bytes(),
         },
-        &mut |call| {
-            let answer = calls.answer(call);
+        &mut |batch| {
+            let answers = calls.answer(batch);
             calls.drain_report().into_iter().for_each(&mut show);
-            answer
+            answers
         },
-        &|| cancel.is_cancelled(),
+        Arc::new({
+            let cancel = cancel.clone();
+            move || cancel.is_cancelled()
+        }),
     );
     let made = calls.made();
     show(format!(
@@ -137,12 +135,12 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
     ));
 
     match outcome {
-        Ok(ScriptHostOutcome::Completed { output }) => {
+        Ok(ScriptOutcome::Completed { output }) => {
             let (output, truncated) =
                 truncate_output_with_policy(output, config.tools.output_truncation);
             ToolResult::completed(request, output, truncated)
         }
-        Ok(ScriptHostOutcome::Failed { error }) => ToolResult::failed(request, error, None),
+        Ok(ScriptOutcome::Failed { error }) => ToolResult::failed(request, error, None),
         Err(error) if error.kind() == io::ErrorKind::Interrupted => {
             ToolResult::cancelled(request, "the script was cancelled", None)
         }
@@ -160,6 +158,8 @@ struct ReadOnlyToolExecutor<'a> {
     cwd: &'a Path,
     mcp_registry: &'a McpRegistry,
     cancel: &'a CancelToken,
+    /// When the script that makes the call runs out of time.
+    deadline: Instant,
 }
 
 impl ScriptToolExecutor for ReadOnlyToolExecutor<'_> {
@@ -175,7 +175,7 @@ impl ScriptToolExecutor for ReadOnlyToolExecutor<'_> {
             None,
             orca_core::capability::ExecutionProfile::ReadOnly,
             None,
-            || self.cancel.is_cancelled(),
+            || self.cancel.is_cancelled() || Instant::now() >= self.deadline,
         )
     }
 }

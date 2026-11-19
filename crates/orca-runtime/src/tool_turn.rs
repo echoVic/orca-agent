@@ -3068,9 +3068,6 @@ mod tests {
 
     #[test]
     fn run_script_reads_a_real_file_and_returns_only_what_the_script_computed() {
-        if !crate::script::node_available() {
-            return;
-        }
         let cwd = tempfile::tempdir().expect("cwd");
         std::fs::write(cwd.path().join("notes.txt"), "alpha\nbeta marker\ngamma\n")
             .expect("write file");
@@ -3104,9 +3101,6 @@ mod tests {
 
     #[test]
     fn a_script_cannot_write_or_read_outside_the_workspace() {
-        if !crate::script::node_available() {
-            return;
-        }
         let parent = tempfile::tempdir().expect("parent");
         let cwd = parent.path().join("workspace");
         std::fs::create_dir(&cwd).expect("workspace");
@@ -3134,9 +3128,6 @@ mod tests {
 
     #[test]
     fn a_long_script_result_is_cut_like_any_tool_output() {
-        if !crate::script::node_available() {
-            return;
-        }
         let cwd = tempfile::tempdir().expect("cwd");
 
         let (message, _) = run_script_turn(
@@ -3155,9 +3146,6 @@ mod tests {
 
     #[test]
     fn a_script_stops_at_its_tool_call_limit_and_can_still_answer() {
-        if !crate::script::node_available() {
-            return;
-        }
         let cwd = tempfile::tempdir().expect("cwd");
         std::fs::write(cwd.path().join("a.txt"), "a").expect("write file");
         let mut config = config_with_scripts_on();
