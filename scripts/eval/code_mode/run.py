@@ -47,7 +47,8 @@ def run_once(binary: str, home: Path, cwd: str, mode: str, prompt: str, timeout:
         done = subprocess.run(
             [binary, "exec", "--mode", mode, "--output-format", "jsonl",
              "--cwd", cwd, "--no-history", prompt],
-            # Closed, or a plan-mode run waits on it and never ends.
+            # Closed: exec reads a stdin that is not a terminal to its end as
+            # more of the prompt, and an open pipe has no end.
             stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=timeout, env=env,
         )
