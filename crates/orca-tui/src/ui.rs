@@ -3783,7 +3783,9 @@ fn append_message_lines(
                     theme,
                 );
             } else if let Some(out) = output {
-                if !is_workflow_draft_tool(name)
+                if name == crate::script_run::SCRIPT_TOOL {
+                    append_script_run_lines(lines, out, *expanded, force_expand, theme);
+                } else if !is_workflow_draft_tool(name)
                     || !append_workflow_draft_preview_lines(
                         lines,
                         out,
@@ -4200,6 +4202,65 @@ fn is_tool_image_marker(line: &str) -> bool {
                 && count.bytes().all(|byte| byte.is_ascii_digit())
                 && count.parse::<usize>().is_ok_and(|count| count > 0)
         })
+}
+
+/// How many rows of an expanded script run the live pane shows. A run is
+/// opened to be read through, so far more than a tool's output gets.
+const SCRIPT_RUN_LIVE_ROWS: usize = 200;
+
+/// A script run under its first line: nothing but a way to open it when
+/// collapsed; the script, the calls and what went back when expanded.
+fn append_script_run_lines(
+    lines: &mut Vec<Line<'static>>,
+    body: &str,
+    expanded: bool,
+    force_expand: bool,
+    theme: &Theme,
+) {
+    let body = crate::terminal_output::printable_output(body);
+    let total = body.lines().count();
+    if total == 0 {
+        return;
+    }
+    if !(expanded || force_expand) {
+        lines.push(Line::from(vec![
+            Span::styled(TAIL_ROW.to_string(), theme.dim_style()),
+            Span::styled(
+                format!("+{} · click or ctrl+o to expand", line_count(total)),
+                theme.muted_style(),
+            ),
+        ]));
+        return;
+    }
+    let shown = if force_expand {
+        usize::MAX
+    } else {
+        SCRIPT_RUN_LIVE_ROWS
+    };
+    let rail = Span::styled("    │ ".to_string(), theme.dim_style());
+    for line in body.lines().take(shown) {
+        let style = if crate::script_run::is_section_title(line) {
+            Style::default().fg(theme.text)
+        } else {
+            theme.muted_style()
+        };
+        lines.push(Line::from(vec![
+            rail.clone(),
+            Span::styled(line.to_string(), style),
+        ]));
+    }
+    if force_expand {
+        return;
+    }
+    let tail = if total > shown {
+        format!("{shown} of {total} lines shown · ctrl+o to collapse")
+    } else {
+        format!("{total} lines · ctrl+o to collapse")
+    };
+    lines.push(Line::from(vec![
+        Span::styled(TAIL_ROW.to_string(), theme.dim_style()),
+        Span::styled(tail, theme.muted_style()),
+    ]));
 }
 
 fn append_tool_output_lines(
@@ -9821,6 +9882,152 @@ mod tests {
             text.last().unwrap(),
             "    └ 40 of 60 lines shown · ctrl+o to collapse"
         );
+    }
+
+    const SCRIPT_BODY: &str = "Script\n 1 │ const a = 1;\n 2 │ return a;\nCalls\n  1   grep {\"pattern\":\"TODO\"} · ok · 12ms · 2.1 KiB\n          src/a.rs:3: // TODO remove\n  2 ┬ read_file {\"path\":\"a.rs\"} · ok · 3ms · 1.2 KiB\n  3 └ read_file {\"path\":\"c.rs\"} · failed · 1ms\n          c.rs does not exist\nReturned to the model · 1 B\n 2";
+
+    fn script_row(status: &str, output: Option<&str>, expanded: bool) -> ChatMessage {
+        tool_call(
+            "run_script",
+            Some("3 tool calls · 412ms"),
+            status,
+            output,
+            expanded,
+        )
+    }
+
+    fn script_row_lines(message: &ChatMessage, force_expand: bool) -> Vec<Line<'static>> {
+        build_lines_for_message_after(
+            None,
+            message,
+            &Theme::named(ThemeName::Dark),
+            80,
+            0,
+            force_expand,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_collapsed_script_row_is_its_first_line_and_a_way_to_open_it() {
+        let text = message_text(None, &script_row("completed", Some(SCRIPT_BODY), false));
+        eprintln!("{}", text.join("\n"));
+        assert_eq!(text.len(), 2, "{text:?}");
+        assert!(
+            text[0].contains("run_script") && text[0].contains("3 tool calls · 412ms"),
+            "{text:?}"
+        );
+        assert!(
+            text[1].contains("+11 lines · click or ctrl+o to expand"),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().all(|row| !row.contains("const a = 1;")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn an_expanded_script_row_shows_every_section() {
+        let text = message_text(None, &script_row("completed", Some(SCRIPT_BODY), true));
+        eprintln!("{}", text.join("\n"));
+        let wanted = [
+            "Script",
+            " 1 │ const a = 1;",
+            "Calls",
+            "  2 ┬ read_file",
+            "Returned to the model · 1 B",
+        ];
+        let mut from = 1;
+        for want in wanted {
+            let at = text[from..]
+                .iter()
+                .position(|row| row.contains(want))
+                .unwrap_or_else(|| panic!("{want:?} missing after row {from}: {text:?}"));
+            from += at + 1;
+        }
+        assert!(
+            text.last()
+                .unwrap()
+                .contains("11 lines · ctrl+o to collapse"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn section_titles_are_drawn_in_the_text_colour_and_the_rest_muted() {
+        let theme = Theme::named(ThemeName::Dark);
+        let lines = script_row_lines(&script_row("completed", Some(SCRIPT_BODY), true), false);
+        let span_of = |content: &str| {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content.as_ref() == content)
+                .unwrap_or_else(|| panic!("no span holding {content:?}"))
+                .clone()
+        };
+        assert_eq!(span_of("Script").style.fg, Some(theme.text));
+        assert_eq!(span_of(" 1 │ const a = 1;").style, theme.muted_style());
+    }
+
+    #[test]
+    fn a_long_expanded_script_row_is_capped_in_the_live_pane_and_whole_when_flushed() {
+        let body = (1..=300)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = script_row("completed", Some(&body), true);
+        let live = lines_text(&script_row_lines(&message, false));
+        assert_eq!(live.len(), 1 + 200 + 1, "{}", live.len());
+        assert!(
+            live.last()
+                .unwrap()
+                .contains("200 of 300 lines shown · ctrl+o to collapse"),
+            "{:?}",
+            live.last()
+        );
+        let flushed = lines_text(&script_row_lines(&message, true));
+        assert_eq!(flushed.len(), 1 + 300);
+        assert!(flushed.last().unwrap().contains("line 300"));
+        assert!(flushed.iter().all(|row| !row.starts_with("    └ ")));
+    }
+
+    #[test]
+    fn a_running_script_row_with_nothing_yet_is_one_row() {
+        let text = message_text(None, &script_row("running", None, false));
+        assert_eq!(text.len(), 1, "{text:?}");
+    }
+
+    #[test]
+    fn another_tools_row_is_drawn_as_before_script_row_neighbour() {
+        let text = message_text(
+            None,
+            &tool_call(
+                "read_file",
+                Some("src/main.rs"),
+                "completed",
+                Some("l1\nl2\nl3"),
+                false,
+            ),
+        );
+        assert_eq!(text[1], "    │ l1");
+        assert_eq!(text[2], "    │ l2");
+        assert_eq!(text[3], "    └ +1 line · ctrl+o to expand");
+    }
+
+    #[test]
+    fn a_script_row_draws_no_raw_escape_or_carriage_return() {
+        let body = "Script\n 1 │ \x1b[31mred\x1b[0m\n 2 │ a\rb";
+        for expanded in [false, true] {
+            let lines = script_row_lines(&script_row("completed", Some(body), expanded), false);
+            for span in lines.iter().flat_map(|line| line.spans.iter()) {
+                assert!(
+                    !span.content.contains('\x1b') && !span.content.contains('\r'),
+                    "{:?}",
+                    span.content
+                );
+            }
+        }
     }
 
     fn shell_result(output: &str, exit_code: i64) -> String {
