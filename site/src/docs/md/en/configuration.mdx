@@ -253,13 +253,14 @@ The upload makes `read_document` a network call, like `web_search` and `web_fetc
 enabled = true
 timeout_secs = 60      # how long one script may run
 max_tool_calls = 100   # how many tool calls one script may make
-memory_limit_mb = 64   # how much memory one script may hold
+memory_limit_mb = 64   # how much memory one script may hold; never less than 8
 ```
 
 A script can call `read_file`, `glob`, `grep` and `git_status`, and nothing else. It cannot write, run commands or reach the network, so it needs no approval and works in plan mode, the same as calling those four tools directly. `PreToolUse` hooks run for each call a script makes.
 
 - The script runs inside Orca, in a JavaScript engine that has no file, network or process access of its own; every read goes through Orca's own tools. Nothing needs to be installed.
 - Calls a script starts together, as with `Promise.all`, run at the same time, up to `max_read_parallel` at once.
+- A script can run past `timeout_secs` while a call it made is still running: `read_file` stops when the time is up, but `glob`, `grep` and `git_status` run to their end (`grep` and `git_status` have 120-second limits of their own), and the script is stopped when they return. Calls not yet started when the time is up are not started.
 - Nothing is kept between scripts.
 - While a script runs, Orca shows each call it makes and how it ended. The model sees only the script's result, cut at the usual tool output limit.
 - A script counts as one tool call in a budget, however many calls it makes itself.

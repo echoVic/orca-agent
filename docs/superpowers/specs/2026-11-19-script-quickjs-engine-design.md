@@ -84,19 +84,32 @@ impl ScriptEngine {
 
 A cancelled script is an `Interrupted` error, as it is today.
 
-For one script the engine:
+For one script the engine starts a thread of its own, named `orca-script`,
+with a 2 MiB stack, and on it:
 
-1. creates a runtime on the calling thread, sets the memory limit, installs
-   an interrupt handler that stops the script when `stop` says so or the wall
-   clock has passed, and creates a context holding the language's own
-   built-ins and none of the engine's extras (`performance`, `atob`, `btoa`,
-   `DOMException`);
+1. creates a runtime with the engine's own allocator, which enforces the
+   memory limit (see "Limits"), sets the script's stack limit to 256 KiB,
+   installs an interrupt handler that stops the script when `stop` says so
+   or the wall clock has passed, and creates a context holding the
+   language's own built-ins and none of the engine's extras (`performance`,
+   `atob`, `btoa`, `DOMException`);
 2. evaluates the prelude (below);
 3. compiles the script as the body of an async function in a file named
    `script.js`, the body starting on line 1, so an error names the line of
    the script as the model wrote it;
 4. calls it and runs the loop described under "Concurrency";
 5. drops the context and the runtime.
+
+The calling thread answers the batches the engine thread hands it (tools run
+there, as before) and, while the engine is busy, checks `stop` and the wall
+clock every 20 ms. The thread is there because the interrupt handler does not
+reach every loop (see "Limits"): `Array.prototype.join` on an object whose
+`length` is `2 ** 53` runs inside one native call and never asks it. When the
+script must stop, the caller records why (a cancel wins over the clock),
+gives the engine 200 ms to notice and end, and then returns the stopped
+outcome without waiting for it. An engine thread still busy then is left
+behind: it is not joined, it can hand nothing more to the caller, and it
+ends when the native call returns, or when Orca exits.
 
 Nothing is injected but what the prelude installs. The engine has no file,
 network, process or timer API to take away.
@@ -127,8 +140,14 @@ The prelude takes `JSON.parse`, `JSON.stringify`, `Promise`, `Error` and
 only itself; a script that breaks them so far that the prelude throws fails
 with "The script broke the functions it runs on".
 
+The prelude also fixes `Error.prepareStackTrace` as `undefined`, neither
+writable nor configurable. A function set there would be handed the frames
+beneath an error, each with its function, the prelude's own among them; with
+it fixed, a stack is only text.
+
 The engine keeps one prelude function, `deliver(number, ok, text)`, to
-resolve or reject a call.
+resolve or reject a call. The native `finish` keeps the first outcome it is
+given and ignores any later one.
 
 ## Concurrency
 
@@ -136,8 +155,10 @@ The engine never runs a tool. It runs the script until the script can go no
 further, hands over the calls that are waiting, and resumes it with their
 answers:
 
-1. Run pending jobs until there are none.
-2. If the script has finished, return its outcome.
+1. Run pending jobs until there are none or the script has said how it
+   ended.
+2. If the script has finished, return its outcome, even if jobs it started
+   are still pending.
 3. If calls were started since the last hand-over, give them to `answer` as
    one batch in the order they were started, deliver each answer in that
    order, and go to 1.
@@ -174,6 +195,12 @@ cancel waits for it too. That is how those tools behave when the model calls
 them directly. Making them stop on the probe changes the tools themselves
 and is not part of this stage.
 
+A worker asks the executor's `stopped()` (the same question) before it
+starts each call. Once the script is stopped, the calls of the batch not yet
+started are not started: each is answered as failed with "the script was
+stopped before this call started" and takes no time. Calls already running
+finish.
+
 ## Limits
 
 | Limit | Default | When reached |
@@ -181,21 +208,46 @@ and is not part of this stage.
 | Wall clock for one script | 60 s (`timeout_secs`) | script stopped; tool fails with "the script ran longer than 60s and was stopped" |
 | Inner tool calls per script | 100 (`max_tool_calls`) | the call over the limit rejects in the script; later calls reject too |
 | Bytes of one inner result | 256 KiB | the call rejects, telling the script to ask for less |
-| Memory of one script | 64 MiB (`memory_limit_mb`) | the allocation fails in the script as an out-of-memory error; uncaught, the tool fails with "the script used more than 64 MiB" |
-| Stack of one script | 256 KiB (QuickJS's default) | a `RangeError` in the script, which it may catch |
+| Memory of one script | 64 MiB (`memory_limit_mb`, never less than 8) | the allocation fails in the script; if the script then fails, whatever it threw, the tool fails with "the script used more than 64 MiB" |
+| Stack of one script | 256 KiB, set by the engine, on its own 2 MiB thread | a `RangeError` in the script, which it may catch |
+| Arguments of one inner call | 1 MiB of JSON text | the call rejects in the script with "a tool call's arguments are limited to 1 MiB" |
+| Inner calls waiting to be handed over | 1000 | the call rejects in the script with "too many tool calls are waiting; await some before starting more" |
 | Result returned to the model | `tools.output_truncation` | truncated like any tool output |
 
-The 1 MiB protocol line limit is gone with the protocol. What it bounded, a
-script building one enormous value, is bounded by the memory limit.
+The 1 MiB protocol line limit is gone with the protocol. What it bounded
+inside the script, a script building one enormous value, is bounded by the
+memory limit. What a script hands over is not: the arguments of a call are
+held outside the script's memory until the batch is handed over, so they
+have their own limits, 1 MiB for one call and 1000 calls waiting.
 
-`rquickjs` must be built without its `rust-alloc` and `allocator` features:
-with either, the memory limit is silently ignored. A test allocates past the
-limit and expects the failure, so a feature change that disables the limit
-fails the build's tests.
+The engine knows a script ran out of memory from its allocator, not from
+what the script threw. When QuickJS cannot allocate even the error it
+throws `null`, and a script can throw an `InternalError("out of memory")`
+of its own, so the text says nothing either way. The runtime is created with
+`Runtime::new_with_alloc` and an allocator of the engine's own that wraps the
+binding's `RustAllocator`. It counts what each block takes, refuses an
+allocation that would pass the limit, and sets a flag when it does.
+QuickJS's own limit is left off, so every refusal is one the allocator saw.
+A script that fails after a refusal, whether by throwing, by breaking the
+functions it runs on, or by waiting on a promise nothing will resolve, is
+reported as over the limit; a script that catches the refusal and returns
+has completed.
 
-The interrupt handler is what stops code that never yields: a `while (true)`,
-a promise chain that reschedules itself forever, a regular expression that
-backtracks without end. Stopping is not catchable by the script.
+That interface is part of `rquickjs` 0.14's default build, so no feature is
+enabled. The `allocator` feature is deprecated in 0.14 and adds nothing;
+enabling it only adds a deprecation warning. `rust-alloc` changes what
+`Runtime::new` allocates with, which the engine does not call. A test
+allocates past the limit and expects the failure, so a change that disables
+the limit fails the build's tests.
+
+The interrupt handler stops code that runs as steps of the script: a
+`while (true)`, a promise chain that reschedules itself forever, a regular
+expression that backtracks without end. QuickJS asks it between steps and
+inside a regular-expression match, not inside the native functions that
+loop on their own, such as `join`, `reverse` or `indexOf` on an object whose
+`length` is `2 ** 53`. Those the caller's thread stops: it stops waiting for
+the engine at the wall clock or the cancel, as described under "Engine".
+Neither way is catchable by the script.
 
 The binding's documentation does not say that the handler is consulted
 inside a regular-expression match. A prototype of this engine settled it:
@@ -211,10 +263,18 @@ what is done is to keep a script from reaching the states most likely to
 find one: the memory limit, the stack limit, the interrupt, and a set of
 hostile scripts in the tests (below).
 
-A Rust panic while a script runs is caught at the engine's entry and becomes
-a failed tool result. Tools run between job runs, never beneath a QuickJS
-frame, so a panic in a tool does not unwind through C. The two native
-functions the prelude calls only record what they are given.
+The engine runs on a thread of its own so that a script stuck in a native
+loop cannot hold the turn. The cost is that such a script is not ended, only
+left: its thread keeps spinning, and keeps the memory its runtime holds (up
+to the memory limit), until the native call returns or Orca exits. Some such
+calls take hours. Each script left this way costs a thread until then.
+
+A Rust panic on the engine thread is caught there and becomes a failed tool
+result, "run_script failed inside the script engine". So does a panic in
+`answer` on the calling thread, which also stops the script. Tools run on the
+calling thread while the engine thread waits for their answers, never
+beneath a QuickJS frame, so a panic in a tool does not unwind through C. The
+two native functions the prelude calls only record what they are given.
 
 A failed or stopped script has nothing to undo: every tool it can call is
 read-only.
@@ -267,9 +327,10 @@ their validators are run to confirm it.
 | Syntax error | failed: the syntax error; nothing ran |
 | Unknown tool, or a tool outside the four | that call rejects in the script |
 | Hook blocks an inner call | that call rejects in the script |
-| Wall clock passed | failed: says how long it ran |
-| Memory limit passed, uncaught | failed: says the limit |
-| Turn cancelled | cancelled |
+| A call's arguments over 1 MiB, or 1000 calls already waiting | that call rejects in the script |
+| Wall clock passed, including a script that finished after it | failed: says how long it ran |
+| Memory limit passed, and the script then fails | failed: says the limit |
+| Turn cancelled, including a script that finished after the cancel | cancelled |
 | Script waits on a promise nothing resolves | failed: says so |
 | `run_script` turned off | failed: says how to turn it on |
 | A panic in the engine | failed: "run_script failed inside the script engine" |
@@ -292,10 +353,15 @@ their validators are run to confirm it.
   sequential awaits arrive one at a time; answers delivered out of finishing
   order still resolve the right promises.
 - **Hostile scripts**: `while (true) {}`; a promise chain that reschedules
-  itself forever; unbounded recursion; allocating past the memory limit; a
-  regular expression that backtracks without end; a script that replaces
-  `Promise`, `JSON` and `Object.prototype` members. Each ends as a failed
-  result within its limit and the next script runs normally.
+  itself forever; unbounded recursion; allocating past the memory limit, in
+  large and in small pieces; a regular expression that backtracks without
+  end; `join`, `reverse` and `indexOf` on an object whose `length` is
+  `2 ** 53`; a script that closes the function it is the body of and loops
+  outside it; a script that sets `Error.prepareStackTrace`; a script that
+  replaces `Promise`, `JSON` and `Object.prototype` members. Each ends within
+  its limit and the next script runs normally. The native loops cannot be
+  ended, only left, so their test leaves threads spinning for the rest of
+  the test run.
 - **Runtime** (`calls.rs`): the existing tests, plus: three slow calls in one
   batch take about as long as one; no more than `max_read_parallel` run at
   once; a blocked call in a batch does not stop the others; report lines and
@@ -361,9 +427,14 @@ with the tool off. The runs that used it took no fewer rounds.
 Release binary on `aarch64-apple-darwin`: 71348400 bytes before, 72367760
 bytes after (1019360 more).
 
-The rule for default-on (as many right answers, fewer rounds, lower cost) is
-not met: rounds are higher with the tool on. `enabled` stays `false` by
-default.
+The comparison is inconclusive. The model chose `run_script` in 3 of the 15
+runs with it on, and each task can be answered in two or three rounds of
+`grep`, which leaves a script little to save. With three runs per cell, 53
+rounds against 57 is within the spread between runs of the same task. For
+every task the runs with the tool off came before those with it on, so a
+warmer prompt cache may have favoured the runs with it on. The data shows
+neither a saving nor a cost. `enabled` stays `false` by default because
+nothing was shown, not because the tool did worse.
 
 Nine right answers were first marked wrong by the checker, which took a file
 or an event mentioned in a sentence for one the answer listed, and line

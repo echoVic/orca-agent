@@ -228,13 +228,14 @@ deepseek_web = false   # 搜索改用 Brave 或 Exa，抓取只在本机直接�
 enabled = true
 timeout_secs = 60      # 一个脚本最多运行多久
 max_tool_calls = 100   # 一个脚本最多调用多少次工具
-memory_limit_mb = 64   # 一个脚本最多占用多少内存
+memory_limit_mb = 64   # 一个脚本最多占用多少内存；最少 8
 ```
 
 脚本只能调用 `read_file`、`glob`、`grep` 和 `git_status`。它不能写文件、不能执行命令、不能联网，所以不需要审批，在 plan 模式下也能用，和直接调用这四个工具一样。脚本的每次调用都会触发 `PreToolUse` hook。
 
 - 脚本在 Orca 进程内的 JavaScript 引擎里运行，引擎自身没有文件、网络和进程访问能力；所有读取都经过 Orca 自己的工具。不需要安装任何东西。
 - 脚本同时发起的调用（比如用 `Promise.all`）会并发执行，同时最多 `max_read_parallel` 个。
+- 脚本发起的调用还在运行时，脚本可能超过 `timeout_secs`：时间一到 `read_file` 就会停下，但 `glob`、`grep` 和 `git_status` 会运行到结束（`grep` 和 `git_status` 各自有 120 秒的上限），脚本在它们返回时停止。时间到时还没开始的调用不再开始。
 - 脚本之间不保留任何状态。
 - 脚本运行时，Orca 会显示它的每次调用和结果。模型只看到脚本的返回值，超出工具输出上限的部分照常截断。
 - 不管脚本自己调用了多少次工具，在预算里它只算一次工具调用。
