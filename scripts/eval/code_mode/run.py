@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -41,9 +42,27 @@ def make_home(source: Path, scripts_on: bool) -> Path:
     for name in ("auth.json", "config.toml"):
         if (source / name).exists():
             shutil.copy2(source / name, home / name)
-    with open(home / "config.toml", "a", encoding="utf-8") as config:
-        config.write(f"\n[tools.script]\nenabled = {'true' if scripts_on else 'false'}\n")
+    config = home / "config.toml"
+    text = without_script_table(config.read_text(encoding="utf-8")) if config.exists() else ""
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += f"\n[tools.script]\nenabled = {'true' if scripts_on else 'false'}\n"
+    config.write_text(text, encoding="utf-8")
     return home
+
+
+def without_script_table(text: str) -> str:
+    """`text` without its `[tools.script]` table: the header and every line up
+    to the next line that starts a table."""
+    kept, skipping = [], False
+    for line in text.splitlines(keepends=True):
+        if re.match(r"\s*\[\s*tools\s*\.\s*script\s*\]\s*(#.*)?$", line):
+            skipping = True
+        elif line.lstrip().startswith("["):
+            skipping = False
+        if not skipping:
+            kept.append(line)
+    return "".join(kept)
 
 
 def run_once(binary: str, home: Path, cwd: str, mode: str, prompt: str, timeout: float) -> dict:
@@ -101,7 +120,12 @@ def summarize(jsonl: str) -> dict:
 
 def compare(rows: list[dict]) -> dict:
     """Totals for each variant, and whether they meet the rule for default-on:
-    at least as many right answers, fewer model rounds, lower cost."""
+    at least as many right answers, fewer model rounds, lower cost.
+
+    A run is incomplete when it did not exit 0, has no cost, or made no model
+    round (a timeout looks like that); its zeros would make a variant look
+    cheap. Nothing is decided unless both variants have the same non-zero
+    number of runs and none is incomplete."""
     totals = {}
     for variant in ("off", "on"):
         mine = [row for row in rows if row["variant"] == variant]
@@ -110,9 +134,15 @@ def compare(rows: list[dict]) -> dict:
             "right": sum(1 for row in mine if row["right"]),
             "rounds": sum(row["rounds"] for row in mine),
             "cost_usd": round(sum(row["cost_usd"] or 0 for row in mine), 6),
+            "incomplete": sum(1 for row in mine
+                              if row.get("exit") != 0 or row.get("cost_usd") is None
+                              or not row.get("rounds")),
         }
     off, on = totals["off"], totals["on"]
-    totals["default_on"] = (on["runs"] > 0 and on["right"] >= off["right"]
+    decidable = (off["runs"] > 0 and off["runs"] == on["runs"]
+                 and off["incomplete"] == 0 and on["incomplete"] == 0)
+    totals["decidable"] = decidable
+    totals["default_on"] = (decidable and on["right"] >= off["right"]
                             and on["rounds"] < off["rounds"] and on["cost_usd"] < off["cost_usd"])
     return totals
 
@@ -133,6 +163,9 @@ def main() -> int:
     tasks = json.loads((HERE / "tasks.json").read_text(encoding="utf-8"))
     if args.only:
         tasks = [task for task in tasks if task["id"] in args.only]
+    # Prove each checker can read this checkout before any credit is spent.
+    for task in tasks:
+        expected.is_right(task["id"], "", Path(args.cwd))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     homes = {"off": make_home(Path(args.home), False), "on": make_home(Path(args.home), True)}
