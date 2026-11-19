@@ -144,6 +144,31 @@ class Summarize(unittest.TestCase):
 
         self.assertEqual(run.summarize(jsonl)["script_tool_calls"], 3)
 
+    def calls_in(self, *chunks, ensure_ascii=True):
+        jsonl = "\n".join(
+            json.dumps({"type": "tool.output.delta", "payload": {"chunk": chunk}}, ensure_ascii=ensure_ascii)
+            for chunk in chunks
+        )
+        return run.summarize(jsonl)["script_tool_calls"]
+
+    def test_a_preview_line_shaped_like_a_summary_line_is_not_counted(self):
+        self.assertEqual(self.calls_in(
+            '  1   read_file {"path":"a"} · ok · 2ms · 40 B\n',
+            "            9   grep {} · ok · 1ms · 2 B\n",
+            "          12 | foo bar · ok · 3ms\n",
+            "1 tool call · 4ms\n",
+        ), 1)
+
+    def test_a_summary_line_with_a_line_separator_in_its_arguments_is_counted_once(self):
+        # Orca writes JSON with U+2028 as it is, not as an escape.
+        for ensure_ascii in (True, False):
+            with self.subTest(ensure_ascii=ensure_ascii):
+                self.assertEqual(self.calls_in(
+                    '  1   grep {"pattern":"a b"} · ok · 1ms · 2 B\n',
+                    "1 tool call · 2ms\n",
+                    ensure_ascii=ensure_ascii,
+                ), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

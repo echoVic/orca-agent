@@ -36,8 +36,10 @@ sys.path.insert(0, str(HERE))
 import expected  # noqa: E402
 
 # One call of a script as the runtime writes it: number, batch mark, tool,
-# arguments, how it ended, how long it took.
-SCRIPT_CALL = re.compile(r"^\s*\d+ . \S+ .* · (ok|failed) · \d+ms")
+# arguments, how it ended, how long it took. The number is right-aligned in
+# three columns, so a summary line starts with at most two spaces; a preview
+# line starts with ten.
+SCRIPT_CALL = re.compile(r"^ {0,2}\d+ . \S+ .* · (ok|failed) · \d+ms")
 
 
 def make_home(source: Path, scripts_on: bool) -> Path:
@@ -91,7 +93,9 @@ def run_once(binary: str, home: Path, cwd: str, mode: str, prompt: str, timeout:
 
 def summarize(jsonl: str) -> dict:
     rounds, tools, usage, answer, script_calls = 0, [], {}, [], 0
-    for line in jsonl.splitlines():
+    # One event per "\n": Orca's JSON keeps U+2028 and U+0085 as they are,
+    # and splitlines() would end a line at either.
+    for line in jsonl.split("\n"):
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -104,7 +108,9 @@ def summarize(jsonl: str) -> dict:
             answer = []
         elif kind == "tool.output.delta":
             chunk = str(payload.get("chunk", ""))
-            script_calls += sum(1 for part in chunk.splitlines() if SCRIPT_CALL.match(part))
+            # Lines end at "\n" only: splitlines() also ends one at a U+2028
+            # inside a call's arguments.
+            script_calls += sum(1 for part in chunk.split("\n") if SCRIPT_CALL.match(part))
         elif kind == "usage.updated":
             usage = payload
         elif kind == "assistant.message.delta":
