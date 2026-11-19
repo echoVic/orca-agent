@@ -400,6 +400,12 @@ impl AppState {
                     self.transcript.call_start = self.transcript.messages.len();
                     return;
                 }
+                // A request starts its run: a call id used again must not
+                // show the earlier run's calls and result. The script and
+                // the calls follow the request.
+                if name == SCRIPT_TOOL {
+                    self.transcript.script_runs.remove(&id);
+                }
                 if let Some(index) = self.receiving_tool_call_message_index(&id) {
                     self.mutate_message(index, |message| {
                         let ChatMessage::ToolCall {

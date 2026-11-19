@@ -3262,6 +3262,89 @@ fn two_script_rows_do_not_share_their_calls() {
 }
 
 #[test]
+fn a_reused_call_id_starts_a_new_script_run() {
+    let mut state = state();
+    script_request(&mut state, "s1", Some("return 1;"));
+    script_chunk(&mut state, "s1", "  1   one {} · ok · 1ms · 1 B\n");
+    script_chunk(&mut state, "s1", "1 tool call · 2ms\n");
+    script_end(&mut state, "s1", "completed", "1");
+
+    script_request(&mut state, "s1", Some("return 2;"));
+    let running = script_row(&state);
+    script_chunk(&mut state, "s1", "  1   two {} · ok · 3ms · 2 B\n");
+    script_chunk(&mut state, "s1", "1 tool call · 4ms\n");
+    script_end(&mut state, "s1", "completed", "22");
+
+    assert_eq!(
+        running,
+        (
+            None,
+            "running".to_string(),
+            Some("Script\n 1 │ return 2;".to_string())
+        )
+    );
+    let outputs: Vec<(Option<String>, Option<String>)> = state
+        .transcript
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            ChatMessage::ToolCall { target, output, .. } => Some((target.clone(), output.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        outputs,
+        [
+            (
+                Some("1 tool call · 2ms".to_string()),
+                Some(
+                    "Script\n 1 │ return 1;\nCalls\n  1   one {} · ok · 1ms · 1 B\nReturned to the model · 1 B\n 1"
+                        .to_string()
+                ),
+            ),
+            (
+                Some("1 tool call · 4ms".to_string()),
+                Some(
+                    "Script\n 1 │ return 2;\nCalls\n  1   two {} · ok · 3ms · 2 B\nReturned to the model · 2 B\n 22"
+                        .to_string()
+                ),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_reused_call_id_received_before_its_request_starts_a_new_script_run() {
+    let mut state = state();
+    script_request(&mut state, "s1", Some("return 1;"));
+    script_chunk(&mut state, "s1", "  1   one {} · ok · 1ms · 1 B\n");
+    script_chunk(&mut state, "s1", "1 tool call · 2ms\n");
+    script_end(&mut state, "s1", "completed", "1");
+
+    state.update(TuiEvent::ToolCallProgress {
+        id: "s1".to_string(),
+        name: Some("run_script".to_string()),
+        arguments_bytes: 30,
+    });
+    script_request(&mut state, "s1", Some("return 2;"));
+    script_chunk(&mut state, "s1", "  1   two {} · ok · 3ms · 2 B\n");
+    script_chunk(&mut state, "s1", "1 tool call · 4ms\n");
+    script_end(&mut state, "s1", "completed", "22");
+
+    assert_eq!(
+        script_row(&state),
+        (
+            Some("1 tool call · 4ms".to_string()),
+            "completed".to_string(),
+            Some(
+                "Script\n 1 │ return 2;\nCalls\n  1   two {} · ok · 3ms · 2 B\nReturned to the model · 2 B\n 22"
+                    .to_string()
+            ),
+        )
+    );
+}
+
+#[test]
 fn clearing_the_transcript_forgets_script_runs() {
     let mut state = state();
     script_request(&mut state, "s1", Some("return 1;"));
