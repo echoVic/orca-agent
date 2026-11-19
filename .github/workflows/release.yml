@@ -378,18 +378,22 @@ jobs:
             package_version="$(tar -xOf "$tarball" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')"
             local_integrity="sha512-$(node -e 'const fs=require("fs"),c=require("crypto");process.stdout.write(c.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"))' "$tarball")"
             set +e
-            registry_output="$(npm view "@blade-ai/orca@${package_version}" dist.integrity --json 2>&1)"
+            registry_stderr="$(mktemp)"
+            registry_output="$(npm view "@blade-ai/orca@${package_version}" dist.integrity --json 2>"$registry_stderr")"
             registry_status=$?
             set -e
+            registry_error="$(cat "$registry_stderr")"
+            rm -f "$registry_stderr"
             if [[ $registry_status -eq 0 ]]; then
+              # npm prints its warnings on stderr; only its answer is parsed.
               registry_integrity="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]))' "$registry_output")"
               if [[ "$registry_integrity" != "$local_integrity" ]]; then
                 echo "@blade-ai/orca@${package_version} exists with different registry integrity" >&2
                 exit 1
               fi
               existing["$package_version"]=1
-            elif [[ "$registry_output" != *E404* ]]; then
-              echo "$registry_output" >&2
+            elif [[ "$registry_output$registry_error" != *E404* ]]; then
+              printf '%s\n' "$registry_output$registry_error" >&2
               exit "$registry_status"
             fi
           done
@@ -401,7 +405,19 @@ jobs:
             fi
             tag=latest
             [[ "$package_version" == *-* ]] && tag=native
-            npm publish "$tarball" --access public --tag "$tag"
+            if ! publish_log="$(npm publish "$tarball" --access public --tag "$tag" 2>&1)"; then
+              printf '%s\n' "$publish_log" >&2
+              # npm can retry a publish inside one process and sign the same
+              # provenance twice; Rekor then refuses the duplicate entry. A
+              # new process signs again, so one retry settles that case.
+              if [[ "$publish_log" != *TLOG_CREATE_ENTRY_ERROR* ]]; then
+                exit 1
+              fi
+              echo "retrying @blade-ai/orca@${package_version}: the transparency log already has that entry" >&2
+              npm publish "$tarball" --access public --tag "$tag"
+            else
+              printf '%s\n' "$publish_log"
+            fi
           done
 
   npm-release-assets:
