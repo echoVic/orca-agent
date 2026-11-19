@@ -98,7 +98,8 @@ with a 2 MiB stack, and on it:
    `script.js`, the body starting on line 1, so an error names the line of
    the script as the model wrote it;
 4. calls it and runs the loop described under "Concurrency";
-5. drops the context and the runtime.
+5. says how the script ended, and only then drops the context and the
+   runtime, so the time that takes is not counted against the script.
 
 The calling thread answers the batches the engine thread hands it (tools run
 there, as before) and, while the engine is busy, checks `stop` and the wall
@@ -210,15 +211,18 @@ finish.
 | Bytes of one inner result | 256 KiB | the call rejects, telling the script to ask for less |
 | Memory of one script | 64 MiB (`memory_limit_mb`, never less than 8) | the allocation fails in the script; if the script then fails, whatever it threw, the tool fails with "the script used more than 64 MiB" |
 | Stack of one script | 256 KiB, set by the engine, on its own 2 MiB thread | a `RangeError` in the script, which it may catch |
-| Arguments of one inner call | 1 MiB of JSON text | the call rejects in the script with "a tool call's arguments are limited to 1 MiB" |
+| Argument text of the inner calls started and not yet answered | 256 KiB of JSON text in all | the call that would pass it rejects in the script with "tool call arguments waiting to be answered are limited to 256 KiB in all; await some calls before starting more" |
 | Inner calls waiting to be handed over | 1000 | the call rejects in the script with "too many tool calls are waiting; await some before starting more" |
 | Result returned to the model | `tools.output_truncation` | truncated like any tool output |
 
 The 1 MiB protocol line limit is gone with the protocol. What it bounded
 inside the script, a script building one enormous value, is bounded by the
 memory limit. What a script hands over is not: the arguments of a call are
-held outside the script's memory until the batch is handed over, so they
-have their own limits, 1 MiB for one call and 1000 calls waiting.
+held outside the script's memory until the batch is handed over, as the
+JSON text the script made, and are parsed only then. So they have their own
+limits: the calls a script has started and not yet been answered may hold
+at most 256 KiB of argument text in all, and at most 1000 calls may be
+waiting.
 
 The engine knows a script ran out of memory from its allocator, not from
 what the script threw. When QuickJS cannot allocate even the error it
@@ -243,11 +247,12 @@ the limit fails the build's tests.
 The interrupt handler stops code that runs as steps of the script: a
 `while (true)`, a promise chain that reschedules itself forever, a regular
 expression that backtracks without end. QuickJS asks it between steps and
-inside a regular-expression match, not inside the native functions that
-loop on their own, such as `join`, `reverse` or `indexOf` on an object whose
-`length` is `2 ** 53`. Those the caller's thread stops: it stops waiting for
-the engine at the wall clock or the cancel, as described under "Engine".
-Neither way is catchable by the script.
+inside a regular-expression match, not inside every native function that
+loops on its own: among the loops the interrupt does not reach are `join`
+and `reverse` over an object whose `length` is `2 ** 53` and
+`String.prototype.indexOf` over very long strings. Those the caller's thread
+stops: it stops waiting for the engine at the wall clock or the cancel, as
+described under "Engine". Neither way is catchable by the script.
 
 The binding's documentation does not say that the handler is consulted
 inside a regular-expression match. A prototype of this engine settled it:
@@ -327,7 +332,7 @@ their validators are run to confirm it.
 | Syntax error | failed: the syntax error; nothing ran |
 | Unknown tool, or a tool outside the four | that call rejects in the script |
 | Hook blocks an inner call | that call rejects in the script |
-| A call's arguments over 1 MiB, or 1000 calls already waiting | that call rejects in the script |
+| A call that would take the waiting calls past 256 KiB of argument text in all, or 1000 calls already waiting | that call rejects in the script |
 | Wall clock passed, including a script that finished after it | failed: says how long it ran |
 | Memory limit passed, and the script then fails | failed: says the limit |
 | Turn cancelled, including a script that finished after the cancel | cancelled |
@@ -355,13 +360,13 @@ their validators are run to confirm it.
 - **Hostile scripts**: `while (true) {}`; a promise chain that reschedules
   itself forever; unbounded recursion; allocating past the memory limit, in
   large and in small pieces; a regular expression that backtracks without
-  end; `join`, `reverse` and `indexOf` on an object whose `length` is
-  `2 ** 53`; a script that closes the function it is the body of and loops
-  outside it; a script that sets `Error.prepareStackTrace`; a script that
-  replaces `Promise`, `JSON` and `Object.prototype` members. Each ends within
-  its limit and the next script runs normally. The native loops cannot be
-  ended, only left, so their test leaves threads spinning for the rest of
-  the test run.
+  end; `join` and `reverse` over an object whose `length` is `2 ** 53` and
+  `String.prototype.indexOf` over very long strings; a script that closes
+  the function it is the body of and loops outside it; a script that sets
+  `Error.prepareStackTrace`; a script that replaces `Promise`, `JSON` and
+  `Object.prototype` members. Each ends within its limit and the next
+  script runs normally. The native loops cannot be ended, only left, so
+  their test leaves threads spinning for the rest of the test run.
 - **Runtime** (`calls.rs`): the existing tests, plus: three slow calls in one
   batch take about as long as one; no more than `max_read_parallel` run at
   once; a blocked call in a batch does not stop the others; report lines and
@@ -428,13 +433,13 @@ Release binary on `aarch64-apple-darwin`: 71348400 bytes before, 72367760
 bytes after (1019360 more).
 
 The comparison is inconclusive. The model chose `run_script` in 3 of the 15
-runs with it on, and each task can be answered in two or three rounds of
-`grep`, which leaves a script little to save. With three runs per cell, 53
-rounds against 57 is within the spread between runs of the same task. For
-every task the runs with the tool off came before those with it on, so a
-warmer prompt cache may have favoured the runs with it on. The data shows
-neither a saving nor a cost. `enabled` stays `false` by default because
-nothing was shown, not because the tool did worse.
+runs with it on, and in the saved runs four of the tasks took two to four
+rounds and the fifth five to eight, which leaves a script little to save.
+With three runs per cell, 53 rounds against 57 is within the spread between
+runs of the same task. For every task the runs with the tool off came before
+those with it on, so a warmer prompt cache may have favoured the runs with
+it on. The data shows neither a saving nor a cost. `enabled` stays `false`
+by default because nothing was shown, not because the tool did worse.
 
 Nine right answers were first marked wrong by the checker, which took a file
 or an event mentioned in a sentence for one the answer listed, and line

@@ -46,16 +46,17 @@ const WATCH_STEP: Duration = Duration::from_millis(20);
 /// behind.
 const STOP_GRACE: Duration = Duration::from_millis(200);
 
-/// The most text one call's arguments may be. Arguments are held outside the
-/// script's memory until they are handed over.
-const MAX_CALL_ARGUMENTS_BYTES: usize = 1024 * 1024;
+/// The most argument text the calls waiting to be handed over may hold in
+/// all. It is held outside the script's memory until the hand-over, as text:
+/// parsed, a little text can take a hundred times as much.
+const MAX_WAITING_ARGUMENTS_BYTES: usize = 256 * 1024;
 /// The most calls that may wait to be handed over at once.
 const MAX_WAITING_CALLS: usize = 1000;
 
 const FAILED_INSIDE_THE_ENGINE: &str = "run_script failed inside the script engine";
 const BROKE_ITS_FUNCTIONS: &str = "The script broke the functions it runs on";
 const WAITING_ON_NOTHING: &str = "the script is waiting on a promise that nothing will resolve";
-const ARGUMENTS_TOO_LONG: &str = "a tool call's arguments are limited to 1 MiB";
+const WAITING_ARGUMENTS_TOO_LONG: &str = "tool call arguments waiting to be answered are limited to 256 KiB in all; await some calls before starting more";
 const TOO_MANY_WAITING: &str = "too many tool calls are waiting; await some before starting more";
 
 const RUNNING: u8 = 0;
@@ -117,12 +118,21 @@ impl ScriptEngine {
                 let script = script.to_string();
                 let watch = Arc::clone(&watch);
                 move || {
-                    let ended = catch_unwind(AssertUnwindSafe(|| {
-                        run_engine(&script, limits, &watch, &to_caller, &from_caller)
-                    }))
-                    .unwrap_or_else(|_| Ok(failed(FAILED_INSIDE_THE_ENGINE)));
-                    // Nobody hears this if the caller has stopped waiting.
-                    let _ = to_caller.send(FromEngine::Ended(ended));
+                    let mut said = false;
+                    // Nobody hears either send if the caller has stopped
+                    // waiting.
+                    let ran = catch_unwind(AssertUnwindSafe(|| {
+                        run_engine(&script, limits, &watch, &to_caller, &from_caller, |ended| {
+                            said = true;
+                            let _ = to_caller.send(FromEngine::Ended(ended));
+                        })
+                    }));
+                    // A panic after the engine said how the script ended
+                    // changes nothing: the caller has its outcome.
+                    if ran.is_err() && !said {
+                        let _ =
+                            to_caller.send(FromEngine::Ended(Ok(failed(FAILED_INSIDE_THE_ENGINE))));
+                    }
                 }
             })
             .map_err(|error| {
@@ -245,11 +255,13 @@ impl Caller<'_> {
                     let _ = self.to_engine.send(answers);
                 }
                 Ok(FromEngine::Ended(ended)) => {
-                    let _ = self.engine.join();
                     // A script that ended after its time was up, or after a
-                    // cancel, was stopped.
+                    // cancel, was stopped. That is decided as it says how it
+                    // ended, before the engine drops what it held.
                     self.watch.check();
-                    return self.watch.outcome(self.limits).unwrap_or(ended);
+                    let outcome = self.watch.outcome(self.limits).unwrap_or(ended);
+                    let _ = self.engine.join();
+                    return outcome;
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if self.watch.check() {
@@ -303,24 +315,30 @@ impl Caller<'_> {
     }
 }
 
-/// The engine thread's side: creates the runtime, runs the script, drops the
-/// runtime.
+/// The engine thread's side: creates the runtime, runs the script, says how
+/// it ended with `tell`, and then drops the runtime.
 fn run_engine(
     script: &str,
     limits: ScriptEngineLimits,
     watch: &Arc<Watch>,
     to_caller: &Sender<FromEngine>,
     from_caller: &Receiver<Answers>,
-) -> io::Result<ScriptOutcome> {
+    tell: impl FnOnce(io::Result<ScriptOutcome>),
+) {
     let refused = Arc::new(AtomicBool::new(false));
     // QuickJS's own limit stays off: the allocator enforces the limit, so
     // that every refusal is one it saw.
-    let runtime = Runtime::new_with_alloc(LimitedAllocator {
+    let runtime = match Runtime::new_with_alloc(LimitedAllocator {
         limit: limits.memory_bytes,
         held: 0,
         refused: Arc::clone(&refused),
-    })
-    .map_err(engine_error)?;
+    }) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tell(Err(engine_error(error)));
+            return;
+        }
+    };
     // Measured from where the runtime was created: near the top of this
     // thread's stack.
     runtime.set_max_stack_size(SCRIPT_STACK_BYTES);
@@ -329,7 +347,7 @@ fn run_engine(
         move || watch.check()
     })));
 
-    let context = Context::custom::<(
+    let context = match Context::custom::<(
         intrinsic::Date,
         intrinsic::Eval,
         intrinsic::RegExpCompiler,
@@ -341,29 +359,79 @@ fn run_engine(
         intrinsic::Promise,
         intrinsic::WeakRef,
     )>(&runtime)
-    .map_err(engine_error)?;
+    {
+        Ok(context) => context,
+        Err(error) => {
+            tell(Err(engine_error(error)));
+            return;
+        }
+    };
     let ending = Ending {
         watch,
         refused: &refused,
         limits,
     };
+    // Every JavaScript value the Rust side holds is a local of `drive`, and
+    // is dropped when it returns.
     let outcome = context.with(|ctx| drive(&ctx, script, &ending, to_caller, from_caller));
-    // Nothing of the script may outlive this call.
+    end(outcome, tell, context, runtime);
+}
+
+/// Says how the script ended, and only then lets go of what ran it: the time
+/// it takes to free what the script held is not the script's. Nothing of the
+/// script runs after `tell`. The context and then the runtime are only
+/// dropped: QuickJS frees the jobs still pending without running them.
+fn end(
+    outcome: io::Result<ScriptOutcome>,
+    tell: impl FnOnce(io::Result<ScriptOutcome>),
+    context: Context,
+    runtime: Runtime,
+) {
+    tell(outcome);
     drop(context);
     drop(runtime);
-    outcome
+}
+
+/// A call the script started and that waits to be handed over.
+struct Started {
+    number: u32,
+    tool: String,
+    /// The arguments as the script's JSON text, parsed only at the hand-over.
+    arguments: String,
+}
+
+impl Started {
+    /// The call as `answer` is given it. Text that is not JSON is `null`.
+    fn into_call(self) -> (u32, ScriptToolCall) {
+        let arguments = serde_json::from_str(&self.arguments).unwrap_or(Value::Null);
+        (
+            self.number,
+            ScriptToolCall {
+                tool: self.tool,
+                arguments,
+            },
+        )
+    }
 }
 
 /// What the script's side of the engine has told the Rust side.
 #[derive(Default)]
 struct Told {
-    /// Calls started since the last hand-over, each with its number.
-    started: Vec<(u32, ScriptToolCall)>,
+    /// Calls started since the last hand-over.
+    started: Vec<Started>,
+    /// The bytes of argument text the calls in `started` hold.
+    waiting_bytes: usize,
     numbered: u32,
     outcome: Option<ScriptOutcome>,
 }
 
 impl Told {
+    /// Takes the calls that wait to be handed over; none waits after.
+    fn hand_over(&mut self) -> Vec<Started> {
+        self.waiting_bytes = 0;
+        std::mem::take(&mut self.started)
+    }
+
     /// Records how the script ended. The prelude reports once; a second
     /// report could only come from a script that reached the prelude's own
     /// functions, and the first outcome stands.
@@ -385,18 +453,26 @@ fn natives<'js>(
         let told = Rc::clone(told);
         move |ctx: Ctx<'js>, tool: String, arguments: String| -> rquickjs::Result<u32> {
             let mut told = told.borrow_mut();
-            // A refused call is not kept: its promise rejects in the script.
+            // A refused call is not kept, and leaves the total as it was: its
+            // promise rejects in the script.
             if told.started.len() >= MAX_WAITING_CALLS {
                 return Err(Exception::throw_message(&ctx, TOO_MANY_WAITING));
             }
-            if arguments.len() > MAX_CALL_ARGUMENTS_BYTES {
-                return Err(Exception::throw_message(&ctx, ARGUMENTS_TOO_LONG));
-            }
+            let waiting_bytes = told
+                .waiting_bytes
+                .checked_add(arguments.len())
+                .filter(|&bytes| bytes <= MAX_WAITING_ARGUMENTS_BYTES);
+            let Some(waiting_bytes) = waiting_bytes else {
+                return Err(Exception::throw_message(&ctx, WAITING_ARGUMENTS_TOO_LONG));
+            };
+            told.waiting_bytes = waiting_bytes;
             told.numbered += 1;
             let number = told.numbered;
-            let arguments = serde_json::from_str(&arguments).unwrap_or(Value::Null);
-            told.started
-                .push((number, ScriptToolCall { tool, arguments }));
+            told.started.push(Started {
+                number,
+                tool,
+                arguments,
+            });
             Ok(number)
         }
     })?;
@@ -476,7 +552,7 @@ fn drive<'js>(
         if let Some(outcome) = told.borrow_mut().outcome.take() {
             return ending.reported(outcome);
         }
-        let batch = std::mem::take(&mut told.borrow_mut().started);
+        let batch = told.borrow_mut().hand_over();
         if batch.is_empty() {
             // If the prelude's `run` rejected, the prelude itself failed while
             // reporting; otherwise the script waits on something that will
@@ -488,7 +564,9 @@ fn drive<'js>(
             });
         }
 
-        let (numbers, calls): (Vec<u32>, Vec<ScriptToolCall>) = batch.into_iter().unzip();
+        // Each call's text is parsed, and dropped, as the batch is built.
+        let (numbers, calls): (Vec<u32>, Vec<ScriptToolCall>) =
+            batch.into_iter().map(Started::into_call).unzip();
         // Either fails only when the caller has stopped waiting, and then the
         // script is already stopped.
         if to_caller.send(FromEngine::Calls(calls)).is_err() {
@@ -730,6 +808,64 @@ mod tests {
                 output: "first".to_string()
             })
         );
+    }
+
+    #[test]
+    fn a_refused_call_leaves_what_waits_as_it_was() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        let told = Rc::new(RefCell::new(Told::default()));
+
+        context.with(|ctx| {
+            let (start_call, _) = natives(&ctx, &told).unwrap();
+            let start = |bytes: usize| {
+                let started = start_call.call::<_, u32>(("read_file", "x".repeat(bytes)));
+                let _ = ctx.catch();
+                started.is_ok()
+            };
+            assert!(start(200 * 1024));
+            assert!(!start(100 * 1024), "past the total");
+            assert!(start(56 * 1024), "the refused call took nothing");
+            assert!(!start(1), "the total is full");
+        });
+
+        let mut told = told.borrow_mut();
+        assert_eq!(told.waiting_bytes, 256 * 1024);
+        let handed: Vec<u32> = told
+            .hand_over()
+            .into_iter()
+            .map(|call| call.number)
+            .collect();
+        assert_eq!(handed, [1, 2]);
+        assert_eq!(told.waiting_bytes, 0, "nothing waits after the hand-over");
+    }
+
+    #[test]
+    fn the_engine_says_how_the_script_ended_before_it_drops_the_runtime() {
+        // The runtime's allocator holds a clone of `refused` until the runtime
+        // is freed.
+        let refused = Arc::new(AtomicBool::new(false));
+        let runtime = Runtime::new_with_alloc(LimitedAllocator {
+            limit: usize::MAX,
+            held: 0,
+            refused: Arc::clone(&refused),
+        })
+        .unwrap();
+        let context = Context::full(&runtime).unwrap();
+        let mut held_when_told = None;
+
+        end(
+            Ok(failed("ended")),
+            |ended| {
+                assert_eq!(ended.unwrap(), failed("ended"));
+                held_when_told = Some(Arc::strong_count(&refused));
+            },
+            context,
+            runtime,
+        );
+
+        assert_eq!(held_when_told, Some(2), "the runtime was held when told");
+        assert_eq!(Arc::strong_count(&refused), 1, "and dropped after");
     }
 
     #[test]

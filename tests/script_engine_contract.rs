@@ -732,23 +732,112 @@ fn a_script_that_replaces_object_prototype_members_breaks_only_itself() {
     );
 }
 
+/// What a call refused for the argument text its waiting calls hold rejects
+/// with.
+const WAITING_ARGUMENTS_REFUSED: &str = "tool call arguments waiting to be answered are limited to 256 KiB in all; await some calls before starting more";
+
 #[test]
-fn a_call_whose_arguments_are_over_1_mib_rejects_in_the_script() {
+fn a_call_whose_arguments_are_over_256_kib_rejects_in_the_script() {
+    // `{"path":"…"}` is the path and 11 bytes more: the first call is 11
+    // bytes over, the second exactly at the limit.
     let (outcome, calls) = run(
-        r#"const big = "x".repeat(1024 * 1024);
-           let refused;
-           try { await tools.read_file({ path: big }); } catch (error) { refused = `${error instanceof Error} ${error.message}`; }
-           const small = await tools.read_file({ path: "a" });
-           return [refused, small];"#,
-        |call| Ok(format!("<{}>", call.arguments["path"].as_str().unwrap())),
+        r#"let refused;
+           try { await tools.read_file({ path: "x".repeat(256 * 1024) }); } catch (error) { refused = `${error instanceof Error} ${error.message}`; }
+           const atTheLimit = await tools.read_file({ path: "x".repeat(256 * 1024 - 11) });
+           return [refused, atTheLimit];"#,
+        |call| Ok(call.arguments["path"].as_str().unwrap().len().to_string()),
     );
 
     let seen: Vec<String> = serde_json::from_str(&output_of(outcome)).unwrap();
     assert_eq!(
         seen,
-        ["true a tool call's arguments are limited to 1 MiB", "<a>"]
+        [
+            format!("true {WAITING_ARGUMENTS_REFUSED}"),
+            (256 * 1024 - 11).to_string()
+        ]
     );
     assert_eq!(calls.len(), 1, "the refused call is not handed over");
+}
+
+#[test]
+fn the_arguments_waiting_to_be_handed_over_are_limited_in_all() {
+    let (outcome, batches) = run_batches(
+        r#"const big = "x".repeat(100 * 1024);
+           const settle = (call) => call.then((text) => text, (error) => `${error instanceof Error} ${error.message}`);
+           const started = [settle(tools.read_file({ path: big })), settle(tools.read_file({ path: big })), settle(tools.read_file({ path: big }))];
+           const settled = await Promise.all(started);
+           const later = await settle(tools.read_file({ path: big }));
+           return [...settled, later];"#,
+        limits(),
+        |_| Ok("read".to_string()),
+    );
+
+    let seen: Vec<String> = serde_json::from_str(&output_of(outcome)).unwrap();
+    assert_eq!(
+        seen,
+        [
+            "read".to_string(),
+            "read".to_string(),
+            format!("true {WAITING_ARGUMENTS_REFUSED}"),
+            "read".to_string()
+        ]
+    );
+    let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [2, 1], "the third call is not handed over");
+    assert!(
+        batches
+            .iter()
+            .flatten()
+            .all(|call| call.arguments["path"].as_str().map(str::len) == Some(100 * 1024)),
+        "every call handed over is one the script made"
+    );
+}
+
+#[test]
+fn one_call_over_the_limit_is_refused_by_itself() {
+    let (outcome, batches) = run_batches(
+        r#"try { await tools.read_file({ path: "x".repeat(300 * 1024) }); return "called"; }
+           catch (error) { return `${error instanceof Error} ${error.message}`; }"#,
+        limits(),
+        |_| Ok("read".to_string()),
+    );
+
+    assert_eq!(
+        output_of(outcome),
+        format!("true {WAITING_ARGUMENTS_REFUSED}")
+    );
+    assert!(batches.is_empty(), "answer is never called: {batches:?}");
+}
+
+#[test]
+fn what_a_waiting_call_holds_is_its_text() {
+    // Each `{"a":0}` and its comma is 8 bytes of text and far more parsed.
+    let (outcome, batches) = run_batches(
+        r#"const large = tools.read_file({ path: Array(25000).fill({ a: 0 }) });
+           const small = tools.read_file({ path: "b" });
+           await Promise.all([large, small]);
+           return "done";"#,
+        limits(),
+        |_| Ok("read".to_string()),
+    );
+
+    let large = json!({ "path": vec![json!({ "a": 0 }); 25000] });
+    let text = serde_json::to_string(&large).unwrap().len();
+    assert!((192 * 1024..256 * 1024).contains(&text), "{text} bytes");
+    assert_eq!(output_of(outcome), "done");
+    assert_eq!(
+        batches,
+        [vec![
+            ScriptToolCall {
+                tool: "read_file".to_string(),
+                arguments: large,
+            },
+            ScriptToolCall {
+                tool: "read_file".to_string(),
+                arguments: json!({ "path": "b" }),
+            },
+        ]]
+    );
 }
 
 #[test]
@@ -868,5 +957,27 @@ fn a_script_that_finishes_after_a_cancel_or_its_time_is_stopped() {
     assert_eq!(
         error_of(late.expect("the script engine ran")),
         "the script ran longer than 0s and was stopped"
+    );
+}
+
+#[test]
+fn a_script_that_finishes_just_inside_its_time_is_completed() {
+    // What the script holds is freed after it has said how it ended; the time
+    // that takes is not the script's.
+    let (outcome, _) = run_batches(
+        r#"const held = Array.from({ length: 40 }, () => "x".repeat(1024 * 1024));
+           return held.length === 40 ? "done" : "not held";"#,
+        ScriptEngineLimits {
+            wall_clock: Duration::from_secs(5),
+            ..limits()
+        },
+        |_| Ok(String::new()),
+    );
+
+    assert_eq!(
+        outcome,
+        ScriptOutcome::Completed {
+            output: "done".to_string()
+        }
     );
 }
