@@ -90,6 +90,7 @@ mod rewind_actions;
 mod rewind_panel;
 mod running_actions;
 mod runtime_event_actions;
+mod script_run;
 mod scrollback;
 mod selection;
 mod session_picker;
