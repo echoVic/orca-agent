@@ -27,10 +27,14 @@ the tool.
 
 ### The row, collapsed
 
-One line, as today, ending with what the runtime said of the run:
+The row's first line is its icon, the tool's name and what the runtime said
+of the run, its last line. A status word (`failed`, `interrupted`) follows
+only when the run ended without completing, as on every tool row. Under it
+one row says how to open it:
 
 ```
-● run_script · 4 tool calls · 412ms · completed
+✓ run_script  4 tool calls · 412ms
+└ +18 lines · click or ctrl+o to expand
 ```
 
 ### The row, expanded
@@ -38,25 +42,26 @@ One line, as today, ending with what the runtime said of the run:
 Expanded with the gesture every expandable row uses (a click, or ctrl+o):
 
 ```
-● run_script · 4 tool calls · 412ms · completed
-  Script
-   1 │ const hits = await tools.grep({ pattern: "TODO" });
-   2 │ const files = await Promise.all(paths.map((path) => tools.read_file({ path })));
-   3 │ return files.filter((text) => text.includes("fixme")).length;
-  Calls
-    1   grep {"pattern":"TODO"} · ok · 12ms · 2.1 KiB
-          src/a.rs:3: // TODO remove
-          … 40 more lines
-    2 ┬ read_file {"path":"a.rs"} · ok · 3ms · 1.2 KiB
-          fn main() {
-          … 30 more lines
-    3 ├ read_file {"path":"b.rs"} · ok · 4ms · 8.0 KiB
-          use std::io;
-          … 211 more lines
-    4 └ read_file {"path":"c.rs"} · failed · 1ms
-          c.rs does not exist
-  Returned to the model · 1 B
-   2
+✓ run_script  4 tool calls · 412ms
+│ Script
+│  1 │ const hits = await tools.grep({ pattern: "TODO" });
+│  2 │ const files = await Promise.all(paths.map((path) => tools.read_file({ path })));
+│  3 │ return files.filter((text) => text.includes("fixme")).length;
+│ Calls
+│   1   grep {"pattern":"TODO"} · ok · 12ms · 2.1 KiB
+│           src/a.rs:3: // TODO remove
+│           … 40 more lines
+│   2 ┬ read_file {"path":"a.rs"} · ok · 3ms · 1.2 KiB
+│           fn main() {
+│           … 30 more lines
+│   3 ├ read_file {"path":"b.rs"} · ok · 4ms · 8.0 KiB
+│           use std::io;
+│           … 211 more lines
+│   4 └ read_file {"path":"c.rs"} · failed · 1ms
+│           c.rs does not exist
+│ Returned to the model · 1 B
+│  2
+└ 18 lines · ctrl+o to collapse
 ```
 
 `┬`, `├` and `└` join the calls of one batch: calls the script started
@@ -136,10 +141,14 @@ do not change. What is written per call changes from one line to:
   lines, each cut at 120 characters, at most 400 bytes in all, each
   indented by ten spaces. When lines were left out, a last line says how
   many: `… 40 more lines`. A result with no text has no preview.
+- Control characters in the arguments and in each preview line (C0, DEL,
+  C1, and U+2028 and U+2029) are written as `�`, a tab as a space. This is
+  done before either is cut, so the limits are measured on what is written.
 
 A preview line always starts with at least six spaces and a summary line
 never does, so the two cannot be mistaken for each other by a reader or by
-a program counting calls.
+a program counting calls. A carriage return in what a call read cannot
+take a terminal back over that indent: it is written as `�`.
 
 A call past the script's call limit is, as today, not counted and not
 written.
@@ -148,10 +157,11 @@ The last line of the stream changes from `4 tool calls` to
 `4 tool calls · 412ms`, the time from the script's start to its end. The
 collapsed row shows that line; the TUI computes nothing from the stream.
 
-One call adds at most about 700 bytes to the stream, so a script that makes
-all 100 calls it is allowed adds about 70 KiB to the session's record. The
-full results are not kept: one may be 256 KiB and a script may make 100
-calls.
+One call adds at most about 1.3 KiB to the stream: 200 characters of
+arguments can be 800 bytes, and a preview is at most 400 bytes of text plus
+its indents. A script that makes all 100 calls it is allowed adds about
+130 KiB to the session's record. The full results are not kept: one may be
+256 KiB and a script may make 100 calls.
 
 ### What went back
 
@@ -159,33 +169,48 @@ Unchanged: the tool's result.
 
 ### In the TUI
 
-`ChatMessage::ToolCall` gains one field for a script's run: the script's
-source and the text of its calls. For a `run_script` row, output chunks are
-appended to the calls text instead of `output`, and completion sets
-`output` to the result without touching it. Rows of other tools behave as
-they do now.
+The transcript keeps, per `run_script` call id, the run's parts: the
+script's source, the text of its calls and how it ended
+(`TranscriptState.script_runs`). Output chunks of a `run_script` row are
+appended to the calls text instead of `output`, and completion records how
+the run ended. After each, the row's `output` is set to what the expanded
+row shows, composed from the parts, and its `target` to the run's last
+line. A request for `run_script` starts its id's run afresh, so a call id
+used again does not show the earlier run's parts. The lines of the script
+and of the result, and the calls text line by line, are composed with
+control characters replaced as the runtime replaces them, so a stream
+recorded by an older runtime is as safe. Rows of other tools behave as they
+do now.
 
 ## Sessions resumed or reattached
 
-A resumed session's rows are rebuilt from its saved conversation
-(`hosted_session.rs`): the assistant message that requested the tool and
-the tool message that answered it. Output chunks are not part of the saved
-conversation and are not replayed.
+A resumed or reattached session's rows are rebuilt from the surface's
+snapshot of the conversation (`history_message_from_surface_item` in
+`surface_projection.rs`): each tool result, with the request and result the
+snapshot holds for its tool. Only when the snapshot holds no messages are
+they rebuilt from the saved conversation instead (`HistoryReplay` in
+`hosted_session.rs`), which pairs each tool message with the assistant
+message that requested it. Output chunks are part of neither and are not
+replayed.
 
-So a `run_script` row of a resumed session shows `Script`, taken from the
-saved request's arguments, and `Returned to the model`, taken from the
-saved result. In place of the calls it says
-`Calls are shown only in the session that ran the script`. The rebuild
-already pairs a result with the request it answers (`HistoryReplay`), to
-restore the row's name and target; it now keeps a `run_script` request's
-arguments too.
+Both arrange a `run_script` row the same way. It shows `Script`, taken from
+the request's arguments (the snapshot's `raw_arguments`, or the saved
+request's), and `Returned to the model` or `Failed`, taken from the result.
+In place of the calls it says
+`Calls are shown only in the session that ran the script`.
 
-Keeping the calls of a run across a resume means saving their text with
+The same rebuild happens within a session when the view returns to the main
+conversation from `/side` or from a child's view. A run's calls are then no
+longer shown, and the row says so.
+
+Keeping the calls of a run across a rebuild means keeping their text with
 the conversation, which changes what a session file holds. That is not
 part of this change.
 
-A session reattached while its script is still running receives the chunks
-written after it attached; the row shows those.
+Chunks that arrive for a run that has no row, as after a reattach while its
+script is running, are not shown: a chunk carries only the call's id, so it
+cannot be known to belong to a script. The row appears when the run ends,
+with what went back to the model and nothing else.
 
 ## Who else sees the change
 
@@ -196,11 +221,18 @@ text. No field is added, renamed or removed.
 
 `scripts/eval/code_mode/run.py` counts a script's calls by lines containing
 ` · `. It changes to count summary lines only: lines that match
-`^\s*\d+ . \S+ .* · (ok|failed) · \d+ms`.
+`^ {0,2}\d+ . \S+ .* · (ok|failed) · \d+ms`. A summary line starts with at
+most two spaces and a preview line with ten. The runner splits a chunk into
+lines, and its JSONL into events, at `\n` only: `splitlines()` also ends a
+line at a U+2028, which Orca's JSON writes as it is.
 
 Previews put the start of what a script read on the screen and into the
-session's record. A direct `read_file` already does both, in full. The
-model receives none of it: it gets only what the script returned.
+session's record. A direct `read_file` already puts what it read in the TUI
+and in the record, in full. `orca exec`'s text output prints nothing of a
+direct read, so there previews are new; control characters in them are
+replaced (see "The calls"), so what a script read cannot reach the terminal
+as escape sequences. The model receives none of it: it gets only what the
+script returned.
 
 ## Limits
 
@@ -208,7 +240,7 @@ model receives none of it: it gets only what the script returned.
 |---|---|
 | Arguments shown for one call | 200 characters |
 | Preview of one result or error | 5 lines, 120 characters each, 400 bytes |
-| Added to the stream by one call | about 700 bytes |
+| Added to the stream by one call | about 1.3 KiB at most |
 
 They are constants. Nothing is configurable.
 
@@ -219,18 +251,24 @@ They are constants. Nothing is configurable.
   the preview's three limits and its `more lines` count; an empty result;
   a failed call's preview is its error; a refused call (a tool outside the
   list) has a line and a preview of why; a call past the limit has neither;
-  no preview line can match the summary pattern. The last line carries the
-  time.
+  no preview line can match the summary pattern, even with a carriage
+  return in it; control characters in a preview and in arguments are
+  replaced, before the limits are measured. The last line carries the time.
 - **TUI reducer**: a `run_script` request carries its script; chunks go to
   the calls text; completion keeps them and sets the result; arguments that
-  are not JSON leave no script and fail nothing; rows of other tools are
-  unchanged.
+  are not JSON leave no script and fail nothing; a call id used again shows
+  only its new run; rows of other tools are unchanged.
+- **TUI composition**: control characters in the script, the result and an
+  older runtime's calls are replaced, so a carriage return cannot make a
+  line into a section title; clean calls are shown as they came.
 - **TUI rendering**: the collapsed line; the three sections expanded; a
-  failed run; a running run; a run with no calls.
-- **Resume**: a saved conversation holding a `run_script` request and its
-  result is rebuilt as a row with the script, the
-  result and the line saying where calls are shown; a saved result of any
-  other tool is rebuilt as it is today.
+  failed run; a running run; a run with no calls; a run still receiving its
+  arguments, drawn as any tool's row; a one-line body says `1 line`.
+- **Resume**: a snapshot holding a `run_script` call and its result, and a
+  saved conversation holding a `run_script` request and its result, are
+  each rebuilt as a row with the script, the result and the line saying
+  where calls are shown; a result of any other tool is rebuilt as it is
+  today.
 - **Both projections** pass arguments for `run_script` and for no other
   tool.
 - **`/scripts`**: on and off; the description and parameters equal the
@@ -240,19 +278,20 @@ They are constants. Nothing is configurable.
   line and of a summary line, and the TUI's tests use lines of the same
   shape, so the two halves cannot drift apart unnoticed.
 - `scripts/eval/code_mode/test_run.py`: the call count for a stream in the
-  new format, including a preview line that contains ` · `.
+  new format, including a preview line that contains ` · `, preview lines
+  shaped like summary lines, and a summary line with a U+2028 in its
+  arguments.
 
 ## Documentation
 
 The configuration page's section on scripts says how to see a run and what
-`/scripts` prints, in English and Chinese. The slash-command reference
-lists `/scripts`.
+`/scripts` prints, in English and Chinese.
 
 ## Out of scope
 
 - A panel listing a session's runs, or comparing them.
 - The full text of what a call returned.
-- Keeping a run's calls across a resume.
+- Keeping a run's calls across a resume or a rebuild of the view.
 - Replaying a recorded script.
 - Showing the whole request sent to the model (system prompt, every tool's
   definition, the messages).
