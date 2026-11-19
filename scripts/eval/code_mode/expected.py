@@ -16,6 +16,9 @@ NUMBER = re.compile(r"(?<![\w.])\d+(?!\w|\.\d)")
 LIST_INDEX = re.compile(r"^\s*\|?\s*(?:[-*\u2022]\s*)?\d+[.)]\s+")
 BULLET = re.compile(r"^\s*\|?\s*[-*\u2022]\s+")
 WORKFLOW_NAME = re.compile(r"workflow\.[a-z_.]*[a-z_]")
+# What may come before the first word of an item: spaces, a table pipe, a
+# bullet, a list index, backticks and bold markers.
+DECORATION = re.compile(r"^[\s|`*]*(?:[-*\u2022]\s+)?(?:\d+[.)]\s+)?[\s`*]*")
 EVENT_TYPE = re.compile(r'rename\s*=\s*"(workflow\.[a-z_.]+)"')
 
 
@@ -37,9 +40,17 @@ def _names(path: str, mentioned: str) -> bool:
 
 
 def _only_these_files(answer: str, allowed: list[str]) -> bool:
-    """Every Rust file the answer names is one of `allowed`."""
-    return all(any(_names(path, mentioned) for path in allowed)
-               for mentioned in RUST_PATH.findall(answer))
+    """Every file the answer lists is one of `allowed`.
+
+    Only a line that lists a file names it: one that starts, after its bullet,
+    index, table pipe and markers, with a Rust path. A path mentioned later in
+    a line, or in a sentence, names nothing.
+    """
+    for line in answer.splitlines():
+        found = RUST_PATH.match(DECORATION.sub("", line, count=1))
+        if found and not any(_names(path, found.group(0)) for path in allowed):
+            return False
+    return True
 
 
 def _each_with_its_count(answer: str, counts: dict[str, int], under: str = "") -> bool:
@@ -69,13 +80,30 @@ def _workflow_events(answer: str, root: Path) -> bool:
     events = set(EVENT_TYPE.findall(source))
     if not events:
         raise RuntimeError("no workflow event types found in event_schema.rs")
-    named = set(WORKFLOW_NAME.findall(answer))
-    # The total is read only from lines that name no event.
+    named: set[str] = set()
     stated: set[str] = set()
+    total_lines: set[str] = set()
     for line in answer.splitlines():
-        if not WORKFLOW_NAME.search(line):
-            stated |= _numbers(_without_list_index(line))
-    return named == events and stated == {str(len(events))}
+        listed = _events_listed(line)
+        if listed:
+            named |= listed
+            continue
+        numbers = _numbers(_without_list_index(line))
+        stated |= numbers
+        if "total" in line.lower():
+            total_lines |= numbers
+    total = str(len(events))
+    return named == events and total in stated and total_lines <= {total}
+
+
+def _events_listed(line: str) -> set[str]:
+    """The events a line lists: one made of nothing but event names."""
+    text = DECORATION.sub("", line, count=1).replace("`", "").replace("*", "")
+    text = text.strip().rstrip(".,;:").strip()
+    names = [name for name in re.split(r"[,\s]+", text) if name]
+    if names and all(WORKFLOW_NAME.fullmatch(name) for name in names):
+        return set(names)
+    return set()
 
 
 def _tools_named(answer: str, every: set[str]) -> set[str]:
@@ -110,6 +138,8 @@ def _largest_test_files(answer: str, root: Path) -> bool:
         raise RuntimeError(f"no Rust files under {root / 'tests'}")
     largest = sorted(counts, key=lambda path: (-counts[path], path))[:5]
     if not _each_with_its_count(answer, {path: counts[path] for path in largest}):
+        return False
+    if not _only_these_files(answer, largest):
         return False
     first_seen = [answer.find(path) for path in largest]
     return first_seen == sorted(first_seen)

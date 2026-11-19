@@ -341,3 +341,31 @@ reports the setting, and `enabled = false` turns it off.
   tool discovery, state between scripts, replay: stages 2 to 4.
 - The workflow host.
 - Running anything inside the OS sandbox: a script starts no process.
+
+## Results
+
+Measured on 2026-11-19 at `15e93b0e`, five tasks, three runs each way, through
+`orca exec` against the real provider. All 30 runs ended normally.
+
+| | `run_script` off | `run_script` on |
+|---|---|---|
+| Runs | 15 | 15 |
+| Answers right | 15 | 15 |
+| Model rounds | 53 | 57 |
+| Cost (USD) | 0.018668 | 0.017745 |
+
+With the tool on, the model called `run_script` in 3 of the 15 runs (5 calls
+in all); in the other 12 it used `grep`, `read_file` and `bash` as it does
+with the tool off. The runs that used it took no fewer rounds.
+
+Release binary on `aarch64-apple-darwin`: 71348400 bytes before, 72367760
+bytes after (1019360 more).
+
+The rule for default-on (as many right answers, fewer rounds, lower cost) is
+not met: rounds are higher with the tool on. `enabled` stays `false` by
+default.
+
+Nine right answers were first marked wrong by the checker, which took a file
+or an event mentioned in a sentence for one the answer listed, and line
+numbers for stated totals. The checker was corrected and the saved answers
+marked again; no run was repeated.

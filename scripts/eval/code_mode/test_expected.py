@@ -58,6 +58,18 @@ class UserTrustedLaunches(unittest.TestCase):
         answer = "hooks.rs: 1\nworkflow/host.rs: 2\nquiet.rs: 1"
         self.assertFalse(expected.is_right("user-trusted-launches", answer, self.root))
 
+    def test_a_sentence_that_mentions_other_files_names_none(self):
+        answer = ("hooks.rs: 1\nworkflow/host.rs: 2"
+                  "\n\nThe definitions live in `crates/orca-core/src/execution_broker.rs`, "
+                  "and calls in `tasks.rs` were excluded. No files were modified.")
+        self.assertTrue(expected.is_right("user-trusted-launches", answer, self.root))
+
+    def test_an_extra_file_as_a_bullet_or_backticked_item_is_wrong(self):
+        for extra in ("- quiet.rs: 1", "`quiet.rs` \u2014 1", "* **quiet.rs**: 1", "| quiet.rs | 1 |"):
+            with self.subTest(extra=extra):
+                answer = "hooks.rs: 1\nworkflow/host.rs: 2\n" + extra
+                self.assertFalse(expected.is_right("user-trusted-launches", answer, self.root))
+
 
 class WorkflowEvents(unittest.TestCase):
     def setUp(self):
@@ -96,7 +108,9 @@ class WorkflowEvents(unittest.TestCase):
         self.assertFalse(self.right(self.listed))
 
     def test_two_different_totals_are_wrong(self):
-        self.assertFalse(self.right(self.listed + "\nTotal: 2\nThat is 3 in all."))
+        self.assertFalse(self.right(self.listed + "\nTotal: 2\nIn all, total: 3."))
+        # A number on a line that is not a total line is not a second total.
+        self.assertTrue(self.right(self.listed + "\nTotal: 2\nThat is 3 in all."))
 
     def test_a_bare_prefix_names_no_event(self):
         self.assertTrue(self.right(self.listed + "\nThey start with `workflow.`. Total: 2"))
@@ -104,6 +118,36 @@ class WorkflowEvents(unittest.TestCase):
     def test_a_missing_schema_file_is_an_error(self):
         with self.assertRaises(OSError):
             expected.is_right("workflow-events", "", checkout({}))
+
+    PROSE = ("Found them: 2 `EventType` serde renames "
+             "(`crates/orca-core/src/event_schema.rs:226-253`). "
+             "The `\"workflow.md\"` at line 1873 is a test fixture path, not an event type, "
+             "so it's excluded.\n\n")
+    BLOCK = "```\nworkflow.phase.completed\nworkflow.started\n```\n\n"
+
+    def test_a_list_in_a_code_block_with_prose_around_it_is_right(self):
+        self.assertTrue(self.right(self.PROSE + self.BLOCK + "Total: **2**\n\nNo files were modified."))
+        self.assertTrue(self.right(self.PROSE + self.BLOCK + "**Total: 2**\n\nNo files were modified."))
+
+    def test_a_count_in_the_first_sentence_without_a_total_line_is_right(self):
+        answer = ("2 event type strings begin with `workflow.` (lines 226\u2013253):\n\n"
+                  + self.BLOCK + "No files were modified.")
+        self.assertTrue(self.right(answer))
+
+    def test_a_wrong_total_line_is_wrong_even_with_prose(self):
+        self.assertFalse(self.right(self.PROSE + self.BLOCK + "Total: 3\n"))
+
+    def test_a_file_name_listed_as_a_line_is_wrong_even_with_prose(self):
+        block = "```\nworkflow.md\nworkflow.phase.completed\nworkflow.started\n```\n\n"
+        self.assertFalse(self.right(self.PROSE + block + "Total: 2"))
+
+    def test_an_event_only_in_a_sentence_is_not_listed(self):
+        answer = ("There are 2 events; workflow.phase.completed is the other one.\n"
+                  "```\nworkflow.started\n```\nTotal: 2")
+        self.assertFalse(self.right(answer))
+
+    def test_several_names_on_one_line_are_listed(self):
+        self.assertTrue(self.right("`workflow.phase.completed`, `workflow.started`\nTotal: 2"))
 
 
 class NetworkTools(unittest.TestCase):
@@ -192,6 +236,18 @@ class CredentialScrubSites(unittest.TestCase):
         self.assertFalse(expected.is_right(
             "credential-scrub-sites",
             "crates/orca-tools/src/bash.rs: the shell\ncrates/orca-tools/src/quiet.rs: something",
+            self.root))
+
+    def test_a_sentence_that_mentions_another_file_names_none(self):
+        self.assertTrue(expected.is_right(
+            "credential-scrub-sites",
+            "crates/orca-tools/src/bash.rs: the shell\n\nI skipped `crates/orca-tools/src/quiet.rs`.",
+            self.root))
+
+    def test_another_file_as_an_item_line_is_wrong(self):
+        self.assertFalse(expected.is_right(
+            "credential-scrub-sites",
+            "- `crates/orca-tools/src/bash.rs`: the shell\n- `crates/orca-tools/src/quiet.rs`: x",
             self.root))
 
 
