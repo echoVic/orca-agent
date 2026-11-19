@@ -874,8 +874,9 @@ fn history_message_from_surface_item(
             ..
         } => {
             let output = (!content.as_str().is_empty()).then(|| content.as_str().to_string());
-            // The item holds only the result; the tool's name, target, and
-            // diff live on its tool view, which a resumed thread still has.
+            // The item holds only the result; the tool's name, target,
+            // arguments and diff live on its tool view, which a resumed
+            // thread still has.
             let tool = tools
                 .iter()
                 .find(|tool| &tool.request.tool_call_id == tool_call_id);
@@ -883,16 +884,43 @@ fn history_message_from_surface_item(
                 tool.and_then(|tool| tool.result.as_ref())
                     .and_then(|result| result.file_change.as_ref()),
             );
+            let status = tool_result_status(terminal.kind).to_string();
+            let mut target = tool
+                .and_then(|tool| tool.request.target.as_ref())
+                .map(|target| target.as_str().to_string());
+            let mut output = output;
+            // A script's row is arranged as `HistoryReplay` arranges it: the
+            // script from the request, what went back from the result.
+            if let Some(tool) =
+                tool.filter(|tool| tool.request.name.as_str() == crate::script_run::SCRIPT_TOOL)
+            {
+                let text = if content.as_str().is_empty() {
+                    tool.result
+                        .as_ref()
+                        .and_then(|result| result.error.as_ref())
+                        .map_or_else(String::new, |error| error.as_str().to_string())
+                } else {
+                    content.as_str().to_string()
+                };
+                let body = crate::script_run::ScriptRun::saved(
+                    crate::script_run::script_from_arguments(tool.request.raw_arguments.as_str()),
+                    crate::script_run::ScriptEnd {
+                        completed: status == "completed",
+                        text,
+                    },
+                )
+                .body();
+                output = (!body.is_empty()).then_some(body);
+                target = None;
+            }
             Some(crate::transcript_state::ChatMessage::ToolCall {
                 id: tool_call_id.as_str().to_string(),
                 name: tool.map_or_else(
                     || format!("tool:{}", tool_call_id.as_str()),
                     |tool| tool.request.name.as_str().to_string(),
                 ),
-                target: tool
-                    .and_then(|tool| tool.request.target.as_ref())
-                    .map(|target| target.as_str().to_string()),
-                status: tool_result_status(terminal.kind).to_string(),
+                target,
+                status,
                 output,
                 diff,
                 kind,
@@ -3449,6 +3477,138 @@ mod tests {
             ),
             "got {messages:?}"
         );
+    }
+
+    /// The row a snapshot holding one finished call of `name` is rebuilt as.
+    fn rebuilt_tool_row(
+        name: &str,
+        target: Option<&str>,
+        raw_arguments: &str,
+        kind: SurfaceToolResultKind,
+        content: &str,
+    ) -> crate::transcript_state::ChatMessage {
+        let mut tool = completed_tool_view("call-1", name, target.unwrap_or(""), None);
+        tool.request.target = target.map(DisplayText::new);
+        tool.request.raw_arguments = DisplayText::new(raw_arguments);
+        tool.request.arguments_digest = Sha256Digest::digest(raw_arguments);
+        let result = tool.result.as_mut().unwrap();
+        result.terminal.kind = kind;
+        if kind == SurfaceToolResultKind::Success {
+            result.output = Some(DisplayText::new(content));
+        } else {
+            result.output = None;
+            result.error = Some(DisplayText::new(content));
+        }
+        let items = vec![SurfaceItem::ToolResultMessage {
+            id: SurfaceItemId::new(),
+            turn_id: SurfaceTurnId::new(),
+            tool_call_id: orca_runtime::surface::SurfaceToolCallId::try_new("call-1").unwrap(),
+            content: DisplayText::new(content),
+            terminal: result.terminal.clone(),
+            pinned: false,
+        }];
+
+        let mut messages = history_messages_from_surface_items(&items, &[tool]);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        messages.remove(0)
+    }
+
+    #[test]
+    fn a_script_row_rebuilt_from_a_snapshot_shows_its_script_and_result() {
+        let row = rebuilt_tool_row(
+            "run_script",
+            None,
+            r#"{"script":"return 1;"}"#,
+            SurfaceToolResultKind::Success,
+            "1",
+        );
+
+        let crate::transcript_state::ChatMessage::ToolCall {
+            name,
+            target,
+            status,
+            output,
+            ..
+        } = row
+        else {
+            panic!("a tool row: {row:?}");
+        };
+        assert_eq!(name, "run_script");
+        assert_eq!(target, None);
+        assert_eq!(status, "completed");
+        assert_eq!(
+            output.as_deref(),
+            Some(concat!(
+                "Script\n 1 │ return 1;\n",
+                "Calls are shown only in the session that ran the script\n",
+                "Returned to the model · 1 B\n 1",
+            ))
+        );
+    }
+
+    #[test]
+    fn a_failed_script_row_rebuilt_from_a_snapshot_says_failed_and_why() {
+        let row = rebuilt_tool_row(
+            "run_script",
+            None,
+            r#"{"script":"throw new Error('boom');"}"#,
+            SurfaceToolResultKind::Failed,
+            "Error: boom (script.js:1:7)",
+        );
+
+        let crate::transcript_state::ChatMessage::ToolCall {
+            target,
+            status,
+            output,
+            ..
+        } = row
+        else {
+            panic!("a tool row: {row:?}");
+        };
+        assert_eq!(target, None);
+        assert_eq!(status, "failed");
+        let output = output.expect("a body");
+        assert!(output.starts_with("Script\n"), "{output}");
+        assert!(
+            output.ends_with("Failed\n Error: boom (script.js:1:7)"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn another_tools_row_rebuilt_from_a_snapshot_is_built_as_before() {
+        let row = rebuilt_tool_row(
+            "read_file",
+            Some("src/a.rs"),
+            r#"{"path":"src/a.rs","script":"return 1;"}"#,
+            SurfaceToolResultKind::Success,
+            "fn main() {}",
+        );
+
+        let crate::transcript_state::ChatMessage::ToolCall {
+            id,
+            name,
+            target,
+            status,
+            output,
+            diff,
+            kind,
+            expanded,
+        } = row
+        else {
+            panic!("a tool row: {row:?}");
+        };
+        assert_eq!(
+            (
+                id.as_str(),
+                name.as_str(),
+                target.as_deref(),
+                status.as_str()
+            ),
+            ("call-1", "read_file", Some("src/a.rs"), "completed")
+        );
+        assert_eq!(output.as_deref(), Some("fn main() {}"));
+        assert_eq!((diff, kind, expanded), (None, None, false));
     }
 
     #[test]
