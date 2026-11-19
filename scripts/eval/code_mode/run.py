@@ -4,7 +4,9 @@
 Each task in tasks.json is run once per repetition with `[tools.script]`
 off and once with it on, through `orca exec` against the real provider.
 For each run this records the model rounds, the tools called, tokens, cost
-and the final answer. It measures cost, not correctness: read the answers.
+and the final answer. Each answer is marked right or wrong against the checkout (expected.py), and
+summary.json says whether the totals meet the rule for turning `run_script`
+on by default.
 
 The runs spend provider credit. Credentials and settings are copied from
 --home into two throwaway Orca homes, so the user's own files are not
@@ -21,11 +23,16 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+sys.path.insert(0, str(HERE))
+
+import expected  # noqa: E402
 
 
 def make_home(source: Path, scripts_on: bool) -> Path:
@@ -34,9 +41,8 @@ def make_home(source: Path, scripts_on: bool) -> Path:
     for name in ("auth.json", "config.toml"):
         if (source / name).exists():
             shutil.copy2(source / name, home / name)
-    if scripts_on:
-        with open(home / "config.toml", "a", encoding="utf-8") as config:
-            config.write("\n[tools.script]\nenabled = true\n")
+    with open(home / "config.toml", "a", encoding="utf-8") as config:
+        config.write(f"\n[tools.script]\nenabled = {'true' if scripts_on else 'false'}\n")
     return home
 
 
@@ -93,6 +99,24 @@ def summarize(jsonl: str) -> dict:
     }
 
 
+def compare(rows: list[dict]) -> dict:
+    """Totals for each variant, and whether they meet the rule for default-on:
+    at least as many right answers, fewer model rounds, lower cost."""
+    totals = {}
+    for variant in ("off", "on"):
+        mine = [row for row in rows if row["variant"] == variant]
+        totals[variant] = {
+            "runs": len(mine),
+            "right": sum(1 for row in mine if row["right"]),
+            "rounds": sum(row["rounds"] for row in mine),
+            "cost_usd": round(sum(row["cost_usd"] or 0 for row in mine), 6),
+        }
+    off, on = totals["off"], totals["on"]
+    totals["default_on"] = (on["runs"] > 0 and on["right"] >= off["right"]
+                            and on["rounds"] < off["rounds"] and on["cost_usd"] < off["cost_usd"])
+    return totals
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--binary", required=True)
@@ -126,6 +150,7 @@ def main() -> int:
                     (out / f"{name}.jsonl").write_text(result.pop("jsonl"), encoding="utf-8")
                     row = {"task": task["id"], "variant": variant, "repetition": repetition,
                            **result, **summarize((out / f"{name}.jsonl").read_text(encoding="utf-8"))}
+                    row["right"] = expected.is_right(task["id"], row["answer"], Path(args.cwd))
                     rows.append(row)
                     print(json.dumps({key: value for key, value in row.items() if key not in ("answer", "tools")}),
                           flush=True)
@@ -133,6 +158,9 @@ def main() -> int:
         for home in homes.values():
             shutil.rmtree(home, ignore_errors=True)
     (out / "results.json").write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+    summary = compare(rows)
+    (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary), flush=True)
     return 0
 
 
