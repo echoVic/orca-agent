@@ -920,7 +920,7 @@ mod tests {
             [
                 "          a\u{fffd}[31mb",
                 "          c\u{fffd}d",
-                "          e f",
+                "          e   f",
                 "          g\u{fffd}h",
             ]
         );

@@ -8,14 +8,15 @@
 //! functions loop for a very long time without taking one (`join` on an
 //! object whose `length` is 2**53, say). The caller's thread keeps watching
 //! the clock and the cancel while the engine is busy, and when the script must
-//! stop it stops waiting: the engine thread is left to end on its own.
+//! stop it stops waiting: the engine thread is left to end on its own, and
+//! is counted until it does ([`scripts_left_behind`]).
 
 use std::cell::RefCell;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -66,6 +67,23 @@ const OUT_OF_TIME: u8 = 2;
 /// answered a batch.
 const ABANDONED: u8 = 3;
 
+/// The caller is waiting for the engine thread, or will.
+const WATCHED: u8 = 0;
+/// The caller stopped waiting while the engine thread was busy.
+const LEFT: u8 = 1;
+/// The engine thread has ended.
+const ENDED: u8 = 2;
+
+/// How many engine threads were left behind and have not ended.
+static LEFT_BEHIND: AtomicUsize = AtomicUsize::new(0);
+
+/// How many scripts were stopped and are still running: each is inside a
+/// native call that had not returned when its caller stopped waiting, and
+/// holds a thread, and the memory it had, until that call returns.
+pub fn scripts_left_behind() -> usize {
+    LEFT_BEHIND.load(Ordering::SeqCst)
+}
+
 /// What stops a script that the script itself does not end.
 #[derive(Clone, Copy, Debug)]
 pub struct ScriptEngineLimits {
@@ -105,6 +123,7 @@ impl ScriptEngine {
     ) -> io::Result<ScriptOutcome> {
         let watch = Arc::new(Watch {
             stopped: AtomicU8::new(RUNNING),
+            engine: AtomicU8::new(WATCHED),
             stop,
             // A wall clock too long to add to now never runs out.
             deadline: Instant::now().checked_add(limits.wall_clock),
@@ -132,6 +151,10 @@ impl ScriptEngine {
                     if ran.is_err() && !said {
                         let _ =
                             to_caller.send(FromEngine::Ended(Ok(failed(FAILED_INSIDE_THE_ENGINE))));
+                    }
+                    // A thread that was left behind is no longer one.
+                    if watch.engine.swap(ENDED, Ordering::SeqCst) == LEFT {
+                        LEFT_BEHIND.fetch_sub(1, Ordering::SeqCst);
                     }
                 }
             })
@@ -165,6 +188,8 @@ struct Watch {
     /// Why the script was stopped, if it was. Once set it does not change,
     /// and the engine refuses to run anything more of the script.
     stopped: AtomicU8,
+    /// Whether the engine thread is watched, left behind or ended.
+    engine: AtomicU8,
     stop: Arc<dyn Fn() -> bool + Send + Sync>,
     /// `None` when the wall clock is too long to be reached.
     deadline: Option<Instant>,
@@ -290,9 +315,10 @@ impl Caller<'_> {
     /// once; one busy in the script is given `STOP_GRACE` to notice that it
     /// was stopped, and is otherwise left behind: it is not joined, and it
     /// can do nothing more than end, since everything it sends or waits for
-    /// fails once these channels are dropped.
+    /// fails once these channels are dropped. It is counted until it ends.
     fn let_go(self) {
         let Caller {
+            watch,
             engine,
             from_engine,
             to_engine,
@@ -309,7 +335,20 @@ impl Caller<'_> {
                     let _ = engine.join();
                     return;
                 }
-                Err(_) => return,
+                Err(_) => {
+                    // Counted first, so that the engine thread, which takes
+                    // itself off the count as it ends, never finds it short.
+                    LEFT_BEHIND.fetch_add(1, Ordering::SeqCst);
+                    if watch
+                        .engine
+                        .compare_exchange(WATCHED, LEFT, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                    {
+                        // It ended just now.
+                        LEFT_BEHIND.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    return;
+                }
             }
         }
     }

@@ -811,6 +811,11 @@ pub struct ToolResult {
     pub images: Vec<ImageInput>,
     #[serde(skip)]
     pub file_change_preview: Option<Arc<FileChangePreview>>,
+    /// What the tool wrote for the person watching while it ran, when that
+    /// is to be kept with the conversation. It is never sent to the model.
+    /// Only `run_script` sets it, to the lines that say what its calls did.
+    #[serde(skip)]
+    pub streamed_output: Option<Arc<str>>,
     /// What this call was billed for apart from tokens. It is charged once,
     /// when the call returns, so it never enters a transcript.
     #[serde(skip)]
@@ -874,6 +879,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
     }
@@ -894,6 +900,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
     }
@@ -929,6 +936,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
     }
@@ -982,6 +990,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
     }
@@ -1002,6 +1011,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
     }
@@ -1022,6 +1032,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
     }
@@ -1055,6 +1066,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
     }
@@ -1099,6 +1111,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
     }

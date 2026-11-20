@@ -55,7 +55,52 @@ fn format_goal_notice(goal: &orca_core::goal_types::ThreadGoal) -> String {
     parts.join(" · ")
 }
 
+/// Puts `chunk` at `offset` of `text`, in place of what was there, or at
+/// its end when no offset is given.
+fn put_output(text: &mut String, offset: Option<usize>, chunk: &str) {
+    if let Some(offset) = offset {
+        let mut end = offset.min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text.push_str(chunk);
+}
+
 impl AppState {
+    /// Adds output a tool wrote to its row: to a script's calls, or to any
+    /// other tool's output.
+    fn take_tool_output(&mut self, id: String, offset: Option<usize>, chunk: &str) {
+        if self.suppress_background_main_session_output {
+            return;
+        }
+        let is_script = self.transcript.messages.iter().rev().any(|message| {
+            matches!(message, ChatMessage::ToolCall { id: existing_id, name, .. }
+                if existing_id == &id && name == SCRIPT_TOOL)
+        });
+        if is_script {
+            let run = self
+                .transcript
+                .script_runs
+                .entry(id.clone())
+                .or_insert_with(ScriptRun::live);
+            put_output(&mut run.calls, offset, chunk);
+            self.refresh_script_row(&id);
+            return;
+        }
+        if let Some(index) = self.transcript.messages.iter().rposition(|message| {
+            matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == &id)
+        }) {
+            self.mutate_message(index, |message| {
+                let ChatMessage::ToolCall { output, .. } = message else {
+                    unreachable!();
+                };
+                put_output(output.get_or_insert_with(String::new), offset, chunk);
+            });
+        }
+    }
+
     /// Rewrites a `run_script` row from its run's parts.
     fn refresh_script_row(&mut self, id: &str) {
         let Some(run) = self.transcript.script_runs.get(id) else {
@@ -495,34 +540,9 @@ impl AppState {
                     });
                 }
             }
-            TuiEvent::ToolOutputDelta { id, chunk } => {
-                if self.suppress_background_main_session_output {
-                    return;
-                }
-                let is_script = self.transcript.messages.iter().rev().any(|message| {
-                    matches!(message, ChatMessage::ToolCall { id: existing_id, name, .. }
-                        if existing_id == &id && name == SCRIPT_TOOL)
-                });
-                if is_script {
-                    self.transcript
-                        .script_runs
-                        .entry(id.clone())
-                        .or_insert_with(ScriptRun::live)
-                        .calls
-                        .push_str(&chunk);
-                    self.refresh_script_row(&id);
-                    return;
-                }
-                if let Some(index) = self.transcript.messages.iter().rposition(|message| {
-                    matches!(message, ChatMessage::ToolCall { id: existing_id, .. } if existing_id == &id)
-                }) {
-                    self.mutate_message(index, |message| {
-                        let ChatMessage::ToolCall { output, .. } = message else {
-                            unreachable!();
-                        };
-                        output.get_or_insert_with(String::new).push_str(&chunk);
-                    });
-                }
+            TuiEvent::ToolOutputDelta { id, chunk } => self.take_tool_output(id, None, &chunk),
+            TuiEvent::ToolOutputAt { id, offset, chunk } => {
+                self.take_tool_output(id, Some(offset), &chunk)
             }
             TuiEvent::ToolCompleted {
                 id,

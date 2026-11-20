@@ -3163,6 +3163,76 @@ fn a_script_row_keeps_its_script_and_calls_after_it_ends() {
 }
 
 #[test]
+fn the_calls_a_scripts_record_holds_are_shown_once() {
+    let whole = format!("{SCRIPT_CALL_LINE}1 tool call · 5ms\n");
+    let recorded = |state: &mut AppState| {
+        state.update(TuiEvent::ToolOutputAt {
+            id: "s1".to_string(),
+            offset: 0,
+            chunk: whole.clone(),
+        });
+    };
+    let expected = (
+        Some("1 tool call · 5ms".to_string()),
+        "completed".to_string(),
+        Some(
+            "Script\n 1 │ return 1;\nCalls\n  1   git_status {} · ok · 4ms · 9 B\nReturned to the model · 1 B\n 1"
+                .to_string(),
+        ),
+    );
+
+    // A session that watched the script: the record repeats what it saw.
+    let mut watched = state();
+    script_request(&mut watched, "s1", Some("return 1;"));
+    script_chunk(&mut watched, "s1", SCRIPT_CALL_LINE);
+    script_chunk(&mut watched, "s1", "1 tool call · 5ms\n");
+    recorded(&mut watched);
+    script_end(&mut watched, "s1", "completed", "1");
+    recorded(&mut watched);
+    assert_eq!(script_row(&watched), expected);
+
+    // A session that joined late and saw only the end of it.
+    let mut joined = state();
+    script_request(&mut joined, "s1", Some("return 1;"));
+    script_chunk(&mut joined, "s1", "1 tool call · 5ms\n");
+    recorded(&mut joined);
+    script_end(&mut joined, "s1", "completed", "1");
+    assert_eq!(script_row(&joined), expected);
+}
+
+#[test]
+fn recorded_output_of_another_tool_takes_the_place_of_what_the_row_held_from_there() {
+    let mut state = state();
+    state.update(TuiEvent::ToolRequested {
+        id: "a".to_string(),
+        name: "bash".to_string(),
+        target: None,
+    });
+    state.update(TuiEvent::ToolOutputDelta {
+        id: "a".to_string(),
+        chunk: "one\ntw".to_string(),
+    });
+    state.update(TuiEvent::ToolOutputAt {
+        id: "a".to_string(),
+        offset: 4,
+        chunk: "two\n".to_string(),
+    });
+    // Past the end of what the row holds, and inside a character of it.
+    state.update(TuiEvent::ToolOutputAt {
+        id: "a".to_string(),
+        offset: 99,
+        chunk: "é".to_string(),
+    });
+    state.update(TuiEvent::ToolOutputAt {
+        id: "a".to_string(),
+        offset: 9,
+        chunk: "!".to_string(),
+    });
+
+    assert_eq!(script_row(&state).2.as_deref(), Some("one\ntwo\n!"),);
+}
+
+#[test]
 fn a_running_script_row_shows_what_has_arrived() {
     let mut state = state();
     script_request(&mut state, "s1", Some("return 1;"));

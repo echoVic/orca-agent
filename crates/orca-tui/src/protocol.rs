@@ -322,6 +322,14 @@ pub enum TuiEvent {
         id: String,
         chunk: String,
     },
+    /// Output as the tool's record holds it from `offset` on. It takes the
+    /// place of whatever the row held from there, so a row that already
+    /// received the same output as it was written shows it once.
+    ToolOutputAt {
+        id: String,
+        offset: usize,
+        chunk: String,
+    },
     ToolCompleted {
         id: String,
         name: String,

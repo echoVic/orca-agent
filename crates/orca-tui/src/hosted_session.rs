@@ -894,7 +894,7 @@ impl HistoryReplay {
                 completed: status == "completed",
                 text: output.take().unwrap_or_default(),
             };
-            let body = crate::script_run::ScriptRun::saved(source, end).body();
+            let body = crate::script_run::ScriptRun::saved(source, "", end).body();
             *output = (!body.is_empty()).then_some(body);
             *target = None;
         }
@@ -1214,7 +1214,7 @@ mod tests {
             output.as_deref(),
             Some(concat!(
                 "Script\n 1 │ return 1;\n",
-                "Calls are shown only in the session that ran the script\n",
+                "Calls were not recorded for this run\n",
                 "Returned to the model · 1 B\n",
                 " 1",
             ))

@@ -78,6 +78,10 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
         _ => return ToolResult::invalid_input(request, "run_script needs a non-empty `script`"),
     };
 
+    if let Some(refusal) = refusal_for_scripts_left_behind(engine::scripts_left_behind()) {
+        return ToolResult::failed(request, refusal, None);
+    }
+
     let started = Instant::now();
     let wall_clock = script_wall_clock(settings.timeout_secs);
     let executor = ReadOnlyToolExecutor {
@@ -99,7 +103,12 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
         config.tools.max_read_parallel,
     );
     // What the person watching sees of the script: its calls, as they end.
+    // It is also kept with the result, for whoever reads the conversation
+    // later.
+    let mut shown = String::new();
     let mut show = |line: String| {
+        shown.push_str(&line);
+        shown.push('\n');
         if emit_deltas {
             let _ = sink.emit(events.tool_output_delta(&request.id, &format!("{line}\n")));
         }
@@ -128,7 +137,7 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
         started.elapsed().as_millis()
     ));
 
-    match outcome {
+    let mut result = match outcome {
         Ok(ScriptOutcome::Completed { output }) => {
             let (output, truncated) =
                 truncate_output_with_policy(output, config.tools.output_truncation);
@@ -143,7 +152,20 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
             format!("run_script could not run the script: {error}"),
             None,
         ),
-    }
+    };
+    result.streamed_output = Some(shown.into());
+    result
+}
+
+/// How many scripts may be left behind at once before no more are started.
+/// Each holds a thread, usually a busy one, and up to the memory limit.
+const MAX_SCRIPTS_LEFT_BEHIND: usize = 2;
+const TOO_MANY_SCRIPTS_LEFT_BEHIND: &str = "run_script cannot start: two earlier scripts were stopped but are still running, each inside a call that has not returned. They end when those calls return or when Orca exits. Call the tools directly instead";
+
+/// Why no script may start while `left_behind` scripts are still running
+/// after they were stopped, if that is too many.
+fn refusal_for_scripts_left_behind(left_behind: usize) -> Option<&'static str> {
+    (left_behind >= MAX_SCRIPTS_LEFT_BEHIND).then_some(TOO_MANY_SCRIPTS_LEFT_BEHIND)
 }
 
 /// The longest a script may run, whatever `timeout_secs` says.
@@ -158,18 +180,35 @@ pub fn shown_size(bytes: usize) -> String {
     }
 }
 
-/// One line of what a script did, safe to show: each control character (C0,
-/// DEL, C1) and each line or paragraph separator becomes `�`, a tab a space.
-/// Nothing is cut and no other character changes.
+/// How far apart a shown line's tab stops are, in characters.
+const SHOWN_TAB_WIDTH: usize = 4;
+
+/// One line of what a script did, safe to show. A tab becomes the spaces up
+/// to the line's next tab stop, so indentation reads as it was written. Each
+/// other control character (C0, DEL, C1), each line or paragraph separator
+/// and each character that sets the direction text is drawn in (the bidi
+/// embeddings, overrides and isolates) becomes `�`. Nothing is cut and no
+/// other character changes.
 pub fn shown_line(text: &str) -> String {
-    text.chars()
-        .map(|character| match character {
-            '\t' => ' ',
-            '\u{2028}' | '\u{2029}' => char::REPLACEMENT_CHARACTER,
-            character if character.is_control() => char::REPLACEMENT_CHARACTER,
-            character => character,
-        })
-        .collect()
+    let mut shown = String::with_capacity(text.len());
+    let mut column = 0;
+    for character in text.chars() {
+        match character {
+            '\t' => {
+                let spaces = SHOWN_TAB_WIDTH - column % SHOWN_TAB_WIDTH;
+                shown.extend(std::iter::repeat_n(' ', spaces));
+                column += spaces;
+                continue;
+            }
+            '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {
+                shown.push(char::REPLACEMENT_CHARACTER)
+            }
+            character if character.is_control() => shown.push(char::REPLACEMENT_CHARACTER),
+            character => shown.push(character),
+        }
+        column += 1;
+    }
+    shown
 }
 
 /// The tools a script may call.
@@ -227,11 +266,37 @@ mod tests {
     #[test]
     fn a_shown_line_has_no_control_character_and_keeps_every_other() {
         assert_eq!(
-            shown_line("a\x1b[1m\r\n\x00\x7f\u{85}\u{9b}\u{2028}\u{2029}\tz"),
-            "a\u{fffd}[1m\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd} z"
+            shown_line("a\x1b[1m\r\n\x00\x7f\u{85}\u{9b}\u{2028}\u{2029}z"),
+            "a\u{fffd}[1m\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}\u{fffd}z"
+        );
+        assert_eq!(
+            shown_line("a\u{202e}b\u{2066}c\u{2069}\u{202a}"),
+            "a\u{fffd}b\u{fffd}c\u{fffd}\u{fffd}"
         );
         let clean = "  2 ┬ read_file {\"path\":\"a\"} · ok · 3ms · 1.2 KiB │ … é 中";
         assert_eq!(shown_line(clean), clean);
+    }
+
+    #[test]
+    fn no_script_starts_while_two_stopped_ones_are_still_running() {
+        assert_eq!(refusal_for_scripts_left_behind(0), None);
+        assert_eq!(refusal_for_scripts_left_behind(1), None);
+        for left_behind in [2, 3] {
+            assert_eq!(
+                refusal_for_scripts_left_behind(left_behind),
+                Some(TOO_MANY_SCRIPTS_LEFT_BEHIND)
+            );
+        }
+    }
+
+    #[test]
+    fn a_tab_in_a_shown_line_reaches_the_next_tab_stop() {
+        assert_eq!(shown_line("\tif (a) {"), "    if (a) {");
+        assert_eq!(shown_line("\t\treturn 1;"), "        return 1;");
+        assert_eq!(shown_line("a\tb"), "a   b");
+        assert_eq!(shown_line("abcd\te"), "abcd    e");
+        // A stop is counted in characters, whatever each takes to encode.
+        assert_eq!(shown_line("é\u{7}\tz"), "é\u{fffd}  z");
     }
 
     #[test]

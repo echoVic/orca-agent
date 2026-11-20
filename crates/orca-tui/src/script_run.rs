@@ -13,7 +13,7 @@ const SCRIPT_TITLE: &str = "Script";
 const CALLS_TITLE: &str = "Calls";
 const RETURNED_TITLE: &str = "Returned to the model";
 const FAILED_TITLE: &str = "Failed";
-const CALLS_NOT_KEPT: &str = "Calls are shown only in the session that ran the script";
+const CALLS_NOT_KEPT: &str = "Calls were not recorded for this run";
 
 /// How a script ended.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,7 +30,7 @@ pub(crate) struct ScriptRun {
     /// What the runtime wrote of the script's calls, as it arrived.
     pub(crate) calls: String,
     pub(crate) end: Option<ScriptEnd>,
-    /// False for a run rebuilt from a saved conversation, which holds no calls.
+    /// False for a run read back from a record that holds no calls.
     pub(crate) calls_kept: bool,
 }
 
@@ -45,13 +45,16 @@ impl ScriptRun {
         }
     }
 
-    /// A run read back from a saved conversation.
-    pub(crate) fn saved(source: Option<String>, end: ScriptEnd) -> Self {
+    /// A run read back from a record of the conversation. `calls` is what
+    /// the runtime wrote of the script's calls, and is empty when the record
+    /// holds none: a run recorded before calls were kept, or a conversation
+    /// read from its messages alone.
+    pub(crate) fn saved(source: Option<String>, calls: &str, end: ScriptEnd) -> Self {
         Self {
             source,
-            calls: String::new(),
+            calls: calls.to_string(),
             end: Some(end),
-            calls_kept: false,
+            calls_kept: !calls.is_empty(),
         }
     }
 
@@ -163,6 +166,13 @@ mod tests {
         }
     }
 
+    impl ScriptRun {
+        fn with_source(mut self, source: &str) -> Self {
+            self.source = Some(source.to_string());
+            self
+        }
+    }
+
     #[test]
     fn a_finished_run_shows_its_script_its_calls_and_what_went_back() {
         let run = finished(true, "2");
@@ -232,9 +242,26 @@ mod tests {
     }
 
     #[test]
-    fn a_run_read_from_a_saved_conversation_says_where_calls_are_shown() {
+    fn a_run_read_back_with_its_calls_shows_them() {
         let run = ScriptRun::saved(
             Some("return 1;".to_string()),
+            CALLS,
+            ScriptEnd {
+                completed: true,
+                text: "2".to_string(),
+            },
+        );
+
+        assert_eq!(run, finished(true, "2").with_source("return 1;"));
+        assert_eq!(run.summary(), Some("3 tool calls · 412ms"));
+        assert!(!run.body().contains("not recorded"));
+    }
+
+    #[test]
+    fn a_run_read_back_without_calls_says_none_were_recorded() {
+        let run = ScriptRun::saved(
+            Some("return 1;".to_string()),
+            "",
             ScriptEnd {
                 completed: true,
                 text: String::new(),
@@ -246,7 +273,7 @@ mod tests {
             run.body(),
             concat!(
                 "Script\n 1 │ return 1;\n",
-                "Calls are shown only in the session that ran the script\n",
+                "Calls were not recorded for this run\n",
                 "Returned to the model · 0 B",
             )
         );
@@ -305,6 +332,7 @@ mod tests {
     fn a_carriage_return_cannot_turn_a_line_into_a_title() {
         let run = ScriptRun::saved(
             Some("x\rScript".to_string()),
+            "",
             ScriptEnd {
                 completed: true,
                 text: "x\rScript".to_string(),
@@ -316,7 +344,7 @@ mod tests {
             body,
             concat!(
                 "Script\n 1 │ x\u{fffd}Script\n",
-                "Calls are shown only in the session that ran the script\n",
+                "Calls were not recorded for this run\n",
                 "Returned to the model · 8 B\n x\u{fffd}Script",
             )
         );
@@ -331,7 +359,7 @@ mod tests {
             titles,
             [
                 "Script",
-                "Calls are shown only in the session that ran the script",
+                "Calls were not recorded for this run",
                 "Returned to the model · 8 B",
             ]
         );
@@ -352,7 +380,7 @@ mod tests {
             run.body(),
             concat!(
                 "Script\n",
-                " 1 │ a\u{fffd}[2Jb c\u{fffd}d\n",
+                " 1 │ a\u{fffd}[2Jb  c\u{fffd}d\n",
                 " 2 │ next\n",
                 "Failed\n",
                 " \u{fffd}bell\u{fffd}\u{fffd}",

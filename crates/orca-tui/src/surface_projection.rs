@@ -889,8 +889,9 @@ fn history_message_from_surface_item(
                 .and_then(|tool| tool.request.target.as_ref())
                 .map(|target| target.as_str().to_string());
             let mut output = output;
-            // A script's row is arranged as `HistoryReplay` arranges it: the
-            // script from the request, what went back from the result.
+            // A script's row is arranged from its tool view: the script from
+            // the request, its calls from what the runtime recorded with the
+            // result, what went back from the result.
             if let Some(tool) =
                 tool.filter(|tool| tool.request.name.as_str() == crate::script_run::SCRIPT_TOOL)
             {
@@ -902,16 +903,17 @@ fn history_message_from_surface_item(
                 } else {
                     content.as_str().to_string()
                 };
-                let body = crate::script_run::ScriptRun::saved(
+                let run = crate::script_run::ScriptRun::saved(
                     crate::script_run::script_from_arguments(tool.request.raw_arguments.as_str()),
+                    tool.streamed_output.as_str(),
                     crate::script_run::ScriptEnd {
                         completed: status == "completed",
                         text,
                     },
-                )
-                .body();
+                );
+                let body = run.body();
                 output = (!body.is_empty()).then_some(body);
-                target = None;
+                target = run.summary().map(str::to_string);
             }
             Some(crate::transcript_state::ChatMessage::ToolCall {
                 id: tool_call_id.as_str().to_string(),
@@ -1499,10 +1501,11 @@ impl TuiSurfaceProjection {
                 }),
                 SurfaceEvent::Tool(ToolPatch::OutputDelta {
                     tool_call_id,
+                    offset,
                     chunk,
-                    ..
-                }) => projected.push(TuiEvent::ToolOutputDelta {
+                }) => projected.push(TuiEvent::ToolOutputAt {
                     id: tool_call_id.as_str().to_string(),
+                    offset: usize::try_from(offset.get()).unwrap_or(usize::MAX),
                     chunk: chunk.as_str().to_string(),
                 }),
                 SurfaceEvent::Tool(ToolPatch::Completed { result }) => {
@@ -3359,6 +3362,22 @@ mod tests {
     }
 
     fn tool_request_events(name: &str, raw_arguments: &str) -> Vec<TuiEvent> {
+        tool_patch_events(ToolPatch::Requested {
+            request: orca_runtime::surface::SurfaceToolRequest {
+                tool_call_id: orca_runtime::surface::SurfaceToolCallId::try_new("call-1").unwrap(),
+                source_response_id: None,
+                turn_id: SurfaceTurnId::new(),
+                name: NonEmptyText::try_new(name).unwrap(),
+                action: orca_runtime::surface::SurfaceToolAction::Read,
+                target: None,
+                raw_arguments: DisplayText::new(raw_arguments),
+                arguments_digest: Sha256Digest::digest(raw_arguments),
+            },
+        })
+    }
+
+    /// What one recorded tool patch is projected as.
+    fn tool_patch_events(patch: ToolPatch) -> Vec<TuiEvent> {
         let before = cursor(0, 1);
         let commit_class = CommitClass::Recorded {
             thread_owner_epoch: ThreadOwnerEpoch::new(1),
@@ -3372,19 +3391,7 @@ mod tests {
             scope: SurfaceScope::Generation {
                 fence: operation_fence(63),
             },
-            event: SurfaceEvent::Tool(ToolPatch::Requested {
-                request: orca_runtime::surface::SurfaceToolRequest {
-                    tool_call_id: orca_runtime::surface::SurfaceToolCallId::try_new("call-1")
-                        .unwrap(),
-                    source_response_id: None,
-                    turn_id: SurfaceTurnId::new(),
-                    name: NonEmptyText::try_new(name).unwrap(),
-                    action: orca_runtime::surface::SurfaceToolAction::Read,
-                    target: None,
-                    raw_arguments: DisplayText::new(raw_arguments),
-                    arguments_digest: Sha256Digest::digest(raw_arguments),
-                },
-            }),
+            event: SurfaceEvent::Tool(patch),
         };
         let batch = SurfaceCommitBatch {
             cursor_before: before.clone(),
@@ -3487,7 +3494,21 @@ mod tests {
         kind: SurfaceToolResultKind,
         content: &str,
     ) -> crate::transcript_state::ChatMessage {
+        rebuilt_tool_row_that_wrote(name, target, raw_arguments, kind, content, "")
+    }
+
+    /// A row rebuilt for a tool whose record holds `streamed`, what it wrote
+    /// while it ran.
+    fn rebuilt_tool_row_that_wrote(
+        name: &str,
+        target: Option<&str>,
+        raw_arguments: &str,
+        kind: SurfaceToolResultKind,
+        content: &str,
+        streamed: &str,
+    ) -> crate::transcript_state::ChatMessage {
         let mut tool = completed_tool_view("call-1", name, target.unwrap_or(""), None);
+        tool.streamed_output = DisplayText::new(streamed);
         tool.request.target = target.map(DisplayText::new);
         tool.request.raw_arguments = DisplayText::new(raw_arguments);
         tool.request.arguments_digest = Sha256Digest::digest(raw_arguments);
@@ -3540,9 +3561,58 @@ mod tests {
             output.as_deref(),
             Some(concat!(
                 "Script\n 1 │ return 1;\n",
-                "Calls are shown only in the session that ran the script\n",
+                "Calls were not recorded for this run\n",
                 "Returned to the model · 1 B\n 1",
             ))
+        );
+    }
+
+    #[test]
+    fn a_script_row_rebuilt_from_a_snapshot_that_holds_its_calls_shows_them() {
+        let row = rebuilt_tool_row_that_wrote(
+            "run_script",
+            None,
+            r#"{"script":"return 1;"}"#,
+            SurfaceToolResultKind::Success,
+            "1",
+            concat!(
+                "  1   grep {\"pattern\":\"TODO\"} · ok · 12ms · 2.1 KiB\n",
+                "          src/a.rs:3: // TODO remove\n",
+                "1 tool call · 40ms\n",
+            ),
+        );
+
+        let crate::transcript_state::ChatMessage::ToolCall { target, output, .. } = row else {
+            panic!("a tool row: {row:?}");
+        };
+        assert_eq!(target.as_deref(), Some("1 tool call · 40ms"));
+        assert_eq!(
+            output.as_deref(),
+            Some(concat!(
+                "Script\n 1 │ return 1;\n",
+                "Calls\n",
+                "  1   grep {\"pattern\":\"TODO\"} · ok · 12ms · 2.1 KiB\n",
+                "          src/a.rs:3: // TODO remove\n",
+                "Returned to the model · 1 B\n 1",
+            ))
+        );
+    }
+
+    #[test]
+    fn output_a_tools_record_holds_is_projected_with_where_it_starts() {
+        let events = tool_patch_events(ToolPatch::OutputDelta {
+            tool_call_id: orca_runtime::surface::SurfaceToolCallId::try_new("call-1").unwrap(),
+            offset: orca_runtime::surface::ByteOffset::new(7),
+            chunk: DisplayText::new("1 tool call · 40ms\n"),
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [TuiEvent::ToolOutputAt { id, offset: 7, chunk }]
+                    if id == "call-1" && chunk == "1 tool call · 40ms\n"
+            ),
+            "{events:?}"
         );
     }
 

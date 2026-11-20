@@ -2309,6 +2309,22 @@ impl ThreadActor {
             let (completed, content) =
                 Self::surface_completed_tool_result(tool, result, &snapshot.thread.cwd)?;
             let terminal = completed.terminal.clone();
+            // What the tool wrote while it ran is recorded with its result,
+            // so the conversation still holds it when it is read back.
+            if let Some(streamed) = result
+                .streamed_output
+                .as_deref()
+                .filter(|streamed| !streamed.is_empty())
+            {
+                events.push((
+                    scope.clone(),
+                    surface::SurfaceEvent::Tool(surface::ToolPatch::OutputDelta {
+                        tool_call_id: tool_call_id.clone(),
+                        offset: surface::ByteOffset::new(tool.output_bytes.get()),
+                        chunk: surface_persisted_display_text(streamed),
+                    }),
+                ));
+            }
             events.push((
                 scope.clone(),
                 surface::SurfaceEvent::Tool(surface::ToolPatch::Completed { result: completed }),
