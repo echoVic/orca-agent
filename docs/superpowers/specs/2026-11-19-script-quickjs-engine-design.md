@@ -275,6 +275,19 @@ left: its thread keeps spinning, and keeps the memory its runtime holds (up
 to the memory limit), until the native call returns or Orca exits. Some such
 calls take hours. Each script left this way costs a thread until then.
 
+Scripts left this way are counted until their threads end
+(`scripts_left_behind`). While two are still running, `run_script` starts no
+other: the call fails at once with "run_script cannot start: two earlier
+scripts were stopped but are still running, each inside a call that has not
+returned. They end when those calls return or when Orca exits. Call the
+tools directly instead". So one session can lose at most two threads and
+twice the memory limit this way, and a model that writes the same script
+again is told why it will not run. Refusing a left-behind script any more
+memory was tried as a way to end it and dropped: the loops that never
+return (`reverse`, and `join` with an empty separator, over an object whose
+`length` is `2 ** 53`) allocate nothing, and the loops that allocate reach
+the memory limit on their own.
+
 A Rust panic on the engine thread is caught there and becomes a failed tool
 result, "run_script failed inside the script engine". So does a panic in
 `answer` on the calling thread, which also stops the script. Tools run on the

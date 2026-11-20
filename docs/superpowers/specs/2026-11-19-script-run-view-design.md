@@ -110,11 +110,12 @@ session's configuration.
 
 The runtime surface already carries a tool request's arguments
 (`SurfaceToolRequest.raw_arguments`), and so does the `tool.call.requested`
-event. The TUI's `ToolRequested` event drops them. For `run_script`, and
-only for it, the two projections that build `ToolRequested`
-(`surface_projection.rs` and `hosted_session.rs`) now pass the arguments
-on, and the reducer takes `script` out of them. Arguments that are not the
-expected JSON leave the row without a `Script` section; nothing fails.
+event. The TUI's `ToolRequested` event drops them, and still does. For
+`run_script`, and only for it, the two projections that build
+`ToolRequested` (`surface_projection.rs` and `hosted_session.rs`) take
+`script` out of the arguments and follow the request with a `ToolScript`
+event that carries it. Arguments that are not the expected JSON leave the
+row without a `Script` section; nothing fails.
 
 ### The calls
 
@@ -125,8 +126,8 @@ do not change. What is written per call changes from one line to:
 
 ```
 {n} {mark} {tool} {arguments} · {ok|failed} · {ms}ms[ · {size}]
-      {preview line}
-      … {k} more lines
+          {preview line}
+          … {k} more lines
 ```
 
 - `n` is the call's number, the same `n` as in its request id
@@ -142,10 +143,13 @@ do not change. What is written per call changes from one line to:
   indented by ten spaces. When lines were left out, a last line says how
   many: `… 40 more lines`. A result with no text has no preview.
 - Control characters in the arguments and in each preview line (C0, DEL,
-  C1, and U+2028 and U+2029) are written as `�`, a tab as a space. This is
+  C1, and U+2028 and U+2029) are written as `�`, and so are the characters
+  that set the direction text is drawn in (U+202A to U+202E and U+2066 to
+  U+2069). A tab is written as the spaces up to the line's next tab stop,
+  four characters apart, so indentation reads as it was written. This is
   done before either is cut, so the limits are measured on what is written.
 
-A preview line always starts with at least six spaces and a summary line
+A preview line always starts with ten spaces and a summary line
 never does, so the two cannot be mistaken for each other by a reader or by
 a program counting calls. A carriage return in what a call read cannot
 take a terminal back over that indent: it is written as `�`.
@@ -184,33 +188,41 @@ do now.
 
 ## Sessions resumed or reattached
 
+A script's calls are kept with its result. When `run_script` ends, the
+runtime records everything it wrote to the output stream as the tool
+view's streamed output (`SurfaceToolView.streamed_output`), in the same
+recorded commit as the result: one `OutputDelta` before the `Completed`.
+The field and the patch already existed and nothing had written them, so
+the surface contract and its hashes do not change. A session file grows by
+what the stream holds, at most about 130 KiB for a script that makes all
+100 calls. The text is redacted as a result is.
+
 A resumed or reattached session's rows are rebuilt from the surface's
 snapshot of the conversation (`history_message_from_surface_item` in
 `surface_projection.rs`): each tool result, with the request and result the
-snapshot holds for its tool. Only when the snapshot holds no messages are
-they rebuilt from the saved conversation instead (`HistoryReplay` in
-`hosted_session.rs`), which pairs each tool message with the assistant
-message that requested it. Output chunks are part of neither and are not
-replayed.
+snapshot holds for its tool. A `run_script` row shows `Script`, taken from
+the request's arguments, `Calls`, taken from the tool view's streamed
+output, and `Returned to the model` or `Failed`, taken from the result. The
+same rebuild happens within a session when the view returns to the main
+conversation from `/side` or from a child's view, and shows the same.
 
-Both arrange a `run_script` row the same way. It shows `Script`, taken from
-the request's arguments (the snapshot's `raw_arguments`, or the saved
-request's), and `Returned to the model` or `Failed`, taken from the result.
-In place of the calls it says
-`Calls are shown only in the session that ran the script`.
+A row whose record holds no calls says
+`Calls were not recorded for this run` in their place. That is a run
+recorded before calls were kept, and a conversation rebuilt from its saved
+messages alone (`HistoryReplay` in `hosted_session.rs`, used only when the
+snapshot holds no messages), which pairs each tool message with the
+assistant message that requested it and has no tool views.
 
-The same rebuild happens within a session when the view returns to the main
-conversation from `/side` or from a child's view. A run's calls are then no
-longer shown, and the row says so.
-
-Keeping the calls of a run across a rebuild means keeping their text with
-the conversation, which changes what a session file holds. That is not
-part of this change.
+A session that is attached while the script runs receives the recorded
+calls with the result (`ToolOutputAt`, which carries where the text starts
+and takes the place of what the row held from there). A session that saw
+the calls as they were written is sent the same text again and shows it
+once.
 
 Chunks that arrive for a run that has no row, as after a reattach while its
 script is running, are not shown: a chunk carries only the call's id, so it
 cannot be known to belong to a script. The row appears when the run ends,
-with what went back to the model and nothing else.
+with its calls and what went back to the model.
 
 ## Who else sees the change
 
@@ -264,11 +276,13 @@ They are constants. Nothing is configurable.
 - **TUI rendering**: the collapsed line; the three sections expanded; a
   failed run; a running run; a run with no calls; a run still receiving its
   arguments, drawn as any tool's row; a one-line body says `1 line`.
-- **Resume**: a snapshot holding a `run_script` call and its result, and a
-  saved conversation holding a `run_script` request and its result, are
-  each rebuilt as a row with the script, the result and the line saying
-  where calls are shown; a result of any other tool is rebuilt as it is
-  today.
+- **Resume**: a snapshot holding a `run_script` call, its recorded calls
+  and its result is rebuilt as a row with all three; a snapshot without
+  recorded calls, and a saved conversation holding a `run_script` request
+  and its result, are each rebuilt as a row with the script, the result and
+  the line saying no calls were recorded; a result of any other tool is
+  rebuilt as it is today. Recorded output is projected with where it
+  starts, and a row that already holds the same text shows it once.
 - **Both projections** pass arguments for `run_script` and for no other
   tool.
 - **`/scripts`**: on and off; the description and parameters equal the
@@ -291,7 +305,6 @@ The configuration page's section on scripts says how to see a run and what
 
 - A panel listing a session's runs, or comparing them.
 - The full text of what a call returned.
-- Keeping a run's calls across a resume or a rebuild of the view.
 - Replaying a recorded script.
 - Showing the whole request sent to the model (system prompt, every tool's
   definition, the messages).
