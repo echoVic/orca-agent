@@ -3898,6 +3898,105 @@ impl ThreadActor {
         ))
     }
 
+    /// Starts a turn the thread starts on its own (the next queued message,
+    /// a wake for finished agents) as an operation of the surface, so the
+    /// conversation holds the turn when a surface reads it back: after a
+    /// switch to another view and back, and after a resume. It is admitted
+    /// the way a turn typed into the terminal is, under an attachment of its
+    /// own that no client holds.
+    ///
+    /// `Err` means no turn was started and nothing of one is left waiting:
+    /// the caller starts it the way a thread with no surface does.
+    pub(super) fn start_runtime_turn_on_surface(
+        &mut self,
+        prompt: &str,
+        images: &[orca_core::conversation::ImageInput],
+        runtime_started: RuntimeStartedTurn,
+    ) -> Result<OperationId, surface::SurfaceClientCommandError> {
+        const UNAVAILABLE: surface::SurfaceClientCommandError =
+            surface::SurfaceClientCommandError::RuntimeUnavailable;
+        if self.resident_surface.0.is_none() || self.active.is_some() {
+            return Err(UNAVAILABLE);
+        }
+        let mut blocks = vec![surface::SurfaceInputRequestBlock::Text {
+            text: surface::DisplayText::new(prompt),
+        }];
+        for image in images {
+            blocks.push(surface_image_request_block(image).ok_or(UNAVAILABLE)?);
+        }
+        let settings = &self
+            .resident_surface
+            .coordinator
+            .state()
+            .snapshot()
+            .settings;
+        let intent = surface::OperationRequestIntent {
+            correlation: surface::OperationIngressCorrelation::TuiUser,
+            kind: surface::OperationKind::UserTurn,
+            input: Some(surface::SurfaceInputRequest {
+                blocks: surface::NonEmptyVec::try_new(blocks).map_err(|_| UNAVAILABLE)?,
+            }),
+            replayability: surface::ReplayabilityRequest::CaptureReplayableCapsule,
+            settings_preparation: surface::OperationSettingsPreparation::UseCurrent {
+                expected_settings_revision: settings.thread_revision,
+                expected_policy_epoch: settings.effective.policy_epoch,
+            },
+        };
+        let origin = surface::SurfaceAttachmentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+            .expect("generated UUID is v7");
+        let reserved = match self.reserve_surface_operation(
+            surface::SurfaceRequestId::new(),
+            intent,
+            origin.clone(),
+            None,
+        )? {
+            surface::MutationReply::Committed { value, .. } => value,
+            surface::MutationReply::Deferred { .. }
+            | surface::MutationReply::Uncommitted { .. } => {
+                return Err(UNAVAILABLE);
+            }
+        };
+        let operation_id = reserved.operation_id;
+        let prepared = self
+            .prepare_surface_admission_from(
+                &origin,
+                surface::SurfaceRequestId::new(),
+                operation_id.clone(),
+                reserved.lease.lease_id,
+                None,
+                Some(runtime_started),
+            )
+            .and_then(|(prepared, goal_work)| match goal_work {
+                None => Ok(prepared),
+                Some(_) => Err(UNAVAILABLE),
+            });
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Nothing was admitted: the reservation must not stay queued.
+                let _ = self.terminalize_surface_reservation(
+                    operation_id,
+                    surface::ReservationFinalizerReason::AdmissionRejected {
+                        reason: surface::AdmissionRejectionReason::ConfigurationConflict,
+                    },
+                    surface::NotAdmittedReason::ConfigurationConflict,
+                );
+                return Err(error);
+            }
+        };
+        // A failed admission is repaired, or left to be retried, by the same
+        // code that does so for a turn a client admits.
+        match self.finish_prepared_surface_admission(prepared, None)? {
+            surface::MutationReply::Committed { .. } => self
+                .active
+                .as_ref()
+                .map(|active| active.operation_id)
+                .ok_or(UNAVAILABLE),
+            surface::MutationReply::Deferred { .. }
+            | surface::MutationReply::Uncommitted { .. } => Err(UNAVAILABLE),
+        }
+    }
+
     pub(super) fn prepare_surface_admission(
         &mut self,
         client: &surface::RuntimeSurfaceClientHandle,
@@ -3909,12 +4008,36 @@ impl ThreadActor {
         (PreparedSurfaceAdmission, Option<PreparedGoalAdmissionWork>),
         surface::SurfaceClientCommandError,
     > {
+        self.prepare_surface_admission_from(
+            client.attachment_id(),
+            request_id,
+            operation_id,
+            admission_lease_id,
+            output_writer,
+            None,
+        )
+    }
+
+    /// Prepares the admission of the operation `origin_attachment` reserved.
+    /// `runtime_started` is given for a turn the thread starts on its own.
+    pub(super) fn prepare_surface_admission_from(
+        &mut self,
+        origin_attachment: &surface::SurfaceAttachmentId,
+        request_id: surface::SurfaceRequestId,
+        operation_id: surface::SurfaceOperationId,
+        admission_lease_id: surface::SurfaceAdmissionLeaseId,
+        output_writer: Option<Box<dyn HostedOperationWriter>>,
+        runtime_started: Option<RuntimeStartedTurn>,
+    ) -> Result<
+        (PreparedSurfaceAdmission, Option<PreparedGoalAdmissionWork>),
+        surface::SurfaceClientCommandError,
+    > {
         if self
             .resident_surface
             .interactions
             .operation_origin_attachments
             .get(&operation_id)
-            != Some(client.attachment_id())
+            != Some(origin_attachment)
         {
             return Err(surface::SurfaceClientCommandError::Unauthorized);
         }
@@ -3975,15 +4098,22 @@ impl ThreadActor {
             };
         let resolved_input = resolve_surface_input(&input_request)
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        // A turn the thread starts on its own keeps its prompt the way it
+        // always has: pinned, and not something to rewind to.
         let backtrack_target =
-            matches!(&operation.intent.origin, surface::OperationOrigin::TuiUser);
+            matches!(&operation.intent.origin, surface::OperationOrigin::TuiUser)
+                && runtime_started.is_none();
         let input_pinned = !backtrack_target;
         let logical_turn_id = match &operation.intent.origin {
             surface::OperationOrigin::JsonlThreadTurn { legacy_turn_id, .. } => {
                 TurnId::parse(legacy_turn_id.0.as_str())
                     .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
             }
-            _ => TurnId::new(),
+            // A queued message's turn was named when the message was queued.
+            _ => runtime_started
+                .as_ref()
+                .and_then(|started| started.turn_id.clone())
+                .unwrap_or_else(TurnId::new),
         };
         let fence = surface::SurfaceOperationFence {
             thread_id: snapshot.thread.thread_id.clone(),
@@ -4150,6 +4280,7 @@ impl ThreadActor {
                 admitted_input,
                 generation,
                 goal_identity,
+                runtime_started,
             },
             goal_work,
         ))
@@ -4253,6 +4384,7 @@ impl ThreadActor {
             admitted_input,
             generation,
             goal_identity,
+            runtime_started,
         } = prepared;
         let mut admitted_events = vec![
             (
@@ -4568,6 +4700,7 @@ impl ThreadActor {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let answered_by_the_surface = runtime_started.is_none();
         let mut hosted_request =
             if matches!(operation.intent.origin, surface::OperationOrigin::Headless) {
                 HostedTurnRequest::headless_session(provider_input)
@@ -4578,7 +4711,7 @@ impl ThreadActor {
             .with_backtrack_target(backtrack_target)
             .with_task_description(resolved_input.canonical_text.as_str())
             .with_generation_handlers(move |_, cancel| {
-                HostedGenerationHandlers::default()
+                let handlers = HostedGenerationHandlers::default()
                     .with_provider_suspension_control(generation_background_control.clone())
                     .with_provider_response_ingress(Arc::new(
                         RuntimeSurfaceProviderResponseIngress {
@@ -4607,28 +4740,41 @@ impl ThreadActor {
                             command_tx: interaction_command_tx.clone(),
                             fence: interaction_fence.clone(),
                         },
-                    ))
-                    .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
-                        command_tx: interaction_command_tx.clone(),
-                        fence: interaction_fence.clone(),
-                        cancel: cancel.clone(),
-                    }))
-                    .with_permission_handler(Arc::new(RuntimeSurfacePermissionHandler {
-                        command_tx: interaction_command_tx.clone(),
-                        fence: interaction_fence.clone(),
-                        cancel: cancel.clone(),
-                    }))
-                    .with_user_input_handler(Arc::new(RuntimeSurfaceUserInputHandler {
-                        command_tx: interaction_command_tx.clone(),
-                        fence: interaction_fence.clone(),
-                        cancel: cancel.clone(),
-                    }))
-                    .with_mcp_elicitation_handler(Arc::new(RuntimeSurfaceMcpElicitationHandler {
-                        command_tx: interaction_command_tx.clone(),
-                        fence: interaction_fence.clone(),
-                        cancel,
-                    }))
+                    ));
+                // Whoever shows the thread answers what a turn the thread
+                // started on its own asks: no surface client admitted it, so
+                // none is there to answer.
+                if answered_by_the_surface {
+                    handlers
+                        .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
+                            command_tx: interaction_command_tx.clone(),
+                            fence: interaction_fence.clone(),
+                            cancel: cancel.clone(),
+                        }))
+                        .with_permission_handler(Arc::new(RuntimeSurfacePermissionHandler {
+                            command_tx: interaction_command_tx.clone(),
+                            fence: interaction_fence.clone(),
+                            cancel: cancel.clone(),
+                        }))
+                        .with_user_input_handler(Arc::new(RuntimeSurfaceUserInputHandler {
+                            command_tx: interaction_command_tx.clone(),
+                            fence: interaction_fence.clone(),
+                            cancel: cancel.clone(),
+                        }))
+                        .with_mcp_elicitation_handler(Arc::new(
+                            RuntimeSurfaceMcpElicitationHandler {
+                                command_tx: interaction_command_tx.clone(),
+                                fence: interaction_fence.clone(),
+                                cancel,
+                            },
+                        ))
+                } else {
+                    handlers
+                }
             });
+        if let Some(started) = runtime_started {
+            hosted_request = started.apply(hosted_request);
+        }
         if let Some((_, task_id)) = &main_session_task {
             hosted_request = hosted_request.with_task_id(task_id.clone());
         }
@@ -9639,4 +9785,38 @@ mod jsonl_resume_generation_regression_tests {
         host.shutdown()
             .expect("shutdown JSONL resume regression host");
     }
+}
+
+/// An image of a queued message as the input block a surface operation is
+/// requested with. `None` for one that could not have been attached.
+fn surface_image_request_block(
+    image: &orca_core::conversation::ImageInput,
+) -> Option<surface::SurfaceInputRequestBlock> {
+    use orca_core::conversation::{ImageDetail, ImageSource};
+    let detail = match image.detail {
+        ImageDetail::Low => surface::SurfaceImageDetail::Low,
+        ImageDetail::High => surface::SurfaceImageDetail::High,
+        ImageDetail::Original => surface::SurfaceImageDetail::Original,
+        ImageDetail::Auto => surface::SurfaceImageDetail::Auto,
+    };
+    let source = match &image.source {
+        ImageSource::Base64 { media_type, data } => surface::SurfaceImageSource::Base64 {
+            media_type: surface::CanonicalMime::try_new(media_type.clone()).ok()?,
+            data: data.clone(),
+            digest: surface::Sha256Digest::digest(
+                &base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    data.as_bytes(),
+                )
+                .ok()?,
+            ),
+        },
+        ImageSource::Url { url } => surface::SurfaceImageSource::Url {
+            url: surface::CanonicalUri::try_new(url.clone()).ok()?,
+        },
+        ImageSource::File { file_id } => surface::SurfaceImageSource::File {
+            file_id: surface::NonEmptyText::try_new(file_id.clone()).ok()?,
+        },
+    };
+    Some(surface::SurfaceInputRequestBlock::Image { source, detail })
 }

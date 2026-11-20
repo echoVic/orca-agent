@@ -55,6 +55,11 @@ fn format_goal_notice(goal: &orca_core::goal_types::ThreadGoal) -> String {
     parts.join(" · ")
 }
 
+/// What the conversation shows in place of a prompt when the thread started
+/// a turn on its own because background agents finished.
+pub(crate) const CHILD_RESULTS_WAKE_NOTE: &str =
+    "Background agents finished; continuing with their results.";
+
 /// Puts `chunk` at `offset` of `text`, in place of what was there, or at
 /// its end when no offset is given.
 fn put_output(text: &mut String, offset: Option<usize>, chunk: &str) {
@@ -319,8 +324,7 @@ impl AppState {
                     match self.queued_message_for_turn(&turn_id) {
                         Some((text, images)) => self.push_user_message_with_images(text, &images),
                         None => self.push_message(ChatMessage::System {
-                            text: "Background agents finished; continuing with their results."
-                                .to_string(),
+                            text: CHILD_RESULTS_WAKE_NOTE.to_string(),
                             expanded: false,
                         }),
                     }

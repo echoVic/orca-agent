@@ -656,6 +656,13 @@ fn attach_history_images(projected: Vec<ChatMessage>, history: &[Message]) -> Ve
     let image_groups = history
         .iter()
         .filter_map(|message| match message {
+            // The prompt of a turn the thread woke for is projected as a
+            // note, not as a user message, so it is not counted as one.
+            Message::User { content, .. }
+                if content == orca_runtime::runtime_host::CHILD_RESULTS_WAKE_PROMPT =>
+            {
+                None
+            }
             Message::User {
                 content, images, ..
             } => Some((content.as_str(), images.clone())),
@@ -1101,6 +1108,46 @@ mod tests {
                 ChatMessage::Assistant(_)
             ] if image.label == "[Image #1]"
         ));
+    }
+
+    /// A wake turn's prompt is read back as a note, so it is not one of the
+    /// user messages the images are matched to by their order.
+    #[test]
+    fn images_are_matched_past_a_turn_the_thread_woke_for() {
+        let projected = vec![
+            ChatMessage::System {
+                text: crate::state_reducer::CHILD_RESULTS_WAKE_NOTE.to_string(),
+                expanded: false,
+            },
+            ChatMessage::Assistant("the agents found it".to_string()),
+            ChatMessage::User("inspect [Image #1]".to_string()),
+        ];
+        let history = vec![
+            Message::user(orca_runtime::runtime_host::CHILD_RESULTS_WAKE_PROMPT.to_string()),
+            Message::user_with_images(
+                "inspect [Image #1]".to_string(),
+                vec![orca_core::conversation::ImageInput {
+                    source: orca_core::conversation::ImageSource::Url {
+                        url: "https://example.com/image.png".to_string(),
+                    },
+                    detail: orca_core::conversation::ImageDetail::High,
+                }],
+            ),
+        ];
+
+        let enriched = attach_history_images(projected, &history);
+        assert!(
+            matches!(
+                enriched.as_slice(),
+                [
+                    ChatMessage::System { .. },
+                    ChatMessage::Assistant(_),
+                    ChatMessage::User(_),
+                    ChatMessage::Image(image),
+                ] if image.label == "[Image #1]"
+            ),
+            "{enriched:?}"
+        );
     }
 
     #[test]

@@ -821,22 +821,30 @@ fn history_message_from_surface_item(
         SurfaceItem::UserMessage { input, .. } => match input {
             SurfaceUserInputState::Pending { presentation, .. }
             | SurfaceUserInputState::ResolutionFailed { presentation, .. } => {
-                visible_input_text(presentation).map(crate::transcript_state::ChatMessage::User)
+                visible_input_text(presentation)
             }
             SurfaceUserInputState::Resolved { fact } => match fact {
                 orca_runtime::surface::SurfaceResolvedInputFact::Replayable { input, .. } => {
-                    Some(crate::transcript_state::ChatMessage::User(
-                        input.canonical_text.as_str().to_string(),
-                    ))
+                    Some(input.canonical_text.as_str().to_string())
                 }
                 orca_runtime::surface::SurfaceResolvedInputFact::NonReplayable {
                     presentation,
                     ..
-                } => {
-                    visible_input_text(presentation).map(crate::transcript_state::ChatMessage::User)
-                }
+                } => visible_input_text(presentation),
             },
-        },
+        }
+        .map(|text| {
+            // Nobody typed the prompt of a turn the thread woke for: it is
+            // shown as the note the turn was announced with while it ran.
+            if text == orca_runtime::runtime_host::CHILD_RESULTS_WAKE_PROMPT {
+                crate::transcript_state::ChatMessage::System {
+                    text: crate::state_reducer::CHILD_RESULTS_WAKE_NOTE.to_string(),
+                    expanded: false,
+                }
+            } else {
+                crate::transcript_state::ChatMessage::User(text)
+            }
+        }),
         SurfaceItem::SystemMessage { content, .. }
             if content
                 .as_str()
@@ -3727,6 +3735,41 @@ mod tests {
                 [ChatMessage::Assistant(text), ChatMessage::ProposedPlan(_)] if text == "Short"
             ),
             "{unfit:?}"
+        );
+    }
+
+    /// The thread started this turn because background agents finished:
+    /// nobody typed its prompt, so the conversation read back shows the note
+    /// the turn was announced with while it ran.
+    #[test]
+    fn a_recorded_wake_turn_is_shown_as_its_note_not_as_a_typed_message() {
+        let user = |text: &str, bytes: u8| SurfaceItem::UserMessage {
+            id: SurfaceItemId::new(),
+            turn_id: SurfaceTurnId::new(),
+            input: SurfaceUserInputState::Pending {
+                presentation: SurfaceInputPresentation::Visible {
+                    text: DisplayText::new(text),
+                },
+                correlation_id: SurfaceInputCorrelationId::try_from_bytes(uuid_v7_bytes(bytes))
+                    .unwrap(),
+            },
+            pinned: true,
+            origin: orca_runtime::surface::SurfaceItemOrigin::UserInput,
+        };
+        let items = [
+            user("typed by the user", 8),
+            user(orca_runtime::runtime_host::CHILD_RESULTS_WAKE_PROMPT, 9),
+        ];
+
+        let messages = history_messages_from_surface_items(&items, &[]);
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [crate::transcript_state::ChatMessage::User(typed), crate::transcript_state::ChatMessage::System { text, expanded: false }]
+                    if typed == "typed by the user"
+                        && text == "Background agents finished; continuing with their results."
+            ),
+            "{messages:?}"
         );
     }
 

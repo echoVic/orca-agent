@@ -147,7 +147,7 @@ const SUBAGENT_SETTLE_GRACE: Duration = Duration::from_secs(2);
 /// The prompt of the turn a finished background agent starts on an idle main
 /// thread. The results themselves arrive as the task notifications the turn's
 /// opening drains in; this only asks the model to act on them.
-const CHILD_RESULTS_WAKE_PROMPT: &str = "[Background agents finished; their results are in the task notifications above. Continue the work with them, or tell the user what they found.]";
+pub const CHILD_RESULTS_WAKE_PROMPT: &str = "[Background agents finished; their results are in the task notifications above. Continue the work with them, or tell the user what they found.]";
 /// The shortest gap between two such turns, so a wake that keeps failing to
 /// start does not spin the actor.
 const CHILD_RESULTS_WAKE_BACKOFF: Duration = Duration::from_secs(2);
@@ -12566,6 +12566,45 @@ struct PreparedSurfaceAdmission {
     admitted_input: surface::AdmittedInput,
     generation: surface::GenerationRecord,
     goal_identity: Option<surface::SurfaceGoalGenerationIdentity>,
+    runtime_started: Option<RuntimeStartedTurn>,
+}
+
+/// What a turn the thread starts on its own (the next queued message, a wake
+/// for finished agents) carries that a turn a client admits does not. It is
+/// recorded on the surface like any other, so the conversation holds it when
+/// it is read back, but no surface client admitted it: whoever shows the
+/// thread watches it through `observer` and answers what it asks through
+/// `interaction_handlers`.
+#[derive(Clone)]
+struct RuntimeStartedTurn {
+    /// The turn's id, when whoever queued the message already named it.
+    turn_id: Option<TurnId>,
+    observer: Option<Arc<dyn EventObserver>>,
+    interaction_handlers: PromptQueueInteractionHandlers,
+}
+
+impl RuntimeStartedTurn {
+    fn apply(self, mut request: HostedTurnRequest) -> HostedTurnRequest {
+        if let Some(turn_id) = self.turn_id {
+            request = request.with_turn_id(turn_id);
+        }
+        if let Some(observer) = self.observer {
+            request = request.with_event_observer(observer);
+        }
+        if let Some(handler) = self.interaction_handlers.approval {
+            request = request.with_approval_handler(handler);
+        }
+        if let Some(handler) = self.interaction_handlers.permission {
+            request = request.with_permission_handler(handler);
+        }
+        if let Some(handler) = self.interaction_handlers.user_input {
+            request = request.with_user_input_handler(handler);
+        }
+        if let Some(handler) = self.interaction_handlers.mcp_elicitation {
+            request = request.with_mcp_elicitation_handler(handler);
+        }
+        request
+    }
 }
 
 struct PreparedGoalAdmissionWork {
@@ -17276,26 +17315,17 @@ impl ThreadActor {
         };
         self.last_child_results_wake = Some(Instant::now());
         self.last_child_results_wake_owed = owed;
-        let mut request =
-            HostedTurnRequest::new(CHILD_RESULTS_WAKE_PROMPT).with_event_observer(observer);
-        let interaction_handlers = self
-            .handle
-            .prompt_queue_interaction_handlers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some(handler) = interaction_handlers.approval {
-            request = request.with_approval_handler(handler);
+        let mut started = self.runtime_started_turn(None);
+        started.observer = Some(observer);
+        if self
+            .start_runtime_turn_on_surface(CHILD_RESULTS_WAKE_PROMPT, &[], started.clone())
+            .is_ok()
+        {
+            return;
         }
-        if let Some(handler) = interaction_handlers.permission {
-            request = request.with_permission_handler(handler);
-        }
-        if let Some(handler) = interaction_handlers.user_input {
-            request = request.with_user_input_handler(handler);
-        }
-        if let Some(handler) = interaction_handlers.mcp_elicitation {
-            request = request.with_mcp_elicitation_handler(handler);
-        }
+        // The surface could not take the turn: it runs unrecorded there, as
+        // on a thread that has none.
+        let request = started.apply(HostedTurnRequest::new(CHILD_RESULTS_WAKE_PROMPT));
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.handle_idle_command(ThreadCommand::StartTurn {
             request: Box::new(request),
@@ -17308,6 +17338,26 @@ impl ThreadActor {
             Ok(Err(error)) | Err(error) => {
                 eprintln!("orca: finished background agents could not wake the thread: {error}");
             }
+        }
+    }
+
+    /// What a turn this thread starts on its own is watched and answered
+    /// through: whatever the surface that shows the thread last handed over.
+    fn runtime_started_turn(&self, turn_id: Option<TurnId>) -> RuntimeStartedTurn {
+        RuntimeStartedTurn {
+            turn_id,
+            observer: self
+                .handle
+                .prompt_queue_observer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            interaction_handlers: self
+                .handle
+                .prompt_queue_interaction_handlers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
         }
     }
 
@@ -17370,47 +17420,33 @@ impl ThreadActor {
                 return;
             }
         };
-        let mut request = HostedTurnRequest::new(prompt)
-            .with_images(item.input.images)
-            .with_turn_id(item.client_user_message_id.turn_id());
-        if let Some(observer) = self
-            .handle
-            .prompt_queue_observer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        {
-            request = request.with_event_observer(observer);
-        }
-        let interaction_handlers = self
-            .handle
-            .prompt_queue_interaction_handlers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some(handler) = interaction_handlers.approval {
-            request = request.with_approval_handler(handler);
-        }
-        if let Some(handler) = interaction_handlers.permission {
-            request = request.with_permission_handler(handler);
-        }
-        if let Some(handler) = interaction_handlers.user_input {
-            request = request.with_user_input_handler(handler);
-        }
-        if let Some(handler) = interaction_handlers.mcp_elicitation {
-            request = request.with_mcp_elicitation_handler(handler);
-        }
-        self.handle_idle_command(ThreadCommand::StartTurn {
-            request: Box::new(request),
-            writer: Box::new(PassthroughHostedOperationWriter::new(io::sink())),
-            config: None,
-            reply: reply_tx,
-        });
-        match receive_reply(reply_rx, "queued prompt runtime start") {
-            Ok(Ok(operation)) => {
+        let started = self.runtime_started_turn(Some(item.client_user_message_id.turn_id()));
+        let start = match self.start_runtime_turn_on_surface(
+            &prompt,
+            &item.input.images,
+            started.clone(),
+        ) {
+            Ok(operation_id) => Ok(Ok(operation_id)),
+            // The surface could not take the turn: it runs unrecorded there,
+            // as on a thread that has none.
+            Err(_) => {
+                let request =
+                    started.apply(HostedTurnRequest::new(prompt).with_images(item.input.images));
+                self.handle_idle_command(ThreadCommand::StartTurn {
+                    request: Box::new(request),
+                    writer: Box::new(PassthroughHostedOperationWriter::new(io::sink())),
+                    config: None,
+                    reply: reply_tx,
+                });
+                receive_reply(reply_rx, "queued prompt runtime start")
+                    .map(|started| started.map(|operation| operation.id()))
+            }
+        };
+        match start {
+            Ok(Ok(operation_id)) => {
                 if let Some(accepted) = self
                     .prompt_queue
-                    .accept_dispatch(&item.id, format!("{:?}", operation.id()))
+                    .accept_dispatch(&item.id, format!("{operation_id:?}"))
                 {
                     if self.persist_prompt_queue(&accepted).is_ok() {
                         self.handle.prompt_queue_updates.send_replace(accepted);
@@ -42841,6 +42877,115 @@ mod tests {
             }
         }
         assert_eq!(rounds, [turn_id.clone(), turn_id]);
+        host.shutdown().expect("shutdown prompt queue host");
+    }
+
+    /// A turn the thread starts for a queued message is an operation of the
+    /// surface like the turn before it, so a surface that reads the
+    /// conversation back (after a switch to another view, after a resume)
+    /// still holds it: the message, the tool it ran and the answer.
+    #[test]
+    fn a_queued_prompt_turn_is_recorded_on_the_surface() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start prompt queue host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "queued turn record",
+            )
+            .expect("start prompt queue thread");
+        let (events_tx, events_rx) = mpsc::channel();
+        thread.set_prompt_queue_event_observer(Arc::new(
+            move |event: &orca_core::event_schema::EventEnvelope| {
+                let _ = events_tx.send(event.clone());
+                Ok(())
+            },
+        ));
+        let running = thread
+            .start_turn(
+                HostedTurnRequest::new("mock_stream_delay_ms 250"),
+                io::sink(),
+            )
+            .expect("start active turn");
+        // A queued message whose turn runs a tool round before it answers.
+        let queued = thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text("task_list"),
+            })
+            .expect("queue follow-up");
+        let turn_id = queued.items[0].client_user_message_id.turn_id();
+        running.wait();
+        loop {
+            let event = events_rx
+                .recv_timeout(SURFACE_TEST_TIMEOUT)
+                .expect("queued turn events");
+            if event.event_type == orca_core::event_schema::EventType::SessionCompleted {
+                break;
+            }
+        }
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while !matches!(thread.state(), Ok(RuntimeThreadState::Idle)) {
+            assert!(Instant::now() < deadline, "queued turn did not end");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let surface = thread.surface();
+        let snapshot = fresh_surface_attachment(&surface).baseline.snapshot;
+        // The operation ended, and nothing of it is left waiting.
+        assert!(snapshot.foreground_operation.is_none());
+        assert!(snapshot.queued_operations.is_empty());
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.initial_logical_turn_id.as_ref() == Some(&turn_id))
+            .expect("the queued turn is an operation of the surface");
+        assert!(
+            matches!(
+                operation.terminal.as_ref().map(|record| &record.terminal),
+                Some(surface::OperationTerminal::Succeeded { .. })
+            ),
+            "{:?}",
+            operation.terminal
+        );
+        // Its items carry the turn the queue named: the message as it was
+        // queued, the tool's result, and an answer.
+        let of_the_turn = |item: &&surface::SurfaceItem| match item {
+            surface::SurfaceItem::UserMessage { turn_id: id, .. }
+            | surface::SurfaceItem::ToolResultMessage { turn_id: id, .. }
+            | surface::SurfaceItem::AssistantMessage { turn_id: id, .. } => id == &turn_id,
+            _ => false,
+        };
+        let items = snapshot
+            .items
+            .iter()
+            .filter(of_the_turn)
+            .collect::<Vec<_>>();
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                surface::SurfaceItem::UserMessage {
+                    input: surface::SurfaceUserInputState::Resolved {
+                        fact: surface::SurfaceResolvedInputFact::Replayable { input, .. },
+                    },
+                    // Kept as a turn the thread started always kept it.
+                    pinned: true,
+                    ..
+                } if input.canonical_text.as_str() == "task_list"
+            )),
+            "{items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, surface::SurfaceItem::ToolResultMessage { .. })),
+            "{items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, surface::SurfaceItem::AssistantMessage { .. })),
+            "{items:?}"
+        );
         host.shutdown().expect("shutdown prompt queue host");
     }
 
