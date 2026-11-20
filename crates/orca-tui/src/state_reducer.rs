@@ -98,6 +98,9 @@ impl AppState {
                 };
                 put_output(output.get_or_insert_with(String::new), offset, chunk);
             });
+        } else if offset == Some(0) {
+            // Kept for the result that follows it and makes the row.
+            self.transcript.recorded_output_without_row = Some((id, chunk.to_string()));
         }
     }
 
@@ -630,12 +633,21 @@ impl AppState {
                     });
                     index
                 };
+                let recorded = self
+                    .transcript
+                    .recorded_output_without_row
+                    .take()
+                    .filter(|(recorded_id, _)| recorded_id == &id);
                 if name == SCRIPT_TOOL {
-                    self.transcript
+                    let run = self
+                        .transcript
                         .script_runs
                         .entry(id.clone())
-                        .or_insert_with(ScriptRun::live)
-                        .end = Some(ScriptEnd {
+                        .or_insert_with(ScriptRun::live);
+                    if let Some((_, calls)) = recorded {
+                        run.calls = calls;
+                    }
+                    run.end = Some(ScriptEnd {
                         completed: status == "completed",
                         text: output.clone(),
                     });

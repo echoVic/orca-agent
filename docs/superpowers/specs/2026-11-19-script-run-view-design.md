@@ -222,7 +222,10 @@ once.
 Chunks that arrive for a run that has no row, as after a reattach while its
 script is running, are not shown: a chunk carries only the call's id, so it
 cannot be known to belong to a script. The row appears when the run ends,
-with its calls and what went back to the model.
+with its calls and what went back to the model: recorded output that
+arrives for a call with no row is held for the result that follows it. The
+script itself, which came with the request, is shown once the row is next
+rebuilt from the snapshot.
 
 ## Who else sees the change
 

@@ -1529,6 +1529,7 @@ impl AppState {
         self.transcript.message_revisions.clear();
         self.transcript.tool_call_indices.clear();
         self.transcript.script_runs.clear();
+        self.transcript.recorded_output_without_row = None;
         self.transcript.render_cache.clear();
         self.clear_applied_edit_highlights();
         self.clear_pending_edit_highlights();

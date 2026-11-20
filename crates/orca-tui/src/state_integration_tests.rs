@@ -3201,6 +3201,46 @@ fn the_calls_a_scripts_record_holds_are_shown_once() {
 }
 
 #[test]
+fn a_session_that_joined_after_the_request_shows_the_recorded_calls_with_the_result() {
+    let mut state = state();
+    state.update(TuiEvent::ToolOutputAt {
+        id: "s1".to_string(),
+        offset: 0,
+        chunk: format!("{SCRIPT_CALL_LINE}1 tool call · 5ms\n"),
+    });
+    script_end(&mut state, "s1", "completed", "1");
+
+    assert_eq!(
+        script_row(&state),
+        (
+            Some("1 tool call · 5ms".to_string()),
+            "completed".to_string(),
+            Some(
+                "Calls\n  1   git_status {} · ok · 4ms · 9 B\nReturned to the model · 1 B\n 1"
+                    .to_string()
+            ),
+        )
+    );
+
+    // Recorded output is for the result that follows it, and no other.
+    state.update(TuiEvent::ToolOutputAt {
+        id: "s2".to_string(),
+        offset: 0,
+        chunk: "1 tool call · 5ms\n".to_string(),
+    });
+    script_end(&mut state, "s3", "completed", "3");
+    script_end(&mut state, "s2", "completed", "2");
+    assert_eq!(
+        script_row(&state),
+        (
+            None,
+            "completed".to_string(),
+            Some("Returned to the model · 1 B\n 2".to_string()),
+        )
+    );
+}
+
+#[test]
 fn recorded_output_of_another_tool_takes_the_place_of_what_the_row_held_from_there() {
     let mut state = state();
     state.update(TuiEvent::ToolRequested {

@@ -58,6 +58,10 @@ pub(crate) struct TranscriptState {
     /// The parts of each `run_script` row, by tool call id. The row's
     /// `output` is their arrangement (`ScriptRun::body`).
     pub(crate) script_runs: HashMap<String, crate::script_run::ScriptRun>,
+    /// Output a tool's record holds, by its call id, that arrived while the
+    /// call had no row: a session attached after the call was requested
+    /// receives it just before the result that makes the row.
+    pub(crate) recorded_output_without_row: Option<(String, String)>,
     pub(crate) next_message_revision: u64,
     pub(crate) render_cache: TranscriptRenderCache,
     pub(crate) welcome_render_cache: TranscriptRenderCache,
