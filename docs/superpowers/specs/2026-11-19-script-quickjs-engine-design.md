@@ -280,9 +280,11 @@ Scripts left this way are counted until their threads end
 other: the call fails at once with "run_script cannot start: two earlier
 scripts were stopped but are still running, each inside a call that has not
 returned. They end when those calls return or when Orca exits. Call the
-tools directly instead". So one session can lose at most two threads and
-twice the memory limit this way, and a model that writes the same script
-again is told why it will not run. Refusing a left-behind script any more
+tools directly instead". The count is the process's, not a session's: two
+stuck scripts stop `run_script` for every session the process hosts. It
+bounds what a model that writes the same script again can cost, and tells it
+why the script will not run. It is not a hard limit: scripts already running
+when the count reaches two can still be left behind. Refusing a left-behind script any more
 memory was tried as a way to end it and dropped: the loops that never
 return (`reverse`, and `join` with an empty separator, over an object whose
 `length` is `2 ** 53`) allocate nothing, and the loops that allocate reach

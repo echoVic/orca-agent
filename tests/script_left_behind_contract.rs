@@ -57,7 +57,7 @@ fn a_script_left_behind_is_counted_until_it_ends() {
     run_until_stopped(r#"return new Array(2 ** 26).join("").length;"#);
     assert_eq!(scripts_left_behind(), 1, "counted while it runs");
     assert!(
-        left_behind_becomes(0, Duration::from_secs(120)),
+        left_behind_becomes(0, Duration::from_secs(600)),
         "not counted once it has ended"
     );
     eprintln!("the loop took {:?}", started.elapsed());

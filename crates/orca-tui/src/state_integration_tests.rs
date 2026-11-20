@@ -3222,20 +3222,52 @@ fn a_session_that_joined_after_the_request_shows_the_recorded_calls_with_the_res
         )
     );
 
-    // Recorded output is for the result that follows it, and no other.
+    // Recorded output waits for its own call's result, whatever ends first.
     state.update(TuiEvent::ToolOutputAt {
         id: "s2".to_string(),
         offset: 0,
         chunk: "1 tool call · 5ms\n".to_string(),
     });
     script_end(&mut state, "s3", "completed", "3");
+    assert_eq!(script_row(&state).0, None, "not another call's");
     script_end(&mut state, "s2", "completed", "2");
     assert_eq!(
         script_row(&state),
         (
-            None,
+            Some("1 tool call · 5ms".to_string()),
             "completed".to_string(),
             Some("Returned to the model · 1 B\n 2".to_string()),
+        )
+    );
+}
+
+#[test]
+fn recorded_output_leaves_a_row_rebuilt_from_the_record_as_it_is() {
+    let mut state = state();
+    let rebuilt = "Script\n 1 │ return 1;\nReturned to the model · 1 B\n 1";
+    state.replace_messages([ChatMessage::ToolCall {
+        id: "s1".to_string(),
+        name: "run_script".to_string(),
+        target: Some("0 tool calls · 2ms".to_string()),
+        status: "completed".to_string(),
+        output: Some(rebuilt.to_string()),
+        diff: None,
+        kind: None,
+        expanded: false,
+    }]);
+
+    state.update(TuiEvent::ToolOutputAt {
+        id: "s1".to_string(),
+        offset: 0,
+        chunk: "0 tool calls · 2ms\n".to_string(),
+    });
+
+    assert_eq!(
+        script_row(&state),
+        (
+            Some("0 tool calls · 2ms".to_string()),
+            "completed".to_string(),
+            Some(rebuilt.to_string()),
         )
     );
 }

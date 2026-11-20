@@ -47,10 +47,67 @@ pub(crate) struct RunScriptContext<'a, W: io::Write> {
     pub(crate) emit_deltas: bool,
 }
 
-/// Runs one `run_script` call to its result.
+/// Runs one `run_script` call to its result. The result carries what the
+/// call wrote for the person watching, to be kept with the conversation.
 pub(crate) fn execute_run_script_tool<W: io::Write>(
     context: RunScriptContext<'_, W>,
 ) -> ToolResult {
+    let mut result = run_script(context);
+    // A call that ended before its script ran made no calls, and says so.
+    result
+        .streamed_output
+        .get_or_insert_with(|| run_summary(0, Duration::ZERO).into());
+    result
+}
+
+/// The last line a script's run writes: `4 tool calls · 412ms`.
+fn run_summary(made: u32, took: Duration) -> String {
+    format!(
+        "{made} tool call{} · {}ms\n",
+        if made == 1 { "" } else { "s" },
+        took.as_millis()
+    )
+}
+
+/// The most of what a script wrote of its calls that is kept with its
+/// result. A script within the default call limit writes about half of
+/// this; one allowed many more calls keeps the first of them.
+const KEPT_CALLS_BYTES: usize = 256 * 1024;
+
+/// What a script wrote of its calls, as far as it is kept.
+#[derive(Default)]
+struct KeptCalls {
+    text: String,
+    lines_left_out: usize,
+}
+
+impl KeptCalls {
+    fn push(&mut self, line: &str) {
+        if self.lines_left_out == 0 && self.text.len() + line.len() < KEPT_CALLS_BYTES {
+            self.text.push_str(line);
+            self.text.push('\n');
+        } else {
+            self.lines_left_out += 1;
+        }
+    }
+
+    /// Everything kept, ending with the run's last line. Lines left out are
+    /// counted in a line written as a preview line is, which nothing reads
+    /// as a call.
+    fn finish(mut self, summary: &str) -> String {
+        if self.lines_left_out > 0 {
+            self.text.push_str(&format!(
+                "          … {} more line{} not kept\n",
+                self.lines_left_out,
+                if self.lines_left_out == 1 { "" } else { "s" }
+            ));
+        }
+        self.text.push_str(summary);
+        self.text
+    }
+}
+
+fn run_script<W: io::Write>(context: RunScriptContext<'_, W>) -> ToolResult {
     let RunScriptContext {
         config,
         cwd,
@@ -105,10 +162,9 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
     // What the person watching sees of the script: its calls, as they end.
     // It is also kept with the result, for whoever reads the conversation
     // later.
-    let mut shown = String::new();
+    let mut kept = KeptCalls::default();
     let mut show = |line: String| {
-        shown.push_str(&line);
-        shown.push('\n');
+        kept.push(&line);
         if emit_deltas {
             let _ = sink.emit(events.tool_output_delta(&request.id, &format!("{line}\n")));
         }
@@ -130,12 +186,10 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
             move || cancel.is_cancelled()
         }),
     );
-    let made = calls.made();
-    show(format!(
-        "{made} tool call{} · {}ms",
-        if made == 1 { "" } else { "s" },
-        started.elapsed().as_millis()
-    ));
+    let summary = run_summary(calls.made(), started.elapsed());
+    if emit_deltas {
+        let _ = sink.emit(events.tool_output_delta(&request.id, &summary));
+    }
 
     let mut result = match outcome {
         Ok(ScriptOutcome::Completed { output }) => {
@@ -153,7 +207,7 @@ pub(crate) fn execute_run_script_tool<W: io::Write>(
             None,
         ),
     };
-    result.streamed_output = Some(shown.into());
+    result.streamed_output = Some(kept.finish(&summary).into());
     result
 }
 
@@ -275,6 +329,40 @@ mod tests {
         );
         let clean = "  2 ┬ read_file {\"path\":\"a\"} · ok · 3ms · 1.2 KiB │ … é 中";
         assert_eq!(shown_line(clean), clean);
+    }
+
+    #[test]
+    fn the_calls_kept_with_a_result_are_bounded_and_end_with_the_summary() {
+        let mut few = KeptCalls::default();
+        few.push("  1   grep {} · ok · 1ms · 2 B");
+        few.push("          hit");
+        assert_eq!(
+            few.finish(&run_summary(1, Duration::from_millis(7))),
+            "  1   grep {} · ok · 1ms · 2 B\n          hit\n1 tool call · 7ms\n"
+        );
+
+        let line = "x".repeat(1023);
+        let mut many = KeptCalls::default();
+        for _ in 0..300 {
+            many.push(&line);
+        }
+        // A line that would fit is still left out once one was, so what is
+        // kept is the start of the run and nothing after a gap.
+        many.push("short");
+        let kept = many.finish(&run_summary(300, Duration::from_secs(2)));
+        assert!(kept.len() <= KEPT_CALLS_BYTES + 64, "{}", kept.len());
+        assert_eq!(kept.matches(&line).count(), 256);
+        assert!(
+            kept.ends_with("          … 45 more lines not kept\n300 tool calls · 2000ms\n"),
+            "{}",
+            &kept[kept.len() - 80..]
+        );
+        assert!(!kept.contains("short"));
+    }
+
+    #[test]
+    fn a_run_that_made_no_calls_says_so() {
+        assert_eq!(run_summary(0, Duration::ZERO), "0 tool calls · 0ms\n");
     }
 
     #[test]

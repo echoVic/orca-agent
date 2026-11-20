@@ -75,11 +75,29 @@ impl AppState {
         if self.suppress_background_main_session_output {
             return;
         }
-        let is_script = self.transcript.messages.iter().rev().any(|message| {
-            matches!(message, ChatMessage::ToolCall { id: existing_id, name, .. }
-                if existing_id == &id && name == SCRIPT_TOOL)
-        });
-        if is_script {
+        let script_row_status =
+            self.transcript
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    ChatMessage::ToolCall {
+                        id: existing_id,
+                        name,
+                        status,
+                        ..
+                    } if existing_id == &id && name == SCRIPT_TOOL => Some(status.as_str()),
+                    _ => None,
+                });
+        if let Some(status) = script_row_status {
+            // A row rebuilt from the conversation's record has no run of its
+            // own and already shows what the record holds.
+            if offset.is_some()
+                && !matches!(status, "running" | "receiving")
+                && !self.transcript.script_runs.contains_key(&id)
+            {
+                return;
+            }
             let run = self
                 .transcript
                 .script_runs
@@ -636,8 +654,7 @@ impl AppState {
                 let recorded = self
                     .transcript
                     .recorded_output_without_row
-                    .take()
-                    .filter(|(recorded_id, _)| recorded_id == &id);
+                    .take_if(|(recorded_id, _)| recorded_id == &id);
                 if name == SCRIPT_TOOL {
                     let run = self
                         .transcript

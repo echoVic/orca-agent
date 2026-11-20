@@ -68,8 +68,9 @@ Expanded with the gesture every expandable row uses (a click, or ctrl+o):
 together, which ran at the same time. A call on its own has no mark.
 
 A script that failed shows `Failed` and the error where a completed one
-shows `Returned to the model`. A script still running shows `Script` and
-the calls answered so far.
+shows `Returned to the model`. A script still running shows `Script`, and
+in a turn that delivers them the calls answered so far (see "Sessions
+resumed or reattached").
 
 The three sections stay after the script ends. Today the call lines are
 lost at that moment, because the result replaces them.
@@ -213,11 +214,24 @@ messages alone (`HistoryReplay` in `hosted_session.rs`, used only when the
 snapshot holds no messages), which pairs each tool message with the
 assistant message that requested it and has no tool views.
 
-A session that is attached while the script runs receives the recorded
-calls with the result (`ToolOutputAt`, which carries where the text starts
-and takes the place of what the row held from there). A session that saw
-the calls as they were written is sent the same text again and shows it
-once.
+The recorded calls reach the TUI with the result, as `ToolOutputAt`, which
+carries where the text starts and takes the place of what the row held from
+there. In a turn the person started, that is how the calls arrive at all:
+such a turn's `tool.output.delta` events go nowhere the TUI listens, so the
+row shows `Script` while the script runs and gains `Calls` when it ends.
+(Until calls were recorded, the row of such a turn never showed them.) A
+turn the runtime starts from a message queued behind another turn does
+deliver the events, so its row shows each batch as it ends, and nothing of
+it is committed to the surface: its calls are shown live and are not kept.
+
+What is kept is bounded at 256 KiB. A script allowed many more calls than
+the default keeps the first of them, then a line saying how many lines were
+left out, then the run's last line. A `run_script` call that ended before
+its script ran (the tool is off, the arguments are not a script, two
+scripts are still running after they were stopped) records
+`0 tool calls · 0ms`. A result the runtime writes itself, for a call that
+was cancelled before it started or was settled by recovery after a crash,
+carries no calls, and its row says none were recorded.
 
 Chunks that arrive for a run that has no row, as after a reattach while its
 script is running, are not shown: a chunk carries only the call's id, so it
@@ -230,9 +244,11 @@ rebuilt from the snapshot.
 ## Who else sees the change
 
 The output stream of a `run_script` call is also what `orca exec` prints in
-text mode, what its JSONL carries in `tool.output.delta`, and what an ACP
-client receives as the tool's output. They get the same, more detailed
-text. No field is added, renamed or removed.
+text mode and what its JSONL carries in `tool.output.delta`. They get the
+same, more detailed text. No field is added, renamed or removed. An ACP
+client has no path from `tool.output.delta`; it now receives the recorded
+calls as one in-progress update of the tool call just before the completed
+update, whose content takes its place.
 
 `scripts/eval/code_mode/run.py` counts a script's calls by lines containing
 ` · `. It changes to count summary lines only: lines that match

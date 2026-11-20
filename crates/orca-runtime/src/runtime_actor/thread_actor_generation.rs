@@ -2310,11 +2310,14 @@ impl ThreadActor {
                 Self::surface_completed_tool_result(tool, result, &snapshot.thread.cwd)?;
             let terminal = completed.terminal.clone();
             // What the tool wrote while it ran is recorded with its result,
-            // so the conversation still holds it when it is read back.
+            // so the conversation still holds it when it is read back. Only
+            // as the whole of the tool's output: output the view received
+            // some other way is not in this record, and a recorded piece
+            // that starts after it could not be replayed.
             if let Some(streamed) = result
                 .streamed_output
                 .as_deref()
-                .filter(|streamed| !streamed.is_empty())
+                .filter(|streamed| !streamed.is_empty() && tool.output_bytes.get() == 0)
             {
                 events.push((
                     scope.clone(),
