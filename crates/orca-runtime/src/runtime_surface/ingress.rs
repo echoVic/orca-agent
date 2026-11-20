@@ -149,6 +149,13 @@ pub trait RuntimeProviderResponseIngress: Send + Sync + std::fmt::Debug {
         Ok(())
     }
     fn commit_tool_results(&self, results: &[ToolResult]) -> io::Result<()>;
+    /// What a running tool wrote for the person watching, recorded as it is
+    /// written so a surface can show it before the tool ends. It is the
+    /// start of what the tool's result holds as its streamed output; the
+    /// result's commit records whatever of that is still to come.
+    fn commit_tool_output(&self, _tool_call_id: &str, _chunk: &str) -> io::Result<()> {
+        Ok(())
+    }
     fn commit_plan_update(&self, _update: &UpdatePlanArgs) -> io::Result<()> {
         Ok(())
     }

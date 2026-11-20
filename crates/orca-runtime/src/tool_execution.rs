@@ -1369,6 +1369,7 @@ impl ToolExecutionActor {
                 subagent_child_executor,
                 workflow_child_executor,
                 workflow_lifecycle_ingress,
+                tool_output_ingress: provider_response_ingress,
                 wait_for_background_workflows,
                 root_task_id,
                 child_budget,

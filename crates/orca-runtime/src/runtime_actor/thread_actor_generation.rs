@@ -2310,21 +2310,19 @@ impl ThreadActor {
                 Self::surface_completed_tool_result(tool, result, &snapshot.thread.cwd)?;
             let terminal = completed.terminal.clone();
             // What the tool wrote while it ran is recorded with its result,
-            // so the conversation still holds it when it is read back. Only
-            // as the whole of the tool's output: output the view received
-            // some other way is not in this record, and a recorded piece
-            // that starts after it could not be replayed.
-            if let Some(streamed) = result
-                .streamed_output
-                .as_deref()
-                .filter(|streamed| !streamed.is_empty() && tool.output_bytes.get() == 0)
-            {
+            // so the conversation still holds it when it is read back: all
+            // of it, or what follows the part recorded while the tool ran.
+            // Output the view holds that is not the start of it came some
+            // other way, and nothing recorded after it could be replayed.
+            if let Some(chunk) = result.streamed_output.as_deref().and_then(|streamed| {
+                unrecorded_tool_output(tool.streamed_output.as_str(), streamed)
+            }) {
                 events.push((
                     scope.clone(),
                     surface::SurfaceEvent::Tool(surface::ToolPatch::OutputDelta {
                         tool_call_id: tool_call_id.clone(),
                         offset: surface::ByteOffset::new(tool.output_bytes.get()),
-                        chunk: surface_persisted_display_text(streamed),
+                        chunk,
                     }),
                 ));
             }
@@ -2346,6 +2344,58 @@ impl ThreadActor {
                 }),
             ));
         }
+        let batch = self.surface_event_batch_with_commit_id(events, None);
+        self.commit_surface_generation_batch_with_retry(fence, &batch)
+    }
+
+    /// Records what a running tool wrote, after what is already recorded for
+    /// it, so a surface shows it before the tool ends.
+    pub(super) fn commit_surface_tool_output(
+        &mut self,
+        active: &mut ActiveOperation,
+        fence: surface::SurfaceOperationFence,
+        tool_call_id: &str,
+        chunk: &str,
+    ) -> io::Result<()> {
+        if active.surface_operation.as_ref() != Some(&fence) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tool output generation fence is stale",
+            ));
+        }
+        let tool_call_id = surface::SurfaceToolCallId::try_new(tool_call_id.to_string())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool call id"))?;
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.request.tool_call_id == tool_call_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "tool output lacks a committed provider tool identity",
+                )
+            })?;
+        if tool.result.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tool output follows the tool's result",
+            ));
+        }
+        let chunk = surface_persisted_display_text(chunk);
+        if chunk.as_str().is_empty() {
+            return Ok(());
+        }
+        let events = vec![(
+            surface::SurfaceScope::Generation {
+                fence: fence.clone(),
+            },
+            surface::SurfaceEvent::Tool(surface::ToolPatch::OutputDelta {
+                tool_call_id,
+                offset: surface::ByteOffset::new(tool.output_bytes.get()),
+                chunk,
+            }),
+        )];
         let batch = self.surface_event_batch_with_commit_id(events, None);
         self.commit_surface_generation_batch_with_retry(fence, &batch)
     }
@@ -5754,6 +5804,49 @@ fn surface_file_change(
             ),
         },
     })
+}
+
+/// The part of `streamed`, all a tool wrote while it ran, that `recorded`
+/// does not hold yet, as it is to be recorded. `None` when there is none, or
+/// when `recorded` is not the start of it.
+pub(super) fn unrecorded_tool_output(
+    recorded: &str,
+    streamed: &str,
+) -> Option<surface::DisplayText> {
+    let streamed = surface_persisted_display_text(streamed);
+    let rest = streamed.as_str().strip_prefix(recorded)?;
+    (!rest.is_empty()).then(|| surface::DisplayText::new(rest.to_string()))
+}
+
+#[cfg(test)]
+mod tool_output_tests {
+    use super::unrecorded_tool_output;
+
+    fn rest(recorded: &str, streamed: &str) -> Option<String> {
+        unrecorded_tool_output(recorded, streamed).map(|text| text.as_str().to_string())
+    }
+
+    #[test]
+    fn a_result_records_what_was_not_recorded_while_the_tool_ran() {
+        // Nothing recorded yet: all of it.
+        assert_eq!(
+            rest("", "  1   grep\n1 tool call · 3ms\n").as_deref(),
+            Some("  1   grep\n1 tool call · 3ms\n")
+        );
+        // The calls were recorded as they ended: the last line is left.
+        assert_eq!(
+            rest("  1   grep\n", "  1   grep\n1 tool call · 3ms\n").as_deref(),
+            Some("1 tool call · 3ms\n")
+        );
+        // All of it is there, or the tool wrote nothing.
+        assert_eq!(rest("  1   grep\n", "  1   grep\n"), None);
+        assert_eq!(rest("", ""), None);
+        // What the view holds is not the start of it: nothing can follow it.
+        assert_eq!(
+            rest("something else\n", "  1   grep\n1 tool call · 3ms\n"),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

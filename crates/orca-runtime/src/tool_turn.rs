@@ -2970,6 +2970,56 @@ mod tests {
         cwd: &std::path::Path,
         script: &str,
     ) -> (String, Vec<serde_json::Value>) {
+        run_script_turn_recorded_by(config, cwd, script, None)
+    }
+
+    /// What a turn that keeps a record a surface reads is told of a tool:
+    /// each piece of output as the tool writes it, then its result.
+    #[derive(Debug, Default)]
+    struct RecordedToolOutput {
+        while_running: std::sync::Mutex<Vec<String>>,
+        with_result: std::sync::Mutex<Option<String>>,
+    }
+
+    impl crate::runtime_surface::RuntimeProviderResponseIngress for RecordedToolOutput {
+        fn commit_response(
+            &self,
+            _response: &mut crate::model_response::RuntimeModelResponse,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn commit_provider_step(
+            &self,
+            _identity: &orca_core::thread_item_projection::ModelResponseIdentity,
+            _step: &orca_core::provider_types::ProviderStep,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn commit_tool_results(&self, results: &[ToolResult]) -> io::Result<()> {
+            *self.with_result.lock().unwrap() =
+                results[0].streamed_output.as_deref().map(str::to_string);
+            Ok(())
+        }
+
+        fn commit_tool_output(&self, tool_call_id: &str, chunk: &str) -> io::Result<()> {
+            assert_eq!(tool_call_id, "tool-1");
+            assert!(
+                self.with_result.lock().unwrap().is_none(),
+                "output is recorded before the result"
+            );
+            self.while_running.lock().unwrap().push(chunk.to_string());
+            Ok(())
+        }
+    }
+
+    fn run_script_turn_recorded_by(
+        config: &RunConfig,
+        cwd: &std::path::Path,
+        script: &str,
+        ingress: Option<&dyn crate::runtime_surface::RuntimeProviderResponseIngress>,
+    ) -> (String, Vec<serde_json::Value>) {
         let mut events = EventFactory::new("run-script-turn".to_string());
         let mut output = Vec::new();
         let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
@@ -3032,7 +3082,7 @@ mod tests {
                 permission_handler_owned: None,
                 user_input_handler: None,
                 mcp_elicitation_handler: None,
-                provider_response_ingress: None,
+                provider_response_ingress: ingress,
             },
             extensions: None,
             executors: RuntimeNormalToolTurnExecutors {
@@ -3094,6 +3144,64 @@ mod tests {
             last.starts_with("1 tool call · ") && last.ends_with("ms"),
             "{last}"
         );
+    }
+
+    #[test]
+    fn run_script_records_each_batch_of_calls_as_it_ends() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(cwd.path().join(name), format!("in {name}\n")).expect("write file");
+        }
+        let recorded = RecordedToolOutput::default();
+
+        let (message, events) = run_script_turn_recorded_by(
+            &config_with_scripts_on(),
+            cwd.path(),
+            r#"const [a, b] = await Promise.all([
+                 tools.read_file({ path: "a.txt" }),
+                 tools.read_file({ path: "b.txt" }),
+               ]);
+               const c = await tools.read_file({ path: "c.txt" });
+               return [a, b, c].join("").length;"#,
+            Some(&recorded),
+        );
+
+        assert_eq!(message, "27");
+        let while_running = recorded.while_running.lock().unwrap().clone();
+        // One piece for each batch: the two calls started together, then the
+        // third.
+        assert_eq!(while_running.len(), 2, "{while_running:?}");
+        assert!(
+            while_running[0].contains(r#"  1 ┬ read_file {"path":"a.txt"}"#)
+                && while_running[0].contains(r#"  2 └ read_file {"path":"b.txt"}"#)
+                && !while_running[0].contains("c.txt"),
+            "{}",
+            while_running[0]
+        );
+        assert!(
+            while_running[1].contains(r#"  3   read_file {"path":"c.txt"}"#),
+            "{}",
+            while_running[1]
+        );
+        // The result holds all of it, so whatever was recorded while the
+        // script ran is its start, and only the run's last line is left.
+        let with_result = recorded
+            .with_result
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the result carries what the script wrote");
+        let rest = with_result
+            .strip_prefix(while_running.concat().as_str())
+            .expect("what was recorded while running starts the whole");
+        assert!(
+            rest.starts_with("3 tool calls · ")
+                && rest.ends_with("ms\n")
+                && rest.lines().count() == 1,
+            "{rest}"
+        );
+        // The stream a client reads carries the same text.
+        assert_eq!(output_deltas(&events), with_result);
     }
 
     #[test]

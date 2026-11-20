@@ -70,6 +70,10 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) subagent_child_executor: ChildAgentExecutor<io::Sink>,
     pub(crate) workflow_child_executor: ChildAgentExecutor<SharedEventBuffer>,
     pub(crate) workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
+    /// Where a tool's output is recorded while the tool runs, when the turn
+    /// keeps a record a surface reads.
+    pub(crate) tool_output_ingress:
+        Option<&'a dyn crate::runtime_surface::RuntimeProviderResponseIngress>,
     pub(crate) wait_for_background_workflows: bool,
     pub(crate) root_task_id: Option<&'a str>,
     /// Lease-derived budget bound for subagent children of this tool call
@@ -173,6 +177,7 @@ impl<'a> RuntimeToolRouter<'a> {
             subagent_child_executor,
             workflow_child_executor,
             workflow_lifecycle_ingress,
+            tool_output_ingress,
             wait_for_background_workflows,
             root_task_id,
             child_budget,
@@ -297,6 +302,7 @@ impl<'a> RuntimeToolRouter<'a> {
                     hooks,
                     cancel,
                     emit_deltas,
+                    output_ingress: tool_output_ingress,
                 },
             )),
             RuntimeSpecialToolDispatch::Subagent => {
@@ -609,6 +615,7 @@ mod tests {
                     subagent_child_executor: unused_child_executor,
                     workflow_child_executor: unused_child_executor,
                     workflow_lifecycle_ingress: None,
+                    tool_output_ingress: None,
                     wait_for_background_workflows: false,
                     root_task_id: None,
                     child_budget: None,
@@ -738,6 +745,7 @@ mod tests {
                     subagent_child_executor: catalog_child_executor,
                     workflow_child_executor: unused_child_executor,
                     workflow_lifecycle_ingress: None,
+                    tool_output_ingress: None,
                     wait_for_background_workflows: false,
                     root_task_id: None,
                     child_budget: None,
@@ -866,6 +874,7 @@ mod tests {
                 subagent_child_executor: unused_child_executor,
                 workflow_child_executor: unused_child_executor,
                 workflow_lifecycle_ingress: None,
+                tool_output_ingress: None,
                 wait_for_background_workflows: false,
                 root_task_id: None,
                 child_budget: None,

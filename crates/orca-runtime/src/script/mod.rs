@@ -45,6 +45,10 @@ pub(crate) struct RunScriptContext<'a, W: io::Write> {
     pub(crate) hooks: &'a HookRunner,
     pub(crate) cancel: &'a CancelToken,
     pub(crate) emit_deltas: bool,
+    /// Where the script's calls are recorded as they end, when the turn
+    /// keeps a record a surface reads.
+    pub(crate) output_ingress:
+        Option<&'a dyn crate::runtime_surface::RuntimeProviderResponseIngress>,
 }
 
 /// Runs one `run_script` call to its result. The result carries what the
@@ -82,13 +86,16 @@ struct KeptCalls {
 }
 
 impl KeptCalls {
-    fn push(&mut self, line: &str) {
-        if self.lines_left_out == 0 && self.text.len() + line.len() < KEPT_CALLS_BYTES {
+    /// Keeps `line` if there is room for it, and says whether it did.
+    fn push(&mut self, line: &str) -> bool {
+        let kept = self.lines_left_out == 0 && self.text.len() + line.len() < KEPT_CALLS_BYTES;
+        if kept {
             self.text.push_str(line);
             self.text.push('\n');
         } else {
             self.lines_left_out += 1;
         }
+        kept
     }
 
     /// Everything kept, ending with the run's last line. Lines left out are
@@ -118,6 +125,7 @@ fn run_script<W: io::Write>(context: RunScriptContext<'_, W>) -> ToolResult {
         hooks,
         cancel,
         emit_deltas,
+        output_ingress,
     } = context;
     let settings = &config.tools.script;
 
@@ -163,10 +171,23 @@ fn run_script<W: io::Write>(context: RunScriptContext<'_, W>) -> ToolResult {
     // It is also kept with the result, for whoever reads the conversation
     // later.
     let mut kept = KeptCalls::default();
-    let mut show = |line: String| {
-        kept.push(&line);
-        if emit_deltas {
-            let _ = sink.emit(events.tool_output_delta(&request.id, &format!("{line}\n")));
+    // The lines of one batch, as its calls end: each goes out as it is, and
+    // those that are kept are recorded together, so a surface that reads the
+    // record shows the batch before the script ends.
+    let mut show = |lines: Vec<String>| {
+        let mut recorded = String::new();
+        for line in lines {
+            if kept.push(&line) {
+                recorded.push_str(&line);
+                recorded.push('\n');
+            }
+            if emit_deltas {
+                let _ = sink.emit(events.tool_output_delta(&request.id, &format!("{line}\n")));
+            }
+        }
+        if let Some(ingress) = output_ingress.filter(|_| !recorded.is_empty()) {
+            // What cannot be recorded now is recorded with the result.
+            let _ = ingress.commit_tool_output(&request.id, &recorded);
         }
     };
 
@@ -178,7 +199,7 @@ fn run_script<W: io::Write>(context: RunScriptContext<'_, W>) -> ToolResult {
         },
         &mut |batch| {
             let answers = calls.answer(batch);
-            calls.drain_report().into_iter().for_each(&mut show);
+            show(calls.drain_report());
             answers
         },
         Arc::new({

@@ -1960,6 +1960,19 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
         })?
     }
 
+    fn commit_tool_output(&self, tool_call_id: &str, chunk: &str) -> io::Result<()> {
+        // Not waited for: the mailbox keeps it ahead of the tool's result.
+        send_thread_command_retrying_full(
+            &self.command_tx,
+            ThreadCommand::SurfaceCommitToolOutput {
+                fence: self.fence.clone(),
+                tool_call_id: tool_call_id.to_string(),
+                chunk: chunk.to_string(),
+            },
+        )
+        .map_err(surface_semantic_ingress_send_error)
+    }
+
     fn commit_plan_update(&self, update: &orca_core::plan_types::UpdatePlanArgs) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         send_thread_command_retrying_full(
@@ -5216,6 +5229,11 @@ enum ThreadCommand {
         fence: surface::SurfaceOperationFence,
         results: Vec<orca_core::tool_types::ToolResult>,
         reply: SyncSender<io::Result<()>>,
+    },
+    SurfaceCommitToolOutput {
+        fence: surface::SurfaceOperationFence,
+        tool_call_id: String,
+        chunk: String,
     },
     SurfaceCommitPlanUpdate {
         fence: surface::SurfaceOperationFence,
@@ -18823,6 +18841,7 @@ impl ThreadActor {
                         "runtime thread is shutting down",
                     )));
                 }
+                ThreadCommand::SurfaceCommitToolOutput { .. } => {}
                 ThreadCommand::SurfaceCommitPlanUpdate { reply, .. } => {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
@@ -19555,6 +19574,7 @@ impl ThreadActor {
                     "runtime generation is not active",
                 )));
             }
+            ThreadCommand::SurfaceCommitToolOutput { .. } => {}
             ThreadCommand::SurfaceCommitPlanUpdate { reply, .. } => {
                 let _ = reply.send(Err(io::Error::new(
                     io::ErrorKind::NotConnected,
@@ -20782,6 +20802,15 @@ impl ThreadActor {
             } => {
                 let result = self.commit_surface_tool_results(active, fence, &results);
                 let _ = reply.send(result);
+            }
+            ThreadCommand::SurfaceCommitToolOutput {
+                fence,
+                tool_call_id,
+                chunk,
+            } => {
+                // Output that cannot be recorded now is recorded with the
+                // tool's result.
+                let _ = self.commit_surface_tool_output(active, fence, &tool_call_id, &chunk);
             }
             ThreadCommand::SurfaceCommitPlanUpdate {
                 fence,
