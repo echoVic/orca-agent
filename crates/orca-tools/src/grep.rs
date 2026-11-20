@@ -13,6 +13,7 @@ const DEFAULT_GREP_HEAD_LIMIT: usize = 250;
 const MAX_GREP_HEAD_LIMIT: usize = 1_000;
 const MIN_GREP_LINE_BYTES: usize = 8 * 1024;
 const MAX_GREP_LINE_BYTES: usize = 1024 * 1024;
+const GREP_CANCELLED: &str = "grep was cancelled";
 
 #[derive(Default, Deserialize)]
 struct GrepArgs {
@@ -23,6 +24,16 @@ struct GrepArgs {
 }
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
+    execute_or_cancel(request, cwd, max_bytes, || false)
+}
+
+/// Like [`execute`], but stops the search once `should_cancel` says so.
+pub fn execute_or_cancel(
+    request: &ToolRequest,
+    cwd: &Path,
+    max_bytes: usize,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let args = parse_args(request);
     let pattern = args.pattern.as_deref().or(request
         .target
@@ -57,12 +68,14 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
     let output = crate::process::spawn_user_trusted(command, "tool:grep", cwd)
         .map(|(child, process_job, _receipt)| (child, process_job))
         .and_then(|(child, process_job)| {
-            crate::process::wait_for_child_stdout_lines_with_timeout(
+            crate::process::wait_for_child_stdout_lines_with_timeout_or_cancel(
                 child,
                 process_job,
                 Duration::from_secs(120),
                 max_line_bytes,
+                crate::process::DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM,
                 collector,
+                &should_cancel,
                 |collector, line| {
                     collector.push(line);
                     Ok(())
@@ -71,6 +84,7 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         });
 
     match output {
+        Ok(output) if output.cancelled => ToolResult::cancelled(request, GREP_CANCELLED, None),
         Ok(output) if output.status.success() && !output.timed_out => {
             let ingress_truncated = output.output_was_omitted();
             let (stdout, page_truncated) = output.value.render();
@@ -107,9 +121,14 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
             let stderr = output.stderr_text().trim().to_string();
             ToolResult::failed(request, stderr, output.status.code())
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            execute_in_process(request, cwd, pattern, &search_path, max_bytes)
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => execute_in_process(
+            request,
+            cwd,
+            pattern,
+            &search_path,
+            max_bytes,
+            &should_cancel,
+        ),
         Err(error) => ToolResult::failed(request, format!("failed to run rg: {error}"), None),
     }
 }
@@ -120,6 +139,7 @@ fn execute_in_process(
     pattern: &str,
     search_path: &str,
     max_bytes: usize,
+    should_cancel: &dyn Fn() -> bool,
 ) -> ToolResult {
     let regex = match Regex::new(pattern) {
         Ok(regex) => regex,
@@ -140,6 +160,9 @@ fn execute_in_process(
         .git_exclude(true);
 
     for entry in walker.build() {
+        if should_cancel() {
+            return ToolResult::cancelled(request, GREP_CANCELLED, None);
+        }
         let Ok(entry) = entry else {
             continue;
         };
@@ -540,11 +563,37 @@ mod tests {
             raw_arguments: Some(r#"{"pattern":"needle","path":"notes.txt"}"#.to_string()),
         };
 
-        let result = execute_in_process(&request, &cwd, "needle", "notes.txt", 4096);
+        let result = execute_in_process(&request, &cwd, "needle", "notes.txt", 4096, &|| false);
 
         assert_eq!(result.status, ToolStatus::Completed);
         assert_eq!(result.kind, ToolResultKind::NoMatches);
         assert_eq!(result.output.as_deref(), Some("(no matches)"));
+    }
+
+    #[test]
+    fn a_search_told_to_stop_is_cancelled() {
+        let cwd = temp_dir("grep-cancel");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::write(cwd.join("notes.txt"), "needle\n").expect("write fixture");
+        let request = ToolRequest {
+            id: "grep-cancel".to_string(),
+            name: ToolName::Grep,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"pattern":"needle"}"#.to_string()),
+        };
+
+        // With `rg`, and without it.
+        let results = [
+            execute_or_cancel(&request, &cwd, 4096, || true),
+            execute_in_process(&request, &cwd, "needle", ".", 4096, &|| true),
+        ];
+
+        for result in results {
+            assert_eq!(result.status, ToolStatus::Cancelled);
+            assert_eq!(result.error.as_deref(), Some("grep was cancelled"));
+        }
+        let _ = fs::remove_dir_all(&cwd);
     }
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {

@@ -188,13 +188,14 @@ one batch of three.
 worker threads in the read-only batch.
 
 The probe the executor passes to a tool answers true when the turn is
-cancelled or the script's time is up. Of the four tools only `read_file`
-asks it. `glob`, `grep` and `git_status` run to their own end, `grep` and
-`git_status` under 120-second limits of their own, so a script whose time
-runs out during one of those calls is stopped when the call returns, and a
-cancel waits for it too. That is how those tools behave when the model calls
-them directly. Making them stop on the probe changes the tools themselves
-and is not part of this stage.
+cancelled or the script's time is up. Each of the four tools asks it:
+`read_file` between the pieces of the file it reads, `glob` at each entry it
+walks, and `grep` and `git_status` every 50 ms while the `rg` or `git` they
+started runs, which they then end. A call stopped this way is answered as
+cancelled. The tools ask the same question when the model calls them
+directly, so a cancelled turn no longer waits for a search to finish.
+(At first only `read_file` asked; the other three were changed after this
+stage.)
 
 A worker asks the executor's `stopped()` (the same question) before it
 starts each call. Once the script is stopped, the calls of the batch not yet

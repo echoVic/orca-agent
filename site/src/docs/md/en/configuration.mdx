@@ -260,7 +260,7 @@ A script can call `read_file`, `glob`, `grep` and `git_status`, and nothing else
 
 - The script runs inside Orca, in a JavaScript engine that has no file, network or process access of its own; every read goes through Orca's own tools. Nothing needs to be installed.
 - Calls a script starts together, as with `Promise.all`, run at the same time, up to `max_read_parallel` at once.
-- A script can run past `timeout_secs` while a call it made is still running: `read_file` stops when the time is up, but `glob`, `grep` and `git_status` run to their end (`grep` and `git_status` have 120-second limits of their own), and the script is stopped when they return. Calls not yet started when the time is up are not started.
+- When a script's time is up, the calls it has running are stopped and the calls it has not started are not started.
 - Nothing is kept between scripts.
 - In the terminal UI, a `run_script` row opens with a click or ctrl+o to show the script the model wrote, each call it made (its arguments, how it ended, the first lines of what came back, and which calls ran together) and what went back to the model. The model sees only the script's result, cut at the usual tool output limit. After a session is resumed, the script and the result are still shown; the calls are shown only in the session that ran the script. Within a session, the calls are also no longer shown once you switch back to the main conversation from a side conversation (`/side`) or from an agent's live conversation opened in the Agent Workspace (`/agents`).
 - `/scripts` prints whether the tool is on, its limits, and the description and parameters the model is sent for it.

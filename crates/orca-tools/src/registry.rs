@@ -2066,8 +2066,16 @@ impl Tool for BuiltinTool {
             BuiltinExecutor::Glob if request.name.as_str() == "list_files" => {
                 list_files::execute(request, ctx.cwd, ctx.max_output_bytes())
             }
-            BuiltinExecutor::Glob => glob::execute(request, ctx.cwd, ctx.max_output_bytes()),
-            BuiltinExecutor::Grep => grep::execute(request, ctx.cwd, ctx.max_output_bytes()),
+            BuiltinExecutor::Glob => {
+                glob::execute_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
+                    ctx.is_cancelled()
+                })
+            }
+            BuiltinExecutor::Grep => {
+                grep::execute_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
+                    ctx.is_cancelled()
+                })
+            }
             // `bash` is the single command entry point and is always executed
             // by the runtime-owned terminal service, which owns process
             // identity, lifetime, and output retention. This arm is the
@@ -2099,7 +2107,11 @@ impl Tool for BuiltinTool {
                 edit::execute_or_cancel(request, ctx.cwd, || ctx.is_cancelled())
             }
             BuiltinExecutor::WriteFile => write_file::execute(request, ctx.cwd),
-            BuiltinExecutor::GitStatus => git::status(request, ctx.cwd, ctx.max_output_bytes()),
+            BuiltinExecutor::GitStatus => {
+                git::status_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
+                    ctx.is_cancelled()
+                })
+            }
             BuiltinExecutor::WebSearch => web_search::execute_or_cancel(
                 request,
                 ctx.max_output_bytes(),

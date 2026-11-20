@@ -338,6 +338,8 @@ pub struct LineCommandOutput<T> {
     pub stderr_omitted_bytes: usize,
     pub status: ExitStatus,
     pub timed_out: bool,
+    /// The caller asked for the child to be stopped, and it was.
+    pub cancelled: bool,
 }
 
 impl CommandOutput {
@@ -664,6 +666,7 @@ where
         stderr_omitted_bytes: stderr.omitted_bytes,
         status,
         timed_out: termination == CommandTermination::TimedOut,
+        cancelled: termination == CommandTermination::Cancelled,
     })
 }
 

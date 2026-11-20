@@ -8,6 +8,16 @@ const GIT_STATUS_TIMEOUT: Duration = Duration::from_secs(120);
 const MIN_GIT_STATUS_RETAINED_BYTES: usize = 8 * 1024;
 
 pub fn status(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
+    status_or_cancel(request, cwd, max_bytes, || false)
+}
+
+/// Like [`status`], but stops git once `should_cancel` says so.
+pub fn status_or_cancel(
+    request: &ToolRequest,
+    cwd: &Path,
+    max_bytes: usize,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let mut command = Command::new("git");
     command
         .args(["status", "--short"])
@@ -26,12 +36,15 @@ pub fn status(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult
                 child,
                 process_job,
                 GIT_STATUS_TIMEOUT,
-                || false,
+                &should_cancel,
                 retained_bytes,
             )
         });
 
     match output {
+        Ok(output) if output.termination == crate::process::CommandTermination::Cancelled => {
+            ToolResult::cancelled(request, "git_status was cancelled", None)
+        }
         Ok(output) if output.status.success() && !output.timed_out => {
             let stdout = output.stdout_text();
             let text = if stdout.trim().is_empty() {
@@ -74,6 +87,29 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolStatus};
 
     use super::*;
+
+    #[test]
+    fn a_status_told_to_stop_is_cancelled() {
+        let repo = tempfile::tempdir().expect("repo");
+        let init = Command::new("git")
+            .arg("init")
+            .current_dir(repo.path())
+            .status()
+            .expect("git init");
+        assert!(init.success());
+        let request = ToolRequest {
+            id: "git-status-cancel".to_string(),
+            name: ToolName::GitStatus,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+
+        let result = status_or_cancel(&request, repo.path(), 4 * 1024, || true);
+
+        assert_eq!(result.status, ToolStatus::Cancelled);
+        assert_eq!(result.error.as_deref(), Some("git_status was cancelled"));
+    }
 
     #[test]
     fn git_status_output_is_bounded_at_ingress() {

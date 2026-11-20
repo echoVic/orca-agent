@@ -29,6 +29,18 @@ const MAX_FUZZY_MATCHES: usize = 200;
 const DEFAULT_GLOB_HEAD_LIMIT: usize = 500;
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
+    execute_or_cancel(request, cwd, max_bytes, || false)
+}
+
+/// Like [`execute`], but stops walking once `should_cancel` says so.
+pub fn execute_or_cancel(
+    request: &ToolRequest,
+    cwd: &Path,
+    max_bytes: usize,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
+    let should_cancel = &should_cancel as &dyn Fn() -> bool;
+    let cancelled = || ToolResult::cancelled(request, "glob was cancelled", None);
     let args = match parse_args(request) {
         Ok(args) => args,
         Err(error) => return ToolResult::failed(request, error, None),
@@ -48,7 +60,8 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
     }
 
     if matches!(args.mode, Some(GlobMode::Fuzzy)) {
-        return execute_fuzzy(request, cwd, &search_root, &args, max_bytes);
+        return execute_fuzzy(request, cwd, &search_root, &args, max_bytes, should_cancel)
+            .unwrap_or_else(cancelled);
     }
 
     let pattern = args
@@ -62,7 +75,10 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
     let mut matches = if search_root.is_file() {
         match_file(cwd, &search_root, &matcher)
     } else {
-        match_tree(cwd, &search_root, &matcher)
+        match match_tree(cwd, &search_root, &matcher, should_cancel) {
+            Some(matches) => matches,
+            None => return cancelled(),
+        }
     };
 
     matches.sort();
@@ -132,7 +148,8 @@ fn execute_fuzzy(
     search_root: &Path,
     args: &GlobArgs,
     max_bytes: usize,
-) -> ToolResult {
+    should_cancel: &dyn Fn() -> bool,
+) -> Option<ToolResult> {
     let query = args
         .query
         .as_deref()
@@ -140,7 +157,14 @@ fn execute_fuzzy(
         .trim();
     let mut matches = Vec::new();
     let mut visited = 0;
-    collect_fuzzy_matches(cwd, search_root, query, &mut matches, &mut visited);
+    collect_fuzzy_matches(
+        cwd,
+        search_root,
+        query,
+        &mut matches,
+        &mut visited,
+        should_cancel,
+    )?;
     matches.sort_by(|left, right| {
         left.0
             .cmp(&right.0)
@@ -154,12 +178,12 @@ fn execute_fuzzy(
         .map(|(_, path)| path)
         .collect::<Vec<_>>();
     if matches.is_empty() {
-        return ToolResult::completed_kind(
+        return Some(ToolResult::completed_kind(
             request,
             "(no matches)".to_string(),
             false,
             ToolResultKind::NoMatches,
-        );
+        ));
     }
     let output = paginate_output(
         matches,
@@ -168,7 +192,7 @@ fn execute_fuzzy(
         DEFAULT_GLOB_HEAD_LIMIT,
     );
     let (output, truncated) = truncate_output(output, max_bytes);
-    ToolResult::completed_kind(
+    Some(ToolResult::completed_kind(
         request,
         output,
         truncated,
@@ -177,7 +201,7 @@ fn execute_fuzzy(
         } else {
             ToolResultKind::Success
         },
-    )
+    ))
 }
 
 fn paginate_output(
@@ -231,9 +255,18 @@ fn build_matcher(pattern: &str) -> Result<globset::GlobSet, String> {
         .map_err(|error| format!("invalid glob pattern: {error}"))
 }
 
-fn match_tree(cwd: &Path, search_root: &Path, matcher: &globset::GlobSet) -> Vec<String> {
+/// The paths under `search_root` that match, or `None` when told to stop.
+fn match_tree(
+    cwd: &Path,
+    search_root: &Path,
+    matcher: &globset::GlobSet,
+    should_cancel: &dyn Fn() -> bool,
+) -> Option<Vec<String>> {
     let mut matches = Vec::new();
     for entry in WalkDir::new(search_root).follow_links(false).into_iter() {
+        if should_cancel() {
+            return None;
+        }
         let Ok(entry) = entry else {
             continue;
         };
@@ -248,7 +281,7 @@ fn match_tree(cwd: &Path, search_root: &Path, matcher: &globset::GlobSet) -> Vec
             matches.push(relative_to_workspace(cwd, path));
         }
     }
-    matches
+    Some(matches)
 }
 
 fn match_file(cwd: &Path, path: &Path, matcher: &globset::GlobSet) -> Vec<String> {
@@ -266,9 +299,10 @@ fn collect_fuzzy_matches(
     query: &str,
     scored: &mut Vec<(usize, String)>,
     visited: &mut usize,
-) {
+    should_cancel: &dyn Fn() -> bool,
+) -> Option<()> {
     if *visited >= MAX_FUZZY_VISITS {
-        return;
+        return Some(());
     }
     for entry in WalkDir::new(search_root)
         .follow_links(false)
@@ -276,7 +310,10 @@ fn collect_fuzzy_matches(
         .filter_entry(|entry| !is_hidden_entry(entry.path(), search_root))
     {
         if *visited >= MAX_FUZZY_VISITS {
-            return;
+            return Some(());
+        }
+        if should_cancel() {
+            return None;
         }
         let Ok(entry) = entry else {
             continue;
@@ -296,6 +333,7 @@ fn collect_fuzzy_matches(
             scored.push((score, candidate));
         }
     }
+    Some(())
 }
 
 fn is_hidden_entry(path: &Path, search_root: &Path) -> bool {
@@ -351,6 +389,29 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn a_walk_told_to_stop_is_cancelled() {
+        let cwd = tempdir().expect("temp workspace");
+        fs::write(cwd.path().join("a.txt"), "hello").expect("write match");
+        for arguments in [
+            serde_json::json!({ "pattern": "*.txt" }),
+            serde_json::json!({ "mode": "fuzzy", "query": "a" }),
+        ] {
+            let request = ToolRequest {
+                id: "glob-cancel".to_string(),
+                name: ToolName::Glob,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(arguments.to_string()),
+            };
+
+            let result = execute_or_cancel(&request, cwd.path(), 100_000, || true);
+
+            assert_eq!(result.status, ToolStatus::Cancelled, "{arguments}");
+            assert_eq!(result.error.as_deref(), Some("glob was cancelled"));
+        }
+    }
 
     #[test]
     fn glob_defaults_to_first_500_results() {
