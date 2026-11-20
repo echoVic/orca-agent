@@ -277,7 +277,7 @@ pub fn script_result_limit_bytes() -> usize {
 
 /// How long a script may run: `timeout_secs`, at least a second and at most a
 /// day, so that adding it to now cannot overflow.
-fn script_wall_clock(timeout_secs: u64) -> Duration {
+pub fn script_wall_clock(timeout_secs: u64) -> Duration {
     Duration::from_secs(timeout_secs.clamp(1, MAX_SCRIPT_WALL_CLOCK_SECS))
 }
 

@@ -13,14 +13,37 @@ const SCRIPT_TITLE: &str = "Script";
 const CALLS_TITLE: &str = "Calls";
 const RETURNED_TITLE: &str = "Returned to the model";
 const FAILED_TITLE: &str = "Failed";
+const CANCELLED_TITLE: &str = "Cancelled";
 const CALLS_NOT_KEPT: &str = "Calls were not recorded for this run";
+
+/// Which way a script ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScriptEnded {
+    /// It returned a value to the model.
+    Returned,
+    /// It was stopped: the turn was interrupted, or it never started.
+    Cancelled,
+    Failed,
+}
 
 /// How a script ended.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScriptEnd {
-    pub(crate) completed: bool,
+    pub(crate) how: ScriptEnded,
     /// What went back to the model, or why nothing did.
     pub(crate) text: String,
+}
+
+impl ScriptEnd {
+    /// The end a finished tool call's status and text describe.
+    pub(crate) fn from_status(status: &str, text: String) -> Self {
+        let how = match status {
+            "completed" => ScriptEnded::Returned,
+            "cancelled" => ScriptEnded::Cancelled,
+            _ => ScriptEnded::Failed,
+        };
+        Self { how, text }
+    }
 }
 
 /// One script run, as far as it has gone.
@@ -99,13 +122,13 @@ impl ScriptRun {
             }
         }
         if let Some(end) = &self.end {
-            lines.push(if end.completed {
-                format!(
+            lines.push(match end.how {
+                ScriptEnded::Returned => format!(
                     "{RETURNED_TITLE} · {}",
                     orca_runtime::script::shown_size(end.text.len())
-                )
-            } else {
-                FAILED_TITLE.to_string()
+                ),
+                ScriptEnded::Cancelled => CANCELLED_TITLE.to_string(),
+                ScriptEnded::Failed => FAILED_TITLE.to_string(),
             });
             lines.extend(
                 end.text
@@ -130,6 +153,7 @@ pub(crate) fn is_section_title(line: &str) -> bool {
     line == SCRIPT_TITLE
         || line == CALLS_TITLE
         || line == FAILED_TITLE
+        || line == CANCELLED_TITLE
         || line == CALLS_NOT_KEPT
         || line.starts_with(RETURNED_TITLE)
 }
@@ -159,7 +183,11 @@ mod tests {
             source: Some("const a = 1;\nreturn a;".to_string()),
             calls: CALLS.to_string(),
             end: Some(ScriptEnd {
-                completed,
+                how: if completed {
+                    ScriptEnded::Returned
+                } else {
+                    ScriptEnded::Failed
+                },
                 text: text.to_string(),
             }),
             calls_kept: true,
@@ -228,7 +256,7 @@ mod tests {
             source: Some("return 1;".to_string()),
             calls: "0 tool calls · 2ms\n".to_string(),
             end: Some(ScriptEnd {
-                completed: true,
+                how: ScriptEnded::Returned,
                 text: "1".to_string(),
             }),
             calls_kept: true,
@@ -242,12 +270,37 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_run_says_it_was_cancelled() {
+        let run = ScriptRun::saved(
+            Some("return 1;".to_string()),
+            CALLS,
+            ScriptEnd::from_status("cancelled", "run_script was cancelled".to_string()),
+        );
+        let body = run.body();
+        assert!(
+            body.ends_with("Cancelled\n run_script was cancelled"),
+            "{body}"
+        );
+        assert!(is_section_title("Cancelled"));
+        assert!(!body.contains("Failed"), "{body}");
+    }
+
+    #[test]
+    fn a_status_names_how_a_run_ended() {
+        let ended = |status: &str| ScriptEnd::from_status(status, String::new()).how;
+        assert_eq!(ended("completed"), ScriptEnded::Returned);
+        assert_eq!(ended("cancelled"), ScriptEnded::Cancelled);
+        assert_eq!(ended("failed"), ScriptEnded::Failed);
+        assert_eq!(ended("timed_out"), ScriptEnded::Failed);
+    }
+
+    #[test]
     fn a_run_read_back_with_its_calls_shows_them() {
         let run = ScriptRun::saved(
             Some("return 1;".to_string()),
             CALLS,
             ScriptEnd {
-                completed: true,
+                how: ScriptEnded::Returned,
                 text: "2".to_string(),
             },
         );
@@ -263,7 +316,7 @@ mod tests {
             Some("return 1;".to_string()),
             "",
             ScriptEnd {
-                completed: true,
+                how: ScriptEnded::Returned,
                 text: String::new(),
             },
         );
@@ -334,7 +387,7 @@ mod tests {
             Some("x\rScript".to_string()),
             "",
             ScriptEnd {
-                completed: true,
+                how: ScriptEnded::Returned,
                 text: "x\rScript".to_string(),
             },
         );
@@ -370,7 +423,7 @@ mod tests {
         let run = ScriptRun {
             source: Some("a\x1b[2Jb\tc\u{2028}d\r\nnext".to_string()),
             end: Some(ScriptEnd {
-                completed: false,
+                how: ScriptEnded::Failed,
                 text: "\x07bell\x7f\u{9b}".to_string(),
             }),
             ..ScriptRun::live()

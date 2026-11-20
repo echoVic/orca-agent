@@ -906,10 +906,7 @@ fn history_message_from_surface_item(
                 let run = crate::script_run::ScriptRun::saved(
                     crate::script_run::script_from_arguments(tool.request.raw_arguments.as_str()),
                     tool.streamed_output.as_str(),
-                    crate::script_run::ScriptEnd {
-                        completed: status == "completed",
-                        text,
-                    },
+                    crate::script_run::ScriptEnd::from_status(&status, text),
                 );
                 let body = run.body();
                 output = (!body.is_empty()).then_some(body);

@@ -664,10 +664,7 @@ impl AppState {
                     if let Some((_, calls)) = recorded {
                         run.calls = calls;
                     }
-                    run.end = Some(ScriptEnd {
-                        completed: status == "completed",
-                        text: output.clone(),
-                    });
+                    run.end = Some(ScriptEnd::from_status(&status, output.clone()));
                     self.refresh_script_row(&id);
                 }
                 self.learn_command_ends_from_result(&name, &output);

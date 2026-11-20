@@ -890,10 +890,10 @@ impl HistoryReplay {
                 ..
             }) = messages.first_mut()
         {
-            let end = crate::script_run::ScriptEnd {
-                completed: status == "completed",
-                text: output.take().unwrap_or_default(),
-            };
+            let end = crate::script_run::ScriptEnd::from_status(
+                status,
+                output.take().unwrap_or_default(),
+            );
             let body = crate::script_run::ScriptRun::saved(source, "", end).body();
             *output = (!body.is_empty()).then_some(body);
             *target = None;

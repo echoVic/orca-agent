@@ -18,7 +18,8 @@ pub(crate) fn format_scripts(config: &RunConfig) -> String {
     }
     lines.push(format!(
         "  {}s per script · {} tool calls · {} MiB · {} calls at once · {} KiB per result",
-        script.timeout_secs,
+        // The limit a script is held to, not the number as it was written.
+        orca_runtime::script::script_wall_clock(script.timeout_secs).as_secs(),
         script.max_tool_calls,
         script.memory_limit_bytes() / (1024 * 1024),
         config.tools.max_read_parallel,
@@ -112,5 +113,12 @@ mod tests {
 
         config.tools.script.memory_limit_mb = 0;
         assert!(format_scripts(&config).contains("· 8 MiB ·"));
+
+        // The time is the one a script is held to: at least a second, at
+        // most a day.
+        config.tools.script.timeout_secs = 0;
+        assert!(format_scripts(&config).contains("  1s per script ·"));
+        config.tools.script.timeout_secs = u64::MAX;
+        assert!(format_scripts(&config).contains("  86400s per script ·"));
     }
 }
