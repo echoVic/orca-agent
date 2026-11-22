@@ -1540,6 +1540,12 @@ impl AppState {
         message: Option<&str>,
         reasoning: Option<&str>,
     ) {
+        // Rows of the tool calls this response was still sending follow its
+        // streamed text. Set them aside, so that text is what trails the
+        // transcript and is replaced, and put them back after the completed
+        // text; left in place they would keep the streamed reasoning above
+        // them and gain a second copy below.
+        let receiving = self.take_trailing_receiving_tool_calls();
         // The response's own streamed text is what trails the transcript:
         // the text before the last tool row, notice, or message belongs to
         // an earlier round or reply and stays.
@@ -1563,6 +1569,38 @@ impl AppState {
         if let Some(message) = message.filter(|text| !text.is_empty()) {
             self.handle_message_delta(message);
         }
+        if !receiving.is_empty() {
+            self.finish_assistant_stream();
+            for row in receiving {
+                self.push_message(row);
+            }
+        }
+    }
+
+    /// Removes and returns the rows at the end of the transcript that are
+    /// tool calls whose arguments are still arriving.
+    fn take_trailing_receiving_tool_calls(&mut self) -> Vec<ChatMessage> {
+        let receiving = self
+            .transcript
+            .messages
+            .iter()
+            .rev()
+            .take_while(|message| {
+                matches!(message, ChatMessage::ToolCall { status, .. } if status == "receiving")
+            })
+            .count();
+        if receiving == 0 {
+            return Vec::new();
+        }
+        let kept = self.transcript.messages.len() - receiving;
+        let rows = self.transcript.messages[kept..].to_vec();
+        let mut index = 0;
+        self.retain_messages(|_| {
+            let keep = index < kept;
+            index += 1;
+            keep
+        });
+        rows
     }
 
     /// The last message before the current model call's streamed output:

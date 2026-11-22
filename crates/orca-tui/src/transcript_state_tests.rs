@@ -419,6 +419,53 @@ fn reasoning_from_the_next_model_call_starts_its_own_row() {
     ));
 }
 
+/// A turn the thread starts itself delivers the completed response after the
+/// rows of the tool calls it was sending.
+#[test]
+fn a_completed_response_does_not_repeat_its_reasoning_below_a_tool_call_it_was_sending() {
+    let mut state = state();
+    state.push_message(ChatMessage::User("prompt".to_string()));
+    state.update(TuiEvent::ReasoningDelta("look at the file".to_string()));
+    state.update(TuiEvent::ToolCallProgress {
+        id: "call-1".to_string(),
+        name: Some("read_file".to_string()),
+        arguments_bytes: 12,
+    });
+
+    state.update(TuiEvent::AssistantResponseCompleted(
+        None,
+        Some("look at the file".to_string()),
+    ));
+
+    assert!(
+        matches!(
+            state.transcript.messages.as_slice(),
+            [
+                ChatMessage::User(_),
+                ChatMessage::Reasoning { text, .. },
+                ChatMessage::ToolCall { id, status, .. },
+            ] if text == "look at the file" && id == "call-1" && status == "receiving"
+        ),
+        "{:?}",
+        state.transcript.messages
+    );
+
+    // The request that follows still finds the row it was sending.
+    state.update(TuiEvent::ToolRequested {
+        id: "call-1".to_string(),
+        name: "read_file".to_string(),
+        target: Some("a.rs".to_string()),
+    });
+    assert!(matches!(
+        state.transcript.messages.as_slice(),
+        [
+            ChatMessage::User(_),
+            ChatMessage::Reasoning { .. },
+            ChatMessage::ToolCall { status, .. },
+        ] if status == "running"
+    ));
+}
+
 #[test]
 fn reconcile_assistant_response_replaces_frozen_chunks_and_open_tail() {
     let mut state = state();
