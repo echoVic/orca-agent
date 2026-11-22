@@ -68,9 +68,9 @@ Expanded with the gesture every expandable row uses (a click, or ctrl+o):
 together, which ran at the same time. A call on its own has no mark.
 
 A script that failed shows `Failed` and the error where a completed one
-shows `Returned to the model`. A script still running shows `Script`, and
-in a turn that delivers them the calls answered so far (see "Sessions
-resumed or reattached").
+shows `Returned to the model`, and one the person cancelled shows
+`Cancelled`. A script still running shows `Script` and the calls answered
+so far.
 
 The three sections stay after the script ends. Today the call lines are
 lost at that moment, because the result replaces them.
@@ -189,12 +189,14 @@ do now.
 
 ## Sessions resumed or reattached
 
-A script's calls are kept with its result. When `run_script` ends, the
-runtime records everything it wrote to the output stream as the tool
-view's streamed output (`SurfaceToolView.streamed_output`), in the same
-recorded commit as the result: one `OutputDelta` before the `Completed`.
-The field and the patch already existed and nothing had written them, so
-the surface contract and its hashes do not change. A session file grows by
+A script's calls are kept as it makes them. Each time a batch ends, the
+runtime records the lines it wrote for that batch as the tool view's
+streamed output (`SurfaceToolView.streamed_output`): one `OutputDelta` per
+batch, sent through the turn's ingress (`commit_tool_output`). When
+`run_script` ends, whatever of the stream is not yet recorded (the run's
+last line) goes in the same recorded commit as the result, before the
+`Completed`. The field and the patch already existed and nothing had
+written them, so the surface contract and its hashes do not change. A session file grows by
 what the stream holds, at most about 130 KiB for a script that makes all
 100 calls. The text is redacted as a result is.
 
@@ -214,15 +216,27 @@ messages alone (`HistoryReplay` in `hosted_session.rs`, used only when the
 snapshot holds no messages), which pairs each tool message with the
 assistant message that requested it and has no tool views.
 
-The recorded calls reach the TUI with the result, as `ToolOutputAt`, which
-carries where the text starts and takes the place of what the row held from
-there. In a turn the person started, that is how the calls arrive at all:
-such a turn's `tool.output.delta` events go nowhere the TUI listens, so the
-row shows `Script` while the script runs and gains `Calls` when it ends.
-(Until calls were recorded, the row of such a turn never showed them.) A
-turn the runtime starts from a message queued behind another turn does
-deliver the events, so its row shows each batch as it ends, and nothing of
-it is committed to the surface: its calls are shown live and are not kept.
+The recorded calls reach the TUI as `ToolOutputAt`, which carries where the
+text starts and takes the place of what the row held from there. In a turn
+the person started, that is how the calls arrive at all: such a turn's
+`tool.output.delta` events go nowhere the TUI listens, so the row gains
+each batch when its record is committed, and the run's last line with the
+result. (Only `run_script` records its output while it runs. The output of
+`bash` and the other tools still reaches such a turn's row with the
+result.)
+
+A turn the runtime starts itself, from a message queued behind another turn
+or because a background agent finished while the thread was idle, is an
+operation of the surface like a turn the person started
+(`start_runtime_turn_on_surface`), so it is recorded the same way: its
+message, its tool rows with a script's calls, and its answer are there
+after a resume and after the view returns from `/side`. Such a turn still
+delivers its events to the TUI through the prompt queue's observer, and its
+approvals are still answered through the queue's handlers. The prompt of a
+turn started for finished agents is shown as the note
+`Background agents finished; continuing with their results.`, not as a
+message the person typed. If the surface cannot take the operation, the
+turn starts the way it used to and is not recorded.
 
 What is kept is bounded at 256 KiB. A script allowed many more calls than
 the default keeps the first of them, then a line saying how many lines were
@@ -231,7 +245,8 @@ its script ran (the tool is off, the arguments are not a script, two
 scripts are still running after they were stopped) records
 `0 tool calls · 0ms`. A result the runtime writes itself, for a call that
 was cancelled before it started or was settled by recovery after a crash,
-carries no calls, and its row says none were recorded.
+adds no calls: its row shows the batches recorded before that, and says
+none were recorded when there were none.
 
 Chunks that arrive for a run that has no row, as after a reattach while its
 script is running, are not shown: a chunk carries only the call's id, so it
