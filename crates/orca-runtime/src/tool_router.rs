@@ -486,14 +486,26 @@ impl<'a> RuntimeToolRouter<'a> {
                 .with_git_metadata_write_session(git_metadata_write_session)
                 .with_owner(root_task_id);
                 let output = {
+                    // A piece that could not be recorded is dropped: the tool
+                    // goes on, and its result is recorded as always.
+                    let recorded = std::cell::RefCell::new(RecordedToolOutput::new(
+                        tool_output_ingress.map(|ingress| {
+                            |piece: &str| {
+                                let _ = ingress.commit_tool_output(&execution_request.id, piece);
+                            }
+                        }),
+                    ));
                     let mut output_handler = |chunk: &str| {
+                        recorded.borrow_mut().push(chunk);
                         sink.emit(events.tool_output_delta(&execution_request.id, chunk))
                     };
+                    let mut output_idle = || recorded.borrow_mut().record_if_due();
                     self.tool_calls.execute_normal(
                         invocation,
                         cancel,
                         RuntimeNormalToolInteractions {
                             output_handler: emit_deltas.then_some(&mut output_handler),
+                            output_idle: emit_deltas.then_some(&mut output_idle),
                             permission_handler: permission_handler
                                 .map(|handler| handler as &dyn RuntimePermissionRequestHandler),
                             mcp_elicitation_handler: mcp_elicitation_handler
@@ -524,6 +536,76 @@ impl<'a> RuntimeToolRouter<'a> {
     }
 }
 
+/// How often what a running tool wrote is recorded. Each record is a durable
+/// write of the session, so output is gathered between them.
+const RECORDED_OUTPUT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+/// How much of one call's output is recorded while it runs. The result holds
+/// the output the model gets; this is only what a person watches meanwhile.
+const RECORDED_OUTPUT_LIMIT: usize = 64 * 1024;
+const RECORDED_OUTPUT_CUT: &str = "\n[more output follows; it is shown when the command ends]\n";
+
+/// What a running tool writes, recorded with the turn in pieces so a surface
+/// that shows the turn from its record shows the output while the tool runs.
+/// The first piece is recorded at once and later ones at most once per
+/// `interval`; after `limit` bytes a line says more follows and nothing else
+/// is recorded. `record` is told each piece; without one nothing is kept.
+struct RecordedToolOutput<F: FnMut(&str)> {
+    record: Option<F>,
+    interval: std::time::Duration,
+    limit: usize,
+    pending: String,
+    taken: usize,
+    cut: bool,
+    recorded_at: Option<std::time::Instant>,
+}
+
+impl<F: FnMut(&str)> RecordedToolOutput<F> {
+    fn new(record: Option<F>) -> Self {
+        Self {
+            record,
+            interval: RECORDED_OUTPUT_INTERVAL,
+            limit: RECORDED_OUTPUT_LIMIT,
+            pending: String::new(),
+            taken: 0,
+            cut: false,
+            recorded_at: None,
+        }
+    }
+
+    fn push(&mut self, chunk: &str) {
+        if self.record.is_none() || self.cut || chunk.is_empty() {
+            return;
+        }
+        let mut end = chunk.len().min(self.limit - self.taken);
+        while !chunk.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.pending.push_str(&chunk[..end]);
+        self.taken += end;
+        if end < chunk.len() {
+            self.cut = true;
+            self.pending.push_str(RECORDED_OUTPUT_CUT);
+        }
+        self.record_if_due();
+    }
+
+    fn record_if_due(&mut self) {
+        let Some(record) = self.record.as_mut() else {
+            return;
+        };
+        if self.pending.is_empty()
+            || self
+                .recorded_at
+                .is_some_and(|at| at.elapsed() < self.interval)
+        {
+            return;
+        }
+        record(&self.pending);
+        self.pending.clear();
+        self.recorded_at = Some(std::time::Instant::now());
+    }
+}
+
 fn task_stop_id(request: &tool_types::ToolRequest) -> Option<String> {
     let args: serde_json::Value = serde_json::from_str(request.raw_arguments.as_deref()?).ok()?;
     args.get("task_id")
@@ -536,6 +618,77 @@ fn task_stop_id(request: &tool_types::ToolRequest) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recorded_pieces(
+        pieces: &std::cell::RefCell<Vec<String>>,
+    ) -> RecordedToolOutput<impl FnMut(&str) + '_> {
+        RecordedToolOutput::new(Some(|piece: &str| {
+            pieces.borrow_mut().push(piece.to_string())
+        }))
+    }
+
+    #[test]
+    fn a_running_tools_output_is_recorded_at_once_and_then_in_gathered_pieces() {
+        let pieces = std::cell::RefCell::new(Vec::new());
+        let mut recorded = recorded_pieces(&pieces);
+        recorded.interval = std::time::Duration::from_secs(3600);
+
+        recorded.push("first\n");
+        assert_eq!(*pieces.borrow(), ["first\n"]);
+
+        // Output that follows sooner than the interval waits and goes together.
+        recorded.push("second\n");
+        recorded.push("third\n");
+        recorded.record_if_due();
+        assert_eq!(*pieces.borrow(), ["first\n"]);
+
+        recorded.interval = std::time::Duration::ZERO;
+        recorded.record_if_due();
+        assert_eq!(*pieces.borrow(), ["first\n", "second\nthird\n"]);
+
+        // Nothing waiting is nothing to record.
+        recorded.record_if_due();
+        assert_eq!(pieces.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_running_tools_output_past_the_limit_is_cut_once_at_a_character() {
+        let pieces = std::cell::RefCell::new(Vec::new());
+        let mut recorded = recorded_pieces(&pieces);
+        recorded.interval = std::time::Duration::ZERO;
+        recorded.limit = 4;
+
+        // "你" is three bytes: only "ab" fits whole.
+        recorded.push("ab你好");
+        recorded.push("more");
+        recorded.record_if_due();
+
+        assert_eq!(*pieces.borrow(), [format!("ab{RECORDED_OUTPUT_CUT}")]);
+    }
+
+    #[test]
+    fn output_that_ends_exactly_at_the_limit_is_not_said_to_go_on() {
+        let pieces = std::cell::RefCell::new(Vec::new());
+        let mut recorded = recorded_pieces(&pieces);
+        recorded.interval = std::time::Duration::ZERO;
+        recorded.limit = 4;
+
+        recorded.push("abcd");
+        assert_eq!(*pieces.borrow(), ["abcd"]);
+
+        // The next byte is what shows there is more.
+        recorded.push("e");
+        recorded.push("f");
+        assert_eq!(*pieces.borrow(), ["abcd", RECORDED_OUTPUT_CUT]);
+    }
+
+    #[test]
+    fn nothing_is_gathered_when_no_one_records() {
+        let mut recorded = RecordedToolOutput::<fn(&str)>::new(None);
+        recorded.push("output");
+        recorded.record_if_due();
+        assert!(recorded.pending.is_empty());
+    }
     use crate::extension::ExtensionData;
     use orca_computer_use::fake::{FakeDesktop, FakeLauncher};
     use orca_core::approval_types::ActionKind;

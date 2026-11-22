@@ -171,6 +171,9 @@ pub(crate) type RuntimeNormalToolOutputHandler<'a> = dyn FnMut(&str) -> io::Resu
 #[derive(Default)]
 pub(crate) struct RuntimeNormalToolInteractions<'a> {
     pub(crate) output_handler: Option<&'a mut RuntimeNormalToolOutputHandler<'a>>,
+    /// Called each time the running tool has sent nothing for one poll
+    /// interval, so a caller that holds output back can let it go.
+    pub(crate) output_idle: Option<&'a mut (dyn FnMut() + 'a)>,
     pub(crate) permission_handler: Option<&'a dyn RuntimePermissionRequestHandler>,
     pub(crate) mcp_elicitation_handler: Option<&'a dyn McpElicitationHandler>,
 }
@@ -598,7 +601,11 @@ impl RuntimeToolCallRuntime {
                     &child_cancel,
                     &mut event_error,
                 ),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(idle) = interactions.output_idle.as_deref_mut() {
+                        idle();
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if join.is_finished() {
                         break;

@@ -239,6 +239,7 @@ impl RuntimeToolActorContext {
             parent_cancel,
             RuntimeNormalToolInteractions {
                 output_handler: None,
+                output_idle: None,
                 permission_handler,
                 mcp_elicitation_handler: None,
             },

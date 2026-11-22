@@ -3020,16 +3020,27 @@ mod tests {
         script: &str,
         ingress: Option<&dyn crate::runtime_surface::RuntimeProviderResponseIngress>,
     ) -> (String, Vec<serde_json::Value>) {
-        let mut events = EventFactory::new("run-script-turn".to_string());
-        let mut output = Vec::new();
-        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
-        let mut conversation = Conversation::new();
         let request = request(
             ToolName::RunScript,
             ActionKind::Read,
             None,
             Some(json!({ "script": script }).to_string().as_str()),
         );
+        tool_turn_recorded_by(config, cwd, &request, ingress)
+    }
+
+    /// Runs one tool call as a turn does, with `ingress` standing where the
+    /// surface records the turn, and returns the tool message and the events.
+    fn tool_turn_recorded_by(
+        config: &RunConfig,
+        cwd: &std::path::Path,
+        request: &ToolRequest,
+        ingress: Option<&dyn crate::runtime_surface::RuntimeProviderResponseIngress>,
+    ) -> (String, Vec<serde_json::Value>) {
+        let mut events = EventFactory::new("run-script-turn".to_string());
+        let mut output = Vec::new();
+        let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
         let policy = policy_for_tool_execution(config);
         let instructions = ProjectInstructions::default();
         let memory = MemoryBlock::default();
@@ -3046,7 +3057,7 @@ mod tests {
             request: RuntimeNormalToolTurnRequest {
                 config,
                 cwd,
-                tool_request: &request,
+                tool_request: request,
                 subagent_depth: 0,
                 emit_deltas: true,
                 goal_mode: false,
@@ -3090,7 +3101,7 @@ mod tests {
                 workflow_child_executor: unused_child_executor,
             },
         })
-        .expect("run the run_script turn");
+        .expect("run the tool turn");
 
         let message = match conversation.messages.as_slice() {
             [Message::Tool { content, .. }] => content.clone(),
@@ -3144,6 +3155,38 @@ mod tests {
             last.starts_with("1 tool call · ") && last.ends_with("ms"),
             "{last}"
         );
+    }
+
+    /// A command's output is recorded while the command runs, so a surface
+    /// that shows a turn from its record shows the output before the result.
+    #[cfg(unix)]
+    #[test]
+    fn a_commands_output_is_recorded_while_it_runs() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = config_with_external(Vec::new());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let command = "printf 'one\\n'; sleep 1; printf 'two\\n'";
+        let request = request(
+            ToolName::Bash,
+            ActionKind::Shell,
+            Some(command),
+            Some(json!({ "command": command }).to_string().as_str()),
+        );
+        let recorded = RecordedToolOutput::default();
+
+        let (message, events) =
+            tool_turn_recorded_by(&config, cwd.path(), &request, Some(&recorded));
+
+        assert!(
+            message.contains("one") && message.contains("two"),
+            "{message}"
+        );
+        // What was written a second apart was recorded apart, each piece
+        // before the result.
+        let while_running = recorded.while_running.lock().unwrap().clone();
+        assert!(while_running.len() >= 2, "{while_running:?}");
+        assert!(while_running[0].contains("one") && !while_running[0].contains("two"));
+        assert_eq!(while_running.concat(), output_deltas(&events));
     }
 
     #[test]

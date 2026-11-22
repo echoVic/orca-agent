@@ -221,9 +221,19 @@ text starts and takes the place of what the row held from there. In a turn
 the person started, that is how the calls arrive at all: such a turn's
 `tool.output.delta` events go nowhere the TUI listens, so the row gains
 each batch when its record is committed, and the run's last line with the
-result. (Only `run_script` records its output while it runs. The output of
-`bash` and the other tools still reaches such a turn's row with the
-result.)
+result.
+
+The output of the other tools is recorded while they run too, so a `bash`
+row in such a turn shows what the command has written so far
+(`RecordedToolOutput` in `tool_router.rs`). Each record is a durable write
+of the session, so it is paced and bounded: the first piece is recorded at
+once, later pieces at most once every 200 ms, and no more than 64 KiB for
+one call, after which the line `[more output follows; it is shown when the
+command ends]` is recorded and nothing else. The result is recorded as
+before and is what the row shows once the command ends, and what a rebuilt
+row shows; the pieces are kept in the tool view's streamed output and are
+not shown again. An ACP client receives each piece as an in-progress update
+of the tool call.
 
 A turn the runtime starts itself, from a message queued behind another turn
 or because a background agent finished while the thread was idle, is an
