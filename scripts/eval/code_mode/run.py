@@ -6,7 +6,8 @@ off and once with it on, through `orca exec` against the real provider.
 For each run this records the model rounds, the tools called, tokens, cost
 and the final answer. Each answer is marked right or wrong against the checkout (expected.py), and
 summary.json says whether the totals meet the rule for turning `run_script`
-on by default.
+on by default. The rule needs --repeat 2 or more: one repetition cannot show
+that a difference is larger than what repeating a run changes.
 
 The runs spend provider credit. Credentials and settings are copied from
 --home into two throwaway Orca homes, so the user's own files are not
@@ -128,6 +129,14 @@ def summarize(jsonl: str) -> dict:
     }
 
 
+def per_repetition(rows: list[dict], key: str) -> list[float]:
+    """The total of `key` over the tasks of each repetition."""
+    totals: dict = {}
+    for row in rows:
+        totals[row.get("repetition", 0)] = totals.get(row.get("repetition", 0), 0) + (row[key] or 0)
+    return [totals[repetition] for repetition in sorted(totals)]
+
+
 def compare(rows: list[dict]) -> dict:
     """Totals for each variant, and whether they meet the rule for default-on:
     at least as many right answers, fewer model rounds, lower cost.
@@ -135,7 +144,15 @@ def compare(rows: list[dict]) -> dict:
     A run is incomplete when it did not exit 0, has no cost, or made no model
     round (a timeout looks like that); its zeros would make a variant look
     cheap. Nothing is decided unless both variants have the same non-zero
-    number of runs and none is incomplete."""
+    number of runs and none is incomplete.
+
+    Two more things must hold before lower totals mean the tool saved
+    anything. `used`: more than half of the runs with the tool on called
+    `run_script`; otherwise the two variants did the same work and differ by
+    chance. `beyond_noise`: there are at least two repetitions, and in rounds
+    and in cost the worst repetition with the tool on is below the best one
+    with it off, so the difference is larger than what repeating a variant
+    changes by itself."""
     totals = {}
     for variant in ("off", "on"):
         mine = [row for row in rows if row["variant"] == variant]
@@ -147,12 +164,24 @@ def compare(rows: list[dict]) -> dict:
             "incomplete": sum(1 for row in mine
                               if row.get("exit") != 0 or row.get("cost_usd") is None
                               or not row.get("rounds")),
+            "script_runs": sum(1 for row in mine if "run_script" in (row.get("tools") or [])),
+            "rounds_per_repetition": per_repetition(mine, "rounds"),
+            "cost_usd_per_repetition": [round(cost, 6) for cost in per_repetition(mine, "cost_usd")],
         }
     off, on = totals["off"], totals["on"]
     decidable = (off["runs"] > 0 and off["runs"] == on["runs"]
                  and off["incomplete"] == 0 and on["incomplete"] == 0)
+    used = on["script_runs"] * 2 > on["runs"]
+    beyond_noise = (
+        len(off["rounds_per_repetition"]) >= 2
+        and len(off["rounds_per_repetition"]) == len(on["rounds_per_repetition"])
+        and max(on["rounds_per_repetition"]) < min(off["rounds_per_repetition"])
+        and max(on["cost_usd_per_repetition"]) < min(off["cost_usd_per_repetition"])
+    )
     totals["decidable"] = decidable
-    totals["default_on"] = (decidable and on["right"] >= off["right"]
+    totals["used"] = used
+    totals["beyond_noise"] = beyond_noise
+    totals["default_on"] = (decidable and used and beyond_noise and on["right"] >= off["right"]
                             and on["rounds"] < off["rounds"] and on["cost_usd"] < off["cost_usd"])
     return totals
 

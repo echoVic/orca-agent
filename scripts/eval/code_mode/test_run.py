@@ -20,21 +20,79 @@ except ImportError:  # Python before 3.11
     tomllib = None
 
 
-def row(variant, right=True, rounds=5, cost=0.5, exit=0):
-    return {"variant": variant, "right": right, "rounds": rounds, "cost_usd": cost, "exit": exit}
+def row(variant, right=True, rounds=5, cost=0.5, exit=0, repetition=0, tools=None):
+    if tools is None:
+        tools = ["grep", "run_script"] if variant == "on" else ["grep"]
+    return {"variant": variant, "right": right, "rounds": rounds, "cost_usd": cost, "exit": exit,
+            "repetition": repetition, "tools": tools}
 
 
-def both(off, on):
-    return [row("off", **off), row("on", **on)]
+def both(off, on, repetitions=2):
+    """One task run `repetitions` times each way."""
+    return [row(variant, repetition=repetition, **overrides)
+            for repetition in range(repetitions)
+            for variant, overrides in (("off", off), ("on", on))]
 
 
 class Compare(unittest.TestCase):
     def test_the_rule_holding_turns_it_on(self):
         summary = run.compare(both({}, {"rounds": 3, "cost": 0.3}))
         self.assertTrue(summary["decidable"])
+        self.assertTrue(summary["used"])
+        self.assertTrue(summary["beyond_noise"])
         self.assertTrue(summary["default_on"])
         self.assertEqual(summary["off"]["incomplete"], 0)
-        self.assertEqual(set(summary), {"off", "on", "decidable", "default_on"})
+        self.assertEqual(summary["on"]["script_runs"], 2)
+        self.assertEqual(summary["on"]["rounds_per_repetition"], [3, 3])
+        self.assertEqual(set(summary), {"off", "on", "decidable", "used", "beyond_noise", "default_on"})
+
+    def test_lower_totals_without_the_tool_being_called_keep_it_off(self):
+        summary = run.compare(both({}, {"rounds": 3, "cost": 0.3, "tools": ["grep"]}))
+        self.assertTrue(summary["decidable"])
+        self.assertFalse(summary["used"])
+        self.assertFalse(summary["default_on"])
+
+    def test_the_tool_called_in_half_the_runs_is_not_most_of_them(self):
+        rows = [row("off", repetition=0), row("on", rounds=3, cost=0.3, repetition=0),
+                row("off", repetition=1), row("on", rounds=3, cost=0.3, repetition=1, tools=["grep"])]
+        summary = run.compare(rows)
+        self.assertEqual(summary["on"]["script_runs"], 1)
+        self.assertFalse(summary["used"])
+        self.assertFalse(summary["default_on"])
+
+    def test_one_repetition_cannot_show_a_saving(self):
+        summary = run.compare(both({}, {"rounds": 3, "cost": 0.3}, repetitions=1))
+        self.assertTrue(summary["decidable"])
+        self.assertFalse(summary["beyond_noise"])
+        self.assertFalse(summary["default_on"])
+
+    def test_a_saving_smaller_than_the_spread_between_repetitions_keeps_it_off(self):
+        # Lower in total, but one repetition with the tool on took as many
+        # rounds as one with it off.
+        rows = [row("off", rounds=5, repetition=0), row("on", rounds=2, cost=0.2, repetition=0),
+                row("off", rounds=7, repetition=1), row("on", rounds=5, cost=0.3, repetition=1)]
+        summary = run.compare(rows)
+        self.assertLess(summary["on"]["rounds"], summary["off"]["rounds"])
+        self.assertFalse(summary["beyond_noise"])
+        self.assertFalse(summary["default_on"])
+
+    def test_a_cost_saving_smaller_than_the_spread_keeps_it_off(self):
+        rows = [row("off", cost=0.5, repetition=0), row("on", rounds=3, cost=0.2, repetition=0),
+                row("off", cost=0.9, repetition=1), row("on", rounds=3, cost=0.5, repetition=1)]
+        summary = run.compare(rows)
+        self.assertLess(summary["on"]["cost_usd"], summary["off"]["cost_usd"])
+        self.assertFalse(summary["beyond_noise"])
+        self.assertFalse(summary["default_on"])
+
+    def test_repetitions_are_totalled_over_their_tasks(self):
+        rows = [row(variant, rounds=rounds, cost=cost, repetition=repetition)
+                for repetition in range(2)
+                for variant, rounds, cost in (("off", 5, 0.5), ("on", 3, 0.3))
+                for _task in range(3)]
+        summary = run.compare(rows)
+        self.assertEqual(summary["off"]["rounds_per_repetition"], [15, 15])
+        self.assertEqual(summary["on"]["cost_usd_per_repetition"], [0.9, 0.9])
+        self.assertTrue(summary["default_on"])
 
     def test_equal_right_is_allowed(self):
         self.assertTrue(run.compare(both({"right": True}, {"right": True, "rounds": 3, "cost": 0.3}))["default_on"])
@@ -55,7 +113,7 @@ class Compare(unittest.TestCase):
     def test_a_timed_out_run_is_not_a_cheap_one(self):
         rows = both({}, {"rounds": 0, "cost": None, "exit": None, "right": True})
         summary = run.compare(rows)
-        self.assertEqual(summary["on"]["incomplete"], 1)
+        self.assertEqual(summary["on"]["incomplete"], 2)
         self.assertLess(summary["on"]["rounds"], summary["off"]["rounds"])
         self.assertFalse(summary["decidable"])
         self.assertFalse(summary["default_on"])
@@ -64,7 +122,7 @@ class Compare(unittest.TestCase):
         for bad in ({"exit": 1}, {"cost": None}, {"rounds": 0}):
             with self.subTest(bad=bad):
                 summary = run.compare(both({}, {"rounds": 3, "cost": 0.3, **bad}))
-                self.assertEqual(summary["on"]["incomplete"], 1)
+                self.assertEqual(summary["on"]["incomplete"], 2)
                 self.assertFalse(summary["default_on"])
 
     def test_a_row_without_exit_is_incomplete(self):

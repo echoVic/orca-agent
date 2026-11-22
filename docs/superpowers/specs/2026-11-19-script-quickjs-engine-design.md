@@ -457,6 +457,14 @@ those with it on, so a warmer prompt cache may have favoured the runs with
 it on. The data shows neither a saving nor a cost. `enabled` stays `false`
 by default because nothing was shown, not because the tool did worse.
 
+The runner has since been given the two checks this reading made by hand, so
+`summary.json` cannot say `default_on` from totals alone. `used` holds when
+more than half of the runs with the tool on called `run_script`. `beyond_noise`
+holds when there are at least two repetitions and, in rounds and in cost, the
+worst repetition with the tool on is below the best one with it off.
+`default_on` needs both. This measurement fails both: 3 of 15 runs, and
+overlapping repetitions.
+
 Nine right answers were first marked wrong by the checker, which took a file
 or an event mentioned in a sentence for one the answer listed, and line
 numbers for stated totals. The checker was corrected and the saved answers
