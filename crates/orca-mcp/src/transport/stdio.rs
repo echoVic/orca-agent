@@ -872,7 +872,7 @@ done
             &server,
             r#"#!/bin/sh
 IFS= read -r line
-(sleep 0.4; : > "$2") &
+(sleep 0.4 && : > "$2") &
 cat "$1"
 wait
 "#,
@@ -909,7 +909,7 @@ wait
             &server,
             r#"#!/bin/sh
 IFS= read -r line
-(sleep 0.4; : > "$1") >/dev/null 2>&1 &
+(sleep 0.4 && : > "$1") >/dev/null 2>&1 &
 exec 1>&-
 wait
 "#,
@@ -948,7 +948,7 @@ wait
             &server,
             r#"#!/bin/sh
 IFS= read -r line
-(sleep 0.4; : > "$2") &
+(sleep 0.4 && : > "$2") &
 cat "$1"
 wait
 "#,
@@ -985,7 +985,7 @@ wait
             &server,
             r#"#!/bin/sh
 IFS= read -r line
-(sleep 0.4; : > "$1") &
+(sleep 0.4 && : > "$1") &
 printf '{"jsonrpc":"2.0","id":"prompt-1","method":"elicitation/create"}\n'
 wait
 "#,
@@ -1032,7 +1032,7 @@ while IFS= read -r line; do
       ;;
     *'"method":"tools/call"'*)
       exec 0<&-
-      (sleep 2; : > "$1") &
+      (sleep 2 && : > "$1") &
       printf '{"jsonrpc":"2.0","id":"prompt-1","method":"elicitation/create","params":{"message":"Authorize"}}\n'
       wait
       ;;
@@ -1072,7 +1072,7 @@ done
             &server,
             r#"#!/bin/sh
 exec 0<&-
-(sleep 0.4; : > "$1") &
+(sleep 0.4 && : > "$1") &
 : > "$2"
 wait
 "#,
@@ -1543,7 +1543,7 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"wait","description":"waits","inputSchema":{"type":"object","properties":{},"required":[]}}]}}\n'
       ;;
     *'"method":"tools/call"'*)
-      (sleep 0.4; : > "$1") &
+      (sleep 0.4 && : > "$1") &
       wait
       ;;
   esac
@@ -1580,6 +1580,11 @@ done
         transport
     }
 
+    /// The fixtures leave a descendant that writes the marker after `sleep
+    /// 0.4 &&`, so only one that lived that long writes it. With `;` the
+    /// marker also appeared when a group kill reached `sleep` a moment before
+    /// its parent shell, which then ran the next command before its own
+    /// signal arrived.
     #[cfg(unix)]
     fn assert_descendant_did_not_survive(survivor_marker: &std::path::Path) {
         std::thread::sleep(Duration::from_millis(600));
