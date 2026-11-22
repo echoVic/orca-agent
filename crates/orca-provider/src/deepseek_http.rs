@@ -1049,18 +1049,46 @@ fn cap_tools_for_deepseek(mut tools: Vec<Value>) -> Vec<Value> {
     tools
 }
 
+/// The reasoning an assistant message is sent back with.
+///
+/// DeepSeek refuses a thinking-mode request unless every assistant message
+/// after the last user message carries `reasoning_content`; an empty one is
+/// accepted. `in_unfinished_turn` says the message is one of those, or was when
+/// the request after it was made: it called tools, or the turn went on after it
+/// without a new user message. Such a message keeps the field in every later
+/// request too, so the request prefix it sits in never changes.
 fn replayable_reasoning_content(
     reasoning_content: &Option<String>,
-    has_tool_calls: bool,
+    in_unfinished_turn: bool,
 ) -> Option<String> {
-    if !has_tool_calls {
+    if !in_unfinished_turn {
         return None;
     }
-    reasoning_content
-        .as_deref()
-        .map(str::trim)
-        .filter(|text| !text.is_empty() && *text != "(reasoning omitted)")
-        .map(str::to_string)
+    Some(
+        reasoning_content
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| *text != "(reasoning omitted)")
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// For each message, whether the turn went on after it without a new user
+/// message: something follows it, and the next user or assistant message is
+/// not a user one.
+fn turn_went_on_after(messages: &[Message]) -> Vec<bool> {
+    let mut went_on = vec![false; messages.len()];
+    let mut next_is_user = false;
+    for (index, message) in messages.iter().enumerate().rev() {
+        went_on[index] = !next_is_user && index + 1 < messages.len();
+        match message {
+            Message::User { .. } => next_is_user = true,
+            Message::Assistant { .. } => next_is_user = false,
+            Message::System { .. } | Message::Tool { .. } => {}
+        }
+    }
+    went_on
 }
 
 pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
@@ -1101,7 +1129,8 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
         .iter()
         .take_while(|message| matches!(message, Message::System { pinned: false, .. }))
         .count();
-    for msg in source_messages {
+    let went_on = turn_went_on_after(source_messages);
+    for (index, msg) in source_messages.iter().enumerate() {
         let api_msg = match msg {
             Message::System { content, .. } => {
                 let result = ApiMessage {
@@ -1153,7 +1182,7 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
                     images: Vec::new(),
                     reasoning_content: replayable_reasoning_content(
                         reasoning_content,
-                        !tool_calls.is_empty(),
+                        !tool_calls.is_empty() || went_on[index],
                     ),
                     tool_calls: api_tool_calls,
                     tool_call_id: None,
@@ -2262,7 +2291,7 @@ mod tests {
     }
 
     #[test]
-    fn api_replay_does_not_send_reasoning_omitted_placeholder() {
+    fn api_replay_sends_an_empty_reasoning_instead_of_the_omitted_placeholder() {
         let mut conv = Conversation::new();
         conv.add_user("first".to_string());
         conv.add_assistant(
@@ -2277,8 +2306,84 @@ mod tests {
         conv.add_tool_result("tc1".to_string(), "file contents".to_string());
 
         let messages = conversation_to_api_messages(&conv);
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("assistant replay");
 
-        assert!(messages.iter().all(|m| m.reasoning_content.is_none()));
+        assert_eq!(assistant.reasoning_content.as_deref(), Some(""));
+    }
+
+    /// DeepSeek answers 400 "The `reasoning_content` in the thinking mode must
+    /// be passed back to the API" when an assistant message after the last user
+    /// message has no `reasoning_content`.
+    #[test]
+    fn api_replay_keeps_reasoning_on_a_reply_the_turn_went_on_after() {
+        let mut conv = Conversation::new();
+        conv.add_user("launch a background agent".to_string());
+        conv.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "tc1".to_string(),
+                function_name: "subagent".to_string(),
+                arguments: "{}".to_string(),
+            }],
+        );
+        conv.add_tool_result("tc1".to_string(), "running".to_string());
+        conv.add_assistant(
+            Some("LAUNCHED".to_string()),
+            Some("it is running".to_string()),
+            vec![],
+        );
+        conv.add_system("<task-notification>finished</task-notification>".to_string());
+
+        let reasoning = |conv: &Conversation| {
+            conversation_to_api_messages(conv)
+                .into_iter()
+                .filter(|message| message.role == "assistant")
+                .map(|message| message.reasoning_content)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            reasoning(&conv),
+            vec![Some(String::new()), Some("it is running".to_string())]
+        );
+
+        // The messages already sent keep their shape once the turn is over, so
+        // the next turn still reuses the cached prefix.
+        conv.add_assistant(Some("the agent said PONG".to_string()), None, vec![]);
+        conv.add_user("thanks".to_string());
+        assert_eq!(
+            reasoning(&conv),
+            vec![Some(String::new()), Some("it is running".to_string()), None]
+        );
+    }
+
+    #[test]
+    fn api_replay_omits_reasoning_from_a_reply_that_ended_its_turn() {
+        let mut conv = Conversation::new();
+        conv.add_user("first".to_string());
+        conv.add_assistant(
+            Some("done".to_string()),
+            Some("thinking".to_string()),
+            vec![],
+        );
+        assert!(
+            conversation_to_api_messages(&conv)
+                .iter()
+                .all(|message| message.reasoning_content.is_none())
+        );
+
+        // A notification drained when the next turn starts sits before the new
+        // user message and does not make the reply part of that turn.
+        conv.add_system("<task-notification>finished</task-notification>".to_string());
+        conv.add_user("next".to_string());
+        assert!(
+            conversation_to_api_messages(&conv)
+                .iter()
+                .all(|message| message.reasoning_content.is_none())
+        );
     }
 
     #[test]
