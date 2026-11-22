@@ -750,56 +750,80 @@ fn history_messages_from_surface_items(
         {
             index += 1;
         }
-        let assistant_items = &items[start..index];
-        let of_kind = |kind: fn(&SurfaceItem) -> bool| {
-            assistant_items
-                .iter()
-                .filter(move |item| kind(item))
-                .collect::<Vec<_>>()
-        };
-        let reasoning = of_kind(|item| matches!(item, SurfaceItem::AssistantReasoning { .. }));
-        let replies = of_kind(|item| matches!(item, SurfaceItem::AssistantMessage { .. }));
-        let plans = of_kind(|item| matches!(item, SurfaceItem::AssistantPlan { .. }));
-        // A plan that recorded where it sat in its reply goes back there;
-        // otherwise it follows the message.
-        let placed = match (replies.as_slice(), plans.as_slice()) {
-            (
-                [SurfaceItem::AssistantMessage { text, .. }],
-                [
-                    SurfaceItem::AssistantPlan {
-                        message_offset: Some(offset),
-                        ..
-                    },
-                ],
-            ) => usize::try_from(offset.get())
-                .ok()
-                .filter(|offset| text.as_str().is_char_boundary(*offset))
-                .map(|offset| text.as_str().split_at(offset)),
-            _ => None,
-        };
-        // Each entry is an item to show, or with `Some`, part of a reply.
-        let mut ordered: Vec<(&SurfaceItem, Option<&str>)> =
-            reasoning.iter().map(|item| (*item, None)).collect();
-        match placed {
-            Some((before, after)) => ordered.extend([
-                (replies[0], Some(before)),
-                (plans[0], None),
-                (replies[0], Some(after)),
-            ]),
-            None => ordered.extend(replies.iter().chain(&plans).map(|item| (*item, None))),
-        }
-        for (item, part) in ordered {
-            let message = match part {
-                Some(text) => (!text.trim().is_empty())
-                    .then(|| crate::transcript_state::ChatMessage::Assistant(text.to_string())),
-                None => history_message_from_surface_item(item, tools),
+        for assistant_items in assistant_responses(&items[start..index]) {
+            let of_kind = |kind: fn(&SurfaceItem) -> bool| {
+                assistant_items
+                    .iter()
+                    .filter(move |item| kind(item))
+                    .collect::<Vec<_>>()
             };
-            if let Some(message) = message {
-                messages.push(message);
+            let reasoning = of_kind(|item| matches!(item, SurfaceItem::AssistantReasoning { .. }));
+            let replies = of_kind(|item| matches!(item, SurfaceItem::AssistantMessage { .. }));
+            let plans = of_kind(|item| matches!(item, SurfaceItem::AssistantPlan { .. }));
+            // A plan that recorded where it sat in its reply goes back there;
+            // otherwise it follows the message.
+            let placed = match (replies.as_slice(), plans.as_slice()) {
+                (
+                    [SurfaceItem::AssistantMessage { text, .. }],
+                    [
+                        SurfaceItem::AssistantPlan {
+                            message_offset: Some(offset),
+                            ..
+                        },
+                    ],
+                ) => usize::try_from(offset.get())
+                    .ok()
+                    .filter(|offset| text.as_str().is_char_boundary(*offset))
+                    .map(|offset| text.as_str().split_at(offset)),
+                _ => None,
+            };
+            // Each entry is an item to show, or with `Some`, part of a reply.
+            let mut ordered: Vec<(&SurfaceItem, Option<&str>)> =
+                reasoning.iter().map(|item| (*item, None)).collect();
+            match placed {
+                Some((before, after)) => ordered.extend([
+                    (replies[0], Some(before)),
+                    (plans[0], None),
+                    (replies[0], Some(after)),
+                ]),
+                None => ordered.extend(replies.iter().chain(&plans).map(|item| (*item, None))),
+            }
+            for (item, part) in ordered {
+                let message = match part {
+                    Some(text) => (!text.trim().is_empty())
+                        .then(|| crate::transcript_state::ChatMessage::Assistant(text.to_string())),
+                    None => history_message_from_surface_item(item, tools),
+                };
+                if let Some(message) = message {
+                    messages.push(message);
+                }
             }
         }
     }
     messages
+}
+
+/// Splits one turn's consecutive assistant items into the responses that
+/// made them. A response records its reply before its reasoning and its plan
+/// and holds one reply at most, so a second reply starts the next response.
+/// Two responses follow each other with nothing between them when the turn
+/// went on after a reply: a background agent's result reached the model and
+/// it answered again.
+fn assistant_responses(items: &[SurfaceItem]) -> Vec<&[SurfaceItem]> {
+    let mut responses = Vec::new();
+    let mut start = 0;
+    let mut has_reply = false;
+    for (index, item) in items.iter().enumerate() {
+        if matches!(item, SurfaceItem::AssistantMessage { .. }) {
+            if has_reply {
+                responses.push(&items[start..index]);
+                start = index;
+            }
+            has_reply = true;
+        }
+    }
+    responses.push(&items[start..]);
+    responses
 }
 
 fn assistant_item_turn_id(item: &SurfaceItem) -> Option<&orca_runtime::surface::SurfaceTurnId> {
@@ -3768,6 +3792,46 @@ mod tests {
                 [crate::transcript_state::ChatMessage::User(typed), crate::transcript_state::ChatMessage::System { text, expanded: false }]
                     if typed == "typed by the user"
                         && text == "Background agents finished; continuing with their results."
+            ),
+            "{messages:?}"
+        );
+    }
+
+    /// A turn that went on after a reply holds two responses with nothing
+    /// between them; each keeps its own reasoning above its own reply.
+    #[test]
+    fn a_later_responses_reasoning_stays_below_the_reply_before_it() {
+        let turn_id = SurfaceTurnId::new();
+        let reply = |text: &str| SurfaceItem::AssistantMessage {
+            id: SurfaceItemId::new(),
+            turn_id: turn_id.clone(),
+            text: DisplayText::new(text),
+            pinned: false,
+        };
+        let reasoning = |text: &str| SurfaceItem::AssistantReasoning {
+            id: SurfaceItemId::new(),
+            turn_id: turn_id.clone(),
+            summary: DisplayText::new(""),
+            content: DisplayText::new(text),
+            pinned: false,
+        };
+        // As recorded: a reply without reasoning, then a response whose reply
+        // is recorded before its reasoning.
+        let items = [
+            reply("LAUNCHED"),
+            reply("the agent said PONG"),
+            reasoning("the agent finished"),
+        ];
+
+        let messages = history_messages_from_surface_items(&items, &[]);
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [
+                    crate::transcript_state::ChatMessage::Assistant(first),
+                    crate::transcript_state::ChatMessage::Reasoning { text, .. },
+                    crate::transcript_state::ChatMessage::Assistant(second),
+                ] if first == "LAUNCHED" && text == "the agent finished" && second == "the agent said PONG"
             ),
             "{messages:?}"
         );
