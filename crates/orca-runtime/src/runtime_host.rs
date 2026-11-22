@@ -42989,6 +42989,88 @@ mod tests {
         host.shutdown().expect("shutdown prompt queue host");
     }
 
+    /// The turn the thread wakes for when a background agent finished is
+    /// recorded the same way, under the prompt the thread gave it.
+    #[test]
+    fn a_turn_the_thread_wakes_for_is_recorded_on_the_surface() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start wake host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "wake turn record",
+            )
+            .expect("start wake thread");
+        let (events_tx, events_rx) = mpsc::channel();
+        thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
+            .expect("bind the prompt queue");
+        thread.set_prompt_queue_event_observer(Arc::new(
+            move |event: &orca_core::event_schema::EventEnvelope| {
+                let _ = events_tx.send(event.clone());
+                Ok(())
+            },
+        ));
+
+        let registry = thread.task_registry();
+        let agent = registry.create_subagent("survey the crate".to_string(), None);
+        registry.mark_subagent_result_pending(&agent.id);
+        registry
+            .complete(&agent.id, "survey the crate: done".to_string())
+            .expect("finish the agent");
+
+        loop {
+            let event = events_rx
+                .recv_timeout(SURFACE_TEST_TIMEOUT)
+                .expect("wake turn events");
+            if event.event_type == orca_core::event_schema::EventType::SessionCompleted {
+                break;
+            }
+        }
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while !matches!(thread.state(), Ok(RuntimeThreadState::Idle)) {
+            assert!(Instant::now() < deadline, "wake turn did not end");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let surface = thread.surface();
+        let snapshot = fresh_surface_attachment(&surface).baseline.snapshot;
+        assert!(snapshot.foreground_operation.is_none());
+        let woke_with = snapshot.items.iter().find_map(|item| match item {
+            surface::SurfaceItem::UserMessage {
+                turn_id,
+                input:
+                    surface::SurfaceUserInputState::Resolved {
+                        fact: surface::SurfaceResolvedInputFact::Replayable { input, .. },
+                    },
+                ..
+            } if input.canonical_text.as_str() == CHILD_RESULTS_WAKE_PROMPT => Some(turn_id),
+            _ => None,
+        });
+        let turn_id = woke_with.expect("the wake turn's prompt is an item of the surface");
+        let operation = snapshot
+            .operation_history
+            .iter()
+            .find(|operation| operation.initial_logical_turn_id.as_ref() == Some(turn_id))
+            .expect("the wake turn is an operation of the surface");
+        assert!(
+            matches!(
+                operation.terminal.as_ref().map(|record| &record.terminal),
+                Some(surface::OperationTerminal::Succeeded { .. })
+            ),
+            "{:?}",
+            operation.terminal
+        );
+        assert!(
+            snapshot.items.iter().any(|item| matches!(
+                item,
+                surface::SurfaceItem::AssistantMessage { turn_id: id, .. } if id == turn_id
+            )),
+            "the wake turn's answer is an item of the surface"
+        );
+        host.shutdown().expect("shutdown wake host");
+    }
+
     #[test]
     fn recorded_prompt_queue_recovers_stable_ids_after_cold_restart_bits_spec_ut() {
         let cwd = tempfile::tempdir().unwrap();
