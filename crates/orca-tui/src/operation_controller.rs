@@ -85,6 +85,9 @@ struct HostedOperationInner {
     /// Where `/mcp` saves and deletes MCP logins: the config's
     /// `mcp_credentials_path`.
     mcp_credentials_path: Option<PathBuf>,
+    /// What is on screen, once the controller has started. The dispatcher
+    /// changes it without waiting for the controller.
+    view: Option<crate::hosted_view::HostedView>,
     shutdown: bool,
 }
 
@@ -395,6 +398,31 @@ impl TuiSurfaceTaskControl {
             &runtime.typed_surface(),
             request,
         ))
+    }
+
+    pub(crate) fn bind_view(&self, view: crate::hosted_view::HostedView) {
+        self.lock_hosted().view = Some(view);
+    }
+
+    /// Lets go of the view as the controller ends: it holds the runtime
+    /// host's handle.
+    pub(crate) fn unbind_view(&self) {
+        self.lock_hosted().view = None;
+    }
+
+    pub(crate) fn view(&self) -> Option<crate::hosted_view::HostedView> {
+        self.lock_hosted().view.clone()
+    }
+
+    /// Whether a message sent now would go to the main conversation though
+    /// a child's is on screen: the controller runs a turn and has not taken
+    /// up the child in view.
+    pub(crate) fn message_would_miss_the_child_in_view(&self) -> bool {
+        let (view, turn_active) = {
+            let hosted = self.lock_hosted();
+            (hosted.view.clone(), hosted.surface_active.is_some())
+        };
+        turn_active && view.is_some_and(|view| view.awaits_main())
     }
 
     pub(crate) fn bind_hosted_settings_config(
@@ -1891,6 +1919,38 @@ mod tests {
     use orca_runtime::surface::{ByteOffset, SurfaceOperationId, SurfaceStreamId};
 
     use crate::surface_projection::TuiStreamDeliveryWatermark;
+
+    #[test]
+    fn a_message_is_only_refused_when_a_view_is_bound_and_a_turn_runs() {
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        assert!(control.view().is_none());
+        assert!(
+            !control.message_would_miss_the_child_in_view(),
+            "no view, no turn: nothing to miss"
+        );
+
+        let host = orca_runtime::runtime_host::RuntimeHost::start_with_background_capacity(1)
+            .expect("runtime host");
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let attachment = crate::protocol::SessionAttachmentId::new(1);
+        control.bind_view(crate::hosted_view::HostedView::new(
+            host.handle(),
+            event_tx.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::attachment_routing::AttachmentRouting::new(attachment),
+            )),
+            event_tx,
+            attachment,
+        ));
+        assert!(control.view().is_some());
+        assert!(
+            !control.message_would_miss_the_child_in_view(),
+            "main is on screen"
+        );
+
+        control.unbind_view();
+        assert!(control.view().is_none());
+    }
 
     fn test_surface_operation_id(seed: u8) -> SurfaceOperationId {
         let mut bytes = [seed; 16];
