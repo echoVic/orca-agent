@@ -14,6 +14,10 @@ use crate::protocol::{TuiEvent, TuiInteractionKey, UserAction};
 const INTERACTION_ACK_CAPACITY: usize = TUI_EVENT_CAPACITY + USER_ACTION_CAPACITY + 1;
 const INTERACTION_ACK_OVERFLOW: &str =
     "TUI interaction acknowledgement queue is full; response result discarded";
+/// Said when a message is sent from a child's conversation while the
+/// controller still runs the main turn: it would go to the main agent.
+const MAIN_STILL_RUNNING: &str =
+    "the main agent is still running: return to it to send a message, or wait for it to finish";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InteractionResponseAck {
@@ -200,6 +204,20 @@ fn route_action(
     // See `run_dispatcher`: this alias is typed surface presentation state, not
     // the legacy operation controller.
     let controller = surface_control;
+    // A child's conversation is on screen and the controller still runs the
+    // main turn: this message would go to the main agent. Hand it back.
+    if matches!(
+        action,
+        UserAction::Submit(_)
+            | UserAction::SubmitWithMentions { .. }
+            | UserAction::QueuePrompt { .. }
+            | UserAction::SubmitNow { .. }
+            | UserAction::SubmitQueued { .. }
+    ) && controller.message_would_miss_the_child_in_view()
+    {
+        reject_action(event_tx, action, MAIN_STILL_RUNNING.to_string());
+        return true;
+    }
     match action {
         UserAction::SetModel(encoded) => {
             let encoded = controller.stamp_settings_action(encoded);
@@ -451,6 +469,47 @@ fn route_action(
                 },
             }
         }
+        // Showing a child's conversation, or the main one again, changes
+        // only what is on screen, so it does not wait for the controller,
+        // which a running turn keeps until the turn ends.
+        UserAction::FocusChildThread {
+            task_id,
+            expected_revision,
+        } => match controller.view() {
+            Some(view) => view.handle(
+                crate::hosted_child::HostedChildAction::Focus {
+                    task_id,
+                    expected_revision,
+                },
+                controller,
+            ),
+            None => match enqueue_action(
+                UserAction::FocusChildThread {
+                    task_id,
+                    expected_revision,
+                },
+                command_tx,
+                &mut pending.commands,
+                backlog_capacity,
+            ) {
+                EnqueueResult::Queued => {}
+                EnqueueResult::Disconnected => return false,
+                EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+            },
+        },
+        UserAction::ReturnToParentThread => match controller.view() {
+            Some(view) => view.handle(crate::hosted_child::HostedChildAction::Return, controller),
+            None => match enqueue_action(
+                UserAction::ReturnToParentThread,
+                command_tx,
+                &mut pending.commands,
+                backlog_capacity,
+            ) {
+                EnqueueResult::Queued => {}
+                EnqueueResult::Disconnected => return false,
+                EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+            },
+        },
         action @ (UserAction::McpReconnect { .. }
         | UserAction::McpLogin { .. }
         | UserAction::McpLogout { .. }) => {
@@ -594,7 +653,14 @@ fn enqueue_action(
 }
 
 fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
-    let message = "TUI command queue is full; command rejected".to_string();
+    reject_action(
+        event_tx,
+        action,
+        "TUI command queue is full; command rejected".to_string(),
+    );
+}
+
+fn reject_action(event_tx: &Sender<TuiEvent>, action: UserAction, message: String) {
     // A plain submit, with the token it carried: the controller never gets it.
     let plain_submit = match &action {
         UserAction::Submit(_) => Some(None),
@@ -737,6 +803,77 @@ mod tests {
     use crate::protocol::{
         TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse, UserAction,
     };
+
+    #[test]
+    fn a_focus_before_any_controller_waits_in_the_command_mailbox() {
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (mut dispatcher, command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
+
+        raw_tx
+            .send(UserAction::FocusChildThread {
+                task_id: "child".to_string(),
+                expected_revision: 7,
+            })
+            .expect("focus action");
+
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(UserAction::FocusChildThread { task_id, expected_revision: 7 }) if task_id == "child"
+        ));
+        dispatcher.shutdown().expect("shutdown dispatcher");
+    }
+
+    #[test]
+    fn a_focus_with_a_view_bound_does_not_wait_behind_the_controller() {
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let host = orca_runtime::runtime_host::RuntimeHost::start_with_background_capacity(1)
+            .expect("runtime host");
+        let attachment = crate::protocol::SessionAttachmentId::new(1);
+        control.bind_view(crate::hosted_view::HostedView::new(
+            host.handle(),
+            event_tx.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::attachment_routing::AttachmentRouting::new(attachment),
+            )),
+            event_tx.clone(),
+            attachment,
+        ));
+        let (mut dispatcher, command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
+
+        // The controller is busy: nobody takes this from the mailbox.
+        raw_tx
+            .send(UserAction::Submit("a turn the controller runs".to_string()))
+            .expect("submit");
+        raw_tx
+            .send(UserAction::FocusChildThread {
+                task_id: "child".to_string(),
+                expected_revision: 7,
+            })
+            .expect("focus action");
+
+        // The view answered, here by saying there is no conversation yet,
+        // while the submit still sits in the mailbox.
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::OperationRejected(message))
+                if message == "focus a main conversation before selecting a child"
+        ));
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(UserAction::Submit(prompt)) if prompt == "a turn the controller runs"
+        ));
+        assert!(
+            command_rx.try_recv().is_err(),
+            "the focus never entered the mailbox"
+        );
+        dispatcher.shutdown().expect("shutdown dispatcher");
+    }
 
     #[test]
     fn image_paste_io_runs_off_the_command_mailbox_and_returns_typed_payload() {

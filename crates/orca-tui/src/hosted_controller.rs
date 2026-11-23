@@ -518,7 +518,7 @@ pub(crate) fn hosted_tui_controller_loop(
         match action {
             // The dispatcher shows a child without coming here; these only
             // arrive when it found no view bound yet. The loop follows the
-            // view at its next turn.
+            // view at its next pass.
             Ok(UserAction::FocusChildThread {
                 task_id,
                 expected_revision,
