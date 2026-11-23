@@ -681,6 +681,71 @@ pub use windows::{
     spawn_windows_pty_detached, spawn_windows_pty_named, windows_pty_supported,
 };
 
+/// Keeps the console's output code page at UTF-8 for as long as it lives.
+///
+/// A command run with pipes still shares Orca's console, and cmd.exe and the
+/// tools that ship with Windows write their messages in that console's code
+/// page. On a Chinese system that is GBK, which reads as a row of U+FFFD once
+/// it is taken for UTF-8. With the code page set before the command starts
+/// they write text Orca can read. A command given a terminal of its own is not
+/// affected: its pseudoconsole hands over UTF-8 whatever the code page.
+pub struct Utf8ConsoleOutput {
+    #[cfg(windows)]
+    previous: u32,
+}
+
+impl Utf8ConsoleOutput {
+    /// `None` when there is no console, when it already writes UTF-8, or when
+    /// the system refuses the change; nothing is restored later then.
+    pub fn enter() -> Option<Self> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
+            const UTF8: u32 = 65001;
+            let previous = unsafe { GetConsoleOutputCP() };
+            if previous == 0 || previous == UTF8 {
+                return None;
+            }
+            (unsafe { SetConsoleOutputCP(UTF8) } != 0).then_some(Self { previous })
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+}
+
+impl Drop for Utf8ConsoleOutput {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleOutputCP(self.previous);
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod console_tests {
+    use windows_sys::Win32::System::Console::GetConsoleOutputCP;
+
+    use super::Utf8ConsoleOutput;
+
+    #[test]
+    fn the_console_writes_utf8_until_the_guard_is_dropped() {
+        let before = unsafe { GetConsoleOutputCP() };
+        if before == 0 {
+            // No console: a test runner may give the process none.
+            assert!(Utf8ConsoleOutput::enter().is_none());
+            return;
+        }
+        let guard = Utf8ConsoleOutput::enter();
+        assert_eq!(unsafe { GetConsoleOutputCP() }, 65001);
+        assert_eq!(guard.is_some(), before != 65001);
+        drop(guard);
+        assert_eq!(unsafe { GetConsoleOutputCP() }, before);
+    }
+}
+
 pub fn native_pty_supported() -> bool {
     #[cfg(unix)]
     {
