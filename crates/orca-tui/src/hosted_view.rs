@@ -53,6 +53,7 @@ struct Inner {
     side_active: bool,
     focus: Option<HostedChildFocus>,
     adopted: Option<SessionAttachmentId>,
+    closed: bool,
 }
 
 #[derive(Clone)]
@@ -87,6 +88,7 @@ impl HostedView {
                 side_active: false,
                 focus: None,
                 adopted: None,
+                closed: false,
             })),
             host,
             root_event_tx,
@@ -106,10 +108,11 @@ impl HostedView {
     pub(crate) fn handle(&self, action: HostedChildAction, control: &TuiSurfaceTaskControl) {
         let mut guard = self.lock();
         let inner = &mut *guard;
+        if inner.closed {
+            return;
+        }
         // Where the action starts from: the child in view, or else the main
-        // conversation. A turn that started the main thread has not let the
-        // controller publish it yet, so the control's bound thread is asked
-        // first, unless that one is a child the controller adopted.
+        // conversation the controller recorded.
         let (mut thread, mut event_tx, mut attachment) = match inner.focus.as_ref() {
             Some(focus) => (
                 Some(focus.child_thread.clone()),
@@ -117,13 +120,17 @@ impl HostedView {
                 focus.child_attachment,
             ),
             None => (
-                if inner.adopted.is_some() {
-                    inner.main.thread.clone()
-                } else {
-                    control
-                        .runtime_thread()
-                        .or_else(|| inner.main.thread.clone())
-                },
+                // The main conversation as the controller last recorded it.
+                // Only a turn that started the very first thread has not let
+                // the controller record it, and then the control's bound
+                // thread is that one.
+                inner.main.thread.clone().or_else(|| {
+                    inner
+                        .adopted
+                        .is_none()
+                        .then(|| control.runtime_thread())
+                        .flatten()
+                }),
                 inner.main.event_tx.clone(),
                 inner.main.attachment,
             ),
@@ -226,8 +233,30 @@ impl HostedView {
         on_screen.is_some() && on_screen != inner.adopted
     }
 
-    pub(crate) fn take_focus(&self) -> Option<HostedChildFocus> {
-        self.lock().focus.take()
+    /// Ends the view as the controller ends: nothing can be shown through
+    /// it afterwards, and the child still on screen is handed back to be
+    /// shut down.
+    pub(crate) fn close(&self) -> Option<HostedChildFocus> {
+        let mut inner = self.lock();
+        inner.closed = true;
+        inner.focus.take()
+    }
+
+    /// The controller replaced its main thread in the middle of an action
+    /// (a session installed, then a turn run on it): a focus made during
+    /// that turn must start from the new thread.
+    pub(crate) fn note_main_thread(&self, thread: &RuntimeThreadHandle) {
+        let mut inner = self.lock();
+        if inner.adopted.is_none() {
+            inner.main.thread = Some(thread.clone());
+        }
+    }
+
+    /// Said by the controller before it starts or switches to a side
+    /// conversation, so that no child is focused meanwhile. The controller
+    /// records the truth again as it next follows the view.
+    pub(crate) fn set_side_active(&self, active: bool) {
+        self.lock().side_active = active;
     }
 }
 
@@ -252,5 +281,73 @@ mod tests {
         assert_eq!(adoption(Some(id(3)), Some(id(2))), Adoption::Child);
         // The view went back to main; the controller still holds the child.
         assert_eq!(adoption(None, Some(id(2))), Adoption::Main);
+    }
+
+    fn view_for_test() -> (
+        super::HostedView,
+        crate::operation_controller::TuiSurfaceTaskControl,
+        crossbeam_channel::Receiver<crate::protocol::TuiEvent>,
+        orca_runtime::runtime_host::RuntimeHost,
+    ) {
+        let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
+        let host = orca_runtime::runtime_host::RuntimeHost::start_with_background_capacity(1)
+            .expect("runtime host");
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let attachment = id(1);
+        let view = super::HostedView::new(
+            host.handle(),
+            event_tx.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::attachment_routing::AttachmentRouting::new(attachment),
+            )),
+            event_tx,
+            attachment,
+        );
+        (view, control, event_rx, host)
+    }
+
+    fn focus_action() -> crate::hosted_child::HostedChildAction {
+        crate::hosted_child::HostedChildAction::Focus {
+            task_id: "child".to_string(),
+            expected_revision: 1,
+        }
+    }
+
+    #[test]
+    fn a_focus_is_refused_while_a_side_conversation_is_starting() {
+        let (view, control, events, _host) = view_for_test();
+        view.set_side_active(true);
+        view.handle(focus_action(), &control);
+        match events.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(crate::protocol::TuiEvent::OperationRejected(message)) => assert_eq!(
+                message,
+                "live child focus is unavailable in a side conversation"
+            ),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        assert!(!view.has_focus());
+    }
+
+    #[test]
+    fn a_closed_view_shows_nothing() {
+        let (view, control, events, _host) = view_for_test();
+        view.handle(focus_action(), &control);
+        match events.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(crate::protocol::TuiEvent::OperationRejected(message)) => {
+                assert_eq!(
+                    message,
+                    "focus a main conversation before selecting a child"
+                )
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        assert!(view.close().is_none());
+        view.handle(focus_action(), &control);
+        assert!(
+            events
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a closed view emits nothing"
+        );
     }
 }

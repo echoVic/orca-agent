@@ -296,6 +296,8 @@ fn resume_startup_conversation(
 /// Moves what the controller operates on to what is on screen, and binds
 /// the prompt queue to it. Only between actions: a running turn keeps the
 /// thread it started on. `true` when the operating thread changed.
+/// `on_child` is whether the controller now operates on a child: its own
+/// state, which cannot change under the loop.
 fn follow_view(
     view: &HostedView,
     thread: &mut Option<RuntimeThreadHandle>,
@@ -304,10 +306,13 @@ fn follow_view(
     side_active: bool,
     control: &TuiSurfaceTaskControl,
     active_recap_request_id: &mut Option<orca_runtime::recap::RecapRequestId>,
+    on_child: &mut bool,
 ) -> bool {
     let previous = thread.clone();
-    if view.adopt(thread, event_tx, session_attachment, side_active) == Adoption::Unchanged {
-        return false;
+    match view.adopt(thread, event_tx, session_attachment, side_active) {
+        Adoption::Unchanged => return false,
+        Adoption::Child => *on_child = true,
+        Adoption::Main => *on_child = false,
     }
     // A recap still being written describes the conversation that left the
     // screen; withdrawing it also stops the provider call.
@@ -358,6 +363,7 @@ pub(crate) fn hosted_tui_controller_loop(
         session_attachment,
     );
     control.bind_view(view.clone());
+    let mut on_child = false;
     control.bind_hosted_settings_config(config.clone());
     let mut last_idle_projection_cursor = None;
     let mut next_recap_request_id = 1_u64;
@@ -400,10 +406,11 @@ pub(crate) fn hosted_tui_controller_loop(
             side_parent.is_some(),
             &control,
             &mut active_recap_request_id,
+            &mut on_child,
         ) {
             last_idle_projection_cursor = None;
         }
-        control.restrict_hosted_settings(side_parent.is_some() || view.has_focus());
+        control.restrict_hosted_settings(side_parent.is_some() || on_child || view.has_focus());
         let action: Result<UserAction, ()> = if control.is_shutdown() {
             Ok(UserAction::Cancel)
         } else {
@@ -428,13 +435,14 @@ pub(crate) fn hosted_tui_controller_loop(
             side_parent.is_some(),
             &control,
             &mut active_recap_request_id,
+            &mut on_child,
         ) {
             last_idle_projection_cursor = None;
         }
         while let Ok(completed_request_id) = recap_completion_rx.try_recv() {
             clear_completed_recap_request(&mut active_recap_request_id, completed_request_id);
         }
-        let side_disallowed = (side_parent.is_some() || view.has_focus())
+        let side_disallowed = (side_parent.is_some() || on_child || view.has_focus())
             && matches!(
                 &action,
                 Ok(UserAction::NewSession
@@ -478,7 +486,15 @@ pub(crate) fn hosted_tui_controller_loop(
         ) {
             control.restrict_hosted_settings(true);
         }
-        if view.has_focus()
+        // Said before the check below, so that a child focused from another
+        // thread either is already on screen here or is refused there.
+        if matches!(
+            &action,
+            Ok(UserAction::StartSideConversation { .. } | UserAction::ToggleSideConversation)
+        ) {
+            view.set_side_active(true);
+        }
+        if (on_child || view.has_focus())
             && matches!(
                 &action,
                 Ok(UserAction::StartSideConversation { .. }
@@ -1242,7 +1258,8 @@ pub(crate) fn hosted_tui_controller_loop(
         }
     }
 
-    if let Some(focus) = view.take_focus() {
+    control.unbind_view();
+    if let Some(focus) = view.close() {
         shutdown_attached_child_on_controller_exit(focus);
     } else if let Some(side) = side_parent {
         shutdown_attached_side_on_controller_exit(side);
@@ -1253,7 +1270,6 @@ pub(crate) fn hosted_tui_controller_loop(
     // TUI stops them, those still connecting too; after, the thread stops
     // them as it ends.
     control.close_prestart_mcp();
-    control.unbind_view();
     control.release_runtime_thread();
 }
 

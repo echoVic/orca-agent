@@ -722,7 +722,6 @@ fn focus_child(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn return_to_parent(
     thread: &mut Option<RuntimeThreadHandle>,
     focus: &mut Option<HostedChildFocus>,
