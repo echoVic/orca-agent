@@ -1,11 +1,11 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::display_text::truncate_to_display_width;
+use crate::display_text::{path_for_display, truncate_to_display_width};
 
 const GIT_TIMEOUT: Duration = Duration::from_millis(500);
 const GIT_RETAINED_BYTES_PER_STREAM: usize = 2 * 1024;
@@ -39,17 +39,26 @@ pub(crate) fn compact_cwd(cwd: &str, max_width: usize) -> String {
         return cwd.to_string();
     }
 
-    let basename = Path::new(cwd)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(cwd);
-    let middle = if cwd.starts_with("~/") {
-        format!("~/…/{basename}")
-    } else if cwd.starts_with('/') {
-        format!("/…/{basename}")
+    // Written with the separator the path itself uses: `~\work\orca` on
+    // Windows, `~/work/orca` elsewhere.
+    let separator = if cwd.contains('\\') && !cwd.contains('/') {
+        '\\'
     } else {
-        format!("…/{basename}")
+        '/'
+    };
+    let basename = cwd
+        .rsplit(separator)
+        .find(|part| !part.is_empty())
+        .unwrap_or(cwd);
+    let middle = if cwd
+        .strip_prefix('~')
+        .is_some_and(|rest| rest.starts_with(separator))
+    {
+        format!("~{separator}…{separator}{basename}")
+    } else if cwd.starts_with(separator) {
+        format!("{separator}…{separator}{basename}")
+    } else {
+        format!("…{separator}{basename}")
     };
     if UnicodeWidthStr::width(middle.as_str()) <= max_width {
         return middle;
@@ -61,13 +70,22 @@ pub(crate) fn compact_cwd(cwd: &str, max_width: usize) -> String {
 }
 
 fn display_cwd(workspace: &Path, home: Option<&Path>) -> String {
+    display_cwd_with(workspace, home, std::path::MAIN_SEPARATOR)
+}
+
+fn display_cwd_with(workspace: &Path, home: Option<&Path>, separator: char) -> String {
+    // Both in the spelling a person writes, so that a home directory still
+    // matches a workspace the system resolved.
+    let workspace = PathBuf::from(path_for_display(workspace));
+    let home = home.map(|home| PathBuf::from(path_for_display(home)));
     let display = home
+        .as_deref()
         .and_then(|home| workspace.strip_prefix(home).ok())
         .map(|relative| {
             if relative.as_os_str().is_empty() {
                 "~".to_string()
             } else {
-                format!("~/{}", relative.display())
+                format!("~{separator}{}", relative.display())
             }
         })
         .unwrap_or_else(|| workspace.display().to_string());
@@ -167,12 +185,21 @@ mod tests {
 
     #[test]
     fn display_cwd_shortens_only_a_component_safe_home_prefix() {
+        // Paths spelled with `/`, so with `/` after the `~` on any system.
         assert_eq!(
-            display_cwd(
+            display_cwd_with(
                 Path::new("/Users/alice/work/project"),
                 Some(Path::new("/Users/alice")),
+                '/',
             ),
             "~/work/project"
+        );
+        assert_eq!(
+            display_cwd(
+                std::env::temp_dir().join("work").as_path(),
+                Some(std::env::temp_dir().as_path()),
+            ),
+            format!("~{}work", std::path::MAIN_SEPARATOR)
         );
         assert_eq!(
             display_cwd(
@@ -215,6 +242,29 @@ mod tests {
                 "emoji modifier must remain attached: {compact:?}",
             );
         }
+    }
+
+    #[test]
+    fn a_windows_cwd_is_written_with_one_kind_of_separator() {
+        // On Windows the part below the home directory comes with
+        // backslashes; the `~` in front of it takes the same separator.
+        assert_eq!(
+            display_cwd_with(
+                Path::new("/Users/alice").join(r"orca-vm\w3").as_path(),
+                Some(Path::new("/Users/alice")),
+                '\\',
+            ),
+            r"~\orca-vm\w3"
+        );
+
+        let cwd = r"~\Documents\GitHub\blade-deepseek";
+        assert_eq!(compact_cwd(cwd, 40), cwd);
+        assert_eq!(compact_cwd(cwd, 22), r"~\…\blade-deepseek");
+        assert_eq!(compact_cwd(cwd, 14), "blade-deepseek");
+        assert_eq!(
+            compact_cwd(r"C:\Users\dev\Documents\GitHub\blade-deepseek", 22),
+            r"…\blade-deepseek"
+        );
     }
 
     #[test]

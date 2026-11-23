@@ -1,5 +1,37 @@
+use std::borrow::Cow;
+use std::path::Path;
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+/// A path as a person writes it. On Windows a path the system resolved comes
+/// back in its extended-length spelling (`\\?\C:\Users\dev`,
+/// `\\?\UNC\server\share`). Orca keeps that spelling to tell folders apart;
+/// to a reader the prefix means nothing.
+pub(crate) fn path_for_display(path: &Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        without_extended_length_prefix(&text).into_owned()
+    } else {
+        text
+    }
+}
+
+fn without_extended_length_prefix(path: &str) -> Cow<'_, str> {
+    if let Some(share) = path.strip_prefix(r"\\?\UNC\") {
+        return Cow::Owned(format!(r"\\{share}"));
+    }
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        let mut characters = rest.chars();
+        let drive = characters.next().is_some_and(|c| c.is_ascii_alphabetic());
+        if drive && characters.next() == Some(':') {
+            return Cow::Borrowed(rest);
+        }
+    }
+    // Anything else under `\\?\` (a volume GUID, a device) has no shorter
+    // spelling.
+    Cow::Borrowed(path)
+}
 
 pub(crate) fn truncate_to_display_width(text: &str, max_width: usize) -> String {
     let text_width = UnicodeWidthStr::width(text);
@@ -152,6 +184,40 @@ pub(crate) fn compact_long_text(text: &str, line_width: usize, max_lines: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resolved_windows_path_is_shown_without_its_extended_length_prefix() {
+        assert_eq!(
+            without_extended_length_prefix(r"\\?\C:\Users\dev\工作 区"),
+            r"C:\Users\dev\工作 区"
+        );
+        assert_eq!(
+            without_extended_length_prefix(r"\\?\UNC\server\share\repo"),
+            r"\\server\share\repo"
+        );
+        // No shorter spelling exists for these; they are left alone.
+        for path in [
+            r"\\?\Volume{4c1b02c1-d990-11dc-99ae-806e6f6e6963}\repo",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1",
+            r"C:\Users\dev",
+            r"\\server\share",
+            "/Users/dev/work",
+        ] {
+            assert_eq!(without_extended_length_prefix(path), path);
+        }
+    }
+
+    #[test]
+    fn a_path_is_shown_as_it_is_where_no_prefix_is_added() {
+        if !cfg!(windows) {
+            // Elsewhere a name may begin with these characters.
+            assert_eq!(path_for_display(Path::new(r"\\?\C:\x")), r"\\?\C:\x");
+        }
+        assert_eq!(
+            path_for_display(&std::env::temp_dir().join("orca")),
+            std::env::temp_dir().join("orca").display().to_string()
+        );
+    }
 
     #[test]
     fn wrapping_fills_rows_and_breaks_between_wide_characters() {

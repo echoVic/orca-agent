@@ -27,7 +27,7 @@ use orca_runtime::surface::{TaskTranscriptItem, TaskTranscriptToolStatus};
 use crate::agent_workspace::{AgentHitArea, AgentHitTarget, AgentWorkspaceRow};
 use crate::chrome::{GUTTER_CONTINUATION, GUTTER_WIDTH, TAIL_ROW};
 use crate::diagnostics::{DiagnosticContext, DiagnosticLevel, TuiDiagnostic};
-use crate::display_text::{compact_long_text, truncate_to_display_width};
+use crate::display_text::{compact_long_text, path_for_display, truncate_to_display_width};
 use crate::protocol::TaskTranscriptResult;
 use crate::queued_input::QueuedPreviewSnapshot;
 use crate::recap_view;
@@ -6890,7 +6890,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
             let workspace_lines = || {
                 state.first_run.as_ref().map(|first_run| {
                     wrap_notice_line(
-                        &format!("Workspace: {}", first_run.workspace.display()),
+                        &format!("Workspace: {}", path_for_display(&first_run.workspace)),
                         inner_width,
                         Style::default().fg(theme.border),
                     )
@@ -6922,7 +6922,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
             }
             if let Some(first_run) = &state.first_run {
                 details.extend(wrap_notice_line(
-                    &format!("Auth file: {}", first_run.auth_path.display()),
+                    &format!("Auth file: {}", path_for_display(&first_run.auth_path)),
                     inner_width,
                     Style::default().fg(theme.muted),
                 ));
@@ -7095,7 +7095,7 @@ fn render_setup(frame: &mut Frame, state: &AppState, textarea: &TextArea, theme:
             let auth_path = state
                 .first_run
                 .as_ref()
-                .map(|first_run| first_run.auth_path.display().to_string())
+                .map(|first_run| path_for_display(&first_run.auth_path))
                 .unwrap_or_else(|| "~/.orca/auth.json".to_string());
             let mut content = vec![
                 Line::from(""),

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::commands::{self, GoalSlashCommand, QueueSlashCommand, SlashCommand, TrustSlashCommand};
+use crate::display_text::path_for_display;
 use crate::full_access_confirmation_actions::request_settings_change;
 use crate::protocol::TuiMemoryScope;
 use crate::protocol::{GoalDraft, UserAction};
@@ -567,7 +568,7 @@ fn dispatch_slash_command(
                     state.push_message(ChatMessage::System {
                         text: format!(
                             "{} is trusted; the OS sandbox honors the configured write and network policy.",
-                            cwd.display()
+                            path_for_display(&cwd)
                         ),
                         expanded: false,
                     })
@@ -575,7 +576,7 @@ fn dispatch_slash_command(
                     state.push_message(ChatMessage::System {
                         text: format!(
                             "{} is not trusted; commands run read-only with no network. Use /trust add to trust it.",
-                            cwd.display()
+                            path_for_display(&cwd)
                         ),
                         expanded: false,
                     })
@@ -585,7 +586,7 @@ fn dispatch_slash_command(
                 Ok(()) => state.push_message(ChatMessage::System {
                     text: format!(
                         "Trusted {}. Restart Orca to load project config from this folder.",
-                        cwd.display()
+                        path_for_display(&cwd)
                     ),
                     expanded: false,
                 }),
@@ -597,7 +598,7 @@ fn dispatch_slash_command(
                 Ok(()) => state.push_message(ChatMessage::System {
                     text: format!(
                         "Removed trust for {}; commands now run read-only with no network.",
-                        cwd.display()
+                        path_for_display(&cwd)
                     ),
                     expanded: false,
                 }),
