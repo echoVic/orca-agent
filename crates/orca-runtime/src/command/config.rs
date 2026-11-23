@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 use orca_core::approval_types::ApprovalMode;
 use orca_core::config::file::{ConfigOverrides, FileConfig, load_effective_config};
@@ -62,6 +62,32 @@ pub fn build_run_config(request: RunConfigRequest) -> Result<RunConfig, String> 
     Ok(config)
 }
 
+/// The working directory a run records. One named from where Orca was started
+/// (`--cwd sub`, `--cwd ..`, `--cwd dir/`) is resolved against that directory
+/// here, by name alone: a thread refuses a directory that is not absolute, or
+/// that is spelled with `.`, `..` or a trailing separator.
+fn absolute_runtime_cwd(cwd: PathBuf) -> PathBuf {
+    let cwd = if cwd.is_absolute() {
+        cwd
+    } else {
+        match std::env::current_dir() {
+            Ok(start) => start.join(cwd),
+            Err(_) => return cwd,
+        }
+    };
+    let mut absolute = PathBuf::new();
+    for component in cwd.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                absolute.pop();
+            }
+            named => absolute.push(named.as_os_str()),
+        }
+    }
+    absolute
+}
+
 pub fn assemble_run_config(
     request: RunConfigRequest,
     file: FileConfig,
@@ -76,7 +102,7 @@ pub fn assemble_run_config(
     Ok(RunConfig {
         app_version: request.app_version,
         prompt: request.prompt,
-        cwd: request.runtime_cwd,
+        cwd: request.runtime_cwd.map(absolute_runtime_cwd),
         output_format: request.output_format,
         approval_mode,
         startup_approval_mode: request.overrides.mode,
@@ -277,7 +303,7 @@ output = 2.0
         let request = RunConfigRequest {
             app_version: "9.8.7".to_string(),
             config_cwd: PathBuf::from("/config-root"),
-            runtime_cwd: Some(PathBuf::from("/runtime-root")),
+            runtime_cwd: Some(std::env::temp_dir().join("runtime-root")),
             prompt: "inspect".to_string(),
             output_format: OutputFormat::Jsonl,
             provider: ProviderKind::Mock,
@@ -296,7 +322,12 @@ output = 2.0
         let config = assemble_run_config(request, file).unwrap();
 
         assert_eq!(config.app_version, "9.8.7");
-        assert_eq!(config.cwd, Some(PathBuf::from("/runtime-root")));
+        assert_eq!(
+            config.cwd,
+            Some(absolute_runtime_cwd(
+                std::env::temp_dir().join("runtime-root")
+            ))
+        );
         assert_eq!(config.prompt, "inspect");
         assert_eq!(config.output_format, OutputFormat::Jsonl);
         assert_eq!(config.approval_mode, ApprovalMode::Plan);
@@ -391,5 +422,27 @@ output = 2.0
                 .unwrap()
                 .pricing_refresh
         );
+    }
+
+    #[test]
+    fn a_working_directory_named_from_the_starting_directory_is_made_absolute() {
+        let start = std::env::current_dir().expect("starting directory");
+        assert_eq!(
+            absolute_runtime_cwd(PathBuf::from("work")),
+            start.join("work")
+        );
+        assert_eq!(
+            absolute_runtime_cwd(PathBuf::from("./sub/../work/.")),
+            start.join("work")
+        );
+        assert_eq!(
+            Some(absolute_runtime_cwd(PathBuf::from(".."))),
+            start.parent().map(PathBuf::from)
+        );
+        // What a thread accepts: no `.`, no `..`, no trailing separator.
+        let spelled = start.join("work").join("..").join("work").join("");
+        let absolute = absolute_runtime_cwd(spelled);
+        assert_eq!(absolute, start.join("work"));
+        assert!(crate::runtime_surface::CanonicalPath::try_new(absolute).is_ok());
     }
 }
