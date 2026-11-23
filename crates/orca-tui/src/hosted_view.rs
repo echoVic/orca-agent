@@ -172,7 +172,8 @@ impl HostedView {
     }
 
     /// Moves the controller's operating thread to what is on screen. Called
-    /// by the controller between actions only. While it operates on main it
+    /// by the controller between actions only. It records whether a side
+    /// conversation is active at every call; while it operates on main it
     /// also records main here, for the next focus to start from.
     pub(crate) fn adopt(
         &self,
@@ -183,6 +184,10 @@ impl HostedView {
     ) -> Adoption {
         let mut guard = self.lock();
         let inner = &mut *guard;
+        // The controller says what is true at every pass, whichever way the
+        // operating thread moves: what was said ahead of a check
+        // ([`Self::set_side_active`]) lasts only until the next pass.
+        inner.side_active = side_active;
         let on_screen = inner.focus.as_ref().map(|focus| focus.child_attachment);
         let change = adoption(on_screen, inner.adopted);
         match change {
@@ -214,7 +219,6 @@ impl HostedView {
                         event_tx: event_tx.clone(),
                         attachment: *attachment,
                     };
-                    inner.side_active = side_active;
                 }
             }
         }
@@ -349,5 +353,27 @@ mod tests {
                 .is_err(),
             "a closed view emits nothing"
         );
+    }
+
+    #[test]
+    fn what_the_controller_says_at_a_pass_replaces_what_was_said_ahead_of_a_check() {
+        let (view, control, _unused, _host) = view_for_test();
+        view.set_side_active(true);
+        let (mut event_tx, events) = crossbeam_channel::unbounded();
+        let mut attachment = id(1);
+        assert_eq!(
+            view.adopt(&mut None, &mut event_tx, &mut attachment, false),
+            Adoption::Unchanged
+        );
+        view.handle(focus_action(), &control);
+        match events.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(crate::protocol::TuiEvent::OperationRejected(message)) => {
+                assert_eq!(
+                    message,
+                    "focus a main conversation before selecting a child"
+                )
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
     }
 }
