@@ -224,8 +224,39 @@ fn route_action(
         let message = match out_of_step {
             crate::hosted_view::OutOfStep::MainRuns => MAIN_STILL_RUNNING,
             crate::hosted_view::OutOfStep::AgentRuns => AGENT_STILL_RUNNING,
-        };
-        reject_action(event_tx, action, message.to_string());
+        }
+        .to_string();
+        match action {
+            // Sent while the conversation in view runs: nothing there
+            // stopped, so only the text goes back.
+            UserAction::QueuePrompt {
+                prompt,
+                bindings,
+                images,
+            }
+            | UserAction::SubmitNow {
+                prompt,
+                bindings,
+                images,
+            } => {
+                let _ = event_tx.try_send(TuiEvent::RefusedElsewhere {
+                    prompt: Some(prompt),
+                    bindings,
+                    images,
+                    message,
+                });
+            }
+            UserAction::PromptQueueControl(_) => {
+                let _ = event_tx.try_send(TuiEvent::RefusedElsewhere {
+                    prompt: None,
+                    bindings: orca_runtime::mentions::MentionBindings::default(),
+                    images: Vec::new(),
+                    message,
+                });
+            }
+            // A plain submit: the renderer showed it and waits for its turn.
+            action => reject_action(event_tx, action, message),
+        }
         return true;
     }
     match action {

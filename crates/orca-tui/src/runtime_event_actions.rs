@@ -151,14 +151,28 @@ pub(crate) fn handle_runtime_event(
         TuiEvent::Backtracked { prompt } => Some(prompt.clone()),
         TuiEvent::RewindCompleted(outcome) => outcome.prompt.clone(),
         TuiEvent::SubmissionRejected { prompt, .. } => Some(prompt.clone()),
+        TuiEvent::RefusedElsewhere {
+            prompt: Some(prompt),
+            ..
+        } => Some(prompt.clone()),
         _ => None,
     };
     let restored_images = match &tui_event {
         TuiEvent::SubmissionRejected { images, .. } => Some(images.clone()),
+        TuiEvent::RefusedElsewhere {
+            prompt: Some(_),
+            images,
+            ..
+        } => Some(images.clone()),
         _ => None,
     };
     let restored_bindings = match &tui_event {
         TuiEvent::SubmissionRejected { bindings, .. } => Some(bindings.clone()),
+        TuiEvent::RefusedElsewhere {
+            prompt: Some(_),
+            bindings,
+            ..
+        } => Some(bindings.clone()),
         _ => None,
     };
     let workflow_notification_turn_boundary = is_workflow_notification_turn_boundary(&tui_event);
@@ -993,6 +1007,42 @@ mod tests {
             1
         );
         assert_eq!(state.status, AppStatus::Idle);
+    }
+
+    #[test]
+    fn a_follow_up_refused_elsewhere_comes_back_to_the_composer() {
+        let (action_tx, _action_rx) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".to_string(),
+            "mock".to_string(),
+            "/tmp".to_string(),
+        );
+        state.enter_running();
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let theme = Theme::named(ThemeName::Dark);
+        let mut vim_state = VimState::new(false);
+        let mut textarea = TextArea::default();
+        let mut presentation = test_presentation();
+
+        handle_runtime_event(
+            TuiEvent::RefusedElsewhere {
+                prompt: Some("more".to_string()),
+                bindings: MentionBindings::default(),
+                images: Vec::new(),
+                message: "why".to_string(),
+            },
+            &mut state,
+            &action_tx,
+            &pending,
+            &mut textarea,
+            &mut vim_state,
+            &theme,
+            &mut presentation,
+        );
+
+        assert_eq!(textarea_text(&textarea), "more");
+        assert_eq!(state.status, AppStatus::Running);
     }
 
     #[test]

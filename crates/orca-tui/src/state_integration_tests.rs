@@ -1999,6 +1999,34 @@ fn submission_rejection_removes_optimistic_user_and_returns_idle() {
 }
 
 #[test]
+fn a_follow_up_refused_elsewhere_leaves_the_running_conversation_as_it_is() {
+    let (action_tx, _action_rx) = crossbeam_channel::unbounded();
+    let mut state = AppState::new(
+        action_tx,
+        "test".to_string(),
+        "mock".to_string(),
+        "/tmp".to_string(),
+    );
+    state.push_message(ChatMessage::User("hi".to_string()));
+    state.push_message(ChatMessage::Assistant("working".to_string()));
+    state.enter_running();
+
+    state.update(TuiEvent::RefusedElsewhere {
+        prompt: Some("more".to_string()),
+        bindings: Default::default(),
+        images: Vec::new(),
+        message: "why".to_string(),
+    });
+
+    assert_eq!(state.status, AppStatus::Running);
+    assert!(matches!(
+        state.transcript.messages.as_slice(),
+        [ChatMessage::User(a), ChatMessage::Assistant(b), ChatMessage::Diagnostic(_)]
+            if a == "hi" && b == "working"
+    ));
+}
+
+#[test]
 fn generic_error_does_not_end_a_running_turn() {
     let mut state = state();
     state.enter_running();

@@ -867,6 +867,19 @@ impl AppState {
                 )));
                 self.set_status(AppStatus::Idle);
             }
+            TuiEvent::RefusedElsewhere {
+                prompt, message, ..
+            } => {
+                // A queue edit that was refused is not in flight any more;
+                // the conversation in view goes on as it was.
+                if prompt.is_none() {
+                    self.cancel_latest_queued_edit();
+                }
+                self.push_message(ChatMessage::Diagnostic(TuiDiagnostic::from_message(
+                    DiagnosticContext::Input,
+                    message,
+                )));
+            }
             TuiEvent::Diagnostic(diagnostic) => {
                 self.finish_assistant_stream();
                 self.clear_receiving_tool_progress();

@@ -446,6 +446,17 @@ pub enum TuiEvent {
         images: Vec<ComposerImageAttachment>,
         message: String,
     },
+    /// A follow-up or a queue edit that was not delivered because the
+    /// controller runs a turn on another conversation than the one on
+    /// screen. Unlike `SubmissionRejected` and `OperationRejected` it leaves
+    /// the conversation in view, which may be running, as it is: it gives
+    /// the text back, when there is any, and says why.
+    RefusedElsewhere {
+        prompt: Option<String>,
+        bindings: MentionBindings,
+        images: Vec<ComposerImageAttachment>,
+        message: String,
+    },
     OperationRejected(String),
     Diagnostic(TuiDiagnostic),
     Error(String),

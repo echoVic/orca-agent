@@ -476,6 +476,9 @@ pub(crate) fn hosted_tui_controller_loop(
                 "this command is unavailable in a side conversation; return to main first"
                     .to_string(),
             ));
+            // The dispatcher may have armed a turn for this action; it will
+            // not start one.
+            control.cancel_surface_activation_if_idle();
             continue;
         }
         // These handlers can start a turn before returning to this loop.
