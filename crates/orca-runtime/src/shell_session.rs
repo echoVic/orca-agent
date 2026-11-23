@@ -2600,6 +2600,11 @@ mod tests {
         );
         assert_eq!(error.to_string(), "injected registration failure");
 
+        // A signal sent to a process group does not reach every member at the
+        // same instant: a descendant already being killed can still look for
+        // the release marker once. Only one that is alive after this wait was
+        // left behind.
+        thread::sleep(Duration::from_millis(200));
         std::fs::write(&release_marker, "release").expect("release descendant");
         thread::sleep(Duration::from_millis(200));
         assert!(
