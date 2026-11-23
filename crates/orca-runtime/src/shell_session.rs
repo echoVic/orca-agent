@@ -1248,9 +1248,8 @@ fn spawn_windows_sandbox(
 }
 
 fn shell_command(shell: &ShellSpec, script: &str, cwd: &std::path::Path) -> std::process::Command {
-    let command = shell.command(script);
-    let mut process = std::process::Command::new(command.program);
-    process.args(command.args).current_dir(cwd);
+    let mut process = shell.command(script).to_command();
+    process.current_dir(cwd);
     orca_tools::process::prepare_non_interactive_command(&mut process);
     process
 }

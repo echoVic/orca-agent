@@ -500,10 +500,31 @@ mod windows {
     }
 
     fn command_line(command: &Command) -> Vec<u16> {
-        let mut line = quote_windows_arg(&command.get_program().to_string_lossy());
-        for argument in command.get_args() {
+        let program = command.get_program();
+        let mut args = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        // A cmd.exe script goes on the line as written. One that already
+        // stands between quotes was put there that way by
+        // `CommandSpec::to_command`; any other is quoted here.
+        let script = crate::shell::cmd_script(std::path::Path::new(program), &args)
+            .map(|script| script.to_string_lossy().into_owned())
+            .map(|script| {
+                if script.len() >= 2 && script.starts_with('"') && script.ends_with('"') {
+                    script
+                } else {
+                    format!("\"{script}\"")
+                }
+            });
+        if script.is_some() {
+            args.pop();
+        }
+        let mut line = quote_windows_arg(&program.to_string_lossy());
+        for argument in &args {
             line.push(' ');
             line.push_str(&quote_windows_arg(&argument.to_string_lossy()));
+        }
+        if let Some(script) = script {
+            line.push(' ');
+            line.push_str(&script);
         }
         line.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -617,6 +638,27 @@ mod windows {
                 quote_windows_arg("say \\\"hi\\\""),
                 "\"say \\\\\\\"hi\\\\\\\"\""
             );
+        }
+
+        #[test]
+        fn command_line_leaves_a_cmd_script_as_written() {
+            let script = r#"echo x > "a b.txt""#;
+            let spec = crate::shell::CommandSpec {
+                program: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+                args: ["/D", "/S", "/C", script].map(OsString::from).to_vec(),
+            };
+            let expected = r#"C:\Windows\System32\cmd.exe /D /S /C "echo x > "a b.txt"""#;
+            let decode = |encoded: Vec<u16>| {
+                String::from_utf16(&encoded[..encoded.len() - 1]).expect("UTF-16")
+            };
+
+            // Through `to_command` the script arrives between its quotes.
+            assert_eq!(decode(command_line(&spec.to_command())), expected);
+
+            // Given as an ordinary argument it is quoted here.
+            let mut command = Command::new(&spec.program);
+            command.args(&spec.args);
+            assert_eq!(decode(command_line(&command)), expected);
         }
 
         #[test]

@@ -295,10 +295,7 @@ pub fn spawn_user_trusted(
 }
 
 pub fn shell_command(shell: &ShellSpec, script: &str) -> Command {
-    let command_spec = shell.command(script);
-    let mut command = Command::new(command_spec.program);
-    command.args(command_spec.args);
-    command
+    shell.command(script).to_command()
 }
 
 pub struct CommandOutput {
@@ -1019,7 +1016,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(command.get_program(), r"C:\Windows\System32\cmd.exe");
-        assert_eq!(args, ["/D", "/S", "/C", "echo ready"]);
+        // On Windows the script stands on the command line between its
+        // quotes; elsewhere this command is only ever described.
+        let script = if cfg!(windows) {
+            "\"echo ready\""
+        } else {
+            "echo ready"
+        };
+        assert_eq!(args, ["/D", "/S", "/C", script]);
     }
 
     #[test]

@@ -946,10 +946,18 @@ fn command_processor() -> PathBuf {
 }
 
 fn command_line(program: &Path, args: &[OsString]) -> Vec<u16> {
+    // A cmd.exe script goes on the line as written, between one pair of
+    // quotes: quoted like an argument, its own quotes reach cmd.exe escaped.
+    let script = orca_platform::shell::cmd_script(program, args);
+    let args = &args[..args.len() - usize::from(script.is_some())];
     let mut line = quote_windows_arg(&program.to_string_lossy());
     for arg in args {
         line.push(' ');
         line.push_str(&quote_windows_arg(&arg.to_string_lossy()));
+    }
+    if let Some(script) = script {
+        line.push(' ');
+        line.push_str(&orca_platform::shell::quoted_cmd_script(script).to_string_lossy());
     }
     line.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -1132,6 +1140,18 @@ mod tests {
         assert_eq!(
             quote_windows_arg("C:\\Program Files\\Orca\\"),
             "\"C:\\Program Files\\Orca\\\\\""
+        );
+    }
+
+    #[test]
+    fn native_command_line_leaves_a_cmd_script_as_written() {
+        let encoded = command_line(
+            Path::new(r"C:\Windows\System32\cmd.exe"),
+            &["/D", "/S", "/C", r#"echo x > "a b.txt""#].map(OsString::from),
+        );
+        assert_eq!(
+            String::from_utf16(&encoded[..encoded.len() - 1]).expect("UTF-16"),
+            r#"C:\Windows\System32\cmd.exe /D /S /C "echo x > "a b.txt"""#
         );
     }
 
