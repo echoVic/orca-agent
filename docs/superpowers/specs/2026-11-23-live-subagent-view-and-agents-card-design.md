@@ -2,7 +2,8 @@
 
 - Date: 2026-11-23
 - Status: direction approved in conversation; the card's default state and
-  the two items under "To verify first" are not yet confirmed
+  item 2 under "To verify first" are not yet confirmed; item 1 was run in a
+  real terminal on 2026-11-24 and failed in part (see there)
 - Baseline: `main` at `11d90cee` (v0.5.23)
 - Reference: `openai/codex` at `9ee4539162`, `codex-rs/tui/src/app/`
 
@@ -92,8 +93,12 @@ live if the main agent is still running.
 ### The composer
 
 Stage 1: in an agent's conversation, the composer works as it does today
-when the main conversation is idle, and is disabled, with a line saying
-why, while the main agent is running or the agent has finished.
+when the main conversation is idle. While the main agent is running, a
+message sent there is handed back to the composer with a line saying why,
+and a row under the conversation says main is running. The same holds the
+other way round: while the controller still runs a turn on an agent that
+is no longer on screen, a message sent from the main conversation is
+handed back to the composer with a line saying why.
 
 Stage 3: the composer always sends to the conversation on screen.
 
@@ -201,10 +206,40 @@ desktop app's. The card here follows Orca's recap detail.
 
 These were read, not run. Each is the first task of its stage's plan.
 
-1. A focus handled off the controller thread while a turn runs: the child
-   shows live, the parent turn finishes undisturbed, and return shows the
-   parent complete with nothing doubled or missing. In particular, what
-   the controller loop does when its turn ends and the view is on a child.
+1. Run on 2026-11-24 against `67bd26a8`, in a pty read with `pyte`
+   (150x50), `deepseek-flash`, the main agent starting two subagents that
+   write essays; four runs and one `--resume latest`. Result: failed in
+   part.
+   - The `subagent` tool's default children (async: the tool has no mode
+     argument) run as detached `orca subagent-worker` processes. Their
+     `subagent_child_thread_id` stays unset, so opening a running one shows
+     the Agents panel ("No transcript checkpoint yet"), as before. The live
+     view was reached only with children the model launched with
+     `"mode": "sync"`, which run on threads of this process.
+   - Passed: the dock lists both agents with `Running …` while main runs;
+     Shift+Down marks one with `›`; Enter switches the view to that child,
+     with `Main is running · send after it finishes · Esc return` under
+     it; `hello` sent there is handed back to the composer with `the main
+     agent is still running: return to it to send a message, or wait for
+     it to finish`, and the child stays shown as running; staying on a
+     child, that row goes when main finishes and the view stays on the
+     finished child; a finished agent opens the Agent Transcript panel;
+     `--resume latest` shows main and both agents as they ended.
+   - Failed: the child's conversation shows only "Inherited conversation
+     context." for its whole run (32 s watched) and never its reply. The
+     child's session file has no surface commit for that turn, so the
+     bridge has nothing to show; a turn the controller itself runs on the
+     child does stream. After a sibling is opened from a child's view the
+     `Main is running` row is gone although main still runs, and
+     Shift+Down there marks no row (opened with a click).
+   - Return while main runs: no paragraph doubled or lost, and the rest of
+     the turn (two agent notices, the two summary lines) arrived once. But
+     main's `Running … · Esc interrupt` row was gone from the return until
+     the turn ended, about 70 s, while main was still running and then
+     writing; the `Delegating to 2 agents in parallel` line was gone (no
+     rebuild has it, resume neither); and `Inherited conversation
+     context.` was appended under main. `Agent completed` notices land in
+     whatever conversation is on screen, so main lacks them after return.
 2. Whether a finished child's thread is still in the host's live table, and
    whether its saved session yields a surface snapshot without starting a
    thread (`RuntimeSurfaceHostHandle::load_saved_session`,
@@ -217,6 +252,8 @@ the conversation view.
 ## Not in this change
 
 - Sending to an agent while the main agent runs (stage 3).
+- Finished agents as conversations: in stage 1 they open the Agents panel
+  as before, until their replay has its own plan.
 - A diff view opened from Changes.
 - Workflow agents and background tasks as conversations.
 - A split-pane layout.
