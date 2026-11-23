@@ -4,7 +4,7 @@ use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 
 use crate::agent_workspace::AgentWorkspaceRow;
 use crate::protocol::{TaskTranscriptRequest, UserAction};
-use crate::types::{AppState, AppStatus, PanelMode};
+use crate::types::{AppState, PanelMode};
 
 /// Opens a subagent the way Enter on it does: a child on a thread of this
 /// process takes over the conversation view, any other one opens its
@@ -25,7 +25,7 @@ pub(crate) fn open_agent_task(
     let Some(expected_revision) = task.publication_revision else {
         return false;
     };
-    if opens_live_conversation(task, state.status == AppStatus::Idle) {
+    if opens_live_conversation(task) {
         let _ = action_tx.send(UserAction::FocusChildThread {
             task_id: task_id.to_string(),
             expected_revision,
@@ -44,12 +44,10 @@ pub(crate) fn open_agent_task(
 }
 
 /// Whether opening this agent switches the view to its live conversation:
-/// only a child still running on a thread of this process, and only while no
-/// turn runs here. The switch belongs to the controller a running turn
-/// holds, so it would wait for the turn and then find the child finished;
-/// any other agent opens its panel, which a running turn does not hold up.
-pub(crate) fn opens_live_conversation(task: &BackgroundTaskSummary, idle: bool) -> bool {
-    task.subagent_child_thread_id.is_some() && task.status.is_active() && idle
+/// a child still running on a thread of this process. Any other agent opens
+/// its panel.
+pub(crate) fn opens_live_conversation(task: &BackgroundTaskSummary) -> bool {
+    task.subagent_child_thread_id.is_some() && task.status.is_active()
 }
 
 /// Leaves whatever agent is open for the main conversation: a focused child
@@ -667,10 +665,9 @@ mod tests {
     }
 
     #[test]
-    fn a_child_the_running_turn_waits_on_opens_its_activity_right_away() {
-        // Switching the view to the child needs the controller the running
-        // turn holds; queued behind the turn, the switch would only find the
-        // child finished.
+    fn a_live_child_opens_its_conversation_while_the_main_agent_runs() {
+        // The dispatcher shows a child without the controller, so a running
+        // turn no longer holds the switch up.
         let mut child = task("child", 1_000);
         child.subagent_child_thread_id = Some("child-thread".to_string());
         let (mut state, rx) = conversation_with(vec![child]);
@@ -679,15 +676,46 @@ mod tests {
 
         assert!(open_agent_task(&mut state, &tx, "child"));
 
-        assert_eq!(state.panel_mode, PanelMode::Agents);
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
         assert!(matches!(
             rx.try_recv(),
-            Ok(UserAction::ReadTaskTranscript(TaskTranscriptRequest {
+            Ok(UserAction::FocusChildThread {
                 task_id,
                 expected_revision: 7,
-            })) if task_id == "child"
+            }) if task_id == "child"
         ));
-        assert!(rx.try_recv().is_err(), "no child focus is queued");
+        assert!(rx.try_recv().is_err(), "no transcript checkpoint is read");
+    }
+
+    #[test]
+    fn a_running_main_shows_under_a_childs_conversation_and_a_click_returns() {
+        let mut child = task("child", 1_000);
+        child.subagent_child_thread_id = Some("child-thread".to_string());
+        let (mut state, _rx) = conversation_with(vec![child]);
+        state.status = crate::types::AppStatus::Running;
+        state.update(crate::protocol::TuiEvent::ChildFocusChanged {
+            task_id: Some("child".to_string()),
+        });
+        assert_eq!(
+            state.main_behind_child,
+            Some(crate::types::SideParentStatus::Running)
+        );
+
+        render_once(&mut state);
+        let main = clicks_on(&state, &AgentHitTarget::Main);
+        assert!(!main.is_empty(), "the row saying main runs returns to main");
+        assert_eq!(click(&mut state, main[0]), MouseFlow::ReturnToMain);
+
+        state.update(crate::protocol::TuiEvent::SideParentStatusChanged(
+            crate::types::SideParentStatus::NeedsApproval,
+        ));
+        assert_eq!(
+            state.main_behind_child,
+            Some(crate::types::SideParentStatus::NeedsApproval)
+        );
+
+        state.update(crate::protocol::TuiEvent::ChildFocusChanged { task_id: None });
+        assert_eq!(state.main_behind_child, None);
     }
 
     #[test]

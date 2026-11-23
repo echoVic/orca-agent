@@ -784,6 +784,9 @@ pub struct AppState {
     pub(crate) workflow_panel: WorkflowPanelState,
     pub(crate) agent_workspace: AgentWorkspaceState,
     pub(crate) agent_dock_selected_task_id: Option<String>,
+    /// What the main conversation is doing while a child's is on screen;
+    /// `None` when main itself is on screen.
+    pub(crate) main_behind_child: Option<SideParentStatus>,
     /// Whether `/tasks` has expanded the background-task dock in the
     /// activity area above the composer. Distinct from `panel_mode`: the
     /// dock stays layered above the transcript instead of replacing it.
@@ -856,6 +859,20 @@ impl AppState {
 
     pub(crate) fn set_conversation_target(&mut self, target: ConversationTarget) {
         self.conversation_target = target;
+    }
+
+    /// Called as a child's conversation replaces the main one: what main
+    /// was doing is what it is doing behind the child, until it says more.
+    pub(crate) fn note_main_behind_child(&mut self) {
+        if self.conversation_target.task_id().is_some() {
+            return;
+        }
+        self.main_behind_child = Some(match self.status {
+            AppStatus::Idle | AppStatus::Setup | AppStatus::SessionPicker => SideParentStatus::Idle,
+            AppStatus::WaitingApproval => SideParentStatus::NeedsApproval,
+            AppStatus::WaitingUserInput => SideParentStatus::NeedsInput,
+            AppStatus::Running | AppStatus::Compacting => SideParentStatus::Running,
+        });
     }
 
     pub(crate) fn clear_task_transcript(&mut self) {
@@ -1195,6 +1212,7 @@ impl AppState {
             workflow_panel: WorkflowPanelState::default(),
             agent_workspace: AgentWorkspaceState::default(),
             agent_dock_selected_task_id: None,
+            main_behind_child: None,
             tasks_dock_expanded: false,
             announced_startup_warnings: std::collections::HashSet::new(),
             announced_subagent_batches: std::collections::HashSet::new(),

@@ -197,8 +197,16 @@ impl AppState {
                 if let Some(side) = self.side_conversation.as_mut() {
                     side.parent_status = status;
                 }
+                if self.conversation_target.task_id().is_some() {
+                    self.main_behind_child = Some(status);
+                }
             }
             TuiEvent::ChildFocusChanged { task_id } => {
+                if task_id.is_some() {
+                    self.note_main_behind_child();
+                } else {
+                    self.main_behind_child = None;
+                }
                 self.pending_tool_image_call_id = None;
                 self.invalidate_recap();
                 // Only snapshot the current workflow task list when transitioning
@@ -221,6 +229,7 @@ impl AppState {
                 self.apply_surface_projection_state(*projection);
             }
             TuiEvent::NewSessionStarted => {
+                self.main_behind_child = None;
                 self.pending_tool_image_call_id = None;
                 self.invalidate_recap();
                 self.task_transcript = None;
@@ -251,6 +260,7 @@ impl AppState {
                 {
                     return;
                 }
+                self.note_main_behind_child();
                 let background_tasks = self.background_workflow_tasks.clone();
                 self.reset_session_projection();
                 self.invalidate_recap();

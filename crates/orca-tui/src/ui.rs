@@ -2509,13 +2509,13 @@ fn agent_workspace_summary_line<'a>(rows: &[AgentWorkspaceRow<'_>], theme: &Them
 fn agent_workspace_action_hint<'a>(
     row: AgentWorkspaceRow<'_>,
     theme: &Theme,
-    idle: bool,
+    _idle: bool,
 ) -> Line<'a> {
     let mut text = " Esc close · ↑↓ select".to_string();
     match row {
         AgentWorkspaceRow::Subagent { task, .. } => {
             if task.publication_revision.is_some() {
-                if crate::agent_workspace_actions::opens_live_conversation(task, idle) {
+                if crate::agent_workspace_actions::opens_live_conversation(task) {
                     text.push_str(" · Enter open conversation");
                 } else {
                     text.push_str(" · Enter transcript");
@@ -5511,6 +5511,9 @@ fn activity_rows(
     } else if let Some(line) = foreground_activity_line(state, theme) {
         rows.push((line, None));
     }
+    if let Some(line) = main_behind_child_line(state, theme) {
+        rows.push((line, Some(AgentHitTarget::Main)));
+    }
 
     if matches!(
         state.panel_mode,
@@ -5590,6 +5593,29 @@ fn turn_has_model_output(state: &AppState) -> bool {
                     | ChatMessage::PlanUpdate { .. }
             )
         })
+}
+
+/// Under a child's conversation: what the main conversation is doing, when
+/// that matters to what the user can do here. A click on it returns.
+fn main_behind_child_line(state: &AppState, theme: &Theme) -> Option<Line<'static>> {
+    state.conversation_target().task_id()?;
+    let (text, color) = match state.main_behind_child? {
+        crate::types::SideParentStatus::Running => (
+            "Main is running · send after it finishes · Esc return",
+            theme.warning,
+        ),
+        crate::types::SideParentStatus::NeedsApproval => {
+            ("Main needs your approval · Esc return", theme.approval)
+        }
+        crate::types::SideParentStatus::NeedsInput => {
+            ("Main needs your answer · Esc return", theme.approval)
+        }
+        _ => return None,
+    };
+    Some(Line::from(Span::styled(
+        format!(" ● {text}"),
+        Style::default().fg(color),
+    )))
 }
 
 fn foreground_activity_line(state: &AppState, theme: &Theme) -> Option<Line<'static>> {
@@ -14685,7 +14711,7 @@ mod tests {
         };
 
         assert!(hint(&child, true).contains("Enter open conversation"));
-        assert!(hint(&child, false).contains("Enter transcript"));
+        assert!(hint(&child, false).contains("Enter open conversation"));
         let mut finished = child.clone();
         finished.status = TaskStatus::Completed;
         assert!(hint(&finished, true).contains("Enter transcript"));
