@@ -400,6 +400,8 @@ impl TuiSurfaceTaskControl {
         ))
     }
 
+    /// Called once by the controller as it starts, before it takes its
+    /// first action.
     pub(crate) fn bind_view(&self, view: crate::hosted_view::HostedView) {
         self.lock_hosted().view = Some(view);
     }
@@ -1920,8 +1922,11 @@ mod tests {
 
     use crate::surface_projection::TuiStreamDeliveryWatermark;
 
+    // The refusing result needs a child on screen and a turn the controller
+    // runs, which takes a live child thread; it is checked in a real
+    // terminal, not here.
     #[test]
-    fn a_message_is_only_refused_when_a_view_is_bound_and_a_turn_runs() {
+    fn a_message_is_never_refused_while_main_is_on_screen() {
         let control = TuiSurfaceTaskControl::isolated_for_test();
         assert!(control.view().is_none());
         assert!(
