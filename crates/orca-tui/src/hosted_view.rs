@@ -130,7 +130,7 @@ impl HostedView {
         };
         if matches!(action, HostedChildAction::Focus { .. }) {
             // Direct settings stay unavailable throughout the change; the
-            // controller sets them again as it follows.
+            // end of this function sets them to what is then on screen.
             control.restrict_hosted_settings(true);
             if inner.focus.is_some() {
                 handle_hosted_child_action(
@@ -159,6 +159,9 @@ impl HostedView {
             &self.routing,
             control,
         );
+        // Settings are restricted exactly while a side conversation or a
+        // child is on screen: a focus that was refused restricts nothing.
+        control.restrict_hosted_settings(inner.side_active || inner.focus.is_some());
     }
 
     /// Moves the controller's operating thread to what is on screen. Called
