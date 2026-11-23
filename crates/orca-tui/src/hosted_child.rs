@@ -22,7 +22,7 @@ use crate::attachment_routing::{
     AttachmentRouting, send_attached_event, spawn_attached_event_sender_with_routing,
 };
 use crate::hosted_session::{
-    announce_runtime_ready, hosted_projection_batch_from_snapshot, project_hosted_thread_attached,
+    hosted_projection_batch_from_snapshot, project_hosted_thread_attached,
     read_hosted_projection_batch,
 };
 use crate::operation_controller::TuiSurfaceTaskControl;
@@ -539,7 +539,6 @@ pub(crate) fn handle_hosted_child_action(
             event_tx,
             session_attachment,
             attachment_routing,
-            control,
         ),
     }
 }
@@ -713,7 +712,8 @@ fn focus_child(
     });
     // Start the relay only after the child reset is queued so hydration and
     // live child events cannot race ahead of the visible focus transition.
-    announce_runtime_ready(&child_thread, event_tx, control);
+    // The prompt queue is not rebound here: the controller does that when
+    // it takes up the child, which is not while it runs another turn.
     for interaction in child_interactions {
         let _ = send_attached_event(root_event_tx, child_attachment, interaction);
     }
@@ -730,7 +730,6 @@ fn return_to_parent(
     event_tx: &mut mpsc::Sender<TuiEvent>,
     session_attachment: &mut SessionAttachmentId,
     attachment_routing: &Arc<Mutex<AttachmentRouting>>,
-    control: &TuiSurfaceTaskControl,
 ) {
     let Some(mut child_focus) = focus.take() else {
         return;
@@ -791,11 +790,6 @@ fn return_to_parent(
     }
     child_focus.event_bridge.stop();
     AttachmentRouting::release_deferred_parent_events(attachment_routing, root_event_tx);
-    announce_runtime_ready(
-        thread.as_ref().expect("parent thread after child return"),
-        event_tx,
-        control,
-    );
     let _ = send_attached_event(
         root_event_tx,
         child_focus.parent_attachment,
