@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.22";
+export const releaseVersion = "v0.5.23";
 
 export const releases = [
+  {
+    version: "v0.5.23",
+    date: "2026-11-23",
+    title: "Scripts run inside Orca, with their runs on screen",
+    body: "run_script now runs inside Orca in an embedded QuickJS engine, so it no longer needs Node.js: calls a script starts together run at the same time, up to tools.max_read_parallel (8 by default), [tools.script] memory_limit_mb bounds what one script may hold (64 MiB by default, never less than 8), and a script stuck inside a native loop that never asks to stop is left behind counted rather than blocking the turn. The terminal UI's run_script row opens with a click or ctrl+o to show the script the model wrote, one entry per call with its arguments, how it ended, how long it took and the first lines of what came back, and what went back to the model; each batch of calls appears as it ends, and the record is saved with the session so a resume or a return from /side shows it. The new /scripts command prints whether the tool is on, its limits, and the description and parameter schema the model is sent. A bash command's output now appears while it runs in a turn typed directly, at most five times a second and up to 64 KiB, and an ACP client receives the same pieces as in-progress updates. Fixes cover a turn started from a queued message, or one Orca starts when a background agent finishes, missing after a resume; DeepSeek rejecting a thinking-mode request whose messages lost their reasoning_content; reasoning shown above the wrong reply after a resume; a duplicated reasoning line and a spurious queue-conflict note when Esc interrupts a queued turn; on Windows without PowerShell 7 a quoted command reaching cmd.exe with backslashes; cmd.exe and the system's tools printing in the console code page coming out unreadable; --cwd with a relative path failing to start; and Windows paths shown in their extended-length spelling with mixed separators. A second comparison with run_script off and on found neither a saving nor a cost, so it stays off by default.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.23",
+  },
   {
     version: "v0.5.22",
     date: "2026-11-19",
