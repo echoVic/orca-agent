@@ -41,6 +41,29 @@ pub(crate) fn adoption(
     }
 }
 
+/// Why a message sent now would not reach the conversation on screen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutOfStep {
+    /// A child is on screen and the controller still operates on main.
+    MainRuns,
+    /// The controller still operates on a child that is not on screen.
+    AgentRuns,
+}
+
+/// `on_screen` is the attachment of the child in view, `adopted` that of
+/// the child the controller operates on; `None` is the main conversation.
+pub(crate) fn out_of_step(
+    on_screen: Option<SessionAttachmentId>,
+    adopted: Option<SessionAttachmentId>,
+) -> Option<OutOfStep> {
+    match (on_screen, adopted) {
+        (on_screen, adopted) if on_screen == adopted => None,
+        (Some(_), None) => Some(OutOfStep::MainRuns),
+        (_, Some(_)) => Some(OutOfStep::AgentRuns),
+        (None, None) => None,
+    }
+}
+
 /// The main conversation as the controller last held it.
 struct MainBinding {
     thread: Option<RuntimeThreadHandle>,
@@ -229,12 +252,14 @@ impl HostedView {
         self.lock().focus.is_some()
     }
 
-    /// A child is on screen and the controller has not taken it up: what
-    /// the controller is sent now still goes to the main conversation.
-    pub(crate) fn awaits_main(&self) -> bool {
+    /// Whether, and how, the screen is ahead of the controller: what the
+    /// controller is sent now still goes to the conversation it operates on.
+    pub(crate) fn out_of_step(&self) -> Option<OutOfStep> {
         let inner = self.lock();
-        let on_screen = inner.focus.as_ref().map(|focus| focus.child_attachment);
-        on_screen.is_some() && on_screen != inner.adopted
+        out_of_step(
+            inner.focus.as_ref().map(|focus| focus.child_attachment),
+            inner.adopted,
+        )
     }
 
     /// Ends the view as the controller ends: nothing can be shown through
@@ -266,7 +291,7 @@ impl HostedView {
 
 #[cfg(test)]
 mod tests {
-    use super::{Adoption, adoption};
+    use super::{Adoption, OutOfStep, adoption, out_of_step};
     use crate::protocol::SessionAttachmentId;
 
     fn id(value: u64) -> SessionAttachmentId {
@@ -285,6 +310,18 @@ mod tests {
         assert_eq!(adoption(Some(id(3)), Some(id(2))), Adoption::Child);
         // The view went back to main; the controller still holds the child.
         assert_eq!(adoption(None, Some(id(2))), Adoption::Main);
+    }
+
+    #[test]
+    fn a_message_misses_the_screen_when_the_controller_is_elsewhere() {
+        assert_eq!(out_of_step(None, None), None);
+        assert_eq!(out_of_step(Some(id(2)), Some(id(2))), None);
+        assert_eq!(out_of_step(Some(id(2)), None), Some(OutOfStep::MainRuns));
+        assert_eq!(out_of_step(None, Some(id(2))), Some(OutOfStep::AgentRuns));
+        assert_eq!(
+            out_of_step(Some(id(3)), Some(id(2))),
+            Some(OutOfStep::AgentRuns)
+        );
     }
 
     fn view_for_test() -> (

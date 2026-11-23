@@ -416,15 +416,23 @@ impl TuiSurfaceTaskControl {
         self.lock_hosted().view.clone()
     }
 
-    /// Whether a message sent now would go to the main conversation though
-    /// a child's is on screen: the controller runs a turn and has not taken
-    /// up the child in view.
-    pub(crate) fn message_would_miss_the_child_in_view(&self) -> bool {
+    /// Whether a message sent now would go to another conversation than the
+    /// one on screen: the controller runs a turn, or is about to, and does
+    /// not operate on what is in view.
+    pub(crate) fn message_would_miss_the_conversation_in_view(
+        &self,
+    ) -> Option<crate::hosted_view::OutOfStep> {
         let (view, turn_active) = {
             let hosted = self.lock_hosted();
-            (hosted.view.clone(), hosted.surface_active.is_some())
+            (
+                hosted.view.clone(),
+                hosted.surface_active.is_some() || hosted.surface_activation_armed,
+            )
         };
-        turn_active && view.is_some_and(|view| view.awaits_main())
+        if !turn_active {
+            return None;
+        }
+        view.and_then(|view| view.out_of_step())
     }
 
     pub(crate) fn bind_hosted_settings_config(
@@ -1930,7 +1938,9 @@ mod tests {
         let control = TuiSurfaceTaskControl::isolated_for_test();
         assert!(control.view().is_none());
         assert!(
-            !control.message_would_miss_the_child_in_view(),
+            control
+                .message_would_miss_the_conversation_in_view()
+                .is_none(),
             "no view, no turn: nothing to miss"
         );
 
@@ -1949,7 +1959,9 @@ mod tests {
         ));
         assert!(control.view().is_some());
         assert!(
-            !control.message_would_miss_the_child_in_view(),
+            control
+                .message_would_miss_the_conversation_in_view()
+                .is_none(),
             "main is on screen"
         );
 

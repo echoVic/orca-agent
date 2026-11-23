@@ -18,6 +18,10 @@ const INTERACTION_ACK_OVERFLOW: &str =
 /// controller still runs the main turn: it would go to the main agent.
 const MAIN_STILL_RUNNING: &str =
     "the main agent is still running: return to it to send a message, or wait for it to finish";
+/// Said when a message is sent while the controller still runs a turn on an
+/// agent that is no longer on screen: it would go to that agent.
+const AGENT_STILL_RUNNING: &str =
+    "the agent you sent a message to is still running: wait for it to finish before sending here";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InteractionResponseAck {
@@ -204,8 +208,9 @@ fn route_action(
     // See `run_dispatcher`: this alias is typed surface presentation state, not
     // the legacy operation controller.
     let controller = surface_control;
-    // A child's conversation is on screen and the controller still runs the
-    // main turn: this message would go to the main agent. Hand it back.
+    // The conversation on screen is not the one the controller operates on,
+    // and the controller runs a turn: this would go to the other one. Hand
+    // it back.
     if matches!(
         action,
         UserAction::Submit(_)
@@ -213,9 +218,14 @@ fn route_action(
             | UserAction::QueuePrompt { .. }
             | UserAction::SubmitNow { .. }
             | UserAction::SubmitQueued { .. }
-    ) && controller.message_would_miss_the_child_in_view()
+            | UserAction::PromptQueueControl(_)
+    ) && let Some(out_of_step) = controller.message_would_miss_the_conversation_in_view()
     {
-        reject_action(event_tx, action, MAIN_STILL_RUNNING.to_string());
+        let message = match out_of_step {
+            crate::hosted_view::OutOfStep::MainRuns => MAIN_STILL_RUNNING,
+            crate::hosted_view::OutOfStep::AgentRuns => AGENT_STILL_RUNNING,
+        };
+        reject_action(event_tx, action, message.to_string());
         return true;
     }
     match action {
@@ -803,6 +813,77 @@ mod tests {
     use crate::protocol::{
         TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse, UserAction,
     };
+
+    #[test]
+    fn a_refused_message_comes_back_with_its_text() {
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        super::reject_action(
+            &event_tx,
+            UserAction::Submit("one".to_string()),
+            super::MAIN_STILL_RUNNING.to_string(),
+        );
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::SubmissionRejected { prompt, message, .. })
+                if prompt == "one" && message == super::MAIN_STILL_RUNNING
+        ));
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::TurnNotStarted { token: None })
+        ));
+        super::reject_action(
+            &event_tx,
+            UserAction::QueuePrompt {
+                prompt: "two".to_string(),
+                bindings: Default::default(),
+                images: Vec::new(),
+            },
+            super::MAIN_STILL_RUNNING.to_string(),
+        );
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(TuiEvent::SubmissionRejected { prompt, message, .. })
+                if prompt == "two" && message == super::MAIN_STILL_RUNNING
+        ));
+    }
+
+    #[test]
+    fn a_return_with_a_view_bound_does_not_wait_behind_the_controller() {
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let host = orca_runtime::runtime_host::RuntimeHost::start_with_background_capacity(1)
+            .expect("runtime host");
+        let attachment = crate::protocol::SessionAttachmentId::new(1);
+        control.bind_view(crate::hosted_view::HostedView::new(
+            host.handle(),
+            event_tx.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::attachment_routing::AttachmentRouting::new(attachment),
+            )),
+            event_tx.clone(),
+            attachment,
+        ));
+        let (mut dispatcher, command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
+
+        raw_tx
+            .send(UserAction::Submit("a turn the controller runs".to_string()))
+            .expect("submit");
+        raw_tx
+            .send(UserAction::ReturnToParentThread)
+            .expect("return action");
+
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(UserAction::Submit(prompt)) if prompt == "a turn the controller runs"
+        ));
+        assert!(
+            command_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the return never entered the mailbox"
+        );
+        dispatcher.shutdown().expect("shutdown dispatcher");
+    }
 
     #[test]
     fn a_focus_before_any_controller_waits_in_the_command_mailbox() {
