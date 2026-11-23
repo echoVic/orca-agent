@@ -556,8 +556,8 @@ impl TuiSurfaceTaskControl {
         true
     }
 
-    /// The runtime thread in view. `None` before the conversation starts.
-    #[cfg(test)]
+    /// The runtime thread the controller operates on. `None` before the
+    /// conversation starts.
     pub(crate) fn runtime_thread(&self) -> Option<orca_runtime::runtime_host::RuntimeThreadHandle> {
         self.lock_hosted().queue_runtime.clone()
     }

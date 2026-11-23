@@ -38,6 +38,7 @@ mod full_access_confirmation_actions;
 mod global_actions;
 mod goal_materialization;
 mod hosted_child;
+mod hosted_view;
 mod hosted_context;
 mod hosted_controller;
 mod hosted_goal;
