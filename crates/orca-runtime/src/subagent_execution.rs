@@ -3512,6 +3512,219 @@ mod tests {
         host.shutdown().expect("shutdown runtime host");
     }
 
+    /// Runs one hosted Sync child through the subagent tool, as a parent
+    /// turn does, and gives back the tool's result and the child's thread id
+    /// as the launch bound it.
+    fn launch_hosted_sync_child(
+        host: &crate::runtime_host::RuntimeHostHandle,
+        cwd: &std::path::Path,
+        label: &str,
+        prompt: &str,
+    ) -> (tool_types::ToolResult, String) {
+        let config = config_in(cwd, SubagentConfig::default());
+        let mut events = EventFactory::new(label.to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = hosted_request(label, "delegated child", prompt);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new(label.to_string());
+        let controller = Arc::new(crate::agent_controller::AgentController::new(
+            host.clone(),
+            label.to_string(),
+            label.to_string(),
+            0,
+        ));
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
+            &config,
+            cwd,
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            false,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            unexpected_child_executor::<io::Sink>,
+            None,
+            Some(activity_ingress),
+            Some(controller),
+            &mut event_error,
+            None,
+        )
+        .expect("hosted sync child result");
+        assert!(event_error.is_none(), "{event_error:?}");
+        // The child's thread shares this registry: a main-session record made
+        // for its turn would be a second record here, never settled.
+        let tasks = task_registry.list();
+        assert_eq!(tasks.len(), 1, "one child, one task record: {tasks:?}");
+        let child_thread_id = tasks[0]
+            .subagent_child_thread_id
+            .clone()
+            .expect("the launch bound the child's thread to its task");
+        (result, child_thread_id)
+    }
+
+    /// What a view of the child reads: the child thread resolved from the
+    /// host by its id, and a fresh attachment's snapshot of its surface, as
+    /// the TUI's child bridge takes it.
+    fn child_surface_snapshot(
+        host: &crate::runtime_host::RuntimeHostHandle,
+        child_thread_id: &str,
+    ) -> Arc<crate::surface::SurfaceSnapshot> {
+        let child = host
+            .resolve_live_thread(child_thread_id)
+            .expect("the child thread is live");
+        match child
+            .surface()
+            .attach_fresh(crate::surface::FreshAttachRequest {
+                request_id: crate::surface::SurfaceRequestId::new(),
+                role: crate::surface::SurfaceAttachmentRole::Tui,
+                requested_capabilities: std::collections::BTreeSet::from([
+                    crate::surface::SurfaceCapability::ReadSnapshot,
+                ]),
+                interaction_capabilities: std::collections::BTreeSet::new(),
+            }) {
+            crate::surface::AttachResult::FreshAttached { attachment } => {
+                attachment.baseline.snapshot
+            }
+            _ => panic!("a fresh attachment to the child's surface failed"),
+        }
+    }
+
+    fn surface_operations(
+        snapshot: &crate::surface::SurfaceSnapshot,
+    ) -> Vec<&crate::surface::OperationRecord> {
+        snapshot
+            .foreground_operation
+            .iter()
+            .chain(&snapshot.queued_operations)
+            .chain(&snapshot.operation_history)
+            .collect()
+    }
+
+    fn surface_user_texts(snapshot: &crate::surface::SurfaceSnapshot) -> Vec<&str> {
+        snapshot
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::surface::SurfaceItem::UserMessage {
+                    input:
+                        crate::surface::SurfaceUserInputState::Resolved {
+                            fact: crate::surface::SurfaceResolvedInputFact::Replayable { input, .. },
+                        },
+                    ..
+                } => Some(input.canonical_text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn surface_assistant_texts(snapshot: &crate::surface::SurfaceSnapshot) -> Vec<&str> {
+        snapshot
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::surface::SurfaceItem::AssistantMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A delegated turn is an operation of the child's surface, so a view of
+    /// the child reads the conversation the child had while and after it ran.
+    #[test]
+    fn a_delegated_turn_is_recorded_on_the_childs_surface() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        // The mock answers this prompt with two text deltas.
+        let prompt = "mock_stream_delay_ms 1";
+        let reply = "Mock slow stream started.Mock slow stream completed.";
+
+        let (result, child_thread_id) =
+            launch_hosted_sync_child(&host_handle, cwd.path(), "delegated-turn-surface", prompt);
+
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Completed,
+            "{:?}",
+            result.error
+        );
+        assert_eq!(result.output.as_deref(), Some(reply));
+        let snapshot = child_surface_snapshot(&host_handle, &child_thread_id);
+        let operations = surface_operations(&snapshot);
+        assert_eq!(
+            operations.len(),
+            1,
+            "the delegated turn is the child surface's one operation: {operations:?}"
+        );
+        let operation = operations[0];
+        assert_eq!(
+            operation.intent.kind,
+            crate::surface::OperationKind::UserTurn
+        );
+        assert!(
+            matches!(
+                operation.terminal.as_ref().map(|record| &record.terminal),
+                Some(crate::surface::OperationTerminal::Succeeded { .. })
+            ),
+            "the delegated turn ended on the child's surface: {:?}",
+            operation.terminal
+        );
+        assert_eq!(surface_user_texts(&snapshot), vec![prompt]);
+        assert_eq!(surface_assistant_texts(&snapshot), vec![reply]);
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A child whose surface does not take the delegated turn still does its
+    /// work: the turn starts raw, as it did before it had a surface to go to,
+    /// and only the child's conversation is missing from that surface.
+    #[test]
+    fn a_delegated_turn_that_the_surface_refuses_still_runs() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let prompt = crate::runtime_host::REFUSE_DELEGATED_SURFACE_TURN_FOR_TEST;
+
+        let (result, child_thread_id) =
+            launch_hosted_sync_child(&host_handle, cwd.path(), "delegated-turn-refused", prompt);
+
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Completed,
+            "{:?}",
+            result.error
+        );
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(
+            result.output.as_deref(),
+            Some("Mock runtime completed the headless harness contract.")
+        );
+        let snapshot = child_surface_snapshot(&host_handle, &child_thread_id);
+        assert!(
+            surface_operations(&snapshot).is_empty(),
+            "a refused turn leaves nothing of itself on the child's surface: {:?}",
+            surface_operations(&snapshot)
+        );
+        assert!(surface_user_texts(&snapshot).is_empty());
+        host.shutdown().expect("shutdown runtime host");
+    }
+
     #[test]
     fn sync_subagent_cancelled_before_admission_never_starts_child_or_lifecycle() {
         let cwd = tempfile::tempdir().expect("temp cwd");

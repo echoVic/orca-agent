@@ -3913,6 +3913,49 @@ impl ThreadActor {
         images: &[orca_core::conversation::ImageInput],
         runtime_started: RuntimeStartedTurn,
     ) -> Result<OperationId, surface::SurfaceClientCommandError> {
+        self.start_runtime_turn_on_surface_with_output(prompt, images, runtime_started, None)
+    }
+
+    /// A delegated child turn, started as an operation of the child's
+    /// surface so a view of the child can follow it. Gives back the handle
+    /// the delegating controller settles on.
+    pub(super) fn start_delegated_turn_on_surface(
+        &mut self,
+        prompt: &str,
+        runtime_started: RuntimeStartedTurn,
+        writer: Box<dyn HostedOperationWriter>,
+    ) -> Result<OperationHandle, RuntimeHostError> {
+        #[cfg(test)]
+        if prompt == REFUSE_DELEGATED_SURFACE_TURN_FOR_TEST {
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "the child's surface was told to refuse the turn".to_string(),
+            });
+        }
+        let operation_id = self
+            .start_runtime_turn_on_surface_with_output(prompt, &[], runtime_started, Some(writer))
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("the child's surface did not admit the turn: {error:?}"),
+            })?;
+        let active = self
+            .active
+            .as_ref()
+            .filter(|active| active.operation_id == operation_id)
+            .ok_or(RuntimeHostError::ThreadUnavailable)?;
+        Ok(OperationHandle {
+            operation_id: active.operation_id,
+            initial_generation: GenerationFence::initial(active.operation_id),
+            thread: self.handle.clone(),
+            completion: active.completion.clone(),
+        })
+    }
+
+    fn start_runtime_turn_on_surface_with_output(
+        &mut self,
+        prompt: &str,
+        images: &[orca_core::conversation::ImageInput],
+        runtime_started: RuntimeStartedTurn,
+        output_writer: Option<Box<dyn HostedOperationWriter>>,
+    ) -> Result<OperationId, surface::SurfaceClientCommandError> {
         const UNAVAILABLE: surface::SurfaceClientCommandError =
             surface::SurfaceClientCommandError::RuntimeUnavailable;
         if self.resident_surface.0.is_none() || self.active.is_some() {
@@ -3963,7 +4006,7 @@ impl ThreadActor {
                 surface::SurfaceRequestId::new(),
                 operation_id.clone(),
                 reserved.lease.lease_id,
-                None,
+                output_writer,
                 Some(runtime_started),
             )
             .and_then(|(prepared, goal_work)| match goal_work {
@@ -4614,7 +4657,17 @@ impl ThreadActor {
 
         // Record the registry root under the admitted generation before execution.
         // StartTurn consumes this same task; the loop task remains a separate ID.
-        let main_session_task = if goal_identity.is_none() {
+        // A hosted child's delegated task is its execution identity. A
+        // main-session record for it would sit in the shared registry and
+        // never be settled.
+        let hosted_child = self.state.as_ref().is_some_and(|state| {
+            state
+                .thread
+                .thread_extensions()
+                .get::<crate::agent_controller::AgentThreadPolicy>()
+                .is_some()
+        });
+        let main_session_task = if goal_identity.is_none() && !hosted_child {
             let registry = self
                 .state
                 .as_ref()

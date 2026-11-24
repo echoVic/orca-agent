@@ -403,21 +403,40 @@ impl AgentController {
                 )),
             });
         }
-        let mut turn = HostedTurnRequest::new(request.prompt)
-            .with_headless_root(child_config.tools.headless_exec)
-            .with_event_observer(publisher.clone());
-        if let Some(handler) = request.approval_handler {
-            turn = turn.with_approval_handler(handler);
-        }
-        if let Some(handler) = request.permission_handler {
-            turn = turn.with_permission_handler(Arc::new(AgentPermissionHandler {
+        let permission_handler = request.permission_handler.map(|handler| {
+            Arc::new(AgentPermissionHandler {
                 inner: handler,
                 publisher: publisher.clone(),
-            }));
-        }
-        let operation = match child
-            .start_turn_with_output(turn, AgentOutputWriter::new(publisher.clone()))
-        {
+            }) as Arc<dyn RuntimePermissionRequestHandler + Send + Sync>
+        });
+        let on_surface = child.start_delegated_turn_on_surface(
+            crate::runtime_host::DelegatedTurnStart {
+                prompt: request.prompt.clone(),
+                headless_root: child_config.tools.headless_exec,
+                observer: publisher.clone(),
+                approval: request.approval_handler.clone(),
+                permission: permission_handler.clone(),
+            },
+            AgentOutputWriter::new(publisher.clone()),
+        );
+        let started = match on_surface {
+            Ok(operation) => Ok(operation),
+            // The child still does its work; it only has no conversation a
+            // view can follow.
+            Err(_) => {
+                let mut turn = HostedTurnRequest::new(request.prompt)
+                    .with_headless_root(child_config.tools.headless_exec)
+                    .with_event_observer(publisher.clone());
+                if let Some(handler) = request.approval_handler {
+                    turn = turn.with_approval_handler(handler);
+                }
+                if let Some(handler) = permission_handler {
+                    turn = turn.with_permission_handler(handler);
+                }
+                child.start_turn_with_output(turn, AgentOutputWriter::new(publisher.clone()))
+            }
+        };
+        let operation = match started {
             Ok(operation) => operation,
             Err(error) => {
                 let terminal_error = publisher.publish_surface_terminal(

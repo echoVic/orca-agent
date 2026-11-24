@@ -3546,6 +3546,23 @@ fn headless_interaction_capabilities() -> BTreeSet<surface::SurfaceInteractionKi
     ])
 }
 
+/// What a delegating controller hands the child's thread to start its turn
+/// on the child's surface: the delegated prompt and what the raw start took
+/// from `HostedTurnRequest`.
+pub(crate) struct DelegatedTurnStart {
+    pub(crate) prompt: String,
+    pub(crate) headless_root: bool,
+    pub(crate) observer: Arc<dyn EventObserver>,
+    pub(crate) approval: Option<Arc<dyn RuntimeApprovalHandler + Send + Sync>>,
+    pub(crate) permission: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
+}
+
+/// Under test, a delegated prompt that is exactly this is refused by the
+/// child's surface, so the raw start a refusal falls back to can be seen.
+#[cfg(test)]
+pub(crate) const REFUSE_DELEGATED_SURFACE_TURN_FOR_TEST: &str =
+    "test_refuse_delegated_surface_turn";
+
 impl RuntimeThreadHandle {
     pub fn thread_id(&self) -> &str {
         &self.thread_id
@@ -3888,6 +3905,37 @@ impl RuntimeThreadHandle {
         W: HostedOperationWriter,
     {
         self.start_turn_inner(request, Box::new(writer), None)
+    }
+
+    /// Starts a delegated child turn through the child's surface, so the
+    /// turn is part of the conversation a view reads.
+    pub(crate) fn start_delegated_turn_on_surface<W>(
+        &self,
+        request: DelegatedTurnStart,
+        writer: W,
+    ) -> Result<OperationHandle, RuntimeHostError>
+    where
+        W: HostedOperationWriter,
+    {
+        let started = RuntimeStartedTurn {
+            turn_id: None,
+            observer: Some(request.observer),
+            interaction_handlers: PromptQueueInteractionHandlers {
+                approval: request.approval,
+                permission: request.permission,
+                user_input: None,
+                mcp_elicitation: None,
+            },
+            headless_root: request.headless_root,
+        };
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::StartDelegatedTurnOnSurface {
+            prompt: request.prompt,
+            started,
+            writer: Box::new(writer),
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
     }
 
     pub fn start_turn_with_config_and_output<W>(
@@ -5484,6 +5532,14 @@ enum ThreadCommand {
         request: Box<HostedTurnRequest>,
         writer: Box<dyn HostedOperationWriter>,
         config: Option<Box<RunConfig>>,
+        reply: SyncSender<Result<OperationHandle, RuntimeHostError>>,
+    },
+    /// Start a delegated child turn as an operation of the child's surface.
+    /// `Err` means nothing started and the caller may start it raw.
+    StartDelegatedTurnOnSurface {
+        prompt: String,
+        started: RuntimeStartedTurn,
+        writer: Box<dyn HostedOperationWriter>,
         reply: SyncSender<Result<OperationHandle, RuntimeHostError>>,
     },
     LaunchWorkflow {
@@ -12581,12 +12637,18 @@ struct RuntimeStartedTurn {
     turn_id: Option<TurnId>,
     observer: Option<Arc<dyn EventObserver>>,
     interaction_handlers: PromptQueueInteractionHandlers,
+    /// A delegated child turn carries its root's headless flag, which the
+    /// raw start took from `HostedTurnRequest::with_headless_root`.
+    headless_root: bool,
 }
 
 impl RuntimeStartedTurn {
     fn apply(self, mut request: HostedTurnRequest) -> HostedTurnRequest {
         if let Some(turn_id) = self.turn_id {
             request = request.with_turn_id(turn_id);
+        }
+        if self.headless_root {
+            request = request.with_headless_root(true);
         }
         if let Some(observer) = self.observer {
             request = request.with_event_observer(observer);
@@ -17358,6 +17420,7 @@ impl ThreadActor {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
+            headless_root: false,
         }
     }
 
@@ -18994,6 +19057,9 @@ impl ThreadActor {
                 ThreadCommand::StartTurn { reply, .. } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
+                ThreadCommand::StartDelegatedTurnOnSurface { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
                 ThreadCommand::LaunchWorkflow { reply, .. } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
@@ -20074,6 +20140,15 @@ impl ThreadActor {
                     thread: self.handle.clone(),
                     completion,
                 }));
+            }
+            ThreadCommand::StartDelegatedTurnOnSurface {
+                prompt,
+                started,
+                writer,
+                reply,
+            } => {
+                let result = self.start_delegated_turn_on_surface(&prompt, started, writer);
+                let _ = reply.send(result);
             }
             ThreadCommand::LaunchWorkflow { request, reply } => {
                 let result = self.launch_hosted_workflow(*request);
@@ -21369,6 +21444,11 @@ impl ThreadActor {
                 });
             }
             ThreadCommand::StartTurn { reply, .. } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
+            ThreadCommand::StartDelegatedTurnOnSurface { reply, .. } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
                     operation_id: active.operation_id,
                 }));
