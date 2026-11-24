@@ -1,9 +1,10 @@
 # Watching a Subagent Live, and the Agents Card Design
 
 - Date: 2026-11-23
-- Status: direction approved in conversation; the card's default state and
-  item 2 under "To verify first" are not yet confirmed; item 1 was run in a
-  real terminal on 2026-11-24 and failed in part (see there)
+- Status: its Design, To verify first and Testing sections are replaced by
+  `2026-11-24-live-subagent-conversations-design.md`, written after item 1
+  under "To verify first" was run in a real terminal on 2026-11-24 and
+  failed in part (see there). The card's look described here still holds.
 - Baseline: `main` at `11d90cee` (v0.5.23)
 - Reference: `openai/codex` at `9ee4539162`, `codex-rs/tui/src/app/`
 
