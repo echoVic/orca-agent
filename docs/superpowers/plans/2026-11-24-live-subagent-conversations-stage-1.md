@@ -1348,7 +1348,7 @@ A test that fails is run again alone, three times. One that passes alone each ti
 
 - [ ] **Step 4: The terminal, auto-edit**
 
-Build `feat/live-subagent-view`. Temporary `ORCA_HOME` with a copy of `auth.json` and no `mode` line, an empty working directory, pty 150x50 read with `pyte`, `deepseek-flash`, no environment switches. Prompt:
+Build `feat/live-subagent-view`. Temporary `ORCA_HOME` with a copy of `auth.json` and `mode = "auto-edit"` in `config.toml` (the TUI starts in full-auto otherwise; confirm `auto-edit` in the status bar and use Shift+Tab if it is not), an empty working directory that is trusted at the prompt, pty 150x50 read with `pyte`, `deepseek-flash`, no environment switches. Prompt:
 
 ```text
 Start two subagents in parallel, named alpha and beta. Each must: write a file named after itself (alpha.txt, beta.txt) with one sentence, run `ls -a && cat <its file>`, then write an 800-word essay about its own name in its reply. Wait for both and tell me the first sentence of each essay.

@@ -85,8 +85,8 @@ permission mode, rules and sandbox at that moment:
 
 | Main's mode | The agent |
 |---|---|
-| auto-edit (default) | writes, runs commands and uses the network inside the sandbox, as main does |
-| full-auto | does all of it on the host, as main does |
+| full-auto (the TUI's default) | does all of it on the host, as main does |
+| auto-edit | writes, runs commands and uses the network inside the sandbox, as main does |
 | suggest | reads only: main would ask before each write or command, and the agent cannot ask |
 | plan | reads only, as main |
 
@@ -346,7 +346,12 @@ by reading.
 
 1. Stage 1: in auto-edit, a threaded child's write and shell command run
    without any prompt (read in `policy.rs`; the spike ran only full-auto
-   and suggest).
+   and suggest). Run on 2026-11-24 on the spike build, in a workspace not
+   trusted: both children wrote their file and ran `ls -a && cat`, nothing
+   was asked or refused, and their sessions record `auto-edit permits
+   write` and `auto-edit permits shell`. The TUI starts in full-auto
+   (`command/launch.rs`, `prepare_interactive`); auto-edit was reached with
+   Shift+Tab.
 2. Stage 1: what else expects the main-session task record that R2 leaves
    out for a hosted child (the spike skipped it on a guess).
 3. Stage 1: which seam says a host is interactive, and that app-server and
