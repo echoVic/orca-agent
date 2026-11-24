@@ -46,11 +46,12 @@ pub(crate) struct HostedChildFocus {
     pub(crate) event_bridge: HostedChildEventBridge,
 }
 
-/// Passive typed-surface subscription for the operation that was visible when
-/// a child was focused. The bridge owns no operation control; it only projects
-/// committed child batches into the currently attached TUI sender. It exits
-/// at the child operation terminal so a later child follow-up can use the
-/// normal TUI operation drain without duplicate deltas.
+/// Passive typed-surface subscription for a focused child's conversation. The
+/// bridge owns no operation control; it only projects committed child batches
+/// into the currently attached TUI sender. It follows the child from one
+/// operation to the next: the one running when the child was focused, if any,
+/// then each the child starts. It ends when it is stopped, when the TUI stops
+/// receiving, or when the child's thread closes.
 pub(crate) struct HostedChildEventBridge {
     stop: Arc<AtomicBool>,
     started: Arc<(Mutex<bool>, Condvar)>,
@@ -255,11 +256,10 @@ fn run_child_surface_bridge(
             return;
         }
     }
-    let Some(mut operation_id) = operation_id else {
-        detach_child_surface(&surface, &client);
-        control.clear_any_focused_child_surface();
-        return;
-    };
+    // The child's operation being followed, if any. The view stays open
+    // between operations: a child just created has none yet, and one that
+    // finished a turn starts another when it is sent a follow-up.
+    let mut followed = operation_id;
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -267,16 +267,22 @@ fn run_child_surface_bridge(
         let Some(item) = subscription.recv_timeout(Duration::from_millis(50)) else {
             continue;
         };
-        let terminal = match item {
+        let end = match item {
             SurfaceSubscriptionItem::Batch { batch } => {
-                let mut terminal = batch.events.as_slice().iter().any(|envelope| {
-                    matches!(
-                        &envelope.event,
-                        SurfaceEvent::Operation(
-                            orca_runtime::surface::OperationPatch::Terminal { record }
-                        ) if record.operation_id == operation_id
-                    )
-                });
+                // Followed before the batch is projected: the projection
+                // shows a turn's start and end only for the operation it is
+                // focused on, and the child's requests are registered only
+                // for the operation installed for it.
+                if followed.is_none()
+                    && let Some(next) = operation_started_in(&batch)
+                {
+                    projection.focus_operation(next.clone());
+                    // This fails only once the controller is shutting down;
+                    // the view, and this bridge with it, goes with it.
+                    let _ = control.install_focused_child_surface(client.clone(), next.clone());
+                    followed = Some(next);
+                }
+                let mut end = false;
                 for envelope in batch.events.as_slice() {
                     if let SurfaceEvent::Interaction(
                         orca_runtime::surface::InteractionPatch::Requested { interaction },
@@ -284,7 +290,7 @@ fn run_child_surface_bridge(
                         && let Some(event) = control.register_surface_interaction(interaction)
                         && event_tx.send(event).is_err()
                     {
-                        terminal = true;
+                        end = true;
                         break;
                     }
                 }
@@ -292,7 +298,7 @@ fn run_child_surface_bridge(
                     Ok(events) => {
                         for event in events {
                             if event_tx.send(event).is_err() {
-                                terminal = true;
+                                end = true;
                                 break;
                             }
                         }
@@ -301,17 +307,22 @@ fn run_child_surface_bridge(
                         let _ = event_tx.send(TuiEvent::Error(format!(
                             "child live transcript projection failed: {error:?}"
                         )));
-                        terminal = true;
+                        end = true;
                     }
                 }
-                terminal
+                if let Some(ended) =
+                    followed.take_if(|operation_id| operation_ended_in(&batch, operation_id))
+                {
+                    control.clear_focused_child_surface(&ended);
+                }
+                end
             }
             SurfaceSubscriptionItem::Gap { required } => {
                 match recover_child_surface(
                     &surface,
                     &mut client,
                     &mut subscription,
-                    &mut operation_id,
+                    &mut followed,
                     &mut *projection,
                     &task_id,
                     &event_tx,
@@ -328,18 +339,55 @@ fn run_child_surface_bridge(
                 }
             }
             SurfaceSubscriptionItem::Sealed { .. } => {
-                let _ = event_tx.send(TuiEvent::Error(
-                    "child live transcript ended before the conversation completed".to_string(),
-                ));
+                // A child whose last operation ended closes its thread when
+                // it is finished: that is the end of its conversation.
+                if followed.is_some() {
+                    let _ = event_tx.send(TuiEvent::Error(
+                        "child live transcript ended before the conversation completed".to_string(),
+                    ));
+                }
                 true
             }
         };
-        if terminal {
+        if end {
             break;
         }
     }
     detach_child_surface(&surface, &client);
     control.clear_any_focused_child_surface();
+}
+
+/// The first operation `batch` requests or admits: the one the child starts.
+fn operation_started_in(
+    batch: &orca_runtime::surface::SurfaceCommitBatch,
+) -> Option<SurfaceOperationId> {
+    batch
+        .events
+        .as_slice()
+        .iter()
+        .find_map(|envelope| match &envelope.event {
+            SurfaceEvent::Operation(orca_runtime::surface::OperationPatch::Requested {
+                operation,
+            }) if operation.terminal.is_none() => Some(operation.operation_id.clone()),
+            SurfaceEvent::Operation(orca_runtime::surface::OperationPatch::Admitted {
+                operation_id,
+                ..
+            }) => Some(operation_id.clone()),
+            _ => None,
+        })
+}
+
+fn operation_ended_in(
+    batch: &orca_runtime::surface::SurfaceCommitBatch,
+    operation_id: &SurfaceOperationId,
+) -> bool {
+    batch.events.as_slice().iter().any(|envelope| {
+        matches!(
+            &envelope.event,
+            SurfaceEvent::Operation(orca_runtime::surface::OperationPatch::Terminal { record })
+                if &record.operation_id == operation_id
+        )
+    })
 }
 
 fn child_interaction_capabilities() -> BTreeSet<SurfaceInteractionKind> {
@@ -372,7 +420,7 @@ fn recover_child_surface(
     surface: &RuntimeSurfaceHandle,
     client: &mut RuntimeSurfaceClientHandle,
     subscription: &mut orca_runtime::surface::SurfaceSubscriptionReceiver,
-    operation_id: &mut SurfaceOperationId,
+    operation_id: &mut Option<SurfaceOperationId>,
     projection: &mut TuiSurfaceProjection,
     task_id: &str,
     event_tx: &mpsc::Sender<TuiEvent>,
@@ -401,26 +449,27 @@ fn recover_child_surface(
         }
     };
     let snapshot = attachment.baseline.snapshot;
-    let Some(next_operation) = snapshot
+    // The child may be between operations; the view then follows none until
+    // the child starts its next one.
+    let next_operation = snapshot
         .foreground_operation
         .as_ref()
         .filter(|operation| operation.terminal.is_none())
-        .map(|operation| operation.operation_id.clone())
-    else {
-        detach_child_surface(surface, &attachment.client);
-        return Err("child no longer has a running operation".to_string());
-    };
+        .map(|operation| operation.operation_id.clone());
     let projection_state = SurfaceProjectionState::from_surface_snapshot(&snapshot);
     let messages = crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
-    control.clear_focused_child_surface(operation_id);
-    *operation_id = next_operation.clone();
+    if let Some(previous) = operation_id.take() {
+        control.clear_focused_child_surface(&previous);
+    }
     *client = attachment.client.clone();
-    if let Err(error) =
-        control.install_focused_child_surface(attachment.client.clone(), next_operation)
+    if let Some(next_operation) = next_operation.as_ref()
+        && let Err(error) =
+            control.install_focused_child_surface(attachment.client.clone(), next_operation.clone())
     {
         detach_child_surface(surface, &attachment.client);
         return Err(error.to_string());
     }
+    *operation_id = next_operation;
     *projection = TuiSurfaceProjection::from_surface_snapshot(&snapshot);
     send_event(
         event_tx,
@@ -1228,6 +1277,259 @@ mod tests {
                 .workflow_tasks()
                 .iter()
                 .any(|task| task.id == child_task.id)
+        );
+    }
+
+    /// A thread of a runtime host standing in for a child kept in the
+    /// process: the bridge reads nothing but the thread's surface, and a turn
+    /// run here is an operation of that surface, as a delegated turn is.
+    struct ChildThread {
+        config: orca_core::config::RunConfig,
+        thread: orca_runtime::runtime_host::RuntimeThreadHandle,
+        host: orca_runtime::runtime_host::RuntimeHost,
+        home: crate::test_support::OrcaHomeGuard,
+    }
+
+    impl ChildThread {
+        fn start() -> Self {
+            let home = crate::test_support::isolate_orca_home();
+            let mut config = crate::test_support::test_run_config();
+            config.cwd = Some(home.path().to_path_buf());
+            config.history_mode = orca_core::config::HistoryMode::Record;
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let thread = host
+                .start_thread(config.clone(), "child")
+                .expect("child thread");
+            Self {
+                config,
+                thread,
+                host,
+                home,
+            }
+        }
+
+        /// Attaches a bridge the way a focus does and lets it read.
+        fn open_view(
+            &self,
+            control: &crate::operation_controller::TuiSurfaceTaskControl,
+        ) -> (
+            super::HostedChildEventBridge,
+            SurfaceProjectionState,
+            crossbeam_channel::Receiver<crate::protocol::TuiEvent>,
+        ) {
+            let (event_tx, events) = crossbeam_channel::unbounded();
+            let (bridge, projection, _messages, _interactions) =
+                super::HostedChildEventBridge::prepare(
+                    &self.thread,
+                    "child".to_string(),
+                    event_tx,
+                    control,
+                )
+                .expect("attach the child's view");
+            bridge.start();
+            (bridge, projection, events)
+        }
+
+        fn shutdown(self) {
+            self.thread.shutdown().expect("child thread shutdown");
+            self.host.shutdown().expect("host shutdown");
+            drop(self.home);
+        }
+    }
+
+    /// Runs one turn on `thread`'s surface through a client of its own: it is
+    /// reserved and then admitted there, as a delegated turn is. Returns once
+    /// the turn has ended.
+    fn run_child_turn(
+        thread: &orca_runtime::runtime_host::RuntimeThreadHandle,
+        config: orca_core::config::RunConfig,
+        prompt: &str,
+        event_tx: &crossbeam_channel::Sender<crate::protocol::TuiEvent>,
+    ) {
+        let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
+        let outcome = crate::surface_actions::TuiSurfaceActions::new(thread.typed_surface())
+            .run_turn(
+                orca_runtime::runtime_host::HostedTurnRequest::new(prompt),
+                config,
+                &control,
+                event_tx,
+            )
+            .expect("the child's turn");
+        assert!(
+            matches!(
+                &outcome,
+                crate::hosted_runtime::TuiHostedOperationOutcome::Turn { status }
+                    if status == "success"
+            ),
+            "the child's turn succeeds"
+        );
+    }
+
+    /// What the view was sent for one turn of the child.
+    struct ViewedTurn {
+        started: bool,
+        reply: String,
+    }
+
+    /// Reads what the bridge sends up to the end of the child's next turn,
+    /// keeping every event in `seen`. A turn that does not reach the view
+    /// within ten seconds, or a bridge that ends first, fails the test.
+    fn next_viewed_turn(
+        events: &crossbeam_channel::Receiver<crate::protocol::TuiEvent>,
+        seen: &mut Vec<crate::protocol::TuiEvent>,
+    ) -> ViewedTurn {
+        use crate::protocol::TuiEvent;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut turn = ViewedTurn {
+            started: false,
+            reply: String::new(),
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let event = match events.recv_timeout(remaining) {
+                Ok(event) => event,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    panic!("the child's turn did not reach its view; it was sent {seen:?}")
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    panic!("the child's view ended before its turn did; it was sent {seen:?}")
+                }
+            };
+            let ended = match &event {
+                TuiEvent::TurnStarted { .. } => {
+                    turn.started = true;
+                    None
+                }
+                TuiEvent::MessageDelta(text) => {
+                    turn.reply.push_str(text);
+                    None
+                }
+                // A completed response replaces what was streamed.
+                TuiEvent::AssistantResponseCompleted(Some(text), _) => {
+                    turn.reply = text.clone();
+                    None
+                }
+                TuiEvent::SessionCompleted { status } => Some(status.clone()),
+                _ => None,
+            };
+            seen.push(event);
+            if let Some(status) = ended {
+                assert_eq!(status, "success", "the child's turn ends as it did");
+                return turn;
+            }
+        }
+    }
+
+    #[test]
+    fn a_child_opened_before_its_turn_starts_is_followed_once_it_does() {
+        let child = ChildThread::start();
+        let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
+        let (mut bridge, projection, events) = child.open_view(&control);
+        assert!(
+            projection.foreground_operation_id.is_none(),
+            "the child has no operation when its view opens"
+        );
+
+        let (turn_tx, _turn_events) = crossbeam_channel::unbounded();
+        run_child_turn(
+            &child.thread,
+            child.config.clone(),
+            "hello\nmock_history_echo",
+            &turn_tx,
+        );
+        let mut seen = Vec::new();
+        let turn = next_viewed_turn(&events, &mut seen);
+
+        assert!(turn.started, "the view shows the turn starting: {seen:?}");
+        assert!(
+            turn.reply.contains("hello"),
+            "the view shows the child's reply, got {:?}",
+            turn.reply
+        );
+        bridge.stop();
+        child.shutdown();
+    }
+
+    #[test]
+    fn the_view_goes_on_to_the_childs_next_turn() {
+        let child = ChildThread::start();
+        let control = crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test();
+        // The first turn streams its first words and then waits for the
+        // marker, so the view opens on it while it runs.
+        let marker = child.home.path().join("release-the-first-turn");
+        let (first_tx, first_events) = crossbeam_channel::unbounded();
+        let first_turn = {
+            let thread = child.thread.clone();
+            let config = child.config.clone();
+            let prompt = format!("mock_stream_release_marker {}", marker.display());
+            std::thread::spawn(move || run_child_turn(&thread, config, &prompt, &first_tx))
+        };
+        loop {
+            match first_events.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(crate::protocol::TuiEvent::MessageDelta(_)) => break,
+                Ok(_) => {}
+                Err(error) => panic!("the first turn did not start streaming: {error:?}"),
+            }
+        }
+        let (mut bridge, projection, events) = child.open_view(&control);
+        assert!(
+            projection.foreground_operation_id.is_some(),
+            "the view opens on the running first turn"
+        );
+
+        std::fs::write(&marker, b"").expect("release the first turn");
+        first_turn.join().expect("the first turn's client");
+        let mut seen = Vec::new();
+        let first = next_viewed_turn(&events, &mut seen);
+        let (second_tx, _second_events) = crossbeam_channel::unbounded();
+        run_child_turn(
+            &child.thread,
+            child.config.clone(),
+            "two\nmock_history_echo",
+            &second_tx,
+        );
+        let second = next_viewed_turn(&events, &mut seen);
+
+        assert!(first.started, "the view shows the first turn: {seen:?}");
+        assert_eq!(
+            first.reply,
+            "Mock release-marker stream started.Mock release-marker stream completed."
+        );
+        assert!(
+            second.started,
+            "the view shows the next turn starting: {seen:?}"
+        );
+        assert!(
+            second.reply.contains("two"),
+            "the view shows the next turn's reply after the first's, got {:?}",
+            second.reply
+        );
+
+        // The child's thread closes after its last turn: the view ends there
+        // on its own, and says nothing went wrong.
+        let ChildThread {
+            thread, host, home, ..
+        } = child;
+        thread.shutdown().expect("the child's thread closes");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match events.recv_timeout(remaining) {
+                Ok(event) => seen.push(event),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    panic!("the view did not end with the child's thread; it was sent {seen:?}")
+                }
+            }
+        }
+        bridge.stop();
+        host.shutdown().expect("host shutdown");
+        drop(home);
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, crate::protocol::TuiEvent::Error(_))),
+            "the view reports no error: {seen:?}"
         );
     }
 }
