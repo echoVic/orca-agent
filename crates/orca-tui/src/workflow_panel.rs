@@ -730,11 +730,13 @@ pub(crate) fn push_pending_workflow_notification_unique(
 pub(crate) fn sort_workflow_tasks_for_panel(
     mut tasks: Vec<BackgroundTaskSummary>,
 ) -> Vec<BackgroundTaskSummary> {
+    // The order tasks were submitted in: a row keeps its place whatever it
+    // does. A task with no sequence (an older record) follows, by creation.
     tasks.sort_by(|left, right| {
-        workflow_task_panel_group(left)
-            .cmp(&workflow_task_panel_group(right))
-            .then_with(|| workflow_task_activity_ms(right).cmp(&workflow_task_activity_ms(left)))
-            .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+        (left.sequence == 0)
+            .cmp(&(right.sequence == 0))
+            .then_with(|| left.sequence.cmp(&right.sequence))
+            .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
             .then_with(|| left.id.cmp(&right.id))
     });
     tasks
@@ -767,28 +769,6 @@ fn is_foregrounded_running_main_session(task: &BackgroundTaskSummary) -> bool {
         && !task.is_backgrounded
 }
 
-fn workflow_task_panel_group(task: &BackgroundTaskSummary) -> u8 {
-    match task.status {
-        orca_core::task_types::TaskStatus::ApprovalRequired => 0,
-        orca_core::task_types::TaskStatus::Queued
-        | orca_core::task_types::TaskStatus::Running
-        | orca_core::task_types::TaskStatus::Paused
-        | orca_core::task_types::TaskStatus::Stopping => 1,
-        orca_core::task_types::TaskStatus::Stopped
-        | orca_core::task_types::TaskStatus::Completed
-        | orca_core::task_types::TaskStatus::Failed
-        | orca_core::task_types::TaskStatus::Blocked
-        | orca_core::task_types::TaskStatus::Cancelled => 2,
-    }
-}
-
-fn workflow_task_activity_ms(task: &BackgroundTaskSummary) -> i64 {
-    task.last_activity_at_ms
-        .or(task.completed_at_ms)
-        .or(task.started_at_ms)
-        .unwrap_or(task.created_at_ms)
-}
-
 #[cfg(test)]
 mod tests {
     use orca_core::task_types::TaskLifetime;
@@ -807,6 +787,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: id.to_string(),
             created_at_ms: activity_at_ms,
+            sequence: 0,
             started_at_ms: Some(activity_at_ms),
             completed_at_ms: None,
             command: None,
@@ -841,17 +822,65 @@ mod tests {
         }
     }
 
+    fn sequenced_task(
+        id: &str,
+        sequence: u64,
+        status: TaskStatus,
+        activity_at_ms: i64,
+    ) -> BackgroundTaskSummary {
+        let mut task = workflow_task(id, activity_at_ms);
+        task.sequence = sequence;
+        task.status = status;
+        task
+    }
+
+    fn ids(tasks: &[BackgroundTaskSummary]) -> Vec<&str> {
+        tasks.iter().map(|task| task.id.as_str()).collect()
+    }
+
+    #[test]
+    fn agents_keep_the_order_they_were_started_in() {
+        let a = sequenced_task("a", 1, TaskStatus::Running, 10);
+        let b = sequenced_task("b", 2, TaskStatus::Completed, 99);
+        let c = sequenced_task("c", 3, TaskStatus::ApprovalRequired, 50);
+        let sorted = super::sort_workflow_tasks_for_panel(vec![c.clone(), b.clone(), a.clone()]);
+        assert_eq!(ids(&sorted), ["a", "b", "c"]);
+
+        // Activity does not move a row.
+        let mut a_later = a.clone();
+        a_later.last_activity_at_ms = Some(500);
+        let sorted = super::sort_workflow_tasks_for_panel(vec![b, c, a_later]);
+        assert_eq!(ids(&sorted), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn tasks_with_no_sequence_follow_in_creation_order() {
+        let mut x = sequenced_task("x", 0, TaskStatus::Running, 5);
+        x.created_at_ms = 5;
+        let mut y = sequenced_task("y", 0, TaskStatus::Running, 3);
+        y.created_at_ms = 3;
+        let mut a = sequenced_task("a", 1, TaskStatus::Running, 9);
+        a.created_at_ms = 9;
+        let sorted = super::sort_workflow_tasks_for_panel(vec![x, y, a]);
+        assert_eq!(ids(&sorted), ["a", "y", "x"]);
+    }
+
     #[test]
     fn workflow_panel_owner_sorts_preserves_selection_and_clears() {
         let mut panel = WorkflowPanelState::default();
-        panel.replace_tasks(vec![workflow_task("later", 20), workflow_task("first", 10)]);
+        let started = |id: &str, sequence: u64, activity_at_ms: i64| {
+            let mut task = workflow_task(id, activity_at_ms);
+            task.sequence = sequence;
+            task
+        };
+        panel.replace_tasks(vec![started("first", 2, 10), started("later", 1, 20)]);
         panel.select_index(0);
         assert_eq!(
             panel.selected_task().map(|task| task.id.as_str()),
             Some("later")
         );
 
-        panel.replace_tasks(vec![workflow_task("later", 30), workflow_task("new", 40)]);
+        panel.replace_tasks(vec![started("later", 1, 30), started("new", 3, 40)]);
         assert_eq!(
             panel.selected_task().map(|task| task.id.as_str()),
             Some("later")
@@ -861,7 +890,7 @@ mod tests {
         assert_eq!(panel.selected(), 1);
         assert_eq!(
             panel.selected_task().map(|task| task.id.as_str()),
-            Some("later")
+            Some("new")
         );
 
         panel.reset_for_session();

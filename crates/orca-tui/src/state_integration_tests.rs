@@ -688,6 +688,7 @@ fn workflow_task_summary(id: &str, name: &str) -> BackgroundTaskSummary {
         lifetime: TaskLifetime::Task,
         description: name.to_string(),
         created_at_ms: 1_000,
+        sequence: 0,
         started_at_ms: Some(1_000),
         completed_at_ms: None,
         command: None,
@@ -4123,6 +4124,7 @@ fn show_workflows_preserves_available_selection() {
             lifetime: TaskLifetime::Task,
             description: "demo".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
             command: None,
@@ -4435,6 +4437,7 @@ fn workflow_events_update_panel_and_queue_model_notification() {
         lifetime: TaskLifetime::Task,
         description: "demo".to_string(),
         created_at_ms: 1_000,
+        sequence: 0,
         started_at_ms: Some(1_000),
         completed_at_ms: Some(2_000),
         command: None,
@@ -4570,9 +4573,10 @@ fn pending_workflow_notification_queue_owns_unique_drain_and_notification_pop() 
 }
 
 #[test]
-fn workflow_task_updates_sort_actionable_active_then_recent_terminal_tasks() {
+fn workflow_task_updates_keep_the_order_tasks_were_started_in() {
     let mut state = state();
     let mut completed = workflow_task_summary("task-completed", "completed");
+    completed.sequence = 1;
     completed.status = TaskStatus::Completed;
     completed.completed_at_ms = Some(9_000);
     completed.last_activity_at_ms = Some(9_000);
@@ -4580,8 +4584,10 @@ fn workflow_task_updates_sort_actionable_active_then_recent_terminal_tasks() {
     let mut running = workflow_task_summary("task-running", "running");
     running.status = TaskStatus::Running;
     running.last_activity_at_ms = Some(5_000);
+    running.sequence = 2;
 
     let mut approval = workflow_task_summary("task-approval", "approval");
+    approval.sequence = 3;
     approval.task_type = TaskType::MainSession;
     approval.status = TaskStatus::ApprovalRequired;
     approval.is_backgrounded = true;
@@ -4595,7 +4601,7 @@ fn workflow_task_updates_sort_actionable_active_then_recent_terminal_tasks() {
             .iter()
             .map(|task| task.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["task-approval", "task-running", "task-completed"]
+        vec!["task-completed", "task-running", "task-approval"]
     );
 }
 
@@ -4603,9 +4609,11 @@ fn workflow_task_updates_sort_actionable_active_then_recent_terminal_tasks() {
 fn workflow_task_updates_preserve_selected_task_id_after_sorting() {
     let mut state = state();
     let mut running = workflow_task_summary("task-running", "running");
+    running.sequence = 1;
     running.status = TaskStatus::Running;
     running.last_activity_at_ms = Some(5_000);
     let mut completed = workflow_task_summary("task-completed", "completed");
+    completed.sequence = 2;
     completed.status = TaskStatus::Completed;
     completed.completed_at_ms = Some(9_000);
     completed.last_activity_at_ms = Some(9_000);
@@ -4625,9 +4633,11 @@ fn workflow_task_updates_preserve_selected_task_id_after_sorting() {
 fn workflow_task_update_preserves_owner_selection() {
     let mut state = state();
     let mut running = workflow_task_summary("task-running", "running");
+    running.sequence = 1;
     running.status = TaskStatus::Running;
     running.last_activity_at_ms = Some(5_000);
     let mut completed = workflow_task_summary("task-completed", "completed");
+    completed.sequence = 2;
     completed.status = TaskStatus::Completed;
     completed.completed_at_ms = Some(9_000);
     completed.last_activity_at_ms = Some(9_000);
@@ -4758,6 +4768,7 @@ fn backgrounded_main_session_suppresses_foreground_output_until_completion() {
         lifetime: TaskLifetime::Task,
         description: "long answer".to_string(),
         created_at_ms: 1_000,
+        sequence: 0,
         started_at_ms: Some(1_000),
         completed_at_ms: None,
         command: None,
@@ -4887,6 +4898,7 @@ fn backgrounded_main_session_completion_adds_system_notice() {
         lifetime: TaskLifetime::Task,
         description: "long answer".to_string(),
         created_at_ms: 1_000,
+        sequence: 0,
         started_at_ms: Some(1_000),
         completed_at_ms: None,
         command: None,

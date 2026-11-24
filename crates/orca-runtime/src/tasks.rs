@@ -6798,6 +6798,7 @@ fn task_summary(record: &TaskRecord) -> BackgroundTaskSummary {
         lifetime: record.lifetime,
         description: record.description.clone(),
         created_at_ms: record.created_at_ms,
+        sequence: record.sequence,
         started_at_ms: record.started_at_ms,
         completed_at_ms: record.completed_at_ms,
         command: record.command.clone(),

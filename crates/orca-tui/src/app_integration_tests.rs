@@ -1765,6 +1765,7 @@ fn workflow_task(id: &str, name: &str) -> orca_core::task_types::BackgroundTaskS
         lifetime: orca_core::task_types::TaskLifetime::Task,
         description: name.to_string(),
         created_at_ms: 1_000,
+        sequence: 0,
         started_at_ms: Some(1_000),
         completed_at_ms: None,
         command: None,

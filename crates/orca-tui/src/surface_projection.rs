@@ -1877,6 +1877,7 @@ pub(crate) fn workflow_task_summaries(
                 lifetime: TaskLifetime::Task,
                 description: task.description.as_str().to_string(),
                 created_at_ms: task.created_at.get(),
+                sequence: 0,
                 started_at_ms: task.started_at.map(UnixMillis::get),
                 completed_at_ms: task.completed_at.map(UnixMillis::get),
                 command: None,

@@ -891,6 +891,7 @@ mod tests {
             lifetime: orca_core::task_types::TaskLifetime::Task,
             description: id.to_string(),
             created_at_ms: 1,
+            sequence: 0,
             started_at_ms: Some(1),
             completed_at_ms: None,
             command: None,
