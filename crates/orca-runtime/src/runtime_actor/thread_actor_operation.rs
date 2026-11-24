@@ -3925,6 +3925,7 @@ impl ThreadActor {
         runtime_started: RuntimeStartedTurn,
         writer: Box<dyn HostedOperationWriter>,
     ) -> Result<OperationHandle, RuntimeHostError> {
+        // Seam for a_delegated_turn_that_the_surface_refuses_still_runs; cf. RuntimeSurfaceBackgroundControl::for_canonical_input.
         #[cfg(test)]
         if prompt == REFUSE_DELEGATED_SURFACE_TURN_FOR_TEST {
             return Err(RuntimeHostError::ThreadStartFailed {
