@@ -361,7 +361,15 @@ fn enqueue_accepted_subagent(
             let mut lifecycle = RuntimeSessionLifecycle::new(format!("subagent-{worker_id}"));
             let started = lifecycle.start_task(RuntimeTaskKind::Subagent).clone();
             let output = run_subagent_worker(invocation, lifecycle, started, cancel);
-            if let Some(error) = output.event_error {
+            // A child that was asked to stop and settled as stopped stays
+            // stopped: the reason it gives, or a parent turn that has ended
+            // before it could be told, does not make the stop a failure.
+            let stopped = worker_registry
+                .get(&worker_id)
+                .is_some_and(|task| task.status == orca_core::task_types::TaskStatus::Stopped);
+            if let Some(error) = output.event_error
+                && !stopped
+            {
                 let _ = worker_registry.fail(&worker_id, error);
             }
         })

@@ -1261,6 +1261,9 @@ pub(crate) fn hosted_tui_controller_loop(
         }
     }
 
+    // The agents this TUI started run on its threads and end with it: stop
+    // them so their tasks are recorded as stopped, not left as running.
+    let _ = host.stop_kept_subagents(Duration::from_secs(2));
     control.unbind_view();
     if let Some(focus) = view.close() {
         shutdown_attached_child_on_controller_exit(focus);
@@ -1499,6 +1502,101 @@ mod tests {
         action_tx.send(UserAction::Cancel).expect("cancel action");
         runtime.shutdown().expect("hosted controller shutdown");
         assert!(observed.view().is_none(), "the view is let go at the end");
+    }
+
+    /// The first running agent with a thread of its own that an event shows.
+    fn kept_running_agent(event: TuiEvent) -> Option<String> {
+        let event = match event {
+            TuiEvent::Attached(attached) => {
+                let AttachedTuiEvent { event, .. } = *attached;
+                event
+            }
+            event => event,
+        };
+        let tasks = match event {
+            TuiEvent::SurfaceProjectionSynced(projection) => projection.workflow_tasks,
+            TuiEvent::WorkflowTasksUpdated(tasks) | TuiEvent::BackgroundTasksUpdated(tasks) => {
+                tasks
+            }
+            TuiEvent::TaskStatusUpdated(task) => vec![task],
+            _ => return None,
+        };
+        tasks
+            .into_iter()
+            .find(|task| {
+                task.task_type == orca_core::task_types::TaskType::Subagent
+                    && task.status.is_active()
+                    && task.subagent_child_thread_id.is_some()
+            })
+            .map(|task| task.id)
+    }
+
+    /// An agent the TUI keeps on its threads ends with it: after a quit its
+    /// task is recorded as stopped, not left running or failed.
+    #[test]
+    fn quitting_stops_the_agents_the_tui_keeps() {
+        let (_home, action_tx, event_rx, mut runtime) =
+            spawn_controller_with_history(HistoryMode::Record);
+        // The mock starts an async agent whose own turn streams for 30 s;
+        // the main conversation's turn waits for its result.
+        action_tx
+            .send(UserAction::Submit(
+                "subagent async mock_stream_delay_ms 30000".to_string(),
+            ))
+            .expect("submit action");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let task_id = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let event = event_rx
+                .recv_timeout(remaining)
+                .expect("the agent is shown running with a thread of its own");
+            let event = match event {
+                TuiEvent::Attached(attached) => {
+                    let AttachedTuiEvent { event, .. } = *attached;
+                    event
+                }
+                event => event,
+            };
+            // In suggest the person approves the call that starts the agent.
+            if let TuiEvent::ApprovalNeeded { key, .. } = event {
+                action_tx
+                    .send(UserAction::RespondToInteraction {
+                        key,
+                        response: crate::protocol::TuiInteractionResponse::Approval(true),
+                    })
+                    .expect("approve the agent's start");
+                continue;
+            }
+            if let Some(task_id) = kept_running_agent(event) {
+                break task_id;
+            }
+        };
+        let registry = runtime
+            .controller()
+            .runtime_thread()
+            .expect("the main conversation's thread")
+            .task_registry();
+
+        // What a quit by signal sends while a turn runs: the interrupt asks
+        // the agents of that turn to stop, and the quit follows at once.
+        action_tx
+            .send(UserAction::Interrupt)
+            .expect("interrupt action");
+        action_tx.send(UserAction::Cancel).expect("cancel action");
+        runtime.shutdown().expect("hosted controller shutdown");
+
+        let task = registry
+            .list()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .expect("the agent's task");
+        assert_eq!(
+            task.status,
+            orca_core::task_types::TaskStatus::Stopped,
+            "{task:?}"
+        );
+        assert!(task.completed_at_ms.is_some());
+        assert_eq!(task.error, None);
     }
 
     #[test]

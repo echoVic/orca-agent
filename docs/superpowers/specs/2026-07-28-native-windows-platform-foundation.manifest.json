@@ -405,6 +405,13 @@
       "windows-test-portability"
     ],
     [
+      "subagent-execution-test-shells",
+      "crates/orca-runtime/src/subagent_execution.rs",
+      "unix_shell_spawn",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "task-test-unix-process-api",
       "crates/orca-runtime/src/tasks.rs",
       "unix_std_api",

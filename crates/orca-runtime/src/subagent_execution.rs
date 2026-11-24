@@ -4017,6 +4017,429 @@ mod tests {
         host.shutdown().expect("shutdown runtime host");
     }
 
+    /// Starts an async child of `controller`'s parent as the model's
+    /// `subagent` call does, with a task the mock keeps streaming for 30 s
+    /// unless it is stopped. Gives back the child's task id and its thread
+    /// id once that thread is up.
+    fn start_streaming_async_child(
+        controller: crate::agent_controller::AgentController,
+        cwd: &std::path::Path,
+        task_registry: &TaskRegistry,
+        label: &str,
+    ) -> (String, String) {
+        let config = config_in(cwd, SubagentConfig::default());
+        let mut events = EventFactory::new(label.to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = tool_types::ToolRequest {
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "wait until stopped",
+                    "prompt": "mock_stream_delay_ms 30000",
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+            ..subagent_request(label)
+        };
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
+            &config,
+            cwd,
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            false,
+            &mut cost_tracker,
+            &cancel,
+            task_registry,
+            None,
+            None,
+            fake_child_executor::<io::Sink>,
+            None,
+            Some(activity_ingress.clone()),
+            Some(Arc::new(controller)),
+            &mut event_error,
+            None,
+        )
+        .expect("async child accepted");
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Running,
+            "{:?}",
+            result.error
+        );
+        let handle: serde_json::Value =
+            serde_json::from_str(result.output.as_deref().expect("the child's handle"))
+                .expect("a JSON handle");
+        let task_id = handle["task_id"]
+            .as_str()
+            .expect("the child's task id")
+            .to_string();
+        // The child's turn is under way once it reports a phase: a stop that
+        // came before would end a turn that never ran.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (bound, thinking) = {
+                let events = activity_ingress.events.lock().expect("surface activity");
+                let bound = events.iter().find_map(|event| match &event.payload {
+                    crate::child_agent_types::SubagentActivityPayload::ChildThreadBound {
+                        thread_id,
+                    } => Some(uuid::Uuid::from_bytes(*thread_id.as_bytes()).to_string()),
+                    _ => None,
+                });
+                let thinking = events.iter().any(|event| {
+                    matches!(
+                        event.payload,
+                        crate::child_agent_types::SubagentActivityPayload::PhaseChanged { .. }
+                    )
+                });
+                (bound, thinking)
+            };
+            if let Some(thread_id) = bound
+                && thinking
+                && task_registry
+                    .get(&task_id)
+                    .is_some_and(|task| task.status == orca_core::task_types::TaskStatus::Running)
+            {
+                return (task_id, thread_id);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the child's turn never got under way: {:?}",
+                task_registry.get(&task_id)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The agents a TUI keeps end with it. Asked to stop, a kept child's
+    /// turn is interrupted, as an interrupted parent turn interrupts it, and
+    /// its task is recorded as stopped, not left running.
+    #[test]
+    fn stopping_kept_subagents_leaves_none_running() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "kept-children-stopped";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let (task_id, child_thread_id) = start_streaming_async_child(
+            parent_controller(&host_handle, label, true),
+            cwd.path(),
+            &task_registry,
+            label,
+        );
+
+        let left = host_handle.stop_kept_subagents(Duration::from_secs(5));
+
+        assert_eq!(left, 0, "no kept child is still running");
+        let task = task_registry.get(&task_id).expect("the child's task");
+        // What `request_stop` leaves for a child in this process, the stop
+        // an interrupted parent turn and `task_stop` ask for: stopped, with
+        // nothing left to reconcile.
+        assert_eq!(
+            task.status,
+            orca_core::task_types::TaskStatus::Stopped,
+            "{:?}",
+            task.error
+        );
+        assert!(task.stop_requested);
+        assert!(task.completed_at_ms.is_some());
+        assert_eq!(task.error, None);
+        // The child's own conversation records its turn as cancelled: it
+        // was ended, not cut off where it stood.
+        let snapshot = child_surface_snapshot(&host_handle, &child_thread_id);
+        let operations = surface_operations(&snapshot);
+        assert_eq!(operations.len(), 1, "{operations:?}");
+        assert!(
+            matches!(
+                operations[0]
+                    .terminal
+                    .as_ref()
+                    .map(|record| &record.terminal),
+                Some(crate::surface::OperationTerminal::Cancelled { .. })
+            ),
+            "the child's turn ended cancelled: {:?}",
+            operations[0].terminal
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A kept child that does not stop within the wait is left to end with
+    /// the process: the call returns when the wait is over and counts it.
+    #[test]
+    fn stopping_kept_subagents_gives_up_when_the_wait_is_over() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        host_handle.keep_subagents_in_process();
+        let label = "kept-child-never-settles";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let task = task_registry.create_subagent("never settles".to_string(), None);
+        task_registry
+            .mark_running(&task.id)
+            .expect("the child's task is running");
+        // A kept child's thread on which nothing runs: nothing settles its
+        // task once it is asked to stop.
+        let child = host_handle
+            .start_agent_thread(
+                label,
+                label,
+                1,
+                orca_core::subagent_types::SubagentType::General,
+                task.id.clone(),
+                task_registry.clone(),
+                config_in(cwd.path(), SubagentConfig::default()),
+                "never settles",
+            )
+            .expect("start the child's thread");
+        let wait = Duration::from_millis(300);
+
+        let started = Instant::now();
+        let left = host_handle.stop_kept_subagents(wait);
+        let elapsed = started.elapsed();
+
+        assert_eq!(left, 1, "the child is still running when the wait is over");
+        assert!(
+            elapsed >= wait,
+            "it waited as long as it was given: {elapsed:?}"
+        );
+        assert!(
+            elapsed < wait + Duration::from_secs(2),
+            "it gave up when the wait was over: {elapsed:?}"
+        );
+        let record = task_registry.get(&task.id).expect("the child's task");
+        assert!(record.stop_requested, "the child was asked to stop");
+        assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopping);
+        task_registry
+            .stop(&task.id, "test cleanup".to_string())
+            .expect("settle the child's task");
+        let _ = child.shutdown();
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// An agent continued after its first task ended runs its later turn
+    /// as a task bound to the same thread: that task is asked to stop too.
+    #[test]
+    fn stopping_kept_subagents_asks_a_continued_agents_task_too() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        host_handle.keep_subagents_in_process();
+        let label = "kept-child-continued";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let first = task_registry.create_subagent("first turn".to_string(), None);
+        task_registry
+            .mark_running(&first.id)
+            .expect("the first task is running");
+        let child = host_handle
+            .start_agent_thread(
+                label,
+                label,
+                1,
+                orca_core::subagent_types::SubagentType::General,
+                first.id.clone(),
+                task_registry.clone(),
+                config_in(cwd.path(), SubagentConfig::default()),
+                "continued",
+            )
+            .expect("start the child's thread");
+        task_registry
+            .complete(&first.id, "first turn done".to_string())
+            .expect("the first task ends");
+        let later = task_registry.create_subagent("later turn".to_string(), None);
+        task_registry
+            .mark_running(&later.id)
+            .expect("the later task is running");
+        task_registry
+            .bind_subagent_thread(&later.id, child.thread_id())
+            .expect("the later task runs on the same thread");
+
+        let left = host_handle.stop_kept_subagents(Duration::from_millis(200));
+
+        assert_eq!(left, 1, "nothing settles the later task here");
+        let later_record = task_registry.get(&later.id).expect("the later task");
+        assert!(
+            later_record.stop_requested,
+            "the later task was asked to stop"
+        );
+        assert_eq!(
+            later_record.status,
+            orca_core::task_types::TaskStatus::Stopping
+        );
+        let first_record = task_registry.get(&first.id).expect("the first task");
+        assert_eq!(
+            first_record.status,
+            orca_core::task_types::TaskStatus::Completed,
+            "an ended task is left as it ended"
+        );
+        assert!(!first_record.stop_requested);
+        task_registry
+            .stop(&later.id, "test cleanup".to_string())
+            .expect("settle the later task");
+        let _ = child.shutdown();
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// Only subagents are stopped: a workflow's task and a command's task
+    /// in the same registry as a kept child go on.
+    #[test]
+    fn stopping_kept_subagents_leaves_workflow_and_shell_tasks_alone() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "kept-child-beside-other-tasks";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let (task_id, _) = start_streaming_async_child(
+            parent_controller(&host_handle, label, true),
+            cwd.path(),
+            &task_registry,
+            label,
+        );
+        let workflow = task_registry.create_workflow(
+            "workflow-run".to_string(),
+            "workflow".to_string(),
+            "a workflow".to_string(),
+            1,
+        );
+        let shell = task_registry.create_shell("a command".to_string(), "sleep 30".to_string());
+        for id in [&workflow.id, &shell.id] {
+            if task_registry
+                .get(id)
+                .is_some_and(|task| task.status != orca_core::task_types::TaskStatus::Running)
+            {
+                task_registry.mark_running(id).expect("the task is running");
+            }
+        }
+
+        let left = host_handle.stop_kept_subagents(Duration::from_secs(5));
+
+        assert_eq!(left, 0);
+        assert_eq!(
+            task_registry
+                .get(&task_id)
+                .expect("the child's task")
+                .status,
+            orca_core::task_types::TaskStatus::Stopped
+        );
+        for id in [&workflow.id, &shell.id] {
+            let task = task_registry.get(id).expect("the task");
+            assert_eq!(task.status, orca_core::task_types::TaskStatus::Running);
+            assert!(
+                !task.stop_requested,
+                "{:?} was asked to stop",
+                task.task_type
+            );
+            assert!(!task.control.cancel.is_cancelled());
+            task_registry
+                .stop(id, "test cleanup".to_string())
+                .expect("settle the task");
+        }
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A detached worker is meant to outlive the TUI: one in the same
+    /// registry as a kept child is not asked to stop, and its process is
+    /// left to it.
+    #[cfg(unix)]
+    #[test]
+    fn stopping_kept_subagents_leaves_a_detached_worker_alone() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "kept-child-beside-a-worker";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let (task_id, _) = start_streaming_async_child(
+            parent_controller(&host_handle, label, true),
+            cwd.path(),
+            &task_registry,
+            label,
+        );
+        let detached = task_registry.create_subagent("detached worker".to_string(), None);
+        let worker = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn the worker's process");
+        let worker_pid = worker.id();
+        task_registry
+            .adopt_subagent_worker(&detached.id, worker)
+            .expect("the task owns its worker");
+
+        let left = host_handle.stop_kept_subagents(Duration::from_secs(5));
+
+        assert_eq!(left, 0);
+        assert_eq!(
+            task_registry
+                .get(&task_id)
+                .expect("the child's task")
+                .status,
+            orca_core::task_types::TaskStatus::Stopped
+        );
+        let worker_task = task_registry.get(&detached.id).expect("the worker's task");
+        assert_eq!(
+            worker_task.status,
+            orca_core::task_types::TaskStatus::Running
+        );
+        assert!(!worker_task.stop_requested);
+        assert!(!worker_task.control.cancel.is_cancelled());
+        assert_eq!(worker_task.worker_pid, Some(worker_pid));
+        task_registry
+            .request_stop_detached(&detached.id)
+            .expect("stop the worker");
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A host that was not asked to keep its subagents stops none of them,
+    /// not even a child that runs on one of its threads.
+    #[test]
+    fn a_host_that_does_not_keep_its_subagents_stops_none() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "unkept-child-goes-on";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let (task_id, _) = start_streaming_async_child(
+            parent_controller(&host_handle, label, false),
+            cwd.path(),
+            &task_registry,
+            label,
+        );
+        assert!(!host_handle.keeps_subagents_in_process());
+
+        let left = host_handle.stop_kept_subagents(Duration::from_secs(5));
+
+        assert_eq!(left, 0);
+        let task = task_registry.get(&task_id).expect("the child's task");
+        assert_eq!(task.status, orca_core::task_types::TaskStatus::Running);
+        assert!(!task.stop_requested);
+        task_registry
+            .request_stop(&task_id)
+            .expect("stop the child");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while task_registry
+            .get(&task_id)
+            .is_some_and(|task| task.status.is_active())
+        {
+            assert!(Instant::now() < deadline, "the child never settled");
+            thread::sleep(Duration::from_millis(10));
+        }
+        host.shutdown().expect("shutdown runtime host");
+    }
+
     #[test]
     fn sync_subagent_cancelled_before_admission_never_starts_child_or_lifecycle() {
         let cwd = tempfile::tempdir().expect("temp cwd");

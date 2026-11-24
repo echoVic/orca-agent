@@ -4564,6 +4564,76 @@ impl RuntimeHostHandle {
         self.agent_registry.keeps_subagents_in_process()
     }
 
+    /// Asks every running subagent kept on a thread of this process to stop,
+    /// as an interrupted turn stops the children it started, and waits up to
+    /// `wait` for their tasks to settle. Returns how many were still running
+    /// when it gave up: those end with the process. Only subagents on this
+    /// host's agent threads are asked, never a detached worker, a workflow or
+    /// a command; a host that was not asked to keep its subagents, or that
+    /// cannot say in time which threads it runs, asks none.
+    pub fn stop_kept_subagents(&self, wait: Duration) -> usize {
+        if !self.keeps_subagents_in_process() {
+            return 0;
+        }
+        let deadline = Instant::now() + wait;
+        let (reply, receive) = mpsc::sync_channel(1);
+        if self
+            .command_tx
+            .try_send(HostCommand::ListAgentThreads { reply })
+            .is_err()
+        {
+            return 0;
+        }
+        let Ok(agent_threads) =
+            receive.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        else {
+            return 0;
+        };
+        let mut asked = HashSet::new();
+        let mut stopping = Vec::new();
+        for agent in agent_threads {
+            let registry = agent.thread.task_registry();
+            let thread_id = agent.thread.thread_id();
+            // The task the thread was started for, and any later one bound
+            // to the same thread when the agent was continued.
+            let bound = registry
+                .list()
+                .into_iter()
+                .filter(|task| task.subagent_child_thread_id.as_deref() == Some(thread_id))
+                .map(|task| task.id);
+            for task_id in std::iter::once(agent.task_id.clone()).chain(bound) {
+                let kept_and_running = registry.get(&task_id).is_some_and(|task| {
+                    task.task_type == orca_core::task_types::TaskType::Subagent
+                        && task.status.is_active()
+                        && task.worker_pid.is_none()
+                });
+                // The registry's stop for a child in this process marks the
+                // task and cancels its turn without waiting for it.
+                if kept_and_running
+                    && asked.insert(task_id.clone())
+                    && registry.request_stop(&task_id).is_ok()
+                {
+                    stopping.push((registry.clone(), task_id));
+                }
+            }
+        }
+        loop {
+            let running = stopping
+                .iter()
+                .filter(|(registry, task_id)| {
+                    registry
+                        .get(task_id)
+                        .is_some_and(|task| task.status.is_active())
+                })
+                .count();
+            let now = Instant::now();
+            if running == 0 || now >= deadline {
+                return running;
+            }
+            thread::sleep(deadline.duration_since(now).min(Duration::from_millis(50)));
+        }
+    }
+
     /// The registry this host's controllers share, so a test can build a
     /// controller the way the host does.
     #[cfg(test)]
@@ -4959,6 +5029,10 @@ enum HostCommand {
     ResolveLiveThread {
         thread_id: String,
         reply: SyncSender<Result<RuntimeThreadHandle, RuntimeHostError>>,
+    },
+    /// The live threads started for a subagent's task.
+    ListAgentThreads {
+        reply: SyncSender<Vec<LiveAgentThread>>,
     },
     JsonlListSessions {
         cursor: Option<String>,
@@ -5701,6 +5775,15 @@ struct ThreadActorEntry {
     handle: RuntimeThreadHandle,
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     join: JoinHandle<()>,
+    /// The subagent task the thread was started for, if it was.
+    agent_task_id: Option<String>,
+}
+
+/// A live thread of the host that runs a subagent, and the task it was
+/// started for, which its task registry holds.
+struct LiveAgentThread {
+    thread: RuntimeThreadHandle,
+    task_id: String,
 }
 
 struct ThreadActorExitNotifier {
@@ -5895,6 +5978,18 @@ async fn run_host_supervisor(
                     .ok_or(RuntimeHostError::ThreadUnavailable);
                 let _ = reply.send(result);
             }
+            HostCommand::ListAgentThreads { reply } => {
+                let agent_threads = actors
+                    .values()
+                    .filter_map(|actor| {
+                        actor.agent_task_id.as_ref().map(|task_id| LiveAgentThread {
+                            thread: actor.handle.clone(),
+                            task_id: task_id.clone(),
+                        })
+                    })
+                    .collect();
+                let _ = reply.send(agent_threads);
+            }
             HostCommand::StartThread { request, reply } => {
                 let completion_tx = command_tx.clone();
                 tokio::spawn(async move {
@@ -6080,6 +6175,7 @@ async fn run_host_supervisor(
                         agent_depth,
                     ),
                 );
+                let entry_agent_task_id = agent_type.as_ref().and(agent_task_id.clone());
                 if let Some(subagent_type) = agent_type {
                     thread
                         .thread_extensions()
@@ -6127,6 +6223,7 @@ async fn run_host_supervisor(
                         handle: handle.clone(),
                         command_tx: thread_command_tx,
                         join,
+                        agent_task_id: entry_agent_task_id,
                     },
                 );
                 let _ = reply.send(Ok(handle));
