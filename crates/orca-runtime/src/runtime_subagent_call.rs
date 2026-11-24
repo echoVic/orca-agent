@@ -1575,6 +1575,22 @@ fn threaded_sync_surface_activity(
     })
 }
 
+/// A child runs on a hosted thread of its own when there is a controller to
+/// host it, it has no isolation, is not a custom agent, is not continued from
+/// a checkpoint (the hosted path refuses `resume_from`), and has no finite
+/// budget (a budgeted child is run without the controller).
+pub(crate) fn child_qualifies_for_thread(
+    request: &SubagentRequest,
+    has_controller: bool,
+    budget_unlimited: bool,
+) -> bool {
+    has_controller
+        && budget_unlimited
+        && request.isolation == SubagentIsolation::None
+        && !matches!(request.subagent_type, SubagentType::Custom(_))
+        && request.resume_from.is_none()
+}
+
 fn run_subagent_worker(
     invocation: RuntimeSubagentInvocation,
     lifecycle: RuntimeSessionLifecycle,
@@ -3179,6 +3195,56 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn plain_request() -> SubagentRequest {
+        SubagentRequest {
+            budget_reservation: None,
+            description: "d".to_string(),
+            prompt: "p".to_string(),
+            subagent_type: SubagentType::Explorer,
+            model: None,
+            mode: crate::subagent::SubagentMode::Async,
+            isolation: SubagentIsolation::None,
+            schema: None,
+            resume_from: None,
+            deadline_ms: None,
+            delegation: None,
+            frozen_agent: None,
+        }
+    }
+
+    #[test]
+    fn a_plain_child_with_a_controller_qualifies_for_a_thread() {
+        assert!(child_qualifies_for_thread(&plain_request(), true, true));
+    }
+
+    #[test]
+    fn isolation_a_custom_type_or_a_resume_do_not_qualify() {
+        let isolated = SubagentRequest {
+            isolation: SubagentIsolation::Worktree,
+            ..plain_request()
+        };
+        let custom = SubagentRequest {
+            subagent_type: SubagentType::Custom("mine".to_string()),
+            ..plain_request()
+        };
+        let resumed = SubagentRequest {
+            resume_from: Some("checkpoint".to_string()),
+            ..plain_request()
+        };
+        for request in [isolated, custom, resumed] {
+            assert!(
+                !child_qualifies_for_thread(&request, true, true),
+                "{request:?}"
+            );
+        }
+        assert!(!child_qualifies_for_thread(&plain_request(), false, true));
+    }
+
+    #[test]
+    fn a_child_with_a_finite_budget_does_not_qualify() {
+        assert!(!child_qualifies_for_thread(&plain_request(), true, false));
+    }
+
     #[test]
     fn report_blocker_subagent_output_includes_optional_question() {
         for question in [None, Some("Use port 8080?")] {

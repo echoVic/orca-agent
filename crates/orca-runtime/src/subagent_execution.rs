@@ -21,7 +21,9 @@ use crate::lifecycle::{
     RuntimeTaskLifecycle, RuntimeTaskStatus,
 };
 use crate::memory::MemoryBlock;
-use crate::runtime_subagent_call::{RuntimeSubagentCallOutput, RuntimeSubagentInvocation};
+use crate::runtime_subagent_call::{
+    RuntimeSubagentCallOutput, RuntimeSubagentInvocation, child_qualifies_for_thread,
+};
 use crate::runtime_tool_call::RuntimeToolCallRuntime;
 use crate::session::record_tool_result_for_agent;
 use crate::subagent::{self, SubagentIsolation, SubagentMode};
@@ -814,11 +816,21 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         .as_ref()
         .and_then(|ingress| ingress.parent_fence())
         .is_some();
-    if request.mode == SubagentMode::Async
-        && !task_registry.is_process_local()
-        && has_parent_fence
-        && activity_ingress.is_some()
-    {
+    let placement = crate::subagent_placement::ChildPlacement {
+        mode_async: request.mode == SubagentMode::Async,
+        registry_shared: !task_registry.is_process_local(),
+        parent_fence: has_parent_fence,
+        activity_ingress: activity_ingress.is_some(),
+        host_keeps_children: agent_controller
+            .as_ref()
+            .is_some_and(|controller| controller.keeps_subagents_in_process()),
+        qualifies_for_thread: child_qualifies_for_thread(
+            &request,
+            agent_controller.is_some(),
+            child_config.budget.to_spec().is_unlimited(),
+        ),
+    };
+    if crate::subagent_placement::detaches(placement) {
         let launch = launch_async_subagent(AsyncSubagentLaunchContext {
             config: &child_config,
             cwd,

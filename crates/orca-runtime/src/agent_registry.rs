@@ -26,6 +26,7 @@ pub struct AgentRegistry {
     journal: Option<Mutex<File>>,
     journal_lock_path: Option<PathBuf>,
     dead_letter_path: Option<PathBuf>,
+    keeps_subagents_in_process: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for AgentRegistry {
@@ -56,6 +57,7 @@ impl AgentRegistry {
             journal: None,
             journal_lock_path: None,
             dead_letter_path: None,
+            keeps_subagents_in_process: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -107,6 +109,7 @@ impl AgentRegistry {
             journal: Some(Mutex::new(journal)),
             journal_lock_path: Some(journal_lock_path),
             dead_letter_path: Some(dead_letter_path),
+            keeps_subagents_in_process: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -176,6 +179,17 @@ impl AgentRegistry {
             .values()
             .map(|agent| agent.root_thread_id.clone())
             .collect()
+    }
+
+    /// The host asked that its subagents run on threads of this process.
+    pub(crate) fn keep_subagents_in_process(&self) {
+        self.keeps_subagents_in_process
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn keeps_subagents_in_process(&self) -> bool {
+        self.keeps_subagents_in_process
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn dead_letter_path(&self) -> Option<&Path> {
@@ -460,6 +474,14 @@ mod tests {
             sequence as i64,
             event,
         )
+    }
+
+    #[test]
+    fn a_registry_keeps_subagents_in_process_only_once_asked() {
+        let registry = AgentRegistry::in_memory();
+        assert!(!registry.keeps_subagents_in_process());
+        registry.keep_subagents_in_process();
+        assert!(registry.keeps_subagents_in_process());
     }
 
     #[test]

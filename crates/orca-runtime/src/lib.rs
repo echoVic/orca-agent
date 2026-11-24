@@ -90,6 +90,7 @@ mod runtime_steer;
 mod runtime_subagent_call;
 mod shell_readiness;
 pub mod subagent_event_relay;
+mod subagent_placement;
 pub mod task_view;
 mod terminal_service;
 

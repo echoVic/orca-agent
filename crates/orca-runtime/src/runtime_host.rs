@@ -4551,6 +4551,19 @@ impl RuntimeHostHandle {
         )
     }
 
+    /// Subagents started under this host run on threads of this process
+    /// when they can, so an interactive client can follow their
+    /// conversations. They end with the process. A host that is not asked
+    /// keeps detaching them.
+    pub fn keep_subagents_in_process(&self) {
+        self.agent_registry.keep_subagents_in_process();
+    }
+
+    /// Whether this host was asked to keep its subagents in the process.
+    pub fn keeps_subagents_in_process(&self) -> bool {
+        self.agent_registry.keeps_subagents_in_process()
+    }
+
     pub fn agent_registry_snapshot(
         &self,
         root_thread_id: &str,

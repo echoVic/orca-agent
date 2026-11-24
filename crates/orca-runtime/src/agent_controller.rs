@@ -297,6 +297,10 @@ impl AgentController {
         }
     }
 
+    pub(crate) fn keeps_subagents_in_process(&self) -> bool {
+        self.registry.keeps_subagents_in_process()
+    }
+
     pub(crate) fn launch(&self, request: AgentLaunchRequest) -> io::Result<AgentLaunchResult> {
         let surface_activity = request.surface_activity;
         let batch_id = surface_activity
