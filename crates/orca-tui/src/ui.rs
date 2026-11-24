@@ -5600,10 +5600,7 @@ fn turn_has_model_output(state: &AppState) -> bool {
 fn main_behind_child_line(state: &AppState, theme: &Theme) -> Option<Line<'static>> {
     state.conversation_target().task_id()?;
     let (text, color) = match state.main_behind_child? {
-        crate::types::SideParentStatus::Running => (
-            "Main is running · send after it finishes · Esc return",
-            theme.warning,
-        ),
+        crate::types::SideParentStatus::Running => ("Main is running · Esc return", theme.warning),
         crate::types::SideParentStatus::NeedsApproval => {
             ("Main needs your approval · Esc return", theme.approval)
         }
@@ -11204,6 +11201,41 @@ mod tests {
             "deepseek".to_string(),
             "/tmp".to_string(),
         )
+    }
+
+    #[test]
+    fn main_behind_child_line_says_main_runs_without_offering_to_send() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut state = test_state();
+        state.set_conversation_target(orca_core::conversation::ConversationTarget::subagent(
+            "child",
+        ));
+        state.main_behind_child = Some(crate::types::SideParentStatus::Running);
+        let line = main_behind_child_line(&state, &theme).expect("a row under the agent");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, " ● Main is running · Esc return");
+
+        state.main_behind_child = Some(crate::types::SideParentStatus::NeedsApproval);
+        let line = main_behind_child_line(&state, &theme).expect("a row under the agent");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, " ● Main needs your approval · Esc return");
+
+        state.main_behind_child = Some(crate::types::SideParentStatus::NeedsInput);
+        let line = main_behind_child_line(&state, &theme).expect("a row under the agent");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, " ● Main needs your answer · Esc return");
     }
 
     /// A path under the host's temp directory, so the first-run fixtures stay

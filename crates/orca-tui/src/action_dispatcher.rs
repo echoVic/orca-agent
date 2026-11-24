@@ -14,10 +14,10 @@ use crate::protocol::{TuiEvent, TuiInteractionKey, UserAction};
 const INTERACTION_ACK_CAPACITY: usize = TUI_EVENT_CAPACITY + USER_ACTION_CAPACITY + 1;
 const INTERACTION_ACK_OVERFLOW: &str =
     "TUI interaction acknowledgement queue is full; response result discarded";
-/// Said when a message is sent from a child's conversation while the
-/// controller still runs the main turn: it would go to the main agent.
-const MAIN_STILL_RUNNING: &str =
-    "the main agent is still running: return to it to send a message, or wait for it to finish";
+/// Said when a message is sent from an agent's conversation: until an agent
+/// takes messages of its own, it would go nowhere it should.
+const AGENT_ON_SCREEN: &str =
+    "this is an agent's conversation: return to the main conversation to send a message";
 /// Said when a message is sent while the controller still runs a turn on an
 /// agent that is no longer on screen: it would go to that agent.
 const AGENT_STILL_RUNNING: &str =
@@ -208,9 +208,9 @@ fn route_action(
     // See `run_dispatcher`: this alias is typed surface presentation state, not
     // the legacy operation controller.
     let controller = surface_control;
-    // The conversation on screen is not the one the controller operates on,
-    // and the controller runs a turn: this would go to the other one. Hand
-    // it back.
+    // An agent's conversation is on screen, which takes no message yet, or
+    // the controller runs a turn on another conversation than the one on
+    // screen: this would go to the wrong place. Hand it back.
     if matches!(
         action,
         UserAction::Submit(_)
@@ -222,7 +222,7 @@ fn route_action(
     ) && let Some(out_of_step) = controller.message_would_miss_the_conversation_in_view()
     {
         let message = match out_of_step {
-            crate::hosted_view::OutOfStep::MainRuns => MAIN_STILL_RUNNING,
+            crate::hosted_view::OutOfStep::AgentOnScreen => AGENT_ON_SCREEN,
             crate::hosted_view::OutOfStep::AgentRuns => AGENT_STILL_RUNNING,
         }
         .to_string();
@@ -851,12 +851,12 @@ mod tests {
         super::reject_action(
             &event_tx,
             UserAction::Submit("one".to_string()),
-            super::MAIN_STILL_RUNNING.to_string(),
+            super::AGENT_ON_SCREEN.to_string(),
         );
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(1)),
             Ok(TuiEvent::SubmissionRejected { prompt, message, .. })
-                if prompt == "one" && message == super::MAIN_STILL_RUNNING
+                if prompt == "one" && message == super::AGENT_ON_SCREEN
         ));
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(1)),
@@ -869,13 +869,48 @@ mod tests {
                 bindings: Default::default(),
                 images: Vec::new(),
             },
-            super::MAIN_STILL_RUNNING.to_string(),
+            super::AGENT_ON_SCREEN.to_string(),
         );
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(1)),
             Ok(TuiEvent::SubmissionRejected { prompt, message, .. })
-                if prompt == "two" && message == super::MAIN_STILL_RUNNING
+                if prompt == "two" && message == super::AGENT_ON_SCREEN
         ));
+    }
+
+    #[test]
+    fn a_message_typed_in_an_agents_view_comes_back_with_its_text() {
+        let on_child = crate::hosted_child::live_child_for_test::ViewOnChild::start();
+        assert!(on_child.view.has_focus(), "a child is on screen");
+        let (raw_tx, raw_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
+        let (mut dispatcher, command_rx) =
+            TuiActionDispatcher::spawn(raw_rx, event_tx, on_child.control.clone(), 1, 1)
+                .expect("spawn dispatcher");
+
+        raw_tx
+            .send(UserAction::Submit("hello".to_string()))
+            .expect("submit");
+
+        match event_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(TuiEvent::SubmissionRejected {
+                prompt, message, ..
+            }) => {
+                assert_eq!(prompt, "hello");
+                assert_eq!(message, super::AGENT_ON_SCREEN);
+            }
+            other => panic!("expected the message to come back, got {other:?}"),
+        }
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(TuiEvent::TurnNotStarted { token: None })
+        ));
+        assert!(
+            command_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "nothing reached the controller's command channel"
+        );
+        dispatcher.shutdown().expect("shutdown dispatcher");
+        on_child.shutdown();
     }
 
     #[test]

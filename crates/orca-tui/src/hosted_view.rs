@@ -44,8 +44,8 @@ pub(crate) fn adoption(
 /// Why a message sent now would not reach the conversation on screen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OutOfStep {
-    /// A child is on screen and the controller still operates on main.
-    MainRuns,
+    /// A child is on screen; a message typed there has nowhere to go.
+    AgentOnScreen,
     /// The controller still operates on a child that is not on screen.
     AgentRuns,
 }
@@ -57,9 +57,8 @@ pub(crate) fn out_of_step(
     adopted: Option<SessionAttachmentId>,
 ) -> Option<OutOfStep> {
     match (on_screen, adopted) {
-        (on_screen, adopted) if on_screen == adopted => None,
-        (Some(_), None) => Some(OutOfStep::MainRuns),
-        (_, Some(_)) => Some(OutOfStep::AgentRuns),
+        (Some(_), _) => Some(OutOfStep::AgentOnScreen),
+        (None, Some(_)) => Some(OutOfStep::AgentRuns),
         (None, None) => None,
     }
 }
@@ -252,6 +251,12 @@ impl HostedView {
         self.lock().focus.is_some()
     }
 
+    /// Puts a child on screen without going through a focus action.
+    #[cfg(test)]
+    pub(crate) fn show_child_for_test(&self, focus: HostedChildFocus) {
+        self.lock().focus = Some(focus);
+    }
+
     /// Whether, and how, the screen is ahead of the controller: what the
     /// controller is sent now still goes to the conversation it operates on.
     pub(crate) fn out_of_step(&self) -> Option<OutOfStep> {
@@ -315,12 +320,18 @@ mod tests {
     #[test]
     fn a_message_misses_the_screen_when_the_controller_is_elsewhere() {
         assert_eq!(out_of_step(None, None), None);
-        assert_eq!(out_of_step(Some(id(2)), Some(id(2))), None);
-        assert_eq!(out_of_step(Some(id(2)), None), Some(OutOfStep::MainRuns));
+        assert_eq!(
+            out_of_step(Some(id(2)), Some(id(2))),
+            Some(OutOfStep::AgentOnScreen)
+        );
+        assert_eq!(
+            out_of_step(Some(id(2)), None),
+            Some(OutOfStep::AgentOnScreen)
+        );
         assert_eq!(out_of_step(None, Some(id(2))), Some(OutOfStep::AgentRuns));
         assert_eq!(
             out_of_step(Some(id(3)), Some(id(2))),
-            Some(OutOfStep::AgentRuns)
+            Some(OutOfStep::AgentOnScreen)
         );
     }
 

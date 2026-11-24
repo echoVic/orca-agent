@@ -924,6 +924,90 @@ pub(crate) fn shutdown_attached_child_on_controller_exit(focus: HostedChildFocus
         .shutdown_with_timeout(Duration::from_secs(5));
 }
 
+/// A view with a live child on screen, for tests of what a message does
+/// there. The child is a thread of a runtime host, as the bridge reads
+/// nothing but a thread's surface.
+#[cfg(test)]
+pub(crate) mod live_child_for_test {
+    use crate::hosted_view::HostedView;
+    use crate::operation_controller::TuiSurfaceTaskControl;
+    use crate::protocol::{SessionAttachmentId, TuiEvent};
+
+    pub(crate) struct ViewOnChild {
+        pub(crate) view: HostedView,
+        pub(crate) control: TuiSurfaceTaskControl,
+        // Kept so the view's senders stay connected.
+        _events: crossbeam_channel::Receiver<TuiEvent>,
+        host: orca_runtime::runtime_host::RuntimeHost,
+        parent: orca_runtime::runtime_host::RuntimeThreadHandle,
+        child: orca_runtime::runtime_host::RuntimeThreadHandle,
+        _home: crate::test_support::OrcaHomeGuard,
+    }
+
+    impl ViewOnChild {
+        /// The view is bound to `control` and shows the child.
+        pub(crate) fn start() -> Self {
+            let home = crate::test_support::isolate_orca_home();
+            let mut config = crate::test_support::test_run_config();
+            config.cwd = Some(home.path().to_path_buf());
+            config.history_mode = orca_core::config::HistoryMode::Record;
+            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let parent = host
+                .start_thread(config.clone(), "parent")
+                .expect("parent thread");
+            let child = host.start_thread(config, "child").expect("child thread");
+            let control = TuiSurfaceTaskControl::isolated_for_test();
+            let (event_tx, events) = crossbeam_channel::unbounded();
+            let main_attachment = SessionAttachmentId::new(1);
+            let child_attachment = SessionAttachmentId::new(2);
+            let view = HostedView::new(
+                host.handle(),
+                event_tx.clone(),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::attachment_routing::AttachmentRouting::new(main_attachment),
+                )),
+                event_tx.clone(),
+                main_attachment,
+            );
+            let (event_bridge, _projection, _messages, _interactions) =
+                super::HostedChildEventBridge::prepare(
+                    &child,
+                    "child".to_string(),
+                    event_tx.clone(),
+                    &control,
+                )
+                .expect("attach the child's view");
+            view.show_child_for_test(super::HostedChildFocus {
+                parent_thread: parent.clone(),
+                parent_event_tx: event_tx.clone(),
+                parent_attachment: main_attachment,
+                child_thread: child.clone(),
+                child_event_tx: event_tx,
+                child_attachment,
+                event_bridge,
+            });
+            control.bind_view(view.clone());
+            Self {
+                view,
+                control,
+                _events: events,
+                host,
+                parent,
+                child,
+                _home: home,
+            }
+        }
+
+        pub(crate) fn shutdown(self) {
+            self.control.unbind_view();
+            drop(self.view.close());
+            self.child.shutdown().expect("child thread shutdown");
+            self.parent.shutdown().expect("parent thread shutdown");
+            self.host.shutdown().expect("host shutdown");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use orca_core::conversation::ConversationTarget;

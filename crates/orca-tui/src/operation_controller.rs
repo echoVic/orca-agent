@@ -416,9 +416,9 @@ impl TuiSurfaceTaskControl {
         self.lock_hosted().view.clone()
     }
 
-    /// Whether a message sent now would go to another conversation than the
-    /// one on screen: the controller runs a turn, or is about to, and does
-    /// not operate on what is in view.
+    /// Whether a message sent now would miss the conversation on screen: a
+    /// child is on screen, which has nowhere to take a message yet, or the
+    /// controller runs a turn, or is about to, on a child that is not.
     pub(crate) fn message_would_miss_the_conversation_in_view(
         &self,
     ) -> Option<crate::hosted_view::OutOfStep> {
@@ -429,10 +429,14 @@ impl TuiSurfaceTaskControl {
                 hosted.surface_active.is_some() || hosted.surface_activation_armed,
             )
         };
+        let view = view?;
+        if view.has_focus() {
+            return Some(crate::hosted_view::OutOfStep::AgentOnScreen);
+        }
         if !turn_active {
             return None;
         }
-        view.and_then(|view| view.out_of_step())
+        view.out_of_step()
     }
 
     pub(crate) fn bind_hosted_settings_config(
@@ -1967,6 +1971,32 @@ mod tests {
 
         control.unbind_view();
         assert!(control.view().is_none());
+    }
+
+    #[test]
+    fn a_message_in_an_agents_view_is_handed_back_whether_or_not_a_turn_runs() {
+        let on_child = crate::hosted_child::live_child_for_test::ViewOnChild::start();
+        let control = &on_child.control;
+        assert!(on_child.view.has_focus(), "a child is on screen");
+        // No surface operation is active and none is armed.
+        assert_eq!(
+            control.message_would_miss_the_conversation_in_view(),
+            Some(crate::hosted_view::OutOfStep::AgentOnScreen)
+        );
+        // A turn the controller runs changes nothing about it.
+        {
+            let mut hosted = control.lock_hosted();
+            hosted.surface_activation_armed = true;
+        }
+        assert_eq!(
+            control.message_would_miss_the_conversation_in_view(),
+            Some(crate::hosted_view::OutOfStep::AgentOnScreen)
+        );
+        {
+            let mut hosted = control.lock_hosted();
+            hosted.surface_activation_armed = false;
+        }
+        on_child.shutdown();
     }
 
     fn test_surface_operation_id(seed: u8) -> SurfaceOperationId {
