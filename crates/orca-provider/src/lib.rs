@@ -1435,6 +1435,31 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         };
     }
 
+    // Two async children with the same prompt, started in one response.
+    if let Some(child_prompt) = prompt.trim().strip_prefix("subagent batch async ") {
+        let requests = ["mock-tool-1", "mock-tool-2"].map(|id| {
+            let mut request = parse_mock_prompt(&format!("subagent async {child_prompt}"))
+                .expect("async subagent request");
+            request.id = id.to_string();
+            request
+        });
+        let tool_calls = requests
+            .iter()
+            .map(|request| RawToolCall {
+                id: request.id.clone(),
+                function_name: request.name.as_str().to_string(),
+                arguments: request.raw_arguments.clone().unwrap_or_default(),
+            })
+            .collect();
+        return ProviderResponse {
+            steps: requests.into_iter().map(ProviderStep::ToolCall).collect(),
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls,
+            usage: None,
+        };
+    }
+
     if prompt.trim() == "subagent batch terminal_boundary" {
         let mut first =
             parse_mock_prompt("subagent sync schema_fail").expect("schema fail request");

@@ -6481,6 +6481,8 @@ fn actor_control_subagent_activity_authorized(
         | super::SurfaceEvent::Subagent(super::SubagentPatch::ChildThreadBound { .. }) => {
             task.status == super::SurfaceTaskStatus::Running && task.completed_at.is_none()
         }
+        // A kept child a person stopped ends cancelled from inside its own
+        // turn, and its task is the stop, so cancelled pairs with Stopped too.
         super::SurfaceEvent::Subagent(super::SubagentPatch::Completed { status, .. }) => {
             task.completed_at.is_some()
                 && matches!(
@@ -6496,7 +6498,7 @@ fn actor_control_subagent_activity_authorized(
                         super::SurfaceTaskStatus::Failed
                     ) | (
                         super::SurfaceSubagentTerminalStatus::Cancelled,
-                        super::SurfaceTaskStatus::Cancelled
+                        super::SurfaceTaskStatus::Cancelled | super::SurfaceTaskStatus::Stopped
                     )
                 )
         }
@@ -15183,6 +15185,154 @@ mod tests {
             ),
             "a settled subagent needs a finished task"
         );
+    }
+
+    /// A child kept in the process that a person stopped ends cancelled from
+    /// inside its own turn; its task may then show the stop. Any other end
+    /// still has to match its task's.
+    #[test]
+    fn actor_permit_lets_a_cancelled_kept_subagent_end_its_task_as_stopped() {
+        let mut snapshot = reducer_snapshot();
+        let operation = started_operation();
+        let fence = operation.generations[0].fence.clone();
+        let turn_id = operation.generations[0].logical_turn_id.clone();
+        snapshot.operation_history.push(operation);
+        let task_id = super::super::SurfaceTaskId::try_new("kept-task").unwrap();
+        let agent_id = super::super::SurfaceSubagentId::try_new("kept-agent").unwrap();
+        let attempt_id = super::super::SurfaceTaskAttemptId::try_new("attempt-kept").unwrap();
+        let owner = super::super::SurfaceSubagentOwner::Generation {
+            fence: fence.clone(),
+        };
+        snapshot.tasks.push(super::super::SurfaceTask {
+            task_id: task_id.clone(),
+            revision: super::super::TaskRevision::try_new(3).unwrap(),
+            task_type: super::super::SurfaceTaskType::Subagent,
+            status: super::super::SurfaceTaskStatus::Running,
+            backgrounded: false,
+            description: super::super::DisplayText::new("kept task"),
+            created_at: super::super::UnixMillis::new(1),
+            started_at: Some(super::super::UnixMillis::new(1)),
+            completed_at: None,
+            parent_operation: Some(fence.operation_id.clone()),
+            parent_task_id: None,
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: Some(agent_id.clone()),
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        });
+        snapshot.subagents.push(super::super::SurfaceSubagent {
+            subagent_id: agent_id.clone(),
+            task_id: task_id.clone(),
+            revision: super::super::SubagentRevision::try_new(3).unwrap(),
+            description: super::super::DisplayText::new("kept agent"),
+            child_thread_id: None,
+            batch_id: super::super::NonEmptyText::try_new("batch-kept").unwrap(),
+            batch_size: 1,
+            status: super::super::SurfaceSubagentStatus::Running,
+            activity: Some(super::super::DisplayText::new("phase: Thinking")),
+            subagent_activity_history: Vec::new(),
+            turn: Some(1),
+            usage: None,
+            output: None,
+            error: None,
+            continuation: None,
+            owner: owner.clone(),
+            source: super::super::SurfaceSubagentSource::new(
+                attempt_id.clone(),
+                turn_id.clone(),
+                3,
+                super::super::UnixMillis::new(3),
+                super::super::SurfaceCommitId::try_from_bytes(uuid_v7_bytes(177)).unwrap(),
+                super::super::Sha256Digest::new([8; 32]),
+            ),
+        });
+        let state = SurfaceReducerState::new(snapshot);
+        let end = |task_status, subagent_status| {
+            test_batch_with_events(
+                &state,
+                vec![
+                    (
+                        SurfaceScope::Thread,
+                        super::super::SurfaceEvent::Task(super::super::TaskPatch::StatusChanged {
+                            task_id: task_id.clone(),
+                            expected_revision: super::super::TaskRevision::try_new(3).unwrap(),
+                            next_revision: super::super::TaskRevision::try_new(4).unwrap(),
+                            status: task_status,
+                            completed_at: Some(super::super::UnixMillis::new(9)),
+                            result: None,
+                            error: None,
+                        }),
+                    ),
+                    (
+                        SurfaceScope::Generation {
+                            fence: fence.clone(),
+                        },
+                        super::super::SurfaceEvent::Subagent(
+                            super::super::SubagentPatch::Completed {
+                                subagent_id: agent_id.clone(),
+                                expected_revision: super::super::SubagentRevision::try_new(3)
+                                    .unwrap(),
+                                next_revision: super::super::SubagentRevision::try_new(4).unwrap(),
+                                owner: owner.clone(),
+                                source: super::super::SurfaceSubagentSource::new(
+                                    attempt_id.clone(),
+                                    turn_id.clone(),
+                                    4,
+                                    super::super::UnixMillis::new(9),
+                                    super::super::SurfaceCommitId::try_from_bytes(uuid_v7_bytes(
+                                        178,
+                                    ))
+                                    .unwrap(),
+                                    super::super::Sha256Digest::new([7; 32]),
+                                ),
+                                status: subagent_status,
+                                output: None,
+                                error: None,
+                                usage: None,
+                                subagent_activity_history: Vec::new(),
+                                continuation: None,
+                            },
+                        ),
+                    ),
+                ],
+            )
+        };
+
+        for task_status in [
+            super::super::SurfaceTaskStatus::Cancelled,
+            super::super::SurfaceTaskStatus::Stopped,
+        ] {
+            assert!(
+                actor_control_subagent_activity_authorized(
+                    &state,
+                    &end(
+                        task_status,
+                        super::super::SurfaceSubagentTerminalStatus::Cancelled
+                    )
+                ),
+                "a cancelled child ends a {task_status:?} task"
+            );
+        }
+        for subagent_status in [
+            super::super::SurfaceSubagentTerminalStatus::Completed,
+            super::super::SurfaceSubagentTerminalStatus::Failed,
+        ] {
+            assert!(
+                !actor_control_subagent_activity_authorized(
+                    &state,
+                    &end(
+                        super::super::SurfaceTaskStatus::Stopped,
+                        subagent_status.clone()
+                    )
+                ),
+                "a {subagent_status:?} child does not end a stopped task"
+            );
+        }
     }
 
     #[test]

@@ -1403,6 +1403,23 @@ impl ThreadActor {
             .iter()
             .find(|task| task.task_id == event.task_id);
         let (activity, turn, usage) = subagent_activity_projection(&event.payload);
+        // A kept child a person stopped ends as cancelled, from inside its
+        // own turn; that end is the stop, and is shown as one.
+        let ends = matches!(&event.payload, SubagentActivityPayload::Completed { .. });
+        let stopped_by_person = matches!(
+            &event.payload,
+            SubagentActivityPayload::Completed {
+                status: surface::SurfaceSubagentTerminalStatus::Cancelled,
+                ..
+            }
+        ) && self
+            .subagents_stopped_by_person
+            .contains(event.task_id.as_str());
+        let activity = if stopped_by_person {
+            surface::DisplayText::new("stopped by user")
+        } else {
+            activity
+        };
         let terminal = match &event.payload {
             SubagentActivityPayload::Completed {
                 status,
@@ -1565,6 +1582,9 @@ impl ThreadActor {
                 );
                 let subagent_patch = match terminal {
                     Some((status, output, error, terminal_usage)) => {
+                        // Its record has no error for a stop, and nor does
+                        // what a person sees of it.
+                        let error = if stopped_by_person { None } else { error };
                         next_task.status = match status {
                             surface::SurfaceSubagentTerminalStatus::Completed => {
                                 surface::SurfaceTaskStatus::Completed
@@ -1574,6 +1594,11 @@ impl ThreadActor {
                             }
                             surface::SurfaceSubagentTerminalStatus::Blocked => {
                                 surface::SurfaceTaskStatus::Blocked
+                            }
+                            surface::SurfaceSubagentTerminalStatus::Cancelled
+                                if stopped_by_person =>
+                            {
+                                surface::SurfaceTaskStatus::Stopped
                             }
                             surface::SurfaceSubagentTerminalStatus::Cancelled => {
                                 surface::SurfaceTaskStatus::Cancelled
@@ -1720,6 +1745,10 @@ impl ThreadActor {
                 io::Error::other(format!("failed to commit subagent activity: {error:?}"))
             })?;
 
+        if ends {
+            self.subagents_stopped_by_person
+                .remove(event.task_id.as_str());
+        }
         if self.subagent_activity_dedupe.len() >= super::SUBAGENT_ACTIVITY_DEDUPE_CAPACITY {
             self.subagent_activity_dedupe.pop_front();
         }

@@ -329,6 +329,28 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// An agent the TUI keeps on a thread of its own process is stopped by
+    /// the same key as one that runs in a worker process.
+    #[test]
+    fn stop_targets_a_running_agent_kept_on_a_thread_of_this_process() {
+        let (mut state, rx) = state(vec![{
+            let mut kept = task("kept", 1_000);
+            kept.subagent_child_thread_id = Some("thread-kept".to_string());
+            kept
+        }]);
+        let tx = state.event_tx.clone();
+
+        assert!(handle_agent_workspace_key(
+            KeyCode::Char('s'),
+            &mut state,
+            &tx,
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::StopTask { task_id }) if task_id == "kept"
+        ));
+    }
+
     #[test]
     fn workflow_agent_rows_do_not_emit_unsupported_task_actions() {
         let mut workflow = task("workflow", 1_000);
