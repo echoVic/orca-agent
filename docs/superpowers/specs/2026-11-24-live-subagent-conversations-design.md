@@ -108,21 +108,27 @@ conversation, one row collapsed, about 34 columns expanded, listing Changes,
 `Main`, the agents and a finished group; `›` marks the conversation on
 screen; a click or Enter on a row opens it; the dock under the conversation
 keeps only the foreground line while the card is in use, and is used as
-today when the terminal is too narrow. Two rows change: no row says
-`needs approval`, and an agent with no conversation is marked `snapshot`.
+today when the terminal is too narrow. One row changes: an agent with no
+conversation is marked `snapshot`, and only such a row can say
+`needs approval`.
 
 ### Agents that keep a snapshot
 
-Four kinds of subagent have no thread of their own after this change: those
-started with isolation, custom agent types, those with a finite budget, and
-those continued with `resume_from`. They open the checkpoint transcript in
-the Agents panel as today, cannot be sent a message, and are marked
-`snapshot`. The permission rule above holds for them too.
+Four kinds of subagent cannot run on a thread of their own: those started
+with isolation, custom agent types, those with a finite budget, and those
+continued with `resume_from`. They are left exactly as they are today: a
+separate process that finishes in the background after a quit and may ask
+for a permission on its row. They open the checkpoint transcript in the
+Agents panel, cannot be sent a message, and are marked `snapshot`. What is
+said above about permissions and quitting is about the others.
 
 ## Three changes in behaviour
 
+These are about subagents that get a conversation; the four kinds that keep
+a snapshot, and everything under `orca exec`, are unchanged.
+
 1. A TUI's subagents end when the TUI quits. Today they finish in the
-   background. (`orca exec` is unchanged.)
+   background.
 2. A subagent of the TUI no longer asks for a permission. Today a request
    to go beyond the sandbox is shown on its row.
 3. A finished subagent cannot be continued by typing in its conversation.
@@ -195,14 +201,16 @@ child turns:
 
 ### Runtime
 
-**R1. Where a child runs.** The detached launch additionally requires that
-the parent is not an interactive host. The TUI's host says it is; every
-other host keeps today's behaviour. An `Async` child of the TUI then goes
-through `enqueue_accepted_subagent` to `run_subagent_worker`, on a hosted
-thread when it qualifies and on the in-process loop otherwise. What the
-model sees does not change: the call returns a task id at once and results
-come through `task_wait` and the finished-children wake. Admission limits
-are unchanged.
+**R1. Where a child runs.** A host can say that its subagents stay in the
+process; the TUI's host says so and no other host does. Under such a host
+an `Async` child that qualifies for a thread (no isolation, not a custom
+type, an unlimited budget, no `resume_from`) is not detached: it goes
+through `enqueue_accepted_subagent` to `run_subagent_worker` and runs on a
+hosted thread. A child that does not qualify is detached as today. The
+flag is the host's, not the configuration's, so a resume or a new session
+keeps it. What the model sees does not change: the call returns a task id
+at once and results come through `task_wait` and the finished-children
+wake. Admission limits are unchanged.
 
 **R2. The delegated turn is an operation of the child's surface.**
 `AgentController::launch` starts the turn through a sibling of
@@ -213,7 +221,7 @@ the turn, the raw start is used as before; the child then works and has no
 live conversation. A hosted child does not get a main-session task record
 from this admission.
 
-**R3. A child never asks.** A child of an interactive host is given
+**R3. A child never asks.** A child kept in the process by R1 is given
 handlers that answer without a prompt:
 
 - a tool call that resolves to "ask" is denied as that one call's result,
