@@ -873,14 +873,14 @@ mod tests {
             task.sequence = sequence;
             task
         };
-        panel.replace_tasks(vec![started("first", 2, 10), started("later", 1, 20)]);
-        panel.select_index(0);
+        panel.replace_tasks(vec![started("later", 2, 20), started("first", 1, 10)]);
+        panel.select_index(1);
         assert_eq!(
             panel.selected_task().map(|task| task.id.as_str()),
             Some("later")
         );
 
-        panel.replace_tasks(vec![started("later", 1, 30), started("new", 3, 40)]);
+        panel.replace_tasks(vec![started("later", 2, 30), started("new", 3, 40)]);
         assert_eq!(
             panel.selected_task().map(|task| task.id.as_str()),
             Some("later")

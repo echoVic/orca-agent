@@ -5677,6 +5677,34 @@ fn background_task_activity_lines(
 
 /// `idle` is whether Enter can open a background approval now: opening one
 /// takes over the status line, so it waits for a running turn to end.
+/// The subagent rows the dock draws when there are more than it has room for:
+/// agents that need attention first, then the selected one, then the rest in
+/// list order. The rows come back in list (start) order, never priority order.
+fn dock_rows<'a>(
+    visible: &[&'a BackgroundTaskSummary],
+    selected: Option<&str>,
+    cap: usize,
+) -> Vec<&'a BackgroundTaskSummary> {
+    if visible.len() <= cap {
+        return visible.to_vec();
+    }
+    let priority = |task: &BackgroundTaskSummary| -> u8 {
+        if task.status.requires_attention() {
+            0
+        } else if selected == Some(task.id.as_str()) {
+            1
+        } else {
+            2
+        }
+    };
+    let mut picked = (0..visible.len()).collect::<Vec<_>>();
+    // Stable: ties keep list order.
+    picked.sort_by_key(|&index| priority(visible[index]));
+    picked.truncate(cap);
+    picked.sort_unstable();
+    picked.into_iter().map(|index| visible[index]).collect()
+}
+
 fn background_task_activity_rows(
     tasks: &[BackgroundTaskSummary],
     theme: &Theme,
@@ -5759,7 +5787,7 @@ fn background_task_activity_rows(
             Some(AgentHitTarget::Main),
         ));
 
-        for task in visible_subagents.iter().take(subagent_cap) {
+        for task in dock_rows(&visible_subagents, selected_task_id, subagent_cap) {
             let selected = selected_task_id == Some(task.id.as_str());
             let selection = if selected { "›" } else { "○" };
             let status = task_status_label(task.status);
@@ -15365,6 +15393,59 @@ mod tests {
 
         assert!(rendered.contains("Enter approve"));
         assert!(rendered.contains("s stop"));
+    }
+
+    fn dock_agent(id: &str, status: TaskStatus) -> BackgroundTaskSummary {
+        let mut task = workflow_task_for_agent_dashboard(
+            id,
+            id,
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        task.id = id.to_string();
+        task.task_type = TaskType::Subagent;
+        task.status = status;
+        task
+    }
+
+    fn dock_ids(rows: &[&BackgroundTaskSummary]) -> Vec<String> {
+        rows.iter().map(|task| task.id.clone()).collect()
+    }
+
+    #[test]
+    fn the_dock_keeps_an_agent_that_needs_approval_past_the_cap() {
+        let cap = 4;
+        let mut tasks: Vec<_> = (0..cap + 2)
+            .map(|i| dock_agent(&format!("a{i}"), TaskStatus::Running))
+            .collect();
+        tasks[cap + 1].status = TaskStatus::ApprovalRequired;
+        let visible: Vec<_> = tasks.iter().collect();
+        let rows = super::dock_rows(&visible, None, cap);
+        assert_eq!(rows.len(), cap);
+        assert_eq!(dock_ids(&rows), ["a0", "a1", "a2", "a5"]);
+    }
+
+    #[test]
+    fn the_dock_keeps_the_selected_agent_past_the_cap() {
+        let cap = 4;
+        let tasks: Vec<_> = (0..cap + 2)
+            .map(|i| dock_agent(&format!("a{i}"), TaskStatus::Running))
+            .collect();
+        let visible: Vec<_> = tasks.iter().collect();
+        let rows = super::dock_rows(&visible, Some("a5"), cap);
+        assert_eq!(rows.len(), cap);
+        assert_eq!(dock_ids(&rows), ["a0", "a1", "a2", "a5"]);
+    }
+
+    #[test]
+    fn the_dock_draws_every_agent_in_start_order_under_the_cap() {
+        let cap = 4;
+        let mut tasks: Vec<_> = (0..cap)
+            .map(|i| dock_agent(&format!("a{i}"), TaskStatus::Running))
+            .collect();
+        tasks[cap - 1].status = TaskStatus::ApprovalRequired;
+        let visible: Vec<_> = tasks.iter().collect();
+        let rows = super::dock_rows(&visible, Some("a1"), cap);
+        assert_eq!(dock_ids(&rows), ["a0", "a1", "a2", "a3"]);
     }
 
     fn workflow_task_for_agent_dashboard(
