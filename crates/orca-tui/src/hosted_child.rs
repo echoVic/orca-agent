@@ -612,9 +612,9 @@ fn focus_child(
         return;
     }
 
-    // The host lookup can race the child terminal commit. Re-read the parent
-    // surface and require both the task revision and bound thread to remain
-    // identical before changing the visible attachment.
+    // The host lookup can race the child's terminal commit. Read the parent
+    // surface again and require the task to be bound to the same thread
+    // before changing what is on screen.
     let current_snapshot = match read_parent_snapshot(&parent_thread) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -831,7 +831,13 @@ fn child_binding(
         .iter()
         .find(|task| task.task_id == task_id)
         .ok_or_else(|| "the selected child task is no longer present".to_string())?;
-    if task.revision.get() != expected_revision {
+    // A child that is writing moves its task's revision several times a
+    // second, so the revision seen at the click is behind by the time this
+    // runs. The task is the same task: its identity and the thread it is
+    // bound to are what must hold, and `focus_child` reads the binding twice
+    // to see that the thread did not change. Only a snapshot from before the
+    // click is stale.
+    if task.revision.get() < expected_revision {
         return Err(format!(
             "the selected child task is stale (expected revision {expected_revision})"
         ));
@@ -874,6 +880,23 @@ mod tests {
     use orca_core::conversation::ConversationTarget;
     use orca_core::cost_types::UsageTotals;
     use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
+
+    use orca_runtime::surface::{
+        CanonicalPath, CompactionState, ContextRevision, CursorSourceRevision, DisplayText,
+        DurableRevision, McpCatalogRevision, NonEmptyText, PinnedContextRevision, PlanRevision,
+        PolicyEpoch, ProviderReplayHealth, SequenceNumber, SessionHealthRevision,
+        SessionMetadataRevision, SettingsRevision, Sha256Digest, SubagentRevision,
+        SurfaceApprovalMode, SurfaceCommitId, SurfaceContextSnapshot, SurfaceCursor,
+        SurfaceGenerationId, SurfaceIncarnation, SurfaceMcpCatalogSnapshot,
+        SurfaceNetworkPermissions, SurfaceOperationFence, SurfaceOperationId,
+        SurfacePermissionRuleSet, SurfacePinnedContextSnapshot, SurfacePlanSnapshot,
+        SurfaceReasoningEffort, SurfaceRuntimeSettings, SurfaceSessionHealth,
+        SurfaceSettingsSnapshot, SurfaceSnapshot, SurfaceSubagent, SurfaceSubagentId,
+        SurfaceSubagentOwner, SurfaceSubagentSource, SurfaceSubagentStatus, SurfaceTask,
+        SurfaceTaskAttemptId, SurfaceTaskId, SurfaceTaskStatus, SurfaceTaskType, SurfaceThreadId,
+        SurfaceThreadSnapshot, SurfaceTurnId, SurfaceUsageSnapshot, TaskRevision, ThreadOwnerEpoch,
+        ThreadPersistence, UnixMillis, UsageRevision, UsageTotals as SurfaceUsageTotals,
+    };
 
     use super::{ChildBinding, project_hosted_child_attached};
     use crate::attachment_routing::accept_attached_tui_event;
@@ -924,6 +947,200 @@ mod tests {
             output_truncated: false,
             publication_revision: Some(1),
         }
+    }
+
+    fn uuid_v7_bytes(seed: u8) -> [u8; 16] {
+        let mut bytes = [seed; 16];
+        bytes[6] = (bytes[6] & 0x0f) | 0x70;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        bytes
+    }
+
+    /// A parent snapshot holding one running subagent task, `child`, at
+    /// `revision`, bound to the hosted thread `child_thread_seed`.
+    fn snapshot_with_child(revision: u64, child_thread_seed: u8) -> SurfaceSnapshot {
+        let path = CanonicalPath::try_new(std::env::temp_dir().join("orca-tui-child-binding"))
+            .expect("canonical test path");
+        let task_id = SurfaceTaskId::try_new("child").unwrap();
+        let subagent_id = SurfaceSubagentId::try_new("agent-child").unwrap();
+        let thread_id = SurfaceThreadId::try_from_bytes(uuid_v7_bytes(1)).unwrap();
+        SurfaceSnapshot {
+            cursor: SurfaceCursor {
+                thread_id: thread_id.clone(),
+                incarnation: SurfaceIncarnation::try_from_bytes(uuid_v7_bytes(2)).unwrap(),
+                next_seq: SequenceNumber::new(0),
+                source_revision: CursorSourceRevision::Recorded {
+                    durable_revision: DurableRevision::try_new(1).unwrap(),
+                },
+            },
+            thread: SurfaceThreadSnapshot {
+                thread_id,
+                owner_epoch: ThreadOwnerEpoch::new(1),
+                persistence: ThreadPersistence::RecordedCatalogued,
+                title: DisplayText::new("Parent"),
+                metadata_revision: SessionMetadataRevision::try_new(1).unwrap(),
+                created_at: UnixMillis::new(1),
+                updated_at: UnixMillis::new(1),
+                cwd: path.clone(),
+                workspace_roots: vec![path.clone()],
+                closed: false,
+            },
+            foreground_operation: None,
+            queued_operations: Vec::new(),
+            background_operations: Vec::new(),
+            operation_history: Vec::new(),
+            items: Vec::new(),
+            assistant_streams: Vec::new(),
+            tools: Vec::new(),
+            plan: SurfacePlanSnapshot {
+                revision: PlanRevision::try_new(1).unwrap(),
+                explanation: None,
+                items: Vec::new(),
+                causative_generation: None,
+            },
+            usage: SurfaceUsageSnapshot {
+                revision: UsageRevision::try_new(1).unwrap(),
+                thread_total: SurfaceUsageTotals::default(),
+                active_operation: None,
+                goal: None,
+                workflow: Vec::new(),
+            },
+            context: SurfaceContextSnapshot {
+                revision: ContextRevision::try_new(1).unwrap(),
+                window_id: orca_runtime::surface::ContextWindowId::new(),
+                used_tokens: 0,
+                limit_tokens: 128_000,
+                compaction: CompactionState::Idle,
+                fragments: Vec::new(),
+                provider_replay: ProviderReplayHealth::None,
+            },
+            interactions: Vec::new(),
+            tasks: vec![SurfaceTask {
+                task_id: task_id.clone(),
+                revision: TaskRevision::try_new(revision).unwrap(),
+                task_type: SurfaceTaskType::Subagent,
+                status: SurfaceTaskStatus::Running,
+                backgrounded: false,
+                description: DisplayText::new("child"),
+                created_at: UnixMillis::new(1),
+                started_at: Some(UnixMillis::new(1)),
+                completed_at: None,
+                parent_operation: None,
+                parent_task_id: None,
+                background_fence: None,
+                workflow_run_id: None,
+                subagent_id: Some(subagent_id.clone()),
+                pending_interaction_id: None,
+                usage: None,
+                result: None,
+                error: None,
+                retry_count: 0,
+                output_truncated: false,
+            }],
+            workflows: Vec::new(),
+            subagents: vec![SurfaceSubagent {
+                subagent_id,
+                task_id,
+                revision: SubagentRevision::try_new(1).unwrap(),
+                description: DisplayText::new("child"),
+                child_thread_id: Some(
+                    SurfaceThreadId::try_from_bytes(uuid_v7_bytes(child_thread_seed)).unwrap(),
+                ),
+                batch_id: NonEmptyText::try_new("batch-child").unwrap(),
+                batch_size: 1,
+                status: SurfaceSubagentStatus::Running,
+                activity: None,
+                subagent_activity_history: Vec::new(),
+                turn: Some(1),
+                usage: None,
+                output: None,
+                error: None,
+                continuation: None,
+                owner: SurfaceSubagentOwner::Generation {
+                    fence: SurfaceOperationFence {
+                        thread_id: SurfaceThreadId::try_from_bytes(uuid_v7_bytes(1)).unwrap(),
+                        thread_owner_epoch: ThreadOwnerEpoch::new(1),
+                        operation_id: SurfaceOperationId::try_from_bytes(uuid_v7_bytes(3)).unwrap(),
+                        generation_id: SurfaceGenerationId::new(3),
+                    },
+                },
+                source: SurfaceSubagentSource::new(
+                    SurfaceTaskAttemptId::try_new("attempt-child").unwrap(),
+                    SurfaceTurnId::new(),
+                    1,
+                    UnixMillis::new(1),
+                    SurfaceCommitId::try_from_bytes(uuid_v7_bytes(4)).unwrap(),
+                    Sha256Digest::new([4; 32]),
+                ),
+            }],
+            goal: None,
+            settings: SurfaceSettingsSnapshot {
+                host_revision: SettingsRevision::try_new(1).unwrap(),
+                thread_revision: SettingsRevision::try_new(1).unwrap(),
+                effective: SurfaceRuntimeSettings {
+                    model: NonEmptyText::try_new("deepseek-v4").unwrap(),
+                    reasoning_effort: SurfaceReasoningEffort::High,
+                    approval_mode: SurfaceApprovalMode::AutoEdit,
+                    cwd: path.clone(),
+                    workspace_roots: vec![path],
+                    active_permission_profile: None,
+                    permission_rules: SurfacePermissionRuleSet {
+                        ordered_rules: Vec::new(),
+                        digest: Sha256Digest::new([1; 32]),
+                    },
+                    additional_working_directories: Vec::new(),
+                    network_permissions: SurfaceNetworkPermissions {
+                        enabled: Some(true),
+                        domains: Vec::new(),
+                    },
+                    policy_epoch: PolicyEpoch::try_new(1).unwrap(),
+                },
+                pending: None,
+                frozen_generation_revision: None,
+            },
+            mcp_catalog: SurfaceMcpCatalogSnapshot {
+                revision: McpCatalogRevision::try_new(1).unwrap(),
+                servers: Vec::new(),
+                tools: Vec::new(),
+                prompts: Vec::new(),
+                resources: Vec::new(),
+                resource_templates: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            pinned_context: SurfacePinnedContextSnapshot {
+                revision: PinnedContextRevision::try_new(1).unwrap(),
+                entries: Vec::new(),
+            },
+            session_health: SurfaceSessionHealth {
+                revision: SessionHealthRevision::try_new(1).unwrap(),
+                accepting_admission: true,
+                issues: Vec::new(),
+                closing: false,
+                closed: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_child_whose_revision_moved_on_is_still_the_one_selected() {
+        let snapshot = snapshot_with_child(7, 9);
+        let binding =
+            super::child_binding(&snapshot, "child", 3).expect("a newer revision is the same task");
+        assert_eq!(
+            binding.child_thread_id,
+            uuid::Uuid::from_bytes(uuid_v7_bytes(9)).to_string()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_older_than_what_was_seen_is_refused() {
+        let snapshot = snapshot_with_child(2, 9);
+        let error =
+            super::child_binding(&snapshot, "child", 3).expect_err("older than what was seen");
+        assert_eq!(
+            error,
+            "the selected child task is stale (expected revision 3)"
+        );
     }
 
     #[test]
