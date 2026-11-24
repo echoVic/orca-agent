@@ -21,6 +21,7 @@ mod child_agent_tests;
 pub mod child_agent_types;
 pub mod child_budget_ledger;
 mod child_permission;
+mod child_refusal;
 pub mod command;
 pub mod compaction;
 mod computer_use;

@@ -1568,6 +1568,23 @@ impl ToolExecutionActor {
                                 result,
                             );
                         }
+                        // Nobody may be asked on this thread: the call is
+                        // refused and the turn goes on, as it does when a
+                        // rule denies a call the model can work around.
+                        Err(error) if crate::child_refusal::refused_without_asking(&error) => {
+                            let result =
+                                tool_types::ToolResult::denied(tool_request, error.to_string());
+                            return finish_approval_gate_terminal(
+                                events,
+                                sink,
+                                &event_request,
+                                emit_deltas,
+                                provider_response_ingress,
+                                event_error,
+                                RunStatus::Success,
+                                result,
+                            );
+                        }
                         Err(error) => {
                             return failed_approval_gate_before_start(
                                 events,
@@ -3324,6 +3341,100 @@ mod tests {
         assert!(
             preview.contains("+return -(-total // per_page)"),
             "{preview}"
+        );
+    }
+
+    /// Runs the approval gate for bash `echo hi` in suggest, answered by
+    /// `handler`, and gives back how the gate ended the call.
+    fn suggest_bash_gate_with(
+        label: &str,
+        handler: &(dyn crate::runtime_approval::RuntimeApprovalHandler + Send + Sync),
+    ) -> (ToolRequest, super::ApprovalGateExecution) {
+        let mut config = config_with_permission_rules(PermissionRules::default());
+        config.approval_mode = ApprovalMode::Suggest;
+        let mut events = EventFactory::new(label.to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = ToolRequest {
+            id: format!("{label}-shell"),
+            name: ToolName::Bash,
+            action: ActionKind::Shell,
+            target: Some("echo hi".to_string()),
+            raw_arguments: Some(r#"{"command":"echo hi"}"#.to_string()),
+        };
+        let registry = McpRegistry::default();
+        let invocation =
+            crate::tool_invocation::prepare_tool_invocation(&request, 0, &registry, &config);
+        let policy = policy_for_tool_execution(&config);
+        let mut overlay = TurnPermissionOverlay::default();
+        let cancel = orca_core::cancel::CancelToken::new();
+
+        let gate = ToolExecutionActor::new(events.run_id().to_string()).handle_approval(
+            ToolApprovalGateContext {
+                config: &config,
+                cwd: std::path::Path::new("."),
+                events: &mut events,
+                sink: &mut sink,
+                tool_request: &request,
+                invocation: &invocation,
+                turn_store: None,
+                policy: &policy,
+                permission_overlay: &mut overlay,
+                approval_handler: Some(handler),
+                cancel: &cancel,
+                emit_deltas: true,
+                provider_response_ingress: None,
+            },
+        );
+        (request, gate)
+    }
+
+    #[test]
+    fn a_refusal_without_asking_is_a_denied_result_and_the_turn_goes_on() {
+        let (request, gate) = suggest_bash_gate_with(
+            "refused-without-asking",
+            &crate::child_refusal::RefusingApprovalHandler,
+        );
+
+        assert!(gate.event_error.is_none(), "{:?}", gate.event_error);
+        let (status, result) = gate.outcome.expect("the gate ends the call");
+        assert_eq!(status, RunStatus::Success);
+        assert_eq!(result.status, ToolStatus::Denied);
+        assert_eq!(
+            serde_json::to_value(&result).expect("serialize the gate's result"),
+            serde_json::to_value(ToolResult::denied(
+                &request,
+                crate::child_refusal::APPROVAL_REFUSED
+            ))
+            .expect("serialize a denied result"),
+            "the result is the one ToolResult::denied builds"
+        );
+        let text = result.error.as_deref().expect("a denied result says why");
+        assert_eq!(text, crate::child_refusal::APPROVAL_REFUSED);
+        assert!(!text.contains("interactive approval failed"), "{text}");
+    }
+
+    #[test]
+    fn a_prompt_that_fails_is_still_a_failed_dispatch() {
+        struct FailingPrompt;
+        impl crate::runtime_approval::RuntimeApprovalHandler for FailingPrompt {
+            fn resolve_interactive(
+                &self,
+                _approval: &ApprovalRequest,
+                _request: &ToolRequest,
+            ) -> io::Result<orca_core::approval_types::ApprovalResolution> {
+                Err(io::Error::from_raw_os_error(35))
+            }
+        }
+
+        let (_request, gate) = suggest_bash_gate_with("prompt-failed", &FailingPrompt);
+
+        let (status, result) = gate.outcome.expect("the gate ends the call");
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(result.status, ToolStatus::Failed);
+        let text = result.error.as_deref().expect("a failed result says why");
+        assert!(
+            text.starts_with("interactive approval failed before tool dispatch:"),
+            "{text}"
         );
     }
 

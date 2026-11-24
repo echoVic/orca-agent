@@ -1319,6 +1319,27 @@ fn run_threaded_agent_worker(
         });
         (None, permission_handler, registry_task_id, cancel.clone())
     };
+    // A child the host keeps in its process asks nobody: there is no one
+    // it could ask from here, so what would need an approval or a grant is
+    // refused, and the child says in its reply what it could not do.
+    //
+    // Any other child never inherits an interactive approval handler. The
+    // parent's `RuntimeApprovalHandler` exists only as a non-'static borrow
+    // scoped to the parent turn, so it cannot cross this worker boundary; the
+    // legacy sync child path is identical. Such a child resolves per-tool
+    // approvals from its own RunConfig (RuntimeConfigApprovalHandler), while
+    // user-facing escalations flow through the scoped permission handler.
+    let kept_in_process = controller.keeps_subagents_in_process();
+    let approval_handler = kept_in_process.then(|| {
+        Arc::new(crate::child_refusal::RefusingApprovalHandler)
+            as Arc<dyn crate::lifecycle::RuntimeApprovalHandler + Send + Sync>
+    });
+    let permission_handler = if kept_in_process {
+        Some(Arc::new(crate::child_refusal::RefusingPermissionHandler)
+            as Arc<dyn RuntimePermissionRequestHandler + Send + Sync>)
+    } else {
+        permission_handler
+    };
     let launch_surface_activity = surface_activity.clone();
     let registry_agent_id = registry_task_id
         .clone()
@@ -1333,13 +1354,8 @@ fn run_threaded_agent_worker(
         mode,
         config: config.clone(),
         cancel: launch_cancel,
-        // Subagents never inherit an interactive approval handler. The parent's
-        // `RuntimeApprovalHandler` exists only as a non-'static borrow scoped to
-        // the parent turn, so it cannot cross this worker boundary; the legacy
-        // sync child path is identical. A child resolves per-tool approvals from
-        // its own RunConfig (RuntimeConfigApprovalHandler), while user-facing
-        // escalations flow through the scoped permission_handler below.
-        approval_handler: None,
+        // Refusing for a child the host keeps, `None` for any other (see above).
+        approval_handler,
         permission_handler,
         surface_activity,
         batch_id: batch_id.clone(),

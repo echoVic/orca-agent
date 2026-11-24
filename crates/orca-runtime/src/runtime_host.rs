@@ -4564,6 +4564,13 @@ impl RuntimeHostHandle {
         self.agent_registry.keeps_subagents_in_process()
     }
 
+    /// The registry this host's controllers share, so a test can build a
+    /// controller the way the host does.
+    #[cfg(test)]
+    pub(crate) fn agent_registry_for_test(&self) -> Arc<crate::agent_registry::AgentRegistry> {
+        Arc::clone(&self.agent_registry)
+    }
+
     pub fn agent_registry_snapshot(
         &self,
         root_thread_id: &str,

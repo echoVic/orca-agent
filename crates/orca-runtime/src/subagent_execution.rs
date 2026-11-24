@@ -3533,7 +3533,29 @@ mod tests {
         label: &str,
         prompt: &str,
     ) -> (tool_types::ToolResult, String) {
-        let config = config_in(cwd, SubagentConfig::default());
+        let controller = crate::agent_controller::AgentController::new(
+            host.clone(),
+            label.to_string(),
+            label.to_string(),
+            0,
+        );
+        launch_hosted_sync_child_with(
+            controller,
+            config_in(cwd, SubagentConfig::default()),
+            cwd,
+            label,
+            prompt,
+        )
+    }
+
+    /// The same, with the parent's controller and config given.
+    fn launch_hosted_sync_child_with(
+        controller: crate::agent_controller::AgentController,
+        config: RunConfig,
+        cwd: &std::path::Path,
+        label: &str,
+        prompt: &str,
+    ) -> (tool_types::ToolResult, String) {
         let mut events = EventFactory::new(label.to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = hosted_request(label, "delegated child", prompt);
@@ -3544,12 +3566,7 @@ mod tests {
         let mut cost_tracker = CostTracker::new(None);
         let cancel = CancelToken::new();
         let task_registry = TaskRegistry::new(label.to_string());
-        let controller = Arc::new(crate::agent_controller::AgentController::new(
-            host.clone(),
-            label.to_string(),
-            label.to_string(),
-            0,
-        ));
+        let controller = Arc::new(controller);
         let activity_ingress = Arc::new(CapturingActivityIngress::default());
         let mut event_error = None;
 
@@ -3734,6 +3751,269 @@ mod tests {
             surface_operations(&snapshot)
         );
         assert!(surface_user_texts(&snapshot).is_empty());
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// The mock's reply once a call of the turn has its result.
+    const MOCK_REPLY_AFTER_A_TOOL: &str = "Mock completed after tool execution.";
+
+    /// A parent's controller made from the host's registry, as the host makes
+    /// one; with `keep`, the host was first asked to keep its subagents.
+    fn parent_controller(
+        host: &crate::runtime_host::RuntimeHostHandle,
+        label: &str,
+        keep: bool,
+    ) -> crate::agent_controller::AgentController {
+        if keep {
+            host.keep_subagents_in_process();
+        }
+        crate::agent_controller::AgentController::new_with_registry(
+            host.clone(),
+            host.agent_registry_for_test(),
+            label.to_string(),
+            label.to_string(),
+            0,
+        )
+    }
+
+    /// A parent in suggest whose events are JSONL, so a child that resolves
+    /// an approval from its own config is denied instead of reading stdin.
+    fn suggest_config_in(cwd: &std::path::Path) -> RunConfig {
+        let mut config = config_in(cwd, SubagentConfig::default());
+        config.approval_mode = orca_core::approval_types::ApprovalMode::Suggest;
+        config.output_format = OutputFormat::Jsonl;
+        config
+    }
+
+    fn child_messages(
+        host: &crate::runtime_host::RuntimeHostHandle,
+        child_thread_id: &str,
+    ) -> Vec<orca_core::conversation::Message> {
+        host.resolve_live_thread(child_thread_id)
+            .expect("the child thread is live")
+            .snapshot()
+            .expect("the child's snapshot")
+            .messages()
+            .to_vec()
+    }
+
+    /// The context pinned ahead of the child's task.
+    fn pinned_child_context(messages: &[orca_core::conversation::Message]) -> &str {
+        messages
+            .iter()
+            .find_map(|message| match message {
+                orca_core::conversation::Message::User {
+                    content,
+                    pinned: true,
+                    ..
+                } => Some(content.as_str()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the child has its pinned context: {messages:?}"))
+    }
+
+    /// The result the provider was sent for one call, and where it is.
+    fn tool_result_sent(
+        messages: &[orca_core::conversation::Message],
+        tool_call_id: &str,
+    ) -> (usize, String) {
+        messages
+            .iter()
+            .enumerate()
+            .find_map(|(index, message)| match message {
+                orca_core::conversation::Message::Tool {
+                    tool_call_id: id,
+                    content,
+                    ..
+                } if id == tool_call_id => Some((index, content.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no result for {tool_call_id}: {messages:?}"))
+    }
+
+    /// The child's reply: its last assistant text, and where it is.
+    fn last_reply(messages: &[orca_core::conversation::Message]) -> (usize, &str) {
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| match message {
+                orca_core::conversation::Message::Assistant {
+                    content: Some(content),
+                    ..
+                } => Some((index, content.as_str())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the child replied: {messages:?}"))
+    }
+
+    /// A child the host keeps asks nobody: its call that needs an approval
+    /// is refused, it is told so, and it still replies to its parent.
+    #[test]
+    fn a_kept_child_in_suggest_is_refused_and_still_replies() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "kept-child-refused";
+        // The mock calls bash `echo hi` and, once the call has a result,
+        // replies with MOCK_REPLY_AFTER_A_TOOL.
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, true),
+            suggest_config_in(cwd.path()),
+            cwd.path(),
+            label,
+            "bash echo hi",
+        );
+
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Completed,
+            "{:?}",
+            result.error
+        );
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.output.as_deref(), Some(MOCK_REPLY_AFTER_A_TOOL));
+        let messages = child_messages(&host_handle, &child_thread_id);
+        let (result_at, sent) = tool_result_sent(&messages, "mock-tool-1");
+        assert!(
+            sent.contains(crate::child_refusal::APPROVAL_REFUSED),
+            "the provider was told the call was refused: {sent}"
+        );
+        let (reply_at, reply) = last_reply(&messages);
+        assert_eq!(reply, MOCK_REPLY_AFTER_A_TOOL);
+        assert!(result_at < reply_at, "the reply came after the refusal");
+        let context = pinned_child_context(&messages);
+        assert!(
+            context.starts_with(crate::agent_controller::DELEGATED_CHILD_CONTEXT),
+            "{context}"
+        );
+        assert!(
+            context.contains(crate::child_refusal::UNATTENDED_CHILD_CONTEXT),
+            "{context}"
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A host that did not ask to keep its subagents gives a child what it
+    /// gave before: approvals resolved from the child's config, and no word
+    /// of refusals in its context.
+    #[test]
+    fn a_child_of_a_host_that_did_not_ask_keeps_todays_handlers() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "unkept-child-today";
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, false),
+            suggest_config_in(cwd.path()),
+            cwd.path(),
+            label,
+            "bash echo hi",
+        );
+
+        assert!(!host_handle.keeps_subagents_in_process());
+        let messages = child_messages(&host_handle, &child_thread_id);
+        let context = pinned_child_context(&messages);
+        assert!(
+            context.starts_with(crate::agent_controller::DELEGATED_CHILD_CONTEXT),
+            "{context}"
+        );
+        assert!(
+            !context.contains(crate::child_refusal::UNATTENDED_CHILD_CONTEXT),
+            "{context}"
+        );
+        // Today's handler: the child's config, which denies in JSONL mode
+        // and stops the child for an approval.
+        let (_, sent) = tool_result_sent(&messages, "mock-tool-1");
+        assert!(
+            sent.contains("interactive confirmation unavailable in jsonl mode"),
+            "{sent}"
+        );
+        assert!(
+            !sent.contains(crate::child_refusal::APPROVAL_REFUSED),
+            "{sent}"
+        );
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert_eq!(result.error.as_deref(), Some("agent requires permission"));
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A child the host keeps is a built-in role, and no role offers a way
+    /// to put a question to the user: not `ask_user_question`, not an MCP
+    /// tool (whose server could ask). It is offered its role's tools only.
+    #[test]
+    fn a_kept_child_is_offered_no_way_to_ask_the_user() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "kept-child-tools";
+        let config = suggest_config_in(cwd.path());
+        // Not a headless run: a parent here would be offered the question.
+        assert!(!config.tools.headless_exec);
+        let (result, _child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, true),
+            config,
+            cwd.path(),
+            label,
+            "mock_offered_tools",
+        );
+
+        let output = result.output.as_deref().unwrap_or_default();
+        let offered = output
+            .strip_prefix("Mock offered tools: ")
+            .unwrap_or_else(|| panic!("the child named its tools: {output}"))
+            .split(", ")
+            .collect::<Vec<_>>();
+        assert!(!offered.is_empty(), "{output}");
+        assert!(!offered.contains(&"ask_user_question"), "{output}");
+        assert!(!offered.contains(&"list_mcp_resources"), "{output}");
+        assert!(!offered.contains(&"read_mcp_resource"), "{output}");
+        // The role names some tools by an alias (`list_files` is `glob`).
+        let registry = orca_tools::registry::tool_registry_with_mcp_and_external(None, &[]);
+        let role = crate::child_agent_entrypoints::role_tool_ceiling(
+            &orca_core::subagent_types::SubagentType::General,
+        )
+        .iter()
+        .filter_map(|tool| {
+            registry
+                .resolve(tool)
+                .map(|resolved| resolved.tool.name().to_string())
+        })
+        .collect::<Vec<_>>();
+        for tool in &offered {
+            assert!(
+                role.iter().any(|allowed| allowed == tool),
+                "{tool} is not one of the role's tools: {output}"
+            );
+        }
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// Should the model of a kept child call for a question anyway, nobody
+    /// is asked: the role refuses the call it was not offered, the model is
+    /// sent why, and the child's turn ends there, as it does for any child
+    /// that calls a tool outside its role.
+    #[test]
+    fn a_kept_childs_question_ends_its_turn_without_asking() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "kept-child-question";
+        // The mock calls ask_user_question with this question.
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, true),
+            suggest_config_in(cwd.path()),
+            cwd.path(),
+            label,
+            "ask Go on?",
+        );
+
+        let refusal = "role 'general' tool policy disallows tool 'ask_user_question'";
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert_eq!(result.error.as_deref(), Some(refusal));
+        let messages = child_messages(&host_handle, &child_thread_id);
+        let (_, sent) = tool_result_sent(&messages, "mock-tool-1");
+        assert!(sent.contains(refusal), "{sent}");
         host.shutdown().expect("shutdown runtime host");
     }
 

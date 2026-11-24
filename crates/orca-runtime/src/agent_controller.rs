@@ -364,9 +364,16 @@ impl AgentController {
             }
         };
         let thread_id = child.thread_id().to_string();
+        let kept_in_process = self.keeps_subagents_in_process();
+        // A child the host keeps is told that it asks nobody.
+        let unattended = if kept_in_process {
+            crate::child_refusal::UNATTENDED_CHILD_CONTEXT
+        } else {
+            ""
+        };
         if let Err(error) = child.mutate(
             crate::runtime_host::RuntimeThreadMutation::AddPinnedContext(format!(
-                "{DELEGATED_CHILD_CONTEXT}{}",
+                "{DELEGATED_CHILD_CONTEXT}{}{unattended}",
                 request.subagent_type.system_prompt_suffix()
             )),
         ) {
@@ -407,12 +414,18 @@ impl AgentController {
                 )),
             });
         }
-        let permission_handler = request.permission_handler.map(|handler| {
-            Arc::new(AgentPermissionHandler {
-                inner: handler,
-                publisher: publisher.clone(),
-            }) as Arc<dyn RuntimePermissionRequestHandler + Send + Sync>
-        });
+        // A kept child's handler refuses at once; its row must not show it
+        // waiting for a permission nobody is asked for.
+        let permission_handler = if kept_in_process {
+            request.permission_handler
+        } else {
+            request.permission_handler.map(|handler| {
+                Arc::new(AgentPermissionHandler {
+                    inner: handler,
+                    publisher: publisher.clone(),
+                }) as Arc<dyn RuntimePermissionRequestHandler + Send + Sync>
+            })
+        };
         let on_surface = child.start_delegated_turn_on_surface(
             crate::runtime_host::DelegatedTurnStart {
                 prompt: request.prompt.clone(),
