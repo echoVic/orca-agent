@@ -4017,24 +4017,56 @@ mod tests {
         host.shutdown().expect("shutdown runtime host");
     }
 
-    /// Starts an async child of `controller`'s parent as the model's
-    /// `subagent` call does, with a task the mock keeps streaming for 30 s
-    /// unless it is stopped. Gives back the child's task id and its thread
-    /// id once that thread is up.
-    fn start_streaming_async_child(
+    /// Records what a kept child reports to its parent. Told to, it refuses
+    /// the child's end as the parent's thread does once the turn that
+    /// started the child is over.
+    #[derive(Debug, Default)]
+    struct KeptChildActivity {
+        refuses_the_end: bool,
+        events: Mutex<Vec<SubagentActivityEvent>>,
+    }
+
+    impl RuntimeSubagentActivityIngress for KeptChildActivity {
+        fn owner(&self) -> SubagentActivityOwner {
+            SubagentActivityOwner::DetachedTask {
+                task_id: SurfaceTaskId::try_new("kept-child-owner").unwrap(),
+                task_revision: TaskRevision::try_new(1).unwrap(),
+                authority_digest: Sha256Digest::new([5; 32]),
+            }
+        }
+
+        fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
+            if self.refuses_the_end
+                && matches!(event.payload, SubagentActivityPayload::Completed { .. })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                ));
+            }
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    /// Submits an async child of `controller`'s parent as the model's
+    /// `subagent` call does, and gives back its task id.
+    fn submit_async_child(
         controller: crate::agent_controller::AgentController,
         cwd: &std::path::Path,
         task_registry: &TaskRegistry,
         label: &str,
-    ) -> (String, String) {
+        prompt: &str,
+        activity: Arc<KeptChildActivity>,
+    ) -> String {
         let config = config_in(cwd, SubagentConfig::default());
         let mut events = EventFactory::new(label.to_string());
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let request = tool_types::ToolRequest {
             raw_arguments: Some(
                 serde_json::json!({
-                    "description": "wait until stopped",
-                    "prompt": "mock_stream_delay_ms 30000",
+                    "description": label,
+                    "prompt": prompt,
                     "mode": "async"
                 })
                 .to_string(),
@@ -4047,7 +4079,6 @@ mod tests {
         let hooks = HookRunner::default();
         let mut cost_tracker = CostTracker::new(None);
         let cancel = CancelToken::new();
-        let activity_ingress = Arc::new(CapturingActivityIngress::default());
         let mut event_error = None;
 
         let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
@@ -4070,7 +4101,7 @@ mod tests {
             None,
             fake_child_executor::<io::Sink>,
             None,
-            Some(activity_ingress.clone()),
+            Some(activity),
             Some(Arc::new(controller)),
             &mut event_error,
             None,
@@ -4085,27 +4116,61 @@ mod tests {
         let handle: serde_json::Value =
             serde_json::from_str(result.output.as_deref().expect("the child's handle"))
                 .expect("a JSON handle");
-        let task_id = handle["task_id"]
+        handle["task_id"]
             .as_str()
             .expect("the child's task id")
-            .to_string();
+            .to_string()
+    }
+
+    /// Starts an async child of `controller`'s parent as the model's
+    /// `subagent` call does, with a task the mock keeps streaming for 30 s
+    /// unless it is stopped. Gives back the child's task id and its thread
+    /// id once that thread is up.
+    fn start_streaming_async_child(
+        controller: crate::agent_controller::AgentController,
+        cwd: &std::path::Path,
+        task_registry: &TaskRegistry,
+        label: &str,
+    ) -> (String, String) {
+        start_streaming_async_child_reporting_to(
+            controller,
+            cwd,
+            task_registry,
+            label,
+            Arc::new(KeptChildActivity::default()),
+        )
+    }
+
+    /// `start_streaming_async_child`, with the child reporting to `activity`.
+    fn start_streaming_async_child_reporting_to(
+        controller: crate::agent_controller::AgentController,
+        cwd: &std::path::Path,
+        task_registry: &TaskRegistry,
+        label: &str,
+        activity: Arc<KeptChildActivity>,
+    ) -> (String, String) {
+        let task_id = submit_async_child(
+            controller,
+            cwd,
+            task_registry,
+            label,
+            "mock_stream_delay_ms 30000",
+            activity.clone(),
+        );
         // The child's turn is under way once it reports a phase: a stop that
         // came before would end a turn that never ran.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let (bound, thinking) = {
-                let events = activity_ingress.events.lock().expect("surface activity");
+                let events = activity.events.lock().expect("surface activity");
                 let bound = events.iter().find_map(|event| match &event.payload {
-                    crate::child_agent_types::SubagentActivityPayload::ChildThreadBound {
-                        thread_id,
-                    } => Some(uuid::Uuid::from_bytes(*thread_id.as_bytes()).to_string()),
+                    SubagentActivityPayload::ChildThreadBound { thread_id } => {
+                        Some(uuid::Uuid::from_bytes(*thread_id.as_bytes()).to_string())
+                    }
                     _ => None,
                 });
                 let thinking = events.iter().any(|event| {
-                    matches!(
-                        event.payload,
-                        crate::child_agent_types::SubagentActivityPayload::PhaseChanged { .. }
-                    )
+                    matches!(event.payload, SubagentActivityPayload::PhaseChanged { .. })
                 });
                 (bound, thinking)
             };
@@ -4124,6 +4189,139 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The child's task once it has ended.
+    fn settled_task(task_registry: &TaskRegistry, task_id: &str) -> crate::tasks::TaskRecord {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let task = task_registry.get(task_id).expect("the child's task");
+            if !task.status.is_active() {
+                return task;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the child's task never ended: {:?}",
+                task.status
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// An async child in this process stopped through the registry call a
+    /// person's stop of an agent ends in is recorded as stopped, with what
+    /// it used, not as failed.
+    #[test]
+    fn a_stopped_async_child_is_recorded_as_stopped() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "async-child-stopped";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let (task_id, _) = start_streaming_async_child(
+            parent_controller(&host_handle, label, true),
+            cwd.path(),
+            &task_registry,
+            label,
+        );
+
+        // The registry call a person's stop of an agent (`StopTask`) ends in.
+        task_registry
+            .request_stop_detached(&task_id)
+            .expect("stop the child");
+
+        let task = settled_task(&task_registry, &task_id);
+        assert_eq!(
+            task.status,
+            orca_core::task_types::TaskStatus::Stopped,
+            "{:?}",
+            task.error
+        );
+        assert!(task.stop_requested);
+        assert_eq!(task.error, None);
+        assert!(task.usage.is_some(), "the child's usage is kept");
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// When the turn that started a kept child is over, its parent refuses
+    /// the child's end. The child stopped at quit is still recorded as
+    /// stopped: the parent not hearing of it does not make the stop fail.
+    #[test]
+    fn a_stopped_async_child_whose_parent_turn_is_over_is_recorded_as_stopped() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "async-child-parent-over";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let activity = Arc::new(KeptChildActivity {
+            refuses_the_end: true,
+            ..KeptChildActivity::default()
+        });
+        let (task_id, _) = start_streaming_async_child_reporting_to(
+            parent_controller(&host_handle, label, true),
+            cwd.path(),
+            &task_registry,
+            label,
+            activity.clone(),
+        );
+
+        let left = host_handle.stop_kept_subagents(Duration::from_secs(5));
+
+        assert_eq!(left, 0, "no kept child is still running");
+        let task = task_registry.get(&task_id).expect("the child's task");
+        assert_eq!(
+            task.status,
+            orca_core::task_types::TaskStatus::Stopped,
+            "{:?}",
+            task.error
+        );
+        assert_eq!(task.error, None);
+        assert!(task.usage.is_some(), "the child's usage is kept");
+        assert!(
+            !activity
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.payload, SubagentActivityPayload::Completed { .. })),
+            "the parent refused the child's end"
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// An async child whose run fails is still recorded as failed.
+    #[test]
+    fn a_failed_async_child_is_still_recorded_failed() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "async-child-failed";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let task_id = submit_async_child(
+            parent_controller(&host_handle, label, true),
+            cwd.path(),
+            &task_registry,
+            label,
+            "mock_fail",
+            Arc::new(KeptChildActivity::default()),
+        );
+
+        let task = settled_task(&task_registry, &task_id);
+        assert_eq!(
+            task.status,
+            orca_core::task_types::TaskStatus::Failed,
+            "{:?}",
+            task.result
+        );
+        assert!(!task.stop_requested);
+        assert!(
+            task.error
+                .as_deref()
+                .is_some_and(|error| error.contains("mock child failure requested")),
+            "{:?}",
+            task.error
+        );
+        host.shutdown().expect("shutdown runtime host");
     }
 
     /// The agents a TUI keeps end with it. Asked to stop, a kept child's
