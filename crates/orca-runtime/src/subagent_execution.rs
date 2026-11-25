@@ -3525,30 +3525,8 @@ mod tests {
     }
 
     /// Runs one hosted Sync child through the subagent tool, as a parent
-    /// turn does, and gives back the tool's result and the child's thread id
-    /// as the launch bound it.
-    fn launch_hosted_sync_child(
-        host: &crate::runtime_host::RuntimeHostHandle,
-        cwd: &std::path::Path,
-        label: &str,
-        prompt: &str,
-    ) -> (tool_types::ToolResult, String) {
-        let controller = crate::agent_controller::AgentController::new(
-            host.clone(),
-            label.to_string(),
-            label.to_string(),
-            0,
-        );
-        launch_hosted_sync_child_with(
-            controller,
-            config_in(cwd, SubagentConfig::default()),
-            cwd,
-            label,
-            prompt,
-        )
-    }
-
-    /// The same, with the parent's controller and config given.
+    /// turn does with this controller and config, and gives back the tool's
+    /// result and the child's thread id as the launch bound it.
     fn launch_hosted_sync_child_with(
         controller: crate::agent_controller::AgentController,
         config: RunConfig,
@@ -3674,19 +3652,118 @@ mod tests {
             .collect()
     }
 
-    /// A delegated turn is an operation of the child's surface, so a view of
-    /// the child reads the conversation the child had while and after it ran.
+    /// The record types of the session the child's thread recorded under
+    /// `home`, in the order they were written.
+    fn child_session_record_types(home: &std::path::Path, child_thread_id: &str) -> Vec<String> {
+        let suffix = format!("-{child_thread_id}.jsonl");
+        let mut directories = vec![home.join("sessions")];
+        let mut session = None;
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory)
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&suffix))
+                {
+                    session = Some(path);
+                }
+            }
+        }
+        let session = session.unwrap_or_else(|| {
+            panic!(
+                "the child {child_thread_id} recorded a session under {}",
+                home.display()
+            )
+        });
+        std::fs::read_to_string(&session)
+            .expect("read the child's session")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|record| record["type"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Under a host that was not asked to keep its subagents, a delegated
+    /// turn starts as it did before the child had a surface to go to: the
+    /// child's surface has no operation and its session no surface commit.
     #[test]
-    fn a_delegated_turn_is_recorded_on_the_childs_surface() {
+    fn a_delegated_turn_of_a_host_that_did_not_ask_is_not_on_the_childs_surface() {
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().expect("temp cwd");
         let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
         let host_handle = host.handle();
+        let label = "delegated-turn-not-kept";
+        let prompt = "mock_stream_delay_ms 1";
+        let reply = "Mock slow stream started.Mock slow stream completed.";
+
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, false),
+            config_in(cwd.path(), SubagentConfig::default()),
+            cwd.path(),
+            label,
+            prompt,
+        );
+
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Completed,
+            "{:?}",
+            result.error
+        );
+        assert_eq!(result.output.as_deref(), Some(reply));
+        let snapshot = child_surface_snapshot(&host_handle, &child_thread_id);
+        assert!(
+            surface_operations(&snapshot).is_empty(),
+            "the child's turn is not an operation of its surface: {:?}",
+            surface_operations(&snapshot)
+        );
+        assert!(surface_user_texts(&snapshot).is_empty());
+        host.shutdown().expect("shutdown runtime host");
+        let records = child_session_record_types(home.path(), &child_thread_id);
+        assert!(
+            records
+                .iter()
+                .any(|record| record == "conversation.message"),
+            "the child recorded its conversation: {records:?}"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.starts_with("runtime.surface_commit")),
+            "the child's session has no surface commit: {records:?}"
+        );
+    }
+
+    /// Under a host that keeps its subagents, a delegated turn is an
+    /// operation of the child's surface, so a view of the child reads the
+    /// conversation the child had while and after it ran.
+    #[test]
+    fn a_delegated_turn_is_recorded_on_the_childs_surface() {
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "delegated-turn-surface";
         // The mock answers this prompt with two text deltas.
         let prompt = "mock_stream_delay_ms 1";
         let reply = "Mock slow stream started.Mock slow stream completed.";
 
-        let (result, child_thread_id) =
-            launch_hosted_sync_child(&host_handle, cwd.path(), "delegated-turn-surface", prompt);
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, true),
+            config_in(cwd.path(), SubagentConfig::default()),
+            cwd.path(),
+            label,
+            prompt,
+        );
 
         assert_eq!(
             result.status,
@@ -3718,20 +3795,34 @@ mod tests {
         assert_eq!(surface_user_texts(&snapshot), vec![prompt]);
         assert_eq!(surface_assistant_texts(&snapshot), vec![reply]);
         host.shutdown().expect("shutdown runtime host");
+        let records = child_session_record_types(home.path(), &child_thread_id);
+        assert!(
+            records
+                .iter()
+                .any(|record| record == "runtime.surface_commit.committed"),
+            "the child's session has the commits of its surface: {records:?}"
+        );
     }
 
-    /// A child whose surface does not take the delegated turn still does its
-    /// work: the turn starts raw, as it did before it had a surface to go to,
-    /// and only the child's conversation is missing from that surface.
+    /// A kept child whose surface does not take the delegated turn still
+    /// does its work: the turn starts raw, as it does under a host that does
+    /// not keep its subagents, and only the child's conversation is missing
+    /// from that surface.
     #[test]
     fn a_delegated_turn_that_the_surface_refuses_still_runs() {
         let cwd = tempfile::tempdir().expect("temp cwd");
         let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
         let host_handle = host.handle();
+        let label = "delegated-turn-refused";
         let prompt = crate::runtime_host::REFUSE_DELEGATED_SURFACE_TURN_FOR_TEST;
 
-        let (result, child_thread_id) =
-            launch_hosted_sync_child(&host_handle, cwd.path(), "delegated-turn-refused", prompt);
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, true),
+            config_in(cwd.path(), SubagentConfig::default()),
+            cwd.path(),
+            label,
+            prompt,
+        );
 
         assert_eq!(
             result.status,

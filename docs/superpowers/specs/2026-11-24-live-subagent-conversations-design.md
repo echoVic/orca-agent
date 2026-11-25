@@ -212,14 +212,17 @@ keeps it. What the model sees does not change: the call returns a task id
 at once and results come through `task_wait` and the finished-children
 wake. Admission limits are unchanged.
 
-**R2. The delegated turn is an operation of the child's surface.**
-`AgentController::launch` starts the turn through a sibling of
+**R2. The delegated turn is an operation of the child's surface, under a
+host that keeps its subagents.** There `AgentController::launch` starts
+the turn through a sibling of
 `start_runtime_turn_on_surface` that takes the output writer, carries the
 event observer, the handlers and `headless_root`, and gives back the
 `OperationHandle` the controller settles on. If the surface cannot admit
 the turn, the raw start is used as before; the child then works and has no
 live conversation. A hosted child does not get a main-session task record
-from this admission.
+from this admission. Any other host starts the turn raw, as before this
+work: a turn on the surface has an activity ingress and a parent fence,
+and those decide where the child's own subagents run.
 
 **R3. A child never asks.** A child kept in the process by R1 is given
 handlers that answer without a prompt:

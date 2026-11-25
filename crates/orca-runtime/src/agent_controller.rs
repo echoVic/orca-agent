@@ -426,21 +426,32 @@ impl AgentController {
                 }) as Arc<dyn RuntimePermissionRequestHandler + Send + Sync>
             })
         };
-        let on_surface = child.start_delegated_turn_on_surface(
-            crate::runtime_host::DelegatedTurnStart {
-                prompt: request.prompt.clone(),
-                headless_root: child_config.tools.headless_exec,
-                observer: publisher.clone(),
-                approval: request.approval_handler.clone(),
-                permission: permission_handler.clone(),
-            },
-            AgentOutputWriter::new(publisher.clone()),
-        );
+        // Only a host that keeps its children starts their turns on their
+        // surfaces, where a view can follow them. Another host starts them
+        // raw, as it did before: a turn on the surface has an activity
+        // ingress and a parent fence, which decide where the child's own
+        // subagents run.
+        let on_surface = if kept_in_process {
+            child
+                .start_delegated_turn_on_surface(
+                    crate::runtime_host::DelegatedTurnStart {
+                        prompt: request.prompt.clone(),
+                        headless_root: child_config.tools.headless_exec,
+                        observer: publisher.clone(),
+                        approval: request.approval_handler.clone(),
+                        permission: permission_handler.clone(),
+                    },
+                    AgentOutputWriter::new(publisher.clone()),
+                )
+                .ok()
+        } else {
+            None
+        };
         let started = match on_surface {
-            Ok(operation) => Ok(operation),
+            Some(operation) => Ok(operation),
             // The child still does its work; it only has no conversation a
             // view can follow.
-            Err(_) => {
+            None => {
                 let mut turn = HostedTurnRequest::new(request.prompt)
                     .with_headless_root(child_config.tools.headless_exec)
                     .with_event_observer(publisher.clone());
