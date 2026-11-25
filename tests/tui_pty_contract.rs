@@ -548,12 +548,12 @@ fn a_queued_message_leaves_the_strip_once_it_is_sent() {
 }
 
 #[test]
-fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
+fn tui_tasks_workspace_stops_one_subagent_without_terminal_spam() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");
     std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n")
         .expect("configure full-auto mode");
-    let release_marker = cwd.path().join("release-detached-subagent");
+    let release_marker = cwd.path().join("release-subagent");
     let mut process = PtyProcess::spawn_with_prompt(
         home.path(),
         cwd.path(),
@@ -562,14 +562,14 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
             release_marker.display()
         ),
     )
-    .expect("spawn detached-subagent TUI in PTY");
+    .expect("spawn subagent TUI in PTY");
     let mut output = Vec::new();
     accept_new_workspace(&mut process, &mut output);
     assert_screen_shows(
         &process,
         &mut output,
         "Agents 1 active",
-        "parent did not expose the running detached child",
+        "parent did not expose the running child",
     );
 
     process.write(b"/agents\r").expect("open Tasks workspace");
@@ -583,7 +583,7 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
         &process,
         &mut output,
         "mock_stream_release_marker",
-        "Tasks workspace did not expose the detached child",
+        "Tasks workspace did not expose the child",
     );
     process.write(b"s").expect("stop selected subagent");
     assert_screen_shows(
@@ -602,6 +602,15 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
             .expect("poll TUI after task stop")
             .is_none(),
         "stopping a child must keep the parent TUI alive"
+    );
+    // The child never finishes on its own: its release marker is never
+    // written. Main's reply after the stopped call shows that the stop ended
+    // the child alone and main's turn went on past it.
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Mock completed after tool execution.",
+        "stopping one subagent ended the parent's turn instead of letting it go on",
     );
     let rendered = String::from_utf8_lossy(&output);
     assert!(

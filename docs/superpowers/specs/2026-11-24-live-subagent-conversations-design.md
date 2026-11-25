@@ -371,6 +371,34 @@ resume. If 6 fails, the runtime records the notice on main's surface. If 7
 fails, Enter in an agent's view steers, and queueing waits for its own
 design.
 
+Run on 2026-11-25 at the end of stage 1 (`a05a69d6`, `deepseek-flash`, a
+150x50 pty read with `pyte`, frames under `/tmp/orca-stage1/`), items 1 to 4
+hold. 1: in auto-edit both kept children wrote their file and ran
+`ls -a && cat` with no prompt, and no `orca subagent-worker` process existed
+at any point. 2: the task registry held a main-session record for main's
+turns only, and the Agents panel, Esc, `s`, quit and `--resume` all worked
+without one for a child. 3: a host keeps its children in its process only
+when it asks to; `server_runtime_contract`, `acp_agent` and
+`subagent_delegation_contract` pass. 4: in suggest, each child's write and
+shell call came back as a tool result, `This call needs an approval, and a
+subagent cannot ask for one.`; neither child stopped there, each reply said
+what it could not do, main's reply said so too, and neither file exists.
+Also seen: a child's conversation streams while it runs and a message sent
+in it is handed back; the rows keep their order; `s` in the Agents panel
+stops one child (`stopped`, no `s stop`) while main and the other go on;
+Esc or Ctrl+C on main stops both (`cancelled`, `0 active`) within about
+three seconds, during `sleep 20` too, and the next prompt is answered with
+no row coming back; the Ctrl+C after that says `Press Ctrl+C again to
+quit.`, the TUI exits 130, no process is left, both records are `stopped`,
+and after a resume neither is shown running. Seen and left to stage 2:
+`Inherited conversation context.` shows in a child's view and on main;
+after returning from a child's view main's running row and its local
+notices (`Stopping …`) are gone, and `Main is running` is lost when a child
+is opened again from its own view; `Agent completed` is shown in the
+child's own view; a cancelled child's panel history ends `completed`; a
+child stopped with `s` that main waited on with `task_wait` reads
+`agent cancelled`, and main started it again both times.
+
 ## Not in this change
 
 - Asking the person, or the main agent, on a subagent's behalf.

@@ -97,6 +97,63 @@ instead of a tool failure. Use `task_wait`, `task_read_output`, `task_list`, and
 `task_stop` to observe and control the task. Finite parent budgets use the same
 path through a durable child reservation.
 
+## Subagents Started From The TUI
+
+A subagent that the TUI starts runs inside the TUI's own process, on a thread
+of its own, instead of as a separate `orca subagent-worker` process. It ends
+when the TUI quits. `orca exec` is unchanged: its subagents are detached
+workers that finish after it exits. The app server and ACP are unchanged too.
+
+Four kinds of subagent run as before, as a separate process that finishes in
+the background after the TUI quits and may ask for a permission on its row:
+those started with `"isolation": "worktree"`, custom agent types, those under
+a finite parent budget, and those continued with `resume_from`. The rest of
+this section is about the others.
+
+A main turn waits for the subagents it started before it ends, so main is
+running while they run. In the TUI:
+
+- A subagent's conversation can be opened while it runs: select its row under
+  the conversation with Shift+↑↓ and press Enter, or select it in the Agents
+  panel (`/agents`) and press Enter. The view shows the task it was given as
+  the first message, then its text, tool calls and results as they happen.
+  Esc returns to the main conversation and interrupts nothing.
+- A message cannot be sent to a subagent yet. Text submitted in its
+  conversation is handed back to the composer with `this is an agent's
+  conversation: return to the main conversation to send a message`.
+- Esc or Ctrl+C on the running main turn stops its subagents with it. Their
+  rows leave the dock and read `cancelled` in the Agents panel.
+- `s` on a subagent's row in the Agents panel stops that subagent only. A
+  `Stopping …` notice is shown at once, and the row reads `stopped` once the
+  subagent has settled. Main's turn and the other subagents go on. A
+  `subagent` call of main's that was waiting for the stopped one returns `the
+  subagent was stopped by the user`; one started in the background reads
+  `stopped` in `task_wait`.
+- Quitting stops the subagents that are still running and records them as
+  stopped. If any is running when main is idle, the first Ctrl+C says how many
+  (`2 agents are still running. Press Ctrl+C again to quit and stop them.`).
+- Backgrounding a main turn that has running subagents is not supported yet.
+
+Such a subagent never asks the person, or the main agent, anything. What it
+may do is fixed when it starts, from the main conversation's permission mode,
+rules and sandbox at that moment; a later change to main's mode does not reach
+a running subagent:
+
+| Main's mode | The subagent |
+| --- | --- |
+| full-auto (the TUI's default) | does all of it on the host, as main does |
+| auto-edit | writes, runs commands and uses the network inside the sandbox, as main does |
+| suggest | reads only: main would ask before each write or command, and the subagent cannot ask |
+| plan | reads only, as main |
+
+Where main would be asked (a write or command in suggest, anything outside
+the sandbox, a tool with an "always ask" rule), the subagent's call is refused
+at once with `This call needs an approval, and a subagent cannot ask for one.`
+and the subagent goes on. It is not offered a tool that asks the user a
+question, and an MCP server's request for input is declined. The subagent is
+told at its start to say in its reply what it could not do, so the main
+agent, which can ask, may do it.
+
 ## Scheduling And Capacity
 
 Direct, nested, Workflow, hosted, continued, and recovered children share one
@@ -153,7 +210,9 @@ tools absent from the built-in ancestor's allowlist.
 Approval mode, execution profile, permission rules/profiles, workspace roots,
 and additional working directories are inherited from the parent unchanged.
 Definitions cannot supply permission grants or execution settings.
-Parent task budgets and depth limits continue to apply.
+Parent task budgets and depth limits continue to apply. A subagent that runs
+inside the TUI applies them without ever asking; see
+[Subagents Started From The TUI](#subagents-started-from-the-tui).
 
 Model selection uses an explicit call override first, then the nearest
 definition's model, then the parent. `auto` retains the existing parent-router
