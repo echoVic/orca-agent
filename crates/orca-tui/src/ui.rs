@@ -13997,6 +13997,77 @@ mod tests {
         assert!(lines.iter().all(|line| !line.contains("agent 5")));
     }
 
+    /// A kept agent whose row ended with its parent's turn is drawn as ended:
+    /// it leaves the dock, and the Agents panel counts it as not active and
+    /// draws it with no spinner, no stale activity and no stop.
+    #[test]
+    fn an_agent_stopped_with_its_parent_turn_leaves_the_dock_and_offers_no_stop() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let kept = |status| {
+            let mut task = workflow_task_for_agent_dashboard(
+                "kept agent",
+                "kept",
+                orca_core::workflow_types::WorkflowAgentStatus::Running,
+            );
+            task.task_type = TaskType::Subagent;
+            task.workflow_agents.clear();
+            task.workflow_run_id = None;
+            task.status = status;
+            task.subagent_child_thread_id = Some("thread-kept".to_string());
+            task.subagent_current_activity = Some("thinking".to_string());
+            task.publication_revision = Some(5);
+            if status != TaskStatus::Running {
+                task.completed_at_ms = Some(4_000);
+            }
+            task
+        };
+        let dock = |tasks: &[BackgroundTaskSummary]| -> Vec<String> {
+            background_task_activity_lines(tasks, &theme, 0, None, false, 100)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+        assert_eq!(
+            dock(&[kept(TaskStatus::Running)])
+                .first()
+                .map(String::as_str),
+            Some(" ● Agents 1 active · /agents view")
+        );
+        let ended = dock(&[kept(TaskStatus::Cancelled)]);
+        assert!(
+            ended
+                .iter()
+                .all(|line| !line.contains("Agents") && !line.contains("kept agent")),
+            "{ended:?}"
+        );
+
+        let mut state = test_state();
+        state.panel_mode = PanelMode::Agents;
+        state.replace_workflow_tasks_for_test(vec![kept(TaskStatus::Cancelled)]);
+        let textarea = TextArea::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
+            .expect("test backend");
+        terminal
+            .draw(|frame| render(frame, &mut state, &textarea, &theme))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("1 task · 0 active"));
+        assert!(rendered.contains("kept agent · cancelled"));
+        assert!(!rendered.contains("thinking"));
+        assert!(!rendered.contains("s stop"));
+        assert!(
+            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+                .iter()
+                .all(|frame| !rendered.contains(frame)),
+            "an ended agent has no spinner"
+        );
+    }
+
     #[test]
     fn expanded_dock_raises_the_subagent_cap_and_appends_the_close_hint() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);

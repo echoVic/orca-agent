@@ -351,6 +351,28 @@ mod tests {
         ));
     }
 
+    /// A kept agent that ended with its parent's turn is shown cancelled, its
+    /// last report still "thinking"; there is nothing left for `s` to stop.
+    #[test]
+    fn a_kept_agent_ended_with_its_parents_turn_is_not_offered_a_stop() {
+        let (mut state, rx) = state(vec![{
+            let mut kept = task("kept", 1_000);
+            kept.status = TaskStatus::Cancelled;
+            kept.completed_at_ms = Some(2_000);
+            kept.subagent_child_thread_id = Some("thread-kept".to_string());
+            kept.subagent_current_activity = Some("thinking".to_string());
+            kept
+        }]);
+        let tx = state.event_tx.clone();
+
+        assert!(handle_agent_workspace_key(
+            KeyCode::Char('s'),
+            &mut state,
+            &tx,
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
     #[test]
     fn workflow_agent_rows_do_not_emit_unsupported_task_actions() {
         let mut workflow = task("workflow", 1_000);

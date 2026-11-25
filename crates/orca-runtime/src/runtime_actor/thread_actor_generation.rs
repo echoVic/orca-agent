@@ -1168,12 +1168,47 @@ impl ThreadActor {
         fence: surface::SurfaceOperationFence,
         event: SubagentActivityEvent,
     ) -> io::Result<()> {
+        // A later turn of this thread is running; the end belongs to the
+        // earlier one that owned the child.
+        if active.surface_operation.as_ref() != Some(&fence)
+            && self.is_late_kept_subagent_end(&event)
+        {
+            return self.commit_late_kept_subagent_end(&fence, &active.task_registry, event);
+        }
         self.commit_subagent_activity_inner(
             Some(active),
             Some(&fence),
             &active.task_registry,
             event,
         )
+    }
+
+    /// Whether `event` is the end of a child this host keeps in its process.
+    /// Such a child is owned by its parent's generation, and an interrupted
+    /// turn stops it without waiting for it, so its end can come after that
+    /// generation has stopped: while the thread is idle, or while a later
+    /// turn of it runs.
+    pub(super) fn is_late_kept_subagent_end(&self, event: &SubagentActivityEvent) -> bool {
+        matches!(&event.payload, SubagentActivityPayload::Completed { .. })
+            && matches!(&event.owner, SubagentActivityOwner::Generation { .. })
+            && self
+                .agent_controller
+                .as_ref()
+                .is_some_and(|controller| controller.keeps_subagents_in_process())
+    }
+
+    /// Commits the end of a kept child, reported for `fence`, once that
+    /// generation is no longer the one running here. It is committed as any
+    /// end is, at the scope of the generation that owned the child, and the
+    /// surface permit decides: the end of a stopped generation's child is
+    /// admitted only while the child's row still runs under it.
+    pub(super) fn commit_late_kept_subagent_end(
+        &mut self,
+        fence: &surface::SurfaceOperationFence,
+        task_registry: &crate::tasks::TaskRegistry,
+        event: SubagentActivityEvent,
+    ) -> io::Result<()> {
+        self.commit_subagent_activity_inner(None, Some(fence), task_registry, event)
     }
 
     /// Commits a detached child event after the parent generation has ended.
