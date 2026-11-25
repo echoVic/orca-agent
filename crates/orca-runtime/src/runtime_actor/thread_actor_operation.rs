@@ -2121,37 +2121,21 @@ impl ThreadActor {
     }
 
     /// Whether a person's stop names a child, running on this surface, that
-    /// the turn `active` keeps on a thread of this process.
-    ///
-    /// The child must be owned by this very turn: a child of another parent
-    /// reports to that parent's thread, and a child of an earlier turn to
-    /// that turn, so neither carries this fence. Its task must be a
-    /// subagent's with no worker process, so neither a child in a worker
-    /// process nor a workflow's agent, whose task is the workflow's, can
-    /// match. And the host must keep its children here, so a host that does
-    /// not refuses as it always has. Whether its record has ended already
-    /// is the stop's to answer.
+    /// the turn `active` keeps on a thread of this process; see
+    /// [`is_running_kept_subagent`].
     fn is_running_kept_subagent(
         &self,
         active: &ActiveOperation,
         subagent: &surface::SurfaceSubagent,
     ) -> bool {
-        let surface::SurfaceSubagentOwner::Generation { fence } = &subagent.owner else {
-            return false;
-        };
-        active.surface_operation.as_ref() == Some(fence)
-            && subagent.status == surface::SurfaceSubagentStatus::Running
-            && self
-                .agent_controller
+        is_running_kept_subagent(
+            active.surface_operation.as_ref(),
+            subagent,
+            self.agent_controller
                 .as_ref()
-                .is_some_and(|controller| controller.keeps_subagents_in_process())
-            && active
-                .task_registry
-                .get(subagent.task_id.as_str())
-                .is_some_and(|record| {
-                    record.task_type == orca_core::task_types::TaskType::Subagent
-                        && record.worker_pid.is_none()
-                })
+                .is_some_and(|controller| controller.keeps_subagents_in_process()),
+            active.task_registry.get(subagent.task_id.as_str()).as_ref(),
+        )
     }
 
     /// Stops one child the running turn keeps on a thread of this process.
@@ -9587,6 +9571,39 @@ fn subagent_already_terminal(
     }
 }
 
+/// Whether a person's stop names a child, running on this surface, that the
+/// turn whose fence is `running` keeps on a thread of this process.
+///
+/// The child must be owned by this very turn: a child of another parent
+/// reports to that parent's thread, and a child of an earlier turn to that
+/// turn, so neither carries this fence. It must have a thread of its own,
+/// whose turn the stop ends: a child that runs in this process without one
+/// (a sync child with a custom type, an isolation or a finite budget) also
+/// reports as the turn's, but watches only its parent's cancel, so it would
+/// run on. Its task, `record`, must be a subagent's with no worker process,
+/// so neither a child in a worker process nor a workflow's agent, whose
+/// task is the workflow's, can match. And the host must keep its children
+/// here (`keeps`), so a host that does not refuses as it always has.
+/// Whether its record has ended already is the stop's to answer.
+fn is_running_kept_subagent(
+    running: Option<&surface::SurfaceOperationFence>,
+    subagent: &surface::SurfaceSubagent,
+    keeps: bool,
+    record: Option<&crate::tasks::TaskRecord>,
+) -> bool {
+    let surface::SurfaceSubagentOwner::Generation { fence } = &subagent.owner else {
+        return false;
+    };
+    running == Some(fence)
+        && subagent.status == surface::SurfaceSubagentStatus::Running
+        && subagent.child_thread_id.is_some()
+        && keeps
+        && record.is_some_and(|record| {
+            record.task_type == orca_core::task_types::TaskType::Subagent
+                && record.worker_pid.is_none()
+        })
+}
+
 #[cfg(test)]
 mod jsonl_resume_generation_regression_tests {
     use super::*;
@@ -10045,4 +10062,110 @@ fn surface_image_request_block(
         },
     };
     Some(surface::SurfaceInputRequestBlock::Image { source, detail })
+}
+
+#[cfg(test)]
+mod kept_subagent_stop_tests {
+    use super::is_running_kept_subagent;
+    use crate::runtime_surface as surface;
+
+    fn uuid_v7() -> [u8; 16] {
+        *uuid::Uuid::now_v7().as_bytes()
+    }
+
+    fn fence() -> surface::SurfaceOperationFence {
+        surface::SurfaceOperationFence {
+            thread_id: surface::SurfaceThreadId::try_from_bytes(uuid_v7()).unwrap(),
+            thread_owner_epoch: surface::ThreadOwnerEpoch::new(1),
+            operation_id: surface::SurfaceOperationId::try_from_bytes(uuid_v7()).unwrap(),
+            generation_id: surface::SurfaceGenerationId::new(0),
+        }
+    }
+
+    /// A child running under the turn whose fence is `fence`, on a thread
+    /// of its own when `child_thread_id` is given.
+    fn running_child(
+        task_id: &str,
+        fence: &surface::SurfaceOperationFence,
+        child_thread_id: Option<surface::SurfaceThreadId>,
+    ) -> surface::SurfaceSubagent {
+        surface::SurfaceSubagent {
+            subagent_id: surface::SurfaceSubagentId::try_new(task_id).unwrap(),
+            task_id: surface::SurfaceTaskId::try_new(task_id).unwrap(),
+            revision: surface::SubagentRevision::try_new(3).unwrap(),
+            description: surface::DisplayText::new("explore the provider"),
+            batch_id: surface::NonEmptyText::try_new("batch").unwrap(),
+            batch_size: 1,
+            child_thread_id,
+            status: surface::SurfaceSubagentStatus::Running,
+            activity: None,
+            subagent_activity_history: Vec::new(),
+            turn: Some(1),
+            usage: None,
+            output: None,
+            error: None,
+            continuation: None,
+            owner: surface::SurfaceSubagentOwner::Generation {
+                fence: fence.clone(),
+            },
+            source: surface::SurfaceSubagentSource::new(
+                surface::SurfaceTaskAttemptId::try_new("attempt-1").unwrap(),
+                orca_core::thread_identity::TurnId::new(),
+                3,
+                surface::UnixMillis::new(2),
+                surface::SurfaceCommitId::try_from_bytes(uuid_v7()).unwrap(),
+                surface::Sha256Digest::new([8; 32]),
+            ),
+        }
+    }
+
+    /// Only a child with a thread of its own is stopped as one the turn
+    /// keeps: a child that runs in the process without one reports as the
+    /// turn's too, but its stop would not reach it.
+    #[test]
+    fn only_a_child_with_a_thread_of_its_own_is_stopped_as_kept() {
+        let registry = crate::tasks::TaskRegistry::new("kept-stop".to_string());
+        let task = registry.create_subagent("explore the provider".to_string(), None);
+        let record = registry.get(&task.id).expect("the child's record");
+        let fence = fence();
+        let threaded = running_child(
+            &task.id,
+            &fence,
+            Some(surface::SurfaceThreadId::try_from_bytes(uuid_v7()).unwrap()),
+        );
+        let threadless = running_child(&task.id, &fence, None);
+
+        assert!(is_running_kept_subagent(
+            Some(&fence),
+            &threaded,
+            true,
+            Some(&record)
+        ));
+        assert!(!is_running_kept_subagent(
+            Some(&fence),
+            &threadless,
+            true,
+            Some(&record)
+        ));
+        // With a thread, the rest still holds: the very turn, a keeping
+        // host, and a subagent's record.
+        assert!(!is_running_kept_subagent(
+            Some(&self::fence()),
+            &threaded,
+            true,
+            Some(&record)
+        ));
+        assert!(!is_running_kept_subagent(
+            Some(&fence),
+            &threaded,
+            false,
+            Some(&record)
+        ));
+        assert!(!is_running_kept_subagent(
+            Some(&fence),
+            &threaded,
+            true,
+            None
+        ));
+    }
 }
