@@ -14018,6 +14018,8 @@ mod tests {
             task.publication_revision = Some(5);
             if status != TaskStatus::Running {
                 task.completed_at_ms = Some(4_000);
+                // What the parent's surface gives the row after an interrupt.
+                task.error = Some("agent cancelled".to_string());
             }
             task
         };
@@ -14046,26 +14048,36 @@ mod tests {
             "{ended:?}"
         );
 
-        let mut state = test_state();
-        state.panel_mode = PanelMode::Agents;
-        state.replace_workflow_tasks_for_test(vec![kept(TaskStatus::Cancelled)]);
-        let textarea = TextArea::default();
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
-            .expect("test backend");
-        terminal
-            .draw(|frame| render(frame, &mut state, &textarea, &theme))
-            .expect("draw");
-        let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("1 task · 0 active"));
-        assert!(rendered.contains("kept agent · cancelled"));
-        assert!(!rendered.contains("thinking"));
-        assert!(!rendered.contains("s stop"));
-        assert!(
+        let panel = |task: BackgroundTaskSummary| -> String {
+            let mut state = test_state();
+            state.panel_mode = PanelMode::Agents;
+            state.replace_workflow_tasks_for_test(vec![task]);
+            let textarea = TextArea::default();
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
+                .expect("test backend");
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .expect("draw");
+            format!("{:?}", terminal.backend().buffer())
+        };
+        let spinning = |rendered: &str| {
             ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
                 .iter()
-                .all(|frame| !rendered.contains(frame)),
-            "an ended agent has no spinner"
-        );
+                .any(|frame| rendered.contains(frame))
+        };
+        // Control: the same agent while it runs has all three.
+        let running_panel = panel(kept(TaskStatus::Running));
+        assert!(running_panel.contains("1 task · 1 active"));
+        assert!(running_panel.contains("thinking"));
+        assert!(running_panel.contains("s stop"));
+        assert!(spinning(&running_panel), "a running agent has a spinner");
+
+        let ended_panel = panel(kept(TaskStatus::Cancelled));
+        assert!(ended_panel.contains("1 task · 0 active"));
+        assert!(ended_panel.contains("kept agent · cancelled"));
+        assert!(!ended_panel.contains("thinking"));
+        assert!(!ended_panel.contains("s stop"));
+        assert!(!spinning(&ended_panel), "an ended agent has no spinner");
     }
 
     #[test]

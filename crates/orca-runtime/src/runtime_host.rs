@@ -34817,6 +34817,23 @@ mod tests {
         );
     }
 
+    /// The marker a `mock_stream_release_marker` turn waits on. It is also
+    /// written when dropped, so an assertion that fails first does not leave
+    /// that turn waiting through the host's teardown.
+    struct ReleaseMarker(std::path::PathBuf);
+
+    impl ReleaseMarker {
+        fn release(&self) {
+            std::fs::write(&self.0, b"").expect("release the turn");
+        }
+    }
+
+    impl Drop for ReleaseMarker {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"");
+        }
+    }
+
     /// The phase of the generation `fence` on `snapshot`.
     fn generation_phase_shown(
         snapshot: &surface::SurfaceSnapshot,
@@ -34909,7 +34926,16 @@ mod tests {
         assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
         assert!(task.completed_at.is_some());
         assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
-        assert_eq!(task.error, shown.error);
+        // Both rows carry the cancel the agent's end reports, as when it
+        // lands while the turn still runs; the record has no error for it.
+        assert_eq!(
+            task.error.as_ref().map(surface::DisplayText::as_str),
+            Some(crate::agent_controller::AGENT_CANCELLED)
+        );
+        assert_eq!(
+            shown.error.as_ref().map(surface::DisplayText::as_str),
+            Some(crate::agent_controller::AGENT_CANCELLED)
+        );
         // The agent's own end, as when it lands while the turn still runs.
         assert_eq!(
             shown
@@ -35014,7 +35040,7 @@ mod tests {
         );
 
         // The next turn runs until it is released.
-        let release = cwd.path().join("release the next turn");
+        let release = ReleaseMarker(cwd.path().join("release the next turn"));
         let snapshot = read_snapshot();
         let next = committed_surface_value(
             attachment
@@ -35023,7 +35049,7 @@ mod tests {
                     surface_request_id(),
                     surface_user_turn_intent(
                         &snapshot,
-                        &format!("mock_stream_release_marker {}", release.display()),
+                        &format!("mock_stream_release_marker {}", release.0.display()),
                     ),
                 )
                 .expect("reserve the next turn"),
@@ -35086,6 +35112,7 @@ mod tests {
             snapshot.subagents
         );
         assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        assert_eq!(record.error, None);
         assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
         assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
         assert_eq!(
@@ -35116,7 +35143,7 @@ mod tests {
             "(task Cancelled patches, subagent terminal patches)"
         );
 
-        std::fs::write(&release, b"").expect("release the next turn");
+        release.release();
         let terminal = attachment
             .client
             .wait_operation_terminal(surface_request_id(), next.operation_id.clone())

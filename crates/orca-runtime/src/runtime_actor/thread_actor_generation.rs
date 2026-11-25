@@ -1175,6 +1175,21 @@ impl ThreadActor {
         {
             return self.commit_late_kept_subagent_end(&fence, &active.task_registry, event);
         }
+        // The running turn's own generation, should its surface already show
+        // it stopped, takes a child's end only from a host that keeps the
+        // child, as the idle and later-turn routes do. The actor does not
+        // hold a generation its surface shows stopped today; this keeps the
+        // gate from relying on that.
+        if !own_generation_takes(
+            self.surface_generation_phase(&fence),
+            &event,
+            self.keeps_children_in_process(),
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "subagent activity generation fence is stale or terminalizing",
+            ));
+        }
         self.commit_subagent_activity_inner(
             Some(active),
             Some(&fence),
@@ -1191,10 +1206,29 @@ impl ThreadActor {
     pub(super) fn is_late_kept_subagent_end(&self, event: &SubagentActivityEvent) -> bool {
         matches!(&event.payload, SubagentActivityPayload::Completed { .. })
             && matches!(&event.owner, SubagentActivityOwner::Generation { .. })
-            && self
-                .agent_controller
-                .as_ref()
-                .is_some_and(|controller| controller.keeps_subagents_in_process())
+            && self.keeps_children_in_process()
+    }
+
+    fn keeps_children_in_process(&self) -> bool {
+        self.agent_controller
+            .as_ref()
+            .is_some_and(|controller| controller.keeps_subagents_in_process())
+    }
+
+    /// The phase this thread's surface shows for the generation `fence`.
+    fn surface_generation_phase(
+        &self,
+        fence: &surface::SurfaceOperationFence,
+    ) -> Option<surface::GenerationPhase> {
+        let snapshot = self.resident_surface.coordinator.state().snapshot();
+        snapshot
+            .foreground_operation
+            .iter()
+            .chain(snapshot.queued_operations.iter())
+            .chain(snapshot.operation_history.iter())
+            .flat_map(|operation| operation.generations.iter())
+            .find(|generation| generation.fence == *fence)
+            .map(|generation| generation.phase)
     }
 
     /// Commits the end of a kept child, reported for `fence`, once that
@@ -5903,6 +5937,100 @@ pub(super) fn unrecorded_tool_output(
 /// that failed say, is still an error and stays.
 fn error_after_a_persons_stop(error: Option<surface::DisplayText>) -> Option<surface::DisplayText> {
     error.filter(|error| error.as_str() != crate::agent_controller::AGENT_CANCELLED)
+}
+
+/// Whether the running turn's own generation takes `event` while its surface
+/// shows that generation in `phase`. Once the generation is shown stopped, a
+/// child's end is taken there only from a host that keeps its children in
+/// its process; anything else is left to the surface permit, as before.
+fn own_generation_takes(
+    phase: Option<surface::GenerationPhase>,
+    event: &SubagentActivityEvent,
+    keeps_children: bool,
+) -> bool {
+    phase != Some(surface::GenerationPhase::Stopped)
+        || !matches!(&event.payload, SubagentActivityPayload::Completed { .. })
+        || !matches!(&event.owner, SubagentActivityOwner::Generation { .. })
+        || keeps_children
+}
+
+#[cfg(test)]
+mod own_generation_tests {
+    use super::own_generation_takes;
+    use crate::agent_continuation::AgentAttemptId;
+    use crate::child_agent_types::{
+        SubagentActivityEvent, SubagentActivityOwner, SubagentActivityPayload,
+    };
+    use crate::runtime_surface as surface;
+
+    fn report(
+        owner: SubagentActivityOwner,
+        payload: SubagentActivityPayload,
+    ) -> SubagentActivityEvent {
+        SubagentActivityEvent::new(
+            surface::SurfaceTaskId::try_new("own-task").unwrap(),
+            surface::SurfaceSubagentId::try_new("own-agent").unwrap(),
+            AgentAttemptId::new(),
+            orca_core::thread_identity::TurnId::new(),
+            2,
+            owner,
+            payload,
+        )
+    }
+
+    fn generation() -> SubagentActivityOwner {
+        SubagentActivityOwner::Generation {
+            operation_id: surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn detached() -> SubagentActivityOwner {
+        SubagentActivityOwner::DetachedTask {
+            task_id: surface::SurfaceTaskId::try_new("own-task").unwrap(),
+            task_revision: surface::TaskRevision::try_new(1).unwrap(),
+            authority_digest: surface::Sha256Digest::digest("own-authority"),
+        }
+    }
+
+    fn end() -> SubagentActivityPayload {
+        SubagentActivityPayload::Completed {
+            status: surface::SurfaceSubagentTerminalStatus::Cancelled,
+            output: None,
+            error: None,
+            usage: None,
+        }
+    }
+
+    fn progress() -> SubagentActivityPayload {
+        SubagentActivityPayload::PhaseChanged {
+            phase: surface::SurfaceSubagentPhase::Thinking,
+            turn: None,
+        }
+    }
+
+    #[test]
+    fn a_stopped_own_generation_takes_an_end_only_from_a_keeping_host() {
+        let stopped = Some(surface::GenerationPhase::Stopped);
+        let an_end = report(generation(), end());
+        assert!(own_generation_takes(stopped, &an_end, true));
+        assert!(!own_generation_takes(stopped, &an_end, false));
+
+        // A live generation takes it from any host, as before.
+        for phase in [
+            surface::GenerationPhase::Started,
+            surface::GenerationPhase::Transferred,
+        ] {
+            assert!(own_generation_takes(Some(phase), &an_end, false));
+        }
+        // Anything but a generation-owned end is left to the permit.
+        let a_progress = report(generation(), progress());
+        let a_detached_end = report(detached(), end());
+        assert!(own_generation_takes(stopped, &a_progress, false));
+        assert!(own_generation_takes(stopped, &a_detached_end, false));
+    }
 }
 
 #[cfg(test)]
