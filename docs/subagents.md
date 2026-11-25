@@ -126,10 +126,13 @@ running while they run. In the TUI:
 - `s` on a subagent's row in the Agents panel stops that subagent only. A
   `Stopping …` notice is shown at once, and the row reads `stopped` once the
   subagent has settled. Main's turn and the other subagents go on. Main is
-  told `the subagent was stopped by the user`: a `subagent` call of main's
+  told who stopped it, in these words: `the person using Orca stopped this
+  subagent from the Agents panel; it was not stopped by you and it did not
+  fail. Do not start it again unless they ask.` A `subagent` call of main's
   that was waiting for the stopped one returns it, and a subagent started in
   the background reads `stopped` in main's `task_wait`, with it as the
-  result.
+  result. Its completion notice gives the same line, without the caveat that
+  follows a subagent's own report.
 - Quitting stops the subagents that are still running and records them as
   stopped. While they run, main's turn is running too, so the first Ctrl+C
   stops that turn and its subagents with it; the next Ctrl+C says `Press

@@ -403,11 +403,14 @@ notices (`Stopping …`) are gone, and `Main is running` is lost when a child
 is opened again from its own view; `Agent completed` is shown in the
 child's own view; a cancelled child's panel history ends `completed`. A
 child stopped with `s` that main waited on with `task_wait` read
-`agent cancelled`, and main started it again both times; since the final
-fix wave it reads `the subagent was stopped by the user` there and in a
-`subagent` call that waited on it. In the one run since (`fd57a5e1`), main
-did not start it again: it reported the agent as stopped by the user and
-offered to start it again if asked.
+`agent cancelled`, and main started it again both times. The final fix
+wave made it read that the user stopped it, there and in a `subagent` call
+that waited on it; in the three runs that followed main still doubted it
+("I didn't stop it") and started the agent again once, the completion notice
+calling the line a child's own report. Since the second round of that wave
+it reads `the person using Orca stopped this subagent from the Agents panel;
+it was not stopped by you and it did not fail. Do not start it again unless
+they ask.`, and the notice gives it without that caveat.
 
 ## Not in this change
 

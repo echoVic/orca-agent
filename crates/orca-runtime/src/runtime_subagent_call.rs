@@ -52,7 +52,7 @@ use crate::runtime_surface::{
 use crate::runtime_tool_call::RuntimeToolCallRuntime;
 use crate::schema_validation::validate_json_schema_subset;
 use crate::subagent::{SubagentIsolation, SubagentRequest};
-use crate::tasks::TaskRegistry;
+use crate::tasks::{SUBAGENT_STOPPED_BY_PERSON, TaskRegistry};
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 
@@ -1145,11 +1145,6 @@ fn cancelled_task_output(
         child_budget_usage: None,
     }
 }
-
-/// What a parent reads of a child a person stopped on its own: a turn that
-/// waited on it, and `task_wait`, `task_read_output` and the completion
-/// notice, which read its record's result.
-const SUBAGENT_STOPPED_BY_PERSON: &str = "the subagent was stopped by the user";
 
 fn run_threaded_agent_worker(
     invocation: RuntimeSubagentInvocation,

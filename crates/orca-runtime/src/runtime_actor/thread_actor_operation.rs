@@ -2180,7 +2180,7 @@ impl ThreadActor {
         }
         let remember = !record.stop_requested;
         // The record's control carries the stop to the child's worker, which
-        // tells the parent the subagent was stopped by the user.
+        // tells the parent that the person stopped it.
         if remember {
             self.subagents_stopped_by_person.insert(task_id.to_string());
             record.control.mark_stopped_by_person();

@@ -34235,8 +34235,9 @@ mod tests {
             })
             .collect();
         assert!(
-            told.iter()
-                .any(|content| content.contains("the subagent was stopped by the user")),
+            told.iter().any(|content| content.contains(
+                "the person using Orca stopped this subagent from the Agents panel; it was not stopped by you and it did not fail. Do not start it again unless they ask."
+            )),
             "{told:?}"
         );
         host.shutdown()
@@ -34331,7 +34332,7 @@ mod tests {
         assert!(
             !told
                 .iter()
-                .any(|content| content.contains("the subagent was stopped by the user")),
+                .any(|content| content.contains("stopped this subagent from the Agents panel")),
             "{told:?}"
         );
         host.shutdown()
@@ -34910,7 +34911,9 @@ mod tests {
         // give the parent for it.
         assert_eq!(
             record.result.as_deref(),
-            Some("the subagent was stopped by the user")
+            Some(
+                "the person using Orca stopped this subagent from the Agents panel; it was not stopped by you and it did not fail. Do not start it again unless they ask."
+            )
         );
 
         // Its own conversation records its turn as cancelled.
