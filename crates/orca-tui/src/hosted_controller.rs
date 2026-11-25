@@ -1263,12 +1263,13 @@ pub(crate) fn hosted_tui_controller_loop(
 
     // The agents this TUI started run on its threads and end with it: stop
     // them so their tasks are recorded as stopped, not left as running.
-    // The turn under way is stopped first, so that it does not go on with
-    // the agents' results once they stop, and its stop also reaches the
-    // agents still waiting for capacity, which have no thread to be asked.
+    // The turn under way is not stopped here: a quit from main's view sent
+    // its interrupt before this cancel, and that stop also reaches the
+    // agents still waiting for capacity, which have no thread to be asked;
+    // an attached session's turn goes on after this TUI. (From an agent's
+    // view while main runs, the keys do not send that interrupt yet.)
     // The wait lets an agent that takes a few seconds to end report its
     // end to the conversation before that conversation's thread ends.
-    let _ = control.interrupt_current();
     let _ = host.stop_kept_subagents(Duration::from_secs(5));
     control.unbind_view();
     if let Some(focus) = view.close() {
@@ -1675,8 +1676,8 @@ mod tests {
             "{queued:?}"
         );
 
-        // The quit alone, as the TUI sends it when the person quits while a
-        // turn runs.
+        // The cancel alone, without the interrupt a quit from main's view
+        // sends first: the agents still end, and end stopped.
         action_tx.send(UserAction::Cancel).expect("cancel action");
         runtime.shutdown().expect("hosted controller shutdown");
 
