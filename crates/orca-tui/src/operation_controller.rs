@@ -368,7 +368,7 @@ impl TuiSurfaceTaskControl {
         &self,
         task_id: &str,
         event_tx: &Sender<TuiEvent>,
-    ) -> Result<Option<SurfaceProjectionState>, String> {
+    ) -> Result<Option<SurfaceProjectionState>, crate::surface_client::TaskStopError> {
         let runtime = self.lock_hosted().queue_runtime.clone();
         let Some(runtime) = runtime else {
             return Ok(None);

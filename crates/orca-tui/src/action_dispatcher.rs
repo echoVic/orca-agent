@@ -477,11 +477,8 @@ fn route_action(
                     EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
                 },
                 Err(error) => {
-                    if !deliver_dispatcher_outcome(
-                        event_tx,
-                        &mut pending.event,
-                        TuiEvent::Error(error),
-                    ) {
+                    if !deliver_dispatcher_outcome(event_tx, &mut pending.event, error.into_event())
+                    {
                         return false;
                     }
                 }

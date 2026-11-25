@@ -657,14 +657,83 @@ pub(crate) fn update_session_metadata(
     }
 }
 
-pub(crate) fn stop_task(
-    thread: &RuntimeSurfaceThreadHandle,
-    task_id: &str,
-    controller: &TuiSurfaceTaskControl,
-    event_tx: &mpsc::Sender<TuiEvent>,
-) -> Result<SurfaceProjectionState, String> {
-    let surface = thread.surface();
-    let attachment = match surface.attach_fresh(FreshAttachRequest {
+/// Why a stop the TUI sent was not taken.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TaskStopError {
+    /// Every try was refused because the agent's row had moved on since it
+    /// was read. Holds the line a person is shown instead of an error.
+    RowKeptChanging(String),
+    /// Any other refusal or failure, worded as the runtime or the attach
+    /// gave it.
+    Failed(String),
+}
+
+impl From<String> for TaskStopError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl TaskStopError {
+    /// What the TUI shows for it: a plain notice for a row that kept
+    /// changing, the error as it is otherwise.
+    pub(crate) fn into_event(self) -> TuiEvent {
+        match self {
+            Self::RowKeptChanging(line) => TuiEvent::Notice(line),
+            Self::Failed(error) => TuiEvent::Error(error),
+        }
+    }
+}
+
+/// How many stops one press of `s` on an agent's row sends at most. The
+/// row moves on with every step the agent takes, and a stop sent with the
+/// row as it was read a moment before is refused as stale.
+const SUBAGENT_STOP_TRIES: usize = 4;
+
+/// What one try at stopping a subagent came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentStopTry {
+    /// The runtime took the stop.
+    Taken,
+    /// Refused: the task had changed since it was read.
+    Stale,
+    /// Read again, the task has already ended: there is nothing to stop.
+    AlreadyEnded,
+}
+
+/// Makes tries at stopping a subagent, each by `try_stop`, until one is
+/// not refused as stale, at most `SUBAGENT_STOP_TRIES`. Any other refusal
+/// is `try_stop`'s `Err` and ends the tries as it is. `label` names the
+/// agent in the line shown when every try was refused as stale.
+fn stop_subagent_until_not_stale(
+    label: impl FnOnce() -> String,
+    mut try_stop: impl FnMut() -> Result<SubagentStopTry, String>,
+) -> Result<(), TaskStopError> {
+    for _ in 0..SUBAGENT_STOP_TRIES {
+        match try_stop()? {
+            SubagentStopTry::Taken | SubagentStopTry::AlreadyEnded => return Ok(()),
+            SubagentStopTry::Stale => {}
+        }
+    }
+    Err(TaskStopError::RowKeptChanging(format!(
+        "Could not stop {}. Press s again.",
+        label()
+    )))
+}
+
+/// The fence a stop of `task` is sent with: the task as it was read.
+fn task_stop_fence(task: &orca_runtime::surface::SurfaceTask) -> SurfaceTaskFence {
+    SurfaceTaskFence {
+        task_id: task.task_id.clone(),
+        task_revision: task.revision,
+        background_owner: task.background_fence.clone(),
+    }
+}
+
+fn attach_for_task_stop(
+    surface: &RuntimeSurfaceHandle,
+) -> Result<orca_runtime::surface::FreshSurfaceAttachment, String> {
+    match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
         role: SurfaceAttachmentRole::Tui,
         requested_capabilities: BTreeSet::from([
@@ -674,27 +743,32 @@ pub(crate) fn stop_task(
         ]),
         interaction_capabilities: BTreeSet::new(),
     }) {
-        AttachResult::FreshAttached { attachment } => attachment,
+        AttachResult::FreshAttached { attachment } => Ok(attachment),
         AttachResult::Denied { reason } => {
-            return Err(format!("typed TUI task-stop attachment denied: {reason:?}"));
+            Err(format!("typed TUI task-stop attachment denied: {reason:?}"))
         }
-        AttachResult::Unavailable { reason } => {
-            return Err(format!(
-                "typed TUI task-stop attachment unavailable: {reason:?}"
-            ));
-        }
+        AttachResult::Unavailable { reason } => Err(format!(
+            "typed TUI task-stop attachment unavailable: {reason:?}"
+        )),
         AttachResult::ThreadClosed { .. } => {
-            return Err("typed TUI task-stop thread is closed".to_string());
+            Err("typed TUI task-stop thread is closed".to_string())
         }
         AttachResult::CursorAttached { .. }
         | AttachResult::SnapshotRequired { .. }
-        | AttachResult::InvalidCursor { .. } => {
-            return Err(
-                "typed TUI task-stop attachment returned an invalid fresh-attach result"
-                    .to_string(),
-            );
-        }
-    };
+        | AttachResult::InvalidCursor { .. } => Err(
+            "typed TUI task-stop attachment returned an invalid fresh-attach result".to_string(),
+        ),
+    }
+}
+
+pub(crate) fn stop_task(
+    thread: &RuntimeSurfaceThreadHandle,
+    task_id: &str,
+    controller: &TuiSurfaceTaskControl,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<SurfaceProjectionState, TaskStopError> {
+    let surface = thread.surface();
+    let attachment = attach_for_task_stop(&surface)?;
     let Some(task) = attachment
         .baseline
         .snapshot
@@ -703,7 +777,7 @@ pub(crate) fn stop_task(
         .find(|task| task.task_id.as_str() == task_id)
     else {
         detach(&surface, &attachment.client);
-        return Err(format!("surface task '{task_id}' not found"));
+        return Err(format!("surface task '{task_id}' not found").into());
     };
     if task.task_type == orca_runtime::surface::SurfaceTaskType::MainSession {
         let mut activation =
@@ -737,10 +811,11 @@ pub(crate) fn stop_task(
                 return Err(format!(
                     "typed TUI task stop deferred: request={:?} commit={:?}",
                     mutation.request_id, mutation.commit_id
-                ));
+                )
+                .into());
             }
             MutationReply::Uncommitted { mutation } => {
-                return Err(format!("typed TUI task stop did not commit: {mutation:?}"));
+                return Err(format!("typed TUI task stop did not commit: {mutation:?}").into());
             }
         }
         controller
@@ -768,31 +843,55 @@ pub(crate) fn stop_task(
         return Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot));
     }
     if task.task_type == orca_runtime::surface::SurfaceTaskType::Subagent {
-        let result = attachment.client.task_control(
-            SurfaceRequestId::new(),
-            TaskControlAction::Stop {
-                fence: SurfaceTaskFence {
-                    task_id: task.task_id.clone(),
-                    task_revision: task.revision,
-                    background_owner: task.background_fence.clone(),
-                },
-            },
-        );
-        detach(&surface, &attachment.client);
-        match result.map_err(|error| format!("typed TUI subagent stop failed: {error:?}"))? {
-            MutationReply::Committed { .. } => {}
-            MutationReply::Deferred { mutation, .. } => {
-                return Err(format!(
+        // An agent's row moves on with every step the agent takes, so a stop
+        // sent with the row as it was read can be refused as stale: each try
+        // after the first reads the task again, from a fresh attachment.
+        let mut first = Some((attachment.client.clone(), task_stop_fence(task)));
+        let label = || {
+            let projection =
+                SurfaceProjectionState::from_surface_snapshot(&attachment.baseline.snapshot);
+            crate::background_tasks::task_notice_label(&projection.workflow_tasks, task_id)
+        };
+        stop_subagent_until_not_stale(label, || {
+            let again;
+            let (client, fence) = match first.take() {
+                Some(first) => first,
+                None => {
+                    again = attach_for_task_stop(&surface)?;
+                    let Some(task) = again
+                        .baseline
+                        .snapshot
+                        .tasks
+                        .iter()
+                        .find(|task| task.task_id.as_str() == task_id)
+                    else {
+                        detach(&surface, &again.client);
+                        return Err(format!("surface task '{task_id}' not found"));
+                    };
+                    if task_has_ended(task.status) {
+                        detach(&surface, &again.client);
+                        return Ok(SubagentStopTry::AlreadyEnded);
+                    }
+                    (again.client.clone(), task_stop_fence(task))
+                }
+            };
+            let result =
+                client.task_control(SurfaceRequestId::new(), TaskControlAction::Stop { fence });
+            detach(&surface, &client);
+            match result.map_err(|error| format!("typed TUI subagent stop failed: {error:?}"))? {
+                MutationReply::Committed { .. } => Ok(SubagentStopTry::Taken),
+                MutationReply::Deferred { mutation, .. } => Err(format!(
                     "typed TUI subagent stop deferred: request={:?} commit={:?}",
                     mutation.request_id, mutation.commit_id
-                ));
-            }
-            MutationReply::Uncommitted { mutation } => {
-                return Err(format!(
+                )),
+                MutationReply::Uncommitted {
+                    mutation: UncommittedMutation::Stale { .. },
+                } => Ok(SubagentStopTry::Stale),
+                MutationReply::Uncommitted { mutation } => Err(format!(
                     "typed TUI subagent stop did not commit: {mutation:?}"
-                ));
+                )),
             }
-        }
+        })?;
         let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
         return Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot));
     }
@@ -800,9 +899,7 @@ pub(crate) fn stop_task(
         && task.workflow_run_id.is_none()
     {
         detach(&surface, &attachment.client);
-        return Err(format!(
-            "surface task '{task_id}' has no runtime-owned control"
-        ));
+        return Err(format!("surface task '{task_id}' has no runtime-owned control").into());
     }
     let workflow = task
         .workflow_run_id
@@ -823,9 +920,7 @@ pub(crate) fn stop_task(
         ),
         None => {
             detach(&surface, &attachment.client);
-            return Err(format!(
-                "surface task '{task_id}' has no runtime-owned workflow"
-            ));
+            return Err(format!("surface task '{task_id}' has no runtime-owned workflow").into());
         }
     };
     detach(&surface, &attachment.client);
@@ -836,15 +931,30 @@ pub(crate) fn stop_task(
             return Err(format!(
                 "typed TUI task stop deferred: request={:?} commit={:?}",
                 mutation.request_id, mutation.commit_id
-            ));
+            )
+            .into());
         }
         MutationReply::Uncommitted { mutation } => {
-            return Err(format!("typed TUI task stop did not commit: {mutation:?}"));
+            return Err(format!("typed TUI task stop did not commit: {mutation:?}").into());
         }
     }
 
     let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
     Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot))
+}
+
+/// Whether a task in this status is over: a stop of it has nothing left to
+/// stop. The statuses the runtime answers "already terminal" for.
+fn task_has_ended(status: orca_runtime::surface::SurfaceTaskStatus) -> bool {
+    use orca_runtime::surface::SurfaceTaskStatus;
+    matches!(
+        status,
+        SurfaceTaskStatus::Stopped
+            | SurfaceTaskStatus::Completed
+            | SurfaceTaskStatus::Failed
+            | SurfaceTaskStatus::Blocked
+            | SurfaceTaskStatus::Cancelled
+    )
 }
 
 pub(crate) fn continue_subagent(
@@ -4155,6 +4265,80 @@ mod tests {
             Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
             None => unsafe { std::env::remove_var("ORCA_HOME") },
         }
+    }
+
+    /// Runs the tries of one stop against scripted replies, one reply per
+    /// try; a try past the script is a failure of the test.
+    fn stop_with_replies(
+        replies: Vec<Result<SubagentStopTry, String>>,
+    ) -> (Result<(), TaskStopError>, usize) {
+        let mut replies = replies.into_iter();
+        let mut tries = 0;
+        let result = stop_subagent_until_not_stale(
+            || "\"alpha writes essay\"".to_string(),
+            || {
+                tries += 1;
+                replies.next().expect("no try past the scripted replies")
+            },
+        );
+        (result, tries)
+    }
+
+    #[test]
+    fn a_stop_refused_because_the_row_moved_is_sent_again_and_taken() {
+        // Seen in a terminal: `s` pressed as the agent's row was first
+        // listed carried the row's first revision, and the runtime, which
+        // had already bound the agent's thread, refused it as stale.
+        let (result, tries) =
+            stop_with_replies(vec![Ok(SubagentStopTry::Stale), Ok(SubagentStopTry::Taken)]);
+        assert_eq!(result, Ok(()));
+        assert_eq!(tries, 2, "the stop is sent once more, and taken");
+    }
+
+    #[test]
+    fn a_stop_refused_as_stale_four_times_says_to_press_s_again() {
+        let (result, tries) = stop_with_replies(vec![Ok(SubagentStopTry::Stale); 4]);
+        assert_eq!(tries, 4, "no more than four tries for one press");
+        let error = result.expect_err("four stale refusals are not a stop");
+        assert_eq!(
+            error,
+            TaskStopError::RowKeptChanging(
+                "Could not stop \"alpha writes essay\". Press s again.".to_string()
+            )
+        );
+        assert!(
+            matches!(
+                error.into_event(),
+                TuiEvent::Notice(line)
+                    if line == "Could not stop \"alpha writes essay\". Press s again."
+            ),
+            "a plain line, not the runtime's error"
+        );
+    }
+
+    #[test]
+    fn a_stop_refused_as_stale_of_an_agent_that_has_since_ended_is_done() {
+        let (result, tries) = stop_with_replies(vec![
+            Ok(SubagentStopTry::Stale),
+            Ok(SubagentStopTry::AlreadyEnded),
+        ]);
+        assert_eq!(result, Ok(()), "no error for an agent that has ended");
+        assert_eq!(tries, 2, "and nothing is sent once it has");
+    }
+
+    #[test]
+    fn a_stop_refused_for_another_reason_is_shown_as_it_is() {
+        let refusal = "typed TUI subagent stop did not commit: Invalid".to_string();
+        let (result, tries) = stop_with_replies(vec![Err(refusal.clone())]);
+        assert_eq!(tries, 1, "only a stale refusal is sent again");
+        let error = result.expect_err("the refusal stands");
+        assert_eq!(error, TaskStopError::Failed(refusal.clone()));
+        assert!(matches!(error.into_event(), TuiEvent::Error(message) if message == refusal));
+
+        let (result, tries) =
+            stop_with_replies(vec![Ok(SubagentStopTry::Stale), Err(refusal.clone())]);
+        assert_eq!(tries, 2);
+        assert_eq!(result, Err(TaskStopError::Failed(refusal)));
     }
 
     #[test]

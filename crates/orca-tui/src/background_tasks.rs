@@ -101,7 +101,7 @@ fn stop_task_for_tui(
             true
         }
         Err(error) => {
-            let _ = event_tx.send(TuiEvent::Error(error));
+            let _ = event_tx.send(error.into_event());
             false
         }
     }
