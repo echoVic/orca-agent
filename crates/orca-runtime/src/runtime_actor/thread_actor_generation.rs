@@ -1220,15 +1220,7 @@ impl ThreadActor {
         &self,
         fence: &surface::SurfaceOperationFence,
     ) -> Option<surface::GenerationPhase> {
-        let snapshot = self.resident_surface.coordinator.state().snapshot();
-        snapshot
-            .foreground_operation
-            .iter()
-            .chain(snapshot.queued_operations.iter())
-            .chain(snapshot.operation_history.iter())
-            .flat_map(|operation| operation.generations.iter())
-            .find(|generation| generation.fence == *fence)
-            .map(|generation| generation.phase)
+        surface::generation_phase(self.resident_surface.coordinator.state().snapshot(), fence)
     }
 
     /// Commits the end of a kept child, reported for `fence`, once that

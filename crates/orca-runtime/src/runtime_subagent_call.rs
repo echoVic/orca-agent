@@ -1645,6 +1645,11 @@ fn threaded_sync_surface_activity(
 /// host it, it has no isolation, is not a custom agent, is not continued from
 /// a checkpoint (the hosted path refuses `resume_from`), and has no finite
 /// budget (a budgeted child is run without the controller).
+///
+/// This rule must stay at least as strict as the test in
+/// `run_subagent_worker` that runs a child on a thread: every child it lets
+/// through must be one that test also runs on a thread, or a child placed
+/// here for a thread of its own would run without one.
 pub(crate) fn child_qualifies_for_thread(
     request: &SubagentRequest,
     has_controller: bool,

@@ -6705,7 +6705,7 @@ fn actor_control_subagent_activity_authorized(
 
 /// The phase of the generation `fence` names, among this snapshot's
 /// foreground, queued and past operations.
-fn generation_phase(
+pub(crate) fn generation_phase(
     snapshot: &super::SurfaceSnapshot,
     fence: &super::SurfaceOperationFence,
 ) -> Option<super::GenerationPhase> {

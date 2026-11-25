@@ -1569,8 +1569,9 @@ impl ToolExecutionActor {
                             );
                         }
                         // Nobody may be asked on this thread: the call is
-                        // refused and the turn goes on, as it does when a
-                        // rule denies a call the model can work around.
+                        // refused and the turn goes on, with the refusal as
+                        // the call's result. A rule's denial is not like
+                        // this: it parks the turn (`Denied`, below).
                         Err(error) if crate::child_refusal::refused_without_asking(&error) => {
                             let result =
                                 tool_types::ToolResult::denied(tool_request, error.to_string());

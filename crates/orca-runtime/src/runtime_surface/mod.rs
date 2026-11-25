@@ -97,6 +97,7 @@ pub use commands::{
 pub(crate) use commands::{AcpAttachmentCapabilityProfile, RuntimeSurfaceCommandDispatcher};
 
 pub(crate) use commit::HistoricalToolResultCommitAuthority;
+pub(crate) use commit::generation_phase;
 pub(crate) use commit::legacy_active_task_adoption_capability_fingerprint;
 pub(crate) use commit::manual_compaction_item_patches;
 pub(crate) use commit::terminal_from_generation_stop;

@@ -34005,8 +34005,20 @@ mod tests {
         }
     }
 
+    /// Stops the agents a keeping host runs on its threads when the test
+    /// that started them ends, a panic included, so that the host can end
+    /// instead of waiting on agents that stream for many seconds.
+    struct StopsKeptAgents(RuntimeHostHandle);
+
+    impl Drop for StopsKeptAgents {
+        fn drop(&mut self) {
+            let _ = self.0.stop_kept_subagents(Duration::from_secs(5));
+        }
+    }
+
     /// A parent's turn on a host that keeps its children in its process,
-    /// admitted with `prompt` on a fresh thread.
+    /// admitted with `prompt` on a fresh thread, and what stops its agents
+    /// once the test is done with them.
     fn start_keeping_parent_turn(
         host: &RuntimeHost,
         cwd: &std::path::Path,
@@ -34015,6 +34027,7 @@ mod tests {
         RuntimeThreadHandle,
         surface::FreshSurfaceAttachment,
         surface::SurfaceOperationId,
+        StopsKeptAgents,
     ) {
         host.handle().keep_subagents_in_process();
         let mut config = surface_test_config(cwd.to_path_buf(), HistoryMode::Record);
@@ -34054,7 +34067,12 @@ mod tests {
             matches!(admitted, surface::AdmissionOutput::Admitted { .. }),
             "the parent's turn was queued"
         );
-        (thread, attachment, reserved.operation_id)
+        (
+            thread,
+            attachment,
+            reserved.operation_id,
+            StopsKeptAgents(host.handle()),
+        )
     }
 
     /// How the parent's surface shows the agent whose task is `task_id`, once
@@ -34107,7 +34125,7 @@ mod tests {
     fn stopping_a_kept_sync_subagent_leaves_its_parent_turn_running() {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start kept sync subagent stop host");
-        let (thread, attachment, operation_id) = start_keeping_parent_turn(
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
             &host,
             cwd.path(),
             "subagent async_then_sync mock_stream_delay_ms 30000",
@@ -34232,7 +34250,7 @@ mod tests {
     fn a_tools_stop_of_a_kept_sync_subagent_ends_the_turn_waiting_on_it() {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start kept sync subagent tool stop host");
-        let (thread, _attachment, operation_id) = start_keeping_parent_turn(
+        let (thread, _attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
             &host,
             cwd.path(),
             "subagent sync mock_stream_delay_ms 30000",
@@ -34327,7 +34345,7 @@ mod tests {
     fn a_kept_subagent_already_stopping_is_not_relabelled_by_a_persons_stop() {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start already stopping subagent host");
-        let (thread, attachment, operation_id) = start_keeping_parent_turn(
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
             &host,
             cwd.path(),
             "subagent async mock_stream_slow_cancel_ms 3000",
@@ -34401,7 +34419,7 @@ mod tests {
     fn a_kept_subagent_whose_record_has_ended_is_answered_already_terminal() {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start ended record subagent host");
-        let (thread, attachment, operation_id) = start_keeping_parent_turn(
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
             &host,
             cwd.path(),
             "subagent batch async mock_stream_slow_cancel_ms 3000",
@@ -34939,21 +34957,6 @@ mod tests {
         }
     }
 
-    /// The phase of the generation `fence` on `snapshot`.
-    fn generation_phase_shown(
-        snapshot: &surface::SurfaceSnapshot,
-        fence: &surface::SurfaceOperationFence,
-    ) -> Option<surface::GenerationPhase> {
-        snapshot
-            .foreground_operation
-            .iter()
-            .chain(snapshot.queued_operations.iter())
-            .chain(snapshot.operation_history.iter())
-            .flat_map(|operation| operation.generations.iter())
-            .find(|generation| generation.fence == *fence)
-            .map(|generation| generation.phase)
-    }
-
     /// Esc on a parent's turn stops the agent it keeps on a thread of this
     /// process and does not wait for it, so the agent's end comes after the
     /// turn is over. The parent's surface takes that end, once, so the row
@@ -34964,7 +34967,7 @@ mod tests {
     fn an_agent_stopped_with_its_parent_turn_is_shown_as_stopped() {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start interrupted parent host");
-        let (thread, attachment, operation_id) = start_keeping_parent_turn(
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
             &host,
             cwd.path(),
             "subagent async mock_stream_slow_cancel_ms 1000",
@@ -35002,7 +35005,7 @@ mod tests {
         let snapshot = read_snapshot();
         assert!(snapshot.foreground_operation.is_none());
         assert_eq!(
-            generation_phase_shown(&snapshot, &fence),
+            surface::generation_phase(&snapshot, &fence),
             Some(surface::GenerationPhase::Stopped)
         );
         let record = registry.get(agent.task_id.as_str()).expect("the record");
@@ -35108,7 +35111,7 @@ mod tests {
     fn a_late_end_is_accepted_while_a_later_turn_runs() {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start later turn host");
-        let (thread, attachment, operation_id) = start_keeping_parent_turn(
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
             &host,
             cwd.path(),
             "subagent async mock_stream_slow_cancel_ms 3000",
@@ -35210,7 +35213,7 @@ mod tests {
             snapshot.foreground_operation
         );
         assert_eq!(
-            generation_phase_shown(&snapshot, &next_fence),
+            surface::generation_phase(&snapshot, &next_fence),
             Some(surface::GenerationPhase::Started)
         );
         assert!(
@@ -35276,7 +35279,7 @@ mod tests {
     fn a_persons_stop_right_before_an_interrupt_still_ends_stopped() {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start stop then interrupt host");
-        let (thread, attachment, operation_id) = start_keeping_parent_turn(
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
             &host,
             cwd.path(),
             "subagent async mock_stream_slow_cancel_ms 1500",
@@ -35369,7 +35372,7 @@ mod tests {
     fn an_agent_in_a_tool_when_its_parent_turn_is_interrupted_is_shown_as_stopped() {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start interrupted tool host");
-        let (thread, attachment, operation_id) =
+        let (thread, attachment, operation_id, _stops_agents) =
             start_keeping_parent_turn(&host, cwd.path(), "subagent async bash sleep 30");
         let surface = thread.surface();
         let mut subscription = surface
@@ -35477,7 +35480,7 @@ mod tests {
     fn an_agent_left_running_by_a_backgrounded_turn_is_shown_ending() {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start backgrounded parent host");
-        let (thread, attachment, operation_id) = start_keeping_parent_turn(
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
             &host,
             cwd.path(),
             "subagent async_then_sync mock_stream_delay_ms 3000",
@@ -35544,7 +35547,8 @@ mod tests {
         let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
         loop {
             let snapshot = read_snapshot();
-            if generation_phase_shown(&snapshot, &fence) == Some(surface::GenerationPhase::Stopped)
+            if surface::generation_phase(&snapshot, &fence)
+                == Some(surface::GenerationPhase::Stopped)
             {
                 assert_eq!(
                     snapshot
@@ -35560,7 +35564,7 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "the handed-off generation never stopped: {:?}",
-                generation_phase_shown(&snapshot, &fence)
+                surface::generation_phase(&snapshot, &fence)
             );
             std::thread::sleep(Duration::from_millis(5));
         }

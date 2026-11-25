@@ -1382,7 +1382,6 @@ impl TuiSurfaceProjection {
         Ok(projected)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn focus_operation(&mut self, operation_id: SurfaceOperationId) {
         self.focused_operation = Some(operation_id);
     }
@@ -2934,6 +2933,52 @@ mod tests {
                 .iter()
                 .all(|task| task.id != "task-shell-1"),
             "the task panel does not list it"
+        );
+    }
+
+    /// The rows the panel lists from a surface snapshot carry no sequence,
+    /// so they are in creation order, then task id order, whatever order
+    /// the snapshot holds the tasks in.
+    #[test]
+    fn rows_from_a_surface_snapshot_are_listed_in_creation_order() {
+        let mut snapshot = goal_projection_snapshot();
+        let task = |id: &str, created_at: i64| SurfaceTask {
+            task_id: SurfaceTaskId::try_new(id).unwrap(),
+            revision: TaskRevision::try_new(1).unwrap(),
+            task_type: SurfaceTaskType::Subagent,
+            status: orca_runtime::surface::SurfaceTaskStatus::Running,
+            backgrounded: false,
+            description: DisplayText::new(id),
+            created_at: UnixMillis::new(created_at),
+            started_at: Some(UnixMillis::new(created_at)),
+            completed_at: None,
+            parent_operation: None,
+            parent_task_id: None,
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        };
+        snapshot.tasks = vec![
+            task("task-c", 3_000),
+            task("task-b", 1_000),
+            task("task-e", 2_000),
+            task("task-a", 2_000),
+        ];
+
+        let rows = crate::workflow_panel::sort_workflow_tasks_for_panel(workflow_task_summaries(
+            &snapshot,
+        ));
+
+        assert!(rows.iter().all(|row| row.sequence == 0));
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["task-b", "task-a", "task-e", "task-c"]
         );
     }
 

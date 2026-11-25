@@ -730,8 +730,12 @@ pub(crate) fn push_pending_workflow_notification_unique(
 pub(crate) fn sort_workflow_tasks_for_panel(
     mut tasks: Vec<BackgroundTaskSummary>,
 ) -> Vec<BackgroundTaskSummary> {
-    // The order tasks were submitted in: a row keeps its place whatever it
-    // does. A task with no sequence (an older record) follows, by creation.
+    // A row keeps its place whatever it does. Summaries that carry the
+    // order their tasks were submitted in (`sequence`) come first, in that
+    // order; the rest follow by creation, then task id. The hosted TUI's
+    // rows all come from the surface projection, which carries no sequence
+    // (`workflow_task_summaries` sets 0), so there they are in creation
+    // order, and two created in the same millisecond are in task id order.
     tasks.sort_by(|left, right| {
         (left.sequence == 0)
             .cmp(&(right.sequence == 0))

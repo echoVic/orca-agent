@@ -5672,8 +5672,6 @@ fn background_task_activity_lines(
         .collect()
 }
 
-/// `idle` is whether Enter can open a background approval now: opening one
-/// takes over the status line, so it waits for a running turn to end.
 /// The subagent rows the dock draws when there are more than it has room for:
 /// agents that need attention first, then the selected one, then the rest in
 /// list order. The rows come back in list (start) order, never priority order.
@@ -5702,6 +5700,8 @@ fn dock_rows<'a>(
     picked.into_iter().map(|index| visible[index]).collect()
 }
 
+/// `idle` is whether Enter can open a background approval now: opening one
+/// takes over the status line, so it waits for a running turn to end.
 fn background_task_activity_rows(
     tasks: &[BackgroundTaskSummary],
     theme: &Theme,
