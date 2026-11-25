@@ -1381,7 +1381,9 @@ pub struct TaskControl {
     /// process against this control's `cancel`, before its row is shown: a
     /// stop through the registry ends that turn, even before the row names
     /// the thread. A subagent that runs in the process without a thread of
-    /// its own never sets it. Not persisted either.
+    /// its own never sets it. Not persisted either: no kept subagent outlives
+    /// its process, so after a restart there is no turn it could describe,
+    /// and a record loaded then reads false, as a stop of it should.
     runs_on_its_own_thread: Arc<AtomicBool>,
     worker: Arc<Mutex<Option<OwnedWorker>>>,
 }

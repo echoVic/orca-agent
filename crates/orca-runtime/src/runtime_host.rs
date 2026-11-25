@@ -34513,6 +34513,113 @@ mod tests {
             .expect("shutdown ended record subagent host");
     }
 
+    /// A sync agent that runs in the parent's process without a thread of
+    /// its own (here, one isolated in a worktree) is shown running as the
+    /// turn's, but only its parent's cancel reaches it: a person's stop of
+    /// it is refused, as before the TUI kept its agents, and leaves its
+    /// record running, not stopping.
+    #[test]
+    fn a_persons_stop_of_an_agent_without_a_thread_of_its_own_is_refused() {
+        let cwd = tempfile::tempdir().unwrap();
+        // A worktree needs a repository with a commit.
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd.path())
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "orca@example.test"]);
+        git(&["config", "user.name", "Orca Test"]);
+        std::fs::write(cwd.path().join("file.txt"), "placeholder").unwrap();
+        git(&["add", "file.txt"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        let host = RuntimeHost::start().expect("start threadless subagent stop host");
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
+            &host,
+            cwd.path(),
+            "subagent worktree sync mock_stream_delay_ms 30000",
+        );
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let agent = loop {
+            let found = read_snapshot()
+                .subagents
+                .iter()
+                .find(|subagent| {
+                    subagent.description.as_str() == "mock_stream_delay_ms 30000"
+                        && subagent.status == surface::SurfaceSubagentStatus::Running
+                })
+                .cloned();
+            if let Some(agent) = found {
+                break agent;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the agent never showed running: {:?}",
+                read_snapshot().subagents
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            matches!(
+                agent.owner,
+                surface::SurfaceSubagentOwner::Generation { .. }
+            ),
+            "{:?}",
+            agent.owner
+        );
+        let record = registry
+            .get(agent.task_id.as_str())
+            .expect("the agent's record");
+        assert_eq!(record.task_type, orca_core::task_types::TaskType::Subagent);
+        assert_eq!(record.worker_pid, None);
+        assert!(!record.control.runs_on_its_own_thread());
+
+        let (reply, _) = stop_agent_as_a_person(&attachment, read_snapshot, &agent.task_id);
+        let error = match reply {
+            surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Invalid { error, .. },
+            } => error,
+            surface::MutationReply::Uncommitted { mutation } => {
+                panic!("the stop was not refused as invalid: {mutation:?}")
+            }
+            surface::MutationReply::Committed { .. } => panic!("the stop was taken"),
+            surface::MutationReply::Deferred { .. } => panic!("the stop was deferred"),
+        };
+        assert_eq!(
+            error.error().message.as_str(),
+            "this subagent cannot be stopped independently"
+        );
+        let record = registry
+            .get(agent.task_id.as_str())
+            .expect("the agent's record");
+        assert_eq!(record.status, TaskStatus::Running);
+        assert!(!record.stop_requested);
+        assert!(!record.control.cancel.is_cancelled());
+        assert!(!record.control.stopped_by_person());
+
+        let _ = attachment
+            .client
+            .cancel_operation(surface_request_id(), operation_id.clone());
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id);
+        host.shutdown()
+            .expect("shutdown threadless subagent stop host");
+    }
+
     /// An agent the TUI keeps that waits for capacity has not started: no
     /// thread, and no row on its parent's surface, so a person has nothing
     /// to press `s` on; a stop by its id finds no task there.
