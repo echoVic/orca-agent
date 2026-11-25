@@ -1377,6 +1377,12 @@ pub struct TaskControl {
     /// parent depends on it. Like the rest of the control it lives only in
     /// this process and is not persisted.
     stopped_by_person: Arc<AtomicBool>,
+    /// Set when a subagent's turn runs on a thread of its own in this
+    /// process against this control's `cancel`, before its row is shown: a
+    /// stop through the registry ends that turn, even before the row names
+    /// the thread. A subagent that runs in the process without a thread of
+    /// its own never sets it. Not persisted either.
+    runs_on_its_own_thread: Arc<AtomicBool>,
     worker: Arc<Mutex<Option<OwnedWorker>>>,
 }
 
@@ -1394,6 +1400,18 @@ impl TaskControl {
     /// Whether the task was stopped by a person.
     pub(crate) fn stopped_by_person(&self) -> bool {
         self.stopped_by_person.load(Ordering::Acquire)
+    }
+
+    /// Marks the task's turn as one on a thread of its own that this
+    /// control's `cancel` ends.
+    pub(crate) fn mark_runs_on_its_own_thread(&self) {
+        self.runs_on_its_own_thread.store(true, Ordering::Release);
+    }
+
+    /// Whether the task's turn runs on a thread of its own that this
+    /// control's `cancel` ends.
+    pub(crate) fn runs_on_its_own_thread(&self) -> bool {
+        self.runs_on_its_own_thread.load(Ordering::Acquire)
     }
 }
 
@@ -3328,6 +3346,7 @@ impl TaskRegistry {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
             stopped_by_person: Arc::new(AtomicBool::new(false)),
+            runs_on_its_own_thread: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
         };
         let sequence = self
@@ -3461,6 +3480,7 @@ impl TaskRegistry {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
             stopped_by_person: Arc::new(AtomicBool::new(false)),
+            runs_on_its_own_thread: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
         };
         let sequence = self
@@ -3599,6 +3619,7 @@ impl TaskRegistry {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
             stopped_by_person: Arc::new(AtomicBool::new(false)),
+            runs_on_its_own_thread: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
         };
         let sequence = self
@@ -3691,6 +3712,7 @@ impl TaskRegistry {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
             stopped_by_person: Arc::new(AtomicBool::new(false)),
+            runs_on_its_own_thread: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
         };
         let sequence = self
@@ -6757,6 +6779,7 @@ fn new_task_control() -> TaskControl {
         cancel: CancelToken::new(),
         pause: Arc::new(AtomicBool::new(false)),
         stopped_by_person: Arc::new(AtomicBool::new(false)),
+        runs_on_its_own_thread: Arc::new(AtomicBool::new(false)),
         worker: Arc::new(Mutex::new(None)),
     }
 }

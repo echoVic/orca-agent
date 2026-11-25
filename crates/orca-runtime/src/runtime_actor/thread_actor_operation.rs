@@ -9576,15 +9576,18 @@ fn subagent_already_terminal(
 ///
 /// The child must be owned by this very turn: a child of another parent
 /// reports to that parent's thread, and a child of an earlier turn to that
-/// turn, so neither carries this fence. It must have a thread of its own,
-/// whose turn the stop ends: a child that runs in this process without one
-/// (a sync child with a custom type, an isolation or a finite budget) also
-/// reports as the turn's, but watches only its parent's cancel, so it would
-/// run on. Its task, `record`, must be a subagent's with no worker process,
-/// so neither a child in a worker process nor a workflow's agent, whose
-/// task is the workflow's, can match. And the host must keep its children
-/// here (`keeps`), so a host that does not refuses as it always has.
-/// Whether its record has ended already is the stop's to answer.
+/// turn, so neither carries this fence. Its task, `record`, must be a
+/// subagent's with no worker process, so neither a child in a worker
+/// process nor a workflow's agent, whose task is the workflow's, can match.
+/// And its turn must run on a thread of its own that the record's stop
+/// ends: a child that runs in this process without one (a sync child with a
+/// custom type, an isolation or a finite budget) also reports as the
+/// turn's, but watches only its parent's cancel, so it would run on. The
+/// record says so from before the child's row is shown; the row names the
+/// thread only once it has started, and a stop in between is taken. And the
+/// host must keep its children here (`keeps`), so a host that does not
+/// refuses as it always has. Whether its record has ended already is the
+/// stop's to answer.
 fn is_running_kept_subagent(
     running: Option<&surface::SurfaceOperationFence>,
     subagent: &surface::SurfaceSubagent,
@@ -9596,11 +9599,11 @@ fn is_running_kept_subagent(
     };
     running == Some(fence)
         && subagent.status == surface::SurfaceSubagentStatus::Running
-        && subagent.child_thread_id.is_some()
         && keeps
         && record.is_some_and(|record| {
             record.task_type == orca_core::task_types::TaskType::Subagent
                 && record.worker_pid.is_none()
+                && record.control.runs_on_its_own_thread()
         })
 }
 
@@ -10121,31 +10124,47 @@ mod kept_subagent_stop_tests {
 
     /// Only a child with a thread of its own is stopped as one the turn
     /// keeps: a child that runs in the process without one reports as the
-    /// turn's too, but its stop would not reach it.
+    /// turn's too, but its stop would not reach it. A child with one is
+    /// stopped from the moment its row is shown, before the row names its
+    /// thread.
     #[test]
     fn only_a_child_with_a_thread_of_its_own_is_stopped_as_kept() {
         let registry = crate::tasks::TaskRegistry::new("kept-stop".to_string());
-        let task = registry.create_subagent("explore the provider".to_string(), None);
-        let record = registry.get(&task.id).expect("the child's record");
+        let on_a_thread = registry.create_subagent("explore the provider".to_string(), None);
+        let without = registry.create_subagent("explore the docs".to_string(), None);
+        registry
+            .get(&on_a_thread.id)
+            .expect("the child's record")
+            .control
+            .mark_runs_on_its_own_thread();
+        let threaded_record = registry.get(&on_a_thread.id).expect("the child's record");
+        let threadless_record = registry.get(&without.id).expect("the other child's record");
         let fence = fence();
         let threaded = running_child(
-            &task.id,
+            &on_a_thread.id,
             &fence,
             Some(surface::SurfaceThreadId::try_from_bytes(uuid_v7()).unwrap()),
         );
-        let threadless = running_child(&task.id, &fence, None);
+        let not_yet_bound = running_child(&on_a_thread.id, &fence, None);
+        let threadless = running_child(&without.id, &fence, None);
 
         assert!(is_running_kept_subagent(
             Some(&fence),
             &threaded,
             true,
-            Some(&record)
+            Some(&threaded_record)
+        ));
+        assert!(is_running_kept_subagent(
+            Some(&fence),
+            &not_yet_bound,
+            true,
+            Some(&threaded_record)
         ));
         assert!(!is_running_kept_subagent(
             Some(&fence),
             &threadless,
             true,
-            Some(&record)
+            Some(&threadless_record)
         ));
         // With a thread, the rest still holds: the very turn, a keeping
         // host, and a subagent's record.
@@ -10153,13 +10172,13 @@ mod kept_subagent_stop_tests {
             Some(&self::fence()),
             &threaded,
             true,
-            Some(&record)
+            Some(&threaded_record)
         ));
         assert!(!is_running_kept_subagent(
             Some(&fence),
             &threaded,
             false,
-            Some(&record)
+            Some(&threaded_record)
         ));
         assert!(!is_running_kept_subagent(
             Some(&fence),

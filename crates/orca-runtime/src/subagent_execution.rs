@@ -3579,6 +3579,14 @@ mod tests {
         // for its turn would be a second record here, never settled.
         let tasks = task_registry.list();
         assert_eq!(tasks.len(), 1, "one child, one task record: {tasks:?}");
+        // What lets a person's stop reach it before its row names its thread.
+        assert!(
+            task_registry
+                .get(&tasks[0].id)
+                .expect("the child's record")
+                .control
+                .runs_on_its_own_thread()
+        );
         let child_thread_id = tasks[0]
             .subagent_child_thread_id
             .clone()

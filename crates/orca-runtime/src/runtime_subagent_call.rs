@@ -1237,11 +1237,15 @@ fn run_threaded_agent_worker(
         // Execute against the canonical task's own cancel token. `task_stop`
         // flips this exact token, so there is no polling race between marking
         // the task running and installing a cancellation watcher.
-        let task_cancel = task_registry
+        let task_control = task_registry
             .get(&registry_task_id)
             .expect("threaded subagent task exists after mark_running")
-            .control
-            .cancel;
+            .control;
+        // Said before the launch shows the child's row, which names the
+        // child's thread only once it has started: a person's stop of that
+        // row reaches the turn through this token from the start.
+        task_control.mark_runs_on_its_own_thread();
+        let task_cancel = task_control.cancel;
         // Parent cancellation remains a separate one-way edge. Stopping this
         // child must never cancel its parent or a sibling.
         let registry_for_cancel = task_registry.clone();
