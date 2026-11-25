@@ -2041,106 +2041,23 @@ impl ThreadActor {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        let next_revision =
-            surface::TaskRevision::try_new(surfaced.revision.get().saturating_add(1))
-                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let batch = self.surface_event_batch_with_commit_id(
-            vec![(
-                surface::SurfaceScope::Thread,
-                surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
-                    task_id: surfaced.task_id.clone(),
-                    expected_revision: surfaced.revision,
-                    next_revision,
-                    status: surface::SurfaceTaskStatus::Running,
-                    completed_at: None,
-                    result: None,
-                    error: None,
-                }),
-            )],
-            None,
-        );
-        self.commit_surface_actor_batch_with_retry(&batch)?;
-        let committed_task = self
-            .resident_surface
-            .coordinator
-            .state()
-            .snapshot()
-            .tasks
-            .iter()
-            .find(|task| task.task_id == surfaced.task_id)
-            .cloned()
-            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        Ok(surface::MutationReply::Committed {
-            mutation: surface::CommittedMutation {
-                request_id,
-                target: surface::MutationTarget::Task {
-                    thread_id: snapshot.thread.thread_id,
-                    task_id: committed_task.task_id.clone(),
-                },
-                disposition: surface::MutationDisposition::Accepted,
-                acknowledgements: surface::NonEmptyVec::try_new(vec![
-                    surface::MutationCommitAck::ThreadLocalCursor {
-                        cursor: batch.cursor_after.clone(),
-                        family: surface::SurfaceFactFamily::Task,
-                        event_id: batch.events.as_slice()[0].event_id.clone(),
-                        commit_class: batch.commit_class.clone(),
-                    },
-                ])
-                .expect("child continuation commit has one acknowledgement"),
+        self.commit_running_task_refresh(
+            request_id,
+            surface::MutationTarget::Task {
+                thread_id: snapshot.thread.thread_id,
+                task_id: surfaced.task_id.clone(),
             },
-            value: surface::TaskControlOutput {
-                task: committed_task,
-                cursor: batch.cursor_after,
-            },
-        })
+            &surfaced,
+        )
     }
 
-    /// Whether a person's stop names a running child that the turn `active`
-    /// keeps on a thread of this process.
-    ///
-    /// The child must be owned by this very turn: a child of another parent
-    /// reports to that parent's thread, and a child of an earlier turn to
-    /// that turn, so neither carries this fence. Its task must be a
-    /// subagent's, still active, with no worker process, so neither a child
-    /// in a worker process nor a workflow's agent, whose task is the
-    /// workflow's, can match. And the host must keep its children here, so
-    /// a host that does not refuses as it always has.
-    fn is_running_kept_subagent(
-        &self,
-        active: &ActiveOperation,
-        subagent: &surface::SurfaceSubagent,
-    ) -> bool {
-        let surface::SurfaceSubagentOwner::Generation { fence } = &subagent.owner else {
-            return false;
-        };
-        active.surface_operation.as_ref() == Some(fence)
-            && subagent.status == surface::SurfaceSubagentStatus::Running
-            && self
-                .agent_controller
-                .as_ref()
-                .is_some_and(|controller| controller.keeps_subagents_in_process())
-            && active
-                .task_registry
-                .get(subagent.task_id.as_str())
-                .is_some_and(|record| {
-                    record.task_type == orca_core::task_types::TaskType::Subagent
-                        && record.status.is_active()
-                        && record.worker_pid.is_none()
-                })
-    }
-
-    /// Stops one child the running turn keeps on a thread of this process.
-    ///
-    /// The registry marks the child stopping and cancels its turn, and
-    /// returns at once; this actor does not wait for the child, whose end
-    /// reaches the parent through this same actor. That end, the child's own
-    /// cancelled completion, is what writes the parent's surface, and is
-    /// shown as stopped because the task is remembered here as stopped by a
-    /// person. What is committed now only answers the request: the task is
-    /// still running until the child has ended.
-    fn stop_kept_subagent(
+    /// Commits `task` as running at its next revision and answers
+    /// `request_id` with it. The task was running and still is, so nothing
+    /// reads this as news; it is how a task control is answered while what
+    /// it asked for is under way, and it lands in the single-event
+    /// running-to-running arm of the actor's permit.
+    fn commit_running_task_refresh(
         &mut self,
-        active: &ActiveOperation,
         request_id: surface::SurfaceRequestId,
         target: surface::MutationTarget,
         task: &surface::SurfaceTask,
@@ -2148,12 +2065,6 @@ impl ThreadActor {
         surface::MutationReply<surface::TaskControlOutput>,
         surface::SurfaceClientCommandError,
     > {
-        active
-            .task_registry
-            .request_stop(task.task_id.as_str())
-            .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        self.subagents_stopped_by_person
-            .insert(task.task_id.as_str().to_string());
         let next_revision = surface::TaskRevision::try_new(
             task.revision
                 .get()
@@ -2200,13 +2111,128 @@ impl ThreadActor {
                         commit_class: batch.commit_class.clone(),
                     },
                 ])
-                .expect("a kept child's stop commits one acknowledgement"),
+                .expect("a running task refresh commits one acknowledgement"),
             },
             value: surface::TaskControlOutput {
                 task: committed_task,
                 cursor: batch.cursor_after,
             },
         })
+    }
+
+    /// Whether a person's stop names a child, running on this surface, that
+    /// the turn `active` keeps on a thread of this process.
+    ///
+    /// The child must be owned by this very turn: a child of another parent
+    /// reports to that parent's thread, and a child of an earlier turn to
+    /// that turn, so neither carries this fence. Its task must be a
+    /// subagent's with no worker process, so neither a child in a worker
+    /// process nor a workflow's agent, whose task is the workflow's, can
+    /// match. And the host must keep its children here, so a host that does
+    /// not refuses as it always has. Whether its record has ended already
+    /// is the stop's to answer.
+    fn is_running_kept_subagent(
+        &self,
+        active: &ActiveOperation,
+        subagent: &surface::SurfaceSubagent,
+    ) -> bool {
+        let surface::SurfaceSubagentOwner::Generation { fence } = &subagent.owner else {
+            return false;
+        };
+        active.surface_operation.as_ref() == Some(fence)
+            && subagent.status == surface::SurfaceSubagentStatus::Running
+            && self
+                .agent_controller
+                .as_ref()
+                .is_some_and(|controller| controller.keeps_subagents_in_process())
+            && active
+                .task_registry
+                .get(subagent.task_id.as_str())
+                .is_some_and(|record| {
+                    record.task_type == orca_core::task_types::TaskType::Subagent
+                        && record.worker_pid.is_none()
+                })
+    }
+
+    /// Stops one child the running turn keeps on a thread of this process.
+    ///
+    /// The registry marks the child stopping and cancels its turn, and
+    /// returns at once; this actor does not wait for the child, whose end
+    /// reaches the parent through this same actor. That end, the child's own
+    /// cancelled completion, is what writes the parent's surface, and is
+    /// shown as stopped because the task is remembered here as stopped by a
+    /// person. What is committed now only answers the request: the task is
+    /// still running until the child has ended.
+    ///
+    /// A child already being stopped, by the `task_stop` tool or by its
+    /// parent's interrupt, is answered the same way but not remembered: that
+    /// stop is not a person's, and its end stays cancelled. A child whose
+    /// record has ended is answered as ended. The stop is remembered before
+    /// the answer is committed and the registry asked, and forgotten if
+    /// either fails, so a failure leaves the child running and not
+    /// remembered, or stopping and remembered.
+    fn stop_kept_subagent(
+        &mut self,
+        active: &ActiveOperation,
+        request_id: surface::SurfaceRequestId,
+        target: surface::MutationTarget,
+        task: &surface::SurfaceTask,
+        current_revision: Option<surface::SurfaceMutationRevision>,
+    ) -> Result<
+        surface::MutationReply<surface::TaskControlOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let task_id = task.task_id.as_str();
+        let record = active
+            .task_registry
+            .get(task_id)
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if !record.status.is_active() {
+            return Ok(subagent_already_terminal(
+                request_id,
+                target,
+                current_revision,
+            ));
+        }
+        let remember = !record.stop_requested;
+        if remember {
+            self.subagents_stopped_by_person.insert(task_id.to_string());
+        }
+        let reply = match self.commit_running_task_refresh(request_id.clone(), target.clone(), task)
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                if remember {
+                    self.subagents_stopped_by_person.remove(task_id);
+                }
+                return Err(error);
+            }
+        };
+        if remember && active.task_registry.request_stop(task_id).is_err() {
+            self.subagents_stopped_by_person.remove(task_id);
+            let ended = active
+                .task_registry
+                .get(task_id)
+                .is_none_or(|record| !record.status.is_active());
+            if !ended {
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            }
+            let snapshot = self.resident_surface.coordinator.state().snapshot();
+            let current_revision = snapshot
+                .tasks
+                .iter()
+                .find(|candidate| candidate.task_id == task.task_id)
+                .map(|candidate| surface::SurfaceMutationRevision::Task {
+                    thread_id: snapshot.thread.thread_id.clone(),
+                    revision: candidate.revision,
+                });
+            return Ok(subagent_already_terminal(
+                request_id,
+                target,
+                current_revision,
+            ));
+        }
+        Ok(reply)
     }
 
     /// `active` is the turn running on this thread, if one is: a child it
@@ -2319,18 +2345,11 @@ impl ThreadActor {
                     | surface::SurfaceTaskStatus::Blocked
                     | surface::SurfaceTaskStatus::Cancelled
             ) {
-                return Ok(surface::MutationReply::Uncommitted {
-                    mutation: surface::UncommittedMutation::Invalid {
-                        request_id,
-                        target: Some(target),
-                        error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
-                            code: surface::SurfaceMutationErrorCode::IllegalState,
-                            message: surface::DisplayText::new("subagent task is already terminal"),
-                            winning_request_id: None,
-                            current_revision,
-                        }),
-                    },
-                });
+                return Ok(subagent_already_terminal(
+                    request_id,
+                    target,
+                    current_revision,
+                ));
             }
             let Some(subagent_id) = task.subagent_id.as_ref() else {
                 return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
@@ -2346,7 +2365,13 @@ impl ThreadActor {
             if let Some(active) = active
                 && self.is_running_kept_subagent(active, &subagent)
             {
-                return self.stop_kept_subagent(active, request_id, target, &task);
+                return self.stop_kept_subagent(
+                    active,
+                    request_id,
+                    target,
+                    &task,
+                    current_revision,
+                );
             }
             if !matches!(
                 subagent.owner,
@@ -2360,7 +2385,7 @@ impl ThreadActor {
                         error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
                             code: surface::SurfaceMutationErrorCode::IllegalState,
                             message: surface::DisplayText::new(
-                                "only a running subagent can be stopped independently",
+                                "this subagent cannot be stopped independently",
                             ),
                             winning_request_id: None,
                             current_revision,
@@ -9534,6 +9559,26 @@ impl ThreadActor {
         active.surface_terminalization.is_some()
             || active.surface_execution_failure.is_some()
             || active.generation.cancel.is_cancelled()
+    }
+}
+
+/// The answer to a control of a subagent task that has already ended.
+fn subagent_already_terminal(
+    request_id: surface::SurfaceRequestId,
+    target: surface::MutationTarget,
+    current_revision: Option<surface::SurfaceMutationRevision>,
+) -> surface::MutationReply<surface::TaskControlOutput> {
+    surface::MutationReply::Uncommitted {
+        mutation: surface::UncommittedMutation::Invalid {
+            request_id,
+            target: Some(target),
+            error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                code: surface::SurfaceMutationErrorCode::IllegalState,
+                message: surface::DisplayText::new("subagent task is already terminal"),
+                winning_request_id: None,
+                current_revision,
+            }),
+        },
     }
 }
 

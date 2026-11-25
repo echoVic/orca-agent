@@ -1194,6 +1194,24 @@ impl ThreadActor {
         task_registry: &crate::tasks::TaskRegistry,
         event: SubagentActivityEvent,
     ) -> io::Result<()> {
+        let ending_task = matches!(&event.payload, SubagentActivityPayload::Completed { .. })
+            .then(|| event.task_id.clone());
+        let result = self.commit_subagent_activity_checked(active, fence, task_registry, event);
+        // A child ends once, whether its end is committed or refused, so a
+        // person's stop of it is no longer awaited either way.
+        if let Some(task_id) = ending_task {
+            self.subagents_stopped_by_person.remove(task_id.as_str());
+        }
+        result
+    }
+
+    fn commit_subagent_activity_checked(
+        &mut self,
+        active: Option<&ActiveOperation>,
+        fence: Option<&surface::SurfaceOperationFence>,
+        task_registry: &crate::tasks::TaskRegistry,
+        event: SubagentActivityEvent,
+    ) -> io::Result<()> {
         // A generation that is ending admits no new child, but a child it
         // already started still reports, up to how it ended: refused, it
         // would stay running after the operation, and a cancelled turn would
@@ -1405,7 +1423,6 @@ impl ThreadActor {
         let (activity, turn, usage) = subagent_activity_projection(&event.payload);
         // A kept child a person stopped ends as cancelled, from inside its
         // own turn; that end is the stop, and is shown as one.
-        let ends = matches!(&event.payload, SubagentActivityPayload::Completed { .. });
         let stopped_by_person = matches!(
             &event.payload,
             SubagentActivityPayload::Completed {
@@ -1582,9 +1599,11 @@ impl ThreadActor {
                 );
                 let subagent_patch = match terminal {
                     Some((status, output, error, terminal_usage)) => {
-                        // Its record has no error for a stop, and nor does
-                        // what a person sees of it.
-                        let error = if stopped_by_person { None } else { error };
+                        let error = if stopped_by_person {
+                            error_after_a_persons_stop(error)
+                        } else {
+                            error
+                        };
                         next_task.status = match status {
                             surface::SurfaceSubagentTerminalStatus::Completed => {
                                 surface::SurfaceTaskStatus::Completed
@@ -1745,10 +1764,6 @@ impl ThreadActor {
                 io::Error::other(format!("failed to commit subagent activity: {error:?}"))
             })?;
 
-        if ends {
-            self.subagents_stopped_by_person
-                .remove(event.task_id.as_str());
-        }
         if self.subagent_activity_dedupe.len() >= super::SUBAGENT_ACTIVITY_DEDUPE_CAPACITY {
             self.subagent_activity_dedupe.pop_front();
         }
@@ -5845,6 +5860,42 @@ pub(super) fn unrecorded_tool_output(
     let streamed = surface_persisted_display_text(streamed);
     let rest = streamed.as_str().strip_prefix(recorded)?;
     (!rest.is_empty()).then(|| surface::DisplayText::new(rest.to_string()))
+}
+
+/// The error a kept child's row keeps when a person stopped it. Its record
+/// has no error for the stop, so neither has the row for the cancel the
+/// child's end reports; anything else it reports, a registry settlement
+/// that failed say, is still an error and stays.
+fn error_after_a_persons_stop(error: Option<surface::DisplayText>) -> Option<surface::DisplayText> {
+    error.filter(|error| error.as_str() != crate::agent_controller::AGENT_CANCELLED)
+}
+
+#[cfg(test)]
+mod persons_stop_tests {
+    use super::error_after_a_persons_stop;
+    use crate::runtime_surface as surface;
+
+    fn kept(error: Option<&str>) -> Option<String> {
+        error_after_a_persons_stop(error.map(|error| surface::DisplayText::new(error.to_string())))
+            .map(|error| error.as_str().to_string())
+    }
+
+    #[test]
+    fn a_persons_stop_drops_only_the_cancel_its_end_reports() {
+        assert_eq!(kept(Some("agent cancelled")), None);
+        assert_eq!(kept(None), None);
+        assert_eq!(
+            kept(Some(
+                "agent cancelled; task registry settlement failed: record is gone"
+            ))
+            .as_deref(),
+            Some("agent cancelled; task registry settlement failed: record is gone")
+        );
+        assert_eq!(
+            kept(Some("task registry settlement failed: record is gone")).as_deref(),
+            Some("task registry settlement failed: record is gone")
+        );
+    }
 }
 
 #[cfg(test)]

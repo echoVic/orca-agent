@@ -557,6 +557,36 @@ async fn call_streaming_async_with_output_budget(
                     usage: None,
                 };
             }
+            // A stream that is slow to end once cancelled: it runs until it
+            // is cancelled (30 s at most), then takes `delay_ms` more to end.
+            if let Some(delay_ms) = mock_stream_slow_cancel_ms(conversation) {
+                let started =
+                    ProviderStep::MessageDelta("Mock slow-cancel stream started.".to_string());
+                on_step(&started);
+                if !sleep_with_cancel(Duration::from_secs(30), cancel).await {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    return ProviderResponse {
+                        steps: vec![started],
+                        assistant_content: Some("Mock slow-cancel stream started.".to_string()),
+                        assistant_reasoning: None,
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    };
+                }
+                let completed =
+                    ProviderStep::MessageDelta("Mock slow-cancel stream completed.".to_string());
+                on_step(&completed);
+                return ProviderResponse {
+                    steps: vec![started, completed],
+                    assistant_content: Some(
+                        "Mock slow-cancel stream started.Mock slow-cancel stream completed."
+                            .to_string(),
+                    ),
+                    assistant_reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                };
+            }
             if let Some(release_marker) = mock_stream_release_marker(conversation) {
                 let started =
                     ProviderStep::MessageDelta("Mock release-marker stream started.".to_string());
@@ -822,6 +852,16 @@ fn mock_stream_delay_ms(conversation: &Conversation) -> Option<u64> {
         .unwrap_or("")
         .trim()
         .strip_prefix("mock_stream_delay_ms ")
+        .and_then(|delay| delay.trim().parse::<u64>().ok())
+        .map(|delay| delay.min(10_000))
+}
+
+fn mock_stream_slow_cancel_ms(conversation: &Conversation) -> Option<u64> {
+    conversation
+        .last_user_message()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("mock_stream_slow_cancel_ms ")
         .and_then(|delay| delay.trim().parse::<u64>().ok())
         .map(|delay| delay.min(10_000))
 }
@@ -1441,6 +1481,38 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
             let mut request = parse_mock_prompt(&format!("subagent async {child_prompt}"))
                 .expect("async subagent request");
             request.id = id.to_string();
+            request
+        });
+        let tool_calls = requests
+            .iter()
+            .map(|request| RawToolCall {
+                id: request.id.clone(),
+                function_name: request.name.as_str().to_string(),
+                arguments: request.raw_arguments.clone().unwrap_or_default(),
+            })
+            .collect();
+        return ProviderResponse {
+            steps: requests.into_iter().map(ProviderStep::ToolCall).collect(),
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls,
+            usage: None,
+        };
+    }
+
+    // An async child, then a sync child, with the same prompt, started in
+    // one response; each is described as "<mode> child".
+    if let Some(child_prompt) = prompt.trim().strip_prefix("subagent async_then_sync ") {
+        let requests = [("mock-tool-1", "async"), ("mock-tool-2", "sync")].map(|(id, mode)| {
+            let mut request = parse_mock_prompt(&format!("subagent {mode} {child_prompt}"))
+                .expect("subagent request");
+            let mut arguments: serde_json::Value =
+                serde_json::from_str(request.raw_arguments.as_deref().unwrap_or("{}"))
+                    .expect("subagent arguments");
+            arguments["description"] = serde_json::Value::String(format!("{mode} child"));
+            request.id = id.to_string();
+            request.target = Some(format!("{mode} child"));
+            request.raw_arguments = Some(arguments.to_string());
             request
         });
         let tool_calls = requests
@@ -2525,6 +2597,53 @@ mod tests {
         assert_eq!(
             response.assistant_content.as_deref(),
             Some("Mock slow stream started.Mock slow stream completed.")
+        );
+    }
+
+    #[test]
+    fn mock_stream_slow_cancel_ms_ends_that_long_after_it_is_cancelled() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_stream_slow_cancel_ms 300".to_string());
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+            max_output_tokens: None,
+        };
+        let cancel = CancelToken::new();
+        let canceller = cancel.clone();
+        let cancelled_at = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            canceller.cancel();
+            std::time::Instant::now()
+        });
+        let mut deltas = Vec::new();
+
+        let response = call_streaming(
+            ProviderKind::Mock,
+            &conversation,
+            &config,
+            &cancel,
+            &mut |step| {
+                if let ProviderStep::MessageDelta(text) = step {
+                    deltas.push(text.clone());
+                }
+            },
+        );
+        let ended_after_cancel = cancelled_at.join().expect("canceller").elapsed();
+
+        assert_eq!(deltas, vec!["Mock slow-cancel stream started.".to_string()]);
+        assert_eq!(
+            response.assistant_content.as_deref(),
+            Some("Mock slow-cancel stream started.")
+        );
+        assert!(
+            ended_after_cancel >= Duration::from_millis(250),
+            "the stream ended {ended_after_cancel:?} after its cancel"
         );
     }
 

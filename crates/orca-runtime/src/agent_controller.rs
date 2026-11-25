@@ -517,6 +517,9 @@ impl AgentController {
     }
 }
 
+/// The error a child's own end reports when its turn was cancelled.
+pub(crate) const AGENT_CANCELLED: &str = "agent cancelled";
+
 fn failure_after_started_message(
     surface_activity: Option<&AgentSurfaceActivity>,
     message: &str,
@@ -941,12 +944,12 @@ fn settle_operation(
     let (status, error) = if cancellation_requested
         || matches!(terminal.outcome(), OperationOutcome::Stopped(_))
     {
-        (RunStatus::Cancelled, Some("agent cancelled".to_string()))
+        (RunStatus::Cancelled, Some(AGENT_CANCELLED.to_string()))
     } else {
         match terminal.outcome() {
             OperationOutcome::Completed(RunStatus::Success) => (RunStatus::Success, None),
             OperationOutcome::Completed(RunStatus::Cancelled) => {
-                (RunStatus::Cancelled, Some("agent cancelled".to_string()))
+                (RunStatus::Cancelled, Some(AGENT_CANCELLED.to_string()))
             }
             OperationOutcome::Completed(RunStatus::ApprovalRequired) => (
                 RunStatus::ApprovalRequired,

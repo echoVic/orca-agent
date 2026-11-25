@@ -1146,6 +1146,9 @@ fn cancelled_task_output(
     }
 }
 
+/// What a turn reads of a child it waited on that was stopped on its own.
+const SUBAGENT_STOPPED_ALONE: &str = "the subagent was stopped by the user";
+
 fn run_threaded_agent_worker(
     invocation: RuntimeSubagentInvocation,
     _lifecycle: RuntimeSessionLifecycle,
@@ -1376,6 +1379,19 @@ fn run_threaded_agent_worker(
                 let _ = task_registry.bind_subagent_thread(id, &launch.thread_id);
             }
             let mut status = launch.status;
+            // A stop of this one child, a person's or the `task_stop`
+            // tool's, in a host that keeps its children here ends the child
+            // and not the turn waiting on it: the turn is told it was stopped
+            // and goes on. A stop that came with the parent's own cancel is
+            // the turn's, and still ends it.
+            let stopped_alone = kept_in_process
+                && !launch.running
+                && status == RunStatus::Cancelled
+                && !cancel.is_cancelled()
+                && registry_task_id
+                    .as_deref()
+                    .and_then(|task_id| task_registry.get(task_id))
+                    .is_some_and(|record| record.stop_requested);
             let mut output = if launch.running {
                 let agent_id = registry_task_id
                     .as_deref()
@@ -1506,6 +1522,13 @@ fn run_threaded_agent_worker(
                 }
             };
             let task = Some(started_task.with_status(task_status));
+            // Its record and its row end as stopped above, and its task as
+            // cancelled; only what the turn reads of it says it may go on.
+            if stopped_alone && status == RunStatus::Cancelled {
+                status = RunStatus::Success;
+                result =
+                    ToolResult::completed(&tool_request, SUBAGENT_STOPPED_ALONE.to_string(), false);
+            }
             RuntimeSubagentCallOutput {
                 tool_request,
                 description,
