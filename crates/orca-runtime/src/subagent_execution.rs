@@ -3845,6 +3845,124 @@ mod tests {
         host.shutdown().expect("shutdown runtime host");
     }
 
+    /// A stdio MCP server that lists no tools and writes its process id to
+    /// `<dir>/<name>.pid` as it starts.
+    #[cfg(unix)]
+    fn pid_writing_mcp_server(
+        name: &str,
+        dir: &std::path::Path,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let script = dir.join(format!("{name}-mcp.sh"));
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+echo $$ > "$1"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"pid","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write the MCP fixture");
+        orca_core::mcp_types::McpServerConfig {
+            name: name.to_string(),
+            command: Some("/bin/sh".to_string()),
+            args: vec![
+                script.to_string_lossy().into_owned(),
+                dir.join(format!("{name}.pid"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            startup_timeout_ms: Some(15_000),
+            tool_timeout_ms: Some(15_000),
+            ..Default::default()
+        }
+    }
+
+    /// Runs one hosted Sync child, of a host asked to keep its subagents or
+    /// not, whose config has one MCP server, `docs`. Gives back how the
+    /// child's thread, which stays, holds that server once the launch has
+    /// returned, and whether the server's process still runs.
+    #[cfg(unix)]
+    fn mcp_server_after_a_hosted_child(
+        keep: bool,
+        label: &str,
+    ) -> (orca_mcp::McpServerState, bool) {
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let mut config = config_in(cwd.path(), SubagentConfig::default());
+        config.mcp_servers = vec![pid_writing_mcp_server("docs", cwd.path())];
+
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, keep),
+            config,
+            cwd.path(),
+            label,
+            "mock_stream_delay_ms 1",
+        );
+
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Completed,
+            "{:?}",
+            result.error
+        );
+        let pid = std::fs::read_to_string(cwd.path().join("docs.pid"))
+            .expect("the child started the server of its config");
+        let statuses = host_handle
+            .resolve_live_thread(&child_thread_id)
+            .expect("the child's thread stays")
+            .mcp_registry()
+            .server_statuses();
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        let running = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .expect("ask whether the server's process runs")
+            .success();
+        host.shutdown().expect("shutdown runtime host");
+        (statuses[0].state.clone(), running)
+    }
+
+    /// Under a host that keeps its subagents, a child's thread stays for its
+    /// conversation once its task has ended, and the MCP servers it started
+    /// for that task are stopped then.
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_childs_mcp_servers_stop_once_its_task_has_ended() {
+        let (state, running) = mcp_server_after_a_hosted_child(true, "kept-child-mcp");
+
+        assert_eq!(
+            state,
+            orca_mcp::McpServerState::Failed {
+                message: "MCP server 'docs' was stopped".to_string()
+            }
+        );
+        assert!(!running, "the server's process still runs");
+    }
+
+    /// Under a host that was not asked, a hosted child's MCP servers are
+    /// left to its thread, as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_childs_mcp_servers_under_a_host_that_did_not_ask_are_left_to_its_thread() {
+        let (state, running) = mcp_server_after_a_hosted_child(false, "not-kept-child-mcp");
+
+        assert_eq!(state, orca_mcp::McpServerState::Ready);
+        assert!(running, "the server's process has ended");
+    }
+
     /// The mock's reply once a call of the turn has its result.
     const MOCK_REPLY_AFTER_A_TOOL: &str = "Mock completed after tool execution.";
 

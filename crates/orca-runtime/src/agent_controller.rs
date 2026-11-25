@@ -490,6 +490,9 @@ impl AgentController {
                 .name(format!("orca-agent-wait-{}", request.agent_id))
                 .spawn(move || {
                     let result = settle_operation(&completion_child, operation, None);
+                    if kept_in_process {
+                        close_settled_childs_mcp_servers(&completion_child);
+                    }
                     let _ = watcher_publisher.publish_surface_terminal(
                         result.status,
                         result.final_message.clone(),
@@ -524,8 +527,22 @@ impl AgentController {
             });
         }
 
-        Ok(settle_operation(&child, operation, Some(&request.cancel)))
+        let result = settle_operation(&child, operation, Some(&request.cancel));
+        if kept_in_process {
+            close_settled_childs_mcp_servers(&child);
+        }
+        Ok(result)
     }
+}
+
+/// Stops the MCP servers a kept child started for its task, once that task
+/// has settled. The child's thread stays for its conversation, which a view
+/// can read, but nothing runs on it again in stage 1, so its servers would
+/// only run on until the host ends. Other hosts leave them to the child's
+/// thread, as they always have. A later turn on this thread (stage 3) will
+/// need the servers again, and must start them before it runs.
+fn close_settled_childs_mcp_servers(child: &RuntimeThreadHandle) {
+    child.mcp_registry().close();
 }
 
 /// The error a child's own end reports when its turn was cancelled.
