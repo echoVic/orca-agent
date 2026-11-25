@@ -1283,11 +1283,11 @@ fn run_threaded_agent_worker(
         match threaded_sync_surface_activity(
             &registry_task_id,
             &registry_task_id,
-            crate::agent_continuation::AgentAttemptId::new(),
             &description,
             &batch_id,
             batch_size,
             activity_ingress.as_ref().cloned(),
+            controller.keeps_subagents_in_process(),
         ) {
             Ok(activity) => {
                 let permission_handler = permission_handler.map(|parent| {
@@ -1569,11 +1569,11 @@ struct ThreadedSyncSurfaceActivity {
 fn threaded_sync_surface_activity(
     task_id: &str,
     subagent_id: &str,
-    attempt_id: crate::agent_continuation::AgentAttemptId,
     description: &str,
     batch_id: &str,
     batch_size: u32,
     activity_ingress: Option<Arc<dyn RuntimeSubagentActivityIngress>>,
+    kept_in_process: bool,
 ) -> io::Result<ThreadedSyncSurfaceActivity> {
     let Some(activity_ingress) = activity_ingress else {
         return Err(io::Error::new(
@@ -1594,18 +1594,26 @@ fn threaded_sync_surface_activity(
         )
     })?;
     let turn_id = TurnId::new();
-    let emitter = Arc::new(ChildAgentActivityEmitter::new(
+    let emitter = ChildAgentActivityEmitter::new(
         SubagentActivityIdentity {
             task_id: task_id.clone(),
             subagent_id: subagent_id.clone(),
-            attempt_id,
+            attempt_id: crate::agent_continuation::AgentAttemptId::new(),
             turn_id: turn_id.clone(),
             owner: activity_ingress.owner(),
         },
         Arc::new(RuntimeSubagentActivitySink {
             ingress: activity_ingress,
         }),
-    ));
+    );
+    // A kept child's end is taken after its parent's turn is over, when
+    // anything else it reports is refused; see the emitter's
+    // `end_takes_a_refused_reports_place`.
+    let emitter = Arc::new(if kept_in_process {
+        emitter.end_takes_a_refused_reports_place()
+    } else {
+        emitter
+    });
     Ok(ThreadedSyncSurfaceActivity {
         permission_identity: ChildPermissionIdentity::new(
             task_id,
@@ -3412,11 +3420,11 @@ mod tests {
         let activity = threaded_sync_surface_activity(
             &task.id,
             &task.id,
-            AgentAttemptId::new(),
             "inspect identity",
             "batch-identity",
             1,
             Some(ingress.clone()),
+            false,
         )
         .expect("threaded activity");
         activity
