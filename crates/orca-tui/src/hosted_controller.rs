@@ -1263,7 +1263,13 @@ pub(crate) fn hosted_tui_controller_loop(
 
     // The agents this TUI started run on its threads and end with it: stop
     // them so their tasks are recorded as stopped, not left as running.
-    let _ = host.stop_kept_subagents(Duration::from_secs(2));
+    // The turn under way is stopped first, so that it does not go on with
+    // the agents' results once they stop, and its stop also reaches the
+    // agents still waiting for capacity, which have no thread to be asked.
+    // The wait lets an agent that takes a few seconds to end report its
+    // end to the conversation before that conversation's thread ends.
+    let _ = control.interrupt_current();
+    let _ = host.stop_kept_subagents(Duration::from_secs(5));
     control.unbind_view();
     if let Some(focus) = view.close() {
         shutdown_attached_child_on_controller_exit(focus);
@@ -1434,9 +1440,20 @@ mod tests {
         mpsc::Receiver<TuiEvent>,
         TuiAgentRuntime,
     ) {
+        spawn_controller_configured(|config| config.history_mode = history_mode)
+    }
+
+    fn spawn_controller_configured(
+        configure: impl FnOnce(&mut orca_core::config::RunConfig),
+    ) -> (
+        crate::test_support::OrcaHomeGuard,
+        mpsc::Sender<UserAction>,
+        mpsc::Receiver<TuiEvent>,
+        TuiAgentRuntime,
+    ) {
         let _home = crate::test_support::isolate_orca_home();
         let mut config = crate::test_support::test_run_config();
-        config.history_mode = history_mode;
+        configure(&mut config);
         let config = Arc::new(Mutex::new(config));
         let preloaded = Arc::new(Mutex::new(None));
         let (action_tx, action_rx) = mpsc::bounded(8);
@@ -1504,7 +1521,8 @@ mod tests {
         assert!(observed.view().is_none(), "the view is let go at the end");
     }
 
-    /// The first running agent with a thread of its own that an event shows.
+    /// The first running agent with a thread of its own, whose own turn has
+    /// started, that an event shows.
     fn kept_running_agent(event: TuiEvent) -> Option<String> {
         let event = match event {
             TuiEvent::Attached(attached) => {
@@ -1527,29 +1545,93 @@ mod tests {
                 task.task_type == orca_core::task_types::TaskType::Subagent
                     && task.status.is_active()
                     && task.subagent_child_thread_id.is_some()
+                    && task.subagent_turn.is_some()
             })
             .map(|task| task.id)
     }
 
-    /// An agent the TUI keeps on its threads ends with it: after a quit its
-    /// task is recorded as stopped, not left running or failed.
+    /// The last status of each task that the saved conversations under
+    /// `home` record, as a resume reads them back.
+    fn saved_task_statuses(home: &std::path::Path) -> std::collections::HashMap<String, String> {
+        fn visit(
+            value: &serde_json::Value,
+            statuses: &mut std::collections::HashMap<String, String>,
+        ) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    if let Some(task) = fields.get("Task") {
+                        let (task_id, status) =
+                            match (task.get("Upserted"), task.get("StatusChanged")) {
+                                (Some(upserted), _) => {
+                                    (&upserted["task"]["task_id"], &upserted["task"]["status"])
+                                }
+                                (None, Some(changed)) => (&changed["task_id"], &changed["status"]),
+                                (None, None) => {
+                                    (&serde_json::Value::Null, &serde_json::Value::Null)
+                                }
+                            };
+                        if let (Some(task_id), Some(status)) = (task_id.as_str(), status.as_str()) {
+                            statuses.insert(task_id.to_string(), status.to_string());
+                        }
+                    }
+                    fields.values().for_each(|value| visit(value, statuses));
+                }
+                serde_json::Value::Array(values) => {
+                    values.iter().for_each(|value| visit(value, statuses));
+                }
+                _ => {}
+            }
+        }
+        let mut statuses = std::collections::HashMap::new();
+        let mut dirs = vec![home.join("sessions")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for line in text.lines() {
+                    let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    if record["type"] == "runtime.surface_commit.prepared" {
+                        visit(&record, &mut statuses);
+                    }
+                }
+            }
+        }
+        statuses
+    }
+
+    /// The agents the TUI keeps on its threads end with it: after a quit
+    /// their tasks are recorded as stopped, not left running, failed or
+    /// queued, and the main conversation's turn has ended with them. The
+    /// quit waits for an agent that takes a few seconds to end, so its end
+    /// is in the saved conversation and a resume does not show it running.
     #[test]
     fn quitting_stops_the_agents_the_tui_keeps() {
-        let (_home, action_tx, event_rx, mut runtime) =
-            spawn_controller_with_history(HistoryMode::Record);
-        // The mock starts an async agent whose own turn streams for 30 s;
-        // the main conversation's turn waits for its result.
+        let (_home, action_tx, event_rx, mut runtime) = spawn_controller_configured(|config| {
+            config.history_mode = HistoryMode::Record;
+            config.subagents.limits.max_running = 1;
+        });
+        // The mock starts two async agents whose own turns stream until they
+        // are cancelled and then take 3 s to end: one runs, the other waits
+        // for capacity. The main conversation's turn waits for their results.
         action_tx
             .send(UserAction::Submit(
-                "subagent async mock_stream_delay_ms 30000".to_string(),
+                "subagent batch async mock_stream_slow_cancel_ms 3000".to_string(),
             ))
             .expect("submit action");
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let task_id = loop {
+        let running = loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let event = event_rx
                 .recv_timeout(remaining)
-                .expect("the agent is shown running with a thread of its own");
+                .expect("an agent is shown running with a thread of its own");
             let event = match event {
                 TuiEvent::Attached(attached) => {
                     let AttachedTuiEvent { event, .. } = *attached;
@@ -1576,27 +1658,57 @@ mod tests {
             .runtime_thread()
             .expect("the main conversation's thread")
             .task_registry();
+        let agents = |registry: &orca_runtime::tasks::TaskRegistry| {
+            registry
+                .list()
+                .into_iter()
+                .filter(|task| task.task_type == orca_core::task_types::TaskType::Subagent)
+                .collect::<Vec<_>>()
+        };
+        let queued = agents(&registry)
+            .into_iter()
+            .find(|task| task.id != running)
+            .expect("the second agent");
+        assert_eq!(
+            queued.status,
+            orca_core::task_types::TaskStatus::Queued,
+            "{queued:?}"
+        );
 
-        // What a quit by signal sends while a turn runs: the interrupt asks
-        // the agents of that turn to stop, and the quit follows at once.
-        action_tx
-            .send(UserAction::Interrupt)
-            .expect("interrupt action");
+        // The quit alone, as the TUI sends it when the person quits while a
+        // turn runs.
         action_tx.send(UserAction::Cancel).expect("cancel action");
         runtime.shutdown().expect("hosted controller shutdown");
 
-        let task = registry
+        let agents = agents(&registry);
+        assert_eq!(agents.len(), 2, "{agents:?}");
+        for agent in &agents {
+            assert_eq!(
+                agent.status,
+                orca_core::task_types::TaskStatus::Stopped,
+                "{agent:?}"
+            );
+            assert!(agent.completed_at_ms.is_some());
+            assert_eq!(agent.error, None);
+        }
+        let main_turns: Vec<_> = registry
             .list()
             .into_iter()
-            .find(|task| task.id == task_id)
-            .expect("the agent's task");
-        assert_eq!(
-            task.status,
-            orca_core::task_types::TaskStatus::Stopped,
-            "{task:?}"
+            .filter(|task| task.task_type == orca_core::task_types::TaskType::MainSession)
+            .collect();
+        assert!(!main_turns.is_empty(), "the main conversation's turn");
+        assert!(
+            main_turns.iter().all(|turn| !turn.status.is_active()),
+            "the main conversation's turn has ended: {main_turns:?}"
         );
-        assert!(task.completed_at_ms.is_some());
-        assert_eq!(task.error, None);
+        // The running agent's end reached the main conversation before its
+        // thread ended, so a resume does not show the agent running.
+        let saved = saved_task_statuses(_home.path());
+        let shown = saved.get(&running).map(String::as_str);
+        assert!(
+            shown.is_some_and(|status| !matches!(status, "Queued" | "Running" | "Stopping")),
+            "the saved conversation shows the agent {running} as {shown:?}"
+        );
     }
 
     #[test]
