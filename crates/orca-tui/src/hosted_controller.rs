@@ -1265,10 +1265,10 @@ pub(crate) fn hosted_tui_controller_loop(
     // them so their tasks are recorded as stopped, not left as running.
     // The turn under way is not stopped here: a quit from main's view sent
     // its interrupt before this cancel, and that stop also reaches the
-    // agents still waiting for capacity, which have no thread to be asked;
-    // an attached session's turn goes on after this TUI. (From an agent's
-    // view while main runs, the keys do not send that interrupt yet.)
-    // The wait lets an agent that takes a few seconds to end report its
+    // agents still waiting for capacity, which have no thread to be asked.
+    // (From an agent's view while main runs, the keys do not send that
+    // interrupt yet; main's turn then ends with the controller's shutdown.)
+    // An attached session never runs this loop. The wait lets an agent that takes a few seconds to end report its
     // end to the conversation before that conversation's thread ends.
     let _ = host.stop_kept_subagents(Duration::from_secs(5));
     control.unbind_view();
