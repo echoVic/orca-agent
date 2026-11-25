@@ -125,11 +125,11 @@ running while they run. In the TUI:
   rows leave the dock and read `cancelled` in the Agents panel.
 - `s` on a subagent's row in the Agents panel stops that subagent only. A
   `Stopping …` notice is shown at once, and the row reads `stopped` once the
-  subagent has settled. Main's turn and the other subagents go on. A
-  `subagent` call of main's that was waiting for the stopped one returns `the
-  subagent was stopped by the user`. A subagent started in the background
-  reads `stopped` in main's `task_wait`, with the result `agent cancelled`,
-  and main may take that as a failure and start the subagent again.
+  subagent has settled. Main's turn and the other subagents go on. Main is
+  told `the subagent was stopped by the user`: a `subagent` call of main's
+  that was waiting for the stopped one returns it, and a subagent started in
+  the background reads `stopped` in main's `task_wait`, with it as the
+  result.
 - Quitting stops the subagents that are still running and records them as
   stopped. While they run, main's turn is running too, so the first Ctrl+C
   stops that turn and its subagents with it; the next Ctrl+C says `Press

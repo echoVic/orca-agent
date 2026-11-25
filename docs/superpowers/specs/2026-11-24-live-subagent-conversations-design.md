@@ -401,9 +401,13 @@ and after a resume neither is shown running. Seen and left to stage 2:
 after returning from a child's view main's running row and its local
 notices (`Stopping …`) are gone, and `Main is running` is lost when a child
 is opened again from its own view; `Agent completed` is shown in the
-child's own view; a cancelled child's panel history ends `completed`; a
-child stopped with `s` that main waited on with `task_wait` reads
-`agent cancelled`, and main started it again both times.
+child's own view; a cancelled child's panel history ends `completed`. A
+child stopped with `s` that main waited on with `task_wait` read
+`agent cancelled`, and main started it again both times; since the final
+fix wave it reads `the subagent was stopped by the user` there and in a
+`subagent` call that waited on it. In the one run since (`fd57a5e1`), main
+did not start it again: it reported the agent as stopped by the user and
+offered to start it again if asked.
 
 ## Not in this change
 
