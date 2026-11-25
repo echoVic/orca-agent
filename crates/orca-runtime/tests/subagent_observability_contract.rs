@@ -314,7 +314,7 @@ fn subagent_runtime_events_are_not_a_parallel_tui_projection() {
 
 #[test]
 fn surface_task_projection_preserves_the_registry_parent_identity() {
-    let function = balanced_block(GENERATION_ACTOR, "fn commit_subagent_activity_inner");
+    let function = balanced_block(GENERATION_ACTOR, "fn commit_subagent_activity_checked");
     assert!(
         function.contains("resolve_subagent_parent_task_id")
             && function.contains("parent_task_id,"),
@@ -324,7 +324,7 @@ fn surface_task_projection_preserves_the_registry_parent_identity() {
 
 #[test]
 fn durable_commit_retry_checks_the_event_digest_before_acknowledging_id() {
-    let function = balanced_block(GENERATION_ACTOR, "fn commit_subagent_activity_inner");
+    let function = balanced_block(GENERATION_ACTOR, "fn commit_subagent_activity_checked");
     let lookup_start = function
         .find("lookup_commit(&event.surface_commit_id)")
         .expect("subagent activity commit should consult the durable retry index");
