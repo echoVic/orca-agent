@@ -375,9 +375,10 @@ Run on 2026-11-25 at the end of stage 1 (`a05a69d6`, `deepseek-flash`, a
 150x50 pty read with `pyte`, frames under `/tmp/orca-stage1/`), items 1 to 4
 hold. 1: in auto-edit both kept children wrote their file and ran
 `ls -a && cat` with no prompt, and no `orca subagent-worker` process existed
-at any point. 2: the task registry held a main-session record for main's
-turns only, and the Agents panel, Esc, `s`, quit and `--resume` all worked
-without one for a child. 3: a host keeps its children in its process only
+at any point. 2: the task registry held a main-session record for each of
+main's turns and a `subagent` record for each child, but no main-session
+record for a child, and the Agents panel, Esc, `s`, quit and `--resume` all
+worked without one. 3: a host keeps its children in its process only
 when it asks to; `server_runtime_contract`, `acp_agent` and
 `subagent_delegation_contract` pass. 4: in suggest, each child's write and
 shell call came back as a tool result, `This call needs an approval, and a
@@ -386,9 +387,11 @@ what it could not do, main's reply said so too, and neither file exists.
 Also seen: a child's conversation streams while it runs and a message sent
 in it is handed back; the rows keep their order; `s` in the Agents panel
 stops one child (`stopped`, no `s stop`) while main and the other go on;
-Esc or Ctrl+C on main stops both (`cancelled`, `0 active`) within about
-three seconds, during `sleep 20` too, and the next prompt is answered with
-no row coming back; the Ctrl+C after that says `Press Ctrl+C again to
+Esc on main stops both (`cancelled`, `0 active`): their rows left within
+about a second and main's turn ended within about three, during `sleep 20`
+too, and the next prompt is answered with no row coming back; Ctrl+C on main
+does the same, its rows leaving after about two seconds and main's turn
+ending after about five; the Ctrl+C after that says `Press Ctrl+C again to
 quit.`, the TUI exits 130, no process is left, both records are `stopped`,
 and after a resume neither is shown running. Seen and left to stage 2:
 `Inherited conversation context.` shows in a child's view and on main;

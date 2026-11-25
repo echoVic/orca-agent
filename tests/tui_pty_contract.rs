@@ -604,8 +604,8 @@ fn tui_tasks_workspace_stops_one_subagent_without_terminal_spam() {
         "stopping a child must keep the parent TUI alive"
     );
     // The child never finishes on its own: its release marker is never
-    // written. Main's reply after the stopped call shows that the stop ended
-    // the child alone and main's turn went on past it.
+    // written. Main's reply after the stopped call shows that the stop did
+    // not end main's turn: the turn went on to its reply.
     assert_screen_shows(
         &process,
         &mut output,

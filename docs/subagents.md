@@ -127,11 +127,13 @@ running while they run. In the TUI:
   `Stopping …` notice is shown at once, and the row reads `stopped` once the
   subagent has settled. Main's turn and the other subagents go on. A
   `subagent` call of main's that was waiting for the stopped one returns `the
-  subagent was stopped by the user`; one started in the background reads
-  `stopped` in `task_wait`.
+  subagent was stopped by the user`. A subagent started in the background
+  reads `stopped` in main's `task_wait`, with the result `agent cancelled`,
+  and main may take that as a failure and start the subagent again.
 - Quitting stops the subagents that are still running and records them as
-  stopped. If any is running when main is idle, the first Ctrl+C says how many
-  (`2 agents are still running. Press Ctrl+C again to quit and stop them.`).
+  stopped. While they run, main's turn is running too, so the first Ctrl+C
+  stops that turn and its subagents with it; the next Ctrl+C says `Press
+  Ctrl+C again to quit.`, and the one after that quits.
 - Backgrounding a main turn that has running subagents is not supported yet.
 
 Such a subagent never asks the person, or the main agent, anything. What it
