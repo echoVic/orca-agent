@@ -35326,6 +35326,21 @@ mod tests {
                 .map(|entry| entry.activity.as_str()),
             Some("completed")
         );
+        // The end took the place of the cancelled tool's report, which the
+        // parent refused: that report never landed, so what came before the
+        // end is still the tool the agent was in. Nothing makes the report
+        // come after the turn is over; it does because the agent's tool takes
+        // longer to stop than the turn (when this was written, the report
+        // came 120-240 ms after the turn was over).
+        let history = &shown.subagent_activity_history;
+        assert_eq!(
+            history
+                .len()
+                .checked_sub(2)
+                .map(|before_end| history[before_end].activity.as_str()),
+            Some("bash: sleep 30"),
+            "{history:?}"
+        );
         std::thread::sleep(Duration::from_millis(300));
         subagent_terminals_seen(
             &mut subscription,

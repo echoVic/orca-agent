@@ -1171,6 +1171,7 @@ fn run_threaded_agent_worker(
         ..
     } = invocation;
     let controller = agent_controller.expect("threaded agent branch requires controller");
+    let kept_in_process = controller.keeps_subagents_in_process();
     let description = request.description.clone();
     let mode = match request.mode {
         crate::subagent::SubagentMode::Sync => AgentRunMode::Sync,
@@ -1287,7 +1288,7 @@ fn run_threaded_agent_worker(
             &batch_id,
             batch_size,
             activity_ingress.as_ref().cloned(),
-            controller.keeps_subagents_in_process(),
+            kept_in_process,
         ) {
             Ok(activity) => {
                 let permission_handler = permission_handler.map(|parent| {
@@ -1340,7 +1341,6 @@ fn run_threaded_agent_worker(
     // legacy sync child path is identical. Such a child resolves per-tool
     // approvals from its own RunConfig (RuntimeConfigApprovalHandler), while
     // user-facing escalations flow through the scoped permission handler.
-    let kept_in_process = controller.keeps_subagents_in_process();
     let approval_handler = kept_in_process.then(|| {
         Arc::new(crate::child_refusal::RefusingApprovalHandler)
             as Arc<dyn crate::lifecycle::RuntimeApprovalHandler + Send + Sync>
