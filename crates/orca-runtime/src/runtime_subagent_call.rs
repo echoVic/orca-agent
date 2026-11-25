@@ -1146,8 +1146,10 @@ fn cancelled_task_output(
     }
 }
 
-/// What a turn reads of a child it waited on that was stopped on its own.
-const SUBAGENT_STOPPED_ALONE: &str = "the subagent was stopped by the user";
+/// What a parent reads of a child a person stopped on its own: a turn that
+/// waited on it, and `task_wait`, `task_read_output` and the completion
+/// notice, which read its record's result.
+const SUBAGENT_STOPPED_BY_PERSON: &str = "the subagent was stopped by the user";
 
 fn run_threaded_agent_worker(
     invocation: RuntimeSubagentInvocation,
@@ -1379,19 +1381,21 @@ fn run_threaded_agent_worker(
                 let _ = task_registry.bind_subagent_thread(id, &launch.thread_id);
             }
             let mut status = launch.status;
-            // A stop of this one child, a person's or the `task_stop`
-            // tool's, in a host that keeps its children here ends the child
-            // and not the turn waiting on it: the turn is told it was stopped
-            // and goes on. A stop that came with the parent's own cancel is
-            // the turn's, and still ends it.
-            let stopped_alone = kept_in_process
+            // Only a person's stop of this one child marks its record, and
+            // only in a host that keeps its children here. An interrupt, a
+            // quit, a `deadline_ms` expiry and the `task_stop` tool do not:
+            // their child ends cancelled, as it always has.
+            let stopped_by_person = kept_in_process
                 && !launch.running
                 && status == RunStatus::Cancelled
-                && !cancel.is_cancelled()
                 && registry_task_id
                     .as_deref()
                     .and_then(|task_id| task_registry.get(task_id))
-                    .is_some_and(|record| record.stop_requested);
+                    .is_some_and(|record| record.control.stopped_by_person());
+            // A person's stop ends the child and not the turn waiting on it:
+            // the turn is told it was stopped and goes on. A stop that came
+            // with the parent's own cancel is the turn's, and still ends it.
+            let stopped_alone = stopped_by_person && !cancel.is_cancelled();
             let mut output = if launch.running {
                 let agent_id = registry_task_id
                     .as_deref()
@@ -1466,10 +1470,14 @@ fn run_threaded_agent_worker(
                     }
                     (RunStatus::Cancelled, Some(task_id)) => task_registry.stop_with_usage(
                         task_id,
-                        launch
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "subagent cancelled".to_string()),
+                        if stopped_by_person {
+                            SUBAGENT_STOPPED_BY_PERSON.to_string()
+                        } else {
+                            launch
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "subagent cancelled".to_string())
+                        },
                         Some(usage),
                     ),
                     (RunStatus::Blocked { blocker }, Some(task_id)) => task_registry
@@ -1526,8 +1534,11 @@ fn run_threaded_agent_worker(
             // cancelled; only what the turn reads of it says it may go on.
             if stopped_alone && status == RunStatus::Cancelled {
                 status = RunStatus::Success;
-                result =
-                    ToolResult::completed(&tool_request, SUBAGENT_STOPPED_ALONE.to_string(), false);
+                result = ToolResult::completed(
+                    &tool_request,
+                    SUBAGENT_STOPPED_BY_PERSON.to_string(),
+                    false,
+                );
             }
             RuntimeSubagentCallOutput {
                 tool_request,

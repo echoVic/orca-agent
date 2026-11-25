@@ -34225,6 +34225,101 @@ mod tests {
             .expect("shutdown kept sync subagent stop host");
     }
 
+    /// The `task_stop` tool's stop of a sync agent the TUI keeps is not a
+    /// person's: the agent reads cancelled, and the turn waiting on it ends
+    /// cancelled with it, as before a person could stop one agent.
+    #[test]
+    fn a_tools_stop_of_a_kept_sync_subagent_ends_the_turn_waiting_on_it() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start kept sync subagent tool stop host");
+        let (thread, _attachment, operation_id) = start_keeping_parent_turn(
+            &host,
+            cwd.path(),
+            "subagent sync mock_stream_delay_ms 30000",
+        );
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let agent = kept_agents_under_way(read_snapshot, &["mock_stream_delay_ms 30000"]).remove(0);
+
+        // What the `task_stop` tool asks of the registry.
+        registry
+            .request_stop(agent.task_id.as_str())
+            .expect("the tool's stop");
+
+        let (record, _, _) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &agent.task_id,
+            Duration::from_secs(5),
+        );
+        assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        assert_eq!(
+            record.result.as_deref(),
+            Some(crate::agent_controller::AGENT_CANCELLED)
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (snapshot, terminal) = loop {
+            let snapshot = read_snapshot();
+            let terminal = snapshot
+                .foreground_operation
+                .iter()
+                .chain(&snapshot.operation_history)
+                .find(|operation| operation.operation_id == operation_id)
+                .and_then(|operation| operation.terminal.clone());
+            if let Some(terminal) = terminal {
+                break (snapshot, terminal);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the parent's turn did not end with its agent"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            matches!(
+                terminal.terminal,
+                surface::OperationTerminal::Cancelled { .. }
+            ),
+            "the parent's turn ended cancelled: {:?}",
+            terminal.terminal
+        );
+        assert!(
+            !snapshot.items.iter().any(|item| matches!(
+                item,
+                surface::SurfaceItem::AssistantMessage { text, .. }
+                    if text.as_str() == "Mock completed after tool execution."
+            )),
+            "the turn made no model call after its agent was stopped"
+        );
+        let told: Vec<_> = thread
+            .read_surface_history()
+            .expect("the parent's conversation")
+            .into_iter()
+            .filter_map(|message| match message {
+                surface::SurfaceHistoryMessage::Tool { content, .. } => {
+                    Some(content.as_str().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !told
+                .iter()
+                .any(|content| content.contains("the subagent was stopped by the user")),
+            "{told:?}"
+        );
+        host.shutdown()
+            .expect("shutdown kept sync subagent tool stop host");
+    }
+
     /// A kept agent that is already being stopped, by the `task_stop` tool or
     /// by its parent's interrupt, is not a person's stop: a person's `s` in
     /// that window is answered, and the agent still ends cancelled.
@@ -34274,6 +34369,10 @@ mod tests {
             Duration::from_secs(10),
         );
         assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        assert_eq!(
+            record.result.as_deref(),
+            Some(crate::agent_controller::AGENT_CANCELLED)
+        );
         assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
         assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
         assert_ne!(
@@ -34682,6 +34781,12 @@ mod tests {
         assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
         assert_eq!(record.error, None);
         assert!(record.usage.is_some(), "the agent's usage is kept");
+        // What `task_wait`, `task_read_output` and the completion notice
+        // give the parent for it.
+        assert_eq!(
+            record.result.as_deref(),
+            Some("the subagent was stopped by the user")
+        );
 
         // Its own conversation records its turn as cancelled.
         let first_thread = first
@@ -34923,6 +35028,11 @@ mod tests {
         );
         assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
         assert_eq!(record.error, None);
+        // Its parent's interrupt is not a person's stop of it.
+        assert_eq!(
+            record.result.as_deref(),
+            Some(crate::agent_controller::AGENT_CANCELLED)
+        );
         assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
         assert!(task.completed_at.is_some());
         assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);

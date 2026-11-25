@@ -1372,7 +1372,29 @@ impl From<&ContinuationProjection> for TaskContinuationProjection {
 pub struct TaskControl {
     pub cancel: CancelToken,
     pub pause: Arc<AtomicBool>,
+    /// Set by a person's stop of this one subagent, kept on a thread of this
+    /// process, and by nothing else: what the subagent's end says to its
+    /// parent depends on it. Like the rest of the control it lives only in
+    /// this process and is not persisted.
+    stopped_by_person: Arc<AtomicBool>,
     worker: Arc<Mutex<Option<OwnedWorker>>>,
+}
+
+impl TaskControl {
+    /// Marks the task as stopped by a person, before it is asked to stop.
+    pub(crate) fn mark_stopped_by_person(&self) {
+        self.stopped_by_person.store(true, Ordering::Release);
+    }
+
+    /// Forgets a person's stop that was not carried out.
+    pub(crate) fn forget_stopped_by_person(&self) {
+        self.stopped_by_person.store(false, Ordering::Release);
+    }
+
+    /// Whether the task was stopped by a person.
+    pub(crate) fn stopped_by_person(&self) -> bool {
+        self.stopped_by_person.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug)]
@@ -3305,6 +3327,7 @@ impl TaskRegistry {
         let control = TaskControl {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            stopped_by_person: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
         };
         let sequence = self
@@ -3437,6 +3460,7 @@ impl TaskRegistry {
         let control = TaskControl {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            stopped_by_person: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
         };
         let sequence = self
@@ -3574,6 +3598,7 @@ impl TaskRegistry {
         let control = TaskControl {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            stopped_by_person: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
         };
         let sequence = self
@@ -3665,6 +3690,7 @@ impl TaskRegistry {
         let control = TaskControl {
             cancel: CancelToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            stopped_by_person: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
         };
         let sequence = self
@@ -6730,6 +6756,7 @@ fn new_task_control() -> TaskControl {
     TaskControl {
         cancel: CancelToken::new(),
         pause: Arc::new(AtomicBool::new(false)),
+        stopped_by_person: Arc::new(AtomicBool::new(false)),
         worker: Arc::new(Mutex::new(None)),
     }
 }

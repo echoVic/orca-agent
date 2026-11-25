@@ -4367,6 +4367,11 @@ mod tests {
             task.error
         );
         assert_eq!(task.error, None);
+        // A quit is not a person's stop of this one child.
+        assert_eq!(
+            task.result.as_deref(),
+            Some(crate::agent_controller::AGENT_CANCELLED)
+        );
         assert!(task.usage.is_some(), "the child's usage is kept");
         assert!(
             !activity

@@ -2195,8 +2195,11 @@ impl ThreadActor {
             ));
         }
         let remember = !record.stop_requested;
+        // The record's control carries the stop to the child's worker, which
+        // tells the parent the subagent was stopped by the user.
         if remember {
             self.subagents_stopped_by_person.insert(task_id.to_string());
+            record.control.mark_stopped_by_person();
         }
         let reply = match self.commit_running_task_refresh(request_id.clone(), target.clone(), task)
         {
@@ -2204,12 +2207,14 @@ impl ThreadActor {
             Err(error) => {
                 if remember {
                     self.subagents_stopped_by_person.remove(task_id);
+                    record.control.forget_stopped_by_person();
                 }
                 return Err(error);
             }
         };
         if remember && active.task_registry.request_stop(task_id).is_err() {
             self.subagents_stopped_by_person.remove(task_id);
+            record.control.forget_stopped_by_person();
             let ended = active
                 .task_registry
                 .get(task_id)
