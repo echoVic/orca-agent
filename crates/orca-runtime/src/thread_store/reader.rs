@@ -1,7 +1,11 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use serde::Deserializer;
+use serde::de::{IgnoredAny, MapAccess, Visitor};
 
 use super::assets::{self, HydrateImages};
 use super::types::{SessionMeta, SessionRecord, StoredSessionHealth, StoredSessionHealthIssue};
@@ -98,14 +102,41 @@ pub(crate) fn iter_records(path: &Path, images: HydrateImages) -> io::Result<Ses
     SessionRecords::open(path, None, images)
 }
 
+fn has_repeated_key(text: &str) -> bool {
+    struct RepeatedKey;
+
+    impl<'de> Visitor<'de> for RepeatedKey {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a session record object")
+        }
+
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<bool, M::Error> {
+            let mut keys = HashSet::new();
+            let mut repeated = false;
+            while let Some(key) = map.next_key::<String>()? {
+                repeated |= !keys.insert(key);
+                map.next_value::<IgnoredAny>()?;
+            }
+            Ok(repeated)
+        }
+    }
+
+    serde_json::Deserializer::from_str(text)
+        .deserialize_map(RepeatedKey)
+        .unwrap_or(false)
+}
+
 /// Raw search matches have not passed through the transcript iterator.
 pub(super) fn is_ignorable_search_line(text: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| {
-        value["ignorable"] == true
-            && value["type"].is_string()
-            && !assets::is_asset_record(&value)
-            && matches!(parse_session_record(text), Err("unknown_record_type"))
-    })
+    !has_repeated_key(text)
+        && serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| {
+            value["ignorable"] == true
+                && value["type"].is_string()
+                && !assets::is_asset_record(&value)
+                && matches!(parse_session_record(text), Err("unknown_record_type"))
+        })
 }
 
 /// Read preview bytes even for tool images omitted by normal session resume.
@@ -405,6 +436,9 @@ impl Iterator for SessionRecords {
                 Ok(text) => text.trim_end_matches(['\r', '\n']),
                 Err(_) => return self.fail("invalid_utf8", start),
             };
+            if has_repeated_key(text) {
+                return self.fail("malformed_record", start);
+            }
             return match parse_session_record(text) {
                 Ok(record) => self.check_record_version(record, start),
                 Err(code) => self.handle_parse_error(code, start, terminated),

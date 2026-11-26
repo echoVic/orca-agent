@@ -148,6 +148,34 @@ fn only_boolean_true_marks_a_record_ignorable() {
 }
 
 #[test]
+fn a_repeated_ignorable_key_is_malformed() {
+    let root = tempfile::tempdir().unwrap();
+    let record = r#"{"type":"future.thing","ignorable":false,"ignorable":true}"#;
+    let path = write_compat_session(root.path(), SESSION_META, &format!("{record}\n"));
+    let scan = scan_session(&path).unwrap();
+    assert_eq!(scan.health, StoredSessionHealth::Quarantined);
+    assert_eq!(scan.health_issue.unwrap().code, "malformed_record");
+    assert!(!super::reader::is_ignorable_search_line(record));
+}
+
+#[test]
+fn a_repeated_key_in_a_newer_meta_is_malformed() {
+    let root = tempfile::tempdir().unwrap();
+    for meta in [
+        SESSION_META.replace(
+            r#""schema_version":1"#,
+            r#""schema_version":2,"added":1,"added":2"#,
+        ),
+        r#"{"type":"session.meta","schema_version":2,"metadata":{},"metadata":[]}"#.to_owned(),
+    ] {
+        let path = write_compat_session(root.path(), &meta, "");
+        let scan = scan_session(&path).unwrap();
+        assert_eq!(scan.health, StoredSessionHealth::Quarantined);
+        assert_eq!(scan.health_issue.unwrap().code, "malformed_record");
+    }
+}
+
+#[test]
 fn a_newer_schema_version_reports_newer_version() {
     let root = tempfile::tempdir().unwrap();
     let meta = SESSION_META.replace(r#""schema_version":1"#, r#""schema_version":2"#);
