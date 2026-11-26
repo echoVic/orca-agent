@@ -153,7 +153,7 @@ impl PathPolicy {
 
     #[cfg(windows)]
     pub fn open_no_follow(self, path: &Path) -> Result<VerifiedPath, PlatformError> {
-        windows::open_no_follow(path, self, windows::DEFAULT_ACCESS_MODE)
+        windows::open_no_follow(path, self, windows::DEFAULT_ACCESS_MODE, false)
     }
 
     #[cfg(windows)]
@@ -162,7 +162,16 @@ impl PathPolicy {
         path: &Path,
         access_mode: u32,
     ) -> Result<VerifiedPath, PlatformError> {
-        windows::open_no_follow(path, self, access_mode)
+        windows::open_no_follow(path, self, access_mode, false)
+    }
+    /// Holds the opened path in place by excluding delete sharing.
+    #[cfg(windows)]
+    pub(crate) fn open_no_follow_pinned(
+        self,
+        path: &Path,
+        access_mode: u32,
+    ) -> Result<VerifiedPath, PlatformError> {
+        windows::open_no_follow(path, self, access_mode, true)
     }
 }
 
@@ -185,6 +194,11 @@ impl std::fmt::Debug for VerifiedPath {
 impl VerifiedPath {
     pub fn file(&self) -> &File {
         &self.file
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn into_file(self) -> File {
+        self.file
     }
 
     pub fn identity(&self) -> &PathIdentity {
@@ -450,6 +464,7 @@ mod windows {
         path: &Path,
         policy: PathPolicy,
         access_mode: u32,
+        pinned: bool,
     ) -> Result<VerifiedPath, PlatformError> {
         let text = path
             .to_str()
@@ -457,11 +472,13 @@ mod windows {
                 path: path.to_string_lossy().into_owned(),
                 reason: "path is not valid UTF-8".to_string(),
             })?;
-        policy.identity(text)?;
+        let expected = policy.identity(text)?;
 
         let file = std::fs::OpenOptions::new()
             .access_mode(access_mode)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .share_mode(
+                FILE_SHARE_READ | FILE_SHARE_WRITE | if pinned { 0 } else { FILE_SHARE_DELETE },
+            )
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .map_err(|error| {
@@ -480,6 +497,12 @@ mod windows {
 
         let final_path = final_path_from_handle(&file)?;
         let identity = policy.identity(&final_path)?;
+        if pinned && identity != expected {
+            return Err(PlatformError::InvalidPathIdentity {
+                path: text.to_string(),
+                reason: "opened path differs from the verified path".to_string(),
+            });
+        }
         Ok(VerifiedPath {
             file,
             identity,

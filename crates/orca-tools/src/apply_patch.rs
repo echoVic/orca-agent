@@ -1,14 +1,17 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use orca_core::tool_types::{FileChangePreview, ToolRequest, ToolResult, truncate_output};
+use orca_platform::fs::{FileAccess, FileIdentity, VerifiedDirectory, file_links, stale_path};
+use unicode_casefold::UnicodeCaseFold;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::file_admission::{
     MAX_DIFF_OUTPUT_BYTES, MAX_EDIT_FILE_BYTES, build_file_change_preview_with_headers,
-    read_text_file_with_limit,
+    read_utf8_reader_with_limit,
 };
 use crate::resolve_workspace_path;
 
@@ -178,6 +181,8 @@ fn parse_hunk<'a>(
 
 #[derive(Debug)]
 pub(crate) struct Plan {
+    root: PathBuf,
+    root_identity: FileIdentity,
     pub(crate) ops: Vec<PlannedOp>,
 }
 
@@ -185,6 +190,10 @@ pub(crate) struct Plan {
 pub(crate) struct PlannedTarget {
     pub(crate) path: PathBuf,
     pub(crate) label: String,
+    ancestor: PathBuf,
+    ancestor_identity: FileIdentity,
+    case_insensitive: bool,
+    identity: Option<FileIdentity>,
 }
 
 #[derive(Debug)]
@@ -209,6 +218,10 @@ fn preflight_or_cancel(
     let root = cwd
         .canonicalize()
         .map_err(|error| PatchError(format!("cannot resolve workspace: {error}")))?;
+    let root_identity = VerifiedDirectory::open(&root)
+        .and_then(|directory| directory.identity())
+        .map_err(|error| PatchError(format!("cannot verify workspace: {error}")))?;
+    let mut identities = HashSet::new();
     let mut retained = 0;
     let mut matching = MatchBudget {
         remaining: MAX_MATCH_WORK,
@@ -227,7 +240,7 @@ fn preflight_or_cancel(
                 return Err("patch cancelled".into());
             }
             let removes_source = matches!(op, PatchOp::Delete { .. }) || destination.is_some();
-            let target = resolve_target(cwd, &root, path, removes_source, &mut seen)?;
+            let mut target = resolve_target(cwd, &root, path, removes_source, &mut seen)?;
             let move_to = destination
                 .map(|dest| resolve_target(cwd, &root, dest, false, &mut seen))
                 .transpose()?;
@@ -244,12 +257,12 @@ fn preflight_or_cancel(
                     (None, Some(text), (lines.len(), 0))
                 }
                 PatchOp::Delete { .. } => {
-                    let before = read_existing(&target, should_cancel)?;
+                    let before = read_existing(&mut target, should_cancel)?;
                     let removed = before.lines().count();
                     (Some(before), None, (0, removed))
                 }
                 PatchOp::Update { hunks, .. } => {
-                    let before = read_existing(&target, should_cancel)?;
+                    let before = read_existing(&mut target, should_cancel)?;
                     let after = apply_hunks(&before, hunks, &mut matching)?;
                     let counts = hunks.iter().flat_map(|hunk| &hunk.lines).fold(
                         (0, 0),
@@ -266,6 +279,11 @@ fn preflight_or_cancel(
                 && after.len() > MAX_EDIT_FILE_BYTES
             {
                 return Err(format!("result exceeds {MAX_EDIT_FILE_BYTES} bytes"));
+            }
+            if let Some(identity) = target.identity
+                && !identities.insert(identity)
+            {
+                return Err(format!("repeated path: {path}"));
             }
             retained +=
                 before.as_ref().map_or(0, String::len) + after.as_ref().map_or(0, String::len);
@@ -286,7 +304,11 @@ fn preflight_or_cancel(
         })?;
         ops.push(planned);
     }
-    Ok(Plan { ops })
+    Ok(Plan {
+        root,
+        root_identity,
+        ops,
+    })
 }
 
 fn resolve_target(
@@ -296,6 +318,21 @@ fn resolve_target(
     removes_source: bool,
     seen: &mut HashSet<PathBuf>,
 ) -> Result<PlannedTarget, String> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let requested = Path::new(label);
+        if matches!(requested.components().next(), Some(Component::Prefix(prefix))
+            if !matches!(prefix.kind(), Prefix::Disk(_)) || !requested.is_absolute())
+            || (requested.has_root() && !requested.is_absolute())
+        {
+            return Err(format!("unsupported Windows path: {label}"));
+        }
+        let full = cwd.join(requested);
+        orca_platform::fs::PathPolicy::windows_sandbox()
+            .identity(&full.to_string_lossy())
+            .map_err(|error| error.to_string())?;
+    }
     let path = resolve_workspace_path(cwd, Some(label))?;
     let mut ancestor = path.as_path();
     let (canonical, directory) = loop {
@@ -331,11 +368,9 @@ fn resolve_target(
             Err(error) => return Err(format!("cannot resolve {label}: {error}")),
         }
     };
-    let key = if ignores_case(&directory) {
-        PathBuf::from(canonical.to_string_lossy().to_lowercase())
-    } else {
-        canonical.clone()
-    };
+    let verified = VerifiedDirectory::open(&directory).map_err(|error| error.to_string())?;
+    let case_insensitive = verified.ignores_case(&directory);
+    let key = path_key(&canonical, case_insensitive);
     if seen.contains(&key) {
         return Err(format!("repeated path: {label}"));
     }
@@ -351,38 +386,21 @@ fn resolve_target(
     Ok(PlannedTarget {
         path: canonical,
         label: label.to_owned(),
+        ancestor: directory,
+        ancestor_identity: verified.identity().map_err(|error| error.to_string())?,
+        case_insensitive,
+        identity: None,
     })
 }
 
-#[cfg(windows)]
-fn ignores_case(_: &Path) -> bool {
-    true
-}
-
-#[cfg(unix)]
-fn ignores_case(directory: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    // Look up a different spelling of an existing directory, without
-    // creating a probe file during preflight.
-    for directory in directory.ancestors() {
-        let Some(name) = directory.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let mut alternate = name.to_lowercase();
-        if alternate == name {
-            alternate = name.to_uppercase();
-        }
-        if alternate == name {
-            continue;
-        }
-        let Ok(actual) = fs::metadata(directory) else {
-            continue;
-        };
-        return fs::metadata(directory.with_file_name(alternate))
-            .is_ok_and(|other| actual.dev() == other.dev() && actual.ino() == other.ino());
+fn path_key(path: &Path, case_insensitive: bool) -> PathBuf {
+    let name = path.to_string_lossy();
+    let normalized: String = name.nfc().collect();
+    if case_insensitive {
+        PathBuf::from(normalized.as_str().case_fold().nfc().collect::<String>())
+    } else {
+        PathBuf::from(normalized)
     }
-    false
 }
 
 fn require_missing(target: &PlannedTarget) -> Result<(), String> {
@@ -394,16 +412,121 @@ fn require_missing(target: &PlannedTarget) -> Result<(), String> {
 }
 
 fn read_existing(
-    target: &PlannedTarget,
+    target: &mut PlannedTarget,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<String, String> {
-    read_text_file_with_limit(&target.path, MAX_EDIT_FILE_BYTES, should_cancel).map_err(|error| {
-        if error.is_not_found() {
+    let read = || -> io::Result<(FileIdentity, String)> {
+        let directory = VerifiedDirectory::open(&target.ancestor)?;
+        if directory.identity()? != target.ancestor_identity
+            || target.path.parent() != Some(&target.ancestor)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "file or parent is missing",
+            ));
+        }
+        let file = directory.open_file(target.file_name(), FileAccess::Read)?;
+        let identity = single_link_identity(&file)?;
+        Ok((identity, read_opened(&file, should_cancel)?))
+    };
+    let (identity, before) = read().map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
             format!("{} does not exist", target.label)
         } else {
             format!("cannot read {}: {error}", target.label)
         }
-    })
+    })?;
+    target.identity = Some(identity);
+    Ok(before)
+}
+
+fn single_link_identity(file: &fs::File) -> io::Result<FileIdentity> {
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("expected a regular file"));
+    }
+    let links = file_links(file)?;
+    if links.count > 1 {
+        return Err(io::Error::other("file has more than one hard link"));
+    }
+    Ok(links.identity)
+}
+
+fn read_opened(file: &fs::File, should_cancel: &dyn Fn() -> bool) -> io::Result<String> {
+    let declared = file.metadata()?.len();
+    let max = MAX_EDIT_FILE_BYTES as u64;
+    if declared > max {
+        return Err(io::Error::other(format!("file exceeds {max} bytes")));
+    }
+    read_utf8_reader_with_limit(file, declared, max, should_cancel).map_err(io::Error::other)
+}
+
+impl PlannedTarget {
+    fn file_name(&self) -> &std::ffi::OsStr {
+        self.path.file_name().expect("patch target has a file name")
+    }
+
+    fn parent_for_write(
+        &self,
+        plan: &Plan,
+        created: &mut HashMap<PathBuf, FileIdentity>,
+    ) -> io::Result<VerifiedDirectory> {
+        // Unix directory descriptors keep operations on the checked directory
+        // even if another process moves it after the walk.
+        let mut directory = VerifiedDirectory::open(&plan.root)?;
+        if directory.identity()? != plan.root_identity {
+            return Err(stale_path());
+        }
+        let mut path = plan.root.clone();
+        for component in self
+            .ancestor
+            .strip_prefix(&plan.root)
+            .expect("checked workspace ancestor")
+            .iter()
+        {
+            directory = directory.child(component)?;
+            path.push(component);
+        }
+        if directory.identity()? != self.ancestor_identity {
+            return Err(stale_path());
+        }
+        let parent = self.path.parent().expect("patch target has a parent");
+        for component in parent
+            .strip_prefix(&path)
+            .expect("checked target ancestor")
+            .iter()
+        {
+            let next = path.join(component);
+            let key = path_key(&next, self.case_insensitive);
+            if let Some(identity) = created.get(&key) {
+                directory = directory.child(component)?;
+                if directory.identity()? != *identity {
+                    return Err(stale_path());
+                }
+            } else {
+                directory.create_directory(component)?;
+                directory = directory.child(component)?;
+                created.insert(key, directory.identity()?);
+            }
+            path = next;
+        }
+        Ok(directory)
+    }
+
+    fn verify_existing(
+        &self,
+        directory: &VerifiedDirectory,
+        access: FileAccess,
+        before: &str,
+    ) -> io::Result<fs::File> {
+        let file = directory.open_file(self.file_name(), access)?;
+        if Some(single_link_identity(&file)?) != self.identity
+            || read_opened(&file, &|| false)? != before
+        {
+            return Err(stale_path());
+        }
+        single_link_identity(&file)?;
+        Ok(file)
+    }
 }
 
 fn apply_hunks(
@@ -622,11 +745,12 @@ pub(crate) fn execute(
 
 fn commit(request: &ToolRequest, plan: &Plan, should_cancel: &dyn Fn() -> bool) -> ToolResult {
     let mut written = Vec::new();
+    let mut created = HashMap::new();
     for (index, op) in plan.ops.iter().enumerate() {
         let outcome = if should_cancel() {
             Err(io::Error::new(io::ErrorKind::Interrupted, "patch cancelled").into())
         } else {
-            op.write()
+            op.write(plan, &mut created)
         };
         if let Err(WriteFailure { error, changed }) = outcome {
             let failed = op.label();
@@ -714,29 +838,58 @@ impl PlannedOp {
         )
     }
 
-    fn write(&self) -> Result<(), WriteFailure<'_>> {
+    fn write(
+        &self,
+        plan: &Plan,
+        created: &mut HashMap<PathBuf, FileIdentity>,
+    ) -> Result<(), WriteFailure<'_>> {
+        let parent = self.target.parent_for_write(plan, created)?;
         match (&self.move_to, &self.before, &self.after) {
-            (_, _, None) => Ok(fs::remove_file(&self.target.path)?),
-            (Some(dest), _, Some(text)) => {
-                let permissions = fs::metadata(&self.target.path)?.permissions();
-                create_file(dest, text)?
+            (_, Some(before), None) => {
+                let file = self
+                    .target
+                    .verify_existing(&parent, FileAccess::Delete, before)?;
+                Ok(parent.remove_file(self.target.file_name(), &file)?)
+            }
+            (Some(dest), Some(before), Some(text)) => {
+                let file = self
+                    .target
+                    .verify_existing(&parent, FileAccess::Delete, before)?;
+                let permissions = file.metadata()?.permissions();
+                let destination = dest.parent_for_write(plan, created)?;
+                create_file(&destination, dest, text)?
                     .set_permissions(permissions)
                     .map_err(|error| WriteFailure::after_write(error, dest))?;
-                fs::remove_file(&self.target.path)
+                parent
+                    .remove_file(self.target.file_name(), &file)
                     .map_err(|error| WriteFailure::after_write(error, dest))
             }
-            (_, None, Some(text)) => create_file(&self.target, text).map(|_| ()),
-            (_, Some(_), Some(text)) => fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&self.target.path)?
-                .write_all(text.as_bytes())
-                .map_err(|error| WriteFailure::after_write(error, &self.target)),
+            (_, None, Some(text)) => create_file(&parent, &self.target, text).map(|_| ()),
+            (_, Some(before), Some(text)) => {
+                let mut file = self
+                    .target
+                    .verify_existing(&parent, FileAccess::Update, before)?;
+                // A writer holding the same inode can still edit it or add a
+                // hard link between validation and truncation.
+                file.set_len(0)?;
+                use std::io::{Seek, SeekFrom};
+                file.seek(SeekFrom::Start(0))
+                    .and_then(|_| file.write_all(text.as_bytes()))
+                    .map_err(|error| WriteFailure::after_write(error, &self.target))
+            }
+            _ => unreachable!("validated patch operation"),
         }
     }
 
     fn partial_preview(&self, target: &PlannedTarget) -> String {
-        let Ok(after) = read_existing(target, &|| false) else {
+        let after = target
+            .path
+            .parent()
+            .ok_or_else(stale_path)
+            .and_then(VerifiedDirectory::open)
+            .and_then(|directory| directory.open_file(target.file_name(), FileAccess::Read))
+            .and_then(|file| read_opened(&file, &|| false));
+        let Ok(after) = after else {
             return format!("[Diff preview unavailable for {}]\n", target.label);
         };
         let before = if target.path == self.target.path {
@@ -822,14 +975,12 @@ impl<'a> WriteFailure<'a> {
     }
 }
 
-fn create_file<'a>(target: &'a PlannedTarget, text: &str) -> Result<fs::File, WriteFailure<'a>> {
-    if let Some(parent) = target.path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&target.path)?;
+fn create_file<'a>(
+    directory: &VerifiedDirectory,
+    target: &'a PlannedTarget,
+    text: &str,
+) -> Result<fs::File, WriteFailure<'a>> {
+    let mut file = directory.create_file(target.file_name())?;
     file.write_all(text.as_bytes())
         .map_err(|error| WriteFailure::after_write(error, target))?;
     Ok(file)
@@ -1136,6 +1287,90 @@ mod tests {
                 .to_string()
                 .contains("multiple locations")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_refuses_a_parent_link_introduced_after_preparation() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/a"), "old\n").unwrap();
+        fs::write(outside.path().join("a"), "old\n").unwrap();
+        let prepared = [
+            "*** Update File: sub/a\n@@\n-old\n+new",
+            "*** Delete File: sub/a",
+            "*** Add File: sub/b\n+new",
+        ]
+        .map(|body| (request(body), plan(body, dir.path()).unwrap()));
+        fs::rename(dir.path().join("sub"), dir.path().join("saved")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
+        for (req, plan) in prepared {
+            let result = commit(&req, &plan, &|| false);
+            assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+            assert_eq!(
+                fs::read_to_string(outside.path().join("a")).unwrap(),
+                "old\n"
+            );
+            assert!(!outside.path().join("b").exists());
+        }
+    }
+
+    #[test]
+    fn patch_refuses_replaced_or_edited_targets() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a");
+        for replace in [false, true] {
+            fs::write(&path, "old\n").unwrap();
+            let body = "*** Update File: a\n@@\n-old\n+new";
+            let prepared = plan(body, dir.path()).unwrap();
+            let current = if replace {
+                fs::rename(&path, dir.path().join("former")).unwrap();
+                "old\n"
+            } else {
+                "edited\n"
+            };
+            fs::write(&path, current).unwrap();
+            let result = commit(&request(body), &prepared, &|| false);
+            assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+            assert_eq!(fs::read_to_string(&path).unwrap(), current);
+        }
+    }
+
+    #[test]
+    fn patch_refuses_hard_links_before_writing() {
+        let dir = TempDir::new().unwrap();
+        let original = dir.path().join("original");
+        fs::write(&original, "old\n").unwrap();
+        fs::hard_link(&original, dir.path().join("a")).unwrap();
+        for body in ["*** Update File: a\n@@\n-old\n+new", "*** Delete File: a"] {
+            let result = execute(&request(body), dir.path(), || false);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("hard link"))
+            );
+            assert_eq!(fs::read_to_string(&original).unwrap(), "old\n");
+            assert!(dir.path().join("a").exists());
+        }
+    }
+
+    #[test]
+    fn patch_rejects_equivalent_unicode_names_before_creating_either() {
+        let dir = TempDir::new().unwrap();
+        let result = execute(
+            &request("*** Add File: café.txt\n+hi\n*** Add File: cafe\u{301}.txt\n+bye"),
+            dir.path(),
+            || false,
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("repeated path"))
+        );
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0);
     }
 
     #[test]

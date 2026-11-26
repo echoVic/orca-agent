@@ -138,7 +138,7 @@ pub(crate) fn open_regular_file(path: &Path) -> Result<(File, u64), FileAdmissio
     Ok((file, metadata.len()))
 }
 
-fn read_utf8_reader_with_limit(
+pub(crate) fn read_utf8_reader_with_limit(
     mut reader: impl Read,
     declared_bytes: u64,
     max_bytes: u64,
