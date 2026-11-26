@@ -7,6 +7,12 @@ use tempfile::TempDir;
 mod restricted_shell;
 use restricted_shell::host_refuses_restricted_shells;
 
+/// The mock's shell call that waits up to 30 s for its command. A plain
+/// `bash` call waits 10 s, then leaves the command running and ends the turn;
+/// on a cold Windows runner an `echo` into a file took longer than that, and
+/// the call these tests check had not completed.
+const SHELL_CALL_WAITING_FOR_ITS_COMMAND: &str = "bash_wait 30000 ::";
+
 #[test]
 fn yolo_runs_a_host_shell_without_approval_despite_suggest_config() {
     let home = TempDir::new().expect("temp home");
@@ -21,7 +27,10 @@ fn yolo_runs_a_host_shell_without_approval_despite_suggest_config() {
     )
     .expect("trust workspace");
     let marker = outside.path().join("yolo.txt");
-    let prompt = format!("bash echo YOLO_HOST_ACCESS > \"{}\"", marker.display());
+    let prompt = format!(
+        "{SHELL_CALL_WAITING_FOR_ITS_COMMAND} echo YOLO_HOST_ACCESS > \"{}\"",
+        marker.display()
+    );
     for args in [vec!["exec", "--yolo"], vec!["--yolo", "exec"]] {
         let output = Command::new(env!("CARGO_BIN_EXE_orca"))
             .env("ORCA_HOME", home.path())
@@ -72,7 +81,10 @@ fn yolo_resumes_a_saved_suggest_session_with_host_access() {
         .expect("save suggest session");
     assert!(seed.status.success(), "{seed:?}");
     let marker = outside.path().join("resumed-yolo.txt");
-    let prompt = format!("bash echo RESUMED_HOST_ACCESS > \"{}\"", marker.display());
+    let prompt = format!(
+        "{SHELL_CALL_WAITING_FOR_ITS_COMMAND} echo RESUMED_HOST_ACCESS > \"{}\"",
+        marker.display()
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_orca"))
         .env("ORCA_HOME", home.path())
         .env("ORCA_MODE", "suggest")
