@@ -2034,7 +2034,7 @@ impl ThreadActor {
                 "provider response generation fence is stale",
             ));
         }
-        if Self::surface_interaction_admission_closed(active) {
+        if !Self::surface_provider_response_admitted(active, response.cut_short) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "runtime generation is terminalizing",

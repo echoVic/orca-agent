@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{ProviderKind, RunConfig};
-use orca_core::conversation::{Conversation, assistant_message_has_payload};
+use orca_core::conversation::{Conversation, CutShort, assistant_message_has_payload};
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::model::{ImageRouteDecision, VISION_MODEL};
 use orca_core::provider_types::{
-    ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, Usage,
+    PartialReply, ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, Usage,
 };
 #[cfg(test)]
 use orca_core::subagent_types::SubagentType;
@@ -623,9 +623,13 @@ impl RuntimeProviderTurnStep {
         let mut first_delta = None;
         let mut completed_attempts = 0_u32;
         let mut failed_attempt_usage = None;
-        let (mut response, response_identity) = loop {
+        let (mut response, response_identity, delivered) = loop {
             completed_attempts = completed_attempts.saturating_add(1);
             let response_identity = ModelResponseIdentity::new(input.turn_context.turn_id.clone());
+            let mut delivered = PartialReply {
+                content: String::new(),
+                reasoning: None,
+            };
             let mut stream =
                 if crate::investigation_convergence::summary_prompt_present(&model_conversation) {
                     orca_provider::start_streaming_bounded_with_retry_budget(
@@ -670,6 +674,16 @@ impl RuntimeProviderTurnStep {
                                 first_delta = Some((elapsed_millis(request_started), kind));
                             }
                         }
+                        match delivery.step() {
+                            ProviderStep::MessageDelta(text) => delivered.content.push_str(text),
+                            ProviderStep::ReasoningDelta(text) if !text.is_empty() => {
+                                delivered
+                                    .reasoning
+                                    .get_or_insert_with(String::new)
+                                    .push_str(text);
+                            }
+                            _ => {}
+                        }
                         step_batcher.push(delivery.step().clone())?;
                         emit_provider_delta(
                             delivery.step(),
@@ -711,20 +725,21 @@ impl RuntimeProviderTurnStep {
             step_batcher.flush()?;
 
             let Some(error) = response.error() else {
-                break (response, response_identity);
+                break (response, response_identity, delivered);
             };
             let ProviderRetryDecision::RetryAfter(delay) =
                 retry_policy.decide_with_budget(error, completed_attempts, &retry_budget)
             else {
-                break (response, response_identity);
+                break (response, response_identity, delivered);
             };
             if let Some(ingress) = input.turn_context.provider_response_ingress() {
                 ingress.commit_provider_attempt_failure(&response_identity, &error.message)?;
             }
             if retry_budget.wait_blocking(delay, input.cancel).is_err() {
+                delivered.content.clear();
                 // Settle this response and earlier failed-attempt usage below
                 // before returning the cancellation terminal.
-                break (response, response_identity);
+                break (response, response_identity, delivered);
             }
             merge_provider_usage(&mut failed_attempt_usage, response.usage);
         };
@@ -805,6 +820,15 @@ impl RuntimeProviderTurnStep {
         }
 
         if input.cancel.is_cancelled() {
+            record_cut_short_reply(
+                delivered,
+                &response_identity,
+                CutShort::Interrupted,
+                &input.turn_context,
+                conversation,
+                events,
+                sink,
+            )?;
             return cancelled_provider_turn(emit_deltas, events, sink);
         }
         if let Some(stop) = budget_stop {
@@ -847,7 +871,31 @@ impl RuntimeProviderTurnStep {
             sink.emit(events.error(&warning))?;
         }
         if input.cancel.is_cancelled() {
+            record_cut_short_reply(
+                delivered,
+                &response_identity,
+                CutShort::Interrupted,
+                &input.turn_context,
+                conversation,
+                events,
+                sink,
+            )?;
             return cancelled_provider_turn(emit_deltas, events, sink);
+        }
+
+        if let Some(partial) = response
+            .error()
+            .and_then(|error| error.partial_reply.clone())
+        {
+            record_cut_short_reply(
+                partial,
+                &response_identity,
+                CutShort::OutputLimit,
+                &input.turn_context,
+                conversation,
+                events,
+                sink,
+            )?;
         }
 
         let mut response = RuntimeModelResponse::from_parts(response, response_identity);
@@ -1188,6 +1236,43 @@ impl RuntimeTurnProviderCycleStep {
             },
         )
     }
+}
+
+fn record_cut_short_reply<W: io::Write>(
+    partial: PartialReply,
+    identity: &ModelResponseIdentity,
+    reason: CutShort,
+    turn_context: &RuntimeTurnContext<'_>,
+    conversation: &mut Conversation,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+) -> io::Result<()> {
+    if partial.content.trim().is_empty() {
+        return Ok(());
+    }
+    let mut response = RuntimeModelResponse::from_parts(
+        ProviderResponse {
+            steps: Vec::new(),
+            assistant_content: Some(partial.content),
+            assistant_reasoning: partial.reasoning,
+            tool_calls: Vec::new(),
+            usage: None,
+        },
+        identity.clone(),
+    );
+    response.cut_short = Some(reason);
+    if let Some(ingress) = turn_context.provider_response_ingress() {
+        match ingress.commit_response(&mut response) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+    let completed = response.completed();
+    if turn_context.emit_deltas {
+        sink.emit(events.model_response_completed(&completed))?;
+    }
+    record_assistant_response_for_agent(conversation, &completed, false, events, sink)
 }
 
 fn record_provider_retry<W: io::Write>(

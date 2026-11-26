@@ -2894,7 +2894,8 @@ fn emit_assistant_patch(
                 .map_or(AssistantChannel::Message, |stream| stream.channel);
             Some(assistant_chunk(channel, text.as_str()))
         }
-        AssistantPatch::ResponseCompleted { response } => response
+        AssistantPatch::ResponseCompleted { response }
+        | AssistantPatch::ResponseKept { response, .. } => response
             .message_item
             .as_ref()
             .filter(|item| !streams.values().any(|stream| stream.item_id == item.id))

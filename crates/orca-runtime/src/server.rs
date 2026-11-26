@@ -7855,6 +7855,7 @@ enabled = true
                         pinned: false,
                     },
                     Message::Assistant {
+                        cut_short: None,
                         content: Some("server projected assistant".to_string()),
                         reasoning_content: None,
                         tool_calls: Vec::new(),
@@ -7871,6 +7872,7 @@ enabled = true
                         pinned: false,
                     },
                     Message::Assistant {
+                        cut_short: None,
                         content: Some("server projected second assistant".to_string()),
                         reasoning_content: None,
                         tool_calls: Vec::new(),

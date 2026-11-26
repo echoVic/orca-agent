@@ -9354,6 +9354,17 @@ impl ThreadActor {
             )
     }
 
+    pub(super) fn surface_provider_response_admitted(
+        active: &ActiveOperation,
+        cut_short: Option<orca_core::conversation::CutShort>,
+    ) -> bool {
+        if cut_short == Some(orca_core::conversation::CutShort::Interrupted) {
+            return active.surface_terminalization
+                == Some(surface::TerminalizationCause::UserCancel);
+        }
+        !Self::surface_interaction_admission_closed(active)
+    }
+
     pub(super) fn surface_interaction_admission_closed(active: &ActiveOperation) -> bool {
         active.surface_terminalization.is_some()
             || active.surface_execution_failure.is_some()

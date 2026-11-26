@@ -1741,6 +1741,7 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
             Message::Assistant {
                 content,
                 reasoning_content: _,
+                cut_short,
                 tool_calls,
                 pinned,
             } => {
@@ -1754,6 +1755,7 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
                 Message::Assistant {
                     content: new_content,
                     reasoning_content: None,
+                    cut_short: *cut_short,
                     tool_calls: tool_calls
                         .iter()
                         .map(|call| {

@@ -265,9 +265,10 @@ impl Observer {
                                     Err(())
                                 }
                             }
-                            SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted {
-                                response,
-                            }) => {
+                            SurfaceEvent::Assistant(
+                                AssistantPatch::ResponseCompleted { response }
+                                | AssistantPatch::ResponseKept { response, .. },
+                            ) => {
                                 if let Some(item) = &response.message_item {
                                     let offset = streams
                                         .values()

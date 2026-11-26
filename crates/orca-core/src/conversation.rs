@@ -197,6 +197,13 @@ pub struct ImageInput {
     pub detail: ImageDetail,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CutShort {
+    Interrupted,
+    OutputLimit,
+}
+
 #[derive(Clone, Debug)]
 pub enum Message {
     System {
@@ -212,6 +219,7 @@ pub enum Message {
         content: Option<String>,
         reasoning_content: Option<String>,
         tool_calls: Vec<RawToolCall>,
+        cut_short: Option<CutShort>,
         pinned: bool,
     },
     Tool {
@@ -718,6 +726,7 @@ impl Conversation {
             content,
             reasoning_content,
             tool_calls,
+            cut_short: None,
             pinned: false,
         });
     }
@@ -896,6 +905,7 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             } if !tool_calls.is_empty() => {
                 let mut seen_call_ids = HashSet::new();
@@ -927,6 +937,7 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
                     content: content.clone(),
                     reasoning_content: reasoning_content.clone(),
                     tool_calls: unique_tool_calls.clone(),
+                    cut_short: *cut_short,
                     pinned: *pinned,
                 });
                 for tool_call in &unique_tool_calls {

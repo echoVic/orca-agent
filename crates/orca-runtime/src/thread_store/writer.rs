@@ -3022,6 +3022,7 @@ mod tests {
             .expect("append prefix");
         writer
             .append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some("discarded answer".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -3052,6 +3053,7 @@ mod tests {
             .expect("post-write ambiguity is reprobed and durably acknowledged");
         writer
             .append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some("post-compaction answer".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),

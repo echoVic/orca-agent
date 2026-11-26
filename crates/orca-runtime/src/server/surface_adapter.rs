@@ -1836,7 +1836,10 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                 }
             }
         }
-        SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted { response }) => {
+        SurfaceEvent::Assistant(
+            AssistantPatch::ResponseCompleted { response }
+            | AssistantPatch::ResponseKept { response, .. },
+        ) => {
             if !writer.supports_direct_server_events() {
                 let message_id = response
                     .message_item

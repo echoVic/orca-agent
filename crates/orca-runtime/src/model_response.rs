@@ -18,6 +18,7 @@ pub struct RuntimeModelResponse {
     pub response: ProviderResponse,
     pub identity: ModelResponseIdentity,
     pub observation: Option<ProviderResponseObservation>,
+    pub cut_short: Option<orca_core::conversation::CutShort>,
 }
 
 impl RuntimeModelResponse {
@@ -26,6 +27,7 @@ impl RuntimeModelResponse {
             response,
             identity: ModelResponseIdentity::new(turn_id),
             observation: None,
+            cut_short: None,
         }
     }
 
@@ -34,16 +36,19 @@ impl RuntimeModelResponse {
             response,
             identity,
             observation: None,
+            cut_short: None,
         }
     }
 
     pub fn completed(&self) -> CompletedModelResponse {
-        CompletedModelResponse::new(
+        let mut completed = CompletedModelResponse::new(
             self.identity.clone(),
             self.response.assistant_content.clone(),
             self.response.assistant_reasoning.clone(),
             self.response.tool_calls.clone(),
-        )
+        );
+        completed.cut_short = self.cut_short;
+        completed
     }
 
     /// Response-local name for the tool calls of this response.

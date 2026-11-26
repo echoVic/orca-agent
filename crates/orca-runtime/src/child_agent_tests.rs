@@ -343,6 +343,7 @@ fn a_child_agent_on_a_model_that_cannot_see_images_gets_a_note() {
         let runtime_config = config(Some(model));
         let mut setup = child_loop_setup(&runtime_config);
         setup.conversation.messages.push(Message::Assistant {
+            cut_short: None,
             content: None,
             reasoning_content: None,
             tool_calls: vec![RawToolCall {
@@ -448,6 +449,7 @@ fn a_child_agent_on_a_custom_vision_model_gets_a_note_instead_of_tool_images() {
         vec![image.clone()],
     ));
     setup.conversation.messages.push(Message::Assistant {
+        cut_short: None,
         content: None,
         reasoning_content: None,
         tool_calls: vec![RawToolCall {

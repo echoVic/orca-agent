@@ -2266,6 +2266,7 @@ SurfaceItem =
       id: SurfaceItemId,
       turn_id: SurfaceTurnId,
       text: DisplayText,
+      cut_short: Option<CutShort>,
       pinned: bool,
     }
   | AssistantReasoning {
@@ -2371,6 +2372,8 @@ AssistantDiscardReason =
   | RuntimeRestart
   | ProjectionRepair
 
+CutShort = Interrupted | OutputLimit
+
 AssistantPatch =
   StreamOpened {
     stream: SurfaceAssistantStream,
@@ -2383,6 +2386,10 @@ AssistantPatch =
   | ResponseCompleted {
       response: SurfaceCompletedModelResponse,
     }
+  | ResponseKept {
+      response: SurfaceCompletedModelResponse,
+      reason: CutShort,
+    }
   | StreamDiscarded {
       stream_id: SurfaceStreamId,
       reason: AssistantDiscardReason,
@@ -2391,9 +2398,11 @@ AssistantPatch =
 
 `Delta.offset` MUST equal the stream's `next_offset`; the reducer appends and
 advances it by the UTF-8 byte length. `ResponseCompleted` is the durable
-completed-model fact. It closes matching streams and is the only constructor for
-ProviderResponse AssistantMessage/Reasoning/Plan items; `ItemPatch::Added` may
-not independently create those variants. Each declared tool call requires
+completed-model fact. `ResponseKept` closes matching streams using the same
+completion rules and records the cutoff reason on the assistant message. A kept
+response carries visible text and an empty tool-call list. These two patches
+construct ProviderResponse AssistantMessage/Reasoning/Plan items. `ItemPatch::Added`
+cannot create those variants independently. Each declared tool call requires
 exactly one `ToolPatch::Requested` in the same batch with the same response id,
 turn, tool-call id, name, raw arguments, and digest. ResponseCompleted itself
 does not create a tool view; ToolPatch::Requested is that sole constructor.

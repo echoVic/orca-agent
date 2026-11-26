@@ -31395,6 +31395,239 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_reply_with_text_is_kept() {
+        assert_kept_reply(
+            KeptReplyFixture::Mock("mock_stream_delay_ms 30000"),
+            1,
+            Some(("Mock slow stream started.", None, "interrupted")),
+        );
+    }
+
+    #[test]
+    fn kept_a_cancel_mid_tool_call_keeps_only_the_text() {
+        assert_kept_reply(
+            KeptReplyFixture::DeepSeek {
+                partial_tool: true,
+                length: false,
+            },
+            1,
+            Some(("First point", Some("Thinking"), "interrupted")),
+        );
+    }
+
+    #[test]
+    fn kept_a_cancel_with_reasoning_only_is_discarded() {
+        assert_kept_reply(
+            KeptReplyFixture::Mock("mock_stream_usage_delay_ms 30000"),
+            1,
+            None,
+        );
+    }
+
+    #[test]
+    fn kept_a_double_cancel_keeps_the_reply_once() {
+        assert_kept_reply(
+            KeptReplyFixture::Mock("mock_stream_delay_ms 30000"),
+            2,
+            Some(("Mock slow stream started.", None, "interrupted")),
+        );
+    }
+
+    #[test]
+    fn a_reply_at_the_output_limit_is_kept_and_the_turn_still_fails() {
+        assert_kept_reply(
+            KeptReplyFixture::DeepSeek {
+                partial_tool: true,
+                length: true,
+            },
+            0,
+            Some(("First point", Some("Thinking"), "output_limit")),
+        );
+    }
+
+    enum KeptReplyFixture {
+        Mock(&'static str),
+        DeepSeek { partial_tool: bool, length: bool },
+    }
+
+    fn assert_kept_reply(
+        fixture: KeptReplyFixture,
+        cancels: usize,
+        kept: Option<(&str, Option<&str>, &str)>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        let (release, hold) = mpsc::channel();
+        let (prompt, server) = match fixture {
+            KeptReplyFixture::Mock(prompt) => (prompt, None),
+            KeptReplyFixture::DeepSeek {
+                partial_tool,
+                length,
+            } => {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                config.provider = ProviderKind::DeepSeek;
+                config.api_key = Some("test-only".into());
+                config.base_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+                let server = std::thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream.set_read_timeout(Some(SURFACE_TEST_TIMEOUT)).unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let read = stream.read(&mut chunk).unwrap();
+                        assert!(read > 0);
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap();
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    let mut body = String::from(
+                        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Thinking\"},\"finish_reason\":null}]}\n\n",
+                    );
+                    if partial_tool {
+                        body.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"task_list\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\n");
+                    }
+                    body.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"First point\"},\"finish_reason\":null}]}\n\n");
+                    if length {
+                        body.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n");
+                    }
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}").unwrap();
+                    if !length {
+                        let _ = hold.recv_timeout(SURFACE_TEST_TIMEOUT);
+                    }
+                });
+                ("Explain in detail", Some(server))
+            }
+        };
+        let host = RuntimeHost::start().unwrap();
+        let thread = host.start_thread(config, "cut short reply").unwrap();
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let (operation_id, fence) = admit_surface_turn(&surface, &attachment, prompt);
+        let snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        if cancels > 0 {
+            let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+            let channel = if kept.is_some() {
+                surface::AssistantChannel::Message
+            } else {
+                surface::AssistantChannel::Reasoning
+            };
+            while !snapshot().assistant_streams.iter().any(|stream| {
+                stream.fence == fence
+                    && stream.channel == channel
+                    && !stream.text.as_str().is_empty()
+            }) {
+                assert!(Instant::now() < deadline, "provider stream never arrived");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            for n in 0..cancels {
+                let result = attachment
+                    .client
+                    .cancel_operation(surface_request_id(), operation_id.clone());
+                if n == 0 {
+                    assert!(matches!(
+                        committed_surface_value(result.unwrap()),
+                        surface::CancelOperationOutput::Accepted { .. }
+                    ));
+                }
+            }
+        }
+        let surface::WaitOperationTerminalResult::Terminal { value } = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .unwrap()
+        else {
+            panic!("turn reached no terminal");
+        };
+        let _ = release.send(());
+        if let Some(server) = server {
+            server.join().unwrap();
+        }
+        if cancels > 0 {
+            assert!(matches!(
+                value.terminal,
+                surface::OperationTerminal::Cancelled {
+                    reason: surface::CancelReason::User
+                }
+            ));
+        } else {
+            let surface::OperationTerminal::Failed {
+                class: surface::FailureClass::Provider,
+                message,
+            } = value.terminal
+            else {
+                panic!("unexpected terminal: {:?}", value.terminal);
+            };
+            assert_eq!(
+                message.as_str(),
+                "DeepSeek provider error: Response truncated: model hit max_tokens limit (finish_reason=length); ask the model to continue in smaller chunks"
+            );
+        }
+        let snapshot = snapshot();
+        assert!(snapshot.tools.is_empty());
+        let transcript = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap();
+        let assistant: Vec<_> = transcript
+            .messages
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant { .. }))
+            .collect();
+        if let Some((text, reasoning, reason)) = kept {
+            assert_eq!(assistant.len(), 1);
+            let Message::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                ..
+            } = assistant[0]
+            else {
+                unreachable!()
+            };
+            assert_eq!(content.as_deref(), Some(text));
+            assert_eq!(reasoning_content.as_deref(), reasoning);
+            assert!(tool_calls.is_empty());
+            let event = transcript
+                .semantic_events
+                .iter()
+                .find(|event| event.payload["assistant_content"] == text)
+                .expect("durable assistant response");
+            assert_eq!(event.payload["cut_short"], reason);
+        } else {
+            assert!(assistant.is_empty());
+            assert!(
+                snapshot
+                    .assistant_streams
+                    .iter()
+                    .filter(|stream| stream.fence == fence)
+                    .all(|stream| stream.state == surface::SurfaceAssistantStreamState::Discarded)
+            );
+        }
+        host.shutdown().unwrap();
+    }
+
+    #[test]
     fn cancelling_a_turn_ends_its_running_sync_agent_as_cancelled() {
         // Cancelled mid-answer, as an Esc while the agent thinks is.
         cancel_a_turn_running_a_sync_agent(|agent| agent.child_thread_id.is_some());

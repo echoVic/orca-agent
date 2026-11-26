@@ -61,6 +61,7 @@
       "StreamOpened",
       "Delta",
       "ResponseCompleted",
+      "ResponseKept",
       "StreamDiscarded"
     ],
     "tool_patch_variants": [
@@ -10581,7 +10582,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "13bec2ea091e5aae3be40d1a47dd05c7982a6fc3346f9e6244aae4a0d50502d4",
+    "private_contract_sha256": "0ee7b7d66dd7fdc26b23f948ac88fed513ead7a108387ea23c92446c4fa47e66",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",

@@ -255,6 +255,7 @@ impl GenerationContextController {
             scope,
             normalized,
             response.response.usage,
+            response.cut_short,
         ))
     }
 
@@ -578,6 +579,7 @@ pub(crate) fn build_background_provider_response_events(
         scope,
         normalized,
         response.response.usage,
+        None,
     ))
 }
 
@@ -845,6 +847,7 @@ fn completion_events(
     scope: surface::SurfaceScope,
     normalized: NormalizedProviderResponse,
     usage: Option<orca_core::provider_types::Usage>,
+    cut_short: Option<orca_core::conversation::CutShort>,
 ) -> Vec<(surface::SurfaceScope, surface::SurfaceEvent)> {
     let mut events = Vec::new();
     for stream in snapshot.assistant_streams.iter().filter(|stream| {
@@ -891,12 +894,12 @@ fn completion_events(
             )),
         }
     }
-    events.push((
-        scope.clone(),
-        surface::SurfaceEvent::Assistant(surface::AssistantPatch::ResponseCompleted {
-            response: normalized.completed_response,
-        }),
-    ));
+    let response = normalized.completed_response;
+    let patch = match cut_short {
+        Some(reason) => surface::AssistantPatch::ResponseKept { response, reason },
+        None => surface::AssistantPatch::ResponseCompleted { response },
+    };
+    events.push((scope.clone(), surface::SurfaceEvent::Assistant(patch)));
     events.extend(normalized.tool_requests.into_iter().map(|request| {
         (
             scope.clone(),
@@ -931,7 +934,7 @@ fn response_items_match(
             snapshot.items.iter().any(|item| {
                 matches!(
                     item,
-                    surface::SurfaceItem::AssistantMessage { id, turn_id, text, pinned }
+                    surface::SurfaceItem::AssistantMessage { id, turn_id, text, pinned, .. }
                         if id == &expected.id
                             && turn_id == &expected.turn_id
                             && text == &expected.text

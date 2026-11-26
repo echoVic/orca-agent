@@ -178,6 +178,7 @@ mod tests {
                 pinned: false,
             },
             Message::Assistant {
+                cut_short: None,
                 content: Some("hi".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -220,6 +221,7 @@ mod tests {
             ))),
             types::StoredConversationRecord::legacy(types::StoredMessage::from(
                 &Message::Assistant {
+                    cut_short: None,
                     content: Some("legacy assistant".to_string()),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
@@ -235,6 +237,7 @@ mod tests {
                 typed_assistant.clone(),
                 typed_turn.clone(),
                 types::StoredMessage::from(&Message::Assistant {
+                    cut_short: None,
                     content: Some("typed assistant".to_string()),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
@@ -354,6 +357,7 @@ mod tests {
                 ConversationItemId::new(),
                 turn_id.clone(),
                 types::StoredMessage::from(&Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -438,6 +442,7 @@ mod tests {
                     ConversationItemId::new(),
                     turn_id.clone(),
                     types::StoredMessage::from(&Message::Assistant {
+                        cut_short: None,
                         content: None,
                         reasoning_content: None,
                         tool_calls: vec![RawToolCall {
@@ -493,6 +498,7 @@ mod tests {
         let messages = vec![
             Message::user("deploy production".to_string()),
             Message::Assistant {
+                cut_short: None,
                 content: None,
                 reasoning_content: None,
                 tool_calls: vec![RawToolCall {
@@ -574,6 +580,7 @@ mod tests {
             let messages = vec![
                 Message::user("run tool".to_string()),
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {

@@ -4092,6 +4092,7 @@ fn apply_item_patch(
                     turn_id,
                     text,
                     pinned,
+                    cut_short: None,
                 } => batch.events.as_slice().iter().any(|event| {
                     matches!(
                         &event.event,
@@ -4103,6 +4104,9 @@ fn apply_item_patch(
                                     && value.pinned == *pinned)
                     )
                 }),
+                SurfaceItem::AssistantMessage {
+                    cut_short: Some(_), ..
+                } => false,
                 SurfaceItem::AssistantReasoning {
                     id,
                     turn_id,
@@ -4395,7 +4399,22 @@ fn apply_assistant_patch(
             stream.next_offset = ByteOffset::new(offset.get() + text.as_str().len() as u64);
             Ok(())
         }
-        AssistantPatch::ResponseCompleted { response } => {
+        AssistantPatch::ResponseCompleted { response }
+        | AssistantPatch::ResponseKept { response, .. } => {
+            let cut_short = match patch {
+                AssistantPatch::ResponseKept { reason, .. } => Some(*reason),
+                _ => None,
+            };
+            if cut_short.is_some()
+                && (!response.tool_calls.is_empty()
+                    || (response.message_item.is_none() && response.plan_item.is_none()))
+            {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "a kept assistant response needs visible text and no tool calls",
+                ));
+            }
             let fence =
                 generation_fence_for_turn(snapshot, &response.turn_id).ok_or_else(|| {
                     event_error(
@@ -4456,6 +4475,7 @@ fn apply_assistant_patch(
                         id: item.id.clone(),
                         turn_id: item.turn_id.clone(),
                         text: item.text.clone(),
+                        cut_short,
                         pinned: item.pinned,
                     }),
                 response

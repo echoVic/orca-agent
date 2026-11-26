@@ -16781,6 +16781,7 @@ mod tests {
                 origin: super::super::SurfaceItemOrigin::UserInput,
             },
             super::super::SurfaceItem::AssistantMessage {
+                cut_short: None,
                 id: retained_message_id.clone(),
                 turn_id: retained_turn_id.clone(),
                 text: super::super::DisplayText::new("retained assistant"),

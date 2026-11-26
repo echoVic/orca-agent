@@ -423,6 +423,8 @@ pub enum SurfaceItem {
         id: SurfaceItemId,
         turn_id: SurfaceTurnId,
         text: DisplayText,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cut_short: Option<orca_core::conversation::CutShort>,
         pinned: bool,
     },
     AssistantReasoning {
@@ -545,6 +547,10 @@ pub enum AssistantPatch {
     },
     ResponseCompleted {
         response: SurfaceCompletedModelResponse,
+    },
+    ResponseKept {
+        response: SurfaceCompletedModelResponse,
+        reason: orca_core::conversation::CutShort,
     },
     StreamDiscarded {
         stream_id: SurfaceStreamId,
