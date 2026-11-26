@@ -302,7 +302,7 @@ impl JsonlThreadStore {
             target,
             orca_platform::fs::AtomicWritePolicy::NoFollow,
             |output| {
-                for record in iter_records(&path, HydrateImages::All)? {
+                for record in iter_records(&path, HydrateImages::All)?.require_metadata() {
                     super::writer::write_record_line(&mut *output, &record?)?;
                 }
                 Ok(())
@@ -1094,7 +1094,7 @@ impl ThreadStore for JsonlThreadStore {
             )
         })?;
         let _lock = acquire_file_lock(&path)?;
-        let records = iter_records(&path, HydrateImages::All)?;
+        let records = iter_records(&path, HydrateImages::All)?.require_metadata();
         let mut patched = false;
         let records = records.map(|record| {
             let mut record = record?;
@@ -1139,12 +1139,6 @@ impl ThreadStore for JsonlThreadStore {
             Ok(record)
         });
         rewrite_records_unlocked(&path, records)?;
-        if !patched {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "session transcript has no metadata record",
-            ));
-        }
         let summary = summarize_session_with_archive_flag(&path, path.starts_with(archive_dir()))?;
         #[cfg(not(test))]
         let _ = session_index::upsert_summary(&summary);

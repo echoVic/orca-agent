@@ -24,6 +24,7 @@ const SESSION_META: &str = r#"{"type":"session.meta","schema_version":1,"session
 const FIRST_MESSAGE: &str = r#"{"type":"conversation.message","message":{"role":"user","content":"before compatibility marker"}}"#;
 const SECOND_MESSAGE: &str = r#"{"type":"conversation.message","message":{"role":"user","content":"after compatibility marker"}}"#;
 const UNKNOWN_RECORD: &str = r#"{"type":"future.thing","x":1}"#;
+const SKIPPABLE_RECORD: &str = r#"{"type":"future.thing","ignorable":true}"#;
 
 fn write_compat_session(directory: &Path, meta: &str, between: &str) -> PathBuf {
     fs::create_dir_all(directory).unwrap();
@@ -73,6 +74,61 @@ fn an_ignorable_unknown_record_is_skipped() {
             .search_sessions("future.thing", false)
             .unwrap();
         assert!(hits.is_empty(), "{hits:?}");
+    });
+}
+
+#[test]
+fn a_transcript_with_only_skipped_records_is_not_healthy() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("compat.jsonl");
+    for contents in [SKIPPABLE_RECORD, FIRST_MESSAGE, " \n", ""] {
+        fs::write(&path, contents).unwrap();
+        let scan = scan_session(&path).unwrap();
+        assert_eq!(scan.health, StoredSessionHealth::Quarantined, "{contents}");
+        assert_eq!(scan.health_issue.unwrap().code, "missing_session_meta");
+    }
+
+    fs::write(
+        &path,
+        format!("{SKIPPABLE_RECORD}\n").repeat(INDEX_BUDGET.records + 1),
+    )
+    .unwrap();
+    let scan = scan_session(&path).unwrap();
+    assert_eq!(scan.health, StoredSessionHealth::InspectionLimited);
+    assert_eq!(scan.health_issue.unwrap().code, "inspection_budget");
+}
+
+#[test]
+fn export_refuses_a_transcript_without_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    crate::history::with_test_orca_home(root.path(), |_| {
+        let path = sessions_dir().join("compat.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = format!("{SKIPPABLE_RECORD}\n\n");
+        fs::write(&path, &original).unwrap();
+        let store = JsonlThreadStore::new();
+        let target = root.path().join("export.jsonl");
+        let error = store.export_session("compat", &target).unwrap_err();
+        assert!(
+            error.to_string().contains("missing_session_meta"),
+            "{error}"
+        );
+        assert!(!target.exists());
+
+        let error = store
+            .update_thread_metadata(
+                "compat",
+                super::types::ThreadMetadataPatch {
+                    title: Some("new title".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("missing_session_meta"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     });
 }
 

@@ -80,6 +80,7 @@ pub(crate) struct SessionRecords {
     offset: u64,
     pub line_number: u64,
     done: bool,
+    missing_meta: bool,
     pub health: StoredSessionHealth,
     pub issue: Option<StoredSessionHealthIssue>,
     /// Catalog metadata can be read from a newer header without replaying it.
@@ -180,10 +181,16 @@ impl SessionRecords {
             offset: 0,
             line_number: 0,
             done: false,
+            missing_meta: false,
             health: StoredSessionHealth::Healthy,
             issue: None,
             newer_meta: None,
         })
+    }
+
+    pub(super) fn require_metadata(mut self) -> Self {
+        self.missing_meta = true;
+        self
     }
 
     pub fn text(&self) -> &str {
@@ -232,6 +239,14 @@ impl SessionRecords {
         terminated: bool,
     ) -> Option<io::Result<SessionRecord>> {
         if code == "incomplete_record" && !terminated && !self.compressed {
+            if self.missing_meta {
+                return self.stop_with_error(
+                    StoredSessionHealth::RecoverableTail,
+                    "recoverable_tail",
+                    offset,
+                    None,
+                );
+            }
             self.stop(
                 StoredSessionHealth::RecoverableTail,
                 "recoverable_tail",
@@ -302,6 +317,10 @@ impl SessionRecords {
                     None,
                 )
             }
+            SessionRecord::Meta(_) => {
+                self.missing_meta = false;
+                Some(Ok(record))
+            }
             record => Some(Ok(record)),
         }
     }
@@ -315,6 +334,9 @@ impl Iterator for SessionRecords {
             // Probe EOF before reporting a partial scan at an exact boundary.
             match self.reader.fill_buf() {
                 Ok([]) => {
+                    if self.missing_meta {
+                        return self.fail("missing_session_meta", self.offset);
+                    }
                     self.done = true;
                     return None;
                 }

@@ -428,7 +428,7 @@ fn scan_session_with_lines(path: &Path) -> io::Result<SessionScan> {
 
 fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionScan> {
     let mut reader = match SessionRecords::open(path, Some(INDEX_BUDGET), HydrateImages::None) {
-        Ok(reader) => reader,
+        Ok(reader) => reader.require_metadata(),
         Err(error) => {
             let metadata = fs::symlink_metadata(path).ok();
             if metadata
@@ -3734,6 +3734,13 @@ mod tests {
     #[test]
     fn scanner_accepts_a_complete_final_record_without_a_newline() {
         let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        let meta = serde_json::to_string(&SessionRecord::Meta(history::create_meta(
+            Path::new("/workspace"),
+            "mock",
+            None,
+            "test transcript",
+        )))
+        .unwrap();
         let valid = serde_json::to_string(&SessionRecord::Message {
             id: None,
             turn_id: None,
@@ -3744,11 +3751,11 @@ mod tests {
             },
         })
         .expect("serialize valid record");
-        fs::write(path.path(), valid).expect("write transcript");
+        fs::write(path.path(), format!("{meta}\n{valid}")).expect("write transcript");
 
         let scan = scan_session(path.path()).expect("scan transcript");
         assert_eq!(scan.health, StoredSessionHealth::Healthy);
-        assert_eq!(scan.records.len(), 1);
+        assert_eq!(scan.records.len(), 2);
     }
 
     #[test]
