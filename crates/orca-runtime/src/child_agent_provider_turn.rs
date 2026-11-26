@@ -122,8 +122,14 @@ pub fn run_child_agent_provider_turn(
             };
         }
     };
-    let model_conversation =
+    let mut model_conversation =
         child_agent_model_conversation(&setup.conversation, &pre_model_outcome, model_turn);
+    if config.provider == orca_core::config::ProviderKind::DeepSeek {
+        orca_provider::deepseek_http::bind_replay_source(
+            &mut model_conversation,
+            &setup.conversation,
+        );
+    }
 
     let response = orca_provider::call_streaming(
         config.provider,
@@ -193,8 +199,14 @@ pub fn run_child_agent_provider_turn_observed(
             };
         }
     };
-    let model_conversation =
+    let mut model_conversation =
         child_agent_model_conversation(&setup.conversation, &pre_model_outcome, model_turn);
+    if config.provider == orca_core::config::ProviderKind::DeepSeek {
+        orca_provider::deepseek_http::bind_replay_source(
+            &mut model_conversation,
+            &setup.conversation,
+        );
+    }
 
     let mut activity_error = None;
     let response = orca_provider::call_streaming(
@@ -276,14 +288,21 @@ fn child_compaction_provider<'a>(
     config: &RunConfig,
     provider: &'a ProviderConfig,
 ) -> Cow<'a, ProviderConfig> {
-    match config.model.as_option() {
-        Some(model) if provider.model.as_deref() != Some(model.as_str()) => {
-            Cow::Owned(ProviderConfig {
-                model: Some(model),
-                ..provider.clone()
-            })
-        }
-        _ => Cow::Borrowed(provider),
+    let model = config
+        .model
+        .route(ModelRouteContext {
+            subagent_type: &SubagentType::General,
+            subagent_model: None,
+            has_images: false,
+        })
+        .actual_model;
+    if provider.model.as_deref() == Some(model.as_str()) {
+        Cow::Borrowed(provider)
+    } else {
+        Cow::Owned(ProviderConfig {
+            model: Some(model),
+            ..provider.clone()
+        })
     }
 }
 

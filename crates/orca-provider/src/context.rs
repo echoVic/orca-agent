@@ -1100,6 +1100,7 @@ fn checkpoint_headings(text: &str) -> impl Iterator<Item = &str> {
         .filter_map(|line| line.trim_end().strip_prefix("## "))
 }
 
+#[cfg(test)]
 fn replay_summary_messages(conversation: &Conversation, cut: usize) -> Vec<ApiMessage> {
     let mut messages = deepseek_http::conversation_prefix_to_api_messages(conversation, cut);
     messages.push(ApiMessage::user(REPLAY_SUMMARY_INSTRUCTION.to_string()));
@@ -1125,26 +1126,17 @@ fn replay_summary(
     let input_budget = context_config
         .max_tokens
         .checked_sub(REPLAY_REQUEST_OUTPUT_TOKENS as usize)?;
-    let messages = replay_summary_messages(conversation, partition.cut);
-    let model = orca_core::model::canonical_model_name(
-        provider_config
-            .model
-            .as_deref()
-            .unwrap_or(deepseek_http::DEFAULT_MODEL),
-    );
-    if !orca_core::model::accepts_tool_images(model)
-        && messages
-            .iter()
-            .any(|message| message.role == "tool" && !message.images.is_empty())
-    {
-        return None;
-    }
-    let tools = deepseek_http::deepseek_primary_request_tools(provider_config);
-    let prompt_tokens = messages
-        .iter()
-        .map(|message| message.estimated_tokens(&counter))
-        .sum::<usize>()
+    let model = crate::replay_prefix::model(provider_config);
+    let crate::replay_prefix::ReplayPrefix {
+        mut messages,
+        estimated_tokens,
+        tools,
+    } = crate::replay_prefix::load(conversation, partition.cut, provider_config, &model)?;
+    let instruction = ApiMessage::user(REPLAY_SUMMARY_INSTRUCTION.to_string());
+    let prompt_tokens = estimated_tokens
+        + instruction.estimated_tokens(&counter)
         + serialized_tools_tokens(&tools, &counter);
+    messages.push(serde_json::value::to_raw_value(&instruction).ok()?);
     if prompt_tokens > input_budget || cancel.is_some_and(CancelToken::is_cancelled) {
         return None;
     }
@@ -1160,7 +1152,7 @@ fn replay_summary(
     let summary = observed_summary_response(
         provider_kind,
         REPLAY_SUMMARY_PURPOSE,
-        model,
+        &model,
         &response,
         cancel,
         observation,

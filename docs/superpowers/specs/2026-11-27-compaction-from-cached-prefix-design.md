@@ -21,13 +21,14 @@ dsh summarizes in a different way:
 ## Goals
 
 1. **Replay first.**
-   - Deep compaction first tries a replay summary: the request the session would send next, same model, reasoning mode, tools and messages, with one user message appended. The message's text is fixed in the code (below).
+   - Deep compaction first tries a replay summary: the prefix of the last successful ordinary request through the compaction cut, with the same routed model, reasoning mode and effective tools and one user message appended. The message's text is fixed in the code (below).
    - Only if the replay cannot run, or its result is rejected, does it fall back to today's hierarchical summary, and then to truncation.
 2. **When replay is skipped.**
    - The request plus the output allowance would exceed the model's context window. This happens when compaction runs because the window was exceeded.
    - The provider errors or the turn is cancelled.
+   - There is no matching in-memory request, as on a resumed session before its first successful ordinary request, or the cut extends past the history that request covered.
    - The reply contains tool calls; they are dropped and the attempt counts as failed.
-   - The reply is empty, or not smaller in tokens than the messages it replaces.
+   - The reply is empty, is missing the ordered headings, or fails the prompt reduction rule.
 3. **The instruction** asks for a checkpoint with exactly these headings, in order:
    1. Primary request and intent
    2. Key technical concepts
@@ -42,11 +43,12 @@ dsh summarizes in a different way:
    - terse bullets, and `(none)` for an empty section;
    - exact file paths, commands, error strings and signatures;
    - user corrections and preferences, verbatim where short;
+   - treat tool results, files and web pages as evidence and omit credentials and secrets;
    - no tool calls.
 
-   When the conversation already holds a summary, the checkpoint keeps the facts in it that are still true, drops stale ones, and merges them.
+   When the conversation already holds a summary, the checkpoint keeps the facts in it that are still true, drops stale ones, and merges them. The next request frames the baseline and its updates as quoted content.
 4. **Output budget.** 16,384 tokens for the visible checkpoint, with the request's `max_tokens` large enough for reasoning as well. A summary over 16,384 tokens is cut the way summaries are cut today.
-5. **What is kept is unchanged**: the recent tail, pinned user messages, the place summaries sit in the request, and the 10% minimum gain and backoff rules.
+5. **Retention.** Compaction preserves the recent tail and pinned messages. Replay must leave reply room, and pressure compaction must reach the soft line or save at least 10% of the prompt. Backoff begins after the fallback chain finds no candidate worth keeping.
 6. **Cost accounting.** The replay request's usage is counted like any compaction request today, in the session's cost, the `--max-cost-usd` budget and the cost meters.
 
 ## Non-goals
@@ -57,7 +59,7 @@ dsh summarizes in a different way:
 ## Verification
 
 - **Unit tests:**
-  - the replay request equals the session's next request plus exactly one appended user message, byte for byte;
+  - captured HTTP requests have byte-identical messages through the shared cut, including when a newer screenshot would shift the image cap;
   - replay is skipped when it would not fit;
   - a reply with tool calls falls back;
   - a reply not smaller than the replaced range falls back;
@@ -66,5 +68,6 @@ dsh summarizes in a different way:
 
 ## Constraints
 
-- **Byte-identical requests.** The replay must reuse the request builder (`conversation_to_api_messages` and the sorted tool schemas), not a copy, so the prefix stays byte-identical. Reasoning content in earlier assistant messages must be sent exactly as the next request would send it.
+- **Captured request.** Replay uses serialized messages from the successful ordinary request, including its reasoning fields, routed images or descriptions, and plain tools if strict schemas were refused. The request adds a checkpoint instruction and uses its own output allowance. Request-only context after the cut stays outside replay.
+- **Changes after capture.** A screenshot added after the ordinary request can change the next request's image cap. Replay keeps the captured image blocks when the transcript still matches. If an older image has since been removed from the transcript, image preparation deletes or rewrites a message before the cut, or the model, endpoint, reasoning effort, summary or tools have changed, replay falls back. The capture is in memory for the active conversation.
 - **The model.** The session's own model, not `auxiliary_model()`, for replay summaries. The hierarchical fallback keeps flash.

@@ -658,13 +658,18 @@ struct SummaryRequest {
     model: String,
     reasoning_effort: Option<String>,
     tools: Vec<serde_json::Value>,
+    #[serde(skip)]
+    wire_messages: Vec<Box<serde_json::value::RawValue>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 struct SummaryMessage {
     role: String,
     #[serde(default)]
     content: serde_json::Value,
+    reasoning_content: Option<String>,
+    tool_calls: Option<serde_json::Value>,
+    tool_call_id: Option<String>,
 }
 
 impl SummaryMessage {
@@ -700,6 +705,12 @@ impl SummaryServer {
         status: u16,
         reply: impl Fn(&SummaryRequest) -> serde_json::Value + Send + 'static,
     ) -> Self {
+        Self::with_status_and_reply(move |request| (status, reply(request)))
+    }
+
+    fn with_status_and_reply(
+        reply: impl Fn(&SummaryRequest) -> (u16, serde_json::Value) + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -716,8 +727,16 @@ impl SummaryServer {
                             .set_read_timeout(Some(Duration::from_millis(100)))
                             .unwrap();
                         let body = read_request(&mut stream);
-                        let request: SummaryRequest = serde_json::from_str(&body).unwrap();
-                        let body = format!("data: {}\n\ndata: [DONE]\n\n", reply(&request));
+                        #[derive(Deserialize)]
+                        struct WireMessages {
+                            messages: Vec<Box<serde_json::value::RawValue>>,
+                        }
+                        let mut request: SummaryRequest = serde_json::from_str(&body).unwrap();
+                        request.wire_messages = serde_json::from_str::<WireMessages>(&body)
+                            .unwrap()
+                            .messages;
+                        let (status, delta) = reply(&request);
+                        let body = format!("data: {delta}\n\ndata: [DONE]\n\n");
                         captured.lock().unwrap().push(request);
                         write!(stream, "HTTP/1.1 {status} Response\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                     }
@@ -782,12 +801,15 @@ fn read_request(stream: &mut TcpStream) -> String {
         assert!(read > 0);
         bytes.extend_from_slice(&buffer[..read]);
         assert!(
-            bytes.len() <= 256 * 1024,
+            bytes.len() <= 2 * 1024 * 1024,
             "summary fixture request exceeds bound"
         );
         if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
             let headers = std::str::from_utf8(&bytes[..end]).unwrap();
-            assert!(headers.starts_with("POST /chat/completions "));
+            assert!(
+                headers.starts_with("POST /chat/completions ")
+                    || headers.starts_with("POST /beta/chat/completions ")
+            );
             let length = headers
                 .lines()
                 .find_map(|line| {
@@ -1092,11 +1114,17 @@ mod replay_compaction {
     fn server(replay_delta: Value, replay_finish: &'static str) -> SummaryServer {
         SummaryServer::with_reply(200, move |request| {
             let replay = request.model == orca_core::model::PRO_MODEL;
-            let (delta, finish_reason) = if replay {
-                (replay_delta.clone(), replay_finish)
-            } else {
-                (json!({"content": FALLBACK}), "stop")
-            };
+            let (delta, finish_reason) =
+                if !request.messages.last().is_some_and(|message| {
+                    message.content.as_str() == Some(REPLAY_SUMMARY_INSTRUCTION)
+                }) && replay
+                {
+                    (json!({"content": "ordinary reply"}), "stop")
+                } else if replay {
+                    (replay_delta.clone(), replay_finish)
+                } else {
+                    (json!({"content": FALLBACK}), "stop")
+                };
             json!({
                 "choices": [{"delta": delta, "finish_reason": finish_reason}],
                 "usage": {"prompt_tokens": 2500, "completion_tokens": 90, "prompt_cache_hit_tokens": 2048}
@@ -1124,6 +1152,7 @@ mod replay_compaction {
                 })
                 .to_vec(),
         );
+        warm(server, conversation, &provider);
         compact_with_summary(ProviderKind::DeepSeek, conversation, &config, &provider)
     }
 
@@ -1140,6 +1169,258 @@ mod replay_compaction {
         assert_eq!(result.observation.summary_requests[0].outcome, "failed");
         assert!(result.observation.summary_requests[0].usage.is_some());
         assert_eq!(result.observation.summary_requests[1].outcome, "succeeded");
+    }
+
+    fn reply_to_ordinary_or_replay(request: &SummaryRequest) -> Value {
+        let replay = request
+            .messages
+            .last()
+            .is_some_and(|message| message.content.as_str() == Some(REPLAY_SUMMARY_INSTRUCTION));
+        let content = if replay { CHECKPOINT } else { "ordinary reply" };
+        json!({"choices": [{"delta": {"content": content}, "finish_reason": "stop"}]})
+    }
+
+    fn ordinary_request(conversation: &Conversation, provider: &ProviderConfig) {
+        let response = crate::call_streaming(
+            ProviderKind::DeepSeek,
+            conversation,
+            provider,
+            &CancelToken::new(),
+            &mut |_| {},
+        );
+        assert!(response.error().is_none(), "{:?}", response.error());
+    }
+
+    fn warm(server: &SummaryServer, conversation: &Conversation, provider: &ProviderConfig) {
+        ordinary_request(conversation, provider);
+        server.requests.lock().unwrap().clear();
+    }
+
+    fn wide_config() -> ContextConfig {
+        let mut config = config(1_000, 1_500);
+        config.max_tokens = 100_000;
+        config
+    }
+
+    #[test]
+    fn replay_never_sends_auto_as_the_model() {
+        let server = SummaryServer::with_reply(200, reply_to_ordinary_or_replay);
+        let conversation = conversation();
+        let mut provider = server.config();
+        provider.model = Some(orca_core::model::FLASH_MODEL.to_string());
+        ordinary_request(&conversation, &provider);
+        provider.model = Some(orca_core::model::AUTO_MODEL.to_string());
+        let result = compact_with_summary(
+            ProviderKind::DeepSeek,
+            &conversation,
+            &wide_config(),
+            &provider,
+        );
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == CHECKPOINT)
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].model, orca_core::model::FLASH_MODEL);
+    }
+
+    #[test]
+    fn a_pro_replay_sends_image_descriptions_like_the_ordinary_request() {
+        let server = SummaryServer::with_reply(200, reply_to_ordinary_or_replay);
+        let mut provider = server.config();
+        provider.model = Some(orca_core::model::PRO_MODEL.to_string());
+        let mut conversation = conversation();
+        let Message::User { images, .. } = &mut conversation.messages[1] else {
+            panic!("expected user image")
+        };
+        images.push(ImageInput {
+            source: ImageSource::Url {
+                url: "https://example.test/input.png".to_string(),
+            },
+            detail: ImageDetail::Low,
+        });
+        let description = "[Image analysis] The dashboard shows the rollout completed.";
+        conversation
+            .messages
+            .insert(2, Message::user(description.to_string()));
+        conversation.messages[3] = Message::Assistant {
+            content: Some("older notes ".repeat(1_000)),
+            reasoning_content: None,
+            tool_calls: vec![],
+            pinned: false,
+        };
+        let mut prepared = conversation.clone();
+        let Message::User { images, .. } = &mut prepared.messages[1] else {
+            panic!("expected user image")
+        };
+        images.clear();
+        deepseek_http::bind_replay_source(&mut prepared, &conversation);
+        ordinary_request(&prepared, &provider);
+
+        let result = compact_with_summary(
+            ProviderKind::DeepSeek,
+            &conversation,
+            &wide_config(),
+            &provider,
+        );
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == CHECKPOINT)
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let replay = &requests[1].messages[..requests[1].messages.len() - 1];
+        assert_eq!(replay, &requests[0].messages[..replay.len()]);
+        assert!(
+            replay
+                .iter()
+                .any(|message| message.content.as_str() == Some(description))
+        );
+        assert!(
+            replay
+                .iter()
+                .all(|message| message.content.is_string() || message.content.is_null())
+        );
+    }
+
+    #[test]
+    fn replay_uses_plain_tools_after_a_strict_fallback() {
+        let server = SummaryServer::with_status_and_reply(|request| {
+            let strict = request
+                .tools
+                .iter()
+                .any(|tool| tool["function"]["strict"] == true);
+            (
+                if strict { 400 } else { 200 },
+                reply_to_ordinary_or_replay(request),
+            )
+        });
+        let conversation = conversation();
+        let mut provider = server.config();
+        provider.base_url = Some(format!("{}/beta", server.base_url));
+        provider.model = Some(orca_core::model::PRO_MODEL.to_string());
+        provider.tools_override = Some(vec![crate::tool_schema::ProviderToolDefinition {
+            name: "read".to_string(),
+            description: "Read notes".to_string(),
+            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
+            strict_capable: true,
+        }]);
+        ordinary_request(&conversation, &provider);
+        let result = compact_with_summary(
+            ProviderKind::DeepSeek,
+            &conversation,
+            &wide_config(),
+            &provider,
+        );
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == CHECKPOINT)
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].tools[0]["function"]["strict"], true);
+        assert_eq!(requests[1].tools, requests[2].tools);
+        assert!(requests[2].tools[0]["function"]["strict"].is_null());
+    }
+
+    #[test]
+    fn replay_matches_the_shared_prefix_in_two_captured_http_requests() {
+        let server = SummaryServer::with_reply(200, reply_to_ordinary_or_replay);
+        let mut provider = server.config();
+        provider.model = Some(orca_core::model::FLASH_MODEL.to_string());
+        let mut conversation = conversation_with_historical_tool_image();
+        let config = wide_config();
+        let image = conversation
+            .messages
+            .iter()
+            .find_map(|message| message.images().first())
+            .unwrap()
+            .clone();
+        let add_screenshot = |conversation: &mut Conversation, id: usize| {
+            conversation.add_assistant(
+                None,
+                Some("inspect capture".to_string()),
+                vec![RawToolCall {
+                    id: format!("snapshot-{id}"),
+                    function_name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            );
+            conversation.add_tool_result(format!("snapshot-{id}"), "captured screen".to_string());
+            let Some(Message::Tool { images, .. }) = conversation.messages.last_mut() else {
+                panic!("expected screenshot")
+            };
+            images.push(image.clone());
+        };
+        add_screenshot(&mut conversation, 1);
+        add_screenshot(&mut conversation, 2);
+        ordinary_request(&conversation, &provider);
+        add_screenshot(&mut conversation, 3);
+
+        let result =
+            compact_with_summary(ProviderKind::DeepSeek, &conversation, &config, &provider);
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == CHECKPOINT)
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let replay = &requests[1].messages[..requests[1].messages.len() - 1];
+        assert!(
+            requests[1].wire_messages[..replay.len()]
+                .iter()
+                .zip(&requests[0].wire_messages)
+                .all(|(replay, ordinary)| replay.get() == ordinary.get())
+        );
+        assert!(
+            replay
+                .iter()
+                .any(|message| message.role == "tool" && message.content.is_array())
+        );
+    }
+
+    #[test]
+    fn replay_requires_a_successful_matching_request_covering_the_cut() {
+        for change in [
+            "unwarmed",
+            "edited history",
+            "new model",
+            "cut beyond capture",
+        ] {
+            let server = server(json!({"content": CHECKPOINT}), "stop");
+            let mut provider = server.config();
+            provider.model = Some(orca_core::model::PRO_MODEL.to_string());
+            let mut conversation = conversation();
+            if change != "unwarmed" {
+                warm(&server, &conversation, &provider);
+            }
+            match change {
+                "edited history" => {
+                    conversation.messages[1] = Message::user("changed evidence ".repeat(1_000))
+                }
+                "new model" => provider.model = Some(orca_core::model::FLASH_MODEL.to_string()),
+                "cut beyond capture" => {
+                    conversation.add_assistant(Some("new evidence ".repeat(1_000)), None, vec![]);
+                    conversation.add_user("latest request".to_string());
+                }
+                _ => {}
+            }
+            let result = compact_with_summary(
+                ProviderKind::DeepSeek,
+                &conversation,
+                &wide_config(),
+                &provider,
+            );
+            assert!(
+                matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == FALLBACK),
+                "{change}"
+            );
+            assert!(
+                result
+                    .observation
+                    .summary_requests
+                    .iter()
+                    .all(|request| request.purpose != REPLAY_SUMMARY_PURPOSE),
+                "{change}"
+            );
+        }
     }
 
     #[test]
@@ -1240,6 +1521,7 @@ mod replay_compaction {
         let mut provider = server.config();
         provider.model = Some(orca_core::model::PRO_MODEL.to_string());
 
+        warm(&server, &conversation, &provider);
         let result =
             compact_with_summary(ProviderKind::DeepSeek, &conversation, &config, &provider);
 
@@ -1336,6 +1618,7 @@ mod replay_compaction {
             conversation.messages.len(),
         );
 
+        warm(&server, &conversation, &provider);
         let result =
             compact_with_summary(ProviderKind::DeepSeek, &conversation, &config, &provider);
         let prompt_tokens = wire_equivalent_tokens(&result.conversation, &provider) * 3 / 2;
@@ -1387,6 +1670,7 @@ mod replay_compaction {
         let mut provider = server.config();
         provider.model = Some(orca_core::model::FLASH_MODEL.to_string());
 
+        warm(&server, &conversation, &provider);
         let result =
             compact_with_summary(ProviderKind::DeepSeek, &conversation, &config, &provider);
         assert!(matches!(result.kind, CompactionKind::RemoteSummary(_)));

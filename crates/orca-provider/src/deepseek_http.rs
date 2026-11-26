@@ -1,6 +1,7 @@
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::value::RawValue;
 use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
@@ -8,7 +9,7 @@ use orca_core::conversation::{
     Conversation, ImageDetail, ImageInput, ImageSource, Message, RawToolCall, SummaryState,
     assistant_message_has_payload, normalize_tool_boundaries,
 };
-use orca_core::model::{FLASH_MODEL, canonical_model_name};
+use orca_core::model::FLASH_MODEL;
 use orca_core::provider_types::{
     ProviderError, ProviderErrorKind, ProviderReplayState, ProviderResponse, ProviderStep, Usage,
 };
@@ -18,6 +19,7 @@ use orca_core::tool_types::{ToolName, ToolRequest};
 use crate::ProviderConfig;
 use crate::context::render_internal_context;
 use crate::http_client::RetryBudget;
+use crate::replay_prefix;
 use crate::tool_schema::{deepseek_strict_tools_schema_for_endpoint, deepseek_tools_schema};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -131,7 +133,7 @@ fn is_strict_schema_rejection(error: &str) -> bool {
 #[derive(Debug, Serialize)]
 struct ChatRequest {
     model: String,
-    messages: Vec<ApiMessage>,
+    messages: ChatMessages,
     thinking: ThinkingConfig,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,6 +144,18 @@ struct ChatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<orca_core::config::ReasoningEffort>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ChatMessages {
+    Conversation(Vec<ApiMessage>),
+    Replay(Vec<Box<RawValue>>),
+}
+
+/// Associate an ordinary request prepared by the runtime with its live history.
+pub fn bind_replay_source(prepared: &mut Conversation, source: &Conversation) {
+    replay_prefix::bind(prepared, source);
 }
 
 #[derive(Debug, Serialize)]
@@ -159,9 +173,11 @@ impl Default for ThinkingConfig {
 }
 
 fn add_empty_response_recovery_instruction(request: &mut ChatRequest) {
+    let ChatMessages::Conversation(messages) = &mut request.messages else {
+        return;
+    };
     // Look past the trailing internal-context overlay to the prompt itself.
-    if let Some(last) = request
-        .messages
+    if let Some(last) = messages
         .iter_mut()
         .rev()
         .find(|message| message.role != "system")
@@ -173,7 +189,7 @@ fn add_empty_response_recovery_instruction(request: &mut ChatRequest) {
         return;
     }
 
-    request.messages.push(ApiMessage {
+    messages.push(ApiMessage {
         role: "user".to_string(),
         content: Some(EMPTY_RESPONSE_RECOVERY_PROMPT.to_string()),
         images: Vec::new(),
@@ -577,7 +593,7 @@ pub fn call_summary(
 }
 
 pub(crate) fn call_replay_summary(
-    messages: Vec<ApiMessage>,
+    messages: Vec<Box<RawValue>>,
     tools: Vec<Value>,
     config: &ProviderConfig,
     max_tokens: u32,
@@ -645,7 +661,7 @@ enum StreamingRequest<'a> {
         accept_truncated_partial: bool,
     },
     Replay {
-        messages: Vec<ApiMessage>,
+        messages: Vec<Box<RawValue>>,
         tools: Vec<Value>,
         max_tokens: u32,
     },
@@ -662,12 +678,16 @@ async fn request_chat_streaming_with_budget(
         "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string()
     })?;
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
-    let model = canonical_model_name(config.model.as_deref().unwrap_or(DEFAULT_MODEL));
+    let model = replay_prefix::model(config);
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let streaming_client = crate::http_client::streaming_client()?;
 
     let definitions = config.tools_override.as_deref().unwrap_or(&[]);
-    let interactive = matches!(request, StreamingRequest::Turn(_));
+    let ordinary = match &request {
+        StreamingRequest::Turn(conversation) => Some(*conversation),
+        _ => None,
+    };
+    let interactive = ordinary.is_some();
     let accept_truncated_partial = matches!(
         request,
         StreamingRequest::Auxiliary {
@@ -678,7 +698,7 @@ async fn request_chat_streaming_with_budget(
     let auxiliary = matches!(request, StreamingRequest::Auxiliary { .. });
     let (messages, tools, max_tokens) = match request {
         StreamingRequest::Turn(conversation) => (
-            conversation_to_api_messages(conversation),
+            ChatMessages::Conversation(conversation_to_api_messages(conversation)),
             deepseek_primary_request_tools(config),
             chat_max_tokens(config),
         ),
@@ -687,7 +707,7 @@ async fn request_chat_streaming_with_budget(
             max_tokens,
             ..
         } => (
-            conversation_to_api_messages(conversation),
+            ChatMessages::Conversation(conversation_to_api_messages(conversation)),
             Vec::new(),
             max_tokens,
         ),
@@ -695,11 +715,11 @@ async fn request_chat_streaming_with_budget(
             messages,
             tools,
             max_tokens,
-        } => (messages, tools, max_tokens),
+        } => (ChatMessages::Replay(messages), tools, max_tokens),
     };
 
     let mut request = ChatRequest {
-        model: model.to_string(),
+        model,
         messages,
         thinking: if auxiliary {
             ThinkingConfig {
@@ -892,6 +912,9 @@ async fn request_chat_streaming_with_budget(
             ));
         }
 
+        if let Some(conversation) = ordinary {
+            record_replay_source(conversation, config, &request);
+        }
         return Ok(ProviderResponse {
             steps,
             assistant_content,
@@ -899,6 +922,22 @@ async fn request_chat_streaming_with_budget(
             tool_calls: raw_calls_for_history,
             usage: accumulated_usage,
         });
+    }
+}
+
+fn record_replay_source(
+    conversation: &Conversation,
+    config: &ProviderConfig,
+    request: &ChatRequest,
+) {
+    if let ChatMessages::Conversation(messages) = &request.messages {
+        replay_prefix::record(
+            conversation,
+            config,
+            &request.model,
+            messages,
+            request.tools.as_deref().unwrap_or_default(),
+        );
     }
 }
 
@@ -923,7 +962,7 @@ fn request_chat(
         "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string()
     })?;
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
-    let model = canonical_model_name(config.model.as_deref().unwrap_or(DEFAULT_MODEL));
+    let model = replay_prefix::model(config);
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let messages = conversation_to_api_messages(conversation);
@@ -933,8 +972,8 @@ fn request_chat(
     let primary_tools = deepseek_primary_request_tools(config);
 
     let mut request = ChatRequest {
-        model: model.to_string(),
-        messages,
+        model,
+        messages: ChatMessages::Conversation(messages),
         thinking: ThinkingConfig::default(),
         stream: false,
         stream_options: None,
@@ -1068,6 +1107,12 @@ fn request_chat(
             ));
         }
 
+        if !steps
+            .iter()
+            .any(|step| matches!(step, ProviderStep::Error(_)))
+        {
+            record_replay_source(conversation, config, &request);
+        }
         return Ok(ProviderResponse {
             steps,
             assistant_content,
@@ -1106,10 +1151,15 @@ fn parse_tool_call(tc: &ApiToolCallResponse) -> ToolRequest {
 pub(crate) fn deepseek_primary_request_tools(config: &ProviderConfig) -> Vec<Value> {
     let definitions = config.tools_override.as_deref().unwrap_or(&[]);
     let base_url = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
-    let plain = cap_tools_for_deepseek(deepseek_tools_schema(definitions));
     deepseek_strict_tools_schema_for_endpoint(definitions, base_url)
         .map(cap_tools_for_deepseek)
-        .unwrap_or(plain)
+        .unwrap_or_else(|| deepseek_plain_request_tools(config))
+}
+
+pub(crate) fn deepseek_plain_request_tools(config: &ProviderConfig) -> Vec<Value> {
+    cap_tools_for_deepseek(deepseek_tools_schema(
+        config.tools_override.as_deref().unwrap_or_default(),
+    ))
 }
 
 fn cap_tools_for_deepseek(mut tools: Vec<Value>) -> Vec<Value> {
@@ -1170,6 +1220,7 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
 }
 
 /// `cut` is a unit boundary in the normalized compaction conversation.
+#[cfg(test)]
 pub(crate) fn conversation_prefix_to_api_messages(
     conversation: &Conversation,
     cut: usize,
@@ -2569,7 +2620,7 @@ mod tests {
     fn chat_request_serializes_latest_reasoning_contract() {
         let request = ChatRequest {
             model: "deepseek-v4-pro".to_string(),
-            messages: Vec::new(),
+            messages: ChatMessages::Conversation(Vec::new()),
             thinking: ThinkingConfig::default(),
             stream: true,
             stream_options: None,

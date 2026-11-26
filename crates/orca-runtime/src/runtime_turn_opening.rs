@@ -260,38 +260,39 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let started = Instant::now();
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        if started.elapsed() > Duration::from_secs(3) {
-                            return;
+            for warming in [true, false] {
+                let started = Instant::now();
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if started.elapsed() > Duration::from_secs(3) {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
                         }
-                        std::thread::sleep(Duration::from_millis(5));
+                        Err(error) => panic!("accept summary: {error}"),
                     }
-                    Err(error) => panic!("accept summary: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0_u8; 16 * 1024];
+                let _ = stream.read(&mut request);
+                if !warming && cancel_on_accept {
+                    server_cancel.cancel();
                 }
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = [0_u8; 16 * 1024];
-            let _ = stream.read(&mut request);
-            if cancel_on_accept {
-                server_cancel.cancel();
+                if !warming && max_cost_usd_micros.is_none() {
+                    std::thread::sleep(Duration::from_millis(1_200));
+                }
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"retained facts\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4000,\"completion_tokens\":90,\"prompt_cache_hit_tokens\":1000}}\n\ndata: [DONE]\n\n";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
             }
-            // The endpoint waits beyond the entire operation budget.
-            if max_cost_usd_micros.is_none() {
-                std::thread::sleep(Duration::from_millis(1_200));
-            }
-            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"retained facts\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4000,\"completion_tokens\":90,\"prompt_cache_hit_tokens\":1000}}\n\ndata: [DONE]\n\n";
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
         });
         let mut conversation = Conversation::new();
         conversation.add_system("system".to_string());
@@ -314,6 +315,14 @@ mod tests {
             external_tools: vec![],
             max_output_tokens: None,
         };
+        let warm = orca_provider::call_streaming(
+            ProviderKind::DeepSeek,
+            &conversation,
+            &provider_config,
+            &cancel,
+            &mut |_| {},
+        );
+        assert!(warm.error().is_none(), "{:?}", warm.error());
         let mut lifecycle = crate::lifecycle::RuntimeSessionLifecycle::new("opening-deadline");
         let mut actor = RuntimeTaskActor::new(&mut lifecycle);
         let mut operation = OperationContext::for_tests(

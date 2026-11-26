@@ -572,10 +572,13 @@ impl RuntimeProviderTurnStep {
 
         let model_conversation =
             conversation_with_hook_context(&prepared_images.conversation, &pre_model_outcome);
-        let model_conversation = conversation_with_runtime_system_messages(
+        let mut model_conversation = conversation_with_runtime_system_messages(
             &model_conversation,
             input.runtime_system_messages,
         );
+        if input.provider == ProviderKind::DeepSeek {
+            orca_provider::deepseek_http::bind_replay_source(&mut model_conversation, conversation);
+        }
         let measurement = context::measure_prompt(&model_conversation, input.provider_config);
         let request_config = context::with_request_reply_budget(
             input.provider_config,

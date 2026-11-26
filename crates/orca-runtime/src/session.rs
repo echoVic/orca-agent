@@ -915,7 +915,7 @@ impl InteractiveSession {
             },
             cancel,
         );
-        let provider_config = crate::tool_invocation::provider_config_for_agent_loop(
+        let mut provider_config = crate::tool_invocation::provider_config_for_agent_loop(
             config,
             cwd,
             0,
@@ -924,11 +924,17 @@ impl InteractiveSession {
             &self.mcp_registry,
             session_tools,
         );
+        let model = config.model.route(orca_core::model::ModelRouteContext {
+            subagent_type: &SubagentType::General,
+            subagent_model: None,
+            has_images: false,
+        });
+        provider_config.model = Some(model.actual_model);
         let compaction = orca_provider::context::compact_with_summary_cancellable(
             config.provider,
             &candidate,
             &orca_provider::context::ContextConfig::for_model_with_runtime(
-                config.model.as_option().as_deref(),
+                provider_config.model.as_deref(),
                 &config.model_runtime,
                 config.reasoning_effort,
             ),

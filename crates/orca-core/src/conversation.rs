@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -426,7 +427,7 @@ impl InternalContext {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SummaryState {
     pub baseline: Option<String>,
     pub deltas: Vec<String>,
@@ -473,6 +474,38 @@ pub struct UsageAnchor {
     boundary: u64,
 }
 
+/// In-memory DeepSeek request data used only for compaction replay.
+pub struct CapturedProviderRequest {
+    pub source_messages: Vec<[u8; 32]>,
+    pub summary: SummaryState,
+    pub endpoint: String,
+    pub model: String,
+    pub reasoning_effort: crate::config::ReasoningEffort,
+    pub messages: Vec<CapturedProviderMessage>,
+    pub tools: Vec<serde_json::Value>,
+}
+
+pub struct CapturedProviderMessage {
+    pub json: Box<serde_json::value::RawValue>,
+    pub estimated_tokens: usize,
+    pub has_images: bool,
+    pub has_tool_images: bool,
+}
+
+#[derive(Clone, Default)]
+struct ProviderRequestCapture {
+    latest: Arc<Mutex<Option<Arc<CapturedProviderRequest>>>>,
+    prepared_source: Option<Arc<[[u8; 32]]>>,
+}
+
+impl fmt::Debug for ProviderRequestCapture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderRequestCapture")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
@@ -487,6 +520,7 @@ pub struct Conversation {
     /// not try again until the prompt has grown well past it (#175).
     pub compaction_hold: Option<usize>,
     retained_tool_images: Option<RetainedToolImages>,
+    provider_request_capture: ProviderRequestCapture,
 }
 
 // Prompt snapshots and inherited conversations must not publish into the
@@ -501,6 +535,10 @@ impl Clone for Conversation {
             usage_anchor: self.usage_anchor,
             compaction_hold: self.compaction_hold,
             retained_tool_images: None,
+            provider_request_capture: ProviderRequestCapture {
+                latest: Arc::new(Mutex::new(self.last_provider_request())),
+                prepared_source: None,
+            },
         }
     }
 }
@@ -515,7 +553,33 @@ impl Conversation {
             usage_anchor: None,
             compaction_hold: None,
             retained_tool_images: None,
+            provider_request_capture: ProviderRequestCapture::default(),
         }
+    }
+
+    pub fn last_provider_request(&self) -> Option<Arc<CapturedProviderRequest>> {
+        self.provider_request_capture.latest.lock().unwrap().clone()
+    }
+
+    pub fn record_provider_request(&self, request: CapturedProviderRequest) {
+        *self.provider_request_capture.latest.lock().unwrap() = Some(Arc::new(request));
+    }
+
+    pub fn bind_provider_request_source(&mut self, source: &Self, messages: Vec<[u8; 32]>) {
+        self.provider_request_capture = ProviderRequestCapture {
+            latest: Arc::clone(&source.provider_request_capture.latest),
+            prepared_source: Some(messages.into()),
+        };
+    }
+
+    pub fn provider_request_source(&self) -> Option<&[[u8; 32]]> {
+        self.provider_request_capture.prepared_source.as_deref()
+    }
+
+    pub fn clone_for_provider_request(&self) -> Self {
+        let mut request = self.clone();
+        request.provider_request_capture = self.provider_request_capture.clone();
+        request
     }
 
     /// Enable a bounded read view before lending this conversation to a worker.
