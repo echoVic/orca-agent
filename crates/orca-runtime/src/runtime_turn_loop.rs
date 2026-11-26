@@ -2,6 +2,7 @@ use std::io;
 
 use orca_approval::ApprovalPolicy;
 use orca_core::config::{ProviderKind, RunConfig};
+use orca_core::conversation::{Conversation, Message};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelSelection;
@@ -292,8 +293,7 @@ impl RuntimeTurnLoopStep {
         let mut summary_provider_config = None;
         loop {
             park_pending_task_wait(&mut input)?;
-            deliver_child_results(&mut input)?;
-            deliver_shell_completions(&mut input)?;
+            deliver_loop_notices(&mut input, true)?;
             if let Some(task_id) = input.request.turn_context.task_id.as_deref() {
                 let registry = input.loop_state.runtime.task_registry;
                 let messages = registry.pending_child_messages(task_id);
@@ -456,13 +456,10 @@ fn direct_subagent_children_settled(
     Ok(!first.status.is_active() && children.all(|task| !task.status.is_active()))
 }
 
-/// Drain at every settled model boundary, not only when a new user turn starts.
-fn deliver_child_results<W: io::Write>(
+fn deliver_loop_notices<W: io::Write>(
     input: &mut RuntimeTurnLoopInput<'_, '_, W>,
+    include_shell: bool,
 ) -> io::Result<bool> {
-    if conversation_has_open_tool_calls(input.prepared_conversation.checkpoint_parts().0) {
-        return Ok(false);
-    }
     let registry = input.loop_state.runtime.task_registry;
     let parent = input
         .request
@@ -470,72 +467,67 @@ fn deliver_child_results<W: io::Write>(
         .task_id
         .as_deref()
         .or(input.request.turn_context.root_task_id);
-    let results = registry.claim_subagent_results_for_parent(parent);
-    let delivered = !results.is_empty();
-    for result in results {
-        let ack = crate::tasks::DeliveryAck::from(&result);
-        let content = result.model_notification();
-        let (conversation, mut writer) = input.prepared_conversation.parts_mut();
-        let present = conversation.messages.iter().any(|message|
-            matches!(message, orca_core::conversation::Message::System { content: text, .. } if text == &content));
+    let service = include_shell.then(|| terminal_service(input)).flatten();
+    let usage = input.operation.controller.usage();
+    let (conversation, writer, observer) = input
+        .prepared_conversation
+        .parts_mut_with_checkpoint_observer();
+    deliver_boundary_notices(
+        conversation,
+        writer,
+        registry,
+        parent,
+        service.as_deref(),
+        |conversation| checkpoint_child(conversation, observer, usage),
+    )
+}
+
+/// Append and acknowledge notices at a settled tool boundary, child results first.
+pub(crate) fn deliver_boundary_notices(
+    conversation: &mut Conversation,
+    mut writer: Option<&mut crate::thread_store::SessionWriter>,
+    registry: &crate::tasks::TaskRegistry,
+    parent: Option<&str>,
+    terminal: Option<&TerminalService>,
+    mut checkpoint: impl FnMut(&Conversation) -> io::Result<()>,
+) -> io::Result<bool> {
+    if conversation_has_open_tool_calls(conversation) {
+        return Ok(false);
+    }
+    let mut append = |content: String| {
         if let Some(writer) = writer.as_deref_mut() {
-            if let Err(error) = writer.append_system_delivery_once(&content) {
-                registry.release_subagent_result_claim(&ack);
-                return Err(error);
-            }
+            writer.append_system_delivery_once(&content)?;
         }
-        if !present {
+        if !conversation.messages.iter().any(
+            |message| matches!(message, Message::System { content: text, .. } if text == &content),
+        ) {
             conversation.add_system(content);
         }
-        if let Err(error) = emit_safe_child_checkpoint(
-            input.prepared_conversation,
-            input.operation.controller.usage(),
-        ) {
+        checkpoint(conversation)
+    };
+    let mut children = registry
+        .claim_subagent_results_for_parent(parent)
+        .into_iter();
+    let delivered_children = children.len() != 0;
+    while let Some(child) = children.next() {
+        let ack = crate::tasks::DeliveryAck::from(&child);
+        if let Err(error) = append(child.model_notification()) {
             registry.release_subagent_result_claim(&ack);
+            for remaining in children {
+                registry
+                    .release_subagent_result_claim(&crate::tasks::DeliveryAck::from(&remaining));
+            }
             return Err(error);
         }
         registry.ack_subagent_result(&ack);
     }
-    Ok(delivered)
-}
-
-fn deliver_shell_completions<W: io::Write>(
-    input: &mut RuntimeTurnLoopInput<'_, '_, W>,
-) -> io::Result<bool> {
-    if conversation_has_open_tool_calls(input.prepared_conversation.checkpoint_parts().0) {
-        return Ok(false);
+    if let Some(service) = terminal {
+        for completion in service.pending_completions() {
+            append(completion.model_notification())?;
+            service.observe_completions(vec![completion.task_id]);
+        }
     }
-    let Some(service) = terminal_service(input) else {
-        return Ok(false);
-    };
-    let completions = service.pending_completions();
-    let delivered = !completions.is_empty();
-    for completion in completions {
-        let (conversation, writer) = input.prepared_conversation.parts_mut();
-        append_shell_completion(conversation, writer, completion.model_notification())?;
-        emit_safe_child_checkpoint(
-            input.prepared_conversation,
-            input.operation.controller.usage(),
-        )?;
-        service.observe_completions(vec![completion.task_id]);
-    }
-    Ok(delivered)
-}
-
-pub(crate) fn append_shell_completion(
-    conversation: &mut orca_core::conversation::Conversation,
-    writer: Option<&mut crate::thread_store::SessionWriter>,
-    content: String,
-) -> io::Result<()> {
-    if let Some(writer) = writer {
-        writer.append_system_delivery_once(&content)?;
-    }
-    if !conversation.messages.iter().any(|message|
-        matches!(message, orca_core::conversation::Message::System { content: text, .. } if text == &content))
-    {
-        conversation.add_system(content);
-    }
-    Ok(())
+    Ok(delivered_children)
 }
 
 fn terminal_service<W: io::Write>(
@@ -657,7 +649,7 @@ fn settle_children_before_return<W: io::Write>(
         }
     }
     input.operation.refresh_child_budgets()?;
-    let delivered_children = deliver_child_results(input)?;
+    let delivered_children = deliver_loop_notices(input, false)?;
     Ok(delivered_children || waited)
 }
 
@@ -799,6 +791,14 @@ fn emit_safe_child_checkpoint(
     usage: orca_core::budget::BudgetUsage,
 ) -> io::Result<()> {
     let (conversation, observer) = prepared_conversation.checkpoint_parts();
+    checkpoint_child(conversation, observer, usage)
+}
+
+fn checkpoint_child(
+    conversation: &Conversation,
+    observer: Option<&dyn crate::child_agent_types::ChildAgentCheckpointSink>,
+    usage: orca_core::budget::BudgetUsage,
+) -> io::Result<()> {
     let Some(observer) = observer else {
         return Ok(());
     };

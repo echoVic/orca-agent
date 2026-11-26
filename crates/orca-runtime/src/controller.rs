@@ -2243,14 +2243,7 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
         Some(thread_extensions.unwrap_or_else(|| session.runtime_extensions(lifecycle.run_id())));
     let turn_extension_id =
         Some(turn_extension_id.unwrap_or_else(|| request.turn_id().as_str().to_string()));
-    drain_terminal_notifications(session, thread_extensions.as_deref())?;
-    if thread_extensions
-        .as_ref()
-        .and_then(|extensions| extensions.get::<crate::agent_controller::AgentThreadPolicy>())
-        .is_none()
-    {
-        drain_subagent_notifications(session);
-    }
+    drain_turn_start_notices(session, thread_extensions.as_deref())?;
     let mut context = ThreadTurnContext::prepare(config, session, request)?;
     // File checkpoints are captured per backtrackable user turn. The capture is
     // registered on the thread extension store because the tool dispatch path
@@ -2358,69 +2351,30 @@ fn finish_rewind_turn(
     }
 }
 
-fn drain_terminal_notifications(
+fn drain_turn_start_notices(
     session: &mut InteractiveSession,
     thread_extensions: Option<&ExtensionData>,
 ) -> io::Result<()> {
-    let Some(service) = thread_extensions.and_then(ExtensionData::get::<TerminalService>) else {
+    // A delegated thread resolves its child-result owner at admission. Its
+    // loop delivers both kinds of notice once that owner is available.
+    if thread_extensions
+        .and_then(ExtensionData::get::<crate::agent_controller::AgentThreadPolicy>)
+        .is_some()
+        || (session.session_id().is_some() && session.writer_mut().is_none())
+    {
         return Ok(());
-    };
-    for completion in service.pending_completions() {
-        let parts = session.runtime_parts();
-        crate::runtime_turn_loop::append_shell_completion(
-            parts.conversation,
-            parts.writer,
-            completion.model_notification(),
-        )?;
-        service.observe_completions(vec![completion.task_id]);
     }
+    let service = thread_extensions.and_then(ExtensionData::get::<TerminalService>);
+    let parts = session.runtime_parts();
+    crate::runtime_turn_loop::deliver_boundary_notices(
+        parts.conversation,
+        parts.writer,
+        parts.task_registry,
+        None,
+        service.as_deref(),
+        |_| Ok(()),
+    )?;
     Ok(())
-}
-
-/// Pushes finished detached children back into the parent conversation.
-///
-/// This runs at a turn boundary, the only point where appending a system
-/// message cannot interleave with an in-flight model request or a tool result.
-///
-/// Delivery is claim-then-acknowledge, not claim-as-delivered: the claim is
-/// written first, the conversation is appended second, and only then is the
-/// result marked delivered. A crash between the steps leaves an unacknowledged
-/// claim that a later turn retries, so the notification is neither lost nor
-/// injected twice for the same result revision.
-fn drain_subagent_notifications(session: &mut InteractiveSession) {
-    if session.session_id().is_some() && session.writer_mut().is_none() {
-        return;
-    }
-    let claimed = session
-        .task_registry()
-        .claim_subagent_results_for_parent(None);
-    for result in claimed {
-        let ack = crate::tasks::DeliveryAck::from(&result);
-        let content = result.model_notification();
-        let already_present = session.conversation().messages.iter().any(|message|
-            matches!(message, Message::System { content: existing, .. } if existing == &content));
-        let appended = match session.writer_mut() {
-            Some(writer) => writer.append_system_delivery_once(&content),
-            None => Ok(!already_present),
-        };
-        match appended {
-            Ok(true) if !already_present => session
-                .conversation_mut()
-                .messages
-                .push(Message::system(content)),
-            Ok(_) => {}
-            Err(_) => {
-                session.task_registry().release_subagent_result_claim(&ack);
-                continue;
-            }
-        }
-        // Acknowledge only after the message is in the conversation and, when a
-        // writer exists, durably recorded.
-        if !session.task_registry().ack_subagent_result(&ack) {
-            // The claim moved under us; the next turn re-claims the result.
-            continue;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2962,12 +2916,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn terminal_completion_is_injected_once_before_the_next_turn() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut config = config(SubagentConfig::default());
-        config.cwd = Some(temp.path().to_path_buf());
-        let mut thread = RuntimeThread::start(&config, "terminal notification").expect("thread");
+    fn queue_shell_completion(thread: &RuntimeThread, config: &RunConfig, cwd: &Path) -> String {
         let extensions = thread.thread_extensions_handle();
         let service = extensions
             .get_or_init(|| TerminalService::new(thread.session().task_registry().clone()));
@@ -2976,10 +2925,10 @@ mod tests {
             .exec(
                 crate::terminal_service::TerminalExecRequest {
                     lifetime: crate::tasks::TaskLifetime::Task,
-                    command: "sleep 0.1; printf notified",
-                    cwd: temp.path(),
+                    command: &command_after_release("release-notice", "notified"),
+                    cwd: cwd,
                     additional_roots: &[],
-                    config: &config,
+                    config,
                     permission_overlay: &overlay,
                     terminal: crate::shell_session::ShellTerminalMode::pipe(),
                     execution_deadline: None,
@@ -2995,35 +2944,128 @@ mod tests {
             )
             .expect("start background terminal");
         assert_eq!(started.status, "running", "{started:?}");
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let status = thread
-                .session()
-                .task_registry()
-                .get(&started.task_id)
-                .map(|record| record.status);
-            if status == Some(orca_core::task_types::TaskStatus::Completed) {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "observed {status:?}");
+        std::fs::write(cwd.join("release-notice"), "").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !service
+            .pending_completions()
+            .iter()
+            .any(|notice| notice.task_id == started.task_id)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command did not finish"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
+        started.task_id
+    }
 
-        drain_terminal_notifications(thread.session_mut(), Some(extensions.as_ref())).unwrap();
+    #[test]
+    fn terminal_completion_is_injected_once_before_the_next_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(temp.path().to_path_buf());
+        let mut thread = RuntimeThread::start(&config, "terminal notification").unwrap();
+        let task_id = queue_shell_completion(&thread, &config, temp.path());
+        let extensions = thread.thread_extensions_handle();
+        drain_turn_start_notices(thread.session_mut(), Some(extensions.as_ref())).unwrap();
         let message_count = thread.session().conversation().messages.len();
         assert!(matches!(
             thread.session().conversation().messages.last(),
             Some(Message::System { content, pinned: false })
                 if content.contains("<task-notification>")
                     && content.contains("notified")
-                    && content.contains(&started.task_id)
+                    && content.contains(&task_id)
         ));
 
-        drain_terminal_notifications(thread.session_mut(), Some(extensions.as_ref())).unwrap();
+        drain_turn_start_notices(thread.session_mut(), Some(extensions.as_ref())).unwrap();
         assert_eq!(
             thread.session().conversation().messages.len(),
             message_count
         );
+    }
+
+    #[test]
+    fn turn_start_does_not_deliver_while_a_tool_call_is_open() {
+        use orca_core::conversation::RawToolCall;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        let mut thread = RuntimeThread::start(&config, "open tool call").unwrap();
+        let id = queue_shell_completion(&thread, &config, cwd.path());
+        let extensions = thread.thread_extensions_handle();
+        let conversation = thread.session_mut().conversation_mut();
+        conversation.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "still-open".into(),
+                function_name: "bash".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        drain_turn_start_notices(thread.session_mut(), Some(extensions.as_ref())).unwrap();
+        assert_eq!(
+            shell_completion_messages(thread.session().conversation()).count(),
+            0
+        );
+        let service = extensions.get::<TerminalService>().unwrap();
+        assert_eq!(service.pending_completions()[0].task_id, id);
+    }
+
+    fn finish_child(registry: &crate::tasks::TaskRegistry) -> String {
+        let child = registry.create_subagent("child notice".into(), None);
+        registry.mark_subagent_result_pending(&child.id);
+        registry.complete(&child.id, "child-result".into()).unwrap();
+        child.id
+    }
+
+    #[test]
+    fn child_results_come_before_shell_completions_at_both_boundaries() {
+        for at_start in [true, false] {
+            let cwd = tempfile::tempdir().unwrap();
+            let mut config = config(SubagentConfig::default());
+            config.cwd = Some(cwd.path().into());
+            config.approval_mode = ApprovalMode::FullAuto;
+            let mut thread = RuntimeThread::start(&config, "notice order").unwrap();
+            let registry = thread.session().task_registry().clone();
+            let shell = if at_start {
+                let shell = queue_shell_completion(&thread, &config, cwd.path());
+                finish_child(&registry);
+                let request = ThreadTurnRequest::new("mock_system_echo");
+                assert_eq!(
+                    thread.run_request(&config, &request, io::sink()).unwrap(),
+                    RunStatus::Success
+                );
+                shell
+            } else {
+                let (result, tasks) = run_turn_with_shell_completions(
+                    &mut thread,
+                    &config,
+                    cwd.path(),
+                    false,
+                    move || {
+                        finish_child(&registry);
+                        Ok(())
+                    },
+                );
+                assert_eq!(result.unwrap(), RunStatus::Success);
+                tasks[0].clone()
+            };
+            let messages = &thread.session().conversation().messages;
+            let notices =
+                shell_completion_messages(thread.session().conversation()).collect::<Vec<_>>();
+            assert_eq!(notices.len(), 2, "{notices:?}");
+            assert!(notices[0].contains("child-result"), "{notices:?}");
+            assert!(notices[1].contains(&shell), "{notices:?}");
+            if at_start {
+                let index = messages.iter().position(|message| matches!(message, Message::System {content, ..} if content == notices[1])).unwrap();
+                assert!(
+                    matches!(&messages[index + 1], Message::User { content, .. } if content == "mock_system_echo")
+                );
+            }
+        }
     }
 
     fn command_after_release(marker: &str, output: &str) -> String {
@@ -3434,8 +3476,8 @@ mod tests {
         assert_eq!(tasks.len(), 2);
 
         let extensions = thread.thread_extensions_handle();
-        drain_terminal_notifications(thread.session_mut(), Some(extensions.as_ref())).unwrap();
-        drain_terminal_notifications(thread.session_mut(), Some(extensions.as_ref())).unwrap();
+        drain_turn_start_notices(thread.session_mut(), Some(extensions.as_ref())).unwrap();
+        drain_turn_start_notices(thread.session_mut(), Some(extensions.as_ref())).unwrap();
         let notices =
             shell_completion_messages(thread.session().conversation()).collect::<Vec<_>>();
         assert_eq!(notices.len(), 2, "{notices:?}");
