@@ -4862,9 +4862,21 @@ impl ThreadActor {
 
         let interaction_command_tx = self.handle.command_tx.clone();
         let interaction_fence = fence.clone();
-        let background_control = Arc::new(RuntimeSurfaceBackgroundControl::for_canonical_input(
+        let mut background_control = RuntimeSurfaceBackgroundControl::for_canonical_input(
             resolved_input.canonical_text.as_str(),
-        ));
+        );
+        // The turn's subagents that this host keeps in its process are
+        // recorded under its main-session task.
+        if self
+            .agent_controller
+            .as_ref()
+            .is_some_and(|controller| controller.keeps_subagents_in_process())
+            && let Some((registry, task_id)) = &main_session_task
+        {
+            background_control = background_control
+                .refused_while_kept_subagents_run(registry.clone(), task_id.clone());
+        }
+        let background_control = Arc::new(background_control);
         let generation_background_control = Arc::clone(&background_control);
         #[cfg(test)]
         let provider_input = resolved_input

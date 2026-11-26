@@ -1146,6 +1146,16 @@ fn cancelled_task_output(
     }
 }
 
+/// Marks, when dropped, that a child whose turn ran on a thread of its own
+/// is done saying how it ended; see `TaskControl::end_reported`.
+struct EndReportedWhenDone(crate::tasks::TaskControl);
+
+impl Drop for EndReportedWhenDone {
+    fn drop(&mut self) {
+        self.0.mark_end_reported();
+    }
+}
+
 fn run_threaded_agent_worker(
     invocation: RuntimeSubagentInvocation,
     _lifecycle: RuntimeSessionLifecycle,
@@ -1174,6 +1184,9 @@ fn run_threaded_agent_worker(
         crate::subagent::SubagentMode::Sync => AgentRunMode::Sync,
         crate::subagent::SubagentMode::Async => AgentRunMode::Async,
     };
+    // Held until this worker is done, whichever way it ends: until then the
+    // child's row may still show it running after its record has ended.
+    let mut _end_reported = None;
     let (surface_activity, permission_handler, registry_task_id, launch_cancel) = if mode
         == AgentRunMode::Sync
         && activity_ingress.is_some()
@@ -1240,6 +1253,7 @@ fn run_threaded_agent_worker(
         // child's thread only once it has started: a person's stop of that
         // row reaches the turn through this token from the start.
         task_control.mark_runs_on_its_own_thread();
+        _end_reported = Some(EndReportedWhenDone(task_control.clone()));
         let task_cancel = task_control.cancel;
         // Parent cancellation remains a separate one-way edge. Stopping this
         // child must never cancel its parent or a sibling.
