@@ -3428,84 +3428,94 @@ mod tests {
 
     #[test]
     fn shell_list_does_not_reap_command_exec_owned_shells() {
-        let cwd = tempdir().expect("tempdir");
-        let mut state = ServerState::default();
-        let handle = state
-            .shells
-            .spawn(
-                cwd.path(),
-                ShellSessionCommand {
-                    command: test_shell_script(
-                        "printf command-owned",
-                        "[Console]::Out.Write('command-owned')",
-                    ),
-                    argv: None,
-                    cwd: cwd.path().to_path_buf(),
-                    additional_readable_directories: Vec::new(),
-                    additional_working_directories: Vec::new(),
-                    denied_working_directories: Vec::new(),
-                    allowed_unix_socket_roots: Vec::new(),
-                    metadata_read_only_paths: Vec::new(),
-                    env: std::collections::BTreeMap::new(),
-                    description: "command exec owned shell".to_string(),
-                    terminal: crate::shell_session::ShellTerminalMode::pipe(),
-                    sandbox: ShellSandboxMode::DangerFullAccess,
-                },
-                None,
+        // A home of its own: every server in a home shares the "server-shell"
+        // task session, and a server opening it marks the running commands
+        // of the others interrupted (one test's server failed another's
+        // command: "cannot mark_running task in Failed state").
+        with_orca_home(|_home| {
+            let cwd = tempdir().expect("tempdir");
+            let mut state = ServerState::default();
+            let handle = state
+                .shells
+                .spawn(
+                    cwd.path(),
+                    ShellSessionCommand {
+                        command: test_shell_script(
+                            "printf command-owned",
+                            "[Console]::Out.Write('command-owned')",
+                        ),
+                        argv: None,
+                        cwd: cwd.path().to_path_buf(),
+                        additional_readable_directories: Vec::new(),
+                        additional_working_directories: Vec::new(),
+                        denied_working_directories: Vec::new(),
+                        allowed_unix_socket_roots: Vec::new(),
+                        metadata_read_only_paths: Vec::new(),
+                        env: std::collections::BTreeMap::new(),
+                        description: "command exec owned shell".to_string(),
+                        terminal: crate::shell_session::ShellTerminalMode::pipe(),
+                        sandbox: ShellSandboxMode::DangerFullAccess,
+                    },
+                    None,
+                )
+                .expect("spawn command exec shell");
+            state
+                .command_exec
+                .insert(
+                    "proc-shell-list".to_string(),
+                    CommandExecProcess {
+                        shell_id: Some(handle.id),
+                        command_event_id: Value::from("cmd-shell-list"),
+                        command: test_command_argv("true"),
+                        cwd: cwd.path().to_path_buf(),
+                        display_cwd: cwd.path().to_path_buf(),
+                        stream_output: false,
+                        output_bytes_cap: None,
+                        output_offset: 0,
+                        stdout_len: 0,
+                        stderr_len: 0,
+                        stdout_cap_reached: false,
+                        stderr_cap_reached: false,
+                        network_permission_blocks: None,
+                        permission_request: None,
+                        _network_proxy: None,
+                    },
+                )
+                .expect("insert command exec process");
+            let mut output = Vec::new();
+            run_shell_list(&mut state, Value::from("shell-list"), &mut output).expect("shell/list");
+            drain_command_exec_processes_with_timeout(
+                &mut state,
+                &mut output,
+                Duration::from_secs(4),
             )
-            .expect("spawn command exec shell");
-        state
-            .command_exec
-            .insert(
-                "proc-shell-list".to_string(),
-                CommandExecProcess {
-                    shell_id: Some(handle.id),
-                    command_event_id: Value::from("cmd-shell-list"),
-                    command: test_command_argv("true"),
-                    cwd: cwd.path().to_path_buf(),
-                    display_cwd: cwd.path().to_path_buf(),
-                    stream_output: false,
-                    output_bytes_cap: None,
-                    output_offset: 0,
-                    stdout_len: 0,
-                    stderr_len: 0,
-                    stdout_cap_reached: false,
-                    stderr_cap_reached: false,
-                    network_permission_blocks: None,
-                    permission_request: None,
-                    _network_proxy: None,
-                },
-            )
-            .expect("insert command exec process");
-        let mut output = Vec::new();
-        run_shell_list(&mut state, Value::from("shell-list"), &mut output).expect("shell/list");
-        drain_command_exec_processes_with_timeout(&mut state, &mut output, Duration::from_secs(4))
             .expect("drain command exec");
-        let events = parse_jsonl(&output);
+            let events = parse_jsonl(&output);
 
-        assert!(
-            events
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["event"] != "shell_completed"),
+                "shell/list should not complete command/exec-owned shells: {events:?}"
+            );
+            let listed = events
                 .iter()
-                .all(|event| event["event"] != "shell_completed"),
-            "shell/list should not complete command/exec-owned shells: {events:?}"
-        );
-        let listed = events
-            .iter()
-            .find(|event| event["event"] == "shell_listed")
-            .expect("shell/list response");
-        assert_eq!(
-            listed["shells"].as_array().expect("shell list").len(),
-            0,
-            "shell/list should hide command/exec-owned shells: {events:?}"
-        );
-        assert!(
-            events.iter().any(|event| {
-                event["event"] == "command_exec_completed"
-                    && event["processId"] == "proc-shell-list"
-                    && event["stdout"] == "command-owned"
-            }),
-            "command/exec owner should still emit completion after shell/list: {events:?}"
-        );
+                .find(|event| event["event"] == "shell_listed")
+                .expect("shell/list response");
+            assert_eq!(
+                listed["shells"].as_array().expect("shell list").len(),
+                0,
+                "shell/list should hide command/exec-owned shells: {events:?}"
+            );
+            assert!(
+                events.iter().any(|event| {
+                    event["event"] == "command_exec_completed"
+                        && event["processId"] == "proc-shell-list"
+                        && event["stdout"] == "command-owned"
+                }),
+                "command/exec owner should still emit completion after shell/list: {events:?}"
+            );
+        });
     }
 
     #[test]
@@ -3701,9 +3711,11 @@ extends = "parent"
         if host_refuses_restricted_shells() {
             return;
         }
-        let mut config = test_run_config();
-        let file_config: orca_core::config::file::FileConfig = toml::from_str(
-            r#"
+        // A home of its own (see shell_list_does_not_reap_command_exec_owned_shells).
+        with_orca_home(|_home| {
+            let mut config = test_run_config();
+            let file_config: orca_core::config::file::FileConfig = toml::from_str(
+                r#"
 [permission_profiles.limited-network]
 extends = ":workspace"
 
@@ -3713,33 +3725,34 @@ enabled = true
 [permission_profiles.limited-network.network.domains]
 "blocked.orca.invalid" = "deny"
 "#,
-        )
-        .expect("domain policy config");
-        config.permission_profiles = file_config.permission_profiles;
-        let cwd = tempdir().expect("cwd");
-        config.cwd = Some(cwd.path().to_path_buf());
-        let input = Cursor::new(
-            test_command_exec_request(
-                "cmd-deny",
-                "curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true",
-                json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
             )
-            .into_bytes(),
-        );
-        let output = SharedVecWriter::default();
+            .expect("domain policy config");
+            config.permission_profiles = file_config.permission_profiles;
+            let cwd = tempdir().expect("cwd");
+            config.cwd = Some(cwd.path().to_path_buf());
+            let input = Cursor::new(
+                test_command_exec_request(
+                    "cmd-deny",
+                    "curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true",
+                    json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
+                )
+                .into_bytes(),
+            );
+            let output = SharedVecWriter::default();
 
-        run_with_io(ServerConfig { run_config: config }, input, output.clone())
-            .expect("server run");
+            run_with_io(ServerConfig { run_config: config }, input, output.clone())
+                .expect("server run");
 
-        let events = parse_jsonl(&output.bytes());
-        let error = events
-            .iter()
-            .find(|event| event["event"] == "error")
-            .expect("policy denial error");
-        assert_eq!(
-            error["message"],
-            "command/exec network access to blocked.orca.invalid was denied by configured network policy"
-        );
+            let events = parse_jsonl(&output.bytes());
+            let error = events
+                .iter()
+                .find(|event| event["event"] == "error")
+                .expect("policy denial error");
+            assert_eq!(
+                error["message"],
+                "command/exec network access to blocked.orca.invalid was denied by configured network policy"
+            );
+        });
     }
 
     #[cfg(not(windows))]
@@ -3748,9 +3761,11 @@ enabled = true
         if host_refuses_restricted_shells() {
             return;
         }
-        let mut config = test_run_config();
-        let file_config: orca_core::config::file::FileConfig = toml::from_str(
-            r#"
+        // A home of its own (see shell_list_does_not_reap_command_exec_owned_shells).
+        with_orca_home(|_home| {
+            let mut config = test_run_config();
+            let file_config: orca_core::config::file::FileConfig = toml::from_str(
+                r#"
 [permission_profiles.limited-network]
 extends = ":workspace"
 
@@ -3760,39 +3775,40 @@ enabled = true
 [permission_profiles.limited-network.network.domains]
 "api.orca.invalid" = "allow"
 "#,
-        )
-        .expect("domain policy config");
-        config.permission_profiles = file_config.permission_profiles;
-        let cwd = tempdir().expect("cwd");
-        config.cwd = Some(cwd.path().to_path_buf());
-        let input = Cursor::new(
-            test_command_exec_request(
-                "cmd-allowlist",
-                "curl --noproxy '' -sS -D - -o /dev/null http://other.orca.invalid/ || true",
-                json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
             )
-            .into_bytes(),
-        );
-        let output = SharedVecWriter::default();
+            .expect("domain policy config");
+            config.permission_profiles = file_config.permission_profiles;
+            let cwd = tempdir().expect("cwd");
+            config.cwd = Some(cwd.path().to_path_buf());
+            let input = Cursor::new(
+                test_command_exec_request(
+                    "cmd-allowlist",
+                    "curl --noproxy '' -sS -D - -o /dev/null http://other.orca.invalid/ || true",
+                    json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
+                )
+                .into_bytes(),
+            );
+            let output = SharedVecWriter::default();
 
-        run_with_io(ServerConfig { run_config: config }, input, output.clone())
-            .expect("server run");
+            run_with_io(ServerConfig { run_config: config }, input, output.clone())
+                .expect("server run");
 
-        let events = parse_jsonl(&output.bytes());
-        let completed = events
-            .iter()
-            .find(|event| event["event"] == "command_exec_completed")
-            .expect("command completed");
-        let stdout = completed["stdout"].as_str().expect("stdout");
-        assert!(
-            stdout.contains("x-proxy-error: blocked-by-allowlist"),
-            "stdout should include structured proxy block reason: {completed:?}"
-        );
-        assert!(
-            stdout.contains("x-proxy-host: other.orca.invalid"),
-            "stdout should include blocked host for permission attribution: {completed:?}"
-        );
-        assert_eq!(completed["exitCode"], 0);
+            let events = parse_jsonl(&output.bytes());
+            let completed = events
+                .iter()
+                .find(|event| event["event"] == "command_exec_completed")
+                .expect("command completed");
+            let stdout = completed["stdout"].as_str().expect("stdout");
+            assert!(
+                stdout.contains("x-proxy-error: blocked-by-allowlist"),
+                "stdout should include structured proxy block reason: {completed:?}"
+            );
+            assert!(
+                stdout.contains("x-proxy-host: other.orca.invalid"),
+                "stdout should include blocked host for permission attribution: {completed:?}"
+            );
+            assert_eq!(completed["exitCode"], 0);
+        });
     }
 
     #[cfg(not(windows))]
@@ -4820,25 +4836,27 @@ enabled = true
         if host_refuses_restricted_shells() {
             return;
         }
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
-        let port = listener.local_addr().expect("server addr").port();
-        let server = std::thread::spawn(move || {
-            let mut stream = accept_within(&listener, ACCEPT_TIMEOUT);
-            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
-            let mut line = String::new();
-            while reader.read_line(&mut line).expect("read request") != 0 {
-                if line == "\r\n" || line == "\n" {
-                    break;
+        // A home of its own (see shell_list_does_not_reap_command_exec_owned_shells).
+        with_orca_home(|_home| {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+            let port = listener.local_addr().expect("server addr").port();
+            let server = std::thread::spawn(move || {
+                let mut stream = accept_within(&listener, ACCEPT_TIMEOUT);
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).expect("read request") != 0 {
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    line.clear();
                 }
-                line.clear();
-            }
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\nallowed")
-                .expect("write response");
-        });
-        let mut config = test_run_config();
-        let file_config: orca_core::config::file::FileConfig = toml::from_str(
-            r#"
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\nallowed")
+                    .expect("write response");
+            });
+            let mut config = test_run_config();
+            let file_config: orca_core::config::file::FileConfig = toml::from_str(
+                r#"
 [permission_profiles.limited-network]
 extends = ":workspace"
 
@@ -4848,34 +4866,35 @@ enabled = true
 [permission_profiles.limited-network.network.domains]
 "127.0.0.1" = "allow"
 "#,
-        )
-        .expect("domain policy config");
-        config.permission_profiles = file_config.permission_profiles;
-        let cwd = tempdir().expect("cwd");
-        config.cwd = Some(cwd.path().to_path_buf());
-        let request = test_command_exec_request(
-            "cmd-allow",
-            &format!("curl --noproxy '' -sS http://127.0.0.1:{port}/"),
-            // The timeout is a liveness guard, not the behavior under test:
-            // under full-suite parallelism the in-process policy proxy can
-            // legitimately take longer than a few seconds to serve curl, and
-            // a 5s kill removes the completed event these tests assert.
-            json!({"permissionProfile": "limited-network", "timeoutMs": 60000}),
-        );
-        let input = Cursor::new(request.into_bytes());
-        let output = SharedVecWriter::default();
+            )
+            .expect("domain policy config");
+            config.permission_profiles = file_config.permission_profiles;
+            let cwd = tempdir().expect("cwd");
+            config.cwd = Some(cwd.path().to_path_buf());
+            let request = test_command_exec_request(
+                "cmd-allow",
+                &format!("curl --noproxy '' -sS http://127.0.0.1:{port}/"),
+                // The timeout is a liveness guard, not the behavior under test:
+                // under full-suite parallelism the in-process policy proxy can
+                // legitimately take longer than a few seconds to serve curl, and
+                // a 5s kill removes the completed event these tests assert.
+                json!({"permissionProfile": "limited-network", "timeoutMs": 60000}),
+            );
+            let input = Cursor::new(request.into_bytes());
+            let output = SharedVecWriter::default();
 
-        run_with_io(ServerConfig { run_config: config }, input, output.clone())
-            .expect("server run");
+            run_with_io(ServerConfig { run_config: config }, input, output.clone())
+                .expect("server run");
 
-        server.join().expect("server joined");
-        let events = parse_jsonl(&output.bytes());
-        let completed = events
-            .iter()
-            .find(|event| event["event"] == "command_exec_completed")
-            .expect("command completed");
-        assert_eq!(completed["stdout"], "allowed");
-        assert_eq!(completed["exitCode"], 0);
+            server.join().expect("server joined");
+            let events = parse_jsonl(&output.bytes());
+            let completed = events
+                .iter()
+                .find(|event| event["event"] == "command_exec_completed")
+                .expect("command completed");
+            assert_eq!(completed["stdout"], "allowed");
+            assert_eq!(completed["exitCode"], 0);
+        });
     }
 
     #[cfg(not(windows))]
@@ -4884,11 +4903,13 @@ enabled = true
         if host_refuses_restricted_shells() {
             return;
         }
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
-        let port = listener.local_addr().expect("server addr").port();
-        let mut config = test_run_config();
-        let file_config: orca_core::config::file::FileConfig = toml::from_str(
-            r#"
+        // A home of its own (see shell_list_does_not_reap_command_exec_owned_shells).
+        with_orca_home(|_home| {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+            let port = listener.local_addr().expect("server addr").port();
+            let mut config = test_run_config();
+            let file_config: orca_core::config::file::FileConfig = toml::from_str(
+                r#"
 [permission_profiles.limited-network]
 extends = ":workspace"
 
@@ -4898,38 +4919,41 @@ enabled = true
 [permission_profiles.limited-network.network.domains]
 "blocked.orca.invalid" = "deny"
 "#,
-        )
-        .expect("domain policy config");
-        config.permission_profiles = file_config.permission_profiles;
-        let cwd = tempdir().expect("cwd");
-        config.cwd = Some(cwd.path().to_path_buf());
-        let request = test_command_exec_request(
-            "cmd-local-deny",
-            &format!("curl --noproxy '' -sS -D - -o /dev/null http://127.0.0.1:{port}/ || true"),
-            // Liveness guard only (see the allow test above): the asserted
-            // behavior is the policy block header, not the timeout.
-            json!({"permissionProfile": "limited-network", "timeoutMs": 60000}),
-        );
-        let input = Cursor::new(request.into_bytes());
-        let output = SharedVecWriter::default();
+            )
+            .expect("domain policy config");
+            config.permission_profiles = file_config.permission_profiles;
+            let cwd = tempdir().expect("cwd");
+            config.cwd = Some(cwd.path().to_path_buf());
+            let request = test_command_exec_request(
+                "cmd-local-deny",
+                &format!(
+                    "curl --noproxy '' -sS -D - -o /dev/null http://127.0.0.1:{port}/ || true"
+                ),
+                // Liveness guard only (see the allow test above): the asserted
+                // behavior is the policy block header, not the timeout.
+                json!({"permissionProfile": "limited-network", "timeoutMs": 60000}),
+            );
+            let input = Cursor::new(request.into_bytes());
+            let output = SharedVecWriter::default();
 
-        run_with_io(ServerConfig { run_config: config }, input, output.clone())
-            .expect("server run");
+            run_with_io(ServerConfig { run_config: config }, input, output.clone())
+                .expect("server run");
 
-        drop(listener);
-        let events = parse_jsonl(&output.bytes());
-        let completed = events
-            .iter()
-            .find(|event| event["event"] == "command_exec_completed")
-            .expect("command completed");
-        assert!(
-            completed["stdout"]
-                .as_str()
-                .expect("stdout")
-                .contains("x-proxy-error: blocked-by-policy"),
-            "stdout should include local-network policy block: {completed:?}"
-        );
-        assert_eq!(completed["exitCode"], 0);
+            drop(listener);
+            let events = parse_jsonl(&output.bytes());
+            let completed = events
+                .iter()
+                .find(|event| event["event"] == "command_exec_completed")
+                .expect("command completed");
+            assert!(
+                completed["stdout"]
+                    .as_str()
+                    .expect("stdout")
+                    .contains("x-proxy-error: blocked-by-policy"),
+                "stdout should include local-network policy block: {completed:?}"
+            );
+            assert_eq!(completed["exitCode"], 0);
+        });
     }
 
     #[cfg(not(windows))]
@@ -4938,9 +4962,11 @@ enabled = true
         if host_refuses_restricted_shells() {
             return;
         }
-        let mut config = test_run_config();
-        let file_config: orca_core::config::file::FileConfig = toml::from_str(
-            r#"
+        // A home of its own (see shell_list_does_not_reap_command_exec_owned_shells).
+        with_orca_home(|_home| {
+            let mut config = test_run_config();
+            let file_config: orca_core::config::file::FileConfig = toml::from_str(
+                r#"
 [permission_profiles.limited-network]
 extends = ":workspace"
 
@@ -4950,37 +4976,38 @@ enabled = true
 [permission_profiles.limited-network.network.domains]
 "blocked.orca.invalid" = "deny"
 "#,
-        )
-        .expect("domain policy config");
-        config.permission_profiles = file_config.permission_profiles;
-        let cwd = tempdir().expect("cwd");
-        config.cwd = Some(cwd.path().to_path_buf());
-        let request = test_command_exec_request(
-            "cmd-localhost-deny",
-            "curl --noproxy '' -sS -D - -o /dev/null http://localhost/ || true",
-            // Liveness guard only (see the allow test above): the asserted
-            // behavior is the resolved-localhost policy block, not the timeout.
-            json!({"permissionProfile": "limited-network", "timeoutMs": 60000}),
-        );
-        let input = Cursor::new(request.into_bytes());
-        let output = SharedVecWriter::default();
+            )
+            .expect("domain policy config");
+            config.permission_profiles = file_config.permission_profiles;
+            let cwd = tempdir().expect("cwd");
+            config.cwd = Some(cwd.path().to_path_buf());
+            let request = test_command_exec_request(
+                "cmd-localhost-deny",
+                "curl --noproxy '' -sS -D - -o /dev/null http://localhost/ || true",
+                // Liveness guard only (see the allow test above): the asserted
+                // behavior is the resolved-localhost policy block, not the timeout.
+                json!({"permissionProfile": "limited-network", "timeoutMs": 60000}),
+            );
+            let input = Cursor::new(request.into_bytes());
+            let output = SharedVecWriter::default();
 
-        run_with_io(ServerConfig { run_config: config }, input, output.clone())
-            .expect("server run");
+            run_with_io(ServerConfig { run_config: config }, input, output.clone())
+                .expect("server run");
 
-        let events = parse_jsonl(&output.bytes());
-        let completed = events
-            .iter()
-            .find(|event| event["event"] == "command_exec_completed")
-            .expect("command completed");
-        assert!(
-            completed["stdout"]
-                .as_str()
-                .expect("stdout")
-                .contains("x-proxy-error: blocked-by-policy"),
-            "stdout should include resolved localhost policy block: {completed:?}"
-        );
-        assert_eq!(completed["exitCode"], 0);
+            let events = parse_jsonl(&output.bytes());
+            let completed = events
+                .iter()
+                .find(|event| event["event"] == "command_exec_completed")
+                .expect("command completed");
+            assert!(
+                completed["stdout"]
+                    .as_str()
+                    .expect("stdout")
+                    .contains("x-proxy-error: blocked-by-policy"),
+                "stdout should include resolved localhost policy block: {completed:?}"
+            );
+            assert_eq!(completed["exitCode"], 0);
+        });
     }
 
     #[cfg(windows)]
