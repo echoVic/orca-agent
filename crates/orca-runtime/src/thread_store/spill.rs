@@ -23,40 +23,65 @@ pub(crate) fn carry_into_fork(
     messages: &mut [orca_core::conversation::Message],
 ) {
     use orca_core::conversation::Message;
-    use orca_core::tool_types::{
-        parse_tool_output_spill_notice, tool_output_spill_notice, trailing_tool_output_spill_notice,
-    };
     let (Some(parent), Some(fork)) = (directory(parent_id), directory(fork_id)) else {
         return;
     };
     for message in messages {
-        let Message::Tool { content, .. } = message else {
-            continue;
-        };
-        let Some(notice) = trailing_tool_output_spill_notice(content) else {
-            continue;
-        };
-        let Some((omitted, file)) = parse_tool_output_spill_notice(notice) else {
-            continue;
-        };
-        let Some(name) = file
-            .file_name()
-            .filter(|_| file.parent() == Some(parent.as_path()))
+        let Message::Tool {
+            tool_call_id,
+            content,
+            terminal: Some(terminal),
+            ..
+        } = message
         else {
             continue;
         };
-        let target = fork.join(name);
-        let replacement = match copy_spill_file(file, &target) {
-            Ok(()) => tool_output_spill_notice(omitted, &target.display().to_string()),
+        let Some(spill) = terminal.spill.take() else {
+            continue;
+        };
+        if !spill.belongs_to(&parent, tool_call_id) {
+            *content = spill.unavailable(
+                spill.preview(content),
+                "The full result could not be copied into this session.",
+            );
+            continue;
+        }
+        let inherited = spill.in_directory(fork.clone());
+        let preview = spill.preview(content);
+        match copy_spill_file(&spill.path(), &inherited.path()) {
+            Ok(()) => {
+                *content = inherited.render(preview);
+                terminal.spill = Some(Box::new(inherited));
+            }
             Err(error) => {
                 tracing::warn!(%error, "could not copy a saved tool result into the fork");
-                format!(
-                    "[{omitted} bytes omitted. The full result could not be copied into this session.]"
-                )
+                *content = spill.unavailable(
+                    preview,
+                    "The full result could not be copied into this session.",
+                );
             }
-        };
-        content.truncate(content.len() - notice.len());
-        content.push_str(&replacement);
+        }
+    }
+}
+
+pub(super) fn omit_from_export(record: &mut super::types::SessionRecord) {
+    use super::types::{SessionRecord, StoredMessage};
+    fn omit(message: &mut StoredMessage) {
+        if let StoredMessage::Tool {
+            content, terminal, ..
+        } = message
+            && let Some(spill) = terminal.take_spill()
+        {
+            *content =
+                spill.unavailable(spill.preview(content), "The full result was not exported.");
+        }
+    }
+    match record {
+        SessionRecord::Message { message, .. } => omit(message),
+        SessionRecord::ManualCompactionSnapshot(snapshot) => {
+            snapshot.messages.iter_mut().for_each(omit)
+        }
+        _ => {}
     }
 }
 

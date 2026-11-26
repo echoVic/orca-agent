@@ -1313,9 +1313,11 @@ mod tests {
                 target: None,
                 raw_arguments: None,
             };
-            let notice =
-                orca_core::tool_types::tool_output_spill_notice(42, &file.display().to_string());
-            let result = ToolResult::completed(&request, format!("head\n\ntail\n\n{notice}"), true);
+            let mut result = ToolResult::completed(&request, "head\n\ntail".into(), true);
+            result.set_spill(
+                orca_core::tool_types::ToolOutputSpill::new(parent_dir, request.id.clone(), 42)
+                    .unwrap(),
+            );
             super::record_tool_result_for_agent(
                 &mut Conversation::new(),
                 Some(&mut parent),
@@ -1324,6 +1326,12 @@ mod tests {
             )
             .unwrap();
             drop(parent);
+            let store = crate::thread_store::JsonlThreadStore::new();
+            let exported = home.join("portable-spill.jsonl");
+            store.export_session(&parent_id, &exported).unwrap();
+            let portable = std::fs::read_to_string(&exported).unwrap();
+            assert!(!portable.contains(serde_json::to_string(&file).unwrap().trim_matches('"')));
+            assert!(portable.contains("The full result was not exported."));
             let fork = InteractiveSession::new_with_preloaded(
                 &config(cwd.path().to_owned(), HistoryMode::Fork(parent_id.clone())),
                 "fork",

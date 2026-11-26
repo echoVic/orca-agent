@@ -211,12 +211,12 @@ pub fn retain_sessions(
                 continue;
             }
             let spill = super::spill::directory_for_transcript(&candidate.path);
+            assets::remove_directory(&candidate.path)
+                .map_err(|error| retention_error(&report, &candidate.path, false, error))?;
+            super::spill::remove(spill.as_deref())
+                .map_err(|error| retention_error(&report, &candidate.path, false, error))?;
             fs::remove_file(&candidate.path)
                 .map_err(|error| retention_error(&report, &candidate.path, false, error))?;
-            assets::remove_directory(&candidate.path)
-                .map_err(|error| retention_error(&report, &candidate.path, true, error))?;
-            super::spill::remove(spill.as_deref())
-                .map_err(|error| retention_error(&report, &candidate.path, true, error))?;
             let _ = session_index::remove_path(&candidate.path);
             report.bytes_after = report.bytes_after.saturating_sub(candidate.bytes);
             report.deleted.push(candidate.path.clone());

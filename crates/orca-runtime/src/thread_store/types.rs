@@ -15,7 +15,8 @@ use orca_core::plan_types::PlanItem;
 use orca_core::thread_identity::{ConversationItemId, TurnId};
 use orca_core::thread_item_projection::{CompletedModelItem, CompletedModelResponse};
 use orca_core::tool_types::{
-    ToolInvocationStarted, ToolResultKind, ToolStatus, ToolTerminal, ToolTerminalSource,
+    ToolInvocationStarted, ToolOutputSpill, ToolResultKind, ToolStatus, ToolTerminal,
+    ToolTerminalSource,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -561,6 +562,10 @@ impl StoredToolTerminal {
         self.terminal.as_ref()
     }
 
+    pub(crate) fn take_spill(&mut self) -> Option<Box<ToolOutputSpill>> {
+        self.terminal.as_mut()?.spill.take()
+    }
+
     pub(crate) fn error_mut(&mut self) -> Option<&mut String> {
         self.terminal.as_mut()?.error.as_mut()
     }
@@ -582,6 +587,8 @@ struct StoredToolTerminalWire {
     terminal_source: Option<ToolTerminalSource>,
     #[serde(default)]
     invocation_started: Option<ToolInvocationStarted>,
+    #[serde(default)]
+    spill: Option<Box<ToolOutputSpill>>,
 }
 
 impl StoredToolTerminalWire {
@@ -596,11 +603,15 @@ impl StoredToolTerminalWire {
                 self.terminal_source.unwrap_or_default(),
                 self.invocation_started.unwrap_or_default(),
             )
-            .map(Some);
+            .map(|mut terminal| {
+                terminal.spill = self.spill;
+                Some(terminal)
+            });
         }
         if self.kind.is_some()
             || self.terminal_source.is_some()
             || self.invocation_started.is_some()
+            || self.spill.is_some()
         {
             return Err(
                 "stored tool terminal kind/source/start metadata requires status".to_string(),
@@ -631,6 +642,7 @@ pub(crate) fn validate_stored_tool_terminal_fields(message: &Value) -> Option<Re
         "kind",
         "terminal_source",
         "invocation_started",
+        "spill",
     ];
     let object = message.as_object()?;
     if !fields.iter().any(|field| object.contains_key(*field)) {
@@ -663,6 +675,9 @@ impl Serialize for StoredToolTerminal {
                 map.serialize_entry("truncated", &true)?;
             }
             map.serialize_entry("kind", &terminal.kind)?;
+            if let Some(spill) = &terminal.spill {
+                map.serialize_entry("spill", spill)?;
+            }
             if terminal.source != ToolTerminalSource::Observed {
                 map.serialize_entry("terminal_source", &terminal.source)?;
             }

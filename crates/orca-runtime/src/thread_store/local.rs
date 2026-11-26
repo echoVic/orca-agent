@@ -303,7 +303,9 @@ impl JsonlThreadStore {
             orca_platform::fs::AtomicWritePolicy::NoFollow,
             |output| {
                 for record in iter_records(&path, HydrateImages::All)? {
-                    super::writer::write_record_line(&mut *output, &record?)?;
+                    let mut record = record?;
+                    super::spill::omit_from_export(&mut record);
+                    super::writer::write_record_line(&mut *output, &record)?;
                 }
                 Ok(())
             },
@@ -327,9 +329,9 @@ pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
     let _owner = super::retention::acquire_idle_owner(&path)?;
     let _lock = acquire_file_lock(&path)?;
     let spill = super::spill::directory_for_transcript(&path);
-    fs::remove_file(&path)?;
     assets::remove_directory(&path)?;
     super::spill::remove(spill.as_deref())?;
+    fs::remove_file(&path)?;
     #[cfg(not(test))]
     let _ = session_index::remove_path(&path);
     Ok(path)

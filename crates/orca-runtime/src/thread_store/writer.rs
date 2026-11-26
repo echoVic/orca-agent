@@ -1632,7 +1632,14 @@ fn redact_stored_message(message: &mut StoredMessage) {
         StoredMessage::Tool {
             content, terminal, ..
         } => {
-            redact_string_in_place(content);
+            if let Some(spill) = terminal
+                .terminal_ref()
+                .and_then(|terminal| terminal.spill.as_deref())
+            {
+                *content = spill.render(&redact_sensitive_text(spill.preview(content)));
+            } else {
+                redact_string_in_place(content);
+            }
             if let Some(error) = terminal.error_mut() {
                 redact_string_in_place(error);
             }

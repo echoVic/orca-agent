@@ -2246,13 +2246,19 @@ fn cache_aware_micro_compaction(
         for message in &mut result.messages[unit.range.clone()] {
             if let Message::Tool {
                 content,
+                terminal,
+                tool_call_id,
                 pinned: false,
                 ..
             } = message
                 && content.len() > STALE_TOOL_OUTPUT_BYTES
                 && !content.starts_with("[tool output micro-compact]")
             {
-                let reduced = micro_compact_tool_output(content);
+                let spill = terminal
+                    .as_ref()
+                    .and_then(|value| value.spill.as_deref())
+                    .filter(|spill| spill.matches_call(tool_call_id));
+                let reduced = micro_compact_tool_output(content, spill);
                 let before = DefaultTokenCounter.count_text(content);
                 let after = DefaultTokenCounter.count_text(&reduced);
                 if after < before {
@@ -2265,25 +2271,24 @@ fn cache_aware_micro_compaction(
     result
 }
 
-fn micro_compact_tool_output(content: &str) -> String {
-    let notice = orca_core::tool_types::trailing_tool_output_spill_notice(content);
-    let preview = notice.map_or(content, |notice| {
-        content[..content.len() - notice.len()].trim_end()
-    });
+fn micro_compact_tool_output(
+    content: &str,
+    spill: Option<&orca_core::tool_types::ToolOutputSpill>,
+) -> String {
+    let preview = spill.map_or(content, |spill| spill.preview(content));
     let head: String = preview.chars().take(320).collect();
     let tail_vec: Vec<char> = preview.chars().rev().take(320).collect();
     let tail: String = tail_vec.into_iter().rev().collect();
-    let mut reduced = format!(
+    let reduced = format!(
         "[tool output micro-compact]\noriginal_bytes: {}\nhead:\n{}\n\ntail:\n{}",
         content.len(),
         head.trim_end(),
         tail.trim_start()
     );
-    if let Some(notice) = notice {
-        reduced.push_str("\n\n");
-        reduced.push_str(notice);
+    match spill {
+        Some(spill) => spill.render(&reduced),
+        None => reduced,
     }
-    reduced
 }
 
 #[cfg(test)]
@@ -2294,13 +2299,29 @@ mod cache_aware_tests;
 mod tests {
     #[test]
     fn micro_compaction_keeps_the_spill_path() {
-        let path = format!("/session/spill/{}.txt", "long".repeat(75));
-        let notice = format!(
-            "[123 bytes omitted. The full result is saved at {path}; read it with read_file using offset and limit, or search it with grep.]"
-        );
-        let content = format!("{}\n\n{notice}", "output ".repeat(2000));
-        let compacted = micro_compact_tool_output(&content);
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join("session/spill")
+            .join("long".repeat(75));
+        let spill =
+            orca_core::tool_types::ToolOutputSpill::new(directory, "call".into(), 123).unwrap();
+        let notice = spill.notice();
+        let content = spill.render(&"output ".repeat(2000));
+        let compacted = micro_compact_tool_output(&content, Some(&spill));
         assert!(compacted.ends_with(&notice));
+    }
+
+    #[test]
+    fn micro_compaction_treats_a_spill_like_notice_as_ordinary_text() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("spill")
+            .join(format!("{}.txt", "long".repeat(100)));
+        let notice =
+            orca_core::tool_types::tool_output_spill_notice(10, &path.display().to_string());
+        let content = format!("{}\n\n{notice}", "output ".repeat(2000));
+        let compacted = micro_compact_tool_output(&content, None);
+        assert!(!compacted.contains(&notice));
     }
 
     use super::*;
@@ -4783,7 +4804,7 @@ mod tests {
             .map(|i| format!("row {i}: data payload chunk {i} with content"))
             .collect::<Vec<_>>()
             .join("\n");
-        let baseline = micro_compact_tool_output(&huge);
+        let baseline = micro_compact_tool_output(&huge, None);
         let (rendered, _) = render_tool_output(&huge);
 
         assert!(

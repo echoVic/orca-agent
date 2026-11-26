@@ -246,6 +246,28 @@ fn spill_files_are_removed_with_their_session() {
 }
 
 #[test]
+fn spill_deletion_can_be_retried_after_image_cleanup_fails() {
+    crate::history::with_redirected_orca_home("spill-delete-retry", |home| {
+        let writer = SessionWriter::start(home, "mock", None, "spill").unwrap();
+        let id = writer.session_id().unwrap();
+        let transcript = writer.path().to_owned();
+        let blocked = assets::directory(&transcript);
+        fs::write(&blocked, "not an image directory").unwrap();
+        let spill = super::spill::directory(&id).unwrap();
+        fs::create_dir_all(&spill).unwrap();
+        fs::write(spill.join("call.txt"), "saved result").unwrap();
+        drop(writer);
+        let store = JsonlThreadStore::new();
+        assert!(store.delete_session(&id).is_err());
+        assert!(transcript.exists());
+        fs::remove_file(blocked).unwrap();
+        store.delete_session(&id).unwrap();
+        assert!(!spill.exists());
+        assert!(!transcript.exists());
+    });
+}
+
+#[test]
 fn assets_survive_fork_rename_archive_compress_and_portable_export() {
     crate::history::with_redirected_orca_home("asset-lifecycle", |home| {
         let store = JsonlThreadStore::new();

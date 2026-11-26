@@ -15,19 +15,76 @@ pub fn tool_output_spill_notice(omitted: usize, path: &str) -> String {
     format!("[{omitted}{SPILL_NOTICE_PREFIX}{path}{SPILL_NOTICE_SUFFIX}")
 }
 
-pub fn trailing_tool_output_spill_notice(text: &str) -> Option<&str> {
-    let (_, notice) = text.rsplit_once("\n\n")?;
-    parse_tool_output_spill_notice(notice).map(|_| notice)
+/// A saved result belongs to one session directory and one invocation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolOutputSpill {
+    directory: PathBuf,
+    tool_call_id: String,
+    omitted_bytes: usize,
 }
 
-pub fn parse_tool_output_spill_notice(notice: &str) -> Option<(usize, &std::path::Path)> {
-    let (omitted, path) = notice
-        .strip_prefix('[')?
-        .strip_suffix(SPILL_NOTICE_SUFFIX)?
-        .split_once(SPILL_NOTICE_PREFIX)?;
-    let omitted = omitted.parse().ok()?;
-    let path = std::path::Path::new(path);
-    path.is_absolute().then_some((omitted, path))
+impl ToolOutputSpill {
+    pub fn new(directory: PathBuf, tool_call_id: String, omitted_bytes: usize) -> Option<Self> {
+        directory.is_absolute().then_some(Self {
+            directory,
+            tool_call_id,
+            omitted_bytes,
+        })
+    }
+
+    pub fn belongs_to(&self, directory: &std::path::Path, tool_call_id: &str) -> bool {
+        self.directory == directory && self.tool_call_id == tool_call_id
+    }
+
+    pub fn matches_call(&self, tool_call_id: &str) -> bool {
+        self.tool_call_id == tool_call_id
+    }
+
+    pub fn path(&self) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let id = &self.tool_call_id;
+        let name = if !id.is_empty()
+            && id.len() <= 120
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            && orca_platform::fs::PathIdentity::windows(&format!("C:\\{id}.txt")).is_ok()
+        {
+            id.clone()
+        } else {
+            crate::hex::lower(&Sha256::digest(id.as_bytes()))
+        };
+        self.directory.join(format!("{name}.txt"))
+    }
+
+    pub fn notice(&self) -> String {
+        tool_output_spill_notice(self.omitted_bytes, &self.path().display().to_string())
+    }
+
+    /// Remove only the exact notice rendered from this structured reference.
+    pub fn preview<'a>(&self, content: &'a str) -> &'a str {
+        content
+            .strip_suffix(&format!("\n\n{}", self.notice()))
+            .unwrap_or(content)
+    }
+
+    pub fn render(&self, preview: &str) -> String {
+        format!("{preview}\n\n{}", self.notice())
+    }
+
+    pub fn unavailable(&self, preview: &str, reason: &str) -> String {
+        format!(
+            "{preview}\n\n[{} bytes omitted. {reason}]",
+            self.omitted_bytes
+        )
+    }
+
+    pub fn in_directory(&self, directory: PathBuf) -> Self {
+        Self {
+            directory,
+            ..self.clone()
+        }
+    }
 }
 
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
@@ -701,6 +758,8 @@ pub struct ToolTerminal {
         skip_serializing_if = "ToolInvocationStarted::is_unknown"
     )]
     pub started: ToolInvocationStarted,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spill: Option<Box<ToolOutputSpill>>,
 }
 
 impl ToolTerminal {
@@ -728,6 +787,7 @@ impl ToolTerminal {
             kind,
             source,
             started,
+            spill: None,
         })
     }
 
@@ -765,6 +825,8 @@ struct ToolTerminalWire {
     source: ToolTerminalSource,
     #[serde(default, rename = "invocation_started")]
     started: ToolInvocationStarted,
+    #[serde(default)]
+    spill: Option<Box<ToolOutputSpill>>,
 }
 
 impl<'de> Deserialize<'de> for ToolTerminal {
@@ -782,6 +844,10 @@ impl<'de> Deserialize<'de> for ToolTerminal {
             wire.source,
             wire.started,
         )
+        .map(|mut terminal| {
+            terminal.spill = wire.spill;
+            terminal
+        })
         .map_err(serde::de::Error::custom)
     }
 }
@@ -882,6 +948,12 @@ impl ToolResult {
 
     pub fn set_truncated(&mut self, truncated: bool) {
         self.terminal.truncated = truncated;
+    }
+
+    pub fn set_spill(&mut self, spill: ToolOutputSpill) {
+        debug_assert!(spill.matches_call(&self.id));
+        self.terminal.spill = Some(Box::new(spill));
+        self.set_truncated(true);
     }
 
     /// A tool call that started work which is still running.
@@ -1535,6 +1607,7 @@ mod tests {
             kind: ToolResultKind::Indeterminate,
             source: ToolTerminalSource::CompatibilityRepair,
             started: ToolInvocationStarted::Unknown,
+            spill: None,
         };
 
         let value = serde_json::to_value(terminal).unwrap();
@@ -1569,6 +1642,7 @@ mod tests {
                 kind: ToolResultKind::Cancelled,
                 source: ToolTerminalSource::Observed,
                 started: ToolInvocationStarted::Yes,
+                spill: None,
             }
         );
 
