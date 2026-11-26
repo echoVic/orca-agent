@@ -10492,7 +10492,11 @@ fn actor_provider_background_control_authorized(
         && background.task_id.as_ref() == Some(task_id)
         && task.task_type == super::SurfaceTaskType::MainSession
         && task.parent_operation.as_ref() == Some(operation_id)
-        && (task.background_fence.as_ref() == Some(background_fence) || foreground_claimed_denial)
+        && (task.background_fence.as_ref() == Some(background_fence)
+            || (task.status == super::SurfaceTaskStatus::Running
+                && !task.backgrounded
+                && task.background_fence.is_none())
+            || foreground_claimed_denial)
         && task.workflow_run_id.is_none()
         && task.revision == *expected_revision
         && expected_revision.get().checked_add(1) == Some(next_revision.get())

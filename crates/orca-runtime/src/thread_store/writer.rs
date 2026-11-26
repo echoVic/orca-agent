@@ -1912,6 +1912,21 @@ impl SessionWriter {
             .clone()
     }
 
+    pub(crate) fn has_conversation_item(&self, item_id: &ConversationItemId) -> bool {
+        self.conversation_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|record| record.item_id.as_ref() == Some(item_id))
+    }
+
+    pub(crate) fn next_event_seq(&self) -> u64 {
+        *self
+            .event_sequence_cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn append_message(&mut self, message: &Message) -> io::Result<()> {
         let message = StoredMessage::from(message);
         let record = match &self.turn_id {

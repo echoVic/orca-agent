@@ -51,7 +51,6 @@ pub struct InteractiveSession {
     conversation: Conversation,
     writer: Option<SessionWriter>,
     session_id: Option<String>,
-    next_event_seq: u64,
     completion_error: Option<String>,
     instructions: ProjectInstructions,
     cost_tracker: CostTracker,
@@ -355,18 +354,6 @@ impl InteractiveSession {
         } else {
             UsageTotals::default()
         };
-        let next_event_seq = if matches!(
-            config.history_mode,
-            HistoryMode::Resume(_) | HistoryMode::ResumeAt { .. }
-        ) {
-            loaded_transcript
-                .as_ref()
-                .map(|transcript| transcript.next_event_seq)
-                .unwrap_or_default()
-        } else {
-            0
-        };
-
         let mut session_id = None;
         let writer = match &config.history_mode {
             HistoryMode::Disabled => None,
@@ -472,7 +459,6 @@ impl InteractiveSession {
             conversation,
             writer,
             session_id,
-            next_event_seq,
             completion_error: None,
             instructions,
             cost_tracker,
@@ -585,7 +571,7 @@ impl InteractiveSession {
         self.writer
             .as_ref()
             .cloned()
-            .map(|writer| (self.next_event_seq, writer))
+            .map(|writer| (writer.next_event_seq(), writer))
     }
 
     pub(crate) fn surface_commit_path(&self) -> Option<std::path::PathBuf> {
