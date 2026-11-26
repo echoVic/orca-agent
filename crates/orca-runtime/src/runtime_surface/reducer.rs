@@ -497,7 +497,7 @@ fn canonical_task_patch_v1(patch: &TaskPatch) -> CanonicalTaskPatchV1<'_> {
 enum CanonicalEventV1<'a> {
     Operation(CanonicalOperationPatchV1<'a>),
     Item(&'a ItemPatch),
-    Assistant(&'a AssistantPatch),
+    Assistant(std::borrow::Cow<'a, AssistantPatch>),
     Tool(&'a ToolPatch),
     Plan(&'a SurfacePlanSnapshot),
     Usage(&'a SurfaceUsageSnapshot),
@@ -519,7 +519,7 @@ fn canonical_event_v1(event: &SurfaceEvent) -> CanonicalEventV1<'_> {
             CanonicalEventV1::Operation(canonical_operation_patch_v1(patch))
         }
         SurfaceEvent::Item(patch) => CanonicalEventV1::Item(patch),
-        SurfaceEvent::Assistant(patch) => CanonicalEventV1::Assistant(patch),
+        SurfaceEvent::Assistant(patch) => CanonicalEventV1::Assistant(patch.for_v1_event()),
         SurfaceEvent::Tool(patch) => CanonicalEventV1::Tool(patch),
         SurfaceEvent::Plan(snapshot) => CanonicalEventV1::Plan(snapshot),
         SurfaceEvent::Usage(snapshot) => CanonicalEventV1::Usage(snapshot),

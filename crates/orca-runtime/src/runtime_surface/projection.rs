@@ -560,6 +560,19 @@ pub enum AssistantPatch {
     },
 }
 
+impl AssistantPatch {
+    pub(super) fn for_v1_event(&self) -> std::borrow::Cow<'_, Self> {
+        match self {
+            Self::ResponseKept { response, .. } => {
+                std::borrow::Cow::Owned(Self::ResponseCompleted {
+                    response: response.clone(),
+                })
+            }
+            patch => std::borrow::Cow::Borrowed(patch),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SurfaceFileChange {
     UnifiedDiff {

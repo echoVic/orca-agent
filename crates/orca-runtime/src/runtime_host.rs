@@ -31476,6 +31476,118 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_session_with_a_kept_reply_is_readable_by_the_previous_reader() {
+        assert_kept_reply_with_transcript(
+            KeptReplyFixture::Mock("mock_stream_delay_ms 30000"),
+            1,
+            Some(("Mock slow stream started.", None, "interrupted")),
+            assert_previous_reader_can_read_kept_reply,
+        );
+        assert_kept_reply_with_transcript(
+            KeptReplyFixture::DeepSeek {
+                partial_tool: true,
+                length: true,
+            },
+            0,
+            Some(("First point", Some("Thinking"), "output_limit")),
+            assert_previous_reader_can_read_kept_reply,
+        );
+    }
+
+    fn assert_previous_reader_can_read_kept_reply(path: &std::path::Path) {
+        // Orca 0.5.23 (11d90cee) used these four closed assistant variants.
+        // The other record and surface event variants are shared with that reader.
+        #[derive(serde::Deserialize, serde::Serialize)]
+        enum PreviousAssistantPatch {
+            StreamOpened {
+                stream: surface::SurfaceAssistantStream,
+            },
+            Delta {
+                stream_id: surface::SurfaceStreamId,
+                offset: surface::ByteOffset,
+                text: surface::DisplayText,
+            },
+            ResponseCompleted {
+                response: surface::SurfaceCompletedModelResponse,
+            },
+            StreamDiscarded {
+                stream_id: surface::SurfaceStreamId,
+                reason: surface::AssistantDiscardReason,
+            },
+        }
+
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct PreviousCompletedModelResponse {
+            identity: orca_core::thread_item_projection::ModelResponseIdentity,
+            assistant_content: Option<String>,
+            assistant_reasoning: Option<String>,
+            tool_calls: Vec<orca_core::conversation::RawToolCall>,
+        }
+
+        let mut previous_completion = None;
+        let mut previous_batch = None;
+        for line in std::fs::read_to_string(path).unwrap().lines() {
+            let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+            if record["event"]["type"] == "model.response.completed" {
+                let payload = &record["event"]["payload"];
+                let decoded: PreviousCompletedModelResponse =
+                    serde_json::from_value(payload.clone()).unwrap();
+                assert!(payload["cut_short"].is_string());
+                let decoded = serde_json::to_value(decoded).unwrap();
+                assert_eq!(decoded["identity"], payload["identity"]);
+                assert_eq!(decoded["assistant_content"], payload["assistant_content"]);
+                assert!(decoded.get("cut_short").is_none());
+                assert!(previous_completion.replace(decoded).is_none());
+            }
+            if let Some(events) = record
+                .get_mut("batch")
+                .and_then(|batch| batch.get_mut("events"))
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for envelope in events {
+                    let envelope = envelope.as_object_mut().unwrap();
+                    envelope.retain(|key, _| {
+                        matches!(
+                            key.as_str(),
+                            "ordinal" | "event_id" | "commit_class" | "scope" | "event"
+                        )
+                    });
+                    if let Some(assistant) = envelope["event"].get_mut("Assistant") {
+                        let patch: PreviousAssistantPatch = serde_json::from_value(
+                            assistant.clone(),
+                        )
+                        .expect("Orca 0.5.23 must understand the persisted assistant patch");
+                        *assistant = serde_json::to_value(patch).unwrap();
+                    }
+                }
+            }
+            let record: crate::thread_store::SessionRecord =
+                serde_json::from_value(record).unwrap();
+            if let crate::thread_store::SessionRecord::SurfaceCommitPrepared {
+                batch: Some(batch),
+                batch_digest,
+                ..
+            } = record
+            {
+                let batch = batch.into_live().expect("the old event form must validate");
+                assert_eq!(batch.batch_digest.as_bytes().as_slice(), batch_digest);
+                if batch.events.as_slice().iter().any(|envelope| {
+                    matches!(
+                        envelope.event,
+                        surface::SurfaceEvent::Assistant(
+                            surface::AssistantPatch::ResponseCompleted { .. }
+                        )
+                    )
+                }) {
+                    assert!(previous_batch.replace(batch).is_none());
+                }
+            }
+        }
+        assert!(previous_completion.is_some());
+        assert!(previous_batch.is_some());
+    }
+
     enum KeptReplyFixture {
         Mock(&'static str),
         DeepSeek { partial_tool: bool, length: bool },
@@ -31486,6 +31598,15 @@ mod tests {
         fixture: KeptReplyFixture,
         cancels: usize,
         kept: Option<(&str, Option<&str>, &str)>,
+    ) {
+        assert_kept_reply_with_transcript(fixture, cancels, kept, |_| {});
+    }
+
+    fn assert_kept_reply_with_transcript(
+        fixture: KeptReplyFixture,
+        cancels: usize,
+        kept: Option<(&str, Option<&str>, &str)>,
+        check_transcript: impl FnOnce(&std::path::Path),
     ) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -31689,6 +31810,7 @@ mod tests {
         let thread_id = thread.thread_id().to_string();
         thread.shutdown().unwrap();
         host.shutdown().unwrap();
+        check_transcript(&transcript.path);
 
         if let Some((expected_text, _, expected_reason)) = kept {
             let resumed_host = RuntimeHost::start().unwrap();
