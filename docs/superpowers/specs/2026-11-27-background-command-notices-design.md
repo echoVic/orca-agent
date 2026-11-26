@@ -37,6 +37,7 @@ DeepSeek's harness handles this the same way the fixes below do:
 
 - No new turn is started for a notice that arrives while the TUI is idle.
 - The turn does not wait for background commands before ending. A command left running on purpose, such as a server, must not hold the turn.
+- Notices still queued when Orca exits and notices evicted from the 64-entry queue are lost. Persisting pending completions requires a dedicated record and owner.
 
 ## Constraints
 

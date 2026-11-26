@@ -112,6 +112,7 @@ enum TerminalCommand {
     },
     ResolveTask {
         task_id: String,
+        include_archive: bool,
         response: SyncSender<io::Result<String>>,
     },
     CloseInput {
@@ -204,6 +205,7 @@ pub(crate) struct TerminalCompletion {
     pub(crate) output: String,
     pub(crate) exit_code: Option<i32>,
     pub(crate) omitted_bytes: u64,
+    first_retained_cursor: usize,
 }
 
 impl TerminalCompletion {
@@ -217,7 +219,15 @@ impl TerminalCompletion {
         } else {
             self.output.trim_end()
         };
-        let omitted = if self.omitted_bytes > 0 {
+        let omitted = if self.first_retained_cursor > 0 {
+            format!(
+                "\n[{} earlier bytes not shown; {} of them are no longer kept. Read the rest with task_read_output using task_id {} and cursor {}]",
+                self.omitted_bytes,
+                self.first_retained_cursor,
+                self.task_id,
+                self.first_retained_cursor
+            )
+        } else if self.omitted_bytes > 0 {
             format!(
                 "\n[{} earlier bytes not shown; read them with task_read_output using task_id {} and cursor 0]",
                 self.omitted_bytes, self.task_id
@@ -412,12 +422,14 @@ impl TerminalService {
     ///
     /// The model addresses work by `task_id` only; `session_id` stays an
     /// internal detail so callers never translate between two ids.
-    fn session_id_for_task(&self, task_id: &str) -> io::Result<String> {
+    fn session_id_for_task(&self, task_id: &str, include_archive: bool) -> io::Result<String> {
         // Only the supervisor owns the session map, so the lookup always goes
-        // through it rather than through a second, possibly stale copy.
+        // through it rather than through a second, possibly stale copy. A
+        // read may also resolve completed tasks in the session archive.
         let (response, receiver) = mpsc::sync_channel(1);
         self.send(TerminalCommand::ResolveTask {
             task_id: task_id.to_string(),
+            include_archive,
             response,
         })?;
         receive_response(receiver, "terminal resolve")?
@@ -469,7 +481,7 @@ impl TerminalService {
         cursor: Option<usize>,
         max_output_bytes: usize,
     ) -> io::Result<Option<TerminalServiceOutput>> {
-        let session_id = match self.session_id_for_task(task_id) {
+        let session_id = match self.session_id_for_task(task_id, true) {
             Ok(session_id) => session_id,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -495,7 +507,7 @@ impl TerminalService {
         max_output_bytes: usize,
         should_cancel: impl Fn() -> bool,
     ) -> io::Result<Option<TerminalServiceOutput>> {
-        let session_id = match self.session_id_for_task(task_id) {
+        let session_id = match self.session_id_for_task(task_id, false) {
             Ok(session_id) => session_id,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -788,18 +800,26 @@ fn run_terminal_supervisor(mut state: TerminalServiceState, receiver: Receiver<T
             Ok(TerminalCommand::MarkBackground { session_id }) => {
                 state.mark_background(&session_id);
             }
-            Ok(TerminalCommand::ResolveTask { task_id, response }) => {
-                let resolved = state
+            Ok(TerminalCommand::ResolveTask {
+                task_id,
+                include_archive,
+                response,
+            }) => {
+                let live = state
                     .sessions
                     .iter()
                     .find(|(_, session)| session.task_id == task_id)
-                    .map(|(session_id, _)| session_id.clone())
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!("unknown terminal task: {task_id}"),
-                        )
-                    });
+                    .map(|(session_id, _)| session_id.clone());
+                let resolved = match live {
+                    Some(session_id) => Ok(session_id),
+                    None if include_archive => {
+                        state.manager.output_store().archived_shell_id(&task_id)
+                    }
+                    None => Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown terminal task: {task_id}"),
+                    )),
+                };
                 let _ = response.send(resolved);
             }
             Ok(TerminalCommand::CloseInput {
@@ -1214,15 +1234,16 @@ impl TerminalServiceState {
             let start = metadata
                 .bytes_total
                 .saturating_sub(COMPLETION_OUTPUT_MAX_BYTES);
-            store.read_delta(&task_id, start, COMPLETION_OUTPUT_MAX_BYTES)
+            let page = store.read_delta(&task_id, start, COMPLETION_OUTPUT_MAX_BYTES)?;
+            Ok((page, metadata.omitted_prefix_bytes))
         });
-        let (output, omitted_bytes) = match output {
-            Ok(page) => {
+        let (output, omitted_bytes, first_retained_cursor) = match output {
+            Ok((page, first_retained_cursor)) => {
                 // The archive advances a read that begins inside a character.
                 let start = page.next_offset - page.combined.len();
-                (page.combined, start as u64)
+                (page.combined, start as u64, first_retained_cursor)
             }
-            Err(error) => (format!("[task output archive unavailable: {error}]"), 0),
+            Err(error) => (format!("[task output archive unavailable: {error}]"), 0, 0),
         };
         let completion = TerminalCompletion {
             session_id: session_id.to_string(),
@@ -1231,6 +1252,7 @@ impl TerminalServiceState {
             output,
             exit_code: terminal.exit_code,
             omitted_bytes,
+            first_retained_cursor,
         };
         if self.completions.len() >= COMPLETION_QUEUE_CAPACITY {
             self.completions.pop_front();
@@ -2188,6 +2210,73 @@ mod tests {
             completion.task_id
         )));
         assert_eq!(completion.output.len(), 8 * 1024);
+    }
+
+    #[test]
+    fn the_notice_gives_the_first_retained_cursor_after_eviction() {
+        let cwd = tempfile::tempdir().unwrap();
+        let registry =
+            TaskRegistry::new_persistent("evicted-output".into(), cwd.path().join("tasks"))
+                .unwrap();
+        let mut state = TerminalServiceState::new(registry, None);
+        let handle = start_gated_command(&mut state, cwd.path());
+        let store = state.manager.output_store();
+        let retained_bytes = 32 * 1024 * 1024;
+        let output = format!(
+            "{}kept{}tail",
+            "x".repeat(4096),
+            "y".repeat(retained_bytes - 8)
+        );
+        store.append_stdout(&handle.task_id, &output).unwrap();
+        state.manager.write_stdin(&handle.id, "finish\n").unwrap();
+        wait_for_process_exits(&mut state, 1);
+        state.reap().unwrap();
+
+        let notice = state.completions[0].model_notification();
+        assert!(notice.contains("tail\n"));
+        let omitted = retained_bytes + 4096 - 8192;
+        assert!(notice.contains(&format!(
+            "[{omitted} earlier bytes not shown; 4096 of them are no longer kept. Read the rest with task_read_output using task_id {} and cursor 4096]", handle.task_id
+        )), "{}", &notice[notice.len().saturating_sub(250)..]);
+        let page = store.read_delta(&handle.task_id, 4096, 4).unwrap();
+        assert_eq!(page.combined, "kept");
+        assert_eq!(page.omitted_prefix_bytes, 0);
+    }
+
+    #[test]
+    fn archived_output_is_readable_by_task_id_after_the_session_expires() {
+        let cwd = tempfile::tempdir().unwrap();
+        let registry =
+            TaskRegistry::new_persistent("expired-session".into(), cwd.path().join("tasks"))
+                .unwrap();
+        let mut state = TerminalServiceState::new(registry, None);
+        let handle = start_gated_command(&mut state, cwd.path());
+        state
+            .manager
+            .output_store()
+            .append_stdout(&handle.task_id, "retained output")
+            .unwrap();
+        state.manager.write_stdin(&handle.id, "finish\n").unwrap();
+        wait_for_process_exits(&mut state, 1);
+        state.reap().unwrap();
+        state.sessions.get_mut(&handle.id).unwrap().completed_at =
+            Some(Instant::now() - COMPLETED_SESSION_RETENTION);
+        state.cleanup_completed();
+        assert!(!state.sessions.contains_key(&handle.id));
+
+        let (sender, receiver) = mpsc::sync_channel(TERMINAL_COMMAND_CAPACITY);
+        let supervisor = std::thread::spawn(|| run_terminal_supervisor(state, receiver));
+        let service = TerminalService {
+            sender,
+            supervisor: Mutex::new(Some(supervisor)),
+        };
+        let page = service
+            .read_output_at(&handle.task_id, 0, 1024)
+            .unwrap()
+            .expect("retained output by task id");
+        assert_eq!(page.status, "completed");
+        assert_eq!(page.output, "retained output");
+        assert!(page.eof);
     }
 
     #[test]
