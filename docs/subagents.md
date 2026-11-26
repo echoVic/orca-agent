@@ -146,8 +146,8 @@ running while they run. In the TUI:
   subagent is still queued. A Ctrl+B pressed while main runs another tool,
   a `subagent` call that waits for approval included, takes effect when
   main's next reply starts, and is answered with the same line if a
-  subagent has started by then. A `subagent` call for one of the four kinds
-  above is such a tool: its subagent does not count.
+  subagent has started by then. A `subagent` call whose subagent gets no
+  conversation of its own is such a tool: its subagent does not count.
 
 Such a subagent never asks the person, or the main agent, anything. What it
 may do is fixed when it starts, from the main conversation's permission mode,
