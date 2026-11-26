@@ -505,7 +505,43 @@ fn deliver_shell_completions<W: io::Write>(
     if conversation_has_open_tool_calls(input.prepared_conversation.checkpoint_parts().0) {
         return Ok(false);
     }
-    let Some(service) = input
+    let Some(service) = terminal_service(input) else {
+        return Ok(false);
+    };
+    let completions = service.pending_completions();
+    let delivered = !completions.is_empty();
+    for completion in completions {
+        let (conversation, writer) = input.prepared_conversation.parts_mut();
+        append_shell_completion(conversation, writer, completion.model_notification())?;
+        emit_safe_child_checkpoint(
+            input.prepared_conversation,
+            input.operation.controller.usage(),
+        )?;
+        service.observe_completions(vec![completion.task_id]);
+    }
+    Ok(delivered)
+}
+
+pub(crate) fn append_shell_completion(
+    conversation: &mut orca_core::conversation::Conversation,
+    writer: Option<&mut crate::thread_store::SessionWriter>,
+    content: String,
+) -> io::Result<()> {
+    if let Some(writer) = writer {
+        writer.append_system_delivery_once(&content)?;
+    }
+    if !conversation.messages.iter().any(|message|
+        matches!(message, orca_core::conversation::Message::System { content: text, .. } if text == &content))
+    {
+        conversation.add_system(content);
+    }
+    Ok(())
+}
+
+fn terminal_service<W: io::Write>(
+    input: &RuntimeTurnLoopInput<'_, '_, W>,
+) -> Option<std::sync::Arc<TerminalService>> {
+    input
         .loop_state
         .runtime
         .extensions
@@ -513,28 +549,6 @@ fn deliver_shell_completions<W: io::Write>(
         .stores()
         .thread_store()
         .get::<TerminalService>()
-    else {
-        return Ok(false);
-    };
-    let completions = service.drain_completions();
-    let delivered = !completions.is_empty();
-    for completion in completions {
-        let content = completion.model_notification();
-        let (conversation, writer) = input.prepared_conversation.parts_mut();
-        let present = conversation.messages.iter().any(|message|
-            matches!(message, orca_core::conversation::Message::System { content: text, .. } if text == &content));
-        if let Some(writer) = writer {
-            writer.append_system_delivery_once(&content)?;
-        }
-        if !present {
-            conversation.add_system(content);
-        }
-        emit_safe_child_checkpoint(
-            input.prepared_conversation,
-            input.operation.controller.usage(),
-        )?;
-    }
-    Ok(delivered)
 }
 
 /// Whether a turn that ended on its own still owes the model a steer input:
@@ -721,6 +735,14 @@ fn park_pending_task_wait<W: io::Write>(
                 std::time::Duration::from_millis(50),
             );
         };
+        let completed_shells = observations
+            .iter()
+            .flatten()
+            .filter(|view| {
+                view.task_type == orca_core::task_types::TaskType::Shell && view.is_terminal()
+            })
+            .map(|view| view.task_id.clone())
+            .collect();
         wait.result = Some(format!(
             "[Task wait result id={}] {}",
             wait.tool_call_id,
@@ -730,6 +752,9 @@ fn park_pending_task_wait<W: io::Write>(
         registry
             .set_pending_wait(task_id, Some(wait.clone()))
             .map_err(io::Error::other)?;
+        if let Some(service) = terminal_service(input) {
+            service.observe_completions(completed_shells);
+        }
     }
     // Persist the exact observation before delivery, so replay cannot change
     // timing fields and inject a second copy after a crash before acknowledgement.

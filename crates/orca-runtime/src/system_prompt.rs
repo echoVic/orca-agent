@@ -170,7 +170,7 @@ Every shell command goes through `bash`. Command syntax follows the host shell n
 - `yield_time_ms` only controls how long this call waits before handing control back. It never stops the command.
 - `timeout_ms` is the only caller-side limit on how long the command may run. Set it only when you actually need an execution deadline.
 - `task_read_output` reads more output using the cursor you pass, `task_send_input` types into a `pty` task, `task_wait` blocks until a task changes state or finishes, and `task_stop` stops one.
-- Long-running commands notify you when they finish. If you have independent work, keep doing it. When you must have the result, use `task_wait` — do not use `sleep` or repeated short polling to wait for a task you started.
+- A background command's completion is reported at your next step in this turn, or when the next turn starts. Use `task_wait` if you need the result before continuing or ending your turn. Do not use `sleep` or repeated short polling.
 
 For file inspection, prefer `read_file`, `glob`, and `grep`."#
     } else {
@@ -296,6 +296,16 @@ mod tests {
     }
 
     #[test]
+    fn prompt_explains_when_a_background_command_is_reported() {
+        let prompt = build_system_prompt(std::path::Path::new("/repo"));
+
+        assert!(prompt.contains("at your next step"));
+        assert!(prompt.contains("when the next turn starts"));
+        assert!(prompt.contains("`task_wait`"));
+        assert!(!prompt.contains("Long-running commands notify you when they finish"));
+    }
+
+    #[test]
     fn restricted_prompt_preserves_no_shell_guidance_without_tool_listing() {
         let allowed = vec![
             "read_file".to_string(),
@@ -318,7 +328,7 @@ mod tests {
         assert!(prompt.contains("`yield_time_ms` only controls how long this call waits"));
         assert!(prompt.contains("Ordinary pipe commands wait up to 10 seconds by default"));
         assert!(prompt.contains("`timeout_ms` is the only caller-side limit"));
-        assert!(prompt.contains("do not use `sleep` or repeated short polling"));
+        assert!(prompt.contains("Do not use `sleep` or repeated short polling"));
     }
 
     #[test]

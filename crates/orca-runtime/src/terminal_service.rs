@@ -126,7 +126,11 @@ enum TerminalCommand {
         task_id: String,
         response: SyncSender<io::Result<bool>>,
     },
-    DrainCompletions {
+    ObserveCompletions {
+        task_ids: Vec<String>,
+    },
+    ReadCompletions {
+        drain: bool,
         response: SyncSender<Vec<TerminalCompletion>>,
     },
     Shutdown {
@@ -434,7 +438,30 @@ impl TerminalService {
         cursor: usize,
         max_output_bytes: usize,
     ) -> io::Result<Option<TerminalServiceOutput>> {
-        self.read_output_at_or_cursor(task_id, Some(cursor), max_output_bytes)
+        let output = self.read_output_at_or_cursor(task_id, Some(cursor), max_output_bytes)?;
+        if output
+            .as_ref()
+            .is_some_and(|output| output.status != "running")
+        {
+            self.observe_completions(vec![task_id.to_owned()]);
+        }
+        Ok(output)
+    }
+
+    /// Samples a task for a wait. The wait acknowledges completions when it
+    /// returns them to the model.
+    pub(crate) fn peek_output_for_wait(
+        &self,
+        task_id: &str,
+        max_output_bytes: usize,
+    ) -> io::Result<Option<TerminalServiceOutput>> {
+        self.read_output_at_or_cursor(task_id, Some(0), max_output_bytes)
+    }
+
+    pub(crate) fn observe_completions(&self, task_ids: Vec<String>) {
+        if !task_ids.is_empty() {
+            let _ = self.send(TerminalCommand::ObserveCompletions { task_ids });
+        }
     }
 
     fn read_output_at_or_cursor(
@@ -547,10 +574,19 @@ impl TerminalService {
         Ok(output)
     }
 
+    pub(crate) fn pending_completions(&self) -> Vec<TerminalCompletion> {
+        self.read_completions(false)
+    }
+
+    #[cfg(test)]
     pub(crate) fn drain_completions(&self) -> Vec<TerminalCompletion> {
+        self.read_completions(true)
+    }
+
+    fn read_completions(&self, drain: bool) -> Vec<TerminalCompletion> {
         let (response, receiver) = mpsc::sync_channel(1);
         if self
-            .send(TerminalCommand::DrainCompletions { response })
+            .send(TerminalCommand::ReadCompletions { drain, response })
             .is_err()
         {
             return Vec::new();
@@ -783,8 +819,23 @@ fn run_terminal_supervisor(
                 let result = state.stop_task(&task_id);
                 let _ = response.send(result);
             }
-            Ok(TerminalCommand::DrainCompletions { response }) => {
-                let _ = response.send(state.completions.drain(..).collect());
+            Ok(TerminalCommand::ObserveCompletions { task_ids }) => {
+                for session in state.sessions.values_mut() {
+                    if task_ids.contains(&session.task_id) {
+                        session.completion_observed = true;
+                    }
+                }
+                state
+                    .completions
+                    .retain(|completion| !task_ids.contains(&completion.task_id));
+            }
+            Ok(TerminalCommand::ReadCompletions { drain, response }) => {
+                let completions = if drain {
+                    state.completions.drain(..).collect()
+                } else {
+                    state.completions.iter().cloned().collect()
+                };
+                let _ = response.send(completions);
             }
             Ok(TerminalCommand::Shutdown { response }) => {
                 state.deny_pending_network_requests();
@@ -1039,13 +1090,18 @@ impl TerminalServiceState {
     }
 
     fn stop_task(&mut self, task_id: &str) -> io::Result<bool> {
-        let session_id = self.sessions.iter().find_map(|(session_id, session)| {
-            (session.task_id == task_id && session.terminal.is_none()).then(|| session_id.clone())
+        let session = self.sessions.iter().find_map(|(session_id, session)| {
+            (session.task_id == task_id).then(|| (session_id.clone(), session.terminal.is_some()))
         });
-        let Some(session_id) = session_id else {
+        let Some((session_id, already_ended)) = session else {
             return Ok(false);
         };
+        if already_ended {
+            self.observe_completion(&session_id);
+            return Ok(false);
+        }
         let output = self.manager.kill_preserving_output(&session_id)?;
+        self.observe_completion(&session_id);
         self.record_terminal(&output);
         Ok(true)
     }
@@ -2063,11 +2119,9 @@ mod tests {
         assert!(service.drain_completions().is_empty());
     }
 
-    fn completion_with_output(output: &str) -> TerminalCompletion {
+    fn start_output_command(service: &TerminalService, cwd: &Path) -> TerminalServiceOutput {
         use orca_platform::shell::{ShellKind, ShellResolver};
 
-        let temp = tempfile::tempdir().expect("tempdir");
-        let (service, registry) = service(temp.path());
         let overlay = TurnPermissionOverlay::default();
         let command = match ShellResolver::for_current_host()
             .resolve_from_environment()
@@ -2085,17 +2139,28 @@ mod tests {
             }
         };
         let started = start(
-            &service,
-            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
+            service,
+            request(command, cwd, &overlay, ShellTerminalMode::pipe()),
             Duration::from_millis(10),
             8 * 1024,
             || false,
         )
         .expect("start background command");
         assert_eq!(started.status, "running", "{started:?}");
-        let pending = temp.path().join("pending-output");
+        started
+    }
+
+    fn release_output(cwd: &Path, output: &str) {
+        let pending = cwd.join("pending-output");
         std::fs::write(&pending, output).unwrap();
-        std::fs::rename(pending, temp.path().join("notice-output")).unwrap();
+        std::fs::rename(pending, cwd.join("notice-output")).unwrap();
+    }
+
+    fn completion_with_output(output: &str) -> TerminalCompletion {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, registry) = service(temp.path());
+        let started = start_output_command(&service, temp.path());
+        release_output(temp.path(), output);
         wait_for_status(&registry, &started.task_id, TaskStatus::Completed);
         let mut completions = service.drain_completions();
         assert_eq!(completions.len(), 1, "{completions:?}");
@@ -2516,6 +2581,71 @@ mod tests {
             .expect("observe terminal output");
         assert_eq!(completed.status, "completed", "{completed:?}");
         assert!(completed.output.contains("observed"), "{completed:?}");
+        assert!(service.drain_completions().is_empty());
+    }
+
+    #[test]
+    fn a_completion_collected_by_task_wait_is_not_announced() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::{InterruptSemantics, ToolName, ToolRequest, ToolStatus};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, registry) = service(temp.path());
+        let service = Arc::new(service);
+        let started = start_output_command(&service, temp.path());
+        let mut invocation = crate::runtime_tool_call::tests::normal_invocation(
+            "wait-for-shell",
+            InterruptSemantics::WaitForTerminal,
+        );
+        invocation.task_registry = Some(registry);
+        invocation.terminal_service = Some(Arc::clone(&service));
+        let request = ToolRequest {
+            id: "wait-for-shell".into(),
+            name: ToolName::TaskWait,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({"task_ids": [started.task_id], "wait_ms": 5000}).to_string(),
+            ),
+        };
+        let result = thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(150));
+                release_output(temp.path(), "collected by wait");
+            });
+            crate::runtime_normal_tool::execute_runtime_normal_tool_for_test(&invocation, &request)
+        });
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.output.expect("wait result")).unwrap();
+        assert_eq!(payload["tasks"][0]["status"], "completed");
+        assert_eq!(payload["tasks"][0]["output"], "collected by wait");
+        assert!(service.drain_completions().is_empty());
+    }
+
+    #[test]
+    fn a_completion_read_at_an_explicit_cursor_is_not_announced() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, registry) = service(temp.path());
+        let started = start_output_command(&service, temp.path());
+        release_output(temp.path(), "collected at cursor zero");
+        wait_for_status(&registry, &started.task_id, TaskStatus::Completed);
+        let page = service
+            .read_output_at(&started.task_id, 0, 8 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.status, "completed");
+        assert_eq!(page.output, "collected at cursor zero");
+        assert!(service.drain_completions().is_empty());
+    }
+
+    #[test]
+    fn a_command_the_model_stopped_is_not_announced() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, registry) = service(temp.path());
+        let started = start_output_command(&service, temp.path());
+        assert!(service.stop_task(&started.task_id).unwrap());
+        wait_for_status(&registry, &started.task_id, TaskStatus::Stopped);
         assert!(service.drain_completions().is_empty());
     }
 

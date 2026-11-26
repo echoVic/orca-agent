@@ -696,6 +696,7 @@ fn wait_for_tasks(
         if let Err(error) = registry.set_pending_wait(owner, Some(pending)) {
             return ToolResult::failed_before_start(&invocation.request, error, None);
         }
+        observe_wait_completions(invocation, &args.task_ids, &observations);
         return ToolResult::running(&invocation.request, serde_json::json!({
             "wait": "scheduled", "tasks": observations.into_iter().map(|o| o.output).collect::<Vec<_>>(),
             "message": "The runtime will wait after this tool boundary and deliver the observed result before the next model request."
@@ -724,6 +725,7 @@ fn wait_for_tasks(
     });
     match serde_json::to_string(&payload) {
         Ok(output) => {
+            observe_wait_completions(invocation, &args.task_ids, &observations);
             if all_terminal {
                 ToolResult::completed(&invocation.request, output, false)
             } else {
@@ -744,6 +746,23 @@ struct TaskObservation {
     progress: (String, u64, bool),
 }
 
+fn observe_wait_completions(
+    invocation: &RuntimeNormalToolInvocation,
+    task_ids: &[String],
+    observations: &[TaskObservation],
+) {
+    if let Some(service) = &invocation.terminal_service {
+        service.observe_completions(
+            task_ids
+                .iter()
+                .zip(observations)
+                .filter(|(_, observation)| observation.terminal)
+                .map(|(id, _)| id.clone())
+                .collect(),
+        );
+    }
+}
+
 fn observe_once(
     invocation: &RuntimeNormalToolInvocation,
     task_ids: &[String],
@@ -753,7 +772,7 @@ fn observe_once(
         .iter()
         .map(|task_id| {
             if let Some(service) = &invocation.terminal_service {
-                match service.read_output_at(task_id, 0, max_output_bytes) {
+                match service.peek_output_for_wait(task_id, max_output_bytes) {
                     Ok(Some(output)) => {
                         return Ok(TaskObservation {
                             terminal: output.status != "running",

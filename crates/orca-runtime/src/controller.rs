@@ -2243,7 +2243,7 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
         Some(thread_extensions.unwrap_or_else(|| session.runtime_extensions(lifecycle.run_id())));
     let turn_extension_id =
         Some(turn_extension_id.unwrap_or_else(|| request.turn_id().as_str().to_string()));
-    drain_terminal_notifications(session, thread_extensions.as_deref());
+    drain_terminal_notifications(session, thread_extensions.as_deref())?;
     if thread_extensions
         .as_ref()
         .and_then(|extensions| extensions.get::<crate::agent_controller::AgentThreadPolicy>())
@@ -2361,15 +2361,20 @@ fn finish_rewind_turn(
 fn drain_terminal_notifications(
     session: &mut InteractiveSession,
     thread_extensions: Option<&ExtensionData>,
-) {
+) -> io::Result<()> {
     let Some(service) = thread_extensions.and_then(ExtensionData::get::<TerminalService>) else {
-        return;
+        return Ok(());
     };
-    for completion in service.drain_completions() {
-        let message = Message::system(completion.model_notification());
-        session.append_message(&message);
-        session.conversation_mut().messages.push(message);
+    for completion in service.pending_completions() {
+        let parts = session.runtime_parts();
+        crate::runtime_turn_loop::append_shell_completion(
+            parts.conversation,
+            parts.writer,
+            completion.model_notification(),
+        )?;
+        service.observe_completions(vec![completion.task_id]);
     }
+    Ok(())
 }
 
 /// Pushes finished detached children back into the parent conversation.
@@ -3004,7 +3009,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        drain_terminal_notifications(thread.session_mut(), Some(extensions.as_ref()));
+        drain_terminal_notifications(thread.session_mut(), Some(extensions.as_ref())).unwrap();
         let message_count = thread.session().conversation().messages.len();
         assert!(matches!(
             thread.session().conversation().messages.last(),
@@ -3014,7 +3019,7 @@ mod tests {
                     && content.contains(&started.task_id)
         ));
 
-        drain_terminal_notifications(thread.session_mut(), Some(extensions.as_ref()));
+        drain_terminal_notifications(thread.session_mut(), Some(extensions.as_ref())).unwrap();
         assert_eq!(
             thread.session().conversation().messages.len(),
             message_count
@@ -3046,7 +3051,8 @@ mod tests {
         config: &RunConfig,
         cwd: &Path,
         additional_completion: bool,
-    ) -> Vec<String> {
+        after_completion: impl Fn() -> io::Result<()> + Send + Sync + 'static,
+    ) -> (io::Result<RunStatus>, Vec<String>) {
         use orca_core::event_schema::{EventEnvelope, EventType};
         use orca_core::task_types::{TaskStatus, TaskType};
 
@@ -3111,14 +3117,12 @@ mod tests {
                         }
                         completed.lock().unwrap().push(task.id);
                     }
+                    after_completion()?;
                 }
                 Ok(())
             }));
-        assert_eq!(
-            thread.run_request(config, &request, io::sink()).unwrap(),
-            RunStatus::Success
-        );
-        task_ids.lock().unwrap().clone()
+        let result = thread.run_request(config, &request, io::sink());
+        (result, task_ids.lock().unwrap().clone())
     }
 
     fn shell_completion_messages(conversation: &Conversation) -> impl Iterator<Item = &str> {
@@ -3141,6 +3145,18 @@ mod tests {
         for (notice, id) in notices.into_iter().zip(tasks) {
             assert!(notice.contains(id), "{notice}");
         }
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    Message::Assistant { content: Some(content), .. }
+                        if content == "Mock completed after tool execution."
+                ))
+                .count(),
+            1
+        );
         assert!(matches!(
             conversation.messages.last(),
             Some(Message::Assistant { content: Some(content), .. })
@@ -3150,13 +3166,90 @@ mod tests {
 
     #[test]
     fn a_completion_during_a_turn_reaches_the_next_model_request() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut received = Vec::new();
+            let arguments = serde_json::json!({
+                "command": command_after_release("release-first", "first-output"),
+                "yield_time_ms": 10
+            });
+            let tool = serde_json::json!({"choices": [{
+                "delta": {"reasoning_content": "Run the command.", "tool_calls": [{ "index": 0, "id": "shell-test", "type": "function",
+                    "function": {"name": "bash", "arguments": arguments.to_string()}}]},
+                "finish_reason": "tool_calls"
+            }]});
+            let reply = serde_json::json!({"choices": [{
+                "delta": {"content": "done"}, "finish_reason": "stop"
+            }]});
+            for response in [tool, reply] {
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "provider request timed out"
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':')
+                        && key.eq_ignore_ascii_case("content-length")
+                    {
+                        length = Some(value.trim().parse().unwrap());
+                    }
+                }
+                let mut body = vec![0; length.unwrap()];
+                reader.read_exact(&mut body).unwrap();
+                received.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                let body = format!("data: {response}\n\ndata: [DONE]\n\n");
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            received
+        });
         let cwd = tempfile::tempdir().unwrap();
         let mut config = config(SubagentConfig::default());
         config.cwd = Some(cwd.path().into());
         config.approval_mode = ApprovalMode::FullAuto;
+        config.provider = ProviderKind::DeepSeek;
+        config.api_key = Some("test-only".into());
+        config.base_url = Some(format!("http://{address}"));
         let mut thread = RuntimeThread::start(&config, "same-turn notice").unwrap();
-        let tasks = run_turn_with_shell_completions(&mut thread, &config, cwd.path(), false);
-        assert_shell_completions_before_reply(&thread, &tasks);
+        let (result, tasks) =
+            run_turn_with_shell_completions(&mut thread, &config, cwd.path(), false, || Ok(()));
+        let received = provider.join().unwrap();
+        let messages = received[1]["messages"].as_array().unwrap();
+        let notices = messages
+            .iter()
+            .filter_map(|message| {
+                let text = message["content"].as_str()?;
+                (message["role"] == "system" && text.starts_with("<task-notification>"))
+                    .then_some(text)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1, "{messages:?}");
+        assert!(notices[0].contains(&tasks[0]));
+        assert!(notices[0].contains("first-output"));
+        assert_eq!(result.unwrap(), RunStatus::Success);
     }
 
     #[test]
@@ -3166,7 +3259,9 @@ mod tests {
         config.cwd = Some(cwd.path().into());
         config.approval_mode = ApprovalMode::FullAuto;
         let mut thread = RuntimeThread::start(&config, "two same-turn notices").unwrap();
-        let tasks = run_turn_with_shell_completions(&mut thread, &config, cwd.path(), true);
+        let (result, tasks) =
+            run_turn_with_shell_completions(&mut thread, &config, cwd.path(), true, || Ok(()));
+        assert_eq!(result.unwrap(), RunStatus::Success);
         assert_eq!(tasks.len(), 2);
         assert_shell_completions_before_reply(&thread, &tasks);
     }
@@ -3182,7 +3277,9 @@ mod tests {
         config.approval_mode = ApprovalMode::FullAuto;
         config.history_mode = HistoryMode::Record;
         let mut thread = RuntimeThread::start(&config, "recorded same-turn notice").unwrap();
-        let tasks = run_turn_with_shell_completions(&mut thread, &config, cwd.path(), false);
+        let (result, tasks) =
+            run_turn_with_shell_completions(&mut thread, &config, cwd.path(), false, || Ok(()));
+        assert_eq!(result.unwrap(), RunStatus::Success);
         assert_shell_completions_before_reply(&thread, &tasks);
         let session_id = thread.session().session_id().unwrap().to_string();
         drop(thread);
@@ -3210,6 +3307,57 @@ mod tests {
             Some(Message::Assistant { content: Some(content), .. })
                 if content.matches("<task-notification>").count() == 1 && content.contains(&tasks[0])
         ));
+    }
+
+    #[test]
+    fn shell_completions_retry_in_order_after_a_transcript_write_failure() {
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(cwd.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.history_mode = HistoryMode::Record;
+        let mut thread = RuntimeThread::start(&config, "retry notices").unwrap();
+        let path = thread
+            .session_mut()
+            .runtime_parts()
+            .writer
+            .unwrap()
+            .path()
+            .to_path_buf();
+        let backup = path.with_extension("backup");
+        let failure_path = path.clone();
+        let failure_backup = backup.clone();
+        let (result, tasks) =
+            run_turn_with_shell_completions(&mut thread, &config, cwd.path(), true, move || {
+                std::fs::rename(&failure_path, &failure_backup)?;
+                std::fs::create_dir(&failure_path)
+            });
+        assert!(result.is_err(), "{result:?}");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(backup, path).unwrap();
+        assert_eq!(tasks.len(), 2);
+
+        let extensions = thread.thread_extensions_handle();
+        drain_terminal_notifications(thread.session_mut(), Some(extensions.as_ref())).unwrap();
+        drain_terminal_notifications(thread.session_mut(), Some(extensions.as_ref())).unwrap();
+        let notices =
+            shell_completion_messages(thread.session().conversation()).collect::<Vec<_>>();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices[0].contains(&tasks[0]));
+        assert!(notices[1].contains(&tasks[1]));
+        let history = crate::history::load_session(thread.session().session_id().unwrap()).unwrap();
+        for task_id in tasks {
+            let count = history
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(message, Message::System { content, .. }
+                    if content.starts_with("<task-notification>") && content.contains(&task_id))
+                })
+                .count();
+            assert_eq!(count, 1, "{task_id}");
+        }
     }
 
     #[test]
