@@ -1771,6 +1771,8 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
     #[test]
     #[cfg(unix)]
     fn a_node_that_has_the_permission_model_is_started_with_it() {
+        // See `run_confined`: the node found must be the real one.
+        let _env = crate::history::lock_test_env();
         let node = WorkflowHost::node_executable();
         // `--permission` is in Node 22 from 22.13, in 23 from 23.5, and in
         // every later line.
@@ -1793,6 +1795,11 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
     /// Runs `module` as the workflow host would be run, with `readable` as the
     /// workflow script, and returns what it printed.
     fn run_confined(module: &str, readable: &Path, ipc: Option<&WorkflowHostIpcPaths>) -> String {
+        // The node lookup tests point `PATH` at a fake node in a temporary
+        // directory, under this lock, and delete it when they end. Held
+        // until node has run, so the node found here is the real one and
+        // still exists when it is started.
+        let _env = crate::history::lock_test_env();
         let temp = tempfile::tempdir().expect("tempdir");
         let entry = temp.path().join("entry.mjs");
         fs::write(&entry, module).expect("write entry module");
