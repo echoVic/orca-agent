@@ -198,7 +198,7 @@ pub(crate) struct TerminalCompletion {
     pub(crate) status: &'static str,
     pub(crate) output: String,
     pub(crate) exit_code: Option<i32>,
-    pub(crate) truncated: bool,
+    pub(crate) omitted_bytes: u64,
 }
 
 impl TerminalCompletion {
@@ -212,10 +212,13 @@ impl TerminalCompletion {
         } else {
             self.output.trim_end()
         };
-        let truncated = if self.truncated {
-            "\n[completion output truncated]"
+        let omitted = if self.omitted_bytes > 0 {
+            format!(
+                "\n[{} earlier bytes not shown; read them with task_read_output using task_id {} and cursor 0]",
+                self.omitted_bytes, self.task_id
+            )
         } else {
-            ""
+            String::new()
         };
         format!(
             "<task-notification>Terminal session {} (task {}) finished with status {} and exit code {}.\n{}{}{}</task-notification>",
@@ -224,7 +227,7 @@ impl TerminalCompletion {
             self.status,
             exit_code,
             output,
-            truncated,
+            omitted,
             if self.status == "completed" {
                 ""
             } else {
@@ -1141,22 +1144,28 @@ impl TerminalServiceState {
             return;
         }
         let task_id = session.task_id.clone();
-        let output =
-            self.manager
-                .output_store()
-                .read_delta(&task_id, 0, COMPLETION_OUTPUT_MAX_BYTES);
+        let store = self.manager.output_store();
+        let output = store.read_delta(&task_id, 0, 0).and_then(|metadata| {
+            let start = metadata
+                .bytes_total
+                .saturating_sub(COMPLETION_OUTPUT_MAX_BYTES);
+            store.read_delta(&task_id, start, COMPLETION_OUTPUT_MAX_BYTES)
+        });
+        let (output, omitted_bytes) = match output {
+            Ok(page) => {
+                // The archive advances a read that begins inside a character.
+                let start = page.next_offset - page.combined.len();
+                (page.combined, start as u64)
+            }
+            Err(error) => (format!("[task output archive unavailable: {error}]"), 0),
+        };
         let completion = TerminalCompletion {
             session_id: session_id.to_string(),
             task_id,
             status: task_status_label(terminal.status),
-            output: output
-                .as_ref()
-                .map(|output| output.combined.clone())
-                .unwrap_or_else(|error| format!("[task output archive unavailable: {error}]")),
+            output,
             exit_code: terminal.exit_code,
-            truncated: output.as_ref().map_or(true, |output| {
-                output.omitted_prefix_bytes > 0 || output.next_offset < output.bytes_total
-            }),
+            omitted_bytes,
         };
         if self.completions.len() >= COMPLETION_QUEUE_CAPACITY {
             self.completions.pop_front();
@@ -2054,6 +2063,81 @@ mod tests {
         assert!(service.drain_completions().is_empty());
     }
 
+    fn completion_with_output(output: &str) -> TerminalCompletion {
+        use orca_platform::shell::{ShellKind, ShellResolver};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, registry) = service(temp.path());
+        let overlay = TurnPermissionOverlay::default();
+        let command = match ShellResolver::for_current_host()
+            .resolve_from_environment()
+            .unwrap()
+            .kind()
+        {
+            ShellKind::Posix | ShellKind::GitBash => {
+                "while [ ! -f notice-output ]; do sleep 0.01; done; cat notice-output"
+            }
+            ShellKind::PowerShell(_) => {
+                "while (!(Test-Path notice-output)) { Start-Sleep -Milliseconds 10 }; $stdout = [Console]::OpenStandardOutput(); $bytes = [IO.File]::ReadAllBytes((Resolve-Path notice-output).Path); $stdout.Write($bytes, 0, $bytes.Length)"
+            }
+            ShellKind::Cmd => {
+                "for /l %i in (1,1,10000000) do @if exist notice-output (type notice-output & exit /b 0)"
+            }
+        };
+        let started = start(
+            &service,
+            request(command, temp.path(), &overlay, ShellTerminalMode::pipe()),
+            Duration::from_millis(10),
+            8 * 1024,
+            || false,
+        )
+        .expect("start background command");
+        assert_eq!(started.status, "running", "{started:?}");
+        let pending = temp.path().join("pending-output");
+        std::fs::write(&pending, output).unwrap();
+        std::fs::rename(pending, temp.path().join("notice-output")).unwrap();
+        wait_for_status(&registry, &started.task_id, TaskStatus::Completed);
+        let mut completions = service.drain_completions();
+        assert_eq!(completions.len(), 1, "{completions:?}");
+        completions.pop().unwrap()
+    }
+
+    #[test]
+    fn the_notice_holds_the_tail_of_long_output() {
+        let completion =
+            completion_with_output(&format!("head-marker{}tail-marker", "x".repeat(20 * 1024)));
+        let notice = completion.model_notification();
+        assert!(notice.contains("tail-marker"));
+        assert!(!notice.contains("head-marker"));
+        assert!(notice.contains(&format!(
+            "[12310 earlier bytes not shown; read them with task_read_output using task_id {} and cursor 0]",
+            completion.task_id
+        )));
+        assert_eq!(completion.output.len(), 8 * 1024);
+    }
+
+    #[test]
+    fn short_output_is_delivered_whole() {
+        let completion = completion_with_output("all\nof the output");
+        let notice = completion.model_notification();
+        assert_eq!(completion.output, "all\nof the output");
+        assert!(notice.ends_with("\nall\nof the output</task-notification>"));
+    }
+
+    #[test]
+    fn the_tail_starts_on_a_character_boundary() {
+        let completion = completion_with_output(&format!("{}!", "é".repeat(4608)));
+        assert!(completion.output.starts_with('é'));
+        assert!(completion.output.ends_with('!'));
+        assert_eq!(completion.output.len(), 8191);
+        assert!(!completion.model_notification().contains('\u{FFFD}'));
+        assert!(
+            completion
+                .model_notification()
+                .contains("1026 earlier bytes not shown")
+        );
+    }
+
     fn service_with_end_sink(cwd: &Path) -> (TerminalService, TaskRegistry, ShellTaskEndInbox) {
         let registry = TaskRegistry::new_persistent(
             format!("terminal-test-{}", uuid::Uuid::new_v4()),
@@ -2395,10 +2479,10 @@ mod tests {
                 status,
                 output,
                 exit_code,
-                truncated,
+                omitted_bytes,
                 ..
             } = completions[0].clone();
-            notifications.push((status, output, exit_code, truncated));
+            notifications.push((status, output, exit_code, omitted_bytes));
         }
         assert_eq!(notifications[0], notifications[1]);
         assert_eq!(notifications[0].2, Some(3));
