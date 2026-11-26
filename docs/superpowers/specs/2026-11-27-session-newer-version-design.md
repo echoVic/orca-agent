@@ -26,8 +26,8 @@ Required is the default, because a forgotten flag only refuses too much, while s
    - a line is a JSON object whose `type` is not one this version knows, and which lacks `"ignorable": true` (code `unknown_record_type`, and the issue names the type);
    - or `session.meta` has a `schema_version` greater than `SESSION_SCHEMA_VERSION` (code `newer_schema_version`).
    Like `Quarantined`, it blocks resume, fork and mutation.
-2. **Its message says what to do.** For example: `this session was written by a newer version of Orca (it has a "<type>" record this version does not know); upgrade Orca to open it`. Wherever sessions are listed with their health, the TUI and the CLI show this state as newer, not damaged.
-3. **An unknown type marked `"ignorable": true` is skipped.** The session stays `Healthy`, and the records after it are read.
+2. **Its message says what to do.** For example: `this session was written by a newer version of Orca (it has a "<type>" record this version does not know); upgrade Orca to open it`. The TUI session picker labels the session **Newer version**, and the app-server listing serializes `storageHealth` as `newer_version`.
+3. **Orca v0.5.25 and later skip unknown types marked `"ignorable": true`.** The reader continues with the next record. A complete transcript needs a recognized `session.meta` record to count as `Healthy`. Releases before v0.5.25 refuse sessions containing such unknown records.
 4. **A rewrite keeps every skipped line byte for byte**, in its position among the records around it. This covers `rewrite_records_unlocked` and anything else that writes a transcript back from what it read.
 5. **`SessionMeta` accepts fields it does not know.** Drop `deny_unknown_fields`. A field a newer version adds no longer locks the session; a change older readers must refuse raises `schema_version` instead.
 6. **Unchanged:**
@@ -37,6 +37,7 @@ Required is the default, because a forgotten flag only refuses too much, while s
    - a torn last line.
    These keep their current health and code.
 7. **The rule for future record types is written down** where record types are defined (a doc comment on `SessionRecord`) and in the session docs. A new record type that older versions may safely skip must be written with `"ignorable": true`; any other new record type makes older versions refuse the session as newer.
+8. **A fork copies the conversation the current Orca can read.** Skipped records stay in the parent transcript and are omitted from the child.
 
 ## Non-goals
 
@@ -46,7 +47,7 @@ Required is the default, because a forgotten flag only refuses too much, while s
 ## Constraints
 
 - Site docs: `site/src/docs/md/en/session-commands.mdx` and `site/src/docs/md/zh/session-commands.mdx` describe session health and must gain the newer-version state. Both languages say the same thing.
-- If session health is part of a JSON output, the change is additive. That covers `orca sessions` listing output, the runtime surface and ACP. Update `docs/harness-contract.md` if it lists the healths, and run `scripts/validate-runtime-surface-contract.mjs` if a pinned surface type changes.
+- If session health is part of a JSON output, the change is additive. That covers the app-server listing's `storageHealth` field, the runtime surface and ACP. Update `docs/harness-contract.md` if it lists the healths, and run `scripts/validate-runtime-surface-contract.mjs` if a pinned surface type changes.
 
 ## Left to the builder
 

@@ -54,11 +54,14 @@ version does not recognize, the picker shows **Newer version** (`newer_version`)
 The session can be opened after upgrading Orca. In the meantime, resume, fork,
 and transcript edits are blocked.
 
-Use `"ignorable": true` on a new record type only if older Orca versions can
-safely skip it. Orca reads past unrecognized records with this flag and keeps
-their original bytes and position when it rewrites or exports the transcript.
-New record types are required by default. New fields in `session.meta` are
-accepted. Increase `schema_version` for changes that require a newer reader.
+Use `"ignorable": true` on a new record type only if readers can safely skip
+it. Orca v0.5.25 and later skip unrecognized records with this flag and keep
+their original bytes and position when rewriting or exporting the transcript.
+Releases before v0.5.25 refuse sessions containing those unrecognized records.
+A fork copies the conversation the current Orca can read. Skipped records stay
+in the parent transcript and are omitted from the child. New record types are
+required by default. New fields in `session.meta` are accepted. Increase
+`schema_version` for changes that require a newer reader.
 
 New inline images are stored by SHA-256 in the transcript's sibling
 `SESSION.jsonl.assets/` directory. Repeated uses within a session share one

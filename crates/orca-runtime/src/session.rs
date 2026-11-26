@@ -1252,6 +1252,56 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_does_not_copy_skipped_records_and_the_parent_keeps_them() {
+        use std::io::Write;
+
+        with_orca_home(|home| {
+            let mut parent = history::SessionWriter::start(home, "mock", None, "parent").unwrap();
+            parent.enter_turn(TurnId::new());
+            parent
+                .append_message(&Message::user("before skipped record".into()))
+                .unwrap();
+            let skipped =
+                b"{\"type\":\"future.note\",\"ignorable\":true,\"note\":\"parent only\"}\n";
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(parent.path())
+                .unwrap()
+                .write_all(skipped)
+                .unwrap();
+            parent
+                .append_message(&Message::user("after skipped record".into()))
+                .unwrap();
+            let original = std::fs::read(parent.path()).unwrap();
+            let parent_id = history::load_session("latest").unwrap().meta.session_id;
+            let cfg = config(home.to_path_buf(), HistoryMode::Fork(parent_id.clone()));
+
+            let mut child = InteractiveSession::new_with_preloaded(&cfg, "child", None).unwrap();
+            let child_id = child.session_id().unwrap().to_owned();
+            let child_path = child.writer_mut().unwrap().path();
+            assert_ne!(child_path, parent.path());
+            let child_jsonl = std::fs::read_to_string(child_path).unwrap();
+            assert!(!child_jsonl.contains("future.note"));
+            assert_eq!(std::fs::read(parent.path()).unwrap(), original);
+            let transcript = history::load_session(&child_id).unwrap();
+            assert_eq!(transcript.path, child_path);
+            assert_eq!(
+                transcript.meta.parent_id.as_deref(),
+                Some(parent_id.as_str())
+            );
+            let contents = transcript
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User { content, .. } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(contents, ["before skipped record", "after skipped record"]);
+        });
+    }
+
+    #[test]
     fn fork_writer_does_not_copy_parent_prompt_cache_checkpoint() {
         with_orca_home(|home| {
             let mut parent = history::SessionWriter::start(
