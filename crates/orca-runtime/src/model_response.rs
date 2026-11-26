@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use orca_core::provider_types::{ProviderResponse, ProviderStep};
+use orca_core::provider_types::{PartialReply, ProviderResponse, ProviderStep};
 use orca_core::thread_identity::TurnId;
 use orca_core::thread_item_projection::{CompletedModelResponse, ModelResponseIdentity};
 
@@ -19,6 +19,7 @@ pub struct RuntimeModelResponse {
     pub identity: ModelResponseIdentity,
     pub observation: Option<ProviderResponseObservation>,
     pub cut_short: Option<orca_core::conversation::CutShort>,
+    pub(crate) delivered: Option<PartialReply>,
 }
 
 impl RuntimeModelResponse {
@@ -28,6 +29,7 @@ impl RuntimeModelResponse {
             identity: ModelResponseIdentity::new(turn_id),
             observation: None,
             cut_short: None,
+            delivered: None,
         }
     }
 
@@ -37,6 +39,7 @@ impl RuntimeModelResponse {
             identity,
             observation: None,
             cut_short: None,
+            delivered: None,
         }
     }
 

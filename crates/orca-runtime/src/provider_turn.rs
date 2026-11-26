@@ -106,23 +106,32 @@ struct ProviderStepBatcher<'a> {
     identity: ModelResponseIdentity,
     pending: Vec<ProviderStep>,
     started_at: Instant,
+    cancel: &'a CancelToken,
+    delivered: PartialReply,
 }
 
 impl<'a> ProviderStepBatcher<'a> {
     fn new(
         ingress: Option<&'a dyn crate::runtime_surface::RuntimeProviderResponseIngress>,
         identity: &ModelResponseIdentity,
+        cancel: &'a CancelToken,
     ) -> Self {
         Self {
             ingress,
             identity: identity.clone(),
             pending: Vec::with_capacity(PROVIDER_STEP_BATCH_LIMIT),
             started_at: Instant::now(),
+            cancel,
+            delivered: PartialReply {
+                content: String::new(),
+                reasoning: None,
+            },
         }
     }
 
     fn push(&mut self, step: ProviderStep) -> io::Result<()> {
         if self.ingress.is_none() {
+            extend_partial_reply(&mut self.delivered, &step);
             return Ok(());
         }
         if self.pending.is_empty() {
@@ -152,10 +161,37 @@ impl<'a> ProviderStepBatcher<'a> {
             self.pending.clear();
             return Ok(());
         };
-        ingress.commit_provider_steps(&self.identity, &self.pending)?;
+        // Only acknowledge text that the surface accepted before cancellation.
+        match ingress.publish_provider_steps(&self.identity, &self.pending) {
+            Ok(()) => {
+                for step in &self.pending {
+                    extend_partial_reply(&mut self.delivered, step);
+                }
+            }
+            Err(error)
+                if self.cancel.is_cancelled()
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::Interrupted
+                    ) => {}
+            Err(error) => return Err(error),
+        }
         self.pending.clear();
         self.started_at = Instant::now();
         Ok(())
+    }
+}
+
+pub(crate) fn extend_partial_reply(reply: &mut PartialReply, step: &ProviderStep) {
+    match step {
+        ProviderStep::MessageDelta(text) => reply.content.push_str(text),
+        ProviderStep::ReasoningDelta(text) if !text.is_empty() => {
+            reply
+                .reasoning
+                .get_or_insert_with(String::new)
+                .push_str(text);
+        }
+        _ => {}
     }
 }
 
@@ -626,10 +662,6 @@ impl RuntimeProviderTurnStep {
         let (mut response, response_identity, delivered) = loop {
             completed_attempts = completed_attempts.saturating_add(1);
             let response_identity = ModelResponseIdentity::new(input.turn_context.turn_id.clone());
-            let mut delivered = PartialReply {
-                content: String::new(),
-                reasoning: None,
-            };
             let mut stream =
                 if crate::investigation_convergence::summary_prompt_present(&model_conversation) {
                     orca_provider::start_streaming_bounded_with_retry_budget(
@@ -653,6 +685,7 @@ impl RuntimeProviderTurnStep {
             let mut step_batcher = ProviderStepBatcher::new(
                 input.turn_context.provider_response_ingress(),
                 &response_identity,
+                input.cancel,
             );
             let response = loop {
                 match stream.recv_timeout(Duration::from_millis(10)) {
@@ -673,16 +706,6 @@ impl RuntimeProviderTurnStep {
                             if let Some(kind) = kind {
                                 first_delta = Some((elapsed_millis(request_started), kind));
                             }
-                        }
-                        match delivery.step() {
-                            ProviderStep::MessageDelta(text) => delivered.content.push_str(text),
-                            ProviderStep::ReasoningDelta(text) if !text.is_empty() => {
-                                delivered
-                                    .reasoning
-                                    .get_or_insert_with(String::new)
-                                    .push_str(text);
-                            }
-                            _ => {}
                         }
                         step_batcher.push(delivery.step().clone())?;
                         emit_provider_delta(
@@ -711,6 +734,7 @@ impl RuntimeProviderTurnStep {
                             stream,
                             input.provider_config.model.clone(),
                             response_identity,
+                            step_batcher.delivered,
                         )
                         .with_operation(
                             crate::provider_stream::SuspendedOperationHandle {
@@ -723,6 +747,7 @@ impl RuntimeProviderTurnStep {
                 }
             };
             step_batcher.flush()?;
+            let mut delivered = step_batcher.delivered;
 
             let Some(error) = response.error() else {
                 break (response, response_identity, delivered);
@@ -900,6 +925,7 @@ impl RuntimeProviderTurnStep {
 
         let mut response = RuntimeModelResponse::from_parts(response, response_identity);
         response.observation = Some(observation);
+        response.delivered = Some(delivered);
         Ok(RuntimeProviderTurnOutput::response(response))
     }
 
@@ -969,6 +995,7 @@ impl RuntimeProviderResponseStep {
             batch_child_executor,
         } = executors;
         let step_snapshot = step_context.snapshot();
+        let delivered = response.delivered.take();
         if let Some(ingress) = step_snapshot.turn_context.provider_response_ingress() {
             // The ingress answers with the names the surface recorded: a tool
             // call whose provider id the session already used is renamed there
@@ -976,13 +1003,10 @@ impl RuntimeProviderResponseStep {
             if let Err(error) = ingress.commit_response(&mut response) {
                 if error.kind() == io::ErrorKind::Interrupted
                     && step_snapshot.capabilities.cancel.is_cancelled()
-                    && let Some(content) = response.response.assistant_content.take()
+                    && let Some(delivered) = delivered
                 {
                     record_cut_short_reply(
-                        PartialReply {
-                            content,
-                            reasoning: response.response.assistant_reasoning.take(),
-                        },
+                        delivered,
                         &response.identity,
                         CutShort::Interrupted,
                         &step_snapshot.turn_context,
@@ -1266,20 +1290,9 @@ fn record_cut_short_reply<W: io::Write>(
     events: &mut EventFactory,
     sink: &mut EventSink<W>,
 ) -> io::Result<()> {
-    if partial.content.trim().is_empty() {
+    let Some(mut response) = cut_short_response(partial, identity, reason) else {
         return Ok(());
-    }
-    let mut response = RuntimeModelResponse::from_parts(
-        ProviderResponse {
-            steps: Vec::new(),
-            assistant_content: Some(partial.content),
-            assistant_reasoning: partial.reasoning,
-            tool_calls: Vec::new(),
-            usage: None,
-        },
-        identity.clone(),
-    );
-    response.cut_short = Some(reason);
+    };
     if let Some(ingress) = turn_context.provider_response_ingress() {
         match ingress.commit_response(&mut response) {
             Ok(()) => {}
@@ -1292,6 +1305,28 @@ fn record_cut_short_reply<W: io::Write>(
         sink.emit(events.model_response_completed(&completed))?;
     }
     record_assistant_response_for_agent(conversation, &completed, false, events, sink)
+}
+
+pub(crate) fn cut_short_response(
+    partial: PartialReply,
+    identity: &ModelResponseIdentity,
+    reason: CutShort,
+) -> Option<RuntimeModelResponse> {
+    if partial.content.trim().is_empty() {
+        return None;
+    }
+    let mut response = RuntimeModelResponse::from_parts(
+        ProviderResponse {
+            steps: Vec::new(),
+            assistant_content: Some(partial.content),
+            assistant_reasoning: partial.reasoning,
+            tool_calls: Vec::new(),
+            usage: None,
+        },
+        identity.clone(),
+    );
+    response.cut_short = Some(reason);
+    Some(response)
 }
 
 fn record_provider_retry<W: io::Write>(
@@ -1510,7 +1545,8 @@ mod tests {
     fn provider_step_batcher_commits_at_the_limit_and_flushes_the_tail() {
         let ingress = RecordingProviderStepIngress::default();
         let identity = response_identity();
-        let mut batcher = ProviderStepBatcher::new(Some(&ingress), &identity);
+        let cancel = CancelToken::new();
+        let mut batcher = ProviderStepBatcher::new(Some(&ingress), &identity, &cancel);
 
         for index in 0..PROVIDER_STEP_BATCH_LIMIT - 1 {
             batcher

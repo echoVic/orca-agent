@@ -3,8 +3,11 @@ use std::io;
 
 use orca_tools::registry::ToolRegistry;
 
-use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
-use orca_core::provider_types::ProviderStep;
+use orca_core::proposed_plan::{
+    PROPOSED_PLAN_CLOSE, PROPOSED_PLAN_OPEN, ProposedPlanSegment, ProposedPlanStreamParser,
+    message_text_before_plan,
+};
+use orca_core::provider_types::{PartialReply, ProviderStep};
 use orca_core::thread_item_projection::{CompletedModelItem, ModelResponseIdentity};
 
 use crate::model_response::RuntimeModelResponse;
@@ -24,6 +27,45 @@ struct PendingPlanSplit {
 pub(crate) struct ProviderStepProjection {
     pub(crate) events: Vec<(surface::SurfaceScope, surface::SurfaceEvent)>,
     pub(crate) background_fence: Option<surface::SurfaceBackgroundFence>,
+}
+
+pub(crate) fn published_reply_prefix(
+    snapshot: &surface::SurfaceSnapshot,
+    fence: &surface::SurfaceOperationFence,
+    identity: &ModelResponseIdentity,
+    raw_content: &str,
+) -> PartialReply {
+    let published_text = |item_id: &surface::SurfaceItemId| {
+        snapshot
+            .assistant_streams
+            .iter()
+            .find(|stream| {
+                &stream.fence == fence
+                    && &stream.item_id == item_id
+                    && stream.state == surface::SurfaceAssistantStreamState::Open
+            })
+            .map(|stream| stream.text.as_str())
+            .filter(|text| !text.is_empty())
+    };
+    let mut content = published_text(identity.item_ids.agent_message_item_id())
+        .unwrap_or_default()
+        .to_string();
+    if let Some(plan) = published_text(&identity.item_ids.plan_item_id) {
+        let before =
+            message_text_before_plan(raw_content).map(|text| surface_persisted_display_text(&text));
+        let offset = before
+            .as_ref()
+            .filter(|text| content.starts_with(text.as_str()))
+            .map_or(content.len(), |text| text.as_str().len());
+        content.insert_str(
+            offset,
+            &format!("{PROPOSED_PLAN_OPEN}\n{plan}{PROPOSED_PLAN_CLOSE}"),
+        );
+    }
+    PartialReply {
+        content,
+        reasoning: published_text(&identity.item_ids.reasoning_item_id).map(str::to_owned),
+    }
 }
 
 #[derive(Default)]

@@ -39,6 +39,9 @@ DeepSeek's harness keeps the delivered part. On cancel it saves the delivered te
 
 ## Non-goals
 
+- Background cancellation keeps the prefix published before the handoff. Tracking
+  additional streamed text from a background task that is later foregrounded
+  requires publication acknowledgements across background ownership changes.
 - No automatic continuation after the output limit.
 - No change to cancel semantics, exit codes, or the `Cancelled` and `Failed` terminals.
 

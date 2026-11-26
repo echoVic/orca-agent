@@ -2041,13 +2041,38 @@ impl ThreadActor {
             ));
         }
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let mut response =
+            if response.cut_short == Some(orca_core::conversation::CutShort::Interrupted) {
+                let partial = published_reply_prefix(
+                    &snapshot,
+                    &fence,
+                    &response.identity,
+                    response
+                        .response
+                        .assistant_content
+                        .as_deref()
+                        .unwrap_or_default(),
+                );
+                crate::provider_turn::cut_short_response(
+                    partial,
+                    &response.identity,
+                    orca_core::conversation::CutShort::Interrupted,
+                )
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "cancelled before publishing assistant text",
+                    )
+                })?
+            } else {
+                response.clone()
+            };
         // A tool-call id only has to be unique inside one response, but the
         // surface keys a tool by its id for the whole session. Rename the calls
         // that reuse an id from an *earlier* response (a provider deriving ids
         // deterministically, a relay, or a replayed turn) before they reach the
         // reducer, and hand the renamed response back so the conversation and
         // the tool results use the same names (issue #67).
-        let mut response = response.clone();
         rename_tool_calls_held_by_earlier_responses(&snapshot, &mut response)?;
         let events = self
             .generation_context_controller

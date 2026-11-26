@@ -802,7 +802,26 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
         record_child_provider_usage(response.usage, child_cost_tracker, observer)?;
     }
 
-    handle_child_agent_provider_error(config, setup, cwd, hooks, response)
+    let decision = handle_child_agent_provider_error(config, setup, cwd, hooks, response)?;
+    if matches!(decision, Some(ChildAgentProviderErrorDecision::Fail(_)))
+        && let Some(partial) = response
+            .error()
+            .and_then(|error| error.partial_reply.as_ref())
+        && !partial.content.trim().is_empty()
+    {
+        setup.conversation.internal_context.note_assistant_turn();
+        setup
+            .conversation
+            .messages
+            .push(orca_core::conversation::Message::Assistant {
+                content: Some(partial.content.clone()),
+                reasoning_content: partial.reasoning.clone(),
+                tool_calls: Vec::new(),
+                cut_short: Some(orca_core::conversation::CutShort::OutputLimit),
+                pinned: false,
+            });
+    }
+    Ok(decision)
 }
 
 fn record_child_provider_usage(

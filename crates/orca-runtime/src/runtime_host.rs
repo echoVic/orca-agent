@@ -75,7 +75,7 @@ use crate::runtime_actor::commit::{
     SurfaceCommitEffect, SurfaceCommitResolution, SurfaceCommitRetryKey,
 };
 use crate::runtime_actor::generation_context::{
-    GenerationContextController, build_background_provider_response_events,
+    GenerationContextController, build_background_provider_response_events, published_reply_prefix,
     records_request_action_and_target, rename_tool_calls_held_by_earlier_responses,
 };
 use crate::runtime_actor::goal::{
@@ -1939,6 +1939,27 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
         )
         .map_err(surface_semantic_ingress_send_error)?;
         Ok(())
+    }
+
+    fn publish_provider_steps(
+        &self,
+        identity: &ModelResponseIdentity,
+        steps: &[ProviderStep],
+    ) -> io::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        send_thread_command_retrying_full(
+            &self.command_tx,
+            ThreadCommand::SurfaceCommitProviderStep {
+                fence: self.fence.clone(),
+                identity: identity.clone(),
+                steps: steps.to_vec(),
+                reply: Some(reply_tx),
+            },
+        )
+        .map_err(surface_semantic_ingress_send_error)?;
+        reply_rx
+            .recv()
+            .map_err(|_| surface_semantic_ingress_ack_error())?
     }
 
     fn commit_tool_results(&self, results: &[orca_core::tool_types::ToolResult]) -> io::Result<()> {
@@ -21829,7 +21850,7 @@ impl ThreadActor {
 
         let mut result = result.expect("provider-suspended result was matched");
         let GenerationTaskOutcome::Executed(ThreadOperationOutcome::ProviderSuspended {
-            suspension,
+            mut suspension,
             ..
         }) = result.outcome
         else {
@@ -21852,6 +21873,12 @@ impl ThreadActor {
                 .send(Err(surface::SurfaceClientCommandError::Unauthorized));
             return self.finish_generation(active, Ok(result), false);
         }
+        suspension.delivered = published_reply_prefix(
+            self.resident_surface.coordinator.state().snapshot(),
+            &fence,
+            suspension.identity(),
+            &suspension.delivered.content,
+        );
         let task_id = active.main_session_task_id.clone().ok_or_else(|| {
             RuntimeHostError::ThreadStartFailed {
                 message: "typed background transfer lacks a main-session task".to_string(),
@@ -23797,7 +23824,7 @@ fn run_provider_background_task(
     let mut status = RunStatus::Failed;
     let mut error = None;
 
-    if cancelled {
+    if cancelled || cancel.is_cancelled() || context.task_registry.is_cancelled(&context.task_id) {
         status = RunStatus::Cancelled;
     } else if disconnected {
         error = Some("provider stream ended without a response".to_string());
@@ -23811,6 +23838,7 @@ fn run_provider_background_task(
         }
     }
 
+    let was_cancelled = status == RunStatus::Cancelled;
     if status == RunStatus::Failed
         && let Some(response) = response.as_mut()
         && let Some(partial) = response
@@ -23822,11 +23850,6 @@ fn run_provider_background_task(
         response.response.assistant_reasoning = partial.reasoning;
         response.response.tool_calls.clear();
         response.cut_short = Some(orca_core::conversation::CutShort::OutputLimit);
-        if let Err(error) =
-            observe_event(None, events.model_response_completed(&response.completed()))
-        {
-            tracing::warn!(%error, "failed to record the cut-short background reply");
-        }
     }
 
     // The suspended operation settles against its authoritative journal:
@@ -23858,6 +23881,21 @@ fn run_provider_background_task(
                 ));
             }
         }
+    }
+
+    if was_cancelled {
+        response = crate::provider_turn::cut_short_response(
+            suspension.delivered,
+            &context.response_identity,
+            orca_core::conversation::CutShort::Interrupted,
+        );
+    }
+    if let Some(response) = &response
+        && response.cut_short.is_some()
+        && let Err(error) =
+            observe_event(None, events.model_response_completed(&response.completed()))
+    {
+        tracing::warn!(%error, "failed to record the cut-short background reply");
     }
 
     if let Some(surface_outcome) = context.surface_outcome {
@@ -31433,7 +31471,7 @@ mod tests {
                 length: false,
             },
             1,
-            Some(("First point", Some("Thinking"), "interrupted")),
+            Some(("First point.", Some("Thinking"), "interrupted")),
         );
     }
 
@@ -31448,11 +31486,7 @@ mod tests {
 
     #[test]
     fn kept_a_double_cancel_keeps_the_reply_once() {
-        assert_kept_reply(
-            KeptReplyFixture::Mock("mock_stream_delay_ms 30000"),
-            2,
-            Some(("Mock slow stream started.", None, "interrupted")),
-        );
+        assert_cancel_while_second_delta_is_pending(true);
     }
 
     #[test]
@@ -31465,6 +31499,135 @@ mod tests {
             0,
             Some(("First point", Some("Thinking"), "output_limit")),
         );
+    }
+
+    #[test]
+    fn a_background_turn_cancelled_after_text_keeps_it() {
+        assert_kept_reply(
+            KeptReplyFixture::BackgroundCancelled,
+            1,
+            Some(("First point.", Some("Thinking"), "interrupted")),
+        );
+    }
+
+    #[test]
+    fn a_cancel_between_delta_batches_keeps_the_published_prefix() {
+        assert_cancel_while_second_delta_is_pending(false);
+    }
+
+    fn assert_cancel_while_second_delta_is_pending(cancel_twice: bool) {
+        #[derive(Debug)]
+        struct HoldSecondBatch {
+            reached: mpsc::SyncSender<bool>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl surface::RuntimeProviderResponseIngress for HoldSecondBatch {
+            fn commit_response(&self, _: &mut RuntimeModelResponse) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn commit_provider_step(
+                &self,
+                _: &ModelResponseIdentity,
+                step: &ProviderStep,
+            ) -> io::Result<()> {
+                if let ProviderStep::MessageDelta(text) = step {
+                    let second = text.ends_with("completed.");
+                    self.reached.send(second).unwrap();
+                    if second {
+                        self.release
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(SURFACE_TEST_TIMEOUT)
+                            .unwrap();
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "turn was cancelled",
+                        ));
+                    }
+                }
+                Ok(())
+            }
+
+            fn commit_tool_results(&self, _: &[ToolResult]) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let cwd = tempfile::tempdir().unwrap();
+        let marker = cwd.path().join("send-second-delta");
+        let host = RuntimeHost::start().unwrap();
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "cancel between batches",
+            )
+            .unwrap();
+        let (reached, batches) = mpsc::sync_channel(1);
+        let (resume, release) = mpsc::channel();
+        let ingress = Arc::new(HoldSecondBatch {
+            reached,
+            release: Mutex::new(release),
+        });
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new(format!("mock_stream_release_marker {}", marker.display()))
+                    .with_generation_handlers(move |_, _| {
+                        HostedGenerationHandlers::default()
+                            .with_provider_response_ingress(ingress.clone())
+                    }),
+                io::sink(),
+            )
+            .unwrap();
+        assert!(!batches.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap());
+        std::fs::write(&marker, "").unwrap();
+        assert!(batches.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap());
+        assert!(matches!(
+            operation.interrupt().unwrap(),
+            InterruptOperationResult::Requested { .. }
+        ));
+        if cancel_twice {
+            assert!(matches!(
+                operation.interrupt().unwrap(),
+                InterruptOperationResult::AlreadyRequested { .. }
+            ));
+        }
+        resume.send(()).unwrap();
+        let terminal = operation.wait_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        assert_eq!(
+            terminal.outcome(),
+            &OperationOutcome::Completed(RunStatus::Cancelled)
+        );
+        let transcript = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap();
+        let replies: Vec<_> = transcript
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant {
+                    content, cut_short, ..
+                } => Some((content.as_deref(), *cut_short)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            [(
+                Some("Mock release-marker stream started."),
+                Some(orca_core::conversation::CutShort::Interrupted)
+            )]
+        );
+        assert_eq!(
+            transcript
+                .semantic_events
+                .iter()
+                .filter(|event| event.payload.get("cut_short").is_some())
+                .count(),
+            1
+        );
+        host.shutdown().unwrap();
     }
 
     #[test]
@@ -31588,10 +31751,21 @@ mod tests {
         assert!(previous_batch.is_some());
     }
 
+    #[test]
+    fn a_cancelled_reply_keeps_only_the_text_published_before_a_pending_plan() {
+        assert_kept_reply(
+            KeptReplyFixture::PendingPlanOnCancel,
+            1,
+            Some(("First point.", Some("Thinking"), "interrupted")),
+        );
+    }
+
     enum KeptReplyFixture {
         Mock(&'static str),
         DeepSeek { partial_tool: bool, length: bool },
         BackgroundAtLimit,
+        BackgroundCancelled,
+        PendingPlanOnCancel,
     }
 
     fn assert_kept_reply(
@@ -31614,16 +31788,28 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
         let (release, hold) = mpsc::channel();
-        let background = matches!(fixture, KeptReplyFixture::BackgroundAtLimit);
+        let background = matches!(
+            fixture,
+            KeptReplyFixture::BackgroundAtLimit | KeptReplyFixture::BackgroundCancelled
+        );
         let (prompt, server) = match fixture {
             KeptReplyFixture::Mock(prompt) => (prompt, None),
-            KeptReplyFixture::DeepSeek { .. } | KeptReplyFixture::BackgroundAtLimit => {
+            KeptReplyFixture::DeepSeek { .. }
+            | KeptReplyFixture::BackgroundAtLimit
+            | KeptReplyFixture::BackgroundCancelled
+            | KeptReplyFixture::PendingPlanOnCancel => {
                 let (partial_tool, length) = match fixture {
                     KeptReplyFixture::DeepSeek {
                         partial_tool,
                         length,
                     } => (partial_tool, length),
-                    _ => (true, true),
+                    KeptReplyFixture::BackgroundAtLimit => (true, true),
+                    _ => (true, false),
+                };
+                let text = match fixture {
+                    KeptReplyFixture::PendingPlanOnCancel => "First point.<proposed_plan>pending",
+                    _ if length => "First point",
+                    _ => "First point.",
                 };
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 config.provider = ProviderKind::DeepSeek;
@@ -31659,7 +31845,9 @@ mod tests {
                     if partial_tool {
                         body.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"task_list\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\n");
                     }
-                    body.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"First point\"},\"finish_reason\":null}]}\n\n");
+                    body.push_str(&format!("data: {}\n\n", serde_json::json!({
+                        "choices": [{ "delta": { "content": text }, "finish_reason": null }]
+                    })));
                     if length && !background {
                         body.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n");
                     }
@@ -31667,7 +31855,7 @@ mod tests {
                     if !length || background {
                         let _ = hold.recv_timeout(SURFACE_TEST_TIMEOUT);
                     }
-                    if background {
+                    if background && length {
                         stream.write_all(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n").unwrap();
                     }
                 });
@@ -31714,7 +31902,9 @@ mod tests {
                         )
                         .unwrap(),
                 );
-                release.send(()).unwrap();
+                if cancels == 0 {
+                    release.send(()).unwrap();
+                }
             }
             for n in 0..cancels {
                 let result = attachment
@@ -43735,6 +43925,12 @@ mod tests {
             if response.cut_short.is_some() {
                 return Ok(());
             }
+            response
+                .response
+                .assistant_content
+                .as_mut()
+                .unwrap()
+                .push_str(" unpublished suffix");
             self.cancel.cancel();
             Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -43767,11 +43963,13 @@ mod tests {
             .expect("start thread");
         let operation = thread
             .start_turn(
-                HostedTurnRequest::new("hello").with_generation_handlers(|_, cancel| {
-                    HostedGenerationHandlers::default().with_provider_response_ingress(Arc::new(
-                        TerminalizingProviderResponseIngress { cancel },
-                    ))
-                }),
+                HostedTurnRequest::new("mock_stream_delay_ms 5").with_generation_handlers(
+                    |_, cancel| {
+                        HostedGenerationHandlers::default().with_provider_response_ingress(
+                            Arc::new(TerminalizingProviderResponseIngress { cancel }),
+                        )
+                    },
+                ),
                 io::sink(),
             )
             .expect("start turn");
@@ -43788,7 +43986,7 @@ mod tests {
             .load_session(thread.thread_id())
             .unwrap();
         assert_eq!(transcript.messages.iter().filter(|message| matches!(message,
-            Message::Assistant { content: Some(_), cut_short: Some(orca_core::conversation::CutShort::Interrupted), tool_calls, .. } if tool_calls.is_empty()
+            Message::Assistant { content: Some(text), cut_short: Some(orca_core::conversation::CutShort::Interrupted), tool_calls, .. } if text == "Mock slow stream started.Mock slow stream completed." && tool_calls.is_empty()
         )).count(), 1);
         host.shutdown().expect("shutdown host");
     }

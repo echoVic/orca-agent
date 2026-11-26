@@ -148,6 +148,13 @@ pub trait RuntimeProviderResponseIngress: Send + Sync + std::fmt::Debug {
         }
         Ok(())
     }
+    fn publish_provider_steps(
+        &self,
+        identity: &ModelResponseIdentity,
+        steps: &[ProviderStep],
+    ) -> io::Result<()> {
+        self.commit_provider_steps(identity, steps)
+    }
     fn commit_tool_results(&self, results: &[ToolResult]) -> io::Result<()>;
     /// What a running tool wrote for the person watching, recorded as it is
     /// written so a surface can show it before the tool ends. It is the
