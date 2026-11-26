@@ -34,6 +34,7 @@ pub enum StoredSessionHealth {
     RecoverableTail,
     Quarantined,
     InspectionLimited,
+    NewerVersion,
 }
 
 impl StoredSessionHealth {
@@ -43,6 +44,7 @@ impl StoredSessionHealth {
             Self::RecoverableTail => "recoverable_tail",
             Self::Quarantined => "quarantined",
             Self::InspectionLimited => "inspection_limited",
+            Self::NewerVersion => "newer_version",
         }
     }
 
@@ -53,7 +55,7 @@ impl StoredSessionHealth {
     pub fn blocks_mutation(self) -> bool {
         // A partial inspection is not proof of corruption. Resume performs
         // its own complete streaming validation before allowing mutation.
-        matches!(self, Self::Quarantined)
+        matches!(self, Self::Quarantined | Self::NewerVersion)
     }
 }
 
@@ -66,6 +68,8 @@ pub struct StoredSessionHealthIssue {
     pub line: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_type: Option<String>,
 }
 
 /// Durable identity for a thread that executes a subagent task.
@@ -83,7 +87,6 @@ pub struct StoredAgentScope {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct SessionMeta {
     pub schema_version: u32,
     pub session_id: String,
@@ -112,6 +115,9 @@ pub struct SessionMeta {
     pub metadata_writable_directories: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+    /// Fields written by newer versions are carried through transcript rewrites.
+    #[serde(flatten)]
+    pub additional_fields: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -189,6 +195,8 @@ pub(crate) struct ManualCompactionDurableSnapshot {
     pub conversation: orca_core::conversation::Conversation,
 }
 
+/// Write `"ignorable": true` on a new record type only when older Orca versions
+/// can safely skip it. Other new types require a newer Orca to open the session.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum SessionRecord {
@@ -299,6 +307,12 @@ pub(crate) enum SessionRecord {
     /// conversation.
     #[serde(rename = "session.snapshot_retention")]
     SnapshotRetention(SnapshotRetentionRecord),
+    /// The original JSONL bytes of a record the reader can skip.
+    #[serde(skip)]
+    Ignorable(Vec<u8>),
+    /// Serde fallback so new types are recognized from this enum's own tags.
+    #[serde(other, skip_serializing)]
+    Unrecognized,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -58,6 +58,7 @@ impl fmt::Debug for PrestartedMcp {
 pub(crate) fn start_prestart_mcp(
     configs: &[McpServerConfig],
     credentials_path: Option<PathBuf>,
+    external_tools: usize,
     event_tx: mpsc::Sender<TuiEvent>,
 ) -> Option<PrestartedMcp> {
     if configs.is_empty() {
@@ -67,6 +68,7 @@ pub(crate) fn start_prestart_mcp(
     let report = Arc::new(PrestartReport {
         event_tx,
         startup_reported: Mutex::new(false),
+        external_tools,
     });
     // It holds no registry: the subscription must not keep the servers.
     let subscription = registry.subscribe(Arc::new({
@@ -88,6 +90,7 @@ struct PrestartReport {
     /// the servers are read and sent, so that what is sent last was read
     /// last: changes are told on whichever thread made them.
     startup_reported: Mutex<bool>,
+    external_tools: usize,
 }
 
 impl PrestartReport {
@@ -107,7 +110,10 @@ impl PrestartReport {
         // shows each warning once.
         if !*startup_reported && registry.startup_statuses().is_some() {
             *startup_reported = true;
-            for warning in orca_runtime::mcp_startup_warnings(registry) {
+            for warning in orca_runtime::mcp_startup_warnings_with_external_tools(
+                registry,
+                self.external_tools,
+            ) {
                 let _ = self.event_tx.send(TuiEvent::StartupWarning(warning));
             }
         }
@@ -193,7 +199,7 @@ mod tests {
     fn no_configured_server_starts_nothing() {
         let (event_tx, events) = crossbeam_channel::unbounded();
 
-        assert!(start_prestart_mcp(&[], None, event_tx).is_none());
+        assert!(start_prestart_mcp(&[], None, 0, event_tx).is_none());
         assert!(events.try_recv().is_err());
     }
 
@@ -210,7 +216,7 @@ mod tests {
 
         // The panel lists it from launch, as the thread's catalog will,
         // though nothing connects.
-        let prestarted = start_prestart_mcp(std::slice::from_ref(&archive), None, event_tx)
+        let prestarted = start_prestart_mcp(std::slice::from_ref(&archive), None, 0, event_tx)
             .expect("a configured server is listed before the first message");
         assert!(!prestarted.registry().is_starting());
         let mut state = app_state();
@@ -306,7 +312,7 @@ mod tests {
             let fixture = tempfile::tempdir().unwrap();
             let (event_tx, events) = crossbeam_channel::unbounded();
             let prestarted =
-                start_prestart_mcp(&[mcp_server("docs", fixture.path(), 0)], None, event_tx)
+                start_prestart_mcp(&[mcp_server("docs", fixture.path(), 0)], None, 0, event_tx)
                     .expect("an enabled server starts with the TUI");
             let mut state = app_state();
 
@@ -627,7 +633,7 @@ mod tests {
             let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
             let control = TuiSurfaceTaskControl::new();
             let (event_tx, _events) = crossbeam_channel::unbounded();
-            let prestarted = start_prestart_mcp(&config.mcp_servers, None, event_tx.clone())
+            let prestarted = start_prestart_mcp(&config.mcp_servers, None, 0, event_tx.clone())
                 .expect("an enabled server starts with the TUI");
             let registry = prestarted.registry().clone();
             control.set_prestart_mcp(prestarted);

@@ -1,11 +1,66 @@
 use serde_json::{Value, json};
 
+pub const DEEPSEEK_MAX_TOOLS: usize = 128;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProviderToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
     pub strict_capable: bool,
+}
+
+/// Keeps non-MCP tools first, then MCP tools by name, preserving survivor order.
+/// When the caller has no tool source, names beginning with `mcp__` count as MCP.
+pub fn limit_tool_definitions(
+    definitions: &mut Vec<ProviderToolDefinition>,
+    max: usize,
+) -> Vec<String> {
+    limit_tool_definitions_by_source(definitions, max, |_| None)
+}
+
+pub fn limit_tool_definitions_by_source(
+    definitions: &mut Vec<ProviderToolDefinition>,
+    max: usize,
+    is_mcp: impl Fn(&str) -> Option<bool>,
+) -> Vec<String> {
+    limit_tools(definitions, max, |tool| &tool.name, is_mcp)
+}
+
+pub(crate) fn limit_tools_by_name<T>(
+    tools: &mut Vec<T>,
+    max: usize,
+    name: impl Fn(&T) -> &str,
+) -> Vec<String> {
+    limit_tools(tools, max, name, |_| None)
+}
+
+fn limit_tools<T>(
+    tools: &mut Vec<T>,
+    max: usize,
+    name: impl Fn(&T) -> &str,
+    is_mcp: impl Fn(&str) -> Option<bool>,
+) -> Vec<String> {
+    if tools.len() <= max {
+        return Vec::new();
+    }
+    let mut ranked = tools.iter().map(&name).enumerate().collect::<Vec<_>>();
+    ranked.sort_by_cached_key(|&(_, name)| {
+        (
+            is_mcp(name).unwrap_or_else(|| name.starts_with("mcp__")),
+            name,
+        )
+    });
+    let mut keep = vec![true; tools.len()];
+    let mut removed = Vec::with_capacity(tools.len() - max);
+    for (index, name) in ranked.into_iter().skip(max) {
+        keep[index] = false;
+        removed.push(name.to_owned());
+    }
+    let mut keep = keep.into_iter();
+    tools.retain(|_| keep.next().expect("one decision per tool"));
+    removed.sort_unstable();
+    removed
 }
 
 pub fn deepseek_tools_schema(definitions: &[ProviderToolDefinition]) -> Vec<Value> {
@@ -170,6 +225,66 @@ mod tests {
             }),
             strict_capable,
         }
+    }
+
+    #[test]
+    fn limit_keeps_every_builtin_tool_and_drops_mcp_tools_past_the_limit() {
+        let builtins = (0..30).map(|i| format!("b{i:02}")).collect::<Vec<_>>();
+        let mcp = (0..110)
+            .map(|i| format!("mcp__srv__t{i:03}"))
+            .collect::<Vec<_>>();
+        let mut defs = mcp
+            .iter()
+            .chain(&builtins)
+            .rev()
+            .map(|name| named_definition(name, false))
+            .collect::<Vec<_>>();
+        let original = defs.clone();
+
+        assert_eq!(limit_tool_definitions(&mut defs, 128), mcp[98..]);
+        assert_eq!(
+            defs,
+            original
+                .into_iter()
+                .filter(|tool| { builtins.contains(&tool.name) || mcp[..98].contains(&tool.name) })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn limit_leaves_a_list_under_the_limit_unchanged() {
+        let mut defs = ["z", "mcp__srv__z", "a", "mcp__srv__a", "b"]
+            .map(|name| named_definition(name, false))
+            .to_vec();
+        let original = defs.clone();
+
+        assert!(limit_tool_definitions(&mut defs, 128).is_empty());
+        assert_eq!(defs, original);
+    }
+
+    #[test]
+    fn limit_truncates_builtins_only_when_they_alone_exceed_the_limit() {
+        let builtins = (0..130).map(|i| format!("b{i:03}")).collect::<Vec<_>>();
+        let mcp = (0..3).map(|i| format!("mcp__srv__t{i:03}"));
+        let mut defs = mcp
+            .chain(builtins.iter().rev().cloned())
+            .map(|name| named_definition(&name, false))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            limit_tool_definitions(&mut defs, 128),
+            [
+                "b128",
+                "b129",
+                "mcp__srv__t000",
+                "mcp__srv__t001",
+                "mcp__srv__t002"
+            ]
+        );
+        assert_eq!(
+            defs.iter().map(|tool| &tool.name).collect::<Vec<_>>(),
+            builtins[..128].iter().rev().collect::<Vec<_>>()
+        );
     }
 
     #[test]

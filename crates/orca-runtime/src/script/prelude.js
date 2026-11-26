@@ -1,4 +1,4 @@
-(function (startCall, finish, firstLineShift) {
+(function (startCall, finish, __orcaLogLine, logBudget, firstLineShift) {
   "use strict";
 
   // A function set here is handed the frames of the calls beneath the error,
@@ -14,6 +14,9 @@
   // Taken before the script runs: a script that replaces these breaks only
   // what it does with them itself.
   const { stringify } = JSON;
+  const slice = Function.prototype.call.bind(String.prototype.slice);
+  const charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
+  const toWellFormed = Function.prototype.call.bind(String.prototype.toWellFormed);
   const RealmPromise = Promise;
   const RealmError = Error;
   const RealmTypeError = TypeError;
@@ -48,7 +51,21 @@
   }
 
   function log(...values) {
-    logged.push(values.map((value) => show(value)).join(" "));
+    const line = values.length === 1 ? show(values[0]) : values.map((value) => show(value)).join(" ");
+    if (logBudget > 0) {
+      let end = logBudget;
+      if (end < line.length) {
+        const last = charCodeAt(line, end - 1);
+        const next = charCodeAt(line, end);
+        if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+          end -= 1;
+        }
+      }
+      // Replace unmatched surrogates in the bounded prefix before passing it to Rust.
+      const prefix = toWellFormed(slice(line, 0, end));
+      logBudget = __orcaLogLine(prefix);
+    }
+    logged.push(line);
   }
 
   // An error as the model should read it: what it is, and where in the script.

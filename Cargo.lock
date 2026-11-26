@@ -2593,6 +2593,7 @@ dependencies = [
  "tempfile",
  "tiktoken-rs",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

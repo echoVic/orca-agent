@@ -126,6 +126,12 @@ fn session_actions(state: &AppState, selector: &str) -> Vec<SessionPickerAction>
 }
 
 fn blocked_storage_message(session: &SessionSummary) -> String {
+    if session.health == StoredSessionHealth::NewerVersion {
+        return format!(
+            "Session '{}' was written by a newer version of Orca. Upgrade Orca to open it.",
+            session.title
+        );
+    }
     format!(
         "Session '{}' is {:?}; resume, fork, and rename are disabled. Copy, archive, or delete the source instead.",
         session.title, session.health

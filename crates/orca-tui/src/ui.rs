@@ -1343,10 +1343,12 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
                     )
                 };
                 if session.health != StoredSessionHealth::Healthy {
-                    line.spans.push(Span::styled(
-                        format!("  [{:?}]", session.health),
-                        Style::default().fg(theme.error),
-                    ));
+                    let label = match session.health {
+                        StoredSessionHealth::NewerVersion => "  [Newer version]".to_string(),
+                        health => format!("  [{health:?}]"),
+                    };
+                    line.spans
+                        .push(Span::styled(label, Style::default().fg(theme.error)));
                 }
                 lines.push(line);
 

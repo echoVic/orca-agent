@@ -316,6 +316,7 @@ pub const GOAL_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const PLAN_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const SKILL_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const MEMORY_CONTEXT_MAX_TOKENS: usize = 3_072;
+pub const MCP_CONTEXT_MAX_TOKENS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -510,6 +511,8 @@ impl fmt::Debug for ProviderRequestCapture {
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub internal_context: InternalContext,
+    /// Per-server guidance for the current tool set, sent in its own request message.
+    pub mcp_instructions: Vec<(String, String)>,
     pub rolling_summary: Option<String>,
     pub summary: SummaryState,
     /// Not persisted: a resumed conversation measures from a full estimate
@@ -530,6 +533,7 @@ impl Clone for Conversation {
         Self {
             messages: self.messages.clone(),
             internal_context: self.internal_context.clone(),
+            mcp_instructions: self.mcp_instructions.clone(),
             rolling_summary: self.rolling_summary.clone(),
             summary: self.summary.clone(),
             usage_anchor: self.usage_anchor,
@@ -548,6 +552,7 @@ impl Conversation {
         Self {
             messages: Vec::new(),
             internal_context: InternalContext::default(),
+            mcp_instructions: Vec::new(),
             rolling_summary: None,
             summary: SummaryState::default(),
             usage_anchor: None,

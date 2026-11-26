@@ -1327,6 +1327,9 @@ mod replay_compaction {
         let mut provider = server.config();
         provider.model = Some(orca_core::model::FLASH_MODEL.to_string());
         let mut conversation = conversation_with_historical_tool_image();
+        conversation.replace_plan_state("plan overlay".to_string());
+        conversation.mcp_instructions =
+            vec![("notes".to_string(), "Use search before fetch.".to_string())];
         let config = wide_config();
         let image = conversation
             .messages
@@ -1362,7 +1365,15 @@ mod replay_compaction {
         );
         let requests = server.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
+        let ordinary = &requests[0].messages;
+        assert_eq!(ordinary[ordinary.len() - 2].text(), "plan overlay");
+        let guidance = ordinary.last().unwrap();
+        assert_eq!(guidance.role, "system");
+        assert!(guidance.text().contains(
+            "<mcp_server_instructions server=\"notes\">\nUse search before fetch.\n</mcp_server_instructions>"
+        ));
         let replay = &requests[1].messages[..requests[1].messages.len() - 1];
+        assert!(replay.len() <= ordinary.len() - 2);
         assert!(
             requests[1].wire_messages[..replay.len()]
                 .iter()
@@ -1373,6 +1384,10 @@ mod replay_compaction {
             replay
                 .iter()
                 .any(|message| message.role == "tool" && message.content.is_array())
+        );
+        assert_eq!(
+            result.conversation.mcp_instructions,
+            conversation.mcp_instructions
         );
     }
 
