@@ -109,9 +109,10 @@ pub(crate) fn record(
     config: &ProviderConfig,
     model: &str,
     messages: &[ApiMessage],
+    recovery_edit: Option<usize>,
     tools: &[Value],
 ) {
-    let source_messages = if let Some(source) = conversation.provider_request_source() {
+    let mut source_messages = if let Some(source) = conversation.provider_request_source() {
         source.to_vec()
     } else {
         let mut source = conversation.messages.clone();
@@ -124,6 +125,13 @@ pub(crate) fn record(
     };
     let summary = conversation.summary.clone();
     let summary_count = usize::from(summary.baseline.is_some()) + summary.deltas.len();
+    if let Some(edited_index) = recovery_edit {
+        // The summary is serialized ahead of every user message.
+        let Some(unchanged_transcript_messages) = edited_index.checked_sub(summary_count) else {
+            return;
+        };
+        source_messages.truncate(unchanged_transcript_messages);
+    }
     // The mapped transcript and summary end before the request's trailing
     // internal context and any other request-only suffix.
     let Some(messages) = messages.get(..source_messages.len() + summary_count) else {

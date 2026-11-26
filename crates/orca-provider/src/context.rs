@@ -1006,8 +1006,11 @@ pub fn summarize_range(
         &rendered,
         output_tokens,
         cancel,
-        &mut requests_left,
-        &mut observation,
+        &mut SummaryRequests {
+            left: &mut requests_left,
+            observation: &mut observation,
+            settle_usage: &mut |_, _| true,
+        },
     )?
     .trim()
     .to_string();
@@ -1060,7 +1063,7 @@ pub fn compact_with_summary_for_trigger(
     )
 }
 
-/// Settle the replay response before another paid summary can start. Returning
+/// Settle each remote response before another paid summary can start. Returning
 /// false stops the remote chain while preserving the response's observation.
 pub fn compact_with_summary_settled(
     provider_kind: ProviderKind,
@@ -1198,8 +1201,33 @@ Rules:
 - Do not call any tools. Reply with the checkpoint only.";
 
 fn checkpoint_headings(text: &str) -> impl Iterator<Item = &str> {
-    text.lines()
-        .filter_map(|line| line.trim_end().strip_prefix("## "))
+    let mut fence = None;
+    text.lines().filter_map(move |line| {
+        let trimmed = line.trim_start_matches(' ');
+        if line.len() - trimmed.len() <= 3
+            && let Some(marker @ (b'`' | b'~')) = trimmed.bytes().next()
+        {
+            let length = trimmed.bytes().take_while(|&byte| byte == marker).count();
+            let rest = &trimmed[length..];
+            match fence {
+                Some((opening, minimum))
+                    if marker == opening
+                        && length >= minimum
+                        && rest.trim_matches([' ', '\t']).is_empty() =>
+                {
+                    fence = None;
+                }
+                None if length >= 3 && (marker != b'`' || !rest.contains('`')) => {
+                    fence = Some((marker, length));
+                }
+                _ => {}
+            }
+        }
+        if fence.is_some() {
+            return None;
+        }
+        line.trim_end().strip_prefix("## ")
+    })
 }
 
 #[cfg(test)]
@@ -1361,6 +1389,11 @@ fn summarize_collapsed_messages(
     let rendered = render_summary_delta(&collapsed);
     let budget = summary_budget(context_config);
     let mut requests_left = MAX_SUMMARY_REQUESTS;
+    let mut requests = SummaryRequests {
+        left: &mut requests_left,
+        observation,
+        settle_usage: adoption.settle_usage,
+    };
 
     // Small rendered deltas fit directly. Large natural-language messages
     // still need hierarchy so facts in their middle are not silently lost.
@@ -1380,8 +1413,7 @@ fn summarize_collapsed_messages(
             &render_summary_evidence(&collapsed),
             budget.min(SUMMARY_OUTPUT_TOKENS),
             cancel,
-            &mut requests_left,
-            observation,
+            &mut requests,
         )?
     };
 
@@ -1406,8 +1438,7 @@ fn summarize_collapsed_messages(
             &combined,
             budget.min(SUMMARY_OUTPUT_TOKENS),
             cancel,
-            &mut requests_left,
-            observation,
+            &mut requests,
         )?);
         summary.deltas.clear();
     }
@@ -1660,9 +1691,18 @@ fn hierarchical_summary(
         text,
         output_tokens,
         cancel,
-        requests_left,
-        &mut CompactionObservation::new(),
+        &mut SummaryRequests {
+            left: requests_left,
+            observation: &mut CompactionObservation::new(),
+            settle_usage: &mut |_, _| true,
+        },
     )
+}
+
+struct SummaryRequests<'a> {
+    left: &'a mut usize,
+    observation: &'a mut CompactionObservation,
+    settle_usage: &'a mut dyn FnMut(&str, Option<Usage>) -> bool,
 }
 
 fn hierarchical_summary_observed(
@@ -1672,11 +1712,10 @@ fn hierarchical_summary_observed(
     text: &str,
     output_tokens: usize,
     cancel: Option<&CancelToken>,
-    requests_left: &mut usize,
-    observation: &mut CompactionObservation,
+    requests: &mut SummaryRequests<'_>,
 ) -> Option<String> {
     let chunks = summary_chunks(text);
-    if chunks.len() > *requests_left || cancel.is_some_and(CancelToken::is_cancelled) {
+    if chunks.len() > *requests.left || cancel.is_some_and(CancelToken::is_cancelled) {
         return None;
     }
     if chunks.len() == 1 {
@@ -1687,8 +1726,7 @@ fn hierarchical_summary_observed(
             &RenderedSummaryDelta::from_plain(chunks[0].to_string()),
             output_tokens,
             cancel,
-            requests_left,
-            observation,
+            requests,
         );
     }
     let mut summaries = Vec::with_capacity(chunks.len());
@@ -1700,8 +1738,7 @@ fn hierarchical_summary_observed(
             &RenderedSummaryDelta::from_plain(chunk.to_string()),
             output_tokens.min(SUMMARY_OUTPUT_TOKENS),
             cancel,
-            requests_left,
-            observation,
+            requests,
         )?);
     }
     let merged = summaries.join("\n\n");
@@ -1715,8 +1752,7 @@ fn hierarchical_summary_observed(
         &merged,
         output_tokens,
         cancel,
-        requests_left,
-        observation,
+        requests,
     )
 }
 
@@ -1779,13 +1815,13 @@ fn request_summary(
     rendered: &RenderedSummaryDelta,
     output_tokens: usize,
     cancel: Option<&CancelToken>,
-    requests_left: &mut usize,
-    observation: &mut CompactionObservation,
+    requests: &mut SummaryRequests<'_>,
 ) -> Option<String> {
-    if *requests_left == 0 || cancel.is_some_and(CancelToken::is_cancelled) {
+    if *requests.left == 0 || cancel.is_some_and(CancelToken::is_cancelled) {
         return None;
     }
-    *requests_left -= 1;
+    *requests.left -= 1;
+    let observation = &mut *requests.observation;
     let collapsed_text = rendered.text.as_str();
     let cache_scope = format!(
         "{};output_tokens={output_tokens}",
@@ -1852,6 +1888,8 @@ fn request_summary(
     } else {
         crate::call(provider_kind, &summary_conversation, &summary_config)
     };
+    let proceed = (requests.settle_usage)(summary_model, response.usage);
+    let request_index = observation.summary_requests.len();
     let summary = observed_summary_response(
         provider_kind,
         purpose,
@@ -1859,8 +1897,12 @@ fn request_summary(
         &response,
         cancel,
         observation,
-    )?;
-    let summary = bounded_summary(&summary, output_tokens);
+    );
+    if !proceed {
+        observation.summary_requests[request_index].outcome = "budget_stopped";
+        return None;
+    }
+    let summary = bounded_summary(&summary?, output_tokens);
     if provider_kind == ProviderKind::DeepSeek {
         crate::summary_cache::store(&cache_key, &summary);
     }
@@ -2691,6 +2733,74 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_counts_only_headings_outside_code_fences() {
+        let checkpoint = "## Files and code\n   ````md\n## quoted\n```\n## still quoted\n   `````\n\
+                          ~~~markdown\n## quoted too\n~~~ text\n## still quoted too\n~~~~\n## Errors and fixes";
+        assert_eq!(
+            checkpoint_headings(checkpoint).collect::<Vec<_>>(),
+            ["Files and code", "Errors and fixes"]
+        );
+        let wrapped = format!("```markdown\n{REPLAY_SUMMARY_INSTRUCTION}\n```");
+        assert_eq!(checkpoint_headings(&wrapped).next(), None);
+    }
+
+    #[test]
+    fn compaction_settles_flash_usage_before_another_chunk_even_on_failure() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 3,
+            cache_tokens: 40,
+        };
+        for body in [
+            observation_sse("first facts", Some(usage)),
+            format!(
+                "data: {}\n\ndata: invalid-json\n\n",
+                serde_json::json!({"choices": [],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 3, "prompt_cache_hit_tokens": 40}})
+            ),
+        ] {
+            let (config, server) = observation_summary_server(vec![body]);
+            let mut conversation = Conversation::new();
+            conversation.add_system("instructions".to_string());
+            for i in 0..4 {
+                conversation.add_user(format!("message {i}: {}", "facts ".repeat(2_000)));
+                conversation.add_assistant(Some("acknowledged".into()), None, vec![]);
+            }
+            conversation.add_user("current request".to_string());
+            let context_config = ContextConfig {
+                soft_compact_token_limit: Some(1_000),
+                ..ContextConfig::default()
+            };
+            let mut settled = Vec::new();
+            let result = compact_with_summary_settled(
+                ProviderKind::DeepSeek,
+                &conversation,
+                &context_config,
+                &config,
+                None,
+                false,
+                &mut |model, usage| {
+                    if let Some(usage) = usage {
+                        settled.push((model.to_string(), usage));
+                    }
+                    usage.is_none()
+                },
+            );
+            assert_eq!(
+                settled,
+                [(orca_core::model::auxiliary_model().to_string(), usage)]
+            );
+            server.join().unwrap();
+            assert_eq!(result.observation.summary_requests.len(), 1);
+            assert_eq!(result.observation.summary_requests[0].usage, Some(usage));
+            assert_eq!(
+                result.observation.summary_requests[0].outcome,
+                "budget_stopped"
+            );
+        }
+    }
+
+    #[test]
     fn compaction_observation_preserves_hierarchical_usage_and_summary_cache_hits() {
         let first = Usage {
             input_tokens: 100,
@@ -2720,6 +2830,11 @@ mod tests {
         );
         let mut observation = CompactionObservation::new();
         let mut budget = MAX_SUMMARY_REQUESTS;
+        let mut settled = Vec::new();
+        let mut settle = |_: &str, usage| {
+            settled.push(usage);
+            true
+        };
         let summary = hierarchical_summary_observed(
             ProviderKind::DeepSeek,
             &config,
@@ -2727,8 +2842,11 @@ mod tests {
             &text,
             64,
             None,
-            &mut budget,
-            &mut observation,
+            &mut SummaryRequests {
+                left: &mut budget,
+                observation: &mut observation,
+                settle_usage: &mut settle,
+            },
         )
         .expect("summary");
         server.join().expect("summary fixture");
@@ -2764,13 +2882,17 @@ mod tests {
                 &text,
                 64,
                 None,
-                &mut budget,
-                &mut cached
+                &mut SummaryRequests {
+                    left: &mut budget,
+                    observation: &mut cached,
+                    settle_usage: &mut settle,
+                },
             )
             .as_deref(),
             Some("merged facts")
         );
         assert_eq!(cached.summary_requests.len(), 3);
+        assert_eq!(settled, [Some(first), Some(second), Some(rebuild)]);
         assert!(
             cached
                 .summary_requests
@@ -2811,8 +2933,11 @@ mod tests {
                 &text,
                 64,
                 None,
-                &mut budget,
-                &mut observation
+                &mut SummaryRequests {
+                    left: &mut budget,
+                    observation: &mut observation,
+                    settle_usage: &mut |_, _| true,
+                },
             )
             .is_none()
         );
@@ -3042,8 +3167,11 @@ mod tests {
                 &RenderedSummaryDelta::from_plain("missing usage fixture".to_string()),
                 64,
                 None,
-                &mut budget,
-                &mut observation
+                &mut SummaryRequests {
+                    left: &mut budget,
+                    observation: &mut observation,
+                    settle_usage: &mut |_, _| true,
+                },
             )
             .as_deref(),
             Some("facts")

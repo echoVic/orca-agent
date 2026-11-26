@@ -251,21 +251,22 @@ impl Default for ThinkingConfig {
     }
 }
 
-fn add_empty_response_recovery_instruction(request: &mut ChatRequest) {
+fn add_empty_response_recovery_instruction(request: &mut ChatRequest) -> Option<usize> {
     let ChatMessages::Conversation(messages) = &mut request.messages else {
-        return;
+        return None;
     };
     // Look past the trailing internal-context overlay to the prompt itself.
-    if let Some(last) = messages
+    if let Some((index, last)) = messages
         .iter_mut()
+        .enumerate()
         .rev()
-        .find(|message| message.role != "system")
+        .find(|(_, message)| message.role != "system")
         && last.role == "user"
         && let Some(content) = &mut last.content
     {
         content.push_str("\n\n");
         content.push_str(EMPTY_RESPONSE_RECOVERY_PROMPT);
-        return;
+        return Some(index);
     }
 
     messages.push(ApiMessage {
@@ -276,6 +277,7 @@ fn add_empty_response_recovery_instruction(request: &mut ChatRequest) {
         tool_calls: None,
         tool_call_id: None,
     });
+    None
 }
 
 fn merge_usage(total: &mut Option<Usage>, usage: Option<Usage>) {
@@ -819,6 +821,7 @@ async fn request_chat_streaming_with_budget(
     };
 
     let mut empty_response_retries = 0;
+    let mut recovery_edit = None;
     let mut stream_integrity_retries = 0;
     let mut suppress_retry_reasoning = false;
     let mut accumulated_usage = None;
@@ -1002,7 +1005,7 @@ async fn request_chat_streaming_with_budget(
             {
                 empty_response_retries += 1;
                 suppress_retry_reasoning = emitted_reasoning;
-                add_empty_response_recovery_instruction(&mut request);
+                recovery_edit = add_empty_response_recovery_instruction(&mut request);
                 recovery = Some(DeepSeekRequestError::with_usage(
                     EMPTY_RESPONSE_ERROR,
                     accumulated_usage,
@@ -1019,7 +1022,7 @@ async fn request_chat_streaming_with_budget(
             on_step(&ProviderStep::AttemptUsage(stream_result.usage));
         }
         if let Some(conversation) = ordinary {
-            record_replay_source(conversation, config, &request);
+            record_replay_source(conversation, config, &request, recovery_edit);
         }
         return Ok(ProviderResponse {
             steps,
@@ -1035,6 +1038,7 @@ fn record_replay_source(
     conversation: &Conversation,
     config: &ProviderConfig,
     request: &ChatRequest,
+    recovery_edit: Option<usize>,
 ) {
     if let ChatMessages::Conversation(messages) = &request.messages {
         replay_prefix::record(
@@ -1042,6 +1046,7 @@ fn record_replay_source(
             config,
             &request.model,
             messages,
+            recovery_edit,
             request.tools.as_deref().unwrap_or_default(),
         );
     }
@@ -1092,6 +1097,7 @@ fn request_chat(
     let retry_budget = RetryBudget::default();
     let cancel = CancelToken::new();
     let mut accumulated_usage = None;
+    let mut recovery_edit = None;
     for empty_attempt in 0..=EMPTY_RESPONSE_RETRIES {
         let response = match crate::http_client::execute_with_retry_details(
             |client| client.post(&url).bearer_auth(api_key).json(&request),
@@ -1130,7 +1136,7 @@ fn request_chat(
         merge_usage(&mut accumulated_usage, usage);
         let Some(choice) = response.choices.into_iter().next() else {
             if empty_attempt < EMPTY_RESPONSE_RETRIES && retry_budget.can_retry() {
-                add_empty_response_recovery_instruction(&mut request);
+                recovery_edit = add_empty_response_recovery_instruction(&mut request);
                 continue;
             }
             return Err(DeepSeekRequestError::with_usage(
@@ -1210,7 +1216,7 @@ fn request_chat(
                 .any(|step| matches!(step, ProviderStep::Error(_)))
         {
             if empty_attempt < EMPTY_RESPONSE_RETRIES && retry_budget.can_retry() {
-                add_empty_response_recovery_instruction(&mut request);
+                recovery_edit = add_empty_response_recovery_instruction(&mut request);
                 continue;
             }
             return Err(DeepSeekRequestError::with_usage(
@@ -1223,7 +1229,7 @@ fn request_chat(
             .iter()
             .any(|step| matches!(step, ProviderStep::Error(_)))
         {
-            record_replay_source(conversation, config, &request);
+            record_replay_source(conversation, config, &request, recovery_edit);
         }
         return Ok(ProviderResponse {
             steps,
@@ -3122,7 +3128,9 @@ mod tests {
             r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":13,"completion_tokens":5,"prompt_cache_hit_tokens":9}}"#,
         );
         let mut conversation = Conversation::new();
+        conversation.add_system("instructions".into());
         conversation.add_user("hello".to_string());
+        conversation.summary.baseline = Some("previous checkpoint".into());
         conversation.replace_plan_state("[in_progress] answer".to_string());
         let config = ProviderConfig {
             api_key: Some("test-key".to_string()),
@@ -3140,13 +3148,16 @@ mod tests {
         let bodies = bodies.lock().expect("lock captured bodies");
         let retry: Value = serde_json::from_str(&bodies[1]).expect("retry request json");
         let messages = retry["messages"].as_array().expect("retry messages");
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 4);
         assert_eq!(
-            messages[0]["content"],
+            messages[2]["content"],
             format!("hello\n\n{EMPTY_RESPONSE_RECOVERY_PROMPT}")
         );
-        assert_eq!(messages[1]["role"], "system");
-        assert_eq!(messages[1]["content"], "[in_progress] answer");
+        assert_eq!(messages[3]["role"], "system");
+        assert_eq!(messages[3]["content"], "[in_progress] answer");
+        let prefix = replay_prefix::load(&conversation, 1, &config, FLASH_MODEL).unwrap();
+        assert_eq!(prefix.messages.len(), 2);
+        assert!(replay_prefix::load(&conversation, 2, &config, FLASH_MODEL).is_none());
     }
 
     #[test]
@@ -3701,6 +3712,7 @@ mod tests {
             retry["messages"][3]["content"],
             EMPTY_RESPONSE_RECOVERY_PROMPT
         );
+        assert!(replay_prefix::load(&conversation, 3, &config, FLASH_MODEL).is_some());
         assert_eq!(
             serde_json::to_value(conversation_to_api_messages(&conversation))
                 .expect("serialize unchanged messages"),
