@@ -1260,6 +1260,8 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     "crates/orca-tui/src/state_reducer.rs:update:self.announced_startup_warnings.insert",
     1,
   ],
+  ["crates/orca-tui/src/state_reducer.rs:update:self.workflow_provider_retries.insert", 1],
+  ["crates/orca-tui/src/types.rs:reset_session_projection:self.workflow_provider_retries.clear", 1],
   [
     "crates/orca-tui/src/types.rs:reset_session_projection:self.announced_startup_warnings.clear",
     1,
@@ -1910,7 +1912,7 @@ function commandRow(manifest, table, name) {
 function invariantRegistry() {
   return new Map([
     [
-      "source_facts has exactly 59 unique variants matching EventType at baseline",
+      "source_facts has exactly 59 unique variants matching EventType source facts",
       (manifest) => {
         assertCondition(manifest.source_facts.length === 59, "source_facts must contain 59 rows");
         assertUnique(manifest.source_facts.map((row) => row[0]), "source_facts");
@@ -4540,7 +4542,9 @@ export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides
     relativeRepoPath(repoRoot, eventSchemaPath),
     sourceOverrides,
   );
-  const eventTypes = parseRustEnum(eventSchema, "pub enum EventType {");
+  // Retry reports go directly to live output and have no surface source fact.
+  const eventTypes = parseRustEnum(eventSchema, "pub enum EventType {")
+    .filter((variant) => variant !== "ProviderRetry");
   const sourceFacts = manifest.source_facts.map((row) => row[0]);
   assertExactArray(sourceFacts, eventTypes, "source_facts current EventType");
   manifest.source_facts.forEach((row) => {

@@ -24,6 +24,7 @@ pub mod model;
 pub mod plan_types;
 pub mod proposed_plan;
 pub mod provider_types;
+pub mod redaction;
 pub mod retained_output;
 pub mod rewind;
 pub mod subagent_config;

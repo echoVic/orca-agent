@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use orca_core::provider_types::{ProviderResponse, ProviderStep};
+use orca_core::provider_types::{ProviderResponse, ProviderStep, Usage};
 use orca_core::thread_identity::TurnId;
 use orca_core::thread_item_projection::{CompletedModelResponse, ModelResponseIdentity};
 
@@ -16,21 +16,19 @@ pub struct ProviderResponseObservation {
 #[derive(Clone, Debug)]
 pub struct RuntimeModelResponse {
     pub response: ProviderResponse,
+    pub(crate) attempt_usage: Option<Usage>,
     pub identity: ModelResponseIdentity,
     pub observation: Option<ProviderResponseObservation>,
 }
 
 impl RuntimeModelResponse {
     pub fn new(response: ProviderResponse, turn_id: TurnId) -> Self {
-        Self {
-            response,
-            identity: ModelResponseIdentity::new(turn_id),
-            observation: None,
-        }
+        Self::from_parts(response, ModelResponseIdentity::new(turn_id))
     }
 
     pub fn from_parts(response: ProviderResponse, identity: ModelResponseIdentity) -> Self {
         Self {
+            attempt_usage: response.usage,
             response,
             identity,
             observation: None,

@@ -454,6 +454,17 @@ impl AppState {
                 }
                 self.discard_current_assistant_attempt();
             }
+            TuiEvent::ProviderRetry(retry) => self.provider_retry = retry,
+            TuiEvent::WorkflowProviderRetry {
+                operation_id,
+                retry,
+            } => {
+                if let Some(retry) = retry {
+                    self.workflow_provider_retries.insert(operation_id, retry);
+                } else {
+                    self.workflow_provider_retries.remove(&operation_id);
+                }
+            }
             TuiEvent::AssistantResponseCompleted(message, reasoning) => {
                 if self.suppress_background_main_session_output {
                     return;
@@ -1106,6 +1117,7 @@ impl AppState {
                 self.scroll_to_bottom();
             }
             TuiEvent::SessionCompleted { status } => {
+                self.provider_retry = None;
                 self.denied_approval_stops_turn = false;
                 self.invalidate_recap();
                 let was_backgrounded = self.suppress_background_main_session_output;

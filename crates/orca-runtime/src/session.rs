@@ -70,6 +70,7 @@ pub struct InteractiveSession {
 pub(crate) struct InteractiveSessionRuntimeParts<'a> {
     pub conversation: &'a mut Conversation,
     pub writer: Option<&'a mut SessionWriter>,
+    pub recorded: bool,
     pub instructions: &'a ProjectInstructions,
     pub cost_tracker: &'a mut CostTracker,
     pub mcp_registry: &'a McpRegistry,
@@ -98,7 +99,7 @@ pub(crate) fn record_tool_result_for_agent(
     history_writer: Option<&mut SessionWriter>,
     result: &ToolResult,
     emit_deltas: bool,
-) -> io::Result<String> {
+) -> io::Result<bool> {
     let result_content = agent_common::format_tool_result_for_model(result);
     let message = Message::Tool {
         tool_call_id: result.id.clone(),
@@ -107,7 +108,7 @@ pub(crate) fn record_tool_result_for_agent(
         terminal: Some(result.terminal().clone()),
         pinned: false,
     };
-    conversation.add_tool_result_with_terminal(result, result_content.clone());
+    conversation.add_tool_result_with_terminal(result, result_content);
     // Persistence is a durability concern, not an execution concern: a broken
     // transcript must not stop the tool turn. The item is already in memory, so
     // record the failure, mark the writer degraded, and let the turn continue.
@@ -125,8 +126,9 @@ pub(crate) fn record_tool_result_for_agent(
             writer.path().display()
         );
         writer.mark_degraded();
+        return Ok(false);
     }
-    Ok(result_content)
+    Ok(true)
 }
 
 pub(crate) fn record_assistant_response_for_agent<W: io::Write>(
@@ -774,6 +776,7 @@ impl InteractiveSession {
         InteractiveSessionRuntimeParts {
             conversation: &mut self.conversation,
             writer: self.writer.as_mut(),
+            recorded: self.session_id.is_some(),
             instructions: &self.instructions,
             cost_tracker: &mut self.cost_tracker,
             mcp_registry: &self.mcp_registry,
@@ -1473,7 +1476,7 @@ mod tests {
                 record_tool_result_for_agent(&mut conversation, Some(&mut writer), &result, true)
                     .expect("persistence failure must not fail the tool result");
 
-            assert_eq!(recorded, "tool output survives");
+            assert!(!recorded);
             assert!(matches!(
                 conversation.messages.last(),
                 Some(Message::Tool { content, .. }) if content == "tool output survives"

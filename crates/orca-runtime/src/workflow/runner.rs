@@ -14,6 +14,7 @@ use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_schema::RunStatus;
 use orca_core::event_sink::EventSink;
+use orca_core::provider_types::{ProviderRetry, ProviderStep};
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::{
     TaskContinuationSummary, TaskStatus, TaskType, WorkflowPhaseTaskSummary, WorkflowTaskProgress,
@@ -49,8 +50,9 @@ use crate::runtime_subagent_call::{
     continuation_footer,
 };
 use crate::runtime_surface::{
-    RuntimeWorkflowAgentProgress, RuntimeWorkflowProgress, RuntimeWorkflowProgressIngress,
-    SurfaceTaskId, SurfaceWorkflowRunId,
+    RuntimeProviderResponseIngress, RuntimeWorkflowAgentProgress, RuntimeWorkflowProgress,
+    RuntimeWorkflowProgressIngress, SurfaceHub, SurfaceOperationId, SurfaceTaskId,
+    SurfaceWorkflowRunId,
 };
 use crate::schema_validation::validate_json_schema_subset;
 use crate::tasks::{TaskRecord, TaskRegistry};
@@ -172,8 +174,90 @@ pub struct WorkflowRunner {
     state: WorkflowStateStore,
     child_executor: ChildAgentExecutor<SharedEventBuffer>,
     progress_ingress: Option<Arc<dyn RuntimeWorkflowProgressIngress>>,
+    provider_retries: Option<Arc<WorkflowProviderRetries>>,
     parent_budget: Option<crate::child_budget_ledger::ChildBudgetReservation>,
     parent_budget_receipt: Arc<Mutex<WorkflowParentBudgetReceipt>>,
+}
+
+struct WorkflowProviderRetries {
+    hub: SurfaceHub,
+    operation_id: SurfaceOperationId,
+    waiting: Mutex<Vec<(String, ProviderRetry)>>,
+}
+
+impl std::fmt::Debug for WorkflowProviderRetries {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkflowProviderRetries")
+            .field("operation_id", &self.operation_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct WorkflowChildRetryIngress<'a> {
+    retries: &'a WorkflowProviderRetries,
+    task_id: &'a str,
+}
+
+impl WorkflowChildRetryIngress<'_> {
+    fn publish(&self, retry: Option<&ProviderRetry>) {
+        let mut waiting = self
+            .retries
+            .waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let was_visible = waiting.last().is_some_and(|(id, _)| id == self.task_id);
+        waiting.retain(|(id, _)| id != self.task_id);
+        if let Some(retry) = retry {
+            waiting.push((self.task_id.to_owned(), retry.clone()));
+        } else if !was_visible {
+            return;
+        }
+        self.retries.hub.publish_provider_retry(
+            &self.retries.operation_id,
+            waiting.last().map(|(_, retry)| retry.clone()),
+        );
+    }
+}
+
+impl RuntimeProviderResponseIngress for WorkflowChildRetryIngress<'_> {
+    fn commit_response(
+        &self,
+        _: &mut crate::model_response::RuntimeModelResponse,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn commit_provider_attempt_failure(
+        &self,
+        _: &orca_core::thread_item_projection::ModelResponseIdentity,
+        retry: &ProviderRetry,
+    ) -> io::Result<()> {
+        self.publish(Some(retry));
+        Ok(())
+    }
+
+    fn commit_provider_step(
+        &self,
+        _: &orca_core::thread_item_projection::ModelResponseIdentity,
+        step: &ProviderStep,
+    ) -> io::Result<()> {
+        if let ProviderStep::Retry(retry) = step {
+            self.publish(retry.as_ref());
+        }
+        Ok(())
+    }
+
+    fn commit_tool_results(&self, _: &[orca_core::tool_types::ToolResult]) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for WorkflowChildRetryIngress<'_> {
+    fn drop(&mut self) {
+        self.publish(None);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -720,6 +804,7 @@ impl WorkflowRunner {
             state,
             child_executor: execute_child_agent_loop,
             progress_ingress: None,
+            provider_retries: None,
             parent_budget: None,
             parent_budget_receipt: Arc::new(Mutex::new(WorkflowParentBudgetReceipt {
                 usage: orca_core::budget::BudgetUsage::default(),
@@ -783,6 +868,19 @@ impl WorkflowRunner {
         progress_ingress: Option<Arc<dyn RuntimeWorkflowProgressIngress>>,
     ) -> Self {
         self.progress_ingress = progress_ingress;
+        self
+    }
+
+    pub(crate) fn with_provider_retries(
+        mut self,
+        hub: SurfaceHub,
+        operation_id: SurfaceOperationId,
+    ) -> Self {
+        self.provider_retries = Some(Arc::new(WorkflowProviderRetries {
+            hub,
+            operation_id,
+            waiting: Mutex::new(Vec::new()),
+        }));
         self
     }
 
@@ -2219,6 +2317,13 @@ impl WorkflowRunner {
             RuntimeSessionLifecycle::new(format!("workflow-child-{}", call.call_id));
         lifecycle.start_task(RuntimeTaskKind::Subagent);
         let child = panic::catch_unwind(AssertUnwindSafe(|| {
+            let retry_ingress =
+                self.provider_retries
+                    .as_deref()
+                    .map(|retries| WorkflowChildRetryIngress {
+                        retries,
+                        task_id: &child_task_id,
+                    });
             let mut runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
                 cwd: &child_cwd,
                 events: &mut events,
@@ -2237,6 +2342,9 @@ impl WorkflowRunner {
                 turn_id: None,
                 executor: self.child_executor,
             });
+            runtime.provider_response_ingress = retry_ingress
+                .as_ref()
+                .map(|ingress| ingress as &dyn RuntimeProviderResponseIngress);
             run_child_agent(&workflow_child_config, &child_request, &mut runtime)
         }));
         heartbeat.stop();

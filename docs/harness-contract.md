@@ -196,6 +196,7 @@ share operation cancellation and deadline controls.
 - `assistant.reasoning.delta`
 - `assistant.message.delta`
 - `model.response.completed`
+- `provider.retry`
 - `provider.replay.updated`
 - `approval.requested`
 - `approval.resolved`
@@ -208,6 +209,16 @@ share operation cancellation and deadline controls.
 - `error`
 - `session.rewind`
 - `session.completed`
+
+`orca exec` emits `provider.retry` before a scheduled provider retry. The
+payload contains `attempt` (the 1-based count of completed HTTP sends),
+`max_attempts` (the shared send limit), `delay_ms` (the scheduled wait including
+any active quota cooldown), `kind` (the provider error kind), and `reason` (up
+to 200 characters of the redacted diagnostic). Orca emits this event live.
+Terminal errors retain the bounded diagnostic and any available HTTP status
+and request ID.
+After a successful retry, `context.updated` shows the successful attempt's input
+tokens. `usage.updated` includes usage reported by failed attempts as well.
 
 `session.rewind` is emitted on the live runtime event stream after `/rewind`
 actually applied and its durable `session.rewind` transcript record was

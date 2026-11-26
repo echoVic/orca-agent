@@ -18,7 +18,7 @@ use orca_core::cancel::CancelToken;
 use orca_core::conversation::RawToolCall;
 use orca_core::cost_types::UsageTotals;
 use orca_core::provider_types::{
-    ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, ToolCallProgress, Usage,
+    ProviderError, ProviderResponse, ProviderStep, ToolCallProgress, Usage,
 };
 pub use orca_core::task_types::TaskLifetime;
 use orca_core::task_types::{
@@ -1206,6 +1206,8 @@ pub struct PendingTaskWait {
     pub baseline: Vec<u64>,
     #[serde(default)]
     pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) observed_shell_completions: Vec<String>,
 }
 
 /// A message a parent handed to a running child.
@@ -1563,8 +1565,15 @@ struct PersistedProviderResponse {
     #[serde(default)]
     tool_calls: Vec<RawToolCall>,
     usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt_usage: Option<PersistedAttemptUsage>,
     #[serde(default)]
     identity: Option<ModelResponseIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedAttemptUsage {
+    usage: Option<Usage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1581,10 +1590,7 @@ enum PersistedProviderStep {
 #[serde(untagged)]
 enum PersistedProviderError {
     Legacy(String),
-    Classified {
-        kind: ProviderErrorKind,
-        message: String,
-    },
+    Classified(ProviderError),
 }
 
 impl TaskRegistry {
@@ -6647,11 +6653,15 @@ impl PersistedProviderResponse {
             tool_calls: self.tool_calls,
             usage: self.usage,
         };
-        RuntimeModelResponse::from_parts(
+        let mut runtime_response = RuntimeModelResponse::from_parts(
             response,
             self.identity
                 .unwrap_or_else(|| ModelResponseIdentity::new(TurnId::new())),
-        )
+        );
+        if let Some(attempt) = self.attempt_usage {
+            runtime_response.attempt_usage = attempt.usage;
+        }
+        runtime_response
     }
 }
 
@@ -6668,6 +6678,11 @@ impl From<&RuntimeModelResponse> for PersistedProviderResponse {
             assistant_reasoning: response.response.assistant_reasoning.clone(),
             tool_calls: response.response.tool_calls.clone(),
             usage: response.response.usage,
+            attempt_usage: (response.attempt_usage != response.response.usage).then_some(
+                PersistedAttemptUsage {
+                    usage: response.attempt_usage,
+                },
+            ),
             identity: Some(response.identity.clone()),
         }
     }
@@ -6682,11 +6697,12 @@ impl PersistedProviderStep {
                 Some(Self::ToolCallProgress(progress.clone()))
             }
             ProviderStep::ToolCall(request) => Some(Self::ToolCall(request.clone())),
-            ProviderStep::ReplayState(_) => None,
-            ProviderStep::Error(error) => Some(Self::Error(PersistedProviderError::Classified {
-                kind: error.kind,
-                message: error.message.clone(),
-            })),
+            ProviderStep::ReplayState(_)
+            | ProviderStep::Retry(_)
+            | ProviderStep::AttemptUsage(_) => None,
+            ProviderStep::Error(error) => Some(Self::Error(PersistedProviderError::Classified(
+                error.clone(),
+            ))),
         }
     }
 
@@ -6699,9 +6715,7 @@ impl PersistedProviderStep {
             Self::Error(PersistedProviderError::Legacy(message)) => {
                 ProviderStep::Error(ProviderError::other(message))
             }
-            Self::Error(PersistedProviderError::Classified { kind, message }) => {
-                ProviderStep::Error(ProviderError::new(kind, message))
-            }
+            Self::Error(PersistedProviderError::Classified(error)) => ProviderStep::Error(error),
         }
     }
 }
@@ -7404,6 +7418,7 @@ mod tests {
                             state_change: false,
                             baseline: Vec::new(),
                             result: None,
+                            observed_shell_completions: Vec::new(),
                         }),
                     )
                 })
@@ -8771,6 +8786,7 @@ mod tests {
             assistant_reasoning: None,
             tool_calls: Vec::new(),
             usage: None,
+            attempt_usage: None,
             identity: None,
         }
         .into_runtime_response_with_migration_identity();

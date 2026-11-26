@@ -377,10 +377,7 @@ pub(crate) fn handle_child_agent_provider_error_with_cost(
         return Ok(None);
     };
 
-    match RuntimeCompactionPolicy::decide_for_provider_error(
-        &error.message,
-        &setup.compaction_retry,
-    ) {
+    match RuntimeCompactionPolicy::decide_for_provider_error(&error, &setup.compaction_retry) {
         RuntimeCompactionRetryDecision::CompactAndRetry { trigger, reason: _ } => {
             let mut events = EventFactory::new("child-agent-compaction".to_string());
             let mut sink = EventSink::new(child_event_output(), config.output_format);

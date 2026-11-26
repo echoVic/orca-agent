@@ -35,16 +35,20 @@ impl Default for ProviderRetryPolicy {
 }
 
 impl ProviderRetryPolicy {
+    pub(crate) fn max_attempts(&self, kind: ProviderErrorKind) -> u32 {
+        if kind == ProviderErrorKind::StreamClosed {
+            STREAM_CLOSED_MAX_ATTEMPTS
+        } else {
+            self.max_attempts
+        }
+    }
+
     pub(crate) fn decide(
         &self,
         error: &ProviderError,
         completed_attempts: u32,
     ) -> ProviderRetryDecision {
-        let max_attempts = if error.kind == ProviderErrorKind::StreamClosed {
-            STREAM_CLOSED_MAX_ATTEMPTS
-        } else {
-            self.max_attempts
-        };
+        let max_attempts = self.max_attempts(error.kind);
         if !error.is_retryable() || completed_attempts >= max_attempts {
             return ProviderRetryDecision::Stop;
         }

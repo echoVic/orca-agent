@@ -1897,7 +1897,7 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
     fn commit_provider_attempt_failure(
         &self,
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
-        message: &str,
+        retry: &orca_core::provider_types::ProviderRetry,
     ) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         send_thread_command_retrying_full(
@@ -1905,7 +1905,7 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
             ThreadCommand::SurfaceCommitProviderAttemptFailure {
                 fence: self.fence.clone(),
                 identity: identity.clone(),
-                message: message.to_string(),
+                retry: retry.clone(),
                 reply: reply_tx,
             },
         )
@@ -5233,7 +5233,7 @@ enum ThreadCommand {
     SurfaceCommitProviderAttemptFailure {
         fence: surface::SurfaceOperationFence,
         identity: orca_core::thread_item_projection::ModelResponseIdentity,
-        message: String,
+        retry: orca_core::provider_types::ProviderRetry,
         reply: SyncSender<io::Result<()>>,
     },
     SurfaceCommitProviderStep {
@@ -20818,11 +20818,15 @@ impl ThreadActor {
             ThreadCommand::SurfaceCommitProviderAttemptFailure {
                 fence,
                 identity,
-                message,
+                retry,
                 reply,
             } => {
-                let result = self
-                    .commit_surface_provider_attempt_failure(active, fence, &identity, &message);
+                let result = self.commit_surface_provider_attempt_failure(
+                    active,
+                    fence,
+                    &identity,
+                    Some(retry),
+                );
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceCommitProviderStep {
@@ -37231,7 +37235,8 @@ mod tests {
         let interaction_event_count = std::iter::from_fn(|| subscription.try_recv())
             .filter_map(|item| match item {
                 surface::SurfaceSubscriptionItem::Batch { batch } => Some(batch),
-                surface::SurfaceSubscriptionItem::Gap { .. }
+                surface::SurfaceSubscriptionItem::ProviderRetry { .. }
+                | surface::SurfaceSubscriptionItem::Gap { .. }
                 | surface::SurfaceSubscriptionItem::Sealed { .. } => None,
             })
             .flat_map(|batch| batch.events.as_slice().to_vec())
@@ -39084,7 +39089,8 @@ mod tests {
         let duplicate_route_commits = std::iter::from_fn(|| fallback_subscription.try_recv())
             .filter_map(|item| match item {
                 surface::SurfaceSubscriptionItem::Batch { batch } => Some(batch),
-                surface::SurfaceSubscriptionItem::Gap { .. }
+                surface::SurfaceSubscriptionItem::ProviderRetry { .. }
+                | surface::SurfaceSubscriptionItem::Gap { .. }
                 | surface::SurfaceSubscriptionItem::Sealed { .. } => None,
             })
             .map(|batch| {
@@ -39466,7 +39472,8 @@ mod tests {
         let duplicate_events = std::iter::from_fn(|| observer_subscription.try_recv())
             .filter_map(|item| match item {
                 surface::SurfaceSubscriptionItem::Batch { batch } => Some(batch),
-                surface::SurfaceSubscriptionItem::Gap { .. }
+                surface::SurfaceSubscriptionItem::ProviderRetry { .. }
+                | surface::SurfaceSubscriptionItem::Gap { .. }
                 | surface::SurfaceSubscriptionItem::Sealed { .. } => None,
             })
             .flat_map(|batch| batch.events.as_slice().to_vec())

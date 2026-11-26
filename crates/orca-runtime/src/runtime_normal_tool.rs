@@ -499,8 +499,13 @@ fn read_task_output(invocation: &RuntimeNormalToolInvocation) -> ToolResult {
             Some(cursor) => service.read_output_at(&args.task_id, cursor, max_output_bytes),
             None => service.read_output(&args.task_id, max_output_bytes),
         };
-        if let Ok(Some(_)) = &output {
-            return terminal_output_result(invocation, output);
+        if let Ok(Some(page)) = &output {
+            let observed = page.status != "running";
+            let mut result = terminal_output_result(invocation, output);
+            if observed {
+                result.observed_shell_completions.push(args.task_id);
+            }
+            return result;
         }
         if let Err(error) = &output
             && error.kind() != std::io::ErrorKind::NotFound
@@ -675,6 +680,7 @@ fn wait_for_tasks(
         };
         let pending = crate::tasks::PendingTaskWait {
             result: None,
+            observed_shell_completions: Vec::new(),
             tool_call_id: invocation.request.id.clone(),
             task_ids: args.task_ids.clone(),
             deadline_at_ms: chrono::Utc::now()
@@ -696,10 +702,13 @@ fn wait_for_tasks(
         if let Err(error) = registry.set_pending_wait(owner, Some(pending)) {
             return ToolResult::failed_before_start(&invocation.request, error, None);
         }
-        return ToolResult::running(&invocation.request, serde_json::json!({
+        let observed_shell_completions = observed_shell_completions(&observations);
+        let mut result = ToolResult::running(&invocation.request, serde_json::json!({
             "wait": "scheduled", "tasks": observations.into_iter().map(|o| o.output).collect::<Vec<_>>(),
             "message": "The runtime will wait after this tool boundary and deliver the observed result before the next model request."
         }).to_string(), false);
+        result.observed_shell_completions = observed_shell_completions;
+        return result;
     }
     let (observations, return_reason) = match observe_until(
         invocation,
@@ -724,11 +733,13 @@ fn wait_for_tasks(
     });
     match serde_json::to_string(&payload) {
         Ok(output) => {
-            if all_terminal {
+            let mut result = if all_terminal {
                 ToolResult::completed(&invocation.request, output, false)
             } else {
                 ToolResult::running(&invocation.request, output, false)
-            }
+            };
+            result.observed_shell_completions = observed_shell_completions(&observations);
+            result
         }
         Err(error) => ToolResult::failed_after_start(
             &invocation.request,
@@ -742,6 +753,14 @@ struct TaskObservation {
     output: serde_json::Value,
     terminal: bool,
     progress: (String, u64, bool),
+    finished_shell_id: Option<String>,
+}
+
+fn observed_shell_completions(observations: &[TaskObservation]) -> Vec<String> {
+    observations
+        .iter()
+        .filter_map(|observation| observation.finished_shell_id.clone())
+        .collect()
 }
 
 fn observe_once(
@@ -753,10 +772,12 @@ fn observe_once(
         .iter()
         .map(|task_id| {
             if let Some(service) = &invocation.terminal_service {
-                match service.read_output_at(task_id, 0, max_output_bytes) {
+                match service.peek_output_for_wait(task_id, max_output_bytes) {
                     Ok(Some(output)) => {
                         return Ok(TaskObservation {
                             terminal: output.status != "running",
+                            finished_shell_id: (output.status != "running")
+                                .then(|| task_id.clone()),
                             progress: (
                                 output.status.to_owned(),
                                 output.output_bytes_total as u64,
@@ -791,6 +812,9 @@ fn observe_once(
             }
             Ok(TaskObservation {
                 terminal: view.is_terminal(),
+                finished_shell_id: (view.is_terminal()
+                    && view.task_type == orca_core::task_types::TaskType::Shell)
+                    .then(|| task_id.clone()),
                 progress: (
                     view.execution.as_str().to_owned(),
                     record.publication_revision,

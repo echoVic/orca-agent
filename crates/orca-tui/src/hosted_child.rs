@@ -306,6 +306,12 @@ fn run_child_surface_bridge(
                 }
                 terminal
             }
+            SurfaceSubscriptionItem::ProviderRetry {
+                operation_id,
+                retry,
+            } => projection
+                .project_provider_retry(&operation_id, retry)
+                .is_some_and(|event| event_tx.send(event).is_err()),
             SurfaceSubscriptionItem::Gap { required } => {
                 match recover_child_surface(
                     &surface,

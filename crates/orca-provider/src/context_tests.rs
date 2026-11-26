@@ -1289,10 +1289,14 @@ mod replay_compaction {
                 .tools
                 .iter()
                 .any(|tool| tool["function"]["strict"] == true);
-            (
-                if strict { 400 } else { 200 },
-                reply_to_ordinary_or_replay(request),
-            )
+            if strict {
+                (
+                    400,
+                    json!({"error": {"message": "invalid tools: strict schema rejected"}}),
+                )
+            } else {
+                (200, reply_to_ordinary_or_replay(request))
+            }
         });
         let conversation = conversation();
         let mut provider = server.config();

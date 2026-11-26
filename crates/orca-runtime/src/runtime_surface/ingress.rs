@@ -122,7 +122,7 @@ pub trait RuntimeProviderResponseIngress: Send + Sync + std::fmt::Debug {
     fn commit_provider_attempt_failure(
         &self,
         _identity: &ModelResponseIdentity,
-        _message: &str,
+        _retry: &orca_core::provider_types::ProviderRetry,
     ) -> io::Result<()> {
         Ok(())
     }
