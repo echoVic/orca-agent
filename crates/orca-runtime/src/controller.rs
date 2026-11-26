@@ -3021,6 +3021,197 @@ mod tests {
         );
     }
 
+    fn command_after_release(marker: &str, output: &str) -> String {
+        use orca_platform::shell::{ShellKind, ShellResolver};
+
+        match ShellResolver::for_current_host()
+            .resolve_from_environment()
+            .unwrap()
+            .kind()
+        {
+            ShellKind::Posix | ShellKind::GitBash => {
+                format!("while [ ! -f {marker} ]; do sleep 0.01; done; printf {output}")
+            }
+            ShellKind::PowerShell(_) => format!(
+                "while (!(Test-Path '{marker}')) {{ Start-Sleep -Milliseconds 10 }}; [Console]::Out.Write('{output}')"
+            ),
+            ShellKind::Cmd => format!(
+                "for /l %i in (1,1,10000000) do @if exist {marker} (echo {output} & exit /b 0)"
+            ),
+        }
+    }
+
+    fn run_turn_with_shell_completions(
+        thread: &mut RuntimeThread,
+        config: &RunConfig,
+        cwd: &Path,
+        additional_completion: bool,
+    ) -> Vec<String> {
+        use orca_core::event_schema::{EventEnvelope, EventType};
+        use orca_core::task_types::{TaskStatus, TaskType};
+
+        let registry = thread.session().task_registry().clone();
+        let first = command_after_release("release-first", "first-output");
+        let mut commands = vec![("release-first", first.clone())];
+        if additional_completion {
+            let second = command_after_release("release-second", "second-output");
+            let service = thread
+                .thread_extensions_handle()
+                .get_or_init(|| TerminalService::new(registry.clone()));
+            let started = service
+                .exec(
+                    crate::terminal_service::TerminalExecRequest {
+                        lifetime: crate::tasks::TaskLifetime::Task,
+                        command: &second,
+                        cwd,
+                        additional_roots: &[],
+                        config,
+                        permission_overlay: &Default::default(),
+                        terminal: crate::shell_session::ShellTerminalMode::pipe(),
+                        execution_deadline: None,
+                        git_metadata_grant: None,
+                        sandbox_override: Some(
+                            crate::shell_session::ShellSandboxMode::DangerFullAccess,
+                        ),
+                    },
+                    Duration::from_millis(10),
+                    8 * 1024,
+                    || false,
+                    &mut |_| {},
+                )
+                .expect("start the second command before the first");
+            assert_eq!(started.status, "running");
+            commands.push(("release-second", second));
+        }
+        let cwd = cwd.to_path_buf();
+        let task_ids = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::clone(&task_ids);
+        let request = ThreadTurnRequest::new(format!("bash_wait 10 :: {first}"))
+            .with_event_observer(Arc::new(move |event: &EventEnvelope| {
+                if event.event_type == EventType::ToolCallCompleted {
+                    for (marker, command) in &commands {
+                        let task = registry
+                            .list()
+                            .into_iter()
+                            .find(|task| {
+                                task.task_type == TaskType::Shell
+                                    && task.command.as_deref() == Some(command)
+                            })
+                            .expect("the background shell task");
+                        assert_eq!(task.status, TaskStatus::Running);
+                        std::fs::write(cwd.join(marker), "")?;
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        loop {
+                            let status = registry.get(&task.id).map(|task| task.status);
+                            if status == Some(TaskStatus::Completed) {
+                                break;
+                            }
+                            assert!(std::time::Instant::now() < deadline, "{task:?}: {status:?}");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        completed.lock().unwrap().push(task.id);
+                    }
+                }
+                Ok(())
+            }));
+        assert_eq!(
+            thread.run_request(config, &request, io::sink()).unwrap(),
+            RunStatus::Success
+        );
+        task_ids.lock().unwrap().clone()
+    }
+
+    fn shell_completion_messages(conversation: &Conversation) -> impl Iterator<Item = &str> {
+        conversation
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::System { content, .. } if content.starts_with("<task-notification>") => {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+    }
+
+    fn assert_shell_completions_before_reply(thread: &RuntimeThread, tasks: &[String]) {
+        assert!(!tasks.is_empty());
+        let conversation = thread.session().conversation();
+        let notices = shell_completion_messages(conversation).collect::<Vec<_>>();
+        assert_eq!(notices.len(), tasks.len(), "{notices:?}");
+        for (notice, id) in notices.into_iter().zip(tasks) {
+            assert!(notice.contains(id), "{notice}");
+        }
+        assert!(matches!(
+            conversation.messages.last(),
+            Some(Message::Assistant { content: Some(content), .. })
+                if content == "Mock completed after tool execution."
+        ));
+    }
+
+    #[test]
+    fn a_completion_during_a_turn_reaches_the_next_model_request() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut thread = RuntimeThread::start(&config, "same-turn notice").unwrap();
+        let tasks = run_turn_with_shell_completions(&mut thread, &config, cwd.path(), false);
+        assert_shell_completions_before_reply(&thread, &tasks);
+    }
+
+    #[test]
+    fn two_completions_are_delivered_at_the_next_boundary_in_order() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut thread = RuntimeThread::start(&config, "two same-turn notices").unwrap();
+        let tasks = run_turn_with_shell_completions(&mut thread, &config, cwd.path(), true);
+        assert_eq!(tasks.len(), 2);
+        assert_shell_completions_before_reply(&thread, &tasks);
+    }
+
+    #[test]
+    fn a_delivered_notice_is_not_repeated_after_resume() {
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(
+            &crate::history::isolated_test_orca_home_subdir("same-turn-notice-resume"),
+        );
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.history_mode = HistoryMode::Record;
+        let mut thread = RuntimeThread::start(&config, "recorded same-turn notice").unwrap();
+        let tasks = run_turn_with_shell_completions(&mut thread, &config, cwd.path(), false);
+        assert_shell_completions_before_reply(&thread, &tasks);
+        let session_id = thread.session().session_id().unwrap().to_string();
+        drop(thread);
+
+        config.history_mode = HistoryMode::Resume(session_id);
+        let mut resumed = RuntimeThread::start(&config, "resume same-turn notice").unwrap();
+        let notices =
+            shell_completion_messages(resumed.session().conversation()).collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains(&tasks[0]));
+        assert_eq!(
+            resumed
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("mock_system_echo"),
+                    io::sink()
+                )
+                .unwrap(),
+            RunStatus::Success
+        );
+        let conversation = resumed.session().conversation();
+        assert_eq!(shell_completion_messages(conversation).count(), 1);
+        assert!(matches!(
+            conversation.messages.last(),
+            Some(Message::Assistant { content: Some(content), .. })
+                if content.matches("<task-notification>").count() == 1 && content.contains(&tasks[0])
+        ));
+    }
+
     #[test]
     fn headless_controller_propagates_borrowed_writer_failure() {
         struct BrokenWriter;

@@ -19,6 +19,7 @@ use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_turn_iteration::{
     RuntimeTurnIterationInput, RuntimeTurnIterationResult, RuntimeTurnIterationStep,
 };
+use crate::terminal_service::TerminalService;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
@@ -292,6 +293,7 @@ impl RuntimeTurnLoopStep {
         loop {
             park_pending_task_wait(&mut input)?;
             deliver_child_results(&mut input)?;
+            deliver_shell_completions(&mut input)?;
             if let Some(task_id) = input.request.turn_context.task_id.as_deref() {
                 let registry = input.loop_state.runtime.task_registry;
                 let messages = registry.pending_child_messages(task_id);
@@ -497,6 +499,44 @@ fn deliver_child_results<W: io::Write>(
     Ok(delivered)
 }
 
+fn deliver_shell_completions<W: io::Write>(
+    input: &mut RuntimeTurnLoopInput<'_, '_, W>,
+) -> io::Result<bool> {
+    if conversation_has_open_tool_calls(input.prepared_conversation.checkpoint_parts().0) {
+        return Ok(false);
+    }
+    let Some(service) = input
+        .loop_state
+        .runtime
+        .extensions
+        .extension_context()
+        .stores()
+        .thread_store()
+        .get::<TerminalService>()
+    else {
+        return Ok(false);
+    };
+    let completions = service.drain_completions();
+    let delivered = !completions.is_empty();
+    for completion in completions {
+        let content = completion.model_notification();
+        let (conversation, writer) = input.prepared_conversation.parts_mut();
+        let present = conversation.messages.iter().any(|message|
+            matches!(message, orca_core::conversation::Message::System { content: text, .. } if text == &content));
+        if let Some(writer) = writer {
+            writer.append_system_delivery_once(&content)?;
+        }
+        if !present {
+            conversation.add_system(content);
+        }
+        emit_safe_child_checkpoint(
+            input.prepared_conversation,
+            input.operation.controller.usage(),
+        )?;
+    }
+    Ok(delivered)
+}
+
 /// Whether a turn that ended on its own still owes the model a steer input:
 /// one that arrived while the model was writing its last reply, after the
 /// turn's final model request. Another iteration applies it before calling
@@ -603,7 +643,9 @@ fn settle_children_before_return<W: io::Write>(
         }
     }
     input.operation.refresh_child_budgets()?;
-    Ok(deliver_child_results(input)? || waited)
+    let delivered_children = deliver_child_results(input)?;
+    let delivered_shell = deliver_shell_completions(input)?;
+    Ok(delivered_children || delivered_shell || waited)
 }
 
 /// A wait owns no execution slot after its tool boundary is durably settled.
