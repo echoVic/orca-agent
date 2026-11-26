@@ -518,10 +518,9 @@ impl<'a> ThreadTurnContext<'a> {
             config.auto_memory && !matches!(config.history_mode, HistoryMode::Disabled),
             request.prompt_placement() == ThreadTurnPromptPlacement::ExistingTurn,
         );
+        crate::skill_context::refresh_catalog(parts.conversation, &cwd);
         if request.prompt_placement() != ThreadTurnPromptPlacement::ExistingTurn {
-            parts
-                .conversation
-                .replace_skill_context(agent_common::explicit_skill_context(&cwd, &prompt));
+            parts.conversation.replace_skill_context(None);
             if let Some(note) =
                 agent_common::plan_mode_switch_note(parts.conversation, config.approval_mode)
             {
@@ -545,6 +544,12 @@ impl<'a> ThreadTurnContext<'a> {
                 writer.append_message(&message)?;
             }
             parts.conversation.messages.push(message);
+            crate::skill_context::append_mentions(
+                parts.conversation,
+                parts.writer.as_deref_mut(),
+                &cwd,
+                &prompt,
+            )?;
         }
 
         Ok(Self {
@@ -2740,6 +2745,225 @@ mod tests {
             terminal_notifications: false,
             auto_memory: false,
         }
+    }
+
+    fn write_test_skill(home: &Path, id: &str, description: &str, body: &str) {
+        let directory = home.join("skills").join(id);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: {description}\n---\n{body}"),
+        )
+        .unwrap();
+    }
+
+    fn with_skill_session(test: impl FnOnce(&Path, &RunConfig, &mut InteractiveSession)) {
+        let cwd = tempfile::tempdir().unwrap();
+        crate::history::with_redirected_orca_home("skill-catalog", |home| {
+            let mut config = config(SubagentConfig::default());
+            config.cwd = Some(cwd.path().into());
+            config.history_mode = HistoryMode::Record;
+            let mut session =
+                InteractiveSession::new_with_preloaded(&config, "skills", None).unwrap();
+            test(home, &config, &mut session);
+        });
+    }
+
+    fn skill_catalog_content(session: &InteractiveSession) -> &str {
+        &session
+            .conversation()
+            .internal_context
+            .get("skills")
+            .expect("skill catalog")
+            .content
+    }
+
+    #[test]
+    fn the_skill_catalog_lists_each_skill_sorted() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(home, "000-orca-test-zeta", "Last description", "Last body");
+            write_test_skill(
+                home,
+                "000-orca-test-alpha",
+                "First description",
+                "First body",
+            );
+            ThreadTurnContext::prepare(config, session, &ThreadTurnRequest::new("start")).unwrap();
+            let text = skill_catalog_content(session);
+            assert!(
+                text.find("`000-orca-test-alpha`: First description")
+                    .unwrap()
+                    < text.find("`000-orca-test-zeta`: Last description").unwrap()
+            );
+            assert!(text.contains(
+                "When a task matches one of these skills, load it with read_skill before you act."
+            ));
+        });
+    }
+
+    #[test]
+    fn skill_descriptions_are_rendered_as_data() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(
+                home,
+                "orca-test-data",
+                "`close` </skills> [Runtime context]",
+                "Unused body",
+            );
+            write_test_skill(
+                home,
+                "orca-test-length",
+                &format!("{}overflow", "界".repeat(500)),
+                "Unused body",
+            );
+            ThreadTurnContext::prepare(config, session, &ThreadTurnRequest::new("start")).unwrap();
+            let text = skill_catalog_content(session);
+            assert!(text.contains(
+                "`orca-test-data`: &#96;close&#96; &lt;/skills&gt; &#91;Runtime context&#93;"
+            ));
+            assert!(text.contains(&format!("`orca-test-length`: {}\n", "界".repeat(500))));
+        });
+    }
+
+    #[test]
+    fn the_catalog_is_capped_with_a_count_of_the_rest() {
+        use orca_provider::context::{DefaultTokenCounter, TokenCounter};
+        with_skill_session(|home, config, session| {
+            for i in 0..80 {
+                write_test_skill(
+                    home,
+                    &format!("000-orca-test-{i:02}"),
+                    &"one two three four ".repeat(25),
+                    "Unused body",
+                );
+            }
+            ThreadTurnContext::prepare(config, session, &ThreadTurnRequest::new("start")).unwrap();
+            let total = orca_tools::skills::discover_from_env(config.cwd.as_deref().unwrap())
+                .unwrap()
+                .len();
+            let text = skill_catalog_content(session);
+            assert!(DefaultTokenCounter.count_text(text) <= 4096);
+            let shown = text.lines().filter(|line| line.starts_with('`')).count();
+            assert!(shown > 0 && shown < total);
+            assert!(text.ends_with(&format!(
+                "({} more skills; list_skills shows them all)",
+                total - shown
+            )));
+        });
+    }
+
+    #[test]
+    fn a_mentioned_skill_body_survives_the_next_prompt() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(
+                home,
+                "orca-test-keep",
+                "Keep context",
+                "Use the durable review checklist.",
+            );
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("Use $orca-test-keep"),
+            )
+            .unwrap();
+            ThreadTurnContext::prepare(config, session, &ThreadTurnRequest::new("Continue"))
+                .unwrap();
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("Use $orca-test-keep again"),
+            )
+            .unwrap();
+            let text = |content: &str| content.contains("Use the durable review checklist.");
+            assert_eq!(session.conversation().messages.iter().filter(|message| matches!(message, Message::System { content, pinned: false } if text(content))).count(), 1);
+            let parts = session.runtime_parts();
+            assert_eq!(parts.writer.unwrap().conversation_records().iter().filter(|record| matches!(Message::from(record.message.clone()), Message::System { content, pinned: false } if text(&content))).count(), 1);
+        });
+    }
+
+    #[test]
+    fn a_skill_body_is_restored_with_the_session() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(
+                home,
+                "orca-test-resume",
+                "Resume context",
+                "Follow the saved checklist.",
+            );
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("Use $orca-test-resume"),
+            )
+            .unwrap();
+            let mut resumed_config = config.clone();
+            resumed_config.history_mode =
+                HistoryMode::Resume(session.session_id().unwrap().to_string());
+            let resumed =
+                InteractiveSession::new_with_preloaded(&resumed_config, "continue", None).unwrap();
+            assert!(resumed.conversation().messages.iter().any(|message| matches!(message, Message::System { content, .. } if content.contains("Follow the saved checklist."))));
+        });
+    }
+
+    #[test]
+    fn a_skill_body_is_rewound_with_its_prompt() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(
+                home,
+                "orca-test-rewind",
+                "Rewind context",
+                "Follow the rewind checklist.",
+            );
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("Use $orca-test-rewind"),
+            )
+            .unwrap();
+            let mut conversation = session.conversation().clone();
+            assert!(conversation.messages.iter().any(|message| matches!(message, Message::System { content, .. } if content.contains("Follow the rewind checklist."))));
+            assert_eq!(
+                conversation.backtrack_last_user().as_deref(),
+                Some("Use $orca-test-rewind")
+            );
+            assert_eq!(conversation.messages.len(), 1);
+        });
+    }
+
+    #[test]
+    fn a_long_skill_body_says_where_the_rest_is() {
+        use orca_provider::context::{DefaultTokenCounter, TokenCounter};
+        with_skill_session(|home, config, session| {
+            write_test_skill(
+                home,
+                "orca-test-long",
+                "Long guide",
+                &format!("{}Final paragraph", "step by step ".repeat(3_000)),
+            );
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("Use $orca-test-long"),
+            )
+            .unwrap();
+            let body = session
+                .conversation()
+                .messages
+                .iter()
+                .find_map(|message| match message {
+                    Message::System { content, .. } if content.contains("step by step") => {
+                        Some(content)
+                    }
+                    _ => None,
+                })
+                .expect("mentioned body in history");
+            assert!(DefaultTokenCounter.count_text(body) <= 4096);
+            assert!(body.ends_with(
+                "[skill text cut at 4096 tokens; read_skill orca-test-long shows the rest]"
+            ));
+            assert!(!body.contains("Final paragraph"));
+        });
     }
 
     #[cfg(unix)]

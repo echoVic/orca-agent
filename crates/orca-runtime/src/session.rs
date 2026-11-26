@@ -180,8 +180,10 @@ pub(crate) fn bootstrap_agent_conversation(
     {
         conversation.replace_runtime_context(Some(INTERRUPTED_RESUME_HINT.to_string()));
     }
-    conversation.replace_skill_context(agent_common::explicit_skill_context(cwd, prompt));
+    crate::skill_context::refresh_catalog(&mut conversation, cwd);
     conversation.add_user(prompt.to_string());
+    crate::skill_context::append_mentions(&mut conversation, None, cwd, prompt)
+        .expect("appending skill context without a writer cannot fail");
     conversation
 }
 

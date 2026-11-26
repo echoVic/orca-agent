@@ -688,7 +688,7 @@ fn render_mcp_instructions_with_counter(
     (message.len() > MCP_INSTRUCTIONS_PREAMBLE.len()).then_some(message)
 }
 
-fn truncate_text_to_token_limit(
+pub fn truncate_text_to_token_limit(
     text: &str,
     max_tokens: usize,
     counter: &impl TokenCounter,
@@ -4483,6 +4483,24 @@ mod tests {
         );
         assert_eq!(messages[4].content.as_deref(), Some("hello"));
         assert_eq!(messages.len(), 5);
+    }
+
+    #[test]
+    fn no_skills_means_no_catalog_and_unchanged_request_bytes() {
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".into());
+        conv.add_user("hello".into());
+        let bytes = |conv: &Conversation| {
+            serde_json::to_vec(&crate::deepseek_http::conversation_to_api_messages(conv)).unwrap()
+        };
+        let before = bytes(&conv);
+        conv.replace_skill_catalog(None);
+        assert!(
+            conv.internal_context
+                .get(orca_core::conversation::SKILLS_CONTEXT_FRAGMENT_ID)
+                .is_none()
+        );
+        assert_eq!(bytes(&conv), before);
     }
 
     #[test]

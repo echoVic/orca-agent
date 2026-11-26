@@ -303,6 +303,7 @@ pub const MODE_CONTEXT_FRAGMENT_ID: &str = "mode";
 pub const GOAL_CONTEXT_FRAGMENT_ID: &str = "goal";
 pub const PLAN_CONTEXT_FRAGMENT_ID: &str = "plan";
 pub const SKILL_CONTEXT_FRAGMENT_ID: &str = "skill";
+pub const SKILLS_CONTEXT_FRAGMENT_ID: &str = "skills";
 pub const MEMORY_CONTEXT_FRAGMENT_ID: &str = "memory";
 /// Today's date. It rides in the internal context rather than the system
 /// prompt, so the system prompt and the history stay the same across days.
@@ -622,6 +623,16 @@ impl Conversation {
             content
                 .filter(|text| !text.trim().is_empty())
                 .map(|text| format!("[Skill context]\n{text}")),
+            SKILL_CONTEXT_MAX_TOKENS,
+        );
+    }
+
+    pub fn replace_skill_catalog(&mut self, content: Option<String>) {
+        self.replace_internal_context(
+            SKILLS_CONTEXT_FRAGMENT_ID,
+            InternalContextKind::Skill,
+            InternalContextOrigin::System,
+            content,
             SKILL_CONTEXT_MAX_TOKENS,
         );
     }

@@ -69,6 +69,12 @@ pub fn discover_from_env(cwd: &Path) -> Result<Vec<Skill>, String> {
     discover(cwd, orca_home.as_deref(), agents_home.as_deref())
 }
 
+pub fn discover_metadata_from_env(cwd: &Path) -> Result<Vec<Skill>, String> {
+    let orca_home = orca_core::home::orca_home();
+    let agents_home = dirs::home_dir().map(|home| home.join(".agents"));
+    discover_metadata(cwd, orca_home.as_deref(), agents_home.as_deref())
+}
+
 pub fn discover(
     cwd: &Path,
     orca_home: Option<&Path>,
@@ -111,11 +117,11 @@ fn discover_with_body(
             &mut skills,
         )?;
     }
-    if let Some(project_root) = project_root
-        && orca_home.is_some_and(|home| {
-            orca_core::config::folder_trust::is_trusted_with_config_dir(&project_root, home)
-        })
-    {
+    if orca_home.is_some_and(|home| {
+        orca_core::config::folder_trust::is_trusted_with_config_dir(&project_root, home)
+            && (cwd == project_root
+                || orca_core::config::folder_trust::is_trusted_with_config_dir(cwd, home))
+    }) {
         collect_skills(
             &project_root.join(".orca/skills"),
             SkillSource::Project,
@@ -131,7 +137,12 @@ fn discover_with_body(
             &mut skills,
         )?;
     }
-    skills.sort_by(|left, right| left.id.cmp(&right.id));
+    skills.sort_by(|left, right| {
+        left.id.cmp(&right.id).then_with(|| {
+            matches!(right.source, SkillSource::Project)
+                .cmp(&matches!(left.source, SkillSource::Project))
+        })
+    });
     skills.dedup_by(|left, right| left.id == right.id);
     Ok(skills)
 }
@@ -498,21 +509,13 @@ fn valid_skill_id(id: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
-fn project_root(cwd: &Path) -> Option<PathBuf> {
-    for start in [Some(cwd.to_path_buf()), cwd.canonicalize().ok()]
-        .into_iter()
-        .flatten()
-    {
-        for candidate in start.ancestors() {
-            if candidate.join(".git").exists()
-                || candidate.join("Cargo.toml").exists()
-                || candidate.join("package.json").exists()
-            {
-                return Some(candidate.to_path_buf());
-            }
-        }
-    }
-    Some(cwd.to_path_buf())
+fn project_root(cwd: &Path) -> PathBuf {
+    let workspace = canonical_or_self(cwd);
+    workspace
+        .ancestors()
+        .find(|candidate| candidate.join(".git").exists())
+        .unwrap_or(&workspace)
+        .to_path_buf()
 }
 
 fn canonical_or_self(path: &Path) -> PathBuf {
@@ -538,6 +541,79 @@ mod tests {
             orca_core::config::folder_trust::TrustLevel::Trusted,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_project_skill_wins_over_a_user_skill() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_skill(
+            &home.path().join("skills/review"),
+            "Review",
+            "User description",
+            "User body",
+        );
+        write_skill(
+            &project.path().join(".orca/skills/review"),
+            "Review",
+            "Project description",
+            "Project body",
+        );
+        trust_project(home.path(), project.path());
+
+        let metadata = discover_metadata(project.path(), Some(home.path()), None).unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].description, "Project description");
+        let skills = discover(project.path(), Some(home.path()), None).unwrap();
+        assert_eq!(skills[0].body, "Project body");
+    }
+
+    #[test]
+    fn skills_are_found_from_the_git_root() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let subcrate = project.path().join("crates/child");
+        fs::create_dir_all(&subcrate).unwrap();
+        fs::write(project.path().join(".git"), "gitdir: ../worktrees/example").unwrap();
+        fs::write(subcrate.join("Cargo.toml"), "[package]\nname = \"child\"\n").unwrap();
+        write_skill(
+            &project.path().join(".orca/skills/review"),
+            "Review",
+            "Project skill",
+            "Project body",
+        );
+        trust_project(home.path(), project.path());
+
+        let skills = discover(&subcrate, Some(home.path()), None).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].id, "review");
+    }
+
+    #[test]
+    fn skills_respect_an_untrusted_subdirectory() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let child = project.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        write_skill(
+            &project.path().join(".orca/skills/review"),
+            "Review",
+            "Project skill",
+            "Project body",
+        );
+        trust_project(home.path(), project.path());
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            &child,
+            home.path(),
+            orca_core::config::folder_trust::TrustLevel::Untrusted,
+        )
+        .unwrap();
+        assert!(
+            discover(&child, Some(home.path()), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

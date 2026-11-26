@@ -292,8 +292,8 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
     )
     .into_iter()
     // The old system prompt and ephemeral system context are rebuilt rather
-    // than restored. The truncation marker and delivered notices are
-    // conversation content; a notice stays until compaction summarizes it.
+    // than restored. The truncation marker, delivered notices and mentioned
+    // skills are conversation content and stay until compaction.
     .filter(|message| {
         !matches!(
             message,
@@ -303,6 +303,7 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
             } if !content.starts_with(
                 "[Earlier conversation history was truncated to fit context window]"
             ) && !is_delivered_notice(content)
+                && !crate::skill_context::is_mentioned_skill_message(content)
         )
     })
     .collect::<Vec<_>>();
