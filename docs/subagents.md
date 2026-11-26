@@ -137,7 +137,15 @@ running while they run. In the TUI:
   stopped. While they run, main's turn is running too, so the first Ctrl+C
   stops that turn and its subagents with it; the next Ctrl+C says `Press
   Ctrl+C again to quit.`, and the one after that quits.
-- Backgrounding a main turn that has running subagents is not supported yet.
+- A main turn whose subagents are running is not moved to the background.
+  Ctrl+B on it, in main's conversation or in a subagent's, shows `This turn
+  cannot move to the background while its subagents are running.`, and the
+  turn goes on in the foreground. The key
+  is not remembered: once the subagents have ended, press it again to move
+  the turn. A Ctrl+B pressed while main runs a tool, such as while its
+  `subagent` call waits for approval, takes effect when main's next reply
+  starts, and is answered with the same line if a subagent has started by
+  then.
 
 Such a subagent never asks the person, or the main agent, anything. What it
 may do is fixed when it starts, from the main conversation's permission mode,

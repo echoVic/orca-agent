@@ -101,6 +101,13 @@ Quitting the TUI ends its agents. With agents running, the first Ctrl+C
 says so (`2 agents are still running. Press Ctrl+C again to quit and stop
 them.`), and quitting stops them so they are recorded as stopped.
 
+### Moving main to the background
+
+Stage 1 left a main turn whose agents run in the TUI's process free to be
+moved to the background; that gap is closed by refusal: Ctrl+B on such a
+turn shows `This turn cannot move to the background while its subagents
+are running.`, and the turn stays in the foreground.
+
 ### The card
 
 As in the 2026-11-23 spec: a card floating over the top right of the
