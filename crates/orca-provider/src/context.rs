@@ -593,6 +593,7 @@ fn internal_context_tokens_with_counter(
     [
         render_internal_context_with_counter(conversation, counter),
         render_mcp_instructions_with_counter(conversation, counter),
+        render_mcp_catalogs_with_counter(conversation, counter),
     ]
     .into_iter()
     .flatten()
@@ -635,17 +636,6 @@ fn render_mcp_instructions_with_counter(
     conversation: &Conversation,
     counter: &impl TokenCounter,
 ) -> Option<String> {
-    let has_catalog = conversation
-        .mcp_instructions
-        .iter()
-        .any(|(_, text)| text.starts_with(orca_core::mcp_types::ON_DEMAND_CATALOG_PREFIX));
-    let footer = "\n\n[MCP catalog shortened. Call the server's load_tools with {\"names\":[]} for its full list.]";
-    let token_limit = if has_catalog {
-        MCP_CONTEXT_MAX_TOKENS.saturating_sub(counter.count_text(footer) + 2)
-    } else {
-        MCP_CONTEXT_MAX_TOKENS
-    };
-    let mut shortened = false;
     let mut message = MCP_INSTRUCTIONS_PREAMBLE.to_string();
     for (name, text) in &conversation.mcp_instructions {
         let name = name.replace(['"', '<', '>'], "");
@@ -658,11 +648,9 @@ fn render_mcp_instructions_with_counter(
         let close = format!("{cut_note}{MCP_INSTRUCTIONS_CLOSE}");
         let frame_bytes = message.len() + open.len() + close.len();
         if frame_bytes >= MAX_MCP_INSTRUCTION_MESSAGE_BYTES {
-            shortened = true;
             break;
         }
         let server_end = text.floor_char_boundary(MAX_MCP_SERVER_INSTRUCTION_BYTES);
-        shortened |= server_end < text.len();
         let escaped =
             text[..server_end].replace("</mcp_server_instructions", "&lt;/mcp_server_instructions");
         let body_end = escaped.floor_char_boundary(MAX_MCP_INSTRUCTION_MESSAGE_BYTES - frame_bytes);
@@ -672,12 +660,11 @@ fn render_mcp_instructions_with_counter(
         let body_start = message.len();
         message.push_str(text);
         message.push_str(&close);
-        if counter.count_text(&message) > token_limit {
-            shortened = true;
+        if counter.count_text(&message) > MCP_CONTEXT_MAX_TOKENS {
             // Trim the body while reserving room for the note and closing tag.
             message.truncate(body_start);
             let frame_tokens = counter.count_text(&format!("{message}{close}"));
-            let mut body_budget = token_limit.saturating_sub(frame_tokens);
+            let mut body_budget = MCP_CONTEXT_MAX_TOKENS.saturating_sub(frame_tokens);
             while body_budget > 0 {
                 let body = truncate_text_to_token_limit(text, body_budget, counter);
                 if body.is_empty() {
@@ -686,27 +673,90 @@ fn render_mcp_instructions_with_counter(
                 message.push_str(&body);
                 message.push_str(&close);
                 let tokens = counter.count_text(&message);
-                if tokens <= token_limit {
-                    if has_catalog {
-                        message.push_str(footer);
-                    }
+                if tokens <= MCP_CONTEXT_MAX_TOKENS {
                     return Some(message);
                 }
                 message.truncate(body_start);
-                body_budget = body_budget.saturating_sub(tokens - token_limit);
+                body_budget = body_budget.saturating_sub(tokens - MCP_CONTEXT_MAX_TOKENS);
             }
             message.truncate(previous_end);
             break;
         }
         if body_end < escaped.len() {
-            shortened = true;
             break;
         }
     }
-    if has_catalog && shortened {
-        message.push_str(footer);
-    }
     (message.len() > MCP_INSTRUCTIONS_PREAMBLE.len()).then_some(message)
+}
+
+const MCP_CATALOG_OPEN: &str = "MCP tool metadata. Use each server's loader to make a listed tool available.\n<mcp_tool_catalog>\n";
+const MCP_CATALOG_CLOSE: &str = "</mcp_tool_catalog>";
+const MCP_CATALOG_SHORTENED: &str = "\n[MCP catalog shortened. Call the server's load_tools with {\"names\":[]} for its full list.]";
+
+pub(crate) fn render_mcp_catalogs(conversation: &Conversation) -> Option<String> {
+    render_mcp_catalogs_with_counter(conversation, &DefaultTokenCounter)
+}
+
+fn render_mcp_catalogs_with_counter(
+    conversation: &Conversation,
+    counter: &impl TokenCounter,
+) -> Option<String> {
+    if conversation.mcp_catalogs.is_empty() {
+        return None;
+    }
+    // Reserve every loader heading before spending tokens on descriptions.
+    let mut sections = conversation
+        .mcp_catalogs
+        .iter()
+        .map(|catalog| {
+            format!(
+                r#"{{"server":{},"loader":{},"tools":["#,
+                catalog_json(&catalog.server),
+                catalog_json(&catalog.loader)
+            )
+        })
+        .collect::<Vec<_>>();
+    let minimum = assemble_mcp_catalog(&sections, true);
+    let budget = MCP_CONTEXT_MAX_TOKENS.max(counter.count_text(&minimum));
+    let mut shortened = false;
+    for (index, catalog) in conversation.mcp_catalogs.iter().enumerate() {
+        for (entry_index, entry) in catalog.entries.iter().enumerate() {
+            let previous_end = sections[index].len();
+            if entry_index > 0 {
+                sections[index].push(',');
+            }
+            sections[index].push_str(&catalog_json(entry));
+            if counter.count_text(&assemble_mcp_catalog(&sections, true)) > budget {
+                sections[index].truncate(previous_end);
+                shortened = true;
+                break;
+            }
+        }
+    }
+    Some(assemble_mcp_catalog(&sections, shortened))
+}
+
+fn assemble_mcp_catalog(sections: &[String], shortened: bool) -> String {
+    let mut text = String::from(MCP_CATALOG_OPEN);
+    for section in sections {
+        text.push_str(section);
+        text.push_str("]}\n");
+    }
+    text.push_str(MCP_CATALOG_CLOSE);
+    if shortened {
+        text.push_str(MCP_CATALOG_SHORTENED);
+    }
+    text
+}
+
+fn catalog_json(value: &impl serde::Serialize) -> String {
+    serde_json::to_string(value)
+        .expect("MCP catalog metadata is serializable")
+        .replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 pub fn truncate_text_to_token_limit(
@@ -1186,6 +1236,7 @@ fn summarize_collapsed_messages(
     result
         .mcp_instructions
         .clone_from(&conversation.mcp_instructions);
+    result.mcp_catalogs.clone_from(&conversation.mcp_catalogs);
     result.rolling_summary = Some(new_delta.clone());
 
     let mut summary = conversation.summary.clone();

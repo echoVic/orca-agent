@@ -16,7 +16,7 @@ use orca_core::tool_images::{MAX_REQUEST_TOOL_IMAGES, keep_newest_tool_images};
 use orca_core::tool_types::{ToolName, ToolRequest};
 
 use crate::ProviderConfig;
-use crate::context::{render_internal_context, render_mcp_instructions};
+use crate::context::{render_internal_context, render_mcp_catalogs, render_mcp_instructions};
 use crate::http_client::RetryBudget;
 use crate::tool_schema::{
     DEEPSEEK_MAX_TOOLS, deepseek_strict_tools_schema_for_endpoint, deepseek_tools_schema,
@@ -1219,6 +1219,7 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
     for overlay in [
         render_internal_context(conversation),
         render_mcp_instructions(conversation),
+        render_mcp_catalogs(conversation),
     ]
     .into_iter()
     .flatten()
@@ -2152,6 +2153,51 @@ mod tests {
         };
         request_chat(&conversation, &config).expect("request with MCP instructions");
         serde_json::from_str(&bodies.lock().unwrap()[0]).expect("captured body")
+    }
+
+    fn eager_mcp_request_bytes() -> String {
+        let ok = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        let (base_url, bodies) = spawn_response_sequence_server(vec![ok]);
+        let mut conversation = Conversation::new();
+        conversation.add_system("system prompt".into());
+        conversation.add_user("find the record".into());
+        conversation.replace_plan_state("[Plan]\n1. Search".into());
+        conversation.mcp_instructions = vec![(
+            "catalog".into(),
+            format!(
+                "On-demand tools from MCP server {}",
+                "search records by identifier. ".repeat(1_000)
+            ),
+        )];
+        let config = ProviderConfig {
+            api_key: Some("test-key".into()),
+            base_url: Some(base_url),
+            tools_override: Some(vec![crate::tool_schema::ProviderToolDefinition {
+                name: "mcp__catalog__lookup".into(),
+                description: "Look up a record".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                strict_capable: false,
+            }]),
+            model: Some(FLASH_MODEL.into()),
+            reasoning_effort: orca_core::config::ReasoningEffort::High,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+            max_output_tokens: Some(2048),
+        };
+        request_chat(&conversation, &config).expect("request with eager MCP instructions");
+        let body = bodies.lock().unwrap()[0].clone();
+        body
+    }
+
+    #[test]
+    fn eager_mcp_request_matches_origin_main() {
+        // Captured with ea4a9c0b's DeepSeek renderer and the request above.
+        let expected = include_str!("fixtures/eager-mcp-origin-main.json");
+        let actual = eager_mcp_request_bytes();
+        assert!(
+            actual == expected,
+            "eager MCP request differs from origin/main"
+        );
     }
 
     #[test]

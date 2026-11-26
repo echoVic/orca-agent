@@ -16,10 +16,11 @@ use crate::connection_stop::McpConnectionStop;
 use crate::transport::{self, McpElicitationHandler, McpTransport};
 use orca_core::conversation::ImageInput;
 use orca_core::mcp_types::{
-    CallToolResult, GetPromptResult, McpContent, McpPrompt, McpPromptContent, McpPromptDescriptor,
-    McpResource, McpResourceTemplate, McpServerConfig, McpTool, McpToolLoading, McpToolRef,
-    McpTransportKind, PromptsListResult, ReadResourceResult, ResourceTemplatesListResult,
-    ResourcesListResult, ToolsListResult, canonical_mcp_name, tool_is_enabled,
+    CallToolResult, GetPromptResult, McpCatalogEntry, McpContent, McpPrompt, McpPromptContent,
+    McpPromptDescriptor, McpResource, McpResourceTemplate, McpServerConfig, McpTool,
+    McpToolCatalog, McpToolLoading, McpToolRef, McpTransportKind, PromptsListResult,
+    ReadResourceResult, ResourceTemplatesListResult, ResourcesListResult, ToolsListResult,
+    canonical_mcp_name, tool_is_enabled,
 };
 use orca_core::tool_images::tool_image;
 use orca_core::tool_types::McpToolLoad;
@@ -168,6 +169,12 @@ pub type McpLoadedTools = BTreeMap<String, BTreeSet<String>>;
 #[derive(Default)]
 struct McpToolScope {
     loaded: McpLoadedTools,
+    budget: Option<McpToolBudget>,
+}
+
+struct McpToolBudget {
+    ordinary_slots: usize,
+    allowed: Option<HashSet<String>>,
 }
 
 impl McpToolScope {
@@ -1285,7 +1292,10 @@ impl McpRegistry {
         if !inner.servers.iter().any(McpServerEntry::is_on_demand) {
             return self.clone();
         }
-        let mut selection = McpToolScope { loaded };
+        let mut selection = McpToolScope {
+            loaded,
+            ..McpToolScope::default()
+        };
         for server in &inner.servers {
             if server.is_on_demand() && server.state == McpServerState::Ready {
                 selection.retain_offered(server);
@@ -1341,6 +1351,17 @@ impl McpRegistry {
             .collect()
     }
 
+    /// Capacity for ordinary schemas after the current agent's tools and loaders.
+    pub fn set_tool_budget(&self, ordinary_slots: usize, allowed: Option<HashSet<String>>) {
+        self.tool_scope
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .budget = Some(McpToolBudget {
+            ordinary_slots,
+            allowed,
+        });
+    }
+
     pub fn load_tools(
         &self,
         server: &str,
@@ -1388,13 +1409,57 @@ impl McpRegistry {
             .entry(load.server.clone())
             .or_default()
             .extend(load.names.iter().cloned());
-        Ok((
-            format!(
-                "MCP tools available on the next request: {}",
-                names.join(", ")
-            ),
-            Some(load),
-        ))
+        let available = scope.budget.as_ref().map(|budget| {
+            inner
+                .servers
+                .iter()
+                .filter(|entry| !entry.is_on_demand() || entry.state == McpServerState::Ready)
+                .flat_map(|entry| {
+                    let selected = scope.loaded.get(&entry.name);
+                    entry.tools.iter().filter(move |tool| {
+                        budget
+                            .allowed
+                            .as_ref()
+                            .is_none_or(|allowed| allowed.contains(&tool.schema_name))
+                            && (!entry.is_on_demand()
+                                || selected.is_some_and(|names| names.contains(&tool.name)))
+                    })
+                })
+                .map(|tool| tool.schema_name.as_str())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .take(budget.ordinary_slots)
+                .collect::<HashSet<_>>()
+        });
+        let (fitting, omitted): (Vec<_>, Vec<_>) = load.names.iter().partition(|name| {
+            available.as_ref().is_none_or(|available| {
+                server.tools.iter().any(|tool| {
+                    tool.name == **name && available.contains(tool.schema_name.as_str())
+                })
+            })
+        });
+        let names = |names: &[&String]| {
+            names
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut output = format!(
+            "MCP tools available after this load: {}",
+            if fitting.is_empty() {
+                "none".into()
+            } else {
+                names(&fitting)
+            }
+        );
+        if !omitted.is_empty() {
+            output.push_str(&format!(
+                "\nMCP tools unavailable after this load: {}",
+                names(&omitted)
+            ));
+        }
+        Ok((output, Some(load)))
     }
 
     pub fn resolve_agent_tool(&self, schema_name: &str) -> Option<McpToolRef> {
@@ -1445,28 +1510,29 @@ impl McpRegistry {
     }
 
     /// Catalogs of connected on-demand servers in configuration order.
-    pub fn on_demand_catalogs(&self) -> Vec<(String, String)> {
+    pub fn on_demand_catalogs(&self) -> Vec<McpToolCatalog> {
         self.read()
             .servers
             .iter()
             .filter(|server| server.is_on_demand() && server.state == McpServerState::Ready)
-            .map(|server| {
-                let mut text = format!(
-                    "{}'{}':",
-                    orca_core::mcp_types::ON_DEMAND_CATALOG_PREFIX,
-                    server.name
-                );
-                for tool in &server.tools {
-                    let name = tool.name.replace(['\r', '\n'], " ");
-                    let description = tool
-                        .description
-                        .as_deref()
-                        .and_then(|value| value.lines().next())
-                        .unwrap_or("");
-                    let description = description.chars().take(160).collect::<String>();
-                    text.push_str(&format!("\n{name} — {description}"));
-                }
-                (server.name.clone(), text)
+            .map(|server| McpToolCatalog {
+                server: server.name.clone(),
+                loader: server.loader_name(),
+                entries: server
+                    .tools
+                    .iter()
+                    .map(|tool| McpCatalogEntry {
+                        name: tool.name.clone(),
+                        description: tool
+                            .description
+                            .as_deref()
+                            .and_then(|value| value.lines().next())
+                            .unwrap_or("")
+                            .chars()
+                            .take(160)
+                            .collect(),
+                    })
+                    .collect(),
             })
             .collect()
     }

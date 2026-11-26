@@ -4,6 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::approval_types::ActionKind;
+use crate::mcp_types::McpToolCatalog;
 use crate::tool_images::{MAX_REQUEST_TOOL_IMAGES, RetainedToolImages, keep_newest_tool_images};
 use crate::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminal, ToolTerminalSource};
 
@@ -481,6 +482,7 @@ pub struct Conversation {
     pub internal_context: InternalContext,
     /// Per-server guidance for the current tool set, sent in its own request message.
     pub mcp_instructions: Vec<(String, String)>,
+    pub mcp_catalogs: Vec<McpToolCatalog>,
     pub rolling_summary: Option<String>,
     pub summary: SummaryState,
     /// Not persisted: a resumed conversation measures from a full estimate
@@ -501,6 +503,7 @@ impl Clone for Conversation {
             messages: self.messages.clone(),
             internal_context: self.internal_context.clone(),
             mcp_instructions: self.mcp_instructions.clone(),
+            mcp_catalogs: self.mcp_catalogs.clone(),
             rolling_summary: self.rolling_summary.clone(),
             summary: self.summary.clone(),
             usage_anchor: self.usage_anchor,
@@ -516,6 +519,7 @@ impl Conversation {
             messages: Vec::new(),
             internal_context: InternalContext::default(),
             mcp_instructions: Vec::new(),
+            mcp_catalogs: Vec::new(),
             rolling_summary: None,
             summary: SummaryState::default(),
             usage_anchor: None,

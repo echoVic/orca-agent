@@ -5,7 +5,18 @@ use serde_json::{Value, json};
 
 use crate::capability::CapabilitySet;
 
-pub const ON_DEMAND_CATALOG_PREFIX: &str = "On-demand tools from MCP server ";
+#[derive(Clone, Debug)]
+pub struct McpToolCatalog {
+    pub server: String,
+    pub loader: String,
+    pub entries: Vec<McpCatalogEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct McpCatalogEntry {
+    pub name: String,
+    pub description: String,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

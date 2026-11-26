@@ -3366,7 +3366,7 @@ while IFS= read -r line; do
         let _home = crate::history::redirect_test_orca_home(dir.path());
         let mut config = config(SubagentConfig::default());
         config.cwd = Some(dir.path().into());
-        let first_line = "a".repeat(160);
+        let first_line = format!("<example>{}</example>", "a".repeat(141));
         let server = delayed_mcp_server_with_tools(
             dir.path(),
             0,
@@ -3396,9 +3396,10 @@ while IFS= read -r line; do
         );
         let messages = request["messages"].as_array().unwrap();
         let mcp = messages.last().unwrap()["content"].as_str().unwrap();
-        assert!(mcp.contains(&format!(
-            "On-demand tools from MCP server 'catalog':\nlookup — {first_line}"
-        )));
+        assert!(mcp.contains("<mcp_tool_catalog>"));
+        assert!(mcp.contains(r#""name":"lookup""#));
+        assert!(mcp.contains(r"\u003cexample\u003e"));
+        assert!(!mcp.contains("<example>"));
         assert!(!mcp.contains("cutoff"));
         assert!(!mcp.contains("second line"));
     }
@@ -3766,11 +3767,16 @@ while IFS= read -r line; do
         );
         run_mcp_test_prompt(&config, &mut session);
         let requests = provider.join().unwrap();
+        let catalog = requests[0]["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(catalog.contains("MCP catalog shortened"));
+        assert!(catalog.contains("mcp__catalog__load_tools"));
+        assert!(catalog.contains("mcp__other__load_tools"));
+        use orca_provider::context::{DefaultTokenCounter, TokenCounter};
         assert!(
-            requests[0]["messages"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
-                .unwrap()
-                .contains("MCP catalog shortened")
+            DefaultTokenCounter.count_text(catalog)
+                <= orca_core::conversation::MCP_CONTEXT_MAX_TOKENS
         );
         let reply = requests[1]["messages"]
             .as_array()
@@ -3793,8 +3799,15 @@ while IFS= read -r line; do
         let _home = crate::history::redirect_test_orca_home(dir.path());
         let mut config = config(SubagentConfig::default());
         config.cwd = Some(dir.path().into());
+        let tools = (0..135)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("aaa_{i:03}"), "inputSchema": {"type":"object"}
+                })
+            })
+            .collect();
         config.mcp_servers = vec![mcp_loading_mode(
-            delayed_mcp_server(dir.path(), 0, 135),
+            delayed_mcp_server_with_tools(dir.path(), 0, tools),
             "on-demand",
         )];
         let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
@@ -3807,7 +3820,7 @@ while IFS= read -r line; do
         let provider = serve_scripted_provider(
             &mut config,
             [
-                load_mcp_tools((0..135).map(|i| format!("lookup_{i:02}"))),
+                load_mcp_tools((0..135).map(|i| format!("aaa_{i:03}"))),
                 scripted_reply(),
             ],
         );
@@ -3816,6 +3829,38 @@ while IFS= read -r line; do
         assert_eq!(mcp_only_names(&requests[0]), ["mcp__catalog__load_tools"]);
         assert_eq!(requests[1]["tools"].as_array().unwrap().len(), 128);
         let sent = mcp_only_names(&requests[1]);
+        assert!(sent.contains(&"mcp__catalog__load_tools"));
+        let reply = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        let (available, unavailable) = reply
+            .split_once('\n')
+            .expect("loader reports both outcomes");
+        let available = available
+            .split_once(": ")
+            .unwrap()
+            .1
+            .split(", ")
+            .collect::<Vec<_>>();
+        let unavailable = unavailable
+            .split_once(": ")
+            .unwrap()
+            .1
+            .split(", ")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            available,
+            sent.iter()
+                .filter_map(|name| name.strip_prefix("mcp__catalog__"))
+                .filter(|name| *name != "load_tools")
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(available.len() + unavailable.len(), 135);
         let mut dropped = session
             .mcp_registry()
             .tools()
