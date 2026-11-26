@@ -1260,6 +1260,8 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     "crates/orca-tui/src/state_reducer.rs:update:self.announced_startup_warnings.insert",
     1,
   ],
+  ["crates/orca-tui/src/state_reducer.rs:update:self.workflow_provider_retries.insert", 1],
+  ["crates/orca-tui/src/types.rs:reset_session_projection:self.workflow_provider_retries.clear", 1],
   [
     "crates/orca-tui/src/types.rs:reset_session_projection:self.announced_startup_warnings.clear",
     1,

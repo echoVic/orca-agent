@@ -1,7 +1,7 @@
 use crossbeam_channel as mpsc;
 #[cfg(any(test, debug_assertions))]
 use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 #[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -25,7 +25,6 @@ use orca_runtime::history::SessionSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCandidate};
 use orca_runtime::onboarding::FirstRunState;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
-#[cfg(test)]
 use orca_runtime::surface::SurfaceOperationId;
 
 use crate::agent_workspace::AgentWorkspaceState;
@@ -759,6 +758,8 @@ pub struct AppState {
     pub session_picker_show_tests: bool,
     pub(crate) surface_metrics: SurfaceMetricsState,
     pub(crate) provider_retry: Option<orca_core::provider_types::ProviderRetry>,
+    pub(crate) workflow_provider_retries:
+        BTreeMap<SurfaceOperationId, orca_core::provider_types::ProviderRetry>,
     pub slash_menu: Option<SlashMenu>,
     pub mention: MentionPopupState,
     pub mention_bindings: MentionBindings,
@@ -1179,6 +1180,7 @@ impl AppState {
             session_picker_show_tests: false,
             surface_metrics: SurfaceMetricsState::default(),
             provider_retry: None,
+            workflow_provider_retries: BTreeMap::new(),
             slash_menu: None,
             mention: MentionPopupState::default(),
             mention_bindings: MentionBindings::default(),
@@ -1596,6 +1598,7 @@ impl AppState {
         self.pending_workflow_notifications.clear();
         self.suppress_background_main_session_output = false;
         self.provider_retry = None;
+        self.workflow_provider_retries.clear();
         self.last_completed_at = None;
         self.viewport.pending_clipboard_copy = None;
         self.viewport.last_left_click = None;

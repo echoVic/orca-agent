@@ -1879,7 +1879,10 @@ pub(crate) fn launch_workflow(
                     } => {
                         if operation_id == monitor_operation_id {
                             retry_visible = retry.is_some();
-                            let _ = monitor_events.send(TuiEvent::ProviderRetry(retry));
+                            let _ = monitor_events.send(TuiEvent::WorkflowProviderRetry {
+                                operation_id,
+                                retry,
+                            });
                         }
                     }
                     SurfaceSubscriptionItem::Gap { required } => {
@@ -1897,7 +1900,10 @@ pub(crate) fn launch_workflow(
                 }
             }
             if retry_visible {
-                let _ = monitor_events.send(TuiEvent::ProviderRetry(None));
+                let _ = monitor_events.send(TuiEvent::WorkflowProviderRetry {
+                    operation_id: monitor_operation_id,
+                    retry: None,
+                });
             }
             detach(&monitor_surface, &monitor_client);
         })
@@ -4266,9 +4272,13 @@ mod tests {
         let mut retry_events = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(3);
         while let Ok(event) = event_rx.recv_deadline(deadline) {
-            if let TuiEvent::ProviderRetry(retry) = event {
+            if let TuiEvent::WorkflowProviderRetry {
+                operation_id,
+                retry,
+            } = event
+            {
                 let cleared = retry.is_none();
-                retry_events.push(retry);
+                retry_events.push((operation_id, retry));
                 if cleared {
                     break;
                 }
@@ -4276,9 +4286,10 @@ mod tests {
         }
         thread.shutdown().unwrap();
         host.shutdown().unwrap();
-        let [Some(retry), None] = retry_events.as_slice() else {
+        let [(started, Some(retry)), (cleared, None)] = retry_events.as_slice() else {
             panic!("expected a workflow retry and clear, got {retry_events:?}");
         };
+        assert_eq!(started, cleared);
         assert_eq!(retry.attempt, 1);
         assert!(retry.delay_ms > 0);
         assert!(

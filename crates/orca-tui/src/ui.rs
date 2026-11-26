@@ -5281,7 +5281,11 @@ fn workspace_status_spans(
 }
 
 fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
-    if let Some(retry) = &state.provider_retry {
+    if let Some(retry) = state
+        .provider_retry
+        .as_ref()
+        .or_else(|| state.workflow_provider_retries.values().next_back())
+    {
         let reason: String = retry
             .reason
             .chars()
@@ -12758,6 +12762,42 @@ mod tests {
         state.update(crate::protocol::TuiEvent::SessionCompleted {
             status: "cancelled".into(),
         });
+        assert!(!status_text(&state, 120).contains("Retrying"));
+    }
+
+    #[test]
+    fn workflow_retry_display_survives_launch_and_other_operations_finishing() {
+        use orca_core::provider_types::{ProviderErrorKind, ProviderRetry};
+        use orca_runtime::surface::SurfaceOperationId;
+        let mut state = test_state();
+        let first = SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let second = SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let retry = |reason: &str| ProviderRetry {
+            attempt: 1,
+            max_attempts: 5,
+            delay_ms: 1000,
+            kind: ProviderErrorKind::Server,
+            reason: reason.to_owned(),
+        };
+        let workflow =
+            |id: &SurfaceOperationId, retry| crate::protocol::TuiEvent::WorkflowProviderRetry {
+                operation_id: id.clone(),
+                retry,
+            };
+        state.update(workflow(&first, Some(retry("first workflow"))));
+        state.update(crate::protocol::TuiEvent::SessionCompleted {
+            status: "success".into(),
+        });
+        assert!(status_text(&state, 120).contains("first workflow"));
+        state.update(workflow(&second, Some(retry("second workflow"))));
+        state.update(crate::protocol::TuiEvent::ProviderRetry(Some(retry(
+            "foreground",
+        ))));
+        state.update(workflow(&second, None));
+        assert!(status_text(&state, 120).contains("foreground"));
+        state.update(crate::protocol::TuiEvent::ProviderRetry(None));
+        assert!(status_text(&state, 120).contains("first workflow"));
+        state.update(workflow(&first, None));
         assert!(!status_text(&state, 120).contains("Retrying"));
     }
 
