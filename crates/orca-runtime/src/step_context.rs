@@ -146,14 +146,15 @@ impl RuntimeSamplingRequestState {
         result: &ToolResult,
         status: RunStatus,
         emit_deltas: bool,
-    ) -> io::Result<RuntimeToolResultRecordOutcome> {
+    ) -> io::Result<(RuntimeToolResultRecordOutcome, bool)> {
         record_plan_state_for_agent(
             conversation,
             history_writer.as_deref_mut(),
             tool_request,
             result,
         );
-        record_tool_result_for_agent(conversation, history_writer, result, emit_deltas)?;
+        let committed =
+            record_tool_result_for_agent(conversation, history_writer, result, emit_deltas)?;
 
         let terminal_continuation_violation = tool_request.name
             == orca_core::tool_types::ToolName::Subagent
@@ -165,12 +166,15 @@ impl RuntimeSamplingRequestState {
             || result.status == orca_core::tool_types::ToolStatus::Indeterminate
             || terminal_continuation_violation
         {
-            return Ok(RuntimeToolResultRecordOutcome::Return {
-                status,
-                error: result.error.clone(),
-            });
+            return Ok((
+                RuntimeToolResultRecordOutcome::Return {
+                    status,
+                    error: result.error.clone(),
+                },
+                committed,
+            ));
         }
-        Ok(RuntimeToolResultRecordOutcome::Continue)
+        Ok((RuntimeToolResultRecordOutcome::Continue, committed))
     }
 }
 

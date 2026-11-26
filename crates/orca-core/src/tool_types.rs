@@ -820,6 +820,9 @@ pub struct ToolResult {
     /// when the call returns, so it never enters a transcript.
     #[serde(skip)]
     pub service_usage: ToolServiceUsage,
+    /// Shell notices this result makes redundant after it joins the conversation.
+    #[serde(skip)]
+    pub observed_shell_completions: Vec<String>,
 }
 
 impl Deref for ToolResult {
@@ -881,6 +884,7 @@ impl ToolResult {
             file_change_preview: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -902,6 +906,7 @@ impl ToolResult {
             file_change_preview: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -938,6 +943,7 @@ impl ToolResult {
             file_change_preview: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -992,6 +998,7 @@ impl ToolResult {
             file_change_preview: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -1013,6 +1020,7 @@ impl ToolResult {
             file_change_preview: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -1034,6 +1042,7 @@ impl ToolResult {
             file_change_preview: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -1068,6 +1077,7 @@ impl ToolResult {
             file_change_preview: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -1113,6 +1123,7 @@ impl ToolResult {
             file_change_preview: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 

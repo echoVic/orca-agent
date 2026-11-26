@@ -1206,6 +1206,8 @@ pub struct PendingTaskWait {
     pub baseline: Vec<u64>,
     #[serde(default)]
     pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) observed_shell_completions: Vec<String>,
 }
 
 /// A message a parent handed to a running child.
@@ -7404,6 +7406,7 @@ mod tests {
                             state_change: false,
                             baseline: Vec::new(),
                             result: None,
+                            observed_shell_completions: Vec::new(),
                         }),
                     )
                 })
