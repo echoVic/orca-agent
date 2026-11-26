@@ -351,7 +351,7 @@ mod platform {
         // The verified parent chain stays open without delete sharing across
         // these calls. Exclusive file creation refuses any existing leaf.
         pub(super) fn create_directory(&self, name: &OsStr) -> io::Result<()> {
-            std::fs::create_dir(self.0.path.source().join(name))
+            std::fs::create_dir(self.new_path(name)?)
         }
 
         pub(super) fn create_file(&self, name: &OsStr) -> io::Result<File> {
@@ -360,7 +360,18 @@ mod platform {
                 .write(true)
                 .create_new(true)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(self.0.path.source().join(name))
+                .open(self.new_path(name)?)
+        }
+
+        fn new_path(&self, name: &OsStr) -> io::Result<PathBuf> {
+            let path = self.0.path.source().join(name);
+            let text = path.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8")
+            })?;
+            PathPolicy::windows_sandbox()
+                .identity(text)
+                .map_err(as_io)?;
+            Ok(path)
         }
 
         pub(super) fn remove_file(&self, _name: &OsStr, file: &File) -> io::Result<()> {

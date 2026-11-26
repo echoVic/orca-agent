@@ -33,7 +33,7 @@
       "apply-patch-unix-path-and-fixtures",
       "crates/orca-tools/src/apply_patch.rs",
       "unix_std_api",
-      3
+      4
     ],
     [
       "computer-use-nonblocking-stdin",

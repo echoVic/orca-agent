@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use orca_core::tool_types::{
@@ -196,7 +196,6 @@ pub(crate) struct PlannedTarget {
     pub(crate) label: String,
     ancestor: PathBuf,
     ancestor_identity: FileIdentity,
-    case_insensitive: bool,
     relative: String,
     requested_relative: String,
     mode: Option<u32>,
@@ -401,7 +400,6 @@ fn resolve_target(
         label: label.to_owned(),
         ancestor: directory,
         ancestor_identity: verified.identity().map_err(|error| error.to_string())?,
-        case_insensitive,
         relative,
         requested_relative,
         mode: None,
@@ -508,7 +506,7 @@ impl PlannedTarget {
     fn parent_for_write(
         &self,
         plan: &PreparedPatch,
-        created: &mut HashMap<PathBuf, FileIdentity>,
+        created: &mut HashSet<FileIdentity>,
         effects: &mut Vec<FileEffect>,
     ) -> io::Result<VerifiedDirectory> {
         // Unix directory descriptors keep operations on the checked directory
@@ -537,19 +535,19 @@ impl PlannedTarget {
             .iter()
         {
             let next = path.join(component);
-            let key = path_key(&next, self.case_insensitive);
-            if let Some(identity) = created.get(&key) {
-                directory = directory.child(component)?;
-                if directory.identity()? != *identity {
-                    return Err(stale_path());
+            directory = match directory.child(component) {
+                Ok(child) if created.contains(&child.identity()?) => child,
+                Ok(_) => return Err(stale_path()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let label = workspace_label(&plan.root, &next).map_err(io::Error::other)?;
+                    directory.create_directory(component)?;
+                    effects.push(FileEffect::CreatedDirectory(label));
+                    let child = directory.child(component)?;
+                    created.insert(child.identity()?);
+                    child
                 }
-            } else {
-                let label = workspace_label(&plan.root, &next).map_err(io::Error::other)?;
-                directory.create_directory(component)?;
-                effects.push(FileEffect::CreatedDirectory(label));
-                directory = directory.child(component)?;
-                created.insert(key, directory.identity()?);
-            }
+                Err(error) => return Err(error),
+            };
             path = next;
         }
         Ok(directory)
@@ -562,13 +560,20 @@ impl PlannedTarget {
         before: &str,
     ) -> io::Result<fs::File> {
         let file = directory.open_file(self.file_name(), access)?;
-        if Some(single_link_identity(&file)?) != self.identity
-            || read_opened(&file, &|| false)? != before
+        self.verify_contents(&file, before)?;
+        Ok(file)
+    }
+
+    fn verify_contents(&self, mut file: &fs::File, before: &str) -> io::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        if Some(single_link_identity(file)?) != self.identity
+            || read_opened(file, &|| false)? != before
+            || file_mode(file)? != self.mode
         {
             return Err(stale_path());
         }
-        single_link_identity(&file)?;
-        Ok(file)
+        single_link_identity(file)?;
+        Ok(())
     }
 }
 
@@ -802,7 +807,7 @@ fn commit(
 ) -> ToolResult {
     let mut written = Vec::new();
     let mut effects = Vec::new();
-    let mut created = HashMap::new();
+    let mut created = HashSet::new();
     for (index, op) in plan.ops.iter().enumerate() {
         let first_effect = effects.len();
         let cancelled = should_cancel();
@@ -826,15 +831,14 @@ fn commit(
                 .iter()
                 .map(PlannedOp::label)
                 .collect::<Vec<_>>();
-            let mut result = if cancelled && effects.is_empty() {
-                ToolResult::cancelled_before_start(request, "patch cancelled")
-            } else {
-                let message = if cancelled {
-                    error.to_string()
+            let mut result = if cancelled {
+                if effects.is_empty() {
+                    ToolResult::cancelled_before_start(request, "patch cancelled")
                 } else {
-                    format!("failed to apply {failed}: {error}")
-                };
-                ToolResult::failed(request, message, None)
+                    ToolResult::cancelled(request, "patch cancelled", None)
+                }
+            } else {
+                ToolResult::failed(request, format!("failed to apply {failed}: {error}"), None)
             };
             let written = if written.is_empty() {
                 "(none)".into()
@@ -917,7 +921,7 @@ impl PlannedOp {
     fn write(
         &self,
         plan: &PreparedPatch,
-        created: &mut HashMap<PathBuf, FileIdentity>,
+        created: &mut HashSet<FileIdentity>,
         effects: &mut Vec<FileEffect>,
     ) -> Result<(), WriteFailure<'_>> {
         let parent = self.target.parent_for_write(plan, created, effects)?;
@@ -939,8 +943,9 @@ impl PlannedOp {
                 create_file(&destination, dest, text, effects)?
                     .set_permissions(permissions)
                     .map_err(|error| WriteFailure::after_write(error, dest))?;
-                parent
-                    .remove_file(self.target.file_name(), &file)
+                self.target
+                    .verify_contents(&file, before)
+                    .and_then(|()| parent.remove_file(self.target.file_name(), &file))
                     .map_err(|error| WriteFailure::after_write(error, dest))?;
                 effects.push(FileEffect::Deleted(self.target.relative.clone()));
                 Ok(())
@@ -954,7 +959,6 @@ impl PlannedOp {
                 // hard link between validation and truncation.
                 file.set_len(0)?;
                 effects.push(FileEffect::Written(self.target.relative.clone()));
-                use std::io::{Seek, SeekFrom};
                 file.seek(SeekFrom::Start(0))
                     .and_then(|_| file.write_all(text.as_bytes()))
                     .map_err(|error| WriteFailure::after_write(error, &self.target))
@@ -1400,6 +1404,52 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn patch_rejects_windows_special_path_forms() {
+        let dir = TempDir::new().unwrap();
+        for target in [
+            r"C:relative",
+            r"\rooted",
+            r"\\host\share\a",
+            r"\\?\C:\a",
+            "file:stream",
+            "NUL",
+        ] {
+            let result = execute(
+                &request(&format!("*** Add File: {target}\n+x")),
+                dir.path(),
+                || false,
+            );
+            assert_eq!(
+                result.status,
+                orca_core::tool_types::ToolStatus::Failed,
+                "{target}"
+            );
+        }
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn patch_refuses_a_parent_reparse_point_introduced_after_preparation() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        let body = "*** Add File: sub/new\n+x";
+        let prepared = plan(body, dir.path()).unwrap();
+        fs::rename(dir.path().join("sub"), dir.path().join("saved")).unwrap();
+        if let Err(error) =
+            std::os::windows::fs::symlink_dir(outside.path(), dir.path().join("sub"))
+        {
+            assert_eq!(error.raw_os_error(), Some(1314), "{error}");
+            return;
+        }
+        let result = commit(&request(body), &prepared, &|| false);
+        assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+        assert!(!outside.path().join("new").exists());
+    }
+
     #[test]
     fn patch_refuses_replaced_or_edited_targets() {
         let dir = TempDir::new().unwrap();
@@ -1419,6 +1469,22 @@ mod tests {
             assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
             assert_eq!(fs::read_to_string(&path).unwrap(), current);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_refuses_a_file_whose_permissions_changed_after_preparation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("a");
+        fs::write(&file, "old\n").unwrap();
+        let body = "*** Update File: a\n@@\n-old\n+new";
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        let prepared = plan(body, dir.path()).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        let result = commit(&request(body), &prepared, &|| false);
+        assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+        assert_eq!(fs::read_to_string(file).unwrap(), "old\n");
     }
 
     #[test]

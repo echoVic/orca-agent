@@ -253,6 +253,8 @@ pub(crate) fn validate_patch_paths(
                 "rewind cannot restore {path}: directory {directory} is excluded"
             ));
         }
+        orca_rewind::resolve_inside(patch.root(), path)
+            .map_err(|error| format!("rewind cannot restore {path}: {error}"))?;
     }
     Ok(())
 }

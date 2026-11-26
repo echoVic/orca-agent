@@ -703,10 +703,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry, apply_patch: bool) {
         BuiltinExecutor::Edit,
     ));
     if apply_patch {
-        registry.register(BuiltinTool::new(
-        ToolSpec {
-            name: ToolName::ApplyPatch,
-            ..conservative_builtin_spec(
+        let mut spec = conservative_builtin_spec(
             "apply_patch",
             "Apply a patch to one or more workspace files. The whole patch is checked before any writes. If any check fails, no files are written. Use *** Add File, *** Delete File or *** Update File headers. Updates use @@ hunks with context lines prefixed by a space, removals by -, and additions by +. An update can include *** Move to immediately after its header. Example:\n*** Begin Patch\n*** Add File: notes.txt\n+Hello\n*** End Patch",
             json!({
@@ -719,10 +716,9 @@ fn register_builtin_tools(registry: &mut ToolRegistry, apply_patch: bool) {
             ToolExposure::Direct,
             RendererHint::Write,
             false,
-        )
-        },
-        BuiltinExecutor::ApplyPatch,
-    ));
+        );
+        spec.name = ToolName::ApplyPatch;
+        registry.register(BuiltinTool::new(spec, BuiltinExecutor::ApplyPatch));
     }
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(

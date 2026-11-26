@@ -1562,10 +1562,18 @@ impl ToolExecutionActor {
                 .collect();
             let approval_decision = RuntimeToolApprovalPolicy::new(policy, permission_overlay)
                 .resolve_with_targets(approval.clone(), &invocation.effective, &targets);
-            if matches!(approval_decision, RuntimeApprovalDecision::Ask(_)) {
-                approval.preview = prepared_patch
-                    .map(|patch| patch.preview())
-                    .or(approval.preview);
+            if matches!(approval_decision, RuntimeApprovalDecision::Ask(_))
+                && let Some(patch) = prepared_patch
+            {
+                let targets = targets
+                    .iter()
+                    .map(|target| format!("{target:?}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                approval.preview = Some(format!(
+                    "Workspace targets\n{targets}\n\n{}",
+                    patch.preview()
+                ));
             }
             let mut event_error = None;
             if emit_deltas {
@@ -3748,6 +3756,31 @@ mod tests {
         assert!(!cwd.join("first").exists() && !cwd.join("fresh").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn apply_patch_rewind_rejects_paths_the_restore_planner_cannot_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_permission_rules(PermissionRules::default());
+        config.tools.apply_patch = true;
+        config.approval_mode = ApprovalMode::AutoEdit;
+        config.history_mode = orca_core::config::HistoryMode::Record;
+        let result = execute_patch_test(
+            dir.path(),
+            &config,
+            "*** Add File: staged\n+x\n*** Add File: example/a:b\n+x",
+            None,
+            None,
+        )
+        .result;
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("rewind cannot restore example/a:b"))
+        );
+        assert!(!dir.path().join("staged").exists());
+    }
+
     #[test]
     fn apply_patch_approval_keeps_the_preview_bound_to_the_prepared_file() {
         struct ApproveAfterEdit(std::path::PathBuf);
@@ -3758,7 +3791,9 @@ mod tests {
                 _: &ToolRequest,
             ) -> std::io::Result<orca_core::approval_types::ApprovalResolution> {
                 assert_eq!(approval.target.as_deref(), Some("a"));
-                assert!(approval.preview.as_deref().unwrap().contains("+new"));
+                let preview = approval.preview.as_deref().unwrap();
+                assert!(preview.contains("Workspace targets\n\"a\""));
+                assert!(preview.contains("+new"));
                 std::fs::write(&self.0, "old\nunrelated edit\n").unwrap();
                 Ok(orca_core::approval_types::ApprovalResolution {
                     id: approval.id.clone(),
