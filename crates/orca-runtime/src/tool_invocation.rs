@@ -9,7 +9,9 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
-use orca_provider::tool_schema::ProviderToolDefinition;
+use orca_provider::tool_schema::{
+    DEEPSEEK_MAX_TOOLS, ProviderToolDefinition, limit_tool_definitions_by_source,
+};
 use orca_tools::schema::{ToolPolicy, canonical_tool_definitions, normalize_tool_request};
 
 use crate::hooks::{HookOutcome, tool_request_with_hook_outcome};
@@ -132,7 +134,8 @@ impl ToolExecutionFailure {
     }
 }
 
-pub(crate) fn provider_tool_schema_override(
+#[cfg(test)]
+fn provider_tool_schema_override(
     subagent_depth: u32,
     subagent_type: &SubagentType,
     tool_policy: AgentToolPolicyContext<'_>,
@@ -143,6 +146,15 @@ pub(crate) fn provider_tool_schema_override(
         Some(mcp_registry),
         external_tools,
     );
+    provider_tool_definitions(subagent_depth, subagent_type, tool_policy, &registry)
+}
+
+fn provider_tool_definitions(
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    tool_policy: AgentToolPolicyContext<'_>,
+    registry: &orca_tools::registry::ToolRegistry,
+) -> Option<Vec<ProviderToolDefinition>> {
     let mut policy = if let Some(allowed_tools) = tool_policy.allowed_tools() {
         ToolPolicy::allowed(allowed_tools)
     } else if subagent_depth > 0 {
@@ -160,7 +172,7 @@ pub(crate) fn provider_tool_schema_override(
         policy = policy.with_report_blocker();
     }
     Some(
-        canonical_tool_definitions(&policy, &registry)
+        canonical_tool_definitions(&policy, registry)
             .into_iter()
             .filter(|definition| {
                 // A policy the model cannot act on must not be advertised.
@@ -191,13 +203,12 @@ pub(crate) fn provider_config_for_agent_loop(
     session_tools: &crate::extension::ExtensionData,
 ) -> ProviderConfig {
     let shell_readiness = crate::shell_readiness::ShellReadiness::for_config(config);
-    let mut tools_override = provider_tool_schema_override(
-        subagent_depth,
-        subagent_type,
-        tool_policy,
-        mcp_registry,
+    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp_registry),
         &config.external_tools,
     );
+    let mut tools_override =
+        provider_tool_definitions(subagent_depth, subagent_type, tool_policy, &registry);
     if let Some(tools) = tools_override.as_mut() {
         omit_unavailable_session_tools(tools, config, tool_policy.workflow_child);
         omit_unavailable_shell_launch_tools(tools, &shell_readiness);
@@ -208,6 +219,18 @@ pub(crate) fn provider_config_for_agent_loop(
             || tool_policy.allowed_tools().is_some()
         {
             tools.retain(|tool| tool.name != "computer");
+        }
+        if config.provider == orca_core::config::ProviderKind::DeepSeek {
+            let dropped = limit_tool_definitions_by_source(tools, DEEPSEEK_MAX_TOOLS, |name| {
+                registry
+                    .get(name)
+                    .map(|tool| matches!(tool.spec().name, ToolName::Mcp(_)))
+            });
+            if let Some(warnings) =
+                session_tools.get::<std::sync::Arc<crate::mcp_startup::McpStartupWarnings>>()
+            {
+                warnings.report_tool_limit(dropped);
+            }
         }
     }
     let mut provider_config = ProviderConfig {
@@ -760,6 +783,44 @@ mod tests {
         .into_iter()
         .map(|tool| tool.name)
         .collect()
+    }
+
+    #[test]
+    fn mock_provider_keeps_all_130_tools() {
+        let config = RunConfig {
+            provider: ProviderKind::Mock,
+            ..RunConfig::default()
+        };
+        let expected_names: Vec<_> = (0..130).map(|i| format!("mcp__docs__t{i:03}")).collect();
+        let registry = McpRegistry::from_tools_for_test(
+            expected_names
+                .iter()
+                .enumerate()
+                .map(|(i, schema_name)| McpTool {
+                    server: "docs".to_string(),
+                    name: format!("t{i:03}"),
+                    schema_name: schema_name.clone(),
+                    description: None,
+                    input_schema: json!({"type": "object"}),
+                    read_only: true,
+                })
+                .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_config_for_agent_loop(
+            &config,
+            dir.path(),
+            0,
+            &SubagentType::General,
+            AgentToolPolicyContext::new(Some(&expected_names), None),
+            &registry,
+            &crate::extension::ExtensionData::new("schema-test"),
+        );
+        let definitions = provider.tools_override.unwrap();
+        assert_eq!(definitions.len(), 130);
+        let mut names = schema_names(&definitions);
+        names.sort_unstable();
+        assert_eq!(names, expected_names);
     }
 
     #[test]

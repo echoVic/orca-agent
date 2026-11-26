@@ -1820,13 +1820,16 @@ fn run_headless<W: io::Write>(
         for error in thread.startup_warnings() {
             eprintln!("orca: warning: {error}");
         }
-        // The MCP servers connect in the background: their warnings come
-        // once none is still connecting, before the turn, which would wait
-        // for them anyway.
-        let mcp_warnings =
-            thread.wait_for_mcp_startup_warnings(&|| interrupted_exit_code(interrupted).is_some());
-        for error in mcp_warnings.unwrap_or_default() {
-            eprintln!("orca: warning: {error}");
+        // Wait before attaching the reporter so startup warnings print first.
+        if thread
+            .mcp_registry()
+            .wait_for_startup(&|| interrupted_exit_code(interrupted).is_some())
+        {
+            thread.on_mcp_warnings(|warnings| {
+                for warning in warnings {
+                    eprintln!("orca: warning: {warning}");
+                }
+            });
         }
     }
     if let Some(exit_code) = interrupted_exit_code(interrupted) {
@@ -2773,6 +2776,240 @@ mod tests {
             desktop_notifications: false,
             terminal_notifications: false,
             auto_memory: false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn delayed_mcp_server(
+        dir: &std::path::Path,
+        delay: u32,
+        tool_count: usize,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let path = dir.join("catalog.sh");
+        let tools = (0..tool_count)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("lookup_{i:02}"), "inputSchema": {"type": "object"}
+                })
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(&path, format!(r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      sleep {delay}
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"catalog","version":"1"}},"instructions":"Look up records by ID."}}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":{tools}}}}}'
+      ;;
+  esac
+ done
+"#, tools = serde_json::Value::Array(tools))).unwrap();
+        orca_core::mcp_types::McpServerConfig {
+            name: "catalog".into(),
+            command: Some("/bin/sh".into()),
+            args: vec![path.to_string_lossy().into_owned()],
+            startup_timeout_ms: Some(10_000),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn capture_model_request() -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut len = None;
+            loop {
+                let mut header = String::new();
+                assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    len = Some(value.trim().parse().unwrap());
+                }
+            }
+            let mut request = vec![0; len.expect("content length")];
+            reader.read_exact(&mut request).unwrap();
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"found it\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            serde_json::from_slice(&request).unwrap()
+        });
+        (base_url, server)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_finishes_starting_late_has_its_instructions_in_the_first_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let _orca_home = crate::history::redirect_test_orca_home(dir.path());
+        let (base_url, captured) = capture_model_request();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.provider = ProviderKind::DeepSeek;
+        config.api_key = Some("test".into());
+        config.base_url = Some(base_url);
+        config.mcp_servers = vec![delayed_mcp_server(dir.path(), 1, 1)];
+        let registry = orca_mcp::initialize_registry(&config.mcp_servers, None);
+        let mut session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+            &config,
+            "find a record",
+            None,
+            registry.clone(),
+        )
+        .unwrap();
+        assert!(registry.server_instructions().is_empty());
+        assert_eq!(
+            run_thread_turn_to_writer(
+                &config,
+                &mut session,
+                &mut RuntimeSessionLifecycle::new("mcp-test"),
+                "find a record",
+                Vec::new(),
+                ControllerRunOptions::default(),
+            )
+            .unwrap(),
+            RunStatus::Success
+        );
+        let request = captured.join().unwrap();
+        assert!(
+            request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == "mcp__catalog__lookup_00")
+        );
+        let messages = request["messages"].as_array().unwrap();
+        assert!(messages.last().unwrap()["content"].as_str().unwrap().contains(
+            "<mcp_server_instructions server=\"catalog\">\nLook up records by ID.\n</mcp_server_instructions>"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_turn_gets_the_mcp_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let _orca_home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![delayed_mcp_server(dir.path(), 0, 1)];
+        let mut request = crate::child_agent_types::ChildAgentRequest::new(
+            "find a record".into(),
+            SubagentType::General,
+            None,
+            1,
+            false,
+        );
+        request.allowed_tools = Some(vec!["mcp__catalog__lookup_00".into()]);
+        let setup = crate::child_agent_loop_setup::prepare_child_agent_loop(
+            &config,
+            &request,
+            dir.path(),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+        );
+        assert!(
+            setup
+                .provider_config
+                .tools_override
+                .unwrap()
+                .iter()
+                .any(|tool| tool.name == "mcp__catalog__lookup_00")
+        );
+        assert_eq!(
+            setup.conversation.mcp_instructions,
+            [("catalog".into(), "Look up records by ID.".into())]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_runtime_warns_with_the_tools_a_request_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let _orca_home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.provider = ProviderKind::DeepSeek;
+        config.api_key = Some("test".into());
+        config.mcp_servers = vec![delayed_mcp_server(dir.path(), 0, 135)];
+        config.external_tools = vec![orca_core::external_config::ExternalToolConfig {
+            name: "mcp__zz_external__lookup".into(),
+            description: "Local lookup".into(),
+            action_kind: orca_core::approval_types::ActionKind::Read,
+            command: "lookup".into(),
+            schema: serde_json::json!({}),
+        }];
+        let registry = orca_mcp::initialize_registry(&config.mcp_servers, None);
+        assert!(registry.wait_for_startup(&|| false));
+        let mut session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+            &config,
+            "find a record",
+            None,
+            registry.clone(),
+        )
+        .unwrap();
+        let mut lifecycle = RuntimeSessionLifecycle::new("mcp-tool-limit");
+        let warnings =
+            crate::mcp_startup::McpStartupWarnings::watch(&registry, config.external_tools.len());
+        let (send, receive) = std::sync::mpsc::channel();
+        warnings.on_tool_limit(move |warnings| send.send(warnings).unwrap());
+        session
+            .runtime_extensions(lifecycle.run_id())
+            .insert(warnings);
+        for turn in 0..2 {
+            let (url, captured) = capture_model_request();
+            config.base_url = Some(url);
+            assert_eq!(
+                run_thread_turn_to_writer(
+                    &config,
+                    &mut session,
+                    &mut lifecycle,
+                    "find a record",
+                    Vec::new(),
+                    ControllerRunOptions::default()
+                )
+                .unwrap(),
+                RunStatus::Success
+            );
+            let request = captured.join().unwrap();
+            let sent = request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect::<std::collections::HashSet<_>>();
+            let mut dropped = registry
+                .tools()
+                .into_iter()
+                .map(|t| t.schema_name)
+                .filter(|name| !sent.contains(name.as_str()))
+                .collect::<Vec<_>>();
+            dropped.sort_unstable();
+            let reports = receive.try_iter().flatten().collect::<Vec<_>>();
+            if turn == 0 {
+                let detail = format!(
+                    "left out {} tools: {}",
+                    dropped.len(),
+                    dropped[..3].join(", ")
+                );
+                assert!(
+                    reports.iter().any(|warning| warning.contains(&detail)),
+                    "{detail}: {reports:?}"
+                );
+            } else {
+                assert!(reports.is_empty(), "{reports:?}");
+            }
+            assert!(sent.contains("mcp__zz_external__lookup"));
         }
     }
 

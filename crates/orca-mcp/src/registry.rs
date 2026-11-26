@@ -9,7 +9,9 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::auth::is_auth_required;
-use crate::client::{McpClient, McpRequestError, McpServerCapabilities};
+use crate::client::{
+    McpClient, McpRequestError, McpServerCapabilities, instructions_from_initialize_result,
+};
 use crate::connection_stop::McpConnectionStop;
 use crate::transport::{self, McpElicitationHandler, McpTransport};
 use orca_core::conversation::ImageInput;
@@ -184,7 +186,13 @@ struct McpServerEntry {
     /// How it stood when its first connection ended, or the registry closed
     /// first ([`McpRegistryInner::note_startup_ends`]). `None` until then,
     /// and never changed after.
-    startup: Option<McpServerStatus>,
+    startup: Option<McpServerStartup>,
+}
+
+#[derive(Clone)]
+struct McpServerStartup {
+    status: McpServerStatus,
+    tool_names: Vec<String>,
 }
 
 impl McpServerEntry {
@@ -230,7 +238,14 @@ impl McpRegistryInner {
     fn note_startup_ends(&mut self) {
         for server in &mut self.servers {
             if server.startup.is_none() && server.state != McpServerState::Starting {
-                server.startup = Some(server.status());
+                server.startup = Some(McpServerStartup {
+                    status: server.status(),
+                    tool_names: server
+                        .tools
+                        .iter()
+                        .map(|tool| tool.schema_name.clone())
+                        .collect(),
+                });
             }
         }
     }
@@ -240,7 +255,12 @@ impl McpRegistryInner {
     fn startup_statuses(&self) -> Option<Vec<McpServerStatus>> {
         self.servers
             .iter()
-            .map(|server| server.startup.clone())
+            .map(|server| {
+                server
+                    .startup
+                    .as_ref()
+                    .map(|startup| startup.status.clone())
+            })
             .collect()
     }
 
@@ -524,6 +544,7 @@ fn connect_server_with_transport(
         server_name: server_name.to_string(),
         credentials_path,
         capabilities,
+        instructions: Mutex::new(instructions_from_initialize_result(&initialize_result)),
         reconnect_failure: Mutex::default(),
         stop,
         transport: Mutex::new(transport),
@@ -838,6 +859,26 @@ impl McpRegistry {
         self.read().startup_statuses()
     }
 
+    /// The tool names from the servers' first connections, or the current names
+    /// while startup is still in progress.
+    pub fn startup_tool_names(&self) -> Vec<String> {
+        let inner = self.read();
+        if !inner.servers.is_empty() && inner.servers.iter().all(|server| server.startup.is_some())
+        {
+            return inner
+                .servers
+                .iter()
+                .filter_map(|server| server.startup.as_ref())
+                .flat_map(|startup| startup.tool_names.iter().cloned())
+                .collect();
+        }
+        inner
+            .tools
+            .iter()
+            .map(|tool| tool.schema_name.clone())
+            .collect()
+    }
+
     /// Waits until no server is [`McpServerState::Starting`], each having
     /// connected or failed, which each one's startup timeout bounds, and
     /// returns `true`. Returns `false` as soon as `should_cancel`, asked
@@ -999,6 +1040,7 @@ impl McpRegistry {
                     server_name: server.clone(),
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    instructions: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceTransport {
@@ -1033,6 +1075,7 @@ impl McpRegistry {
                         server_name: server,
                         credentials_path: None,
                         capabilities: McpServerCapabilities::resource_capable_for_test(),
+                        instructions: Mutex::default(),
                         reconnect_failure: Mutex::default(),
                         stop: Arc::default(),
                         transport: Mutex::new(Arc::from(transport)),
@@ -1061,6 +1104,20 @@ impl McpRegistry {
     /// The tools of every connected server, in config order.
     pub fn tools(&self) -> Vec<McpTool> {
         self.read().tools.clone()
+    }
+
+    /// Instructions from connected servers, in configuration order.
+    pub fn server_instructions(&self) -> Vec<(String, String)> {
+        let inner = self.read();
+        inner
+            .servers
+            .iter()
+            .filter(|server| server.state == McpServerState::Ready)
+            .filter_map(|server| {
+                let instructions = inner.clients.get(&server.name)?.instructions()?;
+                Some((server.name.clone(), instructions))
+            })
+            .collect()
     }
 
     /// The prompts of every connected server, in config order.
@@ -1461,6 +1518,7 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    instructions: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceListingTransport {
@@ -1487,6 +1545,7 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    instructions: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceListingTransport {
@@ -1581,6 +1640,7 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    instructions: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceTemplateListingTransport {
@@ -1607,6 +1667,7 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    instructions: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceTemplateListingTransport {
