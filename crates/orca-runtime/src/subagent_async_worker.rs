@@ -1934,6 +1934,7 @@ mod tests {
     use orca_core::model::ModelSelection;
     use orca_core::subagent_config::SubagentConfig;
     use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
+    use orca_platform::fs::ExclusiveFileLock;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -2293,15 +2294,26 @@ mod tests {
             find_dir_named(home.path(), "continuations").expect("the continuation store");
         let parked = continuations.with_file_name("continuations.away");
         let blocker = continuations.with_file_name("continuations.blocker");
-        // Swap the directory and the file by renames alone. While the path is
-        // missing a renewal reads the records as gone, which ends the run by
-        // design, so the gap is kept to the instant between two renames.
+        // The store takes this lock before it reads or writes a record.
+        let session_lock = continuations.with_file_name("tasks.lock");
+        assert!(session_lock.is_file(), "the continuation session lock");
+        // Swap the directory and the file by renames, holding the store's
+        // session lock across each pair. Between two renames the path is
+        // missing, and a renewal that read it then would find the record gone,
+        // which ends the run by design; under the lock a renewal sees the
+        // directory or the file, never the gap.
         std::fs::write(&blocker, b"not a directory").unwrap();
-        std::fs::rename(&continuations, &parked).unwrap();
-        std::fs::rename(&blocker, &continuations).unwrap();
+        {
+            let _store_waits = ExclusiveFileLock::acquire(&session_lock).unwrap();
+            std::fs::rename(&continuations, &parked).unwrap();
+            std::fs::rename(&blocker, &continuations).unwrap();
+        }
         thread::sleep(ASYNC_LEASE_HEARTBEAT * 4);
-        std::fs::rename(&continuations, &blocker).unwrap();
-        std::fs::rename(&parked, &continuations).unwrap();
+        {
+            let _store_waits = ExclusiveFileLock::acquire(&session_lock).unwrap();
+            std::fs::rename(&continuations, &blocker).unwrap();
+            std::fs::rename(&parked, &continuations).unwrap();
+        }
         let before = revision.lock().unwrap().get();
         let deadline = Instant::now() + Duration::from_secs(10);
         while revision.lock().unwrap().get() == before
