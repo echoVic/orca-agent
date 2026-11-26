@@ -5,8 +5,9 @@ use super::commands::{
     InvalidCursorReason, RuntimeSurfaceClientHandle, RuntimeSurfaceCommandDispatcher,
     SURFACE_RETAINED_BYTE_LIMIT, SURFACE_RETAINED_EVENT_LIMIT, SURFACE_SUBSCRIBER_BYTE_LIMIT,
     SURFACE_SUBSCRIBER_EVENT_LIMIT, SnapshotAtCursor, SnapshotRequired, SnapshotRequiredReason,
-    SurfaceAttachAuthority, SurfaceAttachmentCapabilities, SurfaceCommitBatch, SurfaceSnapshot,
-    SurfaceSubscriptionHandle, SurfaceSubscriptionItem, SurfaceSubscriptionSealReason,
+    SurfaceAttachAuthority, SurfaceAttachmentCapabilities, SurfaceCommitBatch, SurfaceEvent,
+    SurfaceSnapshot, SurfaceSubscriptionHandle, SurfaceSubscriptionItem,
+    SurfaceSubscriptionSealReason,
 };
 use super::identity::{
     CanonicalPath, CapabilityRevision, HostIncarnation, NonEmptySet, NonEmptyText, Sha256Digest,
@@ -15,7 +16,7 @@ use super::identity::{
     SurfaceThreadId, SurfaceUnavailableReason,
 };
 use super::interaction::SurfaceInteractionKind;
-use super::projection::{SurfaceCapabilityCallKind, SurfaceTerminalExitStatus};
+use super::projection::{OperationPatch, SurfaceCapabilityCallKind, SurfaceTerminalExitStatus};
 use super::reducer::canonical_batch_encoded_bytes;
 use orca_core::provider_types::ProviderRetry;
 use sha2::{Digest, Sha256};
@@ -96,6 +97,7 @@ struct SurfaceSubscriber {
     acp_terminal_cleanup_dispatch_tx: Option<SyncSender<AcpTerminalCleanupDispatch>>,
     acp_terminal_cleanup_dispatch_rx: Option<SyncReceiver<AcpTerminalCleanupDispatch>>,
     queue: VecDeque<QueuedSubscriptionItem>,
+    delivered_retries: BTreeSet<SurfaceOperationId>,
     queued_events: u64,
     queued_bytes: u64,
     claimed: bool,
@@ -1078,13 +1080,7 @@ impl SurfaceHub {
         retry: Option<ProviderRetry>,
     ) {
         let mut state = lock(&self.inner);
-        let head = state.snapshot.cursor.clone();
-        let retained_from = state
-            .retained
-            .front()
-            .map(|batch| batch.batch.cursor_before.clone());
-        let mut overflowed = Vec::new();
-        for (attachment_id, subscriber) in &mut state.subscriptions {
+        for subscriber in state.subscriptions.values_mut() {
             if subscriber.gapped {
                 continue;
             }
@@ -1092,8 +1088,10 @@ impl SurfaceHub {
             subscriber.queue.retain(|item| {
                 !matches!(item, QueuedSubscriptionItem::ProviderRetry(id, _) if id == operation_id)
             });
+            // Allow one pending clear for each operation whose retry was delivered.
             if subscriber.queue.len() < previous_len
                 || (subscriber.queue.len() as u64) < self.config.subscriber_event_limit
+                || (retry.is_none() && subscriber.delivered_retries.contains(operation_id))
             {
                 subscriber
                     .queue
@@ -1101,23 +1099,10 @@ impl SurfaceHub {
                         operation_id.clone(),
                         retry.clone(),
                     ));
-            } else if retry.is_none() {
-                // The client may already have displayed the retry being cleared.
-                subscriber
-                    .queue
-                    .push_back(QueuedSubscriptionItem::Gap(SnapshotRequired {
-                        reason: SnapshotRequiredReason::SlowSubscriber,
-                        retained_from: retained_from.clone(),
-                        head: head.clone(),
-                    }));
-                subscriber.gapped = true;
-                overflowed.push(attachment_id.clone());
             }
         }
-        retire_subscriptions(&mut state, &overflowed);
         drop(state);
         self.notify.notify_all();
-        self.notify_interaction_capability_change(!overflowed.is_empty());
     }
 
     pub(crate) fn repair_committed(
@@ -1565,6 +1550,7 @@ impl SurfaceHub {
                 acp_terminal_cleanup_dispatch_tx,
                 acp_terminal_cleanup_dispatch_rx,
                 queue: VecDeque::new(),
+                delivered_retries: BTreeSet::new(),
                 queued_events: 0,
                 queued_bytes: 0,
                 claimed: false,
@@ -1693,11 +1679,29 @@ fn materialize_replay(replay: Vec<Arc<SharedSurfaceBatch>>) -> Vec<SurfaceCommit
 
 fn dequeue_subscription_item(subscriber: &mut SurfaceSubscriber) -> Option<QueuedSubscriptionItem> {
     let item = subscriber.queue.pop_front()?;
-    if let QueuedSubscriptionItem::Batch(batch) = &item {
-        subscriber.queued_events = subscriber
-            .queued_events
-            .saturating_sub(batch.batch.event_count as u64);
-        subscriber.queued_bytes = subscriber.queued_bytes.saturating_sub(batch.encoded_bytes);
+    match &item {
+        QueuedSubscriptionItem::Batch(batch) => {
+            subscriber.queued_events = subscriber
+                .queued_events
+                .saturating_sub(batch.batch.event_count as u64);
+            subscriber.queued_bytes = subscriber.queued_bytes.saturating_sub(batch.encoded_bytes);
+            if !subscriber.delivered_retries.is_empty() {
+                for event in batch.batch.events.as_slice() {
+                    if let SurfaceEvent::Operation(OperationPatch::Terminal { record }) =
+                        &event.event
+                    {
+                        subscriber.delivered_retries.remove(&record.operation_id);
+                    }
+                }
+            }
+        }
+        QueuedSubscriptionItem::ProviderRetry(id, Some(_)) => {
+            subscriber.delivered_retries.insert(id.clone());
+        }
+        QueuedSubscriptionItem::ProviderRetry(id, None) => {
+            subscriber.delivered_retries.remove(id);
+        }
+        _ => {}
     }
     Some(item)
 }
@@ -1941,7 +1945,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_surface::commands::{SurfaceEvent, SurfaceEventEnvelope};
+    use crate::runtime_surface::commands::SurfaceEventEnvelope;
     use crate::runtime_surface::identity::{
         CommitClass, CursorSourceRevision, DisplayText, DurableRevision, NonEmptyVec,
         SequenceNumber, SurfaceCommitId, SurfaceConnectionId, SurfaceEventId, SurfaceRequestId,
@@ -1981,6 +1985,7 @@ mod tests {
             acp_terminal_cleanup_dispatch_tx: None,
             acp_terminal_cleanup_dispatch_rx: None,
             queue: VecDeque::new(),
+            delivered_retries: BTreeSet::new(),
             queued_events: 0,
             queued_bytes: 0,
             claimed: false,
@@ -2081,8 +2086,47 @@ mod tests {
             matches!(pop(), QueuedSubscriptionItem::ProviderRetry(id, Some(_)) if id == another)
         );
         assert!(
-            matches!(pop(), QueuedSubscriptionItem::Gap(required) if required.reason == SnapshotRequiredReason::SlowSubscriber)
+            matches!(pop(), QueuedSubscriptionItem::ProviderRetry(id, None) if id == operation)
         );
+    }
+
+    #[test]
+    fn provider_retry_clear_for_an_unseen_operation_preserves_a_full_subscription() {
+        let snapshot = reducer_snapshot();
+        let subscriber = subscriber(212, &snapshot.cursor);
+        let attachment_id = subscriber.grant.attachment_id.clone();
+        let hub = SurfaceHub::new_tui(
+            snapshot,
+            subscriber.grant.host_incarnation.clone(),
+            SurfaceHubConfig {
+                subscriber_event_limit: 1,
+                ..SurfaceHubConfig::default()
+            },
+        )
+        .unwrap();
+        lock(&hub.inner)
+            .subscriptions
+            .insert(attachment_id.clone(), subscriber);
+        let operation = SurfaceOperationId::try_from_bytes(uuid_v7_bytes(220)).unwrap();
+        let unseen = SurfaceOperationId::try_from_bytes(uuid_v7_bytes(221)).unwrap();
+        let retry = ProviderRetry::new(
+            1,
+            5,
+            std::time::Duration::from_secs(1),
+            &orca_core::provider_types::ProviderError::new(
+                orca_core::provider_types::ProviderErrorKind::RateLimit,
+                "busy",
+            ),
+        );
+        hub.publish_provider_retry(&operation, Some(retry.clone()));
+        hub.publish_provider_retry(&unseen, Some(retry));
+        hub.publish_provider_retry(&unseen, None);
+        let mut state = lock(&hub.inner);
+        assert!(
+            matches!(take_subscription_item(&mut state, &attachment_id), Some(QueuedSubscriptionItem::ProviderRetry(id, Some(_))) if id == operation)
+        );
+        assert!(take_subscription_item(&mut state, &attachment_id).is_none());
+        assert!(state.subscriptions.contains_key(&attachment_id));
     }
 
     #[test]
