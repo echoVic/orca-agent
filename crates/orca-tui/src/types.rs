@@ -758,6 +758,7 @@ pub struct AppState {
     /// Ctrl+T while browsing.
     pub session_picker_show_tests: bool,
     pub(crate) surface_metrics: SurfaceMetricsState,
+    pub(crate) provider_retry: Option<orca_core::provider_types::ProviderRetry>,
     pub slash_menu: Option<SlashMenu>,
     pub mention: MentionPopupState,
     pub mention_bindings: MentionBindings,
@@ -1177,6 +1178,7 @@ impl AppState {
             session_picker_backfill_complete: true,
             session_picker_show_tests: false,
             surface_metrics: SurfaceMetricsState::default(),
+            provider_retry: None,
             slash_menu: None,
             mention: MentionPopupState::default(),
             mention_bindings: MentionBindings::default(),
@@ -1593,6 +1595,7 @@ impl AppState {
         self.announced_subagent_terminals.clear();
         self.pending_workflow_notifications.clear();
         self.suppress_background_main_session_output = false;
+        self.provider_retry = None;
         self.last_completed_at = None;
         self.viewport.pending_clipboard_copy = None;
         self.viewport.last_left_click = None;

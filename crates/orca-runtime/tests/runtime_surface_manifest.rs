@@ -26,6 +26,7 @@ event_inventory!(
     AssistantMessageDelta,
     ModelResponseCompleted,
     ProviderReplayUpdated,
+    ProviderRetry,
     UsageUpdated,
     ContextUpdated,
     ContextCompactionStarted,
@@ -96,7 +97,7 @@ fn manifest_source_facts_exactly_match_the_typed_event_inventory() {
         .map(event_variant_name)
         .collect::<Vec<_>>();
 
-    assert_eq!(declared.len(), 59, "the reviewed baseline has 59 events");
+    assert_eq!(declared.len(), 60, "the reviewed inventory has 60 events");
     assert_eq!(
         declared.iter().collect::<BTreeSet<_>>().len(),
         declared.len(),

@@ -301,6 +301,7 @@ pub enum TuiEvent {
     /// plan approval.
     ProposedPlanDelta(String),
     AssistantAttemptDiscarded,
+    ProviderRetry(Option<orca_core::provider_types::ProviderRetry>),
     AssistantResponseCompleted(Option<String>, Option<String>),
     ToolRequested {
         id: String,

@@ -94,6 +94,19 @@ impl GenerationContextController {
                     identity.item_ids.reasoning_item_id.clone(),
                     text.clone(),
                 )],
+                ProviderStep::Retry(retry)
+                    if active_generation || foregrounded_background.is_some() =>
+                {
+                    let retry = retry.clone().map(|mut retry| {
+                        retry.reason = crate::thread_store::redact_sensitive_text(&retry.reason)
+                            .chars()
+                            .take(200)
+                            .collect();
+                        retry
+                    });
+                    events.push((scope.clone(), surface::SurfaceEvent::ProviderRetry(retry)));
+                    continue;
+                }
                 _ => continue,
             };
             for (channel, item_id, raw_text) in pieces {
@@ -246,7 +259,7 @@ impl GenerationContextController {
             return Ok(context_usage_events(
                 snapshot,
                 scope,
-                response.response.usage,
+                response.attempt_usage,
             ));
         }
         Ok(completion_events(
@@ -254,7 +267,7 @@ impl GenerationContextController {
             fence,
             scope,
             normalized,
-            response.response.usage,
+            response.attempt_usage,
         ))
     }
 
@@ -567,7 +580,7 @@ pub(crate) fn build_background_provider_response_events(
         return Ok(context_usage_events(
             snapshot,
             scope,
-            response.response.usage,
+            response.attempt_usage,
         ));
     }
     let normalized =
@@ -577,7 +590,7 @@ pub(crate) fn build_background_provider_response_events(
         &fence.operation_fence,
         scope,
         normalized,
-        response.response.usage,
+        response.attempt_usage,
     ))
 }
 

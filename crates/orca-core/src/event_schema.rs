@@ -157,6 +157,8 @@ pub enum EventType {
     ModelResponseCompleted,
     #[serde(rename = "provider.replay.updated")]
     ProviderReplayUpdated,
+    #[serde(rename = "provider.retry")]
+    ProviderRetry,
     #[serde(rename = "usage.updated")]
     UsageUpdated,
     #[serde(rename = "context.updated")]
@@ -319,6 +321,7 @@ impl EventType {
             Self::AssistantReasoningDelta
             | Self::AssistantMessageDelta
             | Self::ProviderReplayUpdated
+            | Self::ProviderRetry
             | Self::UsageUpdated
             | Self::ContextUpdated
             | Self::ToolCallProgress
@@ -529,6 +532,10 @@ impl EventFactory {
 
     pub fn usage_updated(&mut self, usage: UsageTotals) -> EventDraft {
         self.make(EventType::UsageUpdated, usage.event_payload())
+    }
+
+    pub fn provider_retry(&mut self, retry: &crate::provider_types::ProviderRetry) -> EventDraft {
+        self.make_serialized(EventType::ProviderRetry, retry)
     }
 
     pub fn context_updated(&mut self, used_tokens: usize, limit_tokens: usize) -> EventDraft {

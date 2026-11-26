@@ -1925,6 +1925,7 @@ fn surface_event_name(value: &SurfaceEvent) -> &'static str {
         SurfaceEvent::Plan(_) => "Plan",
         SurfaceEvent::Usage(_) => "Usage",
         SurfaceEvent::Context(_) => "Context",
+        SurfaceEvent::ProviderRetry(_) => "ProviderRetry",
         SurfaceEvent::Interaction(_) => "Interaction",
         SurfaceEvent::Task(_) => "Task",
         SurfaceEvent::Workflow(_) => "Workflow",

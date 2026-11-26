@@ -1954,6 +1954,7 @@ SurfaceEvent =
   | Plan(SurfacePlanSnapshot)
   | Usage(SurfaceUsageSnapshot)
   | Context(SurfaceContextSnapshot)
+  | ProviderRetry(Option<ProviderRetry>)
   | Interaction(InteractionPatch)
   | Task(TaskPatch)
   | Workflow(WorkflowPatch)
@@ -1963,7 +1964,21 @@ SurfaceEvent =
   | McpCatalog(McpCatalogPatch)
   | PinnedContext(PinnedContextPatch)
   | Session(SessionPatch)
+
+ProviderRetry {
+  attempt: u32,
+  max_attempts: u32,
+  delay_ms: u64,
+  kind: ProviderErrorKind,
+  reason: String,
+}
 ```
+
+`ProviderRetry` is scoped to the active generation or foreground-attached
+background provider stream. A populated report marks a scheduled backoff, and
+an empty report marks the start of the next attempt. Terminal events also clear
+the display. Retry reports appear in commit batches without modifying the
+surface snapshot.
 
 `commit_class.commit_id` is the batch identity used by append reconciliation.
 Every envelope in one batch has the batch's complete identical `CommitClass`

@@ -33,7 +33,7 @@ const STREAM_INTEGRITY_RETRIES: usize = 1;
 const EMPTY_RESPONSE_ERROR: &str = "response did not contain content or tool calls";
 const EMPTY_RESPONSE_RECOVERY_PROMPT: &str = "Continue the current turn. The previous response ended without visible assistant content or tool calls. Return a user-facing answer in content, or call an available tool. Do not return reasoning only.";
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DeepSeekRequestError {
     kind: ProviderErrorKind,
     message: String,
@@ -125,6 +125,26 @@ impl std::fmt::Display for DeepSeekRequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
     }
+}
+
+pub(crate) fn provider_request_error(error: RequestFailure) -> ProviderError {
+    DeepSeekRequestError::from_request(error, None)
+        .into_provider_error()
+        .0
+}
+
+fn is_strict_schema_rejection(error: &RequestFailure) -> bool {
+    let RequestFailure::Http(failure) = error else {
+        return false;
+    };
+    if error.status() != Some(400) || crate::context::is_prompt_too_long_error(&failure.body) {
+        return false;
+    }
+    let body = failure.body.to_ascii_lowercase();
+    !body.contains("insufficient balance")
+        && (body.contains("invalid tools")
+            || ((body.contains("schema") || body.contains("strict"))
+                && (body.contains("tool") || body.contains("function"))))
 }
 
 fn classify_deepseek_error(message: &str) -> ProviderErrorKind {
@@ -655,7 +675,8 @@ async fn request_chat_streaming_with_budget(
     let messages = conversation_to_api_messages(conversation);
     let definitions = config.tools_override.as_deref().unwrap_or(&[]);
     let tools = cap_tools_for_deepseek(deepseek_tools_schema(definitions));
-    let strict_applied = deepseek_strict_tools_schema_for_endpoint(definitions, base_url).is_some();
+    let mut strict_applied =
+        deepseek_strict_tools_schema_for_endpoint(definitions, base_url).is_some();
     let primary_tools = deepseek_primary_request_tools(config);
 
     let mut request = ChatRequest {
@@ -681,7 +702,10 @@ async fn request_chat_streaming_with_budget(
     let mut stream_integrity_retries = 0;
     let mut suppress_retry_reasoning = false;
     let mut accumulated_usage = None;
+    let mut recovery: Option<DeepSeekRequestError> = None;
     loop {
+        let pending_recovery = recovery.take();
+        let sends_before = retry_budget.attempts();
         let response_result = if summary_budget.is_some() {
             crate::http_client::execute_streaming_once_with_budget(
                 streaming_client
@@ -698,6 +722,10 @@ async fn request_chat_streaming_with_budget(
                 |client| client.post(&url).bearer_auth(api_key).json(&request),
                 cancel,
                 retry_budget,
+                pending_recovery
+                    .clone()
+                    .map(|error| error.into_provider_error().0),
+                |retry| on_step(&ProviderStep::Retry(retry)),
             )
             .await
         };
@@ -706,19 +734,24 @@ async fn request_chat_streaming_with_budget(
             // Strict mode is Beta; if the server rejects the strict schema, retry
             // once with the plain tool list rather than failing the whole turn.
             Err(error)
-                if summary_budget.is_none() && strict_applied && error.status() == Some(400) =>
+                if summary_budget.is_none()
+                    && strict_applied
+                    && retry_budget.can_retry()
+                    && !cancel.is_cancelled()
+                    && is_strict_schema_rejection(&error) =>
             {
+                strict_applied = false;
                 request.tools = Some(tools.clone());
-                crate::http_client::execute_streaming_with_retry_details(
-                    &streaming_client,
-                    |client| client.post(&url).bearer_auth(api_key).json(&request),
-                    cancel,
-                    retry_budget,
-                )
-                .await
-                .map_err(|error| DeepSeekRequestError::from_request(error, accumulated_usage))?
+                recovery = Some(DeepSeekRequestError::from_request(error, accumulated_usage));
+                continue;
             }
             Err(error) => {
+                if !cancel.is_cancelled()
+                    && retry_budget.attempts() == sends_before
+                    && let Some(recovery) = pending_recovery
+                {
+                    return Err(recovery);
+                }
                 return Err(DeepSeekRequestError::from_request(error, accumulated_usage));
             }
         };
@@ -753,9 +786,15 @@ async fn request_chat_streaming_with_budget(
                 if !emitted_step
                     && summary_budget.is_none()
                     && stream_integrity_retries < STREAM_INTEGRITY_RETRIES
+                    && retry_budget.can_retry()
+                    && !cancel.is_cancelled()
                     && crate::streaming::is_stream_integrity_error(&error.message) =>
             {
                 merge_usage(&mut accumulated_usage, error.usage);
+                recovery = Some(DeepSeekRequestError::with_usage(
+                    error.message,
+                    accumulated_usage,
+                ));
                 stream_integrity_retries += 1;
                 continue;
             }
@@ -838,10 +877,18 @@ async fn request_chat_streaming_with_budget(
                 .iter()
                 .any(|step| matches!(step, ProviderStep::Error(_)))
         {
-            if summary_budget.is_none() && empty_response_retries < EMPTY_RESPONSE_RETRIES {
+            if summary_budget.is_none()
+                && empty_response_retries < EMPTY_RESPONSE_RETRIES
+                && retry_budget.can_retry()
+                && !cancel.is_cancelled()
+            {
                 empty_response_retries += 1;
                 suppress_retry_reasoning = emitted_reasoning;
                 add_empty_response_recovery_instruction(&mut request);
+                recovery = Some(DeepSeekRequestError::with_usage(
+                    EMPTY_RESPONSE_ERROR,
+                    accumulated_usage,
+                ));
                 continue;
             }
             return Err(DeepSeekRequestError::with_usage(
@@ -850,6 +897,9 @@ async fn request_chat_streaming_with_budget(
             ));
         }
 
+        if accumulated_usage != stream_result.usage {
+            on_step(&ProviderStep::AttemptUsage(stream_result.usage));
+        }
         return Ok(ProviderResponse {
             steps,
             assistant_content,
@@ -887,7 +937,8 @@ fn request_chat(
     let messages = conversation_to_api_messages(conversation);
     let definitions = config.tools_override.as_deref().unwrap_or(&[]);
     let tools = cap_tools_for_deepseek(deepseek_tools_schema(definitions));
-    let strict_applied = deepseek_strict_tools_schema_for_endpoint(definitions, base_url).is_some();
+    let mut strict_applied =
+        deepseek_strict_tools_schema_for_endpoint(definitions, base_url).is_some();
     let primary_tools = deepseek_primary_request_tools(config);
 
     let mut request = ChatRequest {
@@ -913,7 +964,12 @@ fn request_chat(
             Ok(response) => response,
             // Strict mode is Beta; if the server rejects the strict schema, retry
             // once with the plain tool list rather than failing the whole turn.
-            Err(error) if strict_applied && error.status() == Some(400) => {
+            Err(error)
+                if strict_applied
+                    && retry_budget.can_retry()
+                    && is_strict_schema_rejection(&error) =>
+            {
+                strict_applied = false;
                 request.tools = Some(tools.clone());
                 crate::http_client::execute_with_retry_details(
                     |client| client.post(&url).bearer_auth(api_key).json(&request),
@@ -936,7 +992,7 @@ fn request_chat(
         let usage = response.usage.map(Usage::from);
         merge_usage(&mut accumulated_usage, usage);
         let Some(choice) = response.choices.into_iter().next() else {
-            if empty_attempt < EMPTY_RESPONSE_RETRIES {
+            if empty_attempt < EMPTY_RESPONSE_RETRIES && retry_budget.can_retry() {
                 add_empty_response_recovery_instruction(&mut request);
                 continue;
             }
@@ -1016,7 +1072,7 @@ fn request_chat(
                 .iter()
                 .any(|step| matches!(step, ProviderStep::Error(_)))
         {
-            if empty_attempt < EMPTY_RESPONSE_RETRIES {
+            if empty_attempt < EMPTY_RESPONSE_RETRIES && retry_budget.can_retry() {
                 add_empty_response_recovery_instruction(&mut request);
                 continue;
             }
@@ -1881,6 +1937,40 @@ mod tests {
         let error = streamed_http_error(400, "", "max 5000 tokens per request").await;
         assert_eq!(error.kind, ProviderErrorKind::Other);
         assert!(!error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn strict_beta_400_without_schema_rejection_is_terminal() {
+        let (conversation, mut config) = http_error_fixture(
+            400,
+            "x-request-id: beta-400\r\n",
+            "max 5000 tokens per request",
+        );
+        config.base_url.as_mut().unwrap().push_str("/beta");
+        config.tools_override = Some(vec![crate::tool_schema::ProviderToolDefinition {
+            name: "strict_fixture".into(),
+            description: "Fixture tool".into(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            strict_capable: true,
+        }]);
+        let budget = RetryBudget::new(2, Duration::ZERO, None);
+        let error = request_chat_streaming_with_budget(
+            &conversation,
+            &config,
+            &CancelToken::new(),
+            &mut |_| {},
+            &budget,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err()
+        .into_provider_error()
+        .0;
+        assert_eq!(budget.attempts(), 1);
+        assert_eq!(error.kind, ProviderErrorKind::Other);
+        assert_eq!(error.http_status, Some(400));
+        assert_eq!(error.request_id.as_deref(), Some("beta-400"));
     }
 
     #[tokio::test]
@@ -3231,8 +3321,8 @@ mod tests {
         ));
         assert!(matches!(
             emitted.as_slice(),
-            [ProviderStep::Error(message)]
-                if message.message
+            [ProviderStep::Retry(Some(retry)), ProviderStep::Retry(None), ProviderStep::Error(message)]
+                if retry.kind == ProviderErrorKind::EmptyResponse && message.message
                     == "DeepSeek provider error: response did not contain content or tool calls"
         ));
         assert_eq!(

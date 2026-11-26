@@ -1233,6 +1233,9 @@ fn truncated_provider_attempt_is_discarded_and_retried_with_new_response_identit
         .expect("start recorded runtime thread");
     let surface = thread.surface();
     let attachment = fresh_interaction_attachment(&surface);
+    let mut subscription = surface
+        .claim_subscription(&attachment.subscription)
+        .unwrap();
     let prompt = format!("mock_stream_closed_once {}", uuid::Uuid::new_v4());
     let reserved = committed_value(
         attachment
@@ -1287,6 +1290,21 @@ fn truncated_provider_attempt_is_discarded_and_retried_with_new_response_identit
     assert_eq!(usage.input_tokens, 204);
     assert_eq!(usage.output_tokens, 36);
     assert_eq!(usage.cache_tokens, 19);
+    assert_eq!(snapshot.context.used_tokens, 103);
+
+    let mut retry_states = Vec::new();
+    while let Some(SurfaceSubscriptionItem::Batch { batch }) = subscription.try_recv() {
+        for envelope in batch.events.as_slice() {
+            if let SurfaceEvent::ProviderRetry(retry) = &envelope.event {
+                retry_states.push(
+                    retry
+                        .as_ref()
+                        .map(|retry| (retry.attempt, retry.max_attempts)),
+                );
+            }
+        }
+    }
+    assert_eq!(retry_states, [Some((1, 2)), None]);
     host.shutdown().unwrap();
 }
 

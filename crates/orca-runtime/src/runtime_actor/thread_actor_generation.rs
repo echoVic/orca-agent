@@ -1983,7 +1983,7 @@ impl ThreadActor {
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
         message: &str,
     ) -> io::Result<()> {
-        self.commit_surface_provider_attempt_failure(active, fence, identity, message)?;
+        self.commit_surface_provider_attempt_failure(active, fence, identity, None)?;
         active.surface_execution_failure = Some(surface::GenerationExecutionFailureClass::Provider);
         active.surface_execution_failure_diagnostic = Some(surface_safe_diagnostic(
             message,
@@ -1997,7 +1997,7 @@ impl ThreadActor {
         active: &ActiveOperation,
         fence: surface::SurfaceOperationFence,
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
-        _message: &str,
+        retry: Option<orca_core::provider_types::ProviderRetry>,
     ) -> io::Result<()> {
         if active.surface_operation.as_ref() != Some(&fence) {
             return Err(io::Error::new(
@@ -2012,9 +2012,21 @@ impl ThreadActor {
             ));
         }
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-        let events = self
+        let mut events = self
             .generation_context_controller
             .provider_attempt_failure_events(&snapshot, &fence, identity)?;
+        if let Some(mut retry) = retry {
+            retry.reason = crate::thread_store::redact_sensitive_text(&retry.reason)
+                .chars()
+                .take(200)
+                .collect();
+            events.push((
+                surface::SurfaceScope::Generation {
+                    fence: fence.clone(),
+                },
+                surface::SurfaceEvent::ProviderRetry(Some(retry)),
+            ));
+        }
         if events.is_empty() {
             return Ok(());
         }

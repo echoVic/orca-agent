@@ -18,6 +18,7 @@
       "Plan",
       "Usage",
       "Context",
+      "ProviderRetry",
       "Interaction",
       "Task",
       "Workflow",
@@ -405,7 +406,8 @@
       "Upserted",
       "VerificationCompleted",
       "VerificationStarted",
-      "WorkflowPatchSet"
+      "WorkflowPatchSet",
+      "ProviderRetry"
     ],
     "mutation_dispositions": [
       "Found",
@@ -893,8 +895,22 @@
       "NoLegacyProjection"
     ],
     [
-      "UsageUpdated",
+      "ProviderRetry",
       161,
+      "transient",
+      "ProviderRetry",
+      "ProviderRetry",
+      "GenerationOrBackgroundScope",
+      "recorded_or_ephemeral_observation",
+      [],
+      "typed_provider_attempt_ingress",
+      "Render",
+      "NoWireRetained",
+      "ExistingEvent"
+    ],
+    [
+      "UsageUpdated",
+      163,
       "transient",
       "Usage",
       "SurfaceUsageSnapshot",
@@ -910,7 +926,7 @@
     ],
     [
       "ContextUpdated",
-      163,
+      165,
       "transient",
       "Context",
       "SurfaceContextSnapshot",
@@ -926,7 +942,7 @@
     ],
     [
       "ContextCompactionStarted",
-      165,
+      167,
       "recorded",
       "Context",
       "CompactionRunning",
@@ -942,7 +958,7 @@
     ],
     [
       "ContextCompacted",
-      167,
+      169,
       "recorded",
       "Context",
       "CompactionCompleted",
@@ -959,7 +975,7 @@
     ],
     [
       "ModelRouted",
-      169,
+      171,
       "recorded",
       "Operation",
       "ModelRouteSelected",
@@ -975,7 +991,7 @@
     ],
     [
       "ApprovalRequested",
-      171,
+      173,
       "recorded",
       "Interaction",
       "Requested",
@@ -991,7 +1007,7 @@
     ],
     [
       "ApprovalResolved",
-      173,
+      175,
       "recorded",
       "Interaction",
       "Resolved",
@@ -1007,7 +1023,7 @@
     ],
     [
       "ToolCallProgress",
-      175,
+      177,
       "transient",
       "Tool",
       "ArgumentsProgress",
@@ -1023,7 +1039,7 @@
     ],
     [
       "ToolOutputDelta",
-      177,
+      179,
       "transient",
       "Tool",
       "OutputDelta",
@@ -1039,7 +1055,7 @@
     ],
     [
       "ToolCallRequested",
-      179,
+      181,
       "recorded",
       "Tool",
       "Requested",
@@ -1055,7 +1071,7 @@
     ],
     [
       "ToolCallCompleted",
-      181,
+      183,
       "recorded",
       "Tool",
       "Completed",
@@ -1072,7 +1088,7 @@
     ],
     [
       "PlanUpdated",
-      183,
+      185,
       "recorded",
       "Plan",
       "SurfacePlanSnapshot",
@@ -1088,7 +1104,7 @@
     ],
     [
       "GoalCreated",
-      185,
+      187,
       "recorded",
       "Goal",
       "Created",
@@ -1104,7 +1120,7 @@
     ],
     [
       "GoalRunStarted",
-      187,
+      189,
       "recorded",
       "Goal",
       "RunStarted",
@@ -1120,7 +1136,7 @@
     ],
     [
       "GoalTurnStarted",
-      189,
+      191,
       "recorded",
       "Goal",
       "OuterTurnStarted",
@@ -1136,7 +1152,7 @@
     ],
     [
       "GoalIntentRequested",
-      191,
+      193,
       "recorded",
       "Goal",
       "IntentRequested",
@@ -1152,7 +1168,7 @@
     ],
     [
       "GoalIntentAcknowledged",
-      193,
+      195,
       "recorded",
       "Goal",
       "IntentAcknowledged",
@@ -1168,7 +1184,7 @@
     ],
     [
       "GoalTurnFinished",
-      195,
+      197,
       "recorded",
       "Goal",
       "OuterTurnFinished",
@@ -1185,7 +1201,7 @@
     ],
     [
       "GoalVerificationCompleted",
-      197,
+      199,
       "recorded",
       "Goal",
       "VerificationCompleted",
@@ -1201,7 +1217,7 @@
     ],
     [
       "GoalTransitioned",
-      199,
+      201,
       "recorded",
       "Goal",
       "Transitioned",
@@ -1217,22 +1233,6 @@
     ],
     [
       "GoalContinuationAdmitted",
-      201,
-      "recorded",
-      "Goal",
-      "ContinuationDecided",
-      "Goal",
-      "recorded",
-      [
-        "goal.current_run"
-      ],
-      "post_commit_goal_receipt",
-      "Render",
-      "ExtensionOnly",
-      "NoLegacyProjection"
-    ],
-    [
-      "GoalContinuationRejected",
       203,
       "recorded",
       "Goal",
@@ -1248,8 +1248,24 @@
       "NoLegacyProjection"
     ],
     [
-      "GoalPaused",
+      "GoalContinuationRejected",
       205,
+      "recorded",
+      "Goal",
+      "ContinuationDecided",
+      "Goal",
+      "recorded",
+      [
+        "goal.current_run"
+      ],
+      "post_commit_goal_receipt",
+      "Render",
+      "ExtensionOnly",
+      "NoLegacyProjection"
+    ],
+    [
+      "GoalPaused",
+      207,
       "recorded",
       "Goal",
       "Paused",
@@ -1265,7 +1281,7 @@
     ],
     [
       "GoalRecovered",
-      207,
+      209,
       "recorded",
       "Goal",
       "Recovered",
@@ -1281,7 +1297,7 @@
     ],
     [
       "GoalCompleted",
-      209,
+      211,
       "recorded",
       "Goal",
       "Completed",
@@ -1298,7 +1314,7 @@
     ],
     [
       "SubagentStarted",
-      211,
+      213,
       "recorded",
       "Subagent",
       "Started",
@@ -1314,7 +1330,7 @@
     ],
     [
       "SubagentProgress",
-      213,
+      215,
       "transient",
       "Subagent",
       "Progress",
@@ -1330,7 +1346,7 @@
     ],
     [
       "SubagentCompleted",
-      215,
+      217,
       "recorded",
       "Subagent",
       "Completed",
@@ -1346,7 +1362,7 @@
     ],
     [
       "AgentContinuationCheckpointed",
-      217,
+      219,
       "recorded",
       "Subagent",
       "ContinuationCheckpointed",
@@ -1363,7 +1379,7 @@
     ],
     [
       "AgentContinuationSuspended",
-      219,
+      221,
       "recorded",
       "Subagent",
       "ContinuationSuspended",
@@ -1380,7 +1396,7 @@
     ],
     [
       "AgentContinuationResumed",
-      221,
+      223,
       "recorded",
       "Subagent",
       "ContinuationResumed",
@@ -1397,7 +1413,7 @@
     ],
     [
       "AgentContinuationOrphanReconciled",
-      223,
+      225,
       "recorded",
       "Subagent",
       "ContinuationOrphanReconciled",
@@ -1414,7 +1430,7 @@
     ],
     [
       "AgentContinuationIndeterminate",
-      225,
+      227,
       "recorded",
       "Subagent",
       "ContinuationIndeterminate",
@@ -1431,7 +1447,7 @@
     ],
     [
       "WorkflowStarted",
-      227,
+      229,
       "recorded",
       "Workflow",
       "Started",
@@ -1447,7 +1463,7 @@
     ],
     [
       "WorkflowResumed",
-      229,
+      231,
       "recorded",
       "Workflow",
       "Resumed",
@@ -1463,7 +1479,7 @@
     ],
     [
       "WorkflowPhaseStarted",
-      231,
+      233,
       "recorded",
       "Workflow",
       "PhaseStarted",
@@ -1479,7 +1495,7 @@
     ],
     [
       "WorkflowPhaseCompleted",
-      233,
+      235,
       "recorded",
       "Workflow",
       "PhaseCompleted",
@@ -1495,7 +1511,7 @@
     ],
     [
       "WorkflowAgentStarted",
-      235,
+      237,
       "recorded",
       "Workflow",
       "AgentStarted",
@@ -1511,7 +1527,7 @@
     ],
     [
       "WorkflowAgentCached",
-      237,
+      239,
       "recorded",
       "Workflow",
       "AgentCached",
@@ -1527,7 +1543,7 @@
     ],
     [
       "WorkflowAgentCompleted",
-      239,
+      241,
       "recorded",
       "Workflow",
       "AgentCompleted",
@@ -1543,7 +1559,7 @@
     ],
     [
       "WorkflowAgentFailed",
-      241,
+      243,
       "recorded",
       "Workflow",
       "AgentFailed",
@@ -1559,7 +1575,7 @@
     ],
     [
       "WorkflowPaused",
-      243,
+      245,
       "recorded",
       "Workflow",
       "Paused",
@@ -1575,7 +1591,7 @@
     ],
     [
       "WorkflowStopped",
-      245,
+      247,
       "recorded",
       "Workflow",
       "Stopped",
@@ -1591,7 +1607,7 @@
     ],
     [
       "WorkflowCompleted",
-      247,
+      249,
       "recorded",
       "Workflow",
       "Completed",
@@ -1607,7 +1623,7 @@
     ],
     [
       "WorkflowFailed",
-      249,
+      251,
       "recorded",
       "Workflow",
       "Failed",
@@ -1623,7 +1639,7 @@
     ],
     [
       "WorkflowResultAvailable",
-      251,
+      253,
       "recorded",
       "Workflow",
       "ResultReady",
@@ -1639,7 +1655,7 @@
     ],
     [
       "WorkflowTasksUpdated",
-      253,
+      255,
       "transient",
       "Task",
       "Reconciled",
@@ -1655,7 +1671,7 @@
     ],
     [
       "TaskStatusUpdated",
-      255,
+      257,
       "transient",
       "Task",
       "Upserted",
@@ -1671,7 +1687,7 @@
     ],
     [
       "VerificationStarted",
-      257,
+      259,
       "recorded",
       "Operation",
       "VerificationStarted",
@@ -1687,7 +1703,7 @@
     ],
     [
       "VerificationCompleted",
-      259,
+      261,
       "recorded",
       "Operation",
       "VerificationCompleted",
@@ -1703,7 +1719,7 @@
     ],
     [
       "Error",
-      261,
+      263,
       "recorded",
       "None",
       "TypedSourceRequired",
@@ -1717,7 +1733,7 @@
     ],
     [
       "SessionCompleted",
-      263,
+      265,
       "recorded",
       "Operation",
       "Terminal",
@@ -1733,7 +1749,7 @@
     ],
     [
       "SessionRewind",
-      265,
+      267,
       "recorded",
       "None",
       "TypedSourceRequired",
@@ -7954,7 +7970,7 @@
     }
   ],
   "phase_0a_manifest_invariants": [
-    "source_facts has exactly 59 unique variants matching EventType at baseline",
+    "source_facts has exactly 60 unique variants matching EventType",
     "closed_inventory.current_tui_user_actions has exactly 57 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
@@ -10581,7 +10597,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "13bec2ea091e5aae3be40d1a47dd05c7982a6fc3346f9e6244aae4a0d50502d4",
+    "private_contract_sha256": "a1b0b6763e8f6f4f5ae8848a5cd701d4bcabd475ed215298809cacefc6ca27bb",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",

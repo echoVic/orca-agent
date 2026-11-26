@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use orca_core::cancel::CancelToken;
+use orca_core::{cancel::CancelToken, provider_types::ProviderRetry};
 use reqwest::blocking::{
     Client as BlockingClient, RequestBuilder as BlockingRequestBuilder,
     Response as BlockingResponse,
@@ -15,6 +15,8 @@ const REQUEST_TIMEOUT_SECS: u64 = 120;
 const STREAMING_IDLE_READ_TIMEOUT_SECS: u64 = 300;
 pub(crate) const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+const TRANSIENT_ERROR_BODY_TIMEOUT: Duration = Duration::from_millis(250);
+const RETRY_ERROR_PREFIX_BYTES: usize = 1024;
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 1000;
 const MAX_BACKOFF_MS: u64 = 60_000;
@@ -37,6 +39,7 @@ struct RetryBudgetState {
     attempts: u32,
     waited: Duration,
     reserved_wait: Duration,
+    retry_quota_key: Option<[u8; 32]>,
 }
 
 impl Default for RetryBudget {
@@ -60,6 +63,26 @@ impl RetryBudget {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .attempts
+    }
+
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+
+    pub fn retry_cooldown_delay(&self) -> Duration {
+        let key = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retry_quota_key;
+        key.map_or(Duration::ZERO, cooldown_remaining)
+    }
+
+    fn set_retry_quota_key(&self, key: Option<[u8; 32]>) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retry_quota_key = key;
     }
 
     pub fn can_retry(&self) -> bool {
@@ -90,14 +113,13 @@ impl RetryBudget {
         Ok(())
     }
 
-    fn reserve_wait(&self, delay: Duration) -> Result<(), String> {
+    fn check_wait(&self, delay: Duration, state: &RetryBudgetState) -> Result<(), String> {
         if self
             .remaining_time()?
             .is_some_and(|remaining| delay >= remaining)
         {
             return Err("provider Retry-After/backoff exceeds retry deadline".into());
         }
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if delay
             > self
                 .max_wait
@@ -105,6 +127,17 @@ impl RetryBudget {
         {
             return Err("provider logical retry wait budget exhausted".into());
         }
+        Ok(())
+    }
+
+    pub fn can_wait(&self, delay: Duration) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_wait(delay, &state).is_ok()
+    }
+
+    fn reserve_wait(&self, delay: Duration) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_wait(delay, &state)?;
         state.reserved_wait = state.reserved_wait.saturating_add(delay);
         Ok(())
     }
@@ -213,6 +246,24 @@ fn extend_cooldown(key: [u8; 32], headers: &reqwest::header::HeaderMap) -> Optio
     Some(delay)
 }
 
+fn time_until_quota_admission(entry: &Cooldown, now: Instant) -> Duration {
+    if entry.out_of_range {
+        return Duration::MAX;
+    }
+    entry
+        .until
+        .unwrap_or(now)
+        .max(entry.next_admission.unwrap_or(now))
+        .saturating_duration_since(now)
+}
+
+fn cooldown_remaining(key: [u8; 32]) -> Duration {
+    let cooldowns = COOLDOWNS.lock().unwrap_or_else(|e| e.into_inner());
+    cooldowns.get(&key).map_or(Duration::ZERO, |entry| {
+        time_until_quota_admission(entry, Instant::now())
+    })
+}
+
 // Space admission after a cooldown. Callers recheck after each wait:
 // another 429/503 can extend the shared deadline while a slot is pending.
 fn cooldown_delay(key: [u8; 32]) -> Duration {
@@ -233,15 +284,9 @@ fn cooldown_delay(key: [u8; 32]) -> Duration {
     let Some(entry) = cooldowns.get_mut(&key) else {
         return Duration::ZERO;
     };
-    if entry.out_of_range {
-        return Duration::MAX;
-    }
-    let admission = entry
-        .until
-        .unwrap_or(now)
-        .max(entry.next_admission.unwrap_or(now));
-    if admission > now {
-        return admission.duration_since(now);
+    let delay = time_until_quota_admission(entry, now);
+    if !delay.is_zero() {
+        return delay;
     }
     // Allocate only an immediately usable admission under the mutex. Late
     // wakeups recheck instead of bunching preallocated, expired slots.
@@ -253,6 +298,7 @@ async fn admit_async(
     key: [u8; 32],
     budget: &RetryBudget,
     cancel: &CancelToken,
+    on_admission: &mut impl FnMut(Option<Duration>),
 ) -> Result<(), String> {
     loop {
         if cancel.is_cancelled() {
@@ -260,7 +306,14 @@ async fn admit_async(
         }
         let delay = cooldown_delay(key);
         if delay.is_zero() {
-            return budget.charge_send();
+            budget.charge_send()?;
+            if !cancel.is_cancelled() {
+                on_admission(None);
+            }
+            return Ok(());
+        }
+        if budget.can_wait(delay) {
+            on_admission(Some(delay));
         }
         budget.wait_async(delay, cancel).await?;
     }
@@ -286,7 +339,7 @@ fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct HttpFailure {
     pub(crate) status: reqwest::StatusCode,
     pub(crate) request_id: Option<String>,
@@ -310,7 +363,7 @@ impl HttpFailure {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum RequestFailure {
     Http(HttpFailure),
     Other(String),
@@ -470,7 +523,7 @@ pub async fn execute_streaming_with_retry_budget(
     cancel: &CancelToken,
     budget: &RetryBudget,
 ) -> Result<Response, String> {
-    execute_streaming_with_retry_details(client, build_request, cancel, budget)
+    execute_streaming_with_retry_details(client, build_request, cancel, budget, None, |_| {})
         .await
         .map_err(|error| error.to_string())
 }
@@ -480,39 +533,110 @@ pub(crate) async fn execute_streaming_with_retry_details(
     build_request: impl Fn(&Client) -> RequestBuilder,
     cancel: &CancelToken,
     budget: &RetryBudget,
+    recovery: Option<orca_core::provider_types::ProviderError>,
+    mut on_retry: impl FnMut(Option<ProviderRetry>),
 ) -> Result<Response, RequestFailure> {
+    budget.set_retry_quota_key(None);
     let mut attempt: u32 = 0;
+    let mut previous_failure: Option<RequestFailure> = None;
+    let mut pending_report = recovery.map(|error| (budget.attempts(), error));
     loop {
         let request = build_request(client)
             .build()
             .map_err(|e| format!("request build failed: {e}"))?;
-        let (result, key) = send_built_streaming_request(client, request, cancel, budget).await?;
-        match result {
+        let sends_before = budget.attempts();
+        let retrying = previous_failure.is_some() || pending_report.is_some();
+        let send = send_built_streaming_request(client, request, cancel, budget, |wait| {
+            if let Some((attempt, error)) = pending_report.take() {
+                on_retry(Some(ProviderRetry::new(
+                    attempt,
+                    budget.max_attempts(),
+                    wait.unwrap_or_default(),
+                    &error,
+                )));
+            }
+            if retrying && wait.is_none() && !cancel.is_cancelled() {
+                on_retry(None);
+            }
+        })
+        .await;
+        let (result, key) = match send {
+            Ok(sent) => sent,
+            Err(message) if !cancel.is_cancelled() && budget.attempts() == sends_before => {
+                return Err(previous_failure.unwrap_or_else(|| message.into()));
+            }
+            Err(message) => return Err(message.into()),
+        };
+        let (failure, retry_after) = match result {
             Ok(resp) => {
                 let status = resp.status();
-                if !is_retryable_status(status.as_u16()) {
-                    if !status.is_success() {
-                        return Err(streaming_http_failure(resp, cancel, false).await);
-                    }
+                if status.is_success() {
                     return Ok(resp);
                 }
+                if !is_retryable_status(status.as_u16()) {
+                    return Err(streaming_http_failure(resp, cancel, false, false).await);
+                }
                 let retry_after = extend_cooldown(key, resp.headers());
-                if attempt >= MAX_RETRIES || !budget.can_retry() {
-                    return Err(streaming_http_failure(resp, cancel, true).await);
+                let will_retry = attempt < MAX_RETRIES && budget.can_retry();
+                let delay = retry_after
+                    .map_or_else(|| compute_backoff(attempt), |_| cooldown_remaining(key));
+                let failure = streaming_http_failure(
+                    resp,
+                    cancel,
+                    true,
+                    will_retry && budget.can_wait(delay),
+                )
+                .await;
+                if !will_retry {
+                    budget.set_retry_quota_key(retry_after.map(|_| key));
+                    return Err(failure);
                 }
-                if retry_after.is_none() {
-                    budget.wait_async(compute_backoff(attempt), cancel).await?;
-                }
+                (failure, retry_after)
             }
             Err(err) => {
+                let failure = RequestFailure::Other(format!(
+                    "request failed after {} attempts: {err}",
+                    attempt + 1
+                ));
                 if attempt >= MAX_RETRIES || !budget.can_retry() || !is_retryable_error(&err) {
-                    return Err(
-                        format!("request failed after {} attempts: {err}", attempt + 1).into(),
-                    );
+                    return Err(failure);
                 }
-                budget.wait_async(compute_backoff(attempt), cancel).await?;
+                (failure, None)
+            }
+        };
+        if cancel.is_cancelled() {
+            return Err("request cancelled".to_string().into());
+        }
+        let delay = if retry_after.is_some() {
+            cooldown_remaining(key)
+        } else {
+            compute_backoff(attempt)
+        };
+        if !budget.can_wait(delay) {
+            budget.set_retry_quota_key(retry_after.map(|_| key));
+            return Err(failure);
+        }
+        let error = crate::deepseek_http::provider_request_error(failure.clone());
+        // The next admission enforces Retry-After and the shared quota spacing.
+        if retry_after.is_some() {
+            budget.set_retry_quota_key(Some(key));
+            pending_report = Some((budget.attempts(), error));
+        } else {
+            on_retry(Some(ProviderRetry::new(
+                budget.attempts(),
+                budget.max_attempts(),
+                delay,
+                &error,
+            )));
+            if let Err(message) = budget.wait_async(delay, cancel).await {
+                return Err(if cancel.is_cancelled() {
+                    message.into()
+                } else {
+                    failure
+                });
             }
         }
+        previous_failure = Some(failure);
         attempt += 1;
     }
 }
@@ -540,15 +664,18 @@ pub(crate) async fn execute_streaming_once_with_budget(
     cancel: &CancelToken,
     budget: &RetryBudget,
 ) -> Result<Response, RequestFailure> {
+    budget.set_retry_quota_key(None);
     let (client, request) = request
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build_split();
     let request = request.map_err(|e| format!("request build failed: {e}"))?;
-    let (result, key) = send_built_streaming_request(&client, request, cancel, budget).await?;
+    let (result, key) =
+        send_built_streaming_request(&client, request, cancel, budget, |_| {}).await?;
     let response = result.map_err(|error| format!("request failed after 1 attempt: {error}"))?;
     let status = response.status();
     if is_retryable_status(status.as_u16()) {
-        extend_cooldown(key, response.headers());
+        let retry_after = extend_cooldown(key, response.headers());
+        budget.set_retry_quota_key(retry_after.map(|_| key));
     }
     if !status.is_success() {
         if std::env::var_os("ORCA_SUMMARY_DEBUG").is_some() {
@@ -557,7 +684,7 @@ pub(crate) async fn execute_streaming_once_with_budget(
                 status.as_u16()
             );
         }
-        return Err(streaming_http_failure(response, cancel, false).await);
+        return Err(streaming_http_failure(response, cancel, false, false).await);
     }
     Ok(response)
 }
@@ -566,15 +693,53 @@ async fn streaming_http_failure(
     response: Response,
     cancel: &CancelToken,
     exhausted: bool,
+    prefix_only: bool,
 ) -> RequestFailure {
     let mut failure = HttpFailure::new(response.status(), response.headers());
     failure.exhausted = exhausted;
-    failure.body = match response_text_with_cancel(response, cancel).await {
+    let body = if is_retryable_status(failure.status.as_u16()) {
+        transient_error_text(response, cancel, prefix_only).await
+    } else {
+        response_text_with_cancel(response, cancel).await
+    };
+    failure.body = match body {
         Ok(body) => body,
         Err(message) if cancel.is_cancelled() => return RequestFailure::Other(message),
         Err(message) => message,
     };
     RequestFailure::Http(failure)
+}
+
+async fn transient_error_text(
+    mut response: Response,
+    cancel: &CancelToken,
+    prefix_only: bool,
+) -> Result<String, String> {
+    let mut body = Vec::new();
+    let limit = if prefix_only {
+        RETRY_ERROR_PREFIX_BYTES
+    } else {
+        usize::MAX
+    };
+    let read = async {
+        while body.len() < limit
+            && let Some(chunk) = response.chunk().await?
+        {
+            body.extend_from_slice(&chunk[..chunk.len().min(limit - body.len())]);
+        }
+        Ok::<_, reqwest::Error>(())
+    };
+    tokio::select! {
+        biased;
+        _ = wait_for_cancel(cancel) => return Err("request cancelled".into()),
+        result = tokio::time::timeout(TRANSIENT_ERROR_BODY_TIMEOUT, read) => {
+            if let Ok(Err(error)) = result && body.is_empty() {
+                return Err(format!("response body read failed: {error}"));
+            }
+        }
+    }
+    // A stalled body can still provide useful text before the next wait begins.
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 // Redirects are explicit so every transport hop uses the same admission gate
@@ -732,12 +897,20 @@ async fn send_built_streaming_request(
     mut request: reqwest::Request,
     cancel: &CancelToken,
     budget: &RetryBudget,
+    mut on_admission: impl FnMut(Option<Duration>),
 ) -> HttpSendResult<Response> {
     let scoped = request_retry_budget(budget, request.timeout().copied())?;
     let budget = &scoped;
+    let mut initial_hop = true;
     loop {
         let key = quota_key(request.url(), request.headers());
-        admit_async(key, budget, cancel).await?;
+        admit_async(key, budget, cancel, &mut |wait| {
+            if initial_hop {
+                on_admission(wait);
+            }
+        })
+        .await?;
+        initial_hop = false;
         *request.timeout_mut() = budget.remaining_time()?;
         let replay = request.try_clone();
         let result = tokio::select! {
@@ -886,6 +1059,62 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn retry_does_not_wait_for_a_stalled_error_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (close, keep_open) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0; 1024];
+                let n = stream.read(&mut buffer).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buffer[..n]);
+            }
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 100\r\nX-Request-Id: stalled-body\r\n\r\nbusy").unwrap();
+            let _ = keep_open.recv_timeout(Duration::from_secs(3));
+        });
+        let client = streaming_client().unwrap();
+        let cancel = CancelToken::new();
+        let budget = RetryBudget::default();
+        let mut reported = None;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_streaming_with_retry_details(
+                &client,
+                |c| c.get(&url),
+                &cancel,
+                &budget,
+                None,
+                |retry| {
+                    if let Some(retry) = retry {
+                        reported = Some(retry);
+                        cancel.cancel();
+                    }
+                },
+            ),
+        )
+        .await;
+        close.send(()).unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            result.unwrap().unwrap_err().to_string(),
+            "request cancelled"
+        );
+        assert!(
+            reported
+                .unwrap()
+                .reason
+                .contains("(HTTP 503, request id stalled-body)")
+        );
+        assert_eq!(budget.attempts(), 1);
+    }
 
     #[test]
     fn redirect_review_rejects_https_downgrades_and_preserves_secure_targets() {

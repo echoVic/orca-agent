@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::conversation::RawToolCall;
 use crate::tool_types::ToolRequest;
@@ -113,8 +114,33 @@ impl std::fmt::Display for ProviderError {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderRetry {
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub delay_ms: u64,
+    pub kind: ProviderErrorKind,
+    pub reason: String,
+}
+
+impl ProviderRetry {
+    pub fn new(attempt: u32, max_attempts: u32, delay: Duration, error: &ProviderError) -> Self {
+        Self {
+            attempt,
+            max_attempts,
+            delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            kind: error.kind,
+            reason: error.message.chars().take(200).collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ProviderStep {
+    /// Live retry state. `None` marks the start of the next attempt.
+    Retry(Option<ProviderRetry>),
+    /// Live usage of the successful request when the response includes earlier costs.
+    AttemptUsage(Option<Usage>),
     ReasoningDelta(String),
     MessageDelta(String),
     ToolCallProgress(ToolCallProgress),

@@ -623,6 +623,7 @@ impl RuntimeProviderTurnStep {
         let mut first_delta = None;
         let mut completed_attempts = 0_u32;
         let mut failed_attempt_usage = None;
+        let mut attempt_usage;
         let (mut response, response_identity) = loop {
             completed_attempts = completed_attempts.saturating_add(1);
             let response_identity = ModelResponseIdentity::new(input.turn_context.turn_id.clone());
@@ -670,6 +671,19 @@ impl RuntimeProviderTurnStep {
                                 first_delta = Some((elapsed_millis(request_started), kind));
                             }
                         }
+                        if let ProviderStep::Retry(retry) = delivery.step() {
+                            step_batcher.flush()?;
+                            if let Some(ingress) = input.turn_context.provider_response_ingress() {
+                                ingress
+                                    .commit_provider_step(&response_identity, delivery.step())?;
+                            }
+                            if let Some(retry) = retry
+                                && emit_deltas
+                            {
+                                sink.emit(events.provider_retry(retry))?;
+                            }
+                            continue;
+                        }
                         step_batcher.push(delivery.step().clone())?;
                         emit_provider_delta(
                             delivery.step(),
@@ -708,6 +722,7 @@ impl RuntimeProviderTurnStep {
                     ));
                 }
             };
+            attempt_usage = stream.attempt_usage(&response);
             step_batcher.flush()?;
 
             let Some(error) = response.error() else {
@@ -718,13 +733,32 @@ impl RuntimeProviderTurnStep {
             else {
                 break (response, response_identity);
             };
-            if let Some(ingress) = input.turn_context.provider_response_ingress() {
-                ingress.commit_provider_attempt_failure(&response_identity, &error.message)?;
+            let delay = delay.max(retry_budget.retry_cooldown_delay());
+            if input.cancel.is_cancelled() || !retry_budget.can_wait(delay) {
+                break (response, response_identity);
             }
-            if retry_budget.wait_blocking(delay, input.cancel).is_err() {
+            let attempt = retry_budget.attempts().max(completed_attempts);
+            let max_attempts = (attempt + retry_policy.max_attempts(error.kind)
+                - completed_attempts)
+                .min(retry_budget.max_attempts());
+            let retry =
+                orca_core::provider_types::ProviderRetry::new(attempt, max_attempts, delay, error);
+            let ingress = input.turn_context.provider_response_ingress();
+            if let Some(ingress) = ingress {
+                ingress.commit_provider_attempt_failure(&response_identity, &retry)?;
+            }
+            if emit_deltas {
+                sink.emit(events.provider_retry(&retry))?;
+            }
+            if retry_budget.wait_blocking(delay, input.cancel).is_err()
+                || input.cancel.is_cancelled()
+            {
                 // Settle this response and earlier failed-attempt usage below
                 // before returning the cancellation terminal.
                 break (response, response_identity);
+            }
+            if let Some(ingress) = ingress {
+                ingress.commit_provider_step(&response_identity, &ProviderStep::Retry(None))?;
             }
             merge_provider_usage(&mut failed_attempt_usage, response.usage);
         };
@@ -733,7 +767,6 @@ impl RuntimeProviderTurnStep {
             first_delta_ms: first_delta.map(|(ms, _)| ms),
             first_delta_kind: first_delta.map(|(_, kind)| kind),
         };
-        let attempt_usage = response.usage;
         merge_provider_usage(&mut response.usage, failed_attempt_usage);
         if response.error().is_none() {
             record_request_usage_anchor(
@@ -783,13 +816,14 @@ impl RuntimeProviderTurnStep {
                 if let Some(writer) = history_writer.as_deref_mut() {
                     writer.append_usage(totals)?;
                 }
-                // Real occupancy: the provider-reported prompt tokens for THIS
-                // request (not the cumulative CostTracker totals) against the
-                // compaction line. Non-persisted observability only.
-                sink.emit(events.context_updated(
-                    usage.input_tokens as usize,
-                    input.context_config.soft_limit(),
-                ))?;
+                if let Some(attempt_usage) = attempt_usage.filter(|usage| !usage.is_empty())
+                    && response.error().is_none()
+                {
+                    sink.emit(events.context_updated(
+                        attempt_usage.input_tokens as usize,
+                        input.context_config.soft_limit(),
+                    ))?;
+                }
             }
         }
 
@@ -851,6 +885,7 @@ impl RuntimeProviderTurnStep {
         }
 
         let mut response = RuntimeModelResponse::from_parts(response, response_identity);
+        response.attempt_usage = attempt_usage;
         response.observation = Some(observation);
         Ok(RuntimeProviderTurnOutput::response(response))
     }
@@ -871,7 +906,7 @@ impl RuntimeProviderTurnStep {
             return Ok(RuntimeProviderErrorOutcome::NoError);
         };
 
-        match RuntimeCompactionPolicy::decide_for_provider_error(&error.message, compaction_retry) {
+        match RuntimeCompactionPolicy::decide_for_provider_error(&error, compaction_retry) {
             RuntimeCompactionRetryDecision::CompactAndRetry { trigger, reason: _ } => {
                 if compaction.compact_after_provider_error_retry(conversation, trigger)? {
                     Ok(RuntimeProviderErrorOutcome::ContinueAfterCompaction)
@@ -1949,6 +1984,202 @@ mod tests {
         assert!(first <= elapsed);
     }
 
+    const BUSY_HTTP: &str = "HTTP/1.1 503 Service Unavailable\r\nX-Request-Id: runtime-fixture\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy";
+    const RETRY_USAGE: &str =
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":3}}\n\n";
+
+    fn run_retry_fixture(
+        responses: Vec<String>,
+    ) -> (
+        RuntimeModelResponse,
+        Vec<serde_json::Value>,
+        orca_core::cost_types::UsageTotals,
+    ) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for reply in responses {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "provider never contacted fixture"
+                            );
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, length)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = length.trim().parse().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; content_length]).unwrap();
+                socket.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+
+        let id = "retry-http-fixture";
+        let mut lifecycle = crate::lifecycle::RuntimeSessionLifecycle::new(id);
+        let provider_config = ProviderConfig {
+            api_key: Some("test-retry".into()),
+            base_url: Some(base_url),
+            model: Some(orca_core::model::FLASH_MODEL.into()),
+            reasoning_effort: Default::default(),
+            tools_override: Some(vec![]),
+            mcp_registry: None,
+            external_tools: vec![],
+            max_output_tokens: None,
+        };
+        let mut conversation = Conversation::new();
+        conversation.add_user("inspect".into());
+        let mut tracker = CostTracker::new(provider_config.model.as_deref());
+        let mut output = Vec::new();
+        let turn = RuntimeProviderTurnStep::new()
+            .run(RuntimeProviderTurnInput {
+                actor: &mut RuntimeTaskActor::new(&mut lifecycle),
+                operation: &mut OperationContext::for_tests(Default::default(), id),
+                provider: ProviderKind::DeepSeek,
+                runtime_system_messages: &[],
+                provider_config: &provider_config,
+                image_route: ImageRouteDecision::None,
+                turn_context: RuntimeTurnContext::new(
+                    Path::new("."),
+                    "inspect",
+                    0,
+                    true,
+                    &SubagentType::General,
+                ),
+                hooks: &HookRunner::default(),
+                cancel: &CancelToken::new(),
+                context_config: &context::ContextConfig::for_model_with_runtime(
+                    provider_config.model.as_deref(),
+                    &ModelRuntimeConfig::default(),
+                    Default::default(),
+                ),
+                io: RuntimeProviderTurnIo {
+                    conversation: &mut conversation,
+                    cost_tracker: &mut tracker,
+                    events: &mut EventFactory::new(id.into()),
+                    sink: &mut EventSink::new(&mut output, OutputFormat::Jsonl),
+                    history_writer: None,
+                },
+            })
+            .unwrap();
+        server.join().unwrap();
+        let RuntimeProviderTurnOutput::Response(response) = turn else {
+            panic!("fixture expected a provider response");
+        };
+        let events = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (response, events, tracker.totals())
+    }
+
+    fn retry_sse(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const RETRY_SUCCESS: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+    #[test]
+    fn a_retry_is_reported_before_the_backoff() {
+        let (response, events, _) =
+            run_retry_fixture(vec![BUSY_HTTP.into(), retry_sse(RETRY_SUCCESS)]);
+        assert_eq!(response.response.assistant_content.as_deref(), Some("done"));
+        let retries: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "provider.retry")
+            .collect();
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0]["payload"]["attempt"], 1);
+        assert_eq!(retries[0]["payload"]["max_attempts"], 5);
+        let retry = retries[0];
+        let delta = events
+            .iter()
+            .find(|event| event["type"] == "assistant.message.delta")
+            .unwrap();
+        assert!(retry["seq"].as_u64() < delta["seq"].as_u64());
+        let elapsed_ms = delta["timestamp_ms"]
+            .as_u64()
+            .unwrap()
+            .saturating_sub(retry["timestamp_ms"].as_u64().unwrap());
+        assert!(elapsed_ms >= retry["payload"]["delay_ms"].as_u64().unwrap());
+    }
+
+    #[test]
+    fn no_retry_is_announced_after_the_last_attempt() {
+        let (response, events, _) = run_retry_fixture(vec![BUSY_HTTP.into(); 5]);
+        let attempts: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "provider.retry")
+            .map(|event| event["payload"]["attempt"].as_u64().unwrap())
+            .collect();
+        assert_eq!(attempts, [1, 2, 3, 4]);
+        let error = response.response.error().unwrap();
+        assert!(
+            error
+                .message
+                .ends_with("(HTTP 503, request id runtime-fixture)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_context_meter_counts_one_attempt() {
+        let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        for failed in [
+            format!("{partial}{RETRY_USAGE}"),
+            format!("{RETRY_USAGE}data: [DONE]\n\n"),
+            RETRY_USAGE.into(),
+        ] {
+            let (response, events, usage) = run_retry_fixture(vec![
+                retry_sse(&failed),
+                retry_sse(&format!("{RETRY_USAGE}{RETRY_SUCCESS}")),
+            ]);
+            assert_eq!(response.response.assistant_content.as_deref(), Some("done"));
+            assert_eq!(usage.input_tokens, 2000);
+            let context = events
+                .iter()
+                .find(|event| event["type"] == "context.updated")
+                .unwrap();
+            assert_eq!(context["payload"]["used_tokens"], 1000);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "provider.retry")
+                    .count(),
+                1
+            );
+        }
+    }
+
     #[test]
     fn retry_review_unrepresentable_finite_deadline_rejects_retry_wait() {
         let now = Instant::now();
@@ -2021,6 +2252,8 @@ mod tests {
         struct CancelRetryIngress {
             cancel: CancelToken,
             failures: AtomicUsize,
+            starts: AtomicUsize,
+            waiting: AtomicBool,
             cancel_after: usize,
         }
         impl crate::runtime_surface::RuntimeProviderResponseIngress for CancelRetryIngress {
@@ -2030,8 +2263,13 @@ mod tests {
             fn commit_provider_step(
                 &self,
                 _: &ModelResponseIdentity,
-                _: &ProviderStep,
+                step: &ProviderStep,
             ) -> io::Result<()> {
+                if matches!(step, ProviderStep::Retry(None))
+                    && self.waiting.swap(false, Ordering::SeqCst)
+                {
+                    self.starts.fetch_add(1, Ordering::SeqCst);
+                }
                 Ok(())
             }
             fn commit_tool_results(
@@ -2043,8 +2281,9 @@ mod tests {
             fn commit_provider_attempt_failure(
                 &self,
                 _: &ModelResponseIdentity,
-                _: &str,
+                _: &orca_core::provider_types::ProviderRetry,
             ) -> io::Result<()> {
+                self.waiting.store(true, Ordering::SeqCst);
                 if self.failures.fetch_add(1, Ordering::SeqCst) + 1 == self.cancel_after {
                     self.cancel.cancel();
                 }
@@ -2132,6 +2371,8 @@ mod tests {
         let ingress = CancelRetryIngress {
             cancel: cancel.clone(),
             failures: AtomicUsize::new(0),
+            starts: AtomicUsize::new(0),
+            waiting: AtomicBool::new(false),
             cancel_after,
         };
         let mut tracker = CostTracker::new(Some(orca_core::model::PRO_MODEL));
@@ -2174,6 +2415,7 @@ mod tests {
             panic!("expected cancelled terminal")
         };
         assert_eq!(error.status, RunStatus::Cancelled);
+        assert_eq!(ingress.starts.load(Ordering::SeqCst), cancel_after - 1);
         assert_eq!(ingress.failures.load(Ordering::SeqCst), cancel_after);
         assert_eq!(sends.load(Ordering::SeqCst), cancel_after * 2);
         let totals = tracker.totals();

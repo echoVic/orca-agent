@@ -1910,9 +1910,9 @@ function commandRow(manifest, table, name) {
 function invariantRegistry() {
   return new Map([
     [
-      "source_facts has exactly 59 unique variants matching EventType at baseline",
+      "source_facts has exactly 60 unique variants matching EventType",
       (manifest) => {
-        assertCondition(manifest.source_facts.length === 59, "source_facts must contain 59 rows");
+        assertCondition(manifest.source_facts.length === 60, "source_facts must contain 60 rows");
         assertUnique(manifest.source_facts.map((row) => row[0]), "source_facts");
       },
     ],

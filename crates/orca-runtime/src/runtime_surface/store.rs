@@ -1776,6 +1776,7 @@ enum StoredSurfaceEventV1 {
     Plan(SurfacePlanSnapshot),
     Usage(SurfaceUsageSnapshot),
     Context(SurfaceContextSnapshot),
+    ProviderRetry(Option<orca_core::provider_types::ProviderRetry>),
     Interaction(StoredInteractionPatchV1),
     Task(StoredTaskPatchV1),
     Workflow(WorkflowPatch),
@@ -1799,6 +1800,7 @@ impl StoredSurfaceEventV1 {
             SurfaceEvent::Plan(snapshot) => Self::Plan(snapshot.clone()),
             SurfaceEvent::Usage(snapshot) => Self::Usage(snapshot.clone()),
             SurfaceEvent::Context(snapshot) => Self::Context(snapshot.clone()),
+            SurfaceEvent::ProviderRetry(retry) => Self::ProviderRetry(retry.clone()),
             SurfaceEvent::Interaction(patch) => {
                 Self::Interaction(StoredInteractionPatchV1::from_live(patch)?)
             }
@@ -1822,6 +1824,7 @@ impl StoredSurfaceEventV1 {
             Self::Plan(snapshot) => SurfaceEvent::Plan(snapshot),
             Self::Usage(snapshot) => SurfaceEvent::Usage(snapshot),
             Self::Context(snapshot) => SurfaceEvent::Context(snapshot),
+            Self::ProviderRetry(retry) => SurfaceEvent::ProviderRetry(retry),
             Self::Interaction(patch) => SurfaceEvent::Interaction(patch.into_live()),
             Self::Task(patch) => SurfaceEvent::Task(patch.into_live()),
             Self::Workflow(patch) => SurfaceEvent::Workflow(patch),

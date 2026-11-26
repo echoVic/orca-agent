@@ -1578,6 +1578,19 @@ impl TuiSurfaceProjection {
                         .collect(),
                 }),
                 SurfaceEvent::Usage(_) => {}
+                SurfaceEvent::ProviderRetry(retry)
+                    if match &envelope.scope {
+                        orca_runtime::surface::SurfaceScope::Generation { fence } => {
+                            focused_operation.as_ref() == Some(&fence.operation_id)
+                        }
+                        orca_runtime::surface::SurfaceScope::Background { fence } => {
+                            focused_operation.as_ref() == Some(&fence.operation_fence.operation_id)
+                        }
+                        _ => false,
+                    } =>
+                {
+                    projected.push(TuiEvent::ProviderRetry(retry.clone()))
+                }
                 SurfaceEvent::Context(context) => match &context.compaction {
                     orca_runtime::surface::CompactionState::Running { .. } => {
                         projected.push(TuiEvent::CompactionStarted);

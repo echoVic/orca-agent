@@ -33,6 +33,13 @@ assistant.message.delta events for the same item. Concatenated payload.text is
 unchanged. Merged events retain the first envelope, so seq may skip values.
 model.response.completed carries the full assistant_reasoning and assistant_content.
 
+`provider.retry` is emitted before a scheduled provider retry. Its payload has
+`attempt` (the 1-based failed attempt), `max_attempts`, `delay_ms`, `kind`
+(the provider error kind), and `reason` (up to 200 characters). A terminal failure
+includes the full provider diagnostic and any available HTTP status and request ID.
+After a successful retry, `context.updated` reports that attempt's input tokens.
+`usage.updated` includes usage reported by failed attempts as well.
+
 ~~~bash
 orca exec --output-format jsonl "Run the test suite" |
   jq -c 'select(.type == "tool.call.completed")'

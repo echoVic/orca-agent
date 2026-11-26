@@ -187,6 +187,7 @@ cancellation and deadline controls.
 - `assistant.reasoning.delta`
 - `assistant.message.delta`
 - `model.response.completed`
+- `provider.retry`
 - `provider.replay.updated`
 - `approval.requested`
 - `approval.resolved`
@@ -199,6 +200,14 @@ cancellation and deadline controls.
 - `error`
 - `session.rewind`
 - `session.completed`
+
+`orca exec` emits `provider.retry` before a scheduled provider retry. The
+payload contains `attempt` (the 1-based failed attempt), `max_attempts`,
+`delay_ms`, `kind` (the provider error kind), and `reason` (up to 200
+characters). Only scheduled retries emit this event. The terminal error retains
+the full diagnostic, including the HTTP status and request ID when available.
+After a successful retry, `context.updated` shows the successful attempt's input
+tokens. `usage.updated` includes usage reported by failed attempts as well.
 
 `session.rewind` is emitted on the live runtime event stream after `/rewind`
 actually applied and its durable `session.rewind` transcript record was

@@ -5281,6 +5281,23 @@ fn workspace_status_spans(
 }
 
 fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
+    if let Some(retry) = &state.provider_retry {
+        let reason: String = retry
+            .reason
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        let status = format!(
+            " Retrying in {}s (attempt {} of {}): {reason}",
+            retry.delay_ms.div_ceil(1000),
+            retry.attempt,
+            retry.max_attempts
+        );
+        return Line::from(Span::styled(
+            crate::display_text::truncate_to_display_width(&status, width),
+            Style::default().fg(theme.warning),
+        ));
+    }
     let separator = " · ";
     // Left zone: mode chip (or side-conversation label) plus vim mode.
     let mut left: Vec<Span<'static>> = vec![Span::raw(" ")];
@@ -12717,6 +12734,31 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn a_cancel_during_backoff_clears_the_retry_status() {
+        let mut state = test_state();
+        let retry = orca_core::provider_types::ProviderRetry {
+            attempt: 1,
+            max_attempts: 5,
+            delay_ms: 1_500,
+            kind: orca_core::provider_types::ProviderErrorKind::Server,
+            reason: "provider is busy".into(),
+        };
+        state.update(crate::protocol::TuiEvent::ProviderRetry(Some(
+            retry.clone(),
+        )));
+        assert!(
+            status_text(&state, 120).contains("Retrying in 2s (attempt 1 of 5): provider is busy")
+        );
+        state.update(crate::protocol::TuiEvent::ProviderRetry(None));
+        assert!(!status_text(&state, 120).contains("Retrying"));
+        state.update(crate::protocol::TuiEvent::ProviderRetry(Some(retry)));
+        state.update(crate::protocol::TuiEvent::SessionCompleted {
+            status: "cancelled".into(),
+        });
+        assert!(!status_text(&state, 120).contains("Retrying"));
     }
 
     #[test]

@@ -153,7 +153,7 @@ impl<W: Write> EventSink<W> {
                     event.payload["text"].as_str().unwrap_or("")
                 )
             }
-            EventType::ModelResponseCompleted => Ok(()),
+            EventType::ModelResponseCompleted | EventType::ProviderRetry => Ok(()),
             EventType::ProviderReplayUpdated => writeln!(self.writer, "provider replay updated"),
             EventType::ModelRouted => {
                 let actual = event.payload["actual_model"].as_str().unwrap_or("unknown");

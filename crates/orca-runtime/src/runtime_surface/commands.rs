@@ -115,6 +115,7 @@ pub enum SurfaceEvent {
     Plan(SurfacePlanSnapshot),
     Usage(SurfaceUsageSnapshot),
     Context(SurfaceContextSnapshot),
+    ProviderRetry(Option<orca_core::provider_types::ProviderRetry>),
     Interaction(InteractionPatch),
     Task(TaskPatch),
     Workflow(WorkflowPatch),

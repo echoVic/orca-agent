@@ -76,9 +76,14 @@ pub struct ProviderStreamingCall {
     worker: Option<JoinedProviderWorker>,
     replay_steps: VecDeque<ProviderStep>,
     completed: Option<ProviderResponse>,
+    attempt_usage: Option<Option<Usage>>,
 }
 
 impl ProviderStreamingCall {
+    pub fn attempt_usage(&self, response: &ProviderResponse) -> Option<Usage> {
+        self.attempt_usage.unwrap_or(response.usage)
+    }
+
     pub fn recv_timeout(
         &mut self,
         timeout: Duration,
@@ -99,6 +104,14 @@ impl ProviderStreamingCall {
             .ok_or(mpsc::RecvTimeoutError::Disconnected)
             .and_then(|receiver| receiver.recv_timeout(timeout));
         match delivery {
+            Ok(ProviderWorkerStep {
+                step: ProviderStep::AttemptUsage(usage),
+                acknowledged,
+            }) => {
+                self.attempt_usage = Some(usage);
+                let _ = acknowledged.send(());
+                self.recv_timeout(timeout)
+            }
             Ok(delivery) => Ok(ProviderStreamEvent::Step(ProviderStreamDelivery {
                 step: delivery.step,
                 acknowledged: Some(delivery.acknowledged),
@@ -360,6 +373,7 @@ fn start_streaming_with_output_budget(
                 worker: None,
                 replay_steps: response.steps.iter().cloned().collect(),
                 completed: Some(response),
+                attempt_usage: None,
             };
         }
     };
@@ -368,6 +382,7 @@ fn start_streaming_with_output_budget(
         worker: Some(JoinedProviderWorker::new(worker, cancel)),
         replay_steps: VecDeque::new(),
         completed: None,
+        attempt_usage: None,
     }
 }
 
