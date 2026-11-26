@@ -132,6 +132,13 @@ impl McpClient {
             .clone()
     }
 
+    fn withdraw_instructions(&self) {
+        self.instructions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+
     /// Calls the tool `name`. A failed call is never sent again, but a
     /// failure that stopped the server connects it again first, as
     /// [`Self::request`] does, so that the next call can go through.
@@ -241,9 +248,13 @@ impl McpClient {
             let result = request(transport.as_ref());
             // The transport the request failed on, and whether it closed
             // itself.
-            let failed = result
-                .is_err()
-                .then(|| (Arc::clone(&*transport), transport.is_closed()));
+            let failed = result.is_err().then(|| {
+                let closed = transport.is_closed();
+                if closed {
+                    self.withdraw_instructions();
+                }
+                (Arc::clone(&*transport), closed)
+            });
             (result, failed)
         };
         match (result, failed) {
@@ -361,6 +372,7 @@ impl McpClient {
             if !Arc::ptr_eq(&current, failed) {
                 return Ok(Reconnected::AlreadyReplaced);
             }
+            self.withdraw_instructions();
             current.terminate();
             let began = Instant::now();
             let connected = self

@@ -7,6 +7,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use orca_mcp::{McpChangeSubscription, McpRegistry, McpServerState};
 use orca_provider::tool_schema::DEEPSEEK_MAX_TOOLS;
 
+pub(crate) fn refresh_request_instructions(
+    conversation: &mut orca_core::conversation::Conversation,
+    registry: &orca_mcp::McpRegistry,
+) {
+    conversation.mcp_instructions = registry.server_instructions();
+}
+
 /// The warnings `registry` leaves once its servers' startup has ended, in
 /// its words: what is wrong with the config, and then, server by server in
 /// config order, why one failed to start, the login one needs, or what one

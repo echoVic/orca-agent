@@ -1002,7 +1002,7 @@ while IFS= read -r line; do
       elif [ "$generation" -gt 1 ]; then
         {restart}
       fi
-      printf '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"slow","version":"1"}}}}}}\n'
+      printf '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"slow","version":"1"}},"instructions":"Use generation %s."}}}}\n' "$generation"
       ;;
     *'"method":"notifications/initialized"'*)
       ;;
@@ -1046,6 +1046,30 @@ done
     ]);
     config.startup_timeout_ms = Some(10_000);
     (config, started_file, called_file)
+}
+
+#[cfg(unix)]
+#[test]
+fn instructions_are_withdrawn_when_the_connection_is_invalidated() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (config, started_file, _) = restarting_server_config(dir.path(), Some(1));
+    let registry = connected_registry(&[config], None);
+    assert_eq!(
+        registry.server_instructions(),
+        [("slow".into(), "Use generation 1.".into())]
+    );
+    let tool = registry.resolve_tool("mcp__slow__wait").unwrap();
+    let cancelled =
+        registry.call_tool_or_cancel(&tool, serde_json::json!({}), &|| started_file.exists());
+    assert_eq!(cancelled.unwrap_err(), "MCP tool call cancelled");
+    assert!(registry.server_instructions().is_empty());
+
+    let next = registry.call_tool(&tool, serde_json::json!({})).unwrap();
+    assert_eq!(next.output, "answered by 3");
+    assert_eq!(
+        registry.server_instructions(),
+        [("slow".into(), "Use generation 3.".into())]
+    );
 }
 
 #[cfg(unix)]

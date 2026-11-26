@@ -139,7 +139,7 @@ fn build_child_agent_loop_setup(
     config: &RunConfig,
     request: &ChildAgentRequest,
     cwd: &Path,
-    conversation: Conversation,
+    mut conversation: Conversation,
     continuation: Option<ChildAgentContinuationRuntimeState>,
     turn: u32,
 ) -> ChildAgentLoopSetup {
@@ -160,6 +160,7 @@ fn build_child_agent_loop_setup(
         &mcp_registry,
         &crate::extension::ExtensionData::new("child-session"),
     );
+    crate::mcp_startup::refresh_request_instructions(&mut conversation, &mcp_registry);
     provider_config.model = Some(orca_core::model::FLASH_MODEL.to_string());
 
     let budget_model = config.model.as_option();

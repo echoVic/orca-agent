@@ -518,7 +518,6 @@ impl<'a> ThreadTurnContext<'a> {
             config.auto_memory && !matches!(config.history_mode, HistoryMode::Disabled),
             request.prompt_placement() == ThreadTurnPromptPlacement::ExistingTurn,
         );
-        parts.conversation.mcp_instructions = parts.mcp_registry.server_instructions();
         if request.prompt_placement() != ThreadTurnPromptPlacement::ExistingTurn {
             parts
                 .conversation
@@ -2775,6 +2774,159 @@ mod tests {
             terminal_notifications: false,
             auto_memory: false,
         }
+    }
+
+    #[cfg(unix)]
+    fn delayed_mcp_server(
+        dir: &std::path::Path,
+        delay: u32,
+        tool_count: usize,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let path = dir.join("catalog.sh");
+        let tools = (0..tool_count)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("lookup_{i:02}"), "inputSchema": {"type": "object"}
+                })
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(&path, format!(r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      sleep {delay}
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"catalog","version":"1"}},"instructions":"Look up records by ID."}}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":{tools}}}}}'
+      ;;
+  esac
+ done
+"#, tools = serde_json::Value::Array(tools))).unwrap();
+        orca_core::mcp_types::McpServerConfig {
+            name: "catalog".into(),
+            command: Some("/bin/sh".into()),
+            args: vec![path.to_string_lossy().into_owned()],
+            startup_timeout_ms: Some(10_000),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn capture_model_request() -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut len = None;
+            loop {
+                let mut header = String::new();
+                assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    len = Some(value.trim().parse().unwrap());
+                }
+            }
+            let mut request = vec![0; len.expect("content length")];
+            reader.read_exact(&mut request).unwrap();
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"found it\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            serde_json::from_slice(&request).unwrap()
+        });
+        (base_url, server)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_finishes_starting_late_has_its_instructions_in_the_first_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let _orca_home = crate::history::redirect_test_orca_home(dir.path());
+        let (base_url, captured) = capture_model_request();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.provider = ProviderKind::DeepSeek;
+        config.api_key = Some("test".into());
+        config.base_url = Some(base_url);
+        config.mcp_servers = vec![delayed_mcp_server(dir.path(), 1, 1)];
+        let registry = orca_mcp::initialize_registry(&config.mcp_servers, None);
+        let mut session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+            &config,
+            "find a record",
+            None,
+            registry.clone(),
+        )
+        .unwrap();
+        assert!(registry.server_instructions().is_empty());
+        assert_eq!(
+            run_thread_turn_to_writer(
+                &config,
+                &mut session,
+                &mut RuntimeSessionLifecycle::new("mcp-test"),
+                "find a record",
+                Vec::new(),
+                ControllerRunOptions::default(),
+            )
+            .unwrap(),
+            RunStatus::Success
+        );
+        let request = captured.join().unwrap();
+        assert!(
+            request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == "mcp__catalog__lookup_00")
+        );
+        let messages = request["messages"].as_array().unwrap();
+        assert!(messages.last().unwrap()["content"].as_str().unwrap().contains(
+            "<mcp_server_instructions server=\"catalog\">\nLook up records by ID.\n</mcp_server_instructions>"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_turn_gets_the_mcp_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let _orca_home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![delayed_mcp_server(dir.path(), 0, 1)];
+        let mut request = crate::child_agent_types::ChildAgentRequest::new(
+            "find a record".into(),
+            SubagentType::General,
+            None,
+            1,
+            false,
+        );
+        request.allowed_tools = Some(vec!["mcp__catalog__lookup_00".into()]);
+        let setup = crate::child_agent_loop_setup::prepare_child_agent_loop(
+            &config,
+            &request,
+            dir.path(),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+        );
+        assert!(
+            setup
+                .provider_config
+                .tools_override
+                .unwrap()
+                .iter()
+                .any(|tool| tool.name == "mcp__catalog__lookup_00")
+        );
+        assert_eq!(
+            setup.conversation.mcp_instructions,
+            [("catalog".into(), "Look up records by ID.".into())]
+        );
     }
 
     #[test]
