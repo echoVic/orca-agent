@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.23";
+export const releaseVersion = "v0.5.24";
 
 export const releases = [
+  {
+    version: "v0.5.24",
+    date: "2026-11-27",
+    title: "grep handles patterns that start with a dash",
+    body: "grep now accepts patterns that start with -. A search for -> Result used to fail with an rg usage error and now finds matching lines. Patterns still use regular expressions. Your ripgrep config file no longer changes the results. A path outside the workspace or a symlink leading out of it is refused with path escapes workspace. The grep tests cover patterns starting with -, a file named -, paths that resolve to the workspace root, and refusals for paths outside the workspace, including through a symlink. Session search now finds text that starts with -.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.24",
+  },
   {
     version: "v0.5.23",
     date: "2026-11-23",

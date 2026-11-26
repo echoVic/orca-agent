@@ -46,8 +46,8 @@ pub(crate) const MAX_SESSION_LINE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) struct SessionScan {
     pub records: Vec<SessionRecord>,
     /// Decoded JSONL lines retained only up to the same record/line bounds.
-    /// Search uses these snippets instead of opening the source a second time.
-    pub lines: Vec<String>,
+    /// Skipped records have no snippet. Blank lines keep their own slots.
+    pub lines: Vec<Option<String>>,
     pub health: StoredSessionHealth,
     pub health_issue: Option<StoredSessionHealthIssue>,
     pub source_fingerprint: Option<String>,
@@ -76,6 +76,7 @@ impl SessionScan {
             code: code.into(),
             line,
             offset,
+            record_type: None,
         });
         self
     }
@@ -280,6 +281,9 @@ fn repair_incomplete_final_record(file: &mut File) -> io::Result<()> {
 }
 
 pub(crate) fn write_record_line(mut writer: impl Write, record: &SessionRecord) -> io::Result<()> {
+    if let SessionRecord::Ignorable(bytes) = record {
+        return writer.write_all(bytes);
+    }
     let redacted = redact_session_record(record);
     writer.write_all(&bounded_json_line(&redacted)?)
 }
@@ -393,16 +397,20 @@ fn write_records_to(
     target_path: &Path,
     records: impl IntoIterator<Item = io::Result<SessionRecord>>,
 ) -> io::Result<()> {
+    let lines = records.into_iter().map(|record| match record? {
+        SessionRecord::Ignorable(bytes) => Ok(bytes),
+        record => encode_record_line(target_path, &record),
+    });
     if target_path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
         let mut encoder = zstd::stream::write::Encoder::new(file, 3)?;
-        for record in records {
-            encoder.write_all(&encode_record_line(target_path, &record?)?)?;
+        for line in lines {
+            encoder.write_all(&line?)?;
         }
         encoder.finish()?;
     } else {
         let mut writer = io::BufWriter::new(file);
-        for record in records {
-            writer.write_all(&encode_record_line(target_path, &record?)?)?;
+        for line in lines {
+            writer.write_all(&line?)?;
         }
         writer.flush()?;
     }
@@ -421,7 +429,7 @@ fn scan_session_with_lines(path: &Path) -> io::Result<SessionScan> {
 
 fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionScan> {
     let mut reader = match SessionRecords::open(path, Some(INDEX_BUDGET), HydrateImages::None) {
-        Ok(reader) => reader,
+        Ok(reader) => reader.require_metadata(),
         Err(error) => {
             let metadata = fs::symlink_metadata(path).ok();
             if metadata
@@ -439,17 +447,30 @@ fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionSca
         }
     };
     let mut scan = SessionScan::new(path);
+    let mut last_searchable_line = 0;
     while let Some(record) = reader.next() {
         let Ok(record) = record else {
             break;
         };
-        scan.records.push(record);
+        let skipped = matches!(record, SessionRecord::Ignorable(_));
         if collect_lines {
-            // Preserve physical line numbers, including blank JSONL lines.
+            let line_number = reader.line_number as usize;
             scan.lines
-                .resize(reader.line_number as usize, String::new());
-            *scan.lines.last_mut().expect("current line") = reader.text().to_owned();
+                .resize_with(line_number - 1, || Some(String::new()));
+            scan.lines.push(if skipped {
+                None
+            } else {
+                last_searchable_line = line_number;
+                Some(reader.text().to_owned())
+            });
         }
+        if !skipped {
+            scan.records.push(record);
+        }
+    }
+    scan.lines.truncate(last_searchable_line);
+    if let Some(meta) = reader.newer_meta {
+        scan.records.push(SessionRecord::Meta(meta));
     }
     scan.health = reader.health;
     scan.health_issue = reader.issue;
@@ -525,6 +546,7 @@ pub(super) fn parse_session_record(line: &str) -> Result<SessionRecord, &'static
 
 pub(super) fn validate_session_record(value: SessionRecord) -> Result<SessionRecord, &'static str> {
     match &value {
+        SessionRecord::Unrecognized => Err("unknown_record_type"),
         SessionRecord::Message { id, turn_id, .. } if id.is_some() != turn_id.is_some() => {
             Err("invalid_conversation_identity")
         }
@@ -550,7 +572,7 @@ fn source_fingerprint(path: &Path) -> Option<String> {
     Some(orca_core::hex::lower(&hasher.finalize()))
 }
 
-pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<String>> {
+pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<Option<String>>> {
     let scan = scan_session_with_lines(path)?;
     match scan.health {
         StoredSessionHealth::Healthy
@@ -588,6 +610,24 @@ struct StoredSessionHealthError {
 
 impl std::fmt::Display for StoredSessionHealthError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.health == StoredSessionHealth::NewerVersion {
+            write!(
+                formatter,
+                "stored session {} was written by a newer version of Orca",
+                self.path.display()
+            )?;
+            if let Some(record_type) = self
+                .issue
+                .as_ref()
+                .and_then(|issue| issue.record_type.as_ref())
+            {
+                write!(
+                    formatter,
+                    " (it contains a {record_type:?} record this version does not know)"
+                )?;
+            }
+            return write!(formatter, ", please upgrade Orca to open it");
+        }
         let detail = self
             .issue
             .as_ref()
@@ -1439,6 +1479,7 @@ pub(crate) fn transcript_from_records(
             // File snapshots and retention watermarks are audit data for
             // `/rewind`; they never add or remove conversation messages.
             SessionRecord::FileSnapshot(_) | SessionRecord::SnapshotRetention(_) => {}
+            SessionRecord::Ignorable(_) | SessionRecord::Unrecognized => {}
             SessionRecord::SessionRewind(record) => {
                 apply_rewind_to_transcript(
                     &mut messages,
@@ -1617,6 +1658,7 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
         SessionRecord::SnapshotRetention(record) => {
             redact_string_in_place(&mut record.session_id);
         }
+        SessionRecord::Ignorable(_) | SessionRecord::Unrecognized => {}
     }
     redacted
 }
@@ -2507,6 +2549,7 @@ mod tests {
             additional_working_directories: Vec::new(),
             metadata_writable_directories: Vec::new(),
             network_domain_permissions: Default::default(),
+            additional_fields: Default::default(),
         };
         write_record(&path, &SessionRecord::Meta(meta)).expect("write metadata");
         let writer = SessionWriter {
@@ -3508,6 +3551,13 @@ mod tests {
     #[test]
     fn scanner_accepts_a_complete_final_record_without_a_newline() {
         let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        let meta = serde_json::to_string(&SessionRecord::Meta(history::create_meta(
+            Path::new("/workspace"),
+            "mock",
+            None,
+            "test transcript",
+        )))
+        .unwrap();
         let valid = serde_json::to_string(&SessionRecord::Message {
             id: None,
             turn_id: None,
@@ -3518,11 +3568,11 @@ mod tests {
             },
         })
         .expect("serialize valid record");
-        fs::write(path.path(), valid).expect("write transcript");
+        fs::write(path.path(), format!("{meta}\n{valid}")).expect("write transcript");
 
         let scan = scan_session(path.path()).expect("scan transcript");
         assert_eq!(scan.health, StoredSessionHealth::Healthy);
-        assert_eq!(scan.records.len(), 1);
+        assert_eq!(scan.records.len(), 2);
     }
 
     #[test]

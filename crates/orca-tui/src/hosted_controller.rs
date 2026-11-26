@@ -189,13 +189,20 @@ fn prestart_mcp_servers(
     if thread.is_some() {
         return;
     }
-    let (mcp_servers, mcp_credentials_path) = {
+    let (mcp_servers, mcp_credentials_path, external_tools) = {
         let cfg = config.lock().unwrap();
-        (cfg.mcp_servers.clone(), cfg.mcp_credentials_path.clone())
+        (
+            cfg.mcp_servers.clone(),
+            cfg.mcp_credentials_path.clone(),
+            cfg.external_tools.len(),
+        )
     };
-    if let Some(prestarted) =
-        start_prestart_mcp(&mcp_servers, mcp_credentials_path, event_tx.clone())
-    {
+    if let Some(prestarted) = start_prestart_mcp(
+        &mcp_servers,
+        mcp_credentials_path,
+        external_tools,
+        event_tx.clone(),
+    ) {
         control.set_prestart_mcp(prestarted);
     }
 }
