@@ -170,7 +170,7 @@ Every shell command goes through `bash`. Command syntax follows the host shell n
 - `yield_time_ms` only controls how long this call waits before handing control back. It never stops the command.
 - `timeout_ms` is the only caller-side limit on how long the command may run. Set it only when you actually need an execution deadline.
 - `task_read_output` reads more output using the cursor you pass, `task_send_input` types into a `pty` task, `task_wait` blocks until a task changes state or finishes, and `task_stop` stops one.
-- A background command's completion is reported at your next step in this turn, or when the next turn starts. Use `task_wait` if you need the result before continuing or ending your turn. Do not use `sleep` or repeated short polling.
+- A background command's completion is reported at your next step in this turn, or when the next turn starts. If you have independent work, keep doing it. Use `task_wait` if you need the result before continuing or ending your turn. Do not use `sleep` or repeated short polling.
 
 For file inspection, prefer `read_file`, `glob`, and `grep`."#
     } else {
@@ -302,6 +302,7 @@ mod tests {
         assert!(prompt.contains("at your next step"));
         assert!(prompt.contains("when the next turn starts"));
         assert!(prompt.contains("`task_wait`"));
+        assert!(prompt.contains("If you have independent work, keep doing it."));
         assert!(!prompt.contains("Long-running commands notify you when they finish"));
     }
 
