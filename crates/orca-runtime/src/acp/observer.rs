@@ -12,7 +12,8 @@ use agent_client_protocol::schema::v1::{
 use serde_json::{Map, Value, json};
 
 use super::agent::{
-    AcpNotificationSender, emit_surface_event, replay_snapshot, replay_user_update,
+    AcpNotificationSender, emit_surface_event, kept_message_suffix, kept_response_turns,
+    replay_snapshot, replay_user_update,
 };
 use crate::runtime_surface::{
     AssistantChannel, ItemPatch, OperationPatch, SurfaceAssistantStream,
@@ -229,6 +230,7 @@ impl Observer {
                         .iter()
                         .any(|envelope| matches!(envelope.event, SurfaceEvent::Usage(_)));
                     let mut terminal = None;
+                    let kept_turns = kept_response_turns(batch.events.as_slice());
                     for envelope in batch.events.as_slice() {
                         let result = match &envelope.event {
                             SurfaceEvent::Assistant(AssistantPatch::StreamOpened { stream }) => {
@@ -269,18 +271,29 @@ impl Observer {
                                 AssistantPatch::ResponseCompleted { response }
                                 | AssistantPatch::ResponseKept { response, .. },
                             ) => {
+                                let kept = matches!(
+                                    envelope.event,
+                                    SurfaceEvent::Assistant(AssistantPatch::ResponseKept { .. })
+                                );
                                 if let Some(item) = &response.message_item {
-                                    let offset = streams
+                                    let delivered = streams
                                         .values()
                                         .find(|stream| stream.item_id == item.id)
-                                        .map_or(0, |stream| stream.text.as_str().len());
-                                    if let Some(suffix) =
+                                        .map_or("", |stream| stream.text.as_str());
+                                    let offset = delivered.len();
+                                    let suffix = if kept {
+                                        kept_message_suffix(item.text.as_str(), delivered)
+                                    } else {
                                         item.text.as_str().get(offset..).filter(|s| !s.is_empty())
-                                    {
+                                    };
+                                    if let Some(suffix) = suffix {
                                         let _ = sender.send(SessionNotification::new(id.clone(),
                                             SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::from(suffix.to_string()))))
                                             .meta(metadata(json!({"version": 1, "itemId": item.id.as_str(), "offset": offset}))));
                                     }
+                                }
+                                if kept {
+                                    streams.retain(|_, stream| stream.turn_id != response.turn_id);
                                 }
                                 Ok(())
                             }
@@ -300,8 +313,15 @@ impl Observer {
                                 stream_id,
                                 ..
                             }) => {
-                                streams.remove(stream_id);
-                                state(&sender, &id, "reload_required", true)
+                                if streams
+                                    .get(stream_id)
+                                    .is_some_and(|stream| kept_turns.contains(&&stream.turn_id))
+                                {
+                                    Ok(())
+                                } else {
+                                    streams.remove(stream_id);
+                                    state(&sender, &id, "reload_required", true)
+                                }
                             }
                             SurfaceEvent::Operation(OperationPatch::Terminal { record }) => {
                                 terminal = Some(record.operation_id.clone());
