@@ -3252,6 +3252,101 @@ mod tests {
         assert_eq!(result.unwrap(), RunStatus::Success);
     }
 
+    fn run_with_completion_during_final_answer(
+        max_turns: u32,
+    ) -> (
+        RuntimeThread,
+        RunConfig,
+        tempfile::TempDir,
+        RunStatus,
+        usize,
+    ) {
+        use orca_core::event_schema::{EventEnvelope, EventType};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.budget.max_turns = Some(max_turns);
+        let mut thread = RuntimeThread::start(&config, "completion while answering").unwrap();
+        let extensions = thread.thread_extensions_handle();
+        let responses = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&responses);
+        let marker = cwd.path().join("release-final");
+        let command = command_after_release("release-final", "final-output");
+        let request = ThreadTurnRequest::new(format!("bash_wait 10 :: {command}"))
+            .with_event_observer(Arc::new(move |event: &EventEnvelope| {
+                if event.event_type == EventType::AssistantMessageDelta && !marker.exists() {
+                    assert_eq!(observed.load(Ordering::Relaxed), 1);
+                    std::fs::write(&marker, "").unwrap();
+                    let service = extensions.get::<TerminalService>().expect("bash ran");
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while service.pending_completions().is_empty() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "command did not finish"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                if event.event_type == EventType::ModelResponseCompleted {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }));
+        let result = thread.run_request(&config, &request, io::sink()).unwrap();
+        assert!(
+            cwd.path().join("release-final").exists(),
+            "final answer did not release the command"
+        );
+        (
+            thread,
+            config,
+            cwd,
+            result,
+            responses.load(Ordering::Relaxed),
+        )
+    }
+
+    #[test]
+    fn a_completion_during_the_final_answer_does_not_extend_the_turn() {
+        let (mut thread, config, _cwd, status, responses) =
+            run_with_completion_during_final_answer(2);
+        assert_eq!(status, RunStatus::Success);
+        assert_eq!(responses, 2);
+        let conversation = thread.session().conversation();
+        assert_eq!(shell_completion_messages(conversation).count(), 0);
+        assert!(matches!(conversation.messages.last(),
+            Some(Message::Assistant { content: Some(content), .. })
+                if content == "Mock completed after tool execution."
+        ));
+        let previous_messages = conversation.messages.len();
+        assert_eq!(
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("mock_system_echo"),
+                    io::sink()
+                )
+                .unwrap(),
+            RunStatus::Success
+        );
+        assert!(
+            matches!(&thread.session().conversation().messages[previous_messages],
+                Message::System { content, .. } if content.contains("final-output")
+            )
+        );
+    }
+
+    #[test]
+    fn a_completion_during_the_final_answer_with_budget_left_does_not_add_a_request() {
+        let (_thread, _config, _cwd, status, responses) =
+            run_with_completion_during_final_answer(4);
+        assert_eq!(status, RunStatus::Success);
+        assert_eq!(responses, 2);
+    }
+
     #[test]
     fn two_completions_are_delivered_at_the_next_boundary_in_order() {
         let cwd = tempfile::tempdir().unwrap();

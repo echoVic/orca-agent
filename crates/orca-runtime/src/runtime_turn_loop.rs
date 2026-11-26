@@ -658,8 +658,7 @@ fn settle_children_before_return<W: io::Write>(
     }
     input.operation.refresh_child_budgets()?;
     let delivered_children = deliver_child_results(input)?;
-    let delivered_shell = deliver_shell_completions(input)?;
-    Ok(delivered_children || delivered_shell || waited)
+    Ok(delivered_children || waited)
 }
 
 /// A wait owns no execution slot after its tool boundary is durably settled.
