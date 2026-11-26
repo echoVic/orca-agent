@@ -174,11 +174,20 @@ not isolate transport latency, model latency, or runtime overhead.
 `after_tokens_est`, elapsed time, summary requests with outcome and returned
 usage, and local prefix reuse estimates. Runtime adds confirmed summary cost
 estimates and service cache ratios. Failed, cancelled, and rejected summaries
-retain known usage. Local prefix estimates are distinct from service cache
-metadata. Missing usage stays null and incomplete totals are labelled; summary
-cost is separate from the main cumulative attempt cost stream and is not charged
-to the runtime operation cost counter. Summary requests still share operation
-cancellation and deadline controls.
+retain known usage. Missing usage stays null and incomplete totals are labelled.
+
+Deep compaction first replays the conversation through the compaction cut on
+the session's model, with one instruction appended for an eight-section
+checkpoint. Earlier checkpoints are folded into the new one. DeepSeek bills
+cached input at cache-hit rates. The returned usage identifies how much of the
+request hit the cache. If the replay cannot produce a smaller usable checkpoint,
+Orca tries the hierarchical Flash summary and then local truncation.
+
+Summary requests with `purpose: "replay"` contribute to `usage.updated` and the
+operation's cost budget, including when Orca rejects the result. Their cost in
+the compaction observation is a breakdown of that same charge. Hierarchical
+summary costs are available in the compaction observation. Summary requests
+share operation cancellation and deadline controls.
 
 ## Event Types
 

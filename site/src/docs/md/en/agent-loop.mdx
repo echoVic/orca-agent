@@ -72,7 +72,7 @@ Orchestration:
 context = [system_prompt] + [project_context] + [recent_turns] + [current_turn_scratch]
 ```
 
-The runtime also checks context size at this phase and triggers compaction if the window exceeds 85% of the 1M token limit. Each model-visible window has a stable `ContextWindowId`: usage updates and resume retain it, successful compaction advances it, and forks start with a distinct identity.
+The runtime also checks context pressure at this phase and compacts when it reaches the configured limit. Each model-visible window has a stable `ContextWindowId`: usage updates and resume retain it, successful compaction advances it, and forks start with a distinct identity.
 
 ### Phase 2: Provider Call
 
@@ -342,61 +342,11 @@ Runtime: [success] → 0 bytes written
 
 ## Context Compaction
 
-When the context window approaches the 1M token limit (typically at 85% threshold), Orca triggers **automatic compaction**:
+Orca checks context pressure before requesting a model response. It keeps the
+system prompt, pinned messages and a recent tail. When older history needs a
+summary, deep compaction asks the session's model for a structured checkpoint.
+The checkpoint brings forward prior decisions and pending work while freeing
+space for the next turn.
 
-### Compaction Rules
-
-
-<Steps>
-<Step>
-
-**Keep system prompt** — always preserved
-
-</Step>
-<Step>
-
-**Keep project context** — latest file tree and key artifacts preserved
-
-</Step>
-<Step>
-
-**Keep recent turns** — last 10 turns preserved verbatim
-
-</Step>
-<Step>
-
-**Summarize older turns** — turns 11–20 are condensed into a summary
-
-</Step>
-<Step>
-
-**Discard scratch** — intermediate reasoning and duplicate tool results are removed
-
-</Step>
-<Step>
-
-**Preserve prefix cache** — the byte-aligned prefix is maintained for cache hits
-
-</Step>
-</Steps>
-
-
-### What Gets Compressed
-
-| Element | Compaction Strategy |
-|---------|-------------------|
-| Old user messages | Summarized into key points |
-| Old assistant responses | Summarized into decisions and actions |
-| Tool results | Only status and key output preserved |
-| Reasoning traces | Discarded entirely |
-| File contents | Latest version kept, older versions dropped |
-
-### Compaction Transparency
-
-Orca logs compaction events and shows a compacted-turn indicator in the TUI:
-
-```
-[compact] Turn 1-10 compressed (was 450K tokens, now 80K tokens)
-```
-
-> **Tip:** If you see frequent compactions, consider narrowing your task or starting a new session. Compaction preserves information but can reduce the model's ability to reference very early context.
+The TUI shows compaction progress. In JSONL, `context.compacted` reports the
+strategy and token estimates. See [Context and Compaction](#context-window).
