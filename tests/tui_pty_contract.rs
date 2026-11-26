@@ -815,20 +815,31 @@ fn tui_click_on_a_running_background_agent_opens_its_transcript() {
     process
         .write(format!("\x1b[<0;6;{row}M\x1b[<0;6;{row}m").as_bytes())
         .expect("click the running agent");
-    assert_screen_shows(
-        &process,
-        &mut output,
-        "Agent Transcript",
-        "clicking the running agent did not open its transcript",
-    );
-    // The parent turn keeps waiting on the agent, and the panel is answered
-    // anyway: the agent is still in its first step, so its live activity.
-    assert_screen_shows(
-        &process,
-        &mut output,
-        "No transcript checkpoint yet",
-        "the running agent's panel was not answered while the parent turn ran",
-    );
+    // The parent turn keeps waiting on the agent, and the click is answered
+    // anyway. The agent runs on a thread of this process, and its row names
+    // that thread once the thread has started: a click after that takes the
+    // view to the agent's live conversation. A click that lands first opens
+    // the agent's panel, which says a checkpoint is still to come until the
+    // row names the thread and then shows the agent's live activity.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if screen_contains(&output, "Esc return")
+            || (screen_contains(&output, "Agent Transcript")
+                && screen_contains(&output, "Live activity"))
+        {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "clicking the running agent did not show its live work while the parent turn ran; \
+             reconstructed screen=\n{}",
+            reconstruct_screen(&output)
+        );
+        if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
+            output.extend_from_slice(&chunk);
+        }
+    }
 
     std::fs::write(&release_marker, b"release").expect("release background agent");
     arm_idle_exit(&mut process, &mut output);
