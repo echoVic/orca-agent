@@ -3369,9 +3369,10 @@ mod tests {
             redact_sensitive_text("db.password=hunter2"),
             "db.password=<redacted>"
         );
+        let redacted = redact_sensitive_text(r#"{"refresh_token": "abc"}"#);
         assert_eq!(
-            redact_sensitive_text(r#"{"refresh_token": "abc"}"#),
-            r#"{"refresh_token": "<redacted>"}"#
+            serde_json::from_str::<serde_json::Value>(&redacted).unwrap(),
+            serde_json::json!({"refresh_token": "<redacted>"})
         );
     }
 

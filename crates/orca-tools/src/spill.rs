@@ -92,6 +92,28 @@ pub(crate) enum ReadTarget {
     Spill(PathBuf, File),
 }
 
+pub(crate) fn resolve_read_path(
+    cwd: &Path,
+    target: Option<&str>,
+    spill_dir: Option<&Path>,
+) -> Result<ReadTarget, String> {
+    if let Some((target, dir)) = target.zip(spill_dir) {
+        let path = Path::new(target);
+        if let Ok(relative) = path.strip_prefix(dir) {
+            let mut components = relative.components();
+            if matches!(components.next(), Some(Component::Normal(_)))
+                && components.next().is_none()
+            {
+                return orca_platform::fs::open_confined_regular(path)
+                    .map(|file| ReadTarget::Spill(path.to_owned(), file))
+                    .map_err(|error| format!("cannot open spill file {} (path escapes workspace or is unavailable): {error}", path.display()));
+            }
+            return Err(format!("invalid spill file path: {}", path.display()));
+        }
+    }
+    crate::resolve_workspace_path(cwd, target).map(ReadTarget::Workspace)
+}
+
 #[cfg(test)]
 mod tests {
     use super::preview;
@@ -121,26 +143,4 @@ mod tests {
         assert!(spill.is_none());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
-}
-
-pub(crate) fn resolve_read_path(
-    cwd: &Path,
-    target: Option<&str>,
-    spill_dir: Option<&Path>,
-) -> Result<ReadTarget, String> {
-    if let Some((target, dir)) = target.zip(spill_dir) {
-        let path = Path::new(target);
-        if let Ok(relative) = path.strip_prefix(dir) {
-            let mut components = relative.components();
-            if matches!(components.next(), Some(Component::Normal(_)))
-                && components.next().is_none()
-            {
-                return orca_platform::fs::open_confined_regular(path)
-                    .map(|file| ReadTarget::Spill(path.to_owned(), file))
-                    .map_err(|error| format!("cannot open spill file {} (path escapes workspace or is unavailable): {error}", path.display()));
-            }
-            return Err(format!("invalid spill file path: {}", path.display()));
-        }
-    }
-    crate::resolve_workspace_path(cwd, target).map(ReadTarget::Workspace)
 }
