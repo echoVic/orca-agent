@@ -315,10 +315,10 @@ impl JsonlThreadStore {
 }
 
 pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
-    let path = if is_latest_selector(selector) {
-        latest_session_path(true)?
-    } else {
-        find_session_path(selector, true)?
+    let path = match resolve_session_path(selector, true)? {
+        Some(path) => Some(path),
+        None if !is_latest_selector(selector) => super::retention::find_pending_delete(selector)?,
+        None => None,
     }
     .ok_or_else(|| {
         io::Error::new(
@@ -328,12 +328,7 @@ pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
     })?;
     let _owner = super::retention::acquire_idle_owner(&path)?;
     let _lock = acquire_file_lock(&path)?;
-    let spill = super::spill::directory_for_transcript(&path);
-    assets::remove_directory(&path)?;
-    super::spill::remove(spill.as_deref())?;
-    fs::remove_file(&path)?;
-    #[cfg(not(test))]
-    let _ = session_index::remove_path(&path);
+    super::retention::finish_delete(&path)?;
     Ok(path)
 }
 
@@ -1002,6 +997,21 @@ fn latest_session_path(include_archived: bool) -> io::Result<Option<PathBuf>> {
 }
 
 pub(crate) fn collect_session_files(dir: &Path, on_file: &mut dyn FnMut(&Path)) -> io::Result<()> {
+    collect_history_files(dir, false, on_file)
+}
+
+pub(super) fn collect_pending_deletions(
+    dir: &Path,
+    on_file: &mut dyn FnMut(&Path),
+) -> io::Result<()> {
+    collect_history_files(dir, true, on_file)
+}
+
+fn collect_history_files(
+    dir: &Path,
+    pending: bool,
+    on_file: &mut dyn FnMut(&Path),
+) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -1012,8 +1022,14 @@ pub(crate) fn collect_session_files(dir: &Path, on_file: &mut dyn FnMut(&Path)) 
                 .to_string_lossy()
                 .ends_with(".jsonl.assets")
         {
-            collect_session_files(&path, on_file)?;
-        } else if file_type.is_file() && is_history_file(&path) {
+            collect_history_files(&path, pending, on_file)?;
+        } else if file_type.is_file()
+            && if pending {
+                super::retention::original_path(&path).is_some_and(|path| is_history_file(&path))
+            } else {
+                is_history_file(&path)
+            }
+        {
             on_file(&path);
         }
     }

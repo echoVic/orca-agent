@@ -116,7 +116,8 @@ fn copy_spill_file(file: &Path, target: &Path) -> io::Result<()> {
 
 pub(super) fn directory_for_transcript(path: &Path) -> Option<PathBuf> {
     // The id in Orca's standard filename survives archiving and compression.
-    let name = path.file_name()?.to_str()?;
+    let original = super::retention::original_path(path);
+    let name = original.as_deref().unwrap_or(path).file_name()?.to_str()?;
     let name = name
         .strip_suffix(".zst")
         .unwrap_or(name)

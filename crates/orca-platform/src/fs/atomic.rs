@@ -13,6 +13,19 @@ pub enum AtomicWritePolicy {
     ReplaceDestination,
 }
 
+/// Move a file within its directory and persist the directory change.
+pub fn move_file_for_cleanup(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::rename(source, destination)?;
+        File::open(destination.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        platform::move_file_for_cleanup(source, destination)
+    }
+}
+
 pub fn atomic_write(
     destination: &Path,
     contents: &[u8],
@@ -514,6 +527,22 @@ mod platform {
     }
 
     pub(super) fn sync_parent(_parent: &Path) -> Result<(), PlatformError> {
+        Ok(())
+    }
+
+    pub(super) fn move_file_for_cleanup(source: &Path, destination: &Path) -> io::Result<()> {
+        let source = wide_path(source);
+        let destination = wide_path(destination);
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         Ok(())
     }
 

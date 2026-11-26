@@ -710,11 +710,66 @@ fn spill_deletion_can_be_retried_after_image_cleanup_fails() {
         drop(writer);
         let store = JsonlThreadStore::new();
         assert!(store.delete_session(&id).is_err());
-        assert!(transcript.exists());
+        assert!(!transcript.exists());
+        assert!(store.load_session(&id).is_err());
+        assert_eq!(fs::read(spill.join("call.txt")).unwrap(), b"saved result");
         fs::remove_file(blocked).unwrap();
         store.delete_session(&id).unwrap();
         assert!(!spill.exists());
         assert!(!transcript.exists());
+    });
+}
+
+#[test]
+fn deleting_latest_selects_a_visible_session_before_pending_cleanup() {
+    crate::history::with_redirected_orca_home("delete-latest", |home| {
+        let store = JsonlThreadStore::new();
+        let old = SessionWriter::start(home, "mock", None, "old").unwrap();
+        let old_id = old.session_id().unwrap();
+        let old_path = old.path().to_owned();
+        let blocked = assets::directory(&old_path);
+        fs::write(&blocked, b"not an asset directory").unwrap();
+        drop(old);
+        assert!(store.delete_session(&old_id).is_err());
+
+        let visible = SessionWriter::start(home, "mock", None, "visible").unwrap();
+        let path = visible.path().to_owned();
+        drop(visible);
+        assert_eq!(store.delete_session("latest").unwrap(), path);
+        fs::remove_file(blocked).unwrap();
+        assert_eq!(store.delete_session(&old_id).unwrap(), old_path);
+    });
+}
+
+#[test]
+fn retention_preserves_spill_when_the_pending_move_fails() {
+    crate::history::with_redirected_orca_home("retention-move", |home| {
+        let store = JsonlThreadStore::new();
+        let writer = SessionWriter::start(home, "mock", None, "retention").unwrap();
+        let id = writer.session_id().unwrap();
+        drop(writer);
+        let archive = store.archive_session(&id).unwrap();
+        let mut pending = archive.as_os_str().to_owned();
+        pending.push(".pending-delete");
+        fs::create_dir(&pending).unwrap();
+        let spill = super::spill::directory(&id).unwrap();
+        fs::create_dir_all(&spill).unwrap();
+        fs::write(spill.join("call.txt"), b"saved result").unwrap();
+
+        let policy = SessionRetentionPolicy {
+            max_bytes: Some(0),
+            older_than_days: None,
+        };
+        let error = retain_sessions(&policy, true).unwrap_err();
+        let error = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<super::retention::SessionRetentionError>()
+            .unwrap();
+        assert!(!error.transcript_removed);
+        assert_eq!(error.report.bytes_before, error.report.bytes_after);
+        assert!(store.load_session(&id).is_ok());
+        assert_eq!(fs::read(spill.join("call.txt")).unwrap(), b"saved result");
     });
 }
 

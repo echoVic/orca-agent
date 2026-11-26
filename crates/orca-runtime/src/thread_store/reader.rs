@@ -195,7 +195,12 @@ impl SessionRecords {
             offset: 0,
         }
         .take(snapshot.encoded_bytes);
-        let compressed = path.extension().and_then(|s| s.to_str()) == Some("zst");
+        let compressed = super::retention::original_path(path)
+            .as_deref()
+            .unwrap_or(path)
+            .extension()
+            .and_then(|s| s.to_str())
+            == Some("zst");
         let reader: Box<dyn BufRead> = if compressed {
             let decoder = zstd::stream::read::Decoder::new(file)?;
             Box::new(BufReader::new(decoder))

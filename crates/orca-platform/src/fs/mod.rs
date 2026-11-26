@@ -5,7 +5,9 @@ mod long_path;
 mod open;
 mod path;
 
-pub use atomic::{AtomicWritePolicy, atomic_write, atomic_write_private, atomic_write_with};
+pub use atomic::{
+    AtomicWritePolicy, atomic_write, atomic_write_private, atomic_write_with, move_file_for_cleanup,
+};
 pub use confined::{
     confined_files_size, open_confined_regular, remove_confined_files, write_confined_private,
 };
