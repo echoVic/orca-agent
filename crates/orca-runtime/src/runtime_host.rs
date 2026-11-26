@@ -1897,7 +1897,7 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
     fn commit_provider_attempt_failure(
         &self,
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
-        message: &str,
+        retry: &orca_core::provider_types::ProviderRetry,
     ) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         send_thread_command_retrying_full(
@@ -1905,7 +1905,7 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
             ThreadCommand::SurfaceCommitProviderAttemptFailure {
                 fence: self.fence.clone(),
                 identity: identity.clone(),
-                message: message.to_string(),
+                retry: retry.clone(),
                 reply: reply_tx,
             },
         )
@@ -3649,6 +3649,15 @@ impl RuntimeThreadHandle {
         self.mcp_startup.on_ended(&self.mcp_registry, report);
     }
 
+    /// Reports current startup warnings and future changes to the omitted tool list.
+    pub fn on_mcp_warnings(&self, report: impl Fn(Vec<String>) + Send + Sync + 'static) {
+        let report = Arc::new(report);
+        let runtime_report = Arc::clone(&report);
+        self.mcp_startup
+            .on_tool_limit(move |warnings| runtime_report(warnings));
+        self.on_mcp_startup_warnings(move |warnings| report(warnings));
+    }
+
     /// Waits until none of the session's MCP servers is still making its
     /// first connection, and returns the warnings their startup leaves, as
     /// [`Self::on_mcp_startup_warnings`] reports them. Returns `None` as soon
@@ -5246,7 +5255,7 @@ enum ThreadCommand {
     SurfaceCommitProviderAttemptFailure {
         fence: surface::SurfaceOperationFence,
         identity: orca_core::thread_item_projection::ModelResponseIdentity,
-        message: String,
+        retry: orca_core::provider_types::ProviderRetry,
         reply: SyncSender<io::Result<()>>,
     },
     SurfaceCommitProviderStep {
@@ -6000,7 +6009,11 @@ async fn run_host_supervisor(
                 let startup_warnings = Arc::new(
                     crate::shell_readiness::ShellReadiness::run_startup_warnings(&actor_config),
                 );
-                let mcp_startup = crate::mcp_startup::McpStartupWarnings::watch(&mcp_registry);
+                let mcp_startup = crate::mcp_startup::McpStartupWarnings::watch(
+                    &mcp_registry,
+                    actor_config.external_tools.len(),
+                );
+                thread.thread_extensions().insert(Arc::clone(&mcp_startup));
                 let handle = RuntimeThreadHandle {
                     thread_id: thread_id.clone(),
                     session_id,
@@ -20828,11 +20841,15 @@ impl ThreadActor {
             ThreadCommand::SurfaceCommitProviderAttemptFailure {
                 fence,
                 identity,
-                message,
+                retry,
                 reply,
             } => {
-                let result = self
-                    .commit_surface_provider_attempt_failure(active, fence, &identity, &message);
+                let result = self.commit_surface_provider_attempt_failure(
+                    active,
+                    fence,
+                    &identity,
+                    Some(retry),
+                );
                 let _ = reply.send(result);
             }
             ThreadCommand::SurfaceCommitProviderStep {
@@ -37870,7 +37887,8 @@ mod tests {
         let interaction_event_count = std::iter::from_fn(|| subscription.try_recv())
             .filter_map(|item| match item {
                 surface::SurfaceSubscriptionItem::Batch { batch } => Some(batch),
-                surface::SurfaceSubscriptionItem::Gap { .. }
+                surface::SurfaceSubscriptionItem::ProviderRetry { .. }
+                | surface::SurfaceSubscriptionItem::Gap { .. }
                 | surface::SurfaceSubscriptionItem::Sealed { .. } => None,
             })
             .flat_map(|batch| batch.events.as_slice().to_vec())
@@ -39723,7 +39741,8 @@ mod tests {
         let duplicate_route_commits = std::iter::from_fn(|| fallback_subscription.try_recv())
             .filter_map(|item| match item {
                 surface::SurfaceSubscriptionItem::Batch { batch } => Some(batch),
-                surface::SurfaceSubscriptionItem::Gap { .. }
+                surface::SurfaceSubscriptionItem::ProviderRetry { .. }
+                | surface::SurfaceSubscriptionItem::Gap { .. }
                 | surface::SurfaceSubscriptionItem::Sealed { .. } => None,
             })
             .map(|batch| {
@@ -40105,7 +40124,8 @@ mod tests {
         let duplicate_events = std::iter::from_fn(|| observer_subscription.try_recv())
             .filter_map(|item| match item {
                 surface::SurfaceSubscriptionItem::Batch { batch } => Some(batch),
-                surface::SurfaceSubscriptionItem::Gap { .. }
+                surface::SurfaceSubscriptionItem::ProviderRetry { .. }
+                | surface::SurfaceSubscriptionItem::Gap { .. }
                 | surface::SurfaceSubscriptionItem::Sealed { .. } => None,
             })
             .flat_map(|batch| batch.events.as_slice().to_vec())
@@ -42943,7 +42963,7 @@ mod tests {
             task_registry: TaskRegistry::new(thread_id.clone()),
             mcp_registry: McpRegistry::default(),
             mcp_registry_owned: Arc::new(AtomicBool::new(true)),
-            mcp_startup: crate::mcp_startup::McpStartupWarnings::watch(&McpRegistry::default()),
+            mcp_startup: crate::mcp_startup::McpStartupWarnings::watch(&McpRegistry::default(), 0),
             command_tx,
             surface: unavailable_surface_handle(
                 surface::HostIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
@@ -45351,6 +45371,51 @@ done
         report_rx
             .recv_timeout(SURFACE_TEST_TIMEOUT)
             .expect("the warnings once startup ends")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_startup_estimate_counts_external_tools() {
+        let _env = crate::history::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled);
+        let tools = (0..10)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("lookup_{i}"), "inputSchema": {"type": "object"},
+                })
+            })
+            .collect::<Vec<_>>();
+        config.mcp_servers = vec![catalog_mcp_server(
+            "docs",
+            cwd.path(),
+            &serde_json::to_string(&tools).unwrap(),
+        )];
+        config.external_tools = (0..125)
+            .map(|i| orca_core::external_config::ExternalToolConfig {
+                name: format!("external_{i}"),
+                description: "Lookup".into(),
+                command: "lookup".into(),
+                action_kind: orca_core::approval_types::ActionKind::Read,
+                schema: serde_json::json!({}),
+            })
+            .collect();
+        let host = RuntimeHost::start().unwrap();
+        let thread = host
+            .handle()
+            .start_thread(config, "mcp startup estimate")
+            .unwrap();
+        let warnings = mcp_startup_warnings_of(&thread);
+        host.shutdown().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("10 MCP tools")
+                    && warning.contains("125 configured external tools")),
+            "{warnings:?}"
+        );
     }
 
     #[cfg(unix)]

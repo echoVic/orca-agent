@@ -5,6 +5,14 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use orca_mcp::{McpChangeSubscription, McpRegistry, McpServerState};
+use orca_provider::tool_schema::DEEPSEEK_MAX_TOOLS;
+
+pub(crate) fn refresh_request_instructions(
+    conversation: &mut orca_core::conversation::Conversation,
+    registry: &orca_mcp::McpRegistry,
+) {
+    conversation.mcp_instructions = registry.server_instructions();
+}
 
 /// The warnings `registry` leaves once its servers' startup has ended, in
 /// its words: what is wrong with the config, and then, server by server in
@@ -17,8 +25,16 @@ use orca_mcp::{McpChangeSubscription, McpRegistry, McpServerState};
 /// ([`McpRegistry::startup_statuses`]), however long ago, not as they stand:
 /// a reconnect that failed since was told to whoever asked for it, in the
 /// words of `/mcp`, and is no failure of startup. Called before the startup
-/// has ended, it reads them as they stand.
+/// has ended, it reads them as they stand. Tools that exceed DeepSeek's
+/// limit are reported after the individual server warnings.
 pub fn mcp_startup_warnings(registry: &McpRegistry) -> Vec<String> {
+    mcp_startup_warnings_with_external_tools(registry, 0)
+}
+
+pub fn mcp_startup_warnings_with_external_tools(
+    registry: &McpRegistry,
+    external: usize,
+) -> Vec<String> {
     let mut warnings = registry.config_errors();
     let statuses = registry
         .startup_statuses()
@@ -37,6 +53,20 @@ pub fn mcp_startup_warnings(registry: &McpRegistry) -> Vec<String> {
             _ => warnings.extend(server.errors),
         }
     }
+    let offered = registry.startup_tool_names().len();
+    let builtin = orca_tools::registry::default_tool_registry().iter().count();
+    let available = DEEPSEEK_MAX_TOOLS.saturating_sub(builtin.saturating_add(external));
+    if external > 0 && builtin.saturating_add(external).saturating_add(offered) > DEEPSEEK_MAX_TOOLS
+    {
+        warnings.push(format!(
+            "DeepSeek's tool limit is {DEEPSEEK_MAX_TOOLS}. The startup estimate includes {builtin} Orca tools, {external} configured external tools, and {offered} MCP tools. The tools offered can vary by request."
+        ));
+    } else if offered > available {
+        let max_left_out = offered - available;
+        warnings.push(format!(
+            "MCP servers offer {offered} tools. The startup estimate reserves room for all {builtin} Orca tools within DeepSeek's limit of {DEEPSEEK_MAX_TOOLS}, so up to {max_left_out} MCP tools may be left out of a request, depending on which tools it offers. Use disabled_tools or enabled_tools in an MCP server's configuration to choose which are sent."
+        ));
+    }
     warnings
 }
 
@@ -52,6 +82,16 @@ type WarningsReport = Box<dyn FnOnce(Vec<String>) + Send>;
 /// is lent them.
 pub(crate) struct McpStartupWarnings {
     state: Mutex<StartupState>,
+    external_tools: usize,
+    tool_limit: Mutex<ToolLimitWarnings>,
+}
+
+type ToolLimitReport = Arc<dyn Fn(Vec<String>) + Send + Sync>;
+
+#[derive(Default)]
+struct ToolLimitWarnings {
+    dropped: Vec<String>,
+    report: Option<ToolLimitReport>,
 }
 
 enum StartupState {
@@ -69,12 +109,14 @@ impl McpStartupWarnings {
     /// Watches `registry` until none of its servers is starting, and takes
     /// the warnings then, at once if none is now. The registry is held only
     /// weakly meanwhile, so the watch keeps no server running.
-    pub(crate) fn watch(registry: &McpRegistry) -> Arc<Self> {
+    pub(crate) fn watch(registry: &McpRegistry, external_tools: usize) -> Arc<Self> {
         let watch = Arc::new(Self {
             state: Mutex::new(StartupState::Starting {
                 reports: Vec::new(),
                 subscription: None,
             }),
+            external_tools,
+            tool_limit: Mutex::default(),
         });
         let watcher = Arc::downgrade(&watch);
         let subscription = registry.subscribe(Arc::new(move |registry: &McpRegistry| {
@@ -122,7 +164,7 @@ impl McpStartupWarnings {
             };
             let reports = std::mem::take(reports);
             let subscription = subscription.take();
-            let warnings = mcp_startup_warnings(registry);
+            let warnings = mcp_startup_warnings_with_external_tools(registry, self.external_tools);
             *state = StartupState::Ended(warnings.clone());
             (reports, subscription, warnings)
         };
@@ -154,6 +196,34 @@ impl McpStartupWarnings {
         }
     }
 
+    pub(crate) fn on_tool_limit(&self, report: impl Fn(Vec<String>) + Send + Sync + 'static) {
+        self.tool_limit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .report = Some(Arc::new(report));
+    }
+
+    pub(crate) fn report_tool_limit(&self, dropped: Vec<String>) {
+        let report = {
+            let mut state = self
+                .tool_limit
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if dropped == state.dropped {
+                return;
+            }
+            let warning = (!dropped.is_empty()).then(|| format!(
+                "DeepSeek request left out {} tools: {}. The request limit is {DEEPSEEK_MAX_TOOLS}.",
+                dropped.len(), dropped[..dropped.len().min(3)].join(", ")
+            ));
+            state.dropped = dropped;
+            state.report.clone().zip(warning)
+        };
+        if let Some((report, warning)) = report {
+            report(vec![warning]);
+        }
+    }
+
     /// The warnings, for a caller that has waited for `registry`'s startup
     /// to end: those taken when it ended, or, should a server have started
     /// connecting again before they were, those of its startup all the same
@@ -162,7 +232,9 @@ impl McpStartupWarnings {
         self.observe(registry);
         match &*self.lock() {
             StartupState::Ended(warnings) => warnings.clone(),
-            StartupState::Starting { .. } => mcp_startup_warnings(registry),
+            StartupState::Starting { .. } => {
+                mcp_startup_warnings_with_external_tools(registry, self.external_tools)
+            }
         }
     }
 }
@@ -184,6 +256,44 @@ mod tests {
             startup_timeout_ms: Some(15_000),
             ..Default::default()
         }
+    }
+
+    fn offered_tools(count: usize) -> McpRegistry {
+        McpRegistry::from_tools_for_test(
+            (0..count)
+                .rev()
+                .map(|i| orca_core::mcp_types::McpTool {
+                    server: "docs".to_string(),
+                    name: format!("t{i:03}"),
+                    schema_name: format!("mcp__docs__t{i:03}"),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    read_only: true,
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn startup_estimates_how_many_mcp_tools_may_not_fit() {
+        let available = 128 - orca_tools::registry::default_tool_registry().iter().count();
+        let warnings = mcp_startup_warnings(&offered_tools(available + 4));
+
+        assert!(
+            matches!(warnings.as_slice(), [warning]
+            if warning.starts_with("MCP servers offer ")
+                && warning.contains("up to 4 MCP tools may be left out of a request")
+                && warning.contains("disabled_tools")
+                && !warning.contains("mcp__docs__")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn startup_does_not_warn_when_mcp_tools_fit() {
+        let available = 128 - orca_tools::registry::default_tool_registry().iter().count();
+
+        assert!(mcp_startup_warnings(&offered_tools(available)).is_empty());
     }
 
     /// A stdio server reconnected after its first connection ended is
@@ -236,7 +346,7 @@ done
         }
 
         let (report_tx, report_rx) = std::sync::mpsc::channel();
-        let watch = McpStartupWarnings::watch(&registry);
+        let watch = McpStartupWarnings::watch(&registry, 0);
         watch.on_ended(&registry, move |warnings| {
             let _ = report_tx.send(warnings);
         });
@@ -367,7 +477,7 @@ done
 
         // The registry is handed to a thread, which watches it from then
         // on: what its startup left was nothing.
-        let watch = McpStartupWarnings::watch(&registry);
+        let watch = McpStartupWarnings::watch(&registry, 0);
         let (reported, warnings) = std::sync::mpsc::channel();
         watch.on_ended(&registry, move |warnings| {
             let _ = reported.send(warnings);

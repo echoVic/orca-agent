@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
@@ -43,9 +44,13 @@ pub fn execute_or_cancel(
         return ToolResult::failed(request, "grep pattern is required", None);
     };
 
-    let search_path = args.path.unwrap_or_else(|| ".".to_string());
+    let requested_path = args.path.as_deref().unwrap_or(".");
+    let search_path = match crate::resolve_workspace_path(cwd, Some(requested_path)) {
+        Ok(path) => path,
+        Err(message) => return ToolResult::failed(request, message, None),
+    };
 
-    if !cwd.join(&search_path).exists() {
+    if !search_path.exists() {
         return ToolResult::completed_kind(
             request,
             "(no matches)".to_string(),
@@ -54,9 +59,25 @@ pub fn execute_or_cancel(
         );
     }
 
+    let rg_path = if Path::new(requested_path).is_absolute() {
+        search_path.as_path()
+    } else {
+        let relative = search_path
+            .strip_prefix(cwd)
+            .expect("resolved path is inside the workspace");
+        if relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else if relative.as_os_str() == "-" {
+            // Ripgrep reads stdin for a bare "-", so spell the file path explicitly.
+            Path::new("./-")
+        } else {
+            relative
+        }
+    };
+
     let mut command = Command::new("rg");
     command
-        .args(["--line-number", "--no-heading", pattern, &search_path])
+        .args(rg_args(pattern, rg_path))
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -133,11 +154,22 @@ pub fn execute_or_cancel(
     }
 }
 
+fn rg_args(pattern: &str, search_path: &Path) -> Vec<OsString> {
+    vec![
+        "--no-config".into(),
+        "--line-number".into(),
+        "--no-heading".into(),
+        format!("--regexp={pattern}").into(),
+        "--".into(),
+        search_path.as_os_str().to_owned(),
+    ]
+}
+
 fn execute_in_process(
     request: &ToolRequest,
     cwd: &Path,
     pattern: &str,
-    search_path: &str,
+    search_path: &Path,
     max_bytes: usize,
     should_cancel: &dyn Fn() -> bool,
 ) -> ToolResult {
@@ -150,8 +182,7 @@ fn execute_in_process(
     let limit = normalized_head_limit(parse_args(request).head_limit);
     let mut collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
     let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
-    let search_root = cwd.join(search_path);
-    let mut walker = WalkBuilder::new(search_root);
+    let mut walker = WalkBuilder::new(search_path);
     walker
         .hidden(true)
         .follow_links(false)
@@ -363,6 +394,212 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rg_args_pass_the_pattern_and_path_as_values() {
+        assert_eq!(
+            rg_args("-> Result", Path::new("src")),
+            [
+                "--no-config",
+                "--line-number",
+                "--no-heading",
+                "--regexp=-> Result",
+                "--",
+                "src",
+            ]
+            .map(std::ffi::OsString::from),
+        );
+    }
+
+    #[test]
+    fn a_pattern_starting_with_a_dash_is_searched_literally() {
+        let cwd = temp_dir("grep-dash-pattern");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::write(
+            cwd.join("lib.rs"),
+            "fn load() -> Result<()> {\nfn other() {}\n",
+        )
+        .expect("write fixture");
+
+        let result = execute(
+            &grep_request(r#"{"pattern":"-> Result","path":"."}"#),
+            &cwd,
+            4096,
+        );
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let output = result.output.as_deref().expect("grep output");
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("fn load() -> Result<()> {"), "{output}");
+    }
+
+    #[test]
+    fn a_pattern_naming_an_rg_option_is_searched_literally() {
+        let cwd = temp_dir("grep-option-name");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::write(cwd.join("notes.txt"), "pass --files to list them\n").expect("write fixture");
+        fs::write(cwd.join("other.txt"), "nothing here\n").expect("write fixture");
+
+        let result = execute(&grep_request(r#"{"pattern":"--files"}"#), &cwd, 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let output = result.output.as_deref().expect("grep output");
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("pass --files to list them"), "{output}");
+    }
+
+    #[test]
+    fn a_pattern_with_an_equals_sign_is_searched_literally() {
+        let cwd = temp_dir("grep-equals-pattern");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::write(cwd.join("notes.txt"), "a=b\nab\n").expect("write fixture");
+
+        let result = execute(&grep_request(r#"{"pattern":"a=b"}"#), &cwd, 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let output = result.output.as_deref().expect("grep output");
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("a=b"), "{output}");
+    }
+
+    #[test]
+    fn an_empty_pattern_still_matches_every_line() {
+        let cwd = temp_dir("grep-empty-pattern");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::write(cwd.join("notes.txt"), "first line\nsecond line\n").expect("write fixture");
+
+        let result = execute(&grep_request(r#"{"pattern":""}"#), &cwd, 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let output = result.output.as_deref().expect("grep output");
+        assert_eq!(output.lines().count(), 2);
+        assert!(output.contains("first line"), "{output}");
+        assert!(output.contains("second line"), "{output}");
+    }
+
+    #[test]
+    fn a_path_outside_the_workspace_is_refused() {
+        let root = temp_dir("grep-outside-path");
+        let cwd = root.join("workspace");
+        let outside = root.join("outside");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::create_dir_all(&outside).expect("create neighboring directory");
+        fs::write(outside.join("notes.txt"), "needle outside the workspace\n")
+            .expect("write neighboring fixture");
+
+        for path in [Path::new(".."), outside.as_path()] {
+            let arguments = serde_json::json!({"pattern": "needle", "path": path});
+            let result = execute(&grep_request(&arguments.to_string()), &cwd, 4096);
+
+            assert_eq!(result.status, ToolStatus::Failed, "{path:?}: {result:?}");
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("path escapes workspace")),
+                "{path:?}: {result:?}",
+            );
+            assert!(
+                !result
+                    .output
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("needle outside the workspace"),
+                "{path:?}: {result:?}",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_leading_out_of_the_workspace_is_refused() {
+        let cwd = temp_dir("grep-symlink-workspace");
+        let outside = temp_dir("grep-symlink-neighbor");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::create_dir_all(&outside).expect("create neighboring directory");
+        fs::write(outside.join("notes.txt"), "needle outside the workspace\n")
+            .expect("write neighboring fixture");
+        std::os::unix::fs::symlink(&outside, cwd.join("link")).expect("create symlink fixture");
+
+        let request = grep_request(r#"{"pattern":"needle","path":"link"}"#);
+        let result = execute(&request, &cwd, 4096);
+
+        assert_eq!(result.status, ToolStatus::Failed, "{result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("path escapes workspace")),
+            "{result:?}",
+        );
+    }
+
+    #[test]
+    fn a_path_naming_the_workspace_itself_searches_everything() {
+        let cwd = temp_dir("grep-workspace-path");
+        fs::create_dir_all(cwd.join("src")).expect("create temp workspace");
+        fs::write(cwd.join("notes.txt"), "needle at the workspace root\n").expect("write fixture");
+
+        for path in [".", "./", "src/.."] {
+            let arguments = serde_json::json!({"pattern": "needle", "path": path});
+            let result = execute(&grep_request(&arguments.to_string()), &cwd, 4096);
+
+            assert_eq!(result.status, ToolStatus::Completed, "{path}: {result:?}");
+            let output = result.output.as_deref().expect("grep output");
+            assert!(output.contains("notes.txt:1:needle at the workspace root"));
+        }
+    }
+
+    #[test]
+    fn an_absolute_path_inside_the_workspace_is_searched() {
+        let cwd = temp_dir("grep-absolute-path");
+        let src = cwd.join("src");
+        fs::create_dir_all(&src).expect("create temp workspace");
+        fs::write(src.join("a.rs"), "needle in src\n").expect("write fixture");
+        let arguments = serde_json::json!({"pattern": "needle", "path": src});
+
+        let result = execute(&grep_request(&arguments.to_string()), &cwd, 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let output = result.output.as_deref().expect("grep output");
+        assert!(output.contains("a.rs:1:needle in src"), "{output}");
+    }
+
+    #[test]
+    fn a_path_named_dash_is_searched_as_a_file() {
+        let cwd = temp_dir("grep-dash-path");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::write(cwd.join("-"), "needle in the file named dash\n").expect("write fixture");
+
+        let request = grep_request(r#"{"pattern":"needle","path":"-"}"#);
+        let result = execute(&request, &cwd, 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let output = result.output.as_deref().expect("grep output");
+        assert!(output.contains("needle in the file named dash"), "{output}");
+    }
+
+    #[test]
+    fn the_fallback_searches_the_resolved_path_literally() {
+        let cwd = temp_dir("grep-fallback-dash-pattern");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::write(
+            cwd.join("lib.rs"),
+            "fn load() -> Result<()> {\nfn other() {}\n",
+        )
+        .expect("write fixture");
+        let request = grep_request(r#"{"pattern":"-> Result","path":"."}"#);
+        let search_path =
+            crate::resolve_workspace_path(&cwd, Some(".")).expect("resolve workspace");
+
+        let result = execute_in_process(&request, &cwd, "-> Result", &search_path, 4096, &|| false);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        assert_eq!(
+            result.output.as_deref(),
+            Some("lib.rs:1:fn load() -> Result<()> {"),
+        );
+    }
+
+    #[test]
     fn missing_search_path_completes_with_no_matches() {
         let cwd = temp_dir("grep-missing");
         fs::create_dir_all(&cwd).expect("create temp workspace");
@@ -563,7 +800,14 @@ mod tests {
             raw_arguments: Some(r#"{"pattern":"needle","path":"notes.txt"}"#.to_string()),
         };
 
-        let result = execute_in_process(&request, &cwd, "needle", "notes.txt", 4096, &|| false);
+        let result = execute_in_process(
+            &request,
+            &cwd,
+            "needle",
+            &cwd.join("notes.txt"),
+            4096,
+            &|| false,
+        );
 
         assert_eq!(result.status, ToolStatus::Completed);
         assert_eq!(result.kind, ToolResultKind::NoMatches);
@@ -586,7 +830,7 @@ mod tests {
         // With `rg`, and without it.
         let results = [
             execute_or_cancel(&request, &cwd, 4096, || true),
-            execute_in_process(&request, &cwd, "needle", ".", 4096, &|| true),
+            execute_in_process(&request, &cwd, "needle", &cwd, 4096, &|| true),
         ];
 
         for result in results {
@@ -594,6 +838,16 @@ mod tests {
             assert_eq!(result.error.as_deref(), Some("grep was cancelled"));
         }
         let _ = fs::remove_dir_all(&cwd);
+    }
+
+    fn grep_request(arguments: &str) -> ToolRequest {
+        ToolRequest {
+            id: "grep-1".to_string(),
+            name: ToolName::Grep,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(arguments.to_string()),
+        }
     }
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {

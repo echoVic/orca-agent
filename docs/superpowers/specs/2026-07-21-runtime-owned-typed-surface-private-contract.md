@@ -1789,16 +1789,25 @@ cursors across complete batches contiguous from `from` to `head` (an empty repla
 `from == head`). The subscription begins at `head`; any mismatched id, grant
 cursor, or replay boundary is an internal construction error and no attachment
 is registered.
-Subscriptions and cursor replay deliver only complete `SurfaceCommitBatch`
-values. A client applies every event in a batch atomically before rendering its
+Subscriptions and cursor replay deliver committed events as complete
+`SurfaceCommitBatch` values. A client applies every event in a batch atomically before rendering its
 batch head; no per-envelope subscription API exposes a partial coordinator
 commit.
 
 ```text
 SurfaceSubscriptionItem =
   Batch { batch: SurfaceCommitBatch }
+  | ProviderRetry { operation_id: SurfaceOperationId, retry: Option<ProviderRetry> }
   | Gap { required: SnapshotRequired }
   | Sealed { reason: ThreadClosed | HostShutdown }
+
+ProviderRetry {
+  attempt: u32,
+  max_attempts: u32,
+  delay_ms: u64,
+  kind: ProviderErrorKind,
+  reason: String,
+}
 
 DetachRequest {
   request_id: SurfaceRequestId,
@@ -1855,6 +1864,14 @@ WaitOperationTerminalResult =
   | WrongThread { operation_id: SurfaceOperationId }
   | WaitCancelled { operation_id: SurfaceOperationId }
 ```
+
+`ProviderRetry` is a live-only, best-effort signal for the active generation or
+foreground-attached background provider stream. A report marks a scheduled
+wait, and an empty report clears it when the next attempt starts. Terminal
+updates also clear the display. The signal has no surface cursor, is never
+retained or replayed, and is excluded from the source-facts inventory. The
+`provider.retry` JSONL event uses live event publication without writing a
+session record.
 
 Detach first CASes the attachment and all of its response grants to revoked.
 Only the CAS winner may compute affected interaction routes; it rotates each

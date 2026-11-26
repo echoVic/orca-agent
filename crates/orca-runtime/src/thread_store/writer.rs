@@ -14,6 +14,7 @@ use orca_core::conversation::{Message, SummaryState, is_internal_image_analysis}
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventEnvelope, EventPublicationStore, EventType};
 use orca_core::plan_types::{PlanItem, PlanStatus};
+use orca_core::redaction::redact_sensitive_text;
 use orca_core::thread_identity::{ConversationItemId, TurnId};
 use orca_core::thread_item_projection::CompletedModelResponse;
 use orca_core::tool_images::{
@@ -45,8 +46,8 @@ pub(crate) const MAX_SESSION_LINE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) struct SessionScan {
     pub records: Vec<SessionRecord>,
     /// Decoded JSONL lines retained only up to the same record/line bounds.
-    /// Search uses these snippets instead of opening the source a second time.
-    pub lines: Vec<String>,
+    /// Skipped records have no snippet. Blank lines keep their own slots.
+    pub lines: Vec<Option<String>>,
     pub health: StoredSessionHealth,
     pub health_issue: Option<StoredSessionHealthIssue>,
     pub source_fingerprint: Option<String>,
@@ -75,6 +76,7 @@ impl SessionScan {
             code: code.into(),
             line,
             offset,
+            record_type: None,
         });
         self
     }
@@ -279,6 +281,9 @@ fn repair_incomplete_final_record(file: &mut File) -> io::Result<()> {
 }
 
 pub(crate) fn write_record_line(mut writer: impl Write, record: &SessionRecord) -> io::Result<()> {
+    if let SessionRecord::Ignorable(bytes) = record {
+        return writer.write_all(bytes);
+    }
     let redacted = redact_session_record(record);
     writer.write_all(&bounded_json_line(&redacted)?)
 }
@@ -392,16 +397,20 @@ fn write_records_to(
     target_path: &Path,
     records: impl IntoIterator<Item = io::Result<SessionRecord>>,
 ) -> io::Result<()> {
+    let lines = records.into_iter().map(|record| match record? {
+        SessionRecord::Ignorable(bytes) => Ok(bytes),
+        record => encode_record_line(target_path, &record),
+    });
     if target_path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
         let mut encoder = zstd::stream::write::Encoder::new(file, 3)?;
-        for record in records {
-            encoder.write_all(&encode_record_line(target_path, &record?)?)?;
+        for line in lines {
+            encoder.write_all(&line?)?;
         }
         encoder.finish()?;
     } else {
         let mut writer = io::BufWriter::new(file);
-        for record in records {
-            writer.write_all(&encode_record_line(target_path, &record?)?)?;
+        for line in lines {
+            writer.write_all(&line?)?;
         }
         writer.flush()?;
     }
@@ -420,7 +429,7 @@ fn scan_session_with_lines(path: &Path) -> io::Result<SessionScan> {
 
 fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionScan> {
     let mut reader = match SessionRecords::open(path, Some(INDEX_BUDGET), HydrateImages::None) {
-        Ok(reader) => reader,
+        Ok(reader) => reader.require_metadata(),
         Err(error) => {
             let metadata = fs::symlink_metadata(path).ok();
             if metadata
@@ -438,17 +447,30 @@ fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionSca
         }
     };
     let mut scan = SessionScan::new(path);
+    let mut last_searchable_line = 0;
     while let Some(record) = reader.next() {
         let Ok(record) = record else {
             break;
         };
-        scan.records.push(record);
+        let skipped = matches!(record, SessionRecord::Ignorable(_));
         if collect_lines {
-            // Preserve physical line numbers, including blank JSONL lines.
+            let line_number = reader.line_number as usize;
             scan.lines
-                .resize(reader.line_number as usize, String::new());
-            *scan.lines.last_mut().expect("current line") = reader.text().to_owned();
+                .resize_with(line_number - 1, || Some(String::new()));
+            scan.lines.push(if skipped {
+                None
+            } else {
+                last_searchable_line = line_number;
+                Some(reader.text().to_owned())
+            });
         }
+        if !skipped {
+            scan.records.push(record);
+        }
+    }
+    scan.lines.truncate(last_searchable_line);
+    if let Some(meta) = reader.newer_meta {
+        scan.records.push(SessionRecord::Meta(meta));
     }
     scan.health = reader.health;
     scan.health_issue = reader.issue;
@@ -524,6 +546,7 @@ pub(super) fn parse_session_record(line: &str) -> Result<SessionRecord, &'static
 
 pub(super) fn validate_session_record(value: SessionRecord) -> Result<SessionRecord, &'static str> {
     match &value {
+        SessionRecord::Unrecognized => Err("unknown_record_type"),
         SessionRecord::Message { id, turn_id, .. } if id.is_some() != turn_id.is_some() => {
             Err("invalid_conversation_identity")
         }
@@ -549,7 +572,7 @@ fn source_fingerprint(path: &Path) -> Option<String> {
     Some(orca_core::hex::lower(&hasher.finalize()))
 }
 
-pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<String>> {
+pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<Option<String>>> {
     let scan = scan_session_with_lines(path)?;
     match scan.health {
         StoredSessionHealth::Healthy
@@ -587,6 +610,24 @@ struct StoredSessionHealthError {
 
 impl std::fmt::Display for StoredSessionHealthError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.health == StoredSessionHealth::NewerVersion {
+            write!(
+                formatter,
+                "stored session {} was written by a newer version of Orca",
+                self.path.display()
+            )?;
+            if let Some(record_type) = self
+                .issue
+                .as_ref()
+                .and_then(|issue| issue.record_type.as_ref())
+            {
+                write!(
+                    formatter,
+                    " (it contains a {record_type:?} record this version does not know)"
+                )?;
+            }
+            return write!(formatter, ", please upgrade Orca to open it");
+        }
         let detail = self
             .issue
             .as_ref()
@@ -1438,6 +1479,7 @@ pub(crate) fn transcript_from_records(
             // File snapshots and retention watermarks are audit data for
             // `/rewind`; they never add or remove conversation messages.
             SessionRecord::FileSnapshot(_) | SessionRecord::SnapshotRetention(_) => {}
+            SessionRecord::Ignorable(_) | SessionRecord::Unrecognized => {}
             SessionRecord::SessionRewind(record) => {
                 apply_rewind_to_transcript(
                     &mut messages,
@@ -1616,6 +1658,7 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
         SessionRecord::SnapshotRetention(record) => {
             redact_string_in_place(&mut record.session_id);
         }
+        SessionRecord::Ignorable(_) | SessionRecord::Unrecognized => {}
     }
     redacted
 }
@@ -1675,197 +1718,6 @@ fn redact_json_value(value: &mut serde_json::Value) {
 
 fn redact_string_in_place(value: &mut String) {
     *value = redact_sensitive_text(value);
-}
-
-pub(crate) fn redact_sensitive_text(value: &str) -> String {
-    redact_standalone_secret_tokens(&redact_keyed_secret_values(value))
-}
-
-fn redact_keyed_secret_values(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut output = String::with_capacity(value.len());
-    let mut cursor = 0;
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'=' && bytes[index] != b':' {
-            index += 1;
-            continue;
-        }
-
-        let key_start = key_start_before_delimiter(bytes, index);
-        let key = trim_key_candidate(&value[key_start..index]);
-        if !is_sensitive_key(key) {
-            index += 1;
-            continue;
-        }
-
-        let mut value_start = index + 1;
-        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
-            value_start += 1;
-        }
-        let quote = (value_start < bytes.len()
-            && (bytes[value_start] == b'"' || bytes[value_start] == b'\''))
-            .then(|| bytes[value_start]);
-        let content_start = if quote.is_some() {
-            value_start + 1
-        } else {
-            value_start
-        };
-        let content_end = if let Some(quote) = quote {
-            quoted_value_end(bytes, content_start, quote)
-        } else {
-            unquoted_value_end(
-                bytes,
-                content_start,
-                key_is_in_url_query(&value[..key_start]),
-            )
-        };
-        if content_start == content_end {
-            index += 1;
-            continue;
-        }
-
-        output.push_str(&value[cursor..content_start]);
-        output.push_str("<redacted>");
-        if quote.is_some() && content_end < bytes.len() {
-            output.push(bytes[content_end] as char);
-            cursor = content_end + 1;
-            index = cursor;
-        } else {
-            cursor = content_end;
-            index = cursor;
-        }
-    }
-    output.push_str(&value[cursor..]);
-    output
-}
-
-fn key_start_before_delimiter(bytes: &[u8], delimiter_index: usize) -> usize {
-    let mut start = delimiter_index;
-    while start > 0 {
-        let previous = bytes[start - 1];
-        if previous.is_ascii_whitespace()
-            || matches!(previous, b'{' | b'[' | b',' | b';' | b'(' | b'?' | b'&')
-        {
-            break;
-        }
-        start -= 1;
-    }
-    start
-}
-
-fn trim_key_candidate(key: &str) -> &str {
-    key.trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '{' | '[' | ','))
-}
-
-fn is_sensitive_key(key: &str) -> bool {
-    // A key is a config, env, or JSON name. A path or a code span before a
-    // colon (`auth/token.py`: …) is prose naming a file, not a credential.
-    if key.is_empty()
-        || !key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'$'))
-    {
-        return false;
-    }
-    let key = key.to_ascii_lowercase();
-    key.contains("api_key")
-        || key.contains("apikey")
-        || key.contains("token")
-        || key.contains("password")
-        || key.contains("secret")
-        || key.contains("authorization")
-}
-
-fn quoted_value_end(bytes: &[u8], mut index: usize, quote: u8) -> usize {
-    let mut escaped = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if escaped {
-            escaped = false;
-        } else if byte == b'\\' {
-            escaped = true;
-        } else if byte == quote {
-            return index;
-        }
-        index += 1;
-    }
-    index
-}
-
-fn key_is_in_url_query(prefix: &str) -> bool {
-    let token = prefix
-        .rsplit(|ch: char| {
-            ch.is_whitespace() || matches!(ch, '\"' | '\'' | '{' | '[' | '(' | ',' | ';')
-        })
-        .next()
-        .unwrap_or(prefix);
-    let Some(scheme_end) = token.find("://") else {
-        return false;
-    };
-    let Some(query_start) = token.find('?') else {
-        return false;
-    };
-    scheme_end < query_start && !token.contains('#')
-}
-
-fn unquoted_value_end(bytes: &[u8], mut index: usize, url_query: bool) -> usize {
-    while index < bytes.len()
-        && !bytes[index].is_ascii_whitespace()
-        && !matches!(bytes[index], b',' | b'}' | b']' | b';')
-        && !(url_query && matches!(bytes[index], b'&' | b'#'))
-    {
-        index += 1;
-    }
-    index
-}
-
-fn redact_standalone_secret_tokens(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut token = String::new();
-    for ch in value.chars() {
-        if is_secret_token_boundary(ch) {
-            push_redacted_token(&mut output, &mut token);
-            output.push(ch);
-        } else {
-            token.push(ch);
-        }
-    }
-    push_redacted_token(&mut output, &mut token);
-    output
-}
-
-fn is_secret_token_boundary(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, '"' | '\'' | '{' | '}' | '[' | ']' | ',' | ':')
-}
-
-fn push_redacted_token(output: &mut String, token: &mut String) {
-    if token.is_empty() {
-        return;
-    }
-    if looks_like_standalone_secret(token) {
-        output.push_str("<redacted>");
-    } else {
-        output.push_str(token);
-    }
-    token.clear();
-}
-
-fn looks_like_standalone_secret(token: &str) -> bool {
-    let trimmed = token.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            '.' | ';' | ')' | '(' | '<' | '>' | '`' | '"' | '\'' | '='
-        )
-    });
-    let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("sk-")
-        || (trimmed.len() >= 16
-            && lower.contains("secret")
-            && (lower.contains("token")
-                || lower.contains("password")
-                || lower.contains("key")
-                || lower.contains("test")))
 }
 
 pub(crate) fn acquire_file_lock(path: &Path) -> io::Result<ExclusiveFileLock> {
@@ -2697,6 +2549,7 @@ mod tests {
             additional_working_directories: Vec::new(),
             metadata_writable_directories: Vec::new(),
             network_domain_permissions: Default::default(),
+            additional_fields: Default::default(),
         };
         write_record(&path, &SessionRecord::Meta(meta)).expect("write metadata");
         let writer = SessionWriter {
@@ -3449,11 +3302,11 @@ mod tests {
     #[test]
     fn non_url_keyed_values_redact_the_entire_value_with_query_punctuation() {
         assert_eq!(
-            redact_keyed_secret_values("api_key=ordinary&suffix#remainder"),
+            redact_sensitive_text("api_key=ordinary&suffix#remainder"),
             "api_key=<redacted>"
         );
         assert_eq!(
-            redact_keyed_secret_values("token: ordinary#remainder&suffix"),
+            redact_sensitive_text("token: ordinary#remainder&suffix"),
             "token: <redacted>"
         );
     }
@@ -3700,6 +3553,13 @@ mod tests {
     #[test]
     fn scanner_accepts_a_complete_final_record_without_a_newline() {
         let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        let meta = serde_json::to_string(&SessionRecord::Meta(history::create_meta(
+            Path::new("/workspace"),
+            "mock",
+            None,
+            "test transcript",
+        )))
+        .unwrap();
         let valid = serde_json::to_string(&SessionRecord::Message {
             id: None,
             turn_id: None,
@@ -3710,11 +3570,11 @@ mod tests {
             },
         })
         .expect("serialize valid record");
-        fs::write(path.path(), valid).expect("write transcript");
+        fs::write(path.path(), format!("{meta}\n{valid}")).expect("write transcript");
 
         let scan = scan_session(path.path()).expect("scan transcript");
         assert_eq!(scan.health, StoredSessionHealth::Healthy);
-        assert_eq!(scan.records.len(), 1);
+        assert_eq!(scan.records.len(), 2);
     }
 
     #[test]

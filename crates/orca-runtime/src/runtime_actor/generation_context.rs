@@ -25,6 +25,7 @@ struct PendingPlanSplit {
 }
 
 pub(crate) struct ProviderStepProjection {
+    pub(crate) retries: Vec<Option<orca_core::provider_types::ProviderRetry>>,
     pub(crate) events: Vec<(surface::SurfaceScope, surface::SurfaceEvent)>,
     pub(crate) background_fence: Option<surface::SurfaceBackgroundFence>,
 }
@@ -125,6 +126,7 @@ impl GenerationContextController {
             ),
         > = HashMap::new();
         let mut generation_validated = false;
+        let mut retries = Vec::new();
 
         for step in steps {
             let pieces = match step {
@@ -136,6 +138,12 @@ impl GenerationContextController {
                     identity.item_ids.reasoning_item_id.clone(),
                     text.clone(),
                 )],
+                ProviderStep::Retry(retry)
+                    if active_generation || foregrounded_background.is_some() =>
+                {
+                    retries.push(retry.clone());
+                    continue;
+                }
                 _ => continue,
             };
             for (channel, item_id, raw_text) in pieces {
@@ -249,11 +257,12 @@ impl GenerationContextController {
                 ));
             }
         }
-        if events.is_empty() {
+        if events.is_empty() && retries.is_empty() {
             return Ok(None);
         }
         Ok(Some(ProviderStepProjection {
             events,
+            retries,
             background_fence: foregrounded_background,
         }))
     }
@@ -288,7 +297,7 @@ impl GenerationContextController {
             return Ok(context_usage_events(
                 snapshot,
                 scope,
-                response.response.usage,
+                response.attempt_usage,
             ));
         }
         Ok(completion_events(
@@ -296,7 +305,7 @@ impl GenerationContextController {
             fence,
             scope,
             normalized,
-            response.response.usage,
+            response.attempt_usage,
             response.cut_short,
         ))
     }
@@ -610,7 +619,7 @@ pub(crate) fn build_background_provider_response_events(
         return Ok(context_usage_events(
             snapshot,
             scope,
-            response.response.usage,
+            response.attempt_usage,
         ));
     }
     let normalized =
@@ -620,7 +629,7 @@ pub(crate) fn build_background_provider_response_events(
         &fence.operation_fence,
         scope,
         normalized,
-        response.response.usage,
+        response.attempt_usage,
         response.cut_short,
     ))
 }

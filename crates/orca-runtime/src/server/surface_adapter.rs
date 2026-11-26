@@ -1396,6 +1396,7 @@ fn receive_admitted_turn(
                         }
                         _ => None,
                     }),
+                SurfaceSubscriptionItem::ProviderRetry { .. } => continue,
                 SurfaceSubscriptionItem::Gap { .. } => {
                     return Err(io::Error::other(
                         "JSONL surface snapshot required before admission was observed",
@@ -1508,6 +1509,7 @@ where
                     break Ok(());
                 }
             }
+            SurfaceSubscriptionItem::ProviderRetry { .. } => continue,
             SurfaceSubscriptionItem::Gap { .. } => {
                 write_runtime_event(
                     &mut writer,

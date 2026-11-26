@@ -68,9 +68,11 @@ impl RuntimeProviderSuspension {
                 delivery.step().clone(),
             )),
             ProviderStreamEvent::Completed(response) => {
-                Ok(RuntimeProviderSuspensionEvent::Completed(
-                    RuntimeModelResponse::from_parts(response, self.identity.clone()),
-                ))
+                let attempt_usage = self.stream.attempt_usage(&response);
+                let mut response =
+                    RuntimeModelResponse::from_parts(response, self.identity.clone());
+                response.attempt_usage = attempt_usage;
+                Ok(RuntimeProviderSuspensionEvent::Completed(response))
             }
         }
     }

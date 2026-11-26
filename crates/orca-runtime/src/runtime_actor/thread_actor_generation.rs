@@ -1164,13 +1164,21 @@ impl ThreadActor {
         else {
             return Ok(());
         };
-        let batch = self.surface_event_batch_with_commit_id(projection.events, None);
-        match projection.background_fence {
-            Some(background_fence) => {
-                self.commit_surface_background_batch_with_retry(background_fence, &batch)
+        if !projection.events.is_empty() {
+            let batch = self.surface_event_batch_with_commit_id(projection.events, None);
+            match projection.background_fence {
+                Some(background_fence) => {
+                    self.commit_surface_background_batch_with_retry(background_fence, &batch)?;
+                }
+                None => self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?,
             }
-            None => self.commit_surface_generation_batch_with_retry(fence, &batch),
         }
+        for retry in projection.retries {
+            self.resident_surface
+                .hub
+                .publish_provider_retry(&fence.operation_id, retry);
+        }
+        Ok(())
     }
 
     pub(super) fn commit_surface_subagent_activity(
@@ -1994,12 +2002,16 @@ impl ThreadActor {
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
         message: &str,
     ) -> io::Result<()> {
-        self.commit_surface_provider_attempt_failure(active, fence, identity, message)?;
+        self.commit_surface_provider_attempt_failure(active, fence, identity, None)?;
         active.surface_execution_failure = Some(surface::GenerationExecutionFailureClass::Provider);
-        active.surface_execution_failure_diagnostic = Some(surface_safe_diagnostic(
-            message,
-            "provider execution failed with an invalid diagnostic",
-        ));
+        active.surface_execution_failure_diagnostic = Some(
+            surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
+                surface::SafeDiagnosticText::try_new(
+                    "provider execution failed with an invalid diagnostic",
+                )
+                .expect("fixed diagnostic is bounded")
+            }),
+        );
         Ok(())
     }
 
@@ -2008,7 +2020,7 @@ impl ThreadActor {
         active: &ActiveOperation,
         fence: surface::SurfaceOperationFence,
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
-        _message: &str,
+        retry: Option<orca_core::provider_types::ProviderRetry>,
     ) -> io::Result<()> {
         if active.surface_operation.as_ref() != Some(&fence) {
             return Err(io::Error::new(
@@ -2026,11 +2038,16 @@ impl ThreadActor {
         let events = self
             .generation_context_controller
             .provider_attempt_failure_events(&snapshot, &fence, identity)?;
-        if events.is_empty() {
-            return Ok(());
+        if !events.is_empty() {
+            let batch = self.surface_event_batch_with_commit_id(events, None);
+            self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?;
         }
-        let batch = self.surface_event_batch_with_commit_id(events, None);
-        self.commit_surface_generation_batch_with_retry(fence, &batch)
+        if let Some(retry) = retry {
+            self.resident_surface
+                .hub
+                .publish_provider_retry(&fence.operation_id, Some(retry));
+        }
+        Ok(())
     }
 
     pub(super) fn commit_surface_provider_response(

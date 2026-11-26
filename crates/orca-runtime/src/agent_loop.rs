@@ -134,6 +134,10 @@ pub(crate) fn run_agent_loop(
         turn_deps.memory,
         loop_state.tool_policy(tool_policy).allowed_tools(),
     );
+    crate::mcp_startup::refresh_request_instructions(
+        prepared_conversation.parts_mut().0,
+        turn_deps.mcp_registry,
+    );
     let shell_readiness = crate::shell_readiness::ShellReadiness::for_config(config);
     let shell_context = shell_readiness.model_context(config.approval_mode);
     prepared_conversation.parts_mut().0.replace_mode_context(
@@ -302,6 +306,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         )
         .with_runtime(child_cost_tracker, runtime.cancel, task_registry)
         .with_permission_handler(runtime.permission_handler.as_deref())
+        .with_provider_response_ingress(runtime.provider_response_ingress)
         .with_execution(
             &mut background_workflows,
             request.workflow_ipc.as_ref(),

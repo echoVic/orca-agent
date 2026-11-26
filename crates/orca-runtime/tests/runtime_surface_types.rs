@@ -1867,6 +1867,7 @@ fn attach_result_name(value: &AttachResult) -> &'static str {
 fn subscription_item_name(value: &SurfaceSubscriptionItem) -> &'static str {
     match value {
         SurfaceSubscriptionItem::Batch { .. } => "Batch",
+        SurfaceSubscriptionItem::ProviderRetry { .. } => "ProviderRetry",
         SurfaceSubscriptionItem::Gap { .. } => "Gap",
         SurfaceSubscriptionItem::Sealed { .. } => "Sealed",
     }

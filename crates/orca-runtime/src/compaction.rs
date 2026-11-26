@@ -8,7 +8,7 @@ use orca_core::config::OutputFormat;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::hook_types::HookEvent;
-use orca_core::provider_types::{ProviderResponse, ProviderStep};
+use orca_core::provider_types::{ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
 use orca_provider::{ProviderConfig, context};
 
@@ -415,10 +415,12 @@ impl<'a> RuntimeCompactionPolicy<'a> {
     }
 
     pub(crate) fn decide_for_provider_error(
-        error: &str,
+        error: &ProviderError,
         retry_state: &RuntimeCompactionRetryState,
     ) -> RuntimeCompactionRetryDecision {
-        if context::is_prompt_too_long_error(error) && !retry_state.prompt_too_long_retried {
+        let context_exceeded = error.kind == ProviderErrorKind::ContextExceeded
+            || (error.http_status.is_none() && context::is_prompt_too_long_error(&error.message));
+        if context_exceeded && !retry_state.prompt_too_long_retried {
             RuntimeCompactionRetryDecision::CompactAndRetry {
                 trigger: RuntimeCompactionTrigger::PromptTooLong,
                 reason: RuntimeCompactionReason::PromptTooLongRecovery,
@@ -481,7 +483,7 @@ pub fn handle_tui_agent_provider_error<W: io::Write>(
         return Ok(TuiAgentProviderErrorAction::NoError);
     };
 
-    match RuntimeCompactionPolicy::decide_for_provider_error(&error.message, &state.retry) {
+    match RuntimeCompactionPolicy::decide_for_provider_error(&error, &state.retry) {
         RuntimeCompactionRetryDecision::CompactAndRetry { trigger, .. } => {
             let runtime_parts = session.runtime_parts();
             let mut sink = EventSink::new(input.writer, OutputFormat::Jsonl)
@@ -1273,10 +1275,13 @@ mod tests {
     #[test]
     fn compaction_policy_decides_prompt_too_long_retry_once() {
         let mut retry_state = RuntimeCompactionRetryState::default();
-        let decision = RuntimeCompactionPolicy::decide_for_provider_error(
+        let error = ProviderError::with_http(
+            ProviderErrorKind::ContextExceeded,
             "DeepSeek provider error: prompt_too_long: context length exceeded",
-            &retry_state,
+            Some(400),
+            None,
         );
+        let decision = RuntimeCompactionPolicy::decide_for_provider_error(&error, &retry_state);
 
         assert_eq!(
             decision,
@@ -1287,10 +1292,7 @@ mod tests {
         );
 
         retry_state.record_prompt_too_long_retry();
-        let decision = RuntimeCompactionPolicy::decide_for_provider_error(
-            "DeepSeek provider error: prompt_too_long: context length exceeded",
-            &retry_state,
-        );
+        let decision = RuntimeCompactionPolicy::decide_for_provider_error(&error, &retry_state);
 
         assert_eq!(decision, RuntimeCompactionRetryDecision::SurfaceError);
     }
@@ -1298,12 +1300,18 @@ mod tests {
     #[test]
     fn compaction_policy_surfaces_non_context_errors() {
         let retry_state = RuntimeCompactionRetryState::default();
-        let decision = RuntimeCompactionPolicy::decide_for_provider_error(
-            "DeepSeek provider error: quota exhausted",
-            &retry_state,
-        );
-
-        assert_eq!(decision, RuntimeCompactionRetryDecision::SurfaceError);
+        for error in [
+            ProviderError::other("DeepSeek provider error: quota exhausted"),
+            ProviderError::with_http(
+                ProviderErrorKind::Other,
+                "context length exceeded",
+                Some(403),
+                None,
+            ),
+        ] {
+            let decision = RuntimeCompactionPolicy::decide_for_provider_error(&error, &retry_state);
+            assert_eq!(decision, RuntimeCompactionRetryDecision::SurfaceError);
+        }
     }
 
     #[test]

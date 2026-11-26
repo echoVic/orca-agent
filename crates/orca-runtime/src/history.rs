@@ -26,7 +26,7 @@ pub use crate::thread_store::{
     rename_session, search_sessions,
 };
 
-const SESSION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SESSION_SCHEMA_VERSION: u32 = 1;
 
 /// Serializes tests that deliberately share process-wide state (the session
 /// index, the task registry index, recorded sessions under the process-wide
@@ -434,6 +434,7 @@ pub fn create_meta(cwd: &Path, provider: &str, model: Option<String>, prompt: &s
         additional_working_directories: Vec::new(),
         metadata_writable_directories: Vec::new(),
         network_domain_permissions: Default::default(),
+        additional_fields: Default::default(),
     }
 }
 
