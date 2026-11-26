@@ -951,7 +951,13 @@ impl AppState {
                     expanded: false,
                 });
                 // The background key showed the turn idle before the runtime
-                // answered; it is still running here.
+                // answered; it is still running here. Only the status comes
+                // back: what else the key started stays started. A refusal
+                // that comes later, when an agent reports or main streams
+                // again after a request made while main ran a tool, lands on
+                // the view on screen then, which may no longer be the one
+                // the key was pressed in. Stage 2's work on returning to
+                // main is to revisit this.
                 if self.status == AppStatus::Idle {
                     self.enter_running();
                 }

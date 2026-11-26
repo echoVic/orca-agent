@@ -298,6 +298,10 @@ pub(crate) fn spawn_attached_event_sender_with_routing(
                         }
                         // The background key acts on main's turn from any
                         // view, so its answer goes to the view on screen.
+                        // An answer that comes later (see the reducer's
+                        // arm) goes to the view on screen when it arrives,
+                        // and restores only that view's status; stage 2's
+                        // work on returning to main is to revisit this.
                         if let TuiEvent::TurnKeptInForeground(notice) = event {
                             let _ = root_event_tx.send(TuiEvent::TurnKeptInForeground(notice));
                         }
