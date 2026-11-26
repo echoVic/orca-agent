@@ -1946,20 +1946,29 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
         identity: &ModelResponseIdentity,
         steps: &[ProviderStep],
     ) -> io::Result<()> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        send_thread_command_retrying_full(
-            &self.command_tx,
-            ThreadCommand::SurfaceCommitProviderStep {
-                fence: self.fence.clone(),
-                identity: identity.clone(),
-                steps: steps.to_vec(),
-                reply: Some(reply_tx),
-            },
-        )
-        .map_err(surface_semantic_ingress_send_error)?;
-        reply_rx
-            .recv()
-            .map_err(|_| surface_semantic_ingress_ack_error())?
+        loop {
+            let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+            send_thread_command_retrying_full(
+                &self.command_tx,
+                ThreadCommand::SurfaceCommitProviderStep {
+                    fence: self.fence.clone(),
+                    identity: identity.clone(),
+                    steps: steps.to_vec(),
+                    reply: Some(reply_tx),
+                },
+            )
+            .map_err(surface_semantic_ingress_send_error)?;
+            let result = reply_rx
+                .recv()
+                .map_err(|_| surface_semantic_ingress_ack_error())?;
+            if matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock) {
+                // Let the actor settle the earlier commit before publishing
+                // and acknowledging this batch's delivered text.
+                thread::sleep(SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL);
+                continue;
+            }
+            return result;
+        }
     }
 
     fn commit_tool_results(&self, results: &[orca_core::tool_types::ToolResult]) -> io::Result<()> {
@@ -32542,7 +32551,8 @@ mod tests {
         );
         assert!(matches!(
             second_transfer,
-            surface::TransferBackgroundOutput::HandedOff { .. }
+            surface::TransferBackgroundOutput::HandedOff { background_fence, .. }
+                if background_fence.operation_fence.operation_id == second.operation_id
         ));
 
         let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;

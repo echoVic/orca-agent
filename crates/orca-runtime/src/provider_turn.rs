@@ -172,7 +172,10 @@ impl<'a> ProviderStepBatcher<'a> {
                 if self.cancel.is_cancelled()
                     && matches!(
                         error.kind(),
-                        io::ErrorKind::PermissionDenied | io::ErrorKind::Interrupted
+                        io::ErrorKind::PermissionDenied
+                            | io::ErrorKind::Interrupted
+                            | io::ErrorKind::NotConnected
+                            | io::ErrorKind::BrokenPipe
                     ) => {}
             Err(error) => return Err(error),
         }
@@ -1297,6 +1300,15 @@ fn record_cut_short_reply<W: io::Write>(
         match ingress.commit_response(&mut response) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(error)
+                if reason == CutShort::Interrupted
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
+                    ) =>
+            {
+                return Ok(());
+            }
             Err(error) => return Err(error),
         }
     }
@@ -1554,6 +1566,84 @@ mod tests {
 
     fn response_identity() -> ModelResponseIdentity {
         ModelResponseIdentity::new(orca_core::thread_identity::TurnId::new())
+    }
+
+    #[derive(Debug)]
+    struct ClosedProviderIngress(io::ErrorKind);
+
+    impl crate::runtime_surface::RuntimeProviderResponseIngress for ClosedProviderIngress {
+        fn commit_response(&self, _: &mut RuntimeModelResponse) -> io::Result<()> {
+            Err(io::Error::new(self.0, "runtime thread is shutting down"))
+        }
+
+        fn commit_provider_step(
+            &self,
+            _: &ModelResponseIdentity,
+            _: &ProviderStep,
+        ) -> io::Result<()> {
+            Err(io::Error::new(self.0, "runtime thread is shutting down"))
+        }
+
+        fn commit_tool_results(&self, _: &[orca_core::tool_types::ToolResult]) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn provider_step_batcher_preserves_cancellation_when_publication_closes() {
+        for kind in [io::ErrorKind::NotConnected, io::ErrorKind::BrokenPipe] {
+            for cancelled in [false, true] {
+                let ingress = ClosedProviderIngress(kind);
+                let identity = response_identity();
+                let cancel = CancelToken::new();
+                if cancelled {
+                    cancel.cancel();
+                }
+                let mut batcher = ProviderStepBatcher::new(Some(&ingress), &identity, &cancel);
+                let result = batcher
+                    .push(ProviderStep::MessageDelta("pending text".to_string()))
+                    .and_then(|()| batcher.flush());
+
+                assert_eq!(result.is_ok(), cancelled, "{kind:?}, cancelled={cancelled}");
+                if let Err(error) = result {
+                    assert_eq!(error.kind(), kind);
+                }
+                assert!(batcher.delivered.content.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_reply_recording_preserves_cancellation_when_publication_closes() {
+        for kind in [io::ErrorKind::NotConnected, io::ErrorKind::BrokenPipe] {
+            for (reason, succeeds) in [
+                (CutShort::Interrupted, true),
+                (CutShort::OutputLimit, false),
+            ] {
+                let ingress = ClosedProviderIngress(kind);
+                let context =
+                    RuntimeTurnContext::new(Path::new("."), "", 0, false, &SubagentType::General)
+                        .with_provider_response_ingress(Some(&ingress));
+                let mut conversation = Conversation::new();
+                let mut events = EventFactory::new("cancelled-publication".to_string());
+                let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+                let result = record_cut_short_reply(
+                    PartialReply {
+                        content: "published text".to_string(),
+                        reasoning: None,
+                    },
+                    &response_identity(),
+                    reason,
+                    &context,
+                    &mut conversation,
+                    &mut events,
+                    &mut sink,
+                );
+
+                assert_eq!(result.is_ok(), succeeds, "{kind:?}, {reason:?}");
+                assert!(conversation.messages.is_empty());
+            }
+        }
     }
 
     #[test]

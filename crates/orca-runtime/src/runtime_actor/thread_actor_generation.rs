@@ -1138,11 +1138,22 @@ impl ThreadActor {
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
         steps: &[ProviderStep],
     ) -> io::Result<()> {
-        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let active_generation = active.is_some_and(|active| {
             active.surface_operation.as_ref() == Some(&fence)
                 && !Self::surface_interaction_admission_closed(active)
         });
+        if active_generation
+            && self.resident_surface.coordinator.has_incomplete_batch()
+            && self.has_pending_surface_transition_retry()
+        {
+            // Defer before projection consumes redaction or plan-parser state.
+            // The pending transition owns the next surface cursor range.
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "provider stream is waiting for an earlier surface commit",
+            ));
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let Some(projection) = self.generation_context_controller.provider_steps_events(
             &snapshot,
             active_generation,
