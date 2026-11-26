@@ -14879,6 +14879,7 @@ struct PendingSurfaceBackgroundTransfer {
 
 struct ActiveGeneration {
     context: GenerationContext,
+    user_interrupted: bool,
     tool_images: orca_core::tool_images::RetainedToolImages,
     cancel: CancelToken,
     join: JoinHandle<OperationTaskResult>,
@@ -21412,6 +21413,7 @@ impl ThreadActor {
                     InterruptOperationResult::AlreadyRequested { generation }
                 } else {
                     self.pause_prompt_queue_for_interrupt();
+                    active.generation.user_interrupted = true;
                     Self::cancel_active_task_tree(active);
                     InterruptOperationResult::Requested { generation }
                 };
@@ -21419,6 +21421,7 @@ impl ThreadActor {
             }
             ThreadCommand::InterruptActive { reply } => {
                 self.pause_prompt_queue_for_interrupt();
+                active.generation.user_interrupted = true;
                 Self::cancel_active_task_tree(active);
                 let _ = reply.send(Ok(()));
             }
@@ -21775,6 +21778,7 @@ impl ThreadActor {
         });
         ActiveGeneration {
             context,
+            user_interrupted: false,
             tool_images,
             cancel,
             join,
@@ -23804,6 +23808,24 @@ fn run_provider_background_task(
             error = Some(provider_error);
         } else {
             status = RunStatus::Success;
+        }
+    }
+
+    if status == RunStatus::Failed
+        && let Some(response) = response.as_mut()
+        && let Some(partial) = response
+            .response
+            .error()
+            .and_then(|error| error.partial_reply.clone())
+    {
+        response.response.assistant_content = Some(partial.content);
+        response.response.assistant_reasoning = partial.reasoning;
+        response.response.tool_calls.clear();
+        response.cut_short = Some(orca_core::conversation::CutShort::OutputLimit);
+        if let Err(error) =
+            observe_event(None, events.model_response_completed(&response.completed()))
+        {
+            tracing::warn!(%error, "failed to record the cut-short background reply");
         }
     }
 
@@ -31445,9 +31467,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_background_reply_at_the_output_limit_is_kept() {
+        assert_kept_reply(
+            KeptReplyFixture::BackgroundAtLimit,
+            0,
+            Some(("First point", Some("Thinking"), "output_limit")),
+        );
+    }
+
     enum KeptReplyFixture {
         Mock(&'static str),
         DeepSeek { partial_tool: bool, length: bool },
+        BackgroundAtLimit,
     }
 
     fn assert_kept_reply(
@@ -31461,12 +31493,17 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
         let (release, hold) = mpsc::channel();
+        let background = matches!(fixture, KeptReplyFixture::BackgroundAtLimit);
         let (prompt, server) = match fixture {
             KeptReplyFixture::Mock(prompt) => (prompt, None),
-            KeptReplyFixture::DeepSeek {
-                partial_tool,
-                length,
-            } => {
+            KeptReplyFixture::DeepSeek { .. } | KeptReplyFixture::BackgroundAtLimit => {
+                let (partial_tool, length) = match fixture {
+                    KeptReplyFixture::DeepSeek {
+                        partial_tool,
+                        length,
+                    } => (partial_tool, length),
+                    _ => (true, true),
+                };
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 config.provider = ProviderKind::DeepSeek;
                 config.api_key = Some("test-only".into());
@@ -31502,12 +31539,15 @@ mod tests {
                         body.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"task_list\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\n");
                     }
                     body.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"First point\"},\"finish_reason\":null}]}\n\n");
-                    if length {
+                    if length && !background {
                         body.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n");
                     }
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}").unwrap();
-                    if !length {
+                    if !length || background {
                         let _ = hold.recv_timeout(SURFACE_TEST_TIMEOUT);
+                    }
+                    if background {
+                        stream.write_all(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n").unwrap();
                     }
                 });
                 ("Explain in detail", Some(server))
@@ -31526,7 +31566,7 @@ mod tests {
             .baseline
             .snapshot
         };
-        if cancels > 0 {
+        if cancels > 0 || background {
             let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
             let channel = if kept.is_some() {
                 surface::AssistantChannel::Message
@@ -31540,6 +31580,20 @@ mod tests {
             }) {
                 assert!(Instant::now() < deadline, "provider stream never arrived");
                 std::thread::sleep(Duration::from_millis(10));
+            }
+            if background {
+                committed_surface_value(
+                    attachment
+                        .client
+                        .transfer_background(
+                            surface_request_id(),
+                            surface::BackgroundTarget::ActiveGeneration {
+                                fence: fence.clone(),
+                            },
+                        )
+                        .unwrap(),
+                );
+                release.send(()).unwrap();
             }
             for n in 0..cancels {
                 let result = attachment
@@ -31572,16 +31626,24 @@ mod tests {
                 }
             ));
         } else {
-            let surface::OperationTerminal::Failed {
-                class: surface::FailureClass::Provider,
-                message,
-            } = value.terminal
-            else {
+            let surface::OperationTerminal::Failed { class, message } = value.terminal else {
                 panic!("unexpected terminal: {:?}", value.terminal);
             };
             assert_eq!(
+                class,
+                if background {
+                    surface::FailureClass::RuntimeInvariant
+                } else {
+                    surface::FailureClass::Provider
+                }
+            );
+            assert_eq!(
                 message.as_str(),
-                "DeepSeek provider error: Response truncated: model hit max_tokens limit (finish_reason=length); ask the model to continue in smaller chunks"
+                if background {
+                    "background provider failed"
+                } else {
+                    "DeepSeek provider error: Response truncated: model hit max_tokens limit (finish_reason=length); ask the model to continue in smaller chunks"
+                }
             );
         }
         let snapshot = snapshot();
@@ -31624,7 +31686,37 @@ mod tests {
                     .all(|stream| stream.state == surface::SurfaceAssistantStreamState::Discarded)
             );
         }
+        let thread_id = thread.thread_id().to_string();
+        thread.shutdown().unwrap();
         host.shutdown().unwrap();
+
+        if let Some((expected_text, _, expected_reason)) = kept {
+            let resumed_host = RuntimeHost::start().unwrap();
+            let resumed = resumed_host
+                .start_thread(
+                    surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
+                    "resume cut short reply",
+                )
+                .unwrap();
+            let snapshot = fresh_surface_attachment(&resumed.surface())
+                .baseline
+                .snapshot;
+            let kept_items = snapshot
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    surface::SurfaceItem::AssistantMessage {
+                        text,
+                        cut_short: Some(reason),
+                        ..
+                    } => Some((text.as_str(), *reason)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let reason = serde_json::from_value(serde_json::json!(expected_reason)).unwrap();
+            assert_eq!(kept_items, [(expected_text, reason)]);
+            resumed_host.shutdown().unwrap();
+        }
     }
 
     #[test]
@@ -43462,12 +43554,24 @@ mod tests {
                 input: crate::prompt_queue::PromptQueueInput::text("queued after interrupt"),
             })
             .expect("queue prompt after interruptible prompt");
+        let surface = thread.surface();
+        let snapshot = || fresh_surface_attachment(&surface).baseline.snapshot;
         let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
         loop {
             let snapshot = thread
                 .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
                 .expect("read running queue");
-            if snapshot.running_item().is_some() {
+            if snapshot.running_item().is_some()
+                && fresh_surface_attachment(&surface)
+                    .baseline
+                    .snapshot
+                    .assistant_streams
+                    .iter()
+                    .any(|stream| {
+                        stream.channel == surface::AssistantChannel::Message
+                            && !stream.text.as_str().is_empty()
+                    })
+            {
                 break;
             }
             assert!(Instant::now() < deadline, "queue dispatch did not start");
@@ -43489,6 +43593,10 @@ mod tests {
             assert!(Instant::now() < deadline, "queue dispatch did not pause");
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(snapshot().items.iter().any(|item| matches!(item,
+            surface::SurfaceItem::AssistantMessage { text, cut_short: Some(orca_core::conversation::CutShort::Interrupted), .. }
+            if text.as_str() == "Mock slow stream started."
+        )));
         host.shutdown().expect("shutdown queue interrupt host");
     }
 
@@ -43501,7 +43609,10 @@ mod tests {
     }
 
     impl surface::RuntimeProviderResponseIngress for TerminalizingProviderResponseIngress {
-        fn commit_response(&self, _response: &mut RuntimeModelResponse) -> io::Result<()> {
+        fn commit_response(&self, response: &mut RuntimeModelResponse) -> io::Result<()> {
+            if response.cut_short.is_some() {
+                return Ok(());
+            }
             self.cancel.cancel();
             Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -43528,7 +43639,7 @@ mod tests {
         let host = RuntimeHost::start().expect("start runtime host");
         let thread = host
             .start_thread(
-                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
                 "terminalization race",
             )
             .expect("start thread");
@@ -43551,6 +43662,12 @@ mod tests {
             &OperationOutcome::Completed(RunStatus::Cancelled),
             "a response the actor refused because the turn was being cancelled is that cancellation"
         );
+        let transcript = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap();
+        assert_eq!(transcript.messages.iter().filter(|message| matches!(message,
+            Message::Assistant { content: Some(_), cut_short: Some(orca_core::conversation::CutShort::Interrupted), tool_calls, .. } if tool_calls.is_empty()
+        )).count(), 1);
         host.shutdown().expect("shutdown host");
     }
 

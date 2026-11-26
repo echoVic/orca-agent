@@ -4131,6 +4131,7 @@ fn apply_item_patch(
                     text,
                     message_offset,
                     pinned,
+                    cut_short: None,
                 } => batch.events.as_slice().iter().any(|event| {
                     matches!(
                         &event.event,
@@ -4143,6 +4144,9 @@ fn apply_item_patch(
                                     && value.pinned == *pinned)
                     )
                 }),
+                SurfaceItem::AssistantPlan {
+                    cut_short: Some(_), ..
+                } => false,
                 SurfaceItem::ToolResultMessage {
                     turn_id,
                     tool_call_id,
@@ -4496,6 +4500,7 @@ fn apply_assistant_patch(
                         turn_id: item.turn_id.clone(),
                         text: item.text.clone(),
                         message_offset: item.message_offset,
+                        cut_short: cut_short.filter(|_| response.message_item.is_none()),
                         pinned: item.pinned,
                     }),
             ];

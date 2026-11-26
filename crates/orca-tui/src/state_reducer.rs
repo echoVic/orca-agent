@@ -460,6 +460,16 @@ impl AppState {
                 }
                 self.reconcile_assistant_response(message.as_deref(), reasoning.as_deref());
             }
+            TuiEvent::AssistantReplyKept(reason) => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
+                self.take_trailing_receiving_tool_calls();
+                self.flush_proposed_plan_parser();
+                self.finish_assistant_stream();
+                self.push_message(ChatMessage::AssistantCutShort(reason));
+                self.transcript.call_start = self.transcript.messages.len();
+            }
             TuiEvent::ToolRequested { id, name, target } => {
                 if self.suppress_background_main_session_output {
                     return;

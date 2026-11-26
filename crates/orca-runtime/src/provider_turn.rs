@@ -973,7 +973,26 @@ impl RuntimeProviderResponseStep {
             // The ingress answers with the names the surface recorded: a tool
             // call whose provider id the session already used is renamed there
             // (issue #67), and the conversation must use the same name.
-            ingress.commit_response(&mut response)?;
+            if let Err(error) = ingress.commit_response(&mut response) {
+                if error.kind() == io::ErrorKind::Interrupted
+                    && step_snapshot.capabilities.cancel.is_cancelled()
+                    && let Some(content) = response.response.assistant_content.take()
+                {
+                    record_cut_short_reply(
+                        PartialReply {
+                            content,
+                            reasoning: response.response.assistant_reasoning.take(),
+                        },
+                        &response.identity,
+                        CutShort::Interrupted,
+                        &step_snapshot.turn_context,
+                        conversation,
+                        events,
+                        sink,
+                    )?;
+                }
+                return Err(error);
+            }
         }
         let completed_response = response.completed();
         let mut completion_event = events.model_response_completed(&completed_response);

@@ -302,6 +302,7 @@ pub enum TuiEvent {
     ProposedPlanDelta(String),
     AssistantAttemptDiscarded,
     AssistantResponseCompleted(Option<String>, Option<String>),
+    AssistantReplyKept(orca_core::conversation::CutShort),
     ToolRequested {
         id: String,
         name: String,

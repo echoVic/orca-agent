@@ -1565,6 +1565,8 @@ struct PersistedProviderResponse {
     usage: Option<Usage>,
     #[serde(default)]
     identity: Option<ModelResponseIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut_short: Option<orca_core::conversation::CutShort>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -6647,11 +6649,13 @@ impl PersistedProviderResponse {
             tool_calls: self.tool_calls,
             usage: self.usage,
         };
-        RuntimeModelResponse::from_parts(
+        let mut response = RuntimeModelResponse::from_parts(
             response,
             self.identity
                 .unwrap_or_else(|| ModelResponseIdentity::new(TurnId::new())),
-        )
+        );
+        response.cut_short = self.cut_short;
+        response
     }
 }
 
@@ -6669,6 +6673,7 @@ impl From<&RuntimeModelResponse> for PersistedProviderResponse {
             tool_calls: response.response.tool_calls.clone(),
             usage: response.response.usage,
             identity: Some(response.identity.clone()),
+            cut_short: response.cut_short,
         }
     }
 }
@@ -8772,6 +8777,7 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
             identity: None,
+            cut_short: None,
         }
         .into_runtime_response_with_migration_identity();
 

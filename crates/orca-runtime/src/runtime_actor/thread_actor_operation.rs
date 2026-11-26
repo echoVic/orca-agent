@@ -9360,7 +9360,9 @@ impl ThreadActor {
     ) -> bool {
         if cut_short == Some(orca_core::conversation::CutShort::Interrupted) {
             return active.surface_terminalization
-                == Some(surface::TerminalizationCause::UserCancel);
+                == Some(surface::TerminalizationCause::UserCancel)
+                || (active.surface_terminalization.is_none()
+                    && active.generation.user_interrupted);
         }
         !Self::surface_interaction_admission_closed(active)
     }

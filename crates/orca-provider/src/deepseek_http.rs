@@ -1144,6 +1144,9 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
         .take_while(|message| matches!(message, Message::System { pinned: false, .. }))
         .count();
     let went_on = turn_went_on_after(source_messages);
+    let last_user = source_messages
+        .iter()
+        .rposition(|message| matches!(message, Message::User { .. }));
     for (index, msg) in source_messages.iter().enumerate() {
         let api_msg = match msg {
             Message::System { content, .. } => {
@@ -1171,6 +1174,7 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 ..
             } => {
                 let api_tool_calls = if tool_calls.is_empty() {
@@ -1196,7 +1200,9 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
                     images: Vec::new(),
                     reasoning_content: replayable_reasoning_content(
                         reasoning_content,
-                        !tool_calls.is_empty() || went_on[index],
+                        !tool_calls.is_empty()
+                            || went_on[index]
+                            || (cut_short.is_some() && last_user.is_none_or(|user| index > user)),
                     ),
                     tool_calls: api_tool_calls,
                     tool_call_id: None,
@@ -2241,6 +2247,37 @@ mod tests {
 
         let messages = conversation_to_api_messages(&conv);
         assert_eq!(messages[1].content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn the_request_after_a_kept_reply_is_valid_in_thinking_mode() {
+        use orca_core::conversation::CutShort;
+
+        let mut conversation = Conversation::new();
+        conversation.add_user("List the steps".into());
+        conversation.messages.push(Message::Assistant {
+            content: Some("First, gather the inputs.".into()),
+            reasoning_content: Some("Start at the beginning".into()),
+            tool_calls: Vec::new(),
+            pinned: false,
+            cut_short: Some(CutShort::Interrupted),
+        });
+        let messages = conversation_to_api_messages(&conversation);
+        assert_eq!(
+            messages[1].reasoning_content.as_deref(),
+            Some("Start at the beginning")
+        );
+
+        conversation.add_user("Go on".into());
+        let messages = serde_json::to_value(conversation_to_api_messages(&conversation)).unwrap();
+        assert_eq!(
+            messages,
+            serde_json::json!([
+                {"role": "user", "content": "List the steps"},
+                {"role": "assistant", "content": "First, gather the inputs."},
+                {"role": "user", "content": "Go on"}
+            ])
+        );
     }
 
     #[test]

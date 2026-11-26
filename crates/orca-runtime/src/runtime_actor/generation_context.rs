@@ -579,7 +579,7 @@ pub(crate) fn build_background_provider_response_events(
         scope,
         normalized,
         response.response.usage,
-        None,
+        response.cut_short,
     ))
 }
 
@@ -959,7 +959,7 @@ fn response_items_match(
             snapshot.items.iter().any(|item| {
                 matches!(
                     item,
-                    surface::SurfaceItem::AssistantPlan { id, turn_id, text, message_offset, pinned }
+                    surface::SurfaceItem::AssistantPlan { id, turn_id, text, message_offset, pinned, .. }
                         if id == &expected.id
                             && turn_id == &expected.turn_id
                             && text == &expected.text

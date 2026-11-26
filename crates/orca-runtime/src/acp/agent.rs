@@ -4533,6 +4533,81 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_stream_is_not_retracted() {
+        use crate::runtime_surface::{
+            ByteOffset, SurfaceAssistantMessageItem, SurfaceAssistantStream,
+            SurfaceAssistantStreamState, SurfaceCompletedModelResponse, SurfaceItemId,
+            SurfaceOperationFence, UuidV7,
+        };
+        use orca_core::conversation::CutShort;
+
+        let (note_tx, mut note_rx) = mpsc::channel(8);
+        let note_tx = AcpNotificationSender::Buffered(note_tx);
+        let session_id = SessionId::new("kept-reply");
+        let item_id = SurfaceItemId::new();
+        let stream_id = SurfaceStreamId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let turn_id = TurnId::new();
+        let fence = SurfaceOperationFence {
+            thread_id: crate::surface::SurfaceThreadId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            thread_owner_epoch: crate::surface::ThreadOwnerEpoch::new(1),
+            operation_id: crate::surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            generation_id: crate::surface::SurfaceGenerationId::new(1),
+        };
+        let mut streams = HashMap::new();
+        for patch in [
+            AssistantPatch::StreamOpened {
+                stream: SurfaceAssistantStream {
+                    stream_id: stream_id.clone(),
+                    fence,
+                    turn_id: turn_id.clone(),
+                    item_id: item_id.clone(),
+                    channel: AssistantChannel::Message,
+                    next_offset: ByteOffset::new(0),
+                    text: DisplayText::new(""),
+                    state: SurfaceAssistantStreamState::Open,
+                },
+            },
+            AssistantPatch::Delta {
+                stream_id,
+                offset: ByteOffset::new(0),
+                text: DisplayText::new("answer"),
+            },
+            AssistantPatch::ResponseKept {
+                response: SurfaceCompletedModelResponse {
+                    response_id: UuidV7::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+                    turn_id: turn_id.clone(),
+                    message_item: Some(SurfaceAssistantMessageItem {
+                        id: item_id,
+                        turn_id,
+                        text: DisplayText::new("answer"),
+                        pinned: false,
+                    }),
+                    reasoning_item: None,
+                    plan_item: None,
+                    tool_calls: Vec::new(),
+                },
+                reason: CutShort::Interrupted,
+            },
+        ] {
+            emit_assistant_patch(&session_id, &note_tx, &patch, &mut streams);
+        }
+        assert!(matches!(
+            note_rx.try_recv().unwrap().update,
+            SessionUpdate::AgentMessageChunk(_)
+        ));
+        assert!(matches!(
+            note_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
     fn tool_events_project_as_typed_acp_updates() {
         let request = SurfaceToolRequest {
             tool_call_id: crate::runtime_surface::SurfaceToolCallId::try_new("tool-typed").unwrap(),

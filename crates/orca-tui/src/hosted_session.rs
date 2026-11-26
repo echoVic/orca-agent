@@ -465,6 +465,12 @@ pub(crate) fn announce_runtime_ready(
     thread.set_prompt_queue_event_observer(Arc::new(move |event: &EventEnvelope| {
         if let Some(projected) = runtime_event_to_tui(event) {
             let _ = runtime_events.send(projected);
+            if event.event_type == EventType::ModelResponseCompleted
+                && let Some(reason) = event.payload.get("cut_short")
+                && let Ok(reason) = serde_json::from_value(reason.clone())
+            {
+                let _ = runtime_events.send(TuiEvent::AssistantReplyKept(reason));
+            }
             if let Some(script) = runtime_event_script(event) {
                 let _ = runtime_events.send(script);
             }
@@ -763,10 +769,24 @@ pub(crate) fn chat_messages_from_history(message: Message) -> Vec<ChatMessage> {
             content,
             reasoning_content,
             tool_calls,
+            cut_short,
             ..
         } => {
             if let Some(content) = content.filter(|text| !text.trim().is_empty()) {
-                vec![ChatMessage::Assistant(content)]
+                let mut messages = Vec::new();
+                if cut_short.is_some()
+                    && let Some(text) = reasoning_content.filter(|text| !text.trim().is_empty())
+                {
+                    messages.push(ChatMessage::Reasoning {
+                        text,
+                        expanded: false,
+                    });
+                }
+                messages.push(ChatMessage::Assistant(content));
+                if let Some(reason) = cut_short {
+                    messages.push(ChatMessage::AssistantCutShort(reason));
+                }
+                messages
             } else if let Some(reasoning) = reasoning_content.filter(|text| !text.trim().is_empty())
             {
                 vec![ChatMessage::Reasoning {
@@ -1092,6 +1112,7 @@ mod tests {
                 }],
             ),
             Message::Assistant {
+                cut_short: None,
                 content: Some("done".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -1215,6 +1236,7 @@ mod tests {
         use orca_core::conversation::{Message, RawToolCall};
         let mut replay = HistoryReplay::default();
         let _ = replay.convert(Message::Assistant {
+            cut_short: None,
             content: None,
             reasoning_content: None,
             tool_calls: vec![RawToolCall {
@@ -1326,6 +1348,7 @@ mod tests {
         use orca_core::conversation::{Message, RawToolCall};
         let mut replay = HistoryReplay::default();
         let _ = replay.convert(Message::Assistant {
+            cut_short: None,
             content: None,
             reasoning_content: None,
             tool_calls: vec![RawToolCall {
@@ -1361,6 +1384,7 @@ mod tests {
         use orca_core::conversation::{Message, RawToolCall};
         let mut replay = HistoryReplay::default();
         let assistant = Message::Assistant {
+            cut_short: None,
             content: None,
             reasoning_content: None,
             tool_calls: vec![RawToolCall {

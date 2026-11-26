@@ -9228,9 +9228,10 @@ fn provider_background_stop_authorized(
             super::SurfaceEvent::Assistant(
                 super::AssistantPatch::Delta { .. } | super::AssistantPatch::StreamDiscarded { .. },
             ) if completed_response.is_none() => {}
-            super::SurfaceEvent::Assistant(super::AssistantPatch::ResponseCompleted {
-                response,
-            }) if completed_response.is_none() => {
+            super::SurfaceEvent::Assistant(
+                super::AssistantPatch::ResponseCompleted { response }
+                | super::AssistantPatch::ResponseKept { response, .. },
+            ) if completed_response.is_none() => {
                 completed_response = Some(response);
             }
             super::SurfaceEvent::Tool(super::ToolPatch::Requested { request })
@@ -16799,6 +16800,7 @@ mod tests {
                 turn_id: retained_turn_id,
                 text: super::super::DisplayText::new("retained plan"),
                 message_offset: None,
+                cut_short: None,
                 pinned: false,
             },
         ]);
