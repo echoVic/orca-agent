@@ -1189,6 +1189,51 @@ mod tests {
     }
 
     #[test]
+    fn live_retry_at_reservation_boundary_is_not_reused_on_resume() {
+        use crate::provider_types::{ProviderError, ProviderErrorKind, ProviderRetry};
+        use std::time::Duration;
+
+        let store = Arc::new(RecordingPublicationStore::default());
+        let mut events = EventFactory::with_publication_store("recorded".into(), 0, store.clone());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        for _ in 0..EVENT_SEQUENCE_RESERVATION_SIZE {
+            sink.emit(events.error("first block")).unwrap();
+        }
+        let retry = ProviderRetry::new(
+            1,
+            5,
+            Duration::from_secs(1),
+            &ProviderError::new(ProviderErrorKind::RateLimit, "busy"),
+        );
+        sink.emit(events.provider_retry(&retry)).unwrap();
+        let recovered_next = *store.reservations.lock().unwrap().last().unwrap();
+        let mut resumed =
+            EventFactory::with_publication_store("recorded".into(), recovered_next, store.clone());
+        sink.emit(resumed.error("after resume")).unwrap();
+
+        let output = String::from_utf8(sink.writer_mut().clone()).unwrap();
+        let events: Vec<EventEnvelope> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let [.., retry, resumed] = events.as_slice() else {
+            panic!("missing retry and resumed event");
+        };
+        assert_eq!(retry.event_type, EventType::ProviderRetry);
+        assert_eq!(retry.run_id, resumed.run_id);
+        assert!(retry.seq < recovered_next);
+        assert!(retry.seq < resumed.seq);
+        assert!(
+            store
+                .semantic_events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| event.event_type != EventType::ProviderRetry)
+        );
+    }
+
+    #[test]
     fn reservation_failure_prevents_delivery_without_consuming_sequence() {
         let store = Arc::new(RecordingPublicationStore::default());
         store.fail_reservation.store(true, Ordering::SeqCst);
