@@ -53,8 +53,7 @@ pub fn mcp_startup_warnings_with_external_tools(
             _ => warnings.extend(server.errors),
         }
     }
-    let mut tool_names = registry.startup_tool_names();
-    let offered = tool_names.len();
+    let offered = registry.startup_tool_names().len();
     let builtin = orca_tools::registry::default_tool_registry().iter().count();
     let available = DEEPSEEK_MAX_TOOLS.saturating_sub(builtin.saturating_add(external));
     if external > 0 && builtin.saturating_add(external).saturating_add(offered) > DEEPSEEK_MAX_TOOLS
@@ -63,11 +62,9 @@ pub fn mcp_startup_warnings_with_external_tools(
             "DeepSeek's tool limit is {DEEPSEEK_MAX_TOOLS}. The startup estimate includes {builtin} Orca tools, {external} configured external tools, and {offered} MCP tools. The tools offered can vary by request."
         ));
     } else if offered > available {
-        tool_names.sort_unstable();
-        let left_out = offered - available;
-        let first_three_names = tool_names[available..][..left_out.min(3)].join(", ");
+        let max_left_out = offered - available;
         warnings.push(format!(
-            "MCP servers offer {offered} tools, but only {available} fit beside Orca's own {builtin} tools within DeepSeek's limit of {DEEPSEEK_MAX_TOOLS}; {left_out} are left out of requests, starting with {first_three_names}. Use disabled_tools or enabled_tools in an MCP server's configuration to choose which are sent."
+            "MCP servers offer {offered} tools. The startup estimate reserves room for all {builtin} Orca tools within DeepSeek's limit of {DEEPSEEK_MAX_TOOLS}, so up to {max_left_out} MCP tools may be left out of a request, depending on which tools it offers. Use disabled_tools or enabled_tools in an MCP server's configuration to choose which are sent."
         ));
     }
     warnings
@@ -278,16 +275,16 @@ mod tests {
     }
 
     #[test]
-    fn startup_warns_when_mcp_tools_do_not_fit() {
+    fn startup_estimates_how_many_mcp_tools_may_not_fit() {
         let available = 128 - orca_tools::registry::default_tool_registry().iter().count();
         let warnings = mcp_startup_warnings(&offered_tools(available + 4));
 
         assert!(
             matches!(warnings.as_slice(), [warning]
             if warning.starts_with("MCP servers offer ")
-                && warning.contains("4 are left out of requests")
+                && warning.contains("up to 4 MCP tools may be left out of a request")
                 && warning.contains("disabled_tools")
-                && warning.contains(&format!("mcp__docs__t{available:03}, mcp__docs__t{:03}, mcp__docs__t{:03}", available + 1, available + 2))),
+                && !warning.contains("mcp__docs__")),
             "{warnings:?}"
         );
     }
