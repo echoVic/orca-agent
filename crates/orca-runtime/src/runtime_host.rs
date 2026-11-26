@@ -47561,7 +47561,11 @@ done
         let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
-        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), Some(5))];
+        // The server never answers, so it is connecting until its startup
+        // timeout ends it: a turn that waited for it would end no sooner.
+        let server = slow_mcp_server("slow", cwd.path(), None);
+        let startup_timeout = Duration::from_millis(server.startup_timeout_ms.unwrap());
+        config.mcp_servers = vec![server];
         let host = RuntimeHost::start().expect("start runtime host");
         let thread = host
             .handle()
@@ -47593,10 +47597,10 @@ done
             "the turn ended as {:?}",
             value.terminal
         );
-        assert!(
-            took < Duration::from_secs(1),
-            "the turn took {took:?} to stop"
-        );
+        // Stopping takes a few durable commits after the 25 ms wait poll sees
+        // the cancel, which a loaded machine can stretch past a second; waiting
+        // for the server would take its whole startup timeout.
+        assert!(took < startup_timeout / 3, "the turn took {took:?} to stop");
         assert!(
             thread.mcp_registry().is_starting(),
             "the server is still connecting"
