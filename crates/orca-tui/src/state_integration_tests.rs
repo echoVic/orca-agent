@@ -2094,6 +2094,114 @@ fn failed_terminal_without_an_error_explains_the_missing_diagnostic() {
     ));
 }
 
+/// Plays a turn the user ends by denying its approval with the events a real
+/// run sends, in their order: the mock provider in a terminal, `bash pwd` in
+/// suggest mode, answered Deny, each event the reducer received written to a
+/// file (the projection syncs between them carry no message and are left
+/// out). The runtime ends the turn as failed for want of an approval.
+fn end_a_turn_with_your_denial(state: &mut AppState) {
+    let (action_tx, _action_rx) = mpsc::unbounded();
+    state.push_message(ChatMessage::User("bash pwd".to_string()));
+    state.enter_running();
+    state.update(TuiEvent::TurnStarted {
+        turn: 0,
+        task: Some(crate::protocol::TuiTaskLifecycle {
+            id: "typed-user-turn-1".to_string(),
+            kind: "agent".to_string(),
+            status: "running".to_string(),
+            turn: 0,
+        }),
+    });
+    state.update(TuiEvent::ReasoningDelta(
+        "Mock runtime is preserving the DeepSeek reasoning channel.".to_string(),
+    ));
+    state.update(TuiEvent::ToolRequested {
+        id: "mock-tool-1".to_string(),
+        name: "bash".to_string(),
+        target: Some("pwd".to_string()),
+    });
+    state.update(TuiEvent::ApprovalNeeded {
+        key: interaction_key(TuiInteractionKind::Approval, "approval"),
+        tool: "bash".to_string(),
+        target: Some("pwd".to_string()),
+        preview: Some("bash requested shell".to_string()),
+    });
+    crate::approval_actions::resolve_approval_option(state, &action_tx, ApprovalOption::Deny);
+    state.update(TuiEvent::ToolCompleted {
+        id: "mock-tool-1".to_string(),
+        name: "bash".to_string(),
+        status: "denied".to_string(),
+        output: "denied through runtime surface".to_string(),
+        diff: None,
+        kind: None,
+    });
+    state.update(TuiEvent::Diagnostic(
+        crate::diagnostics::TuiDiagnostic::from_surface_terminal(
+            &orca_runtime::surface::OperationTerminal::Failed {
+                class: orca_runtime::surface::FailureClass::LegacyApprovalRequired,
+                message: orca_runtime::surface::SafeDiagnosticText::try_new(
+                    "permission request denied by the client",
+                )
+                .unwrap(),
+            },
+        )
+        .unwrap(),
+    ));
+    state.update(TuiEvent::SessionCompleted {
+        status: "failed".to_string(),
+    });
+}
+
+/// After the user's own "no", the turn's failed status is their answer, not a
+/// failure without a cause: the turn ends with the notice alone.
+#[test]
+fn a_turn_ended_by_your_denial_shows_the_notice_and_no_failure_line() {
+    let mut state = state();
+
+    end_a_turn_with_your_denial(&mut state);
+
+    assert_eq!(state.status, AppStatus::Idle);
+    let notices = state
+        .transcript
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(message, ChatMessage::System { text, .. }
+                if text == "Denied. Tell Orca what to do instead.")
+        })
+        .count();
+    assert_eq!(notices, 1, "{:?}", state.transcript.messages);
+    assert!(
+        !state.transcript.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::Diagnostic(diagnostic)
+                if diagnostic.code() == "runtime.missing_diagnostic"
+                    || diagnostic.code() == "permission.approval_unavailable"
+        )),
+        "{:?}",
+        state.transcript.messages
+    );
+}
+
+/// The notice explains the turn the user denied, not the next one.
+#[test]
+fn the_turn_after_your_denial_that_fails_without_a_cause_still_says_so() {
+    let mut state = state();
+    end_a_turn_with_your_denial(&mut state);
+    state.push_message(ChatMessage::User("run it".to_string()));
+    state.enter_running();
+
+    state.update(TuiEvent::SessionCompleted {
+        status: "failed".to_string(),
+    });
+
+    assert!(matches!(
+        state.transcript.messages.last(),
+        Some(ChatMessage::Diagnostic(diagnostic))
+            if diagnostic.code() == "runtime.missing_diagnostic"
+    ));
+}
+
 /// An error the TUI shows for something the user did, such as a command
 /// typed while the turn runs, says nothing about how the turn ended.
 #[test]

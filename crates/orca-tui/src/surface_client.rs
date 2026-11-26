@@ -4670,6 +4670,120 @@ mod tests {
         }
     }
 
+    /// A turn the user ended by denying its approval reads the same when its
+    /// conversation is rebuilt from the snapshot, back from a side
+    /// conversation or an agent's view, as it did live: the notice, not
+    /// "Approval could not be requested". The runtime still ends the turn as
+    /// failed for want of an approval.
+    #[test]
+    fn a_turn_ended_by_a_denied_approval_is_rebuilt_with_the_notice() {
+        let _guard = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "typed TUI denial")
+            .expect("runtime thread");
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let worker_controller = controller.clone();
+        let worker_thread = thread.clone();
+        let worker_event_tx = event_tx.clone();
+        let (worker_result_tx, worker_result_rx) = mpsc::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let result = run_through_dispatch(
+                &worker_thread,
+                HostedTurnRequest::new("bash pwd"),
+                config,
+                &worker_controller,
+                &worker_event_tx,
+            );
+            let _ = worker_result_tx.send(result);
+        });
+        let key = loop {
+            match event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("approval event")
+            {
+                TuiEvent::ApprovalNeeded { key, .. } => break key,
+                _ => {}
+            }
+        };
+        assert!(
+            controller
+                .respond_surface_interaction(
+                    &key,
+                    &crate::protocol::TuiInteractionResponse::Approval(false)
+                )
+                .expect("typed denial")
+        );
+        let outcome = worker_result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|error| {
+                let pending_events = event_rx.try_iter().collect::<Vec<_>>();
+                panic!("typed denial worker timed out: {error}; events={pending_events:?}")
+            })
+            .expect("typed denial");
+        worker.join().expect("typed denial worker");
+        assert!(matches!(
+            outcome,
+            TuiHostedOperationOutcome::Turn { status } if status == "failed"
+        ));
+
+        let snapshot = crate::surface_actions::TuiSurfaceActions::new(thread.typed_surface())
+            .read_snapshot()
+            .expect("snapshot after the denial");
+        let (_, messages) =
+            crate::hosted_session::hosted_projection_batch_from_snapshot(&thread, &snapshot);
+        assert!(
+            matches!(
+                messages.last(),
+                Some(crate::transcript_state::ChatMessage::System { text, .. })
+                    if text == "Denied. Tell Orca what to do instead."
+            ),
+            "{messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|message| matches!(
+                message,
+                crate::transcript_state::ChatMessage::Diagnostic(_)
+            )),
+            "{messages:?}"
+        );
+        // Nobody asked, or a headless run answered no for nobody: the turn
+        // still ends with its diagnostic.
+        let shows_approval_unavailable = |snapshot: &orca_runtime::surface::SurfaceSnapshot| {
+            matches!(
+                crate::surface_projection::latest_terminal_message(snapshot),
+                Some(crate::transcript_state::ChatMessage::Diagnostic(diagnostic))
+                    if diagnostic.code() == "permission.approval_unavailable"
+            )
+        };
+        let mut nobody_asked = snapshot.clone();
+        nobody_asked.interactions.clear();
+        assert!(shows_approval_unavailable(&nobody_asked));
+        let mut headless = snapshot.clone();
+        for operation in headless
+            .foreground_operation
+            .iter_mut()
+            .chain(headless.operation_history.iter_mut())
+        {
+            operation.intent.origin = orca_runtime::surface::OperationOrigin::Headless;
+        }
+        assert!(shows_approval_unavailable(&headless));
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
     #[test]
     fn typed_ordinary_turn_routes_permission_through_runtime_surface() {
         let _guard = crate::test_support::lock_process_env();

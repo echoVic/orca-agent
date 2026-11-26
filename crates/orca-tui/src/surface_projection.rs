@@ -2323,9 +2323,12 @@ pub(crate) fn operation_terminal_events(terminal: &OperationTerminal) -> Vec<Tui
     events
 }
 
-pub(crate) fn latest_terminal_diagnostic(
+/// How the latest finished turn of `snapshot` ended, for a conversation
+/// rebuilt from it: the runtime's diagnostic, or, for a turn the user stopped
+/// by denying an approval, the notice the live turn showed in its place.
+pub(crate) fn latest_terminal_message(
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
-) -> Option<crate::diagnostics::TuiDiagnostic> {
+) -> Option<crate::transcript_state::ChatMessage> {
     if snapshot
         .foreground_operation
         .as_ref()
@@ -2333,20 +2336,58 @@ pub(crate) fn latest_terminal_diagnostic(
     {
         return None;
     }
-    snapshot
+    let operation = snapshot
         .foreground_operation
-        .as_ref()
-        .and_then(|operation| operation.terminal.as_ref())
-        .or_else(|| {
-            snapshot
-                .operation_history
-                .iter()
-                .rev()
-                .find_map(|operation| operation.terminal.as_ref())
-        })
-        .and_then(|record| {
-            crate::diagnostics::TuiDiagnostic::from_surface_terminal(&record.terminal)
-        })
+        .iter()
+        .chain(snapshot.operation_history.iter().rev())
+        .find(|operation| operation.terminal.is_some())?;
+    let terminal = &operation.terminal.as_ref()?.terminal;
+    if stopped_by_a_denied_approval(snapshot, operation, terminal) {
+        return Some(crate::transcript_state::ChatMessage::System {
+            text: crate::approval_actions::DENIED_APPROVAL_NOTICE.to_string(),
+            expanded: false,
+        });
+    }
+    crate::diagnostics::TuiDiagnostic::from_surface_terminal(terminal)
+        .map(crate::transcript_state::ChatMessage::Diagnostic)
+}
+
+/// The operation ended for want of an approval after the user answered one of
+/// its approvals no. Only an operation the TUI started counts: a headless run
+/// that fails closed answers no for nobody.
+fn stopped_by_a_denied_approval(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+    operation: &orca_runtime::surface::OperationRecord,
+    terminal: &OperationTerminal,
+) -> bool {
+    use orca_runtime::surface::{
+        FailureClass, OperationOrigin, SurfaceAllowDeny, SurfaceInteractionLifecycle,
+        SurfaceInteractionSafeProjection,
+    };
+    matches!(
+        terminal,
+        OperationTerminal::Failed {
+            class: FailureClass::LegacyApprovalRequired,
+            ..
+        }
+    ) && matches!(
+        operation.intent.origin,
+        OperationOrigin::TuiUser | OperationOrigin::TuiWorkflowNotification { .. }
+    ) && snapshot.interactions.iter().any(|interaction| {
+        interaction.fence.operation_id == operation.operation_id
+            && matches!(
+                &interaction.lifecycle,
+                SurfaceInteractionLifecycle::Resolved { receipt }
+                    if matches!(
+                        receipt.safe_projection,
+                        SurfaceInteractionSafeProjection::ToolApproval { allowed: false }
+                            | SurfaceInteractionSafeProjection::PermissionRequest {
+                                decision: SurfaceAllowDeny::Deny,
+                                ..
+                            }
+                    )
+            )
+    })
 }
 
 pub(crate) fn operation_terminal_status(terminal: &OperationTerminal) -> Option<&'static str> {

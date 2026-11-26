@@ -895,13 +895,15 @@ impl AppState {
                 self.clear_receiving_tool_progress();
                 // The runtime ends a turn whose approval was denied the same
                 // way as one nobody could approve; after the user's own "no"
-                // that is their answer, not an error.
+                // that is their answer, not an error. The notice explains the
+                // end, so the turn's failed status after it adds nothing.
                 if self.denied_approval_stops_turn
                     && diagnostic.code() == "permission.approval_unavailable"
                 {
                     self.denied_approval_stops_turn = false;
+                    self.turn_diagnostic_seen = true;
                     self.push_message(ChatMessage::System {
-                        text: "Denied. Tell Orca what to do instead.".to_string(),
+                        text: crate::approval_actions::DENIED_APPROVAL_NOTICE.to_string(),
                         expanded: false,
                     });
                     return;

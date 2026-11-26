@@ -406,6 +406,72 @@ fn tui_permission_round_trips_through_the_runtime_surface() {
     assert_eq!(status.code(), Some(130), "TUI exited with {status}");
 }
 
+/// A person who denies the approval a turn waits on reads Orca's notice and
+/// nothing that looks like a crash. The runtime ends that turn as failed for
+/// want of an approval, which used to put "Task failed without diagnostic
+/// details" under the notice. The next prompt then runs as usual.
+#[test]
+fn tui_denied_approval_ends_the_turn_with_the_notice_and_no_failure_line() {
+    const NOTICE: &str = "Denied. Tell Orca what to do instead.";
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(home.path().join("config.toml"), "mode = \"suggest\"\n")
+        .expect("configure explicit suggest mode");
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "bash pwd")
+        .expect("spawn denied-approval TUI in PTY");
+
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    receive_until(
+        &process,
+        &mut output,
+        "requested shell",
+        Duration::from_secs(20),
+        "TUI did not ask to approve bash",
+    );
+    process.write(b"4").expect("deny bash");
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        NOTICE,
+        "TUI did not answer the denial with its notice",
+    );
+    // Typed the way a person types it: the prompt shows in the composer
+    // before it is sent.
+    process
+        .write(PROMPT.as_bytes())
+        .expect("type the next prompt");
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        PROMPT,
+        "the composer did not take the next prompt after the denial",
+    );
+    process.write(b"\r").expect("send the next prompt");
+    assert_screen_shows(
+        &process,
+        &mut output,
+        ASSISTANT_SENTINEL,
+        "the prompt after the denial did not run",
+    );
+
+    let screen = reconstruct_screen(&output);
+    assert_eq!(screen.matches(NOTICE).count(), 1, "screen=\n{screen}");
+    assert!(
+        !screen.contains("Task failed without diagnostic details"),
+        "screen=\n{screen}"
+    );
+    assert!(
+        !contains_rendered_text(&output, "runtime.missing_diagnostic"),
+        "a failure line was drawn at some point; screen=\n{screen}"
+    );
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
 #[test]
 fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");

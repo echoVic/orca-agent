@@ -800,7 +800,8 @@ pub struct AppState {
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
     /// The turn under way, or the one that just ended, has shown a diagnostic
-    /// the runtime reported, so its end needs no generic one (see
+    /// the runtime reported, or the notice shown for it after the user denied
+    /// an approval, so its end needs no generic one (see
     /// `TuiEvent::SessionCompleted`). An error the TUI shows for something the
     /// user did (`ChatMessage::Error`) is not one. Cleared when a turn starts
     /// and when one ends.
