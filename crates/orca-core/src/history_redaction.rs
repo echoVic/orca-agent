@@ -3,9 +3,7 @@ use crate::redaction::{is_sensitive_key, redact_sensitive_text as redact_plain_t
 pub fn redact_sensitive_text(value: &str) -> String {
     // Structured tool output can carry multiline text inside a JSON string.
     // Redact its decoded value so escaped line breaks act like ordinary ones.
-    if value.contains('\\')
-        && let Ok(mut json) = serde_json::from_str(value)
-    {
+    if let Ok(mut json) = serde_json::from_str(value) {
         return if redact_json_strings(&mut json) {
             json.to_string()
         } else {
@@ -41,5 +39,20 @@ fn redact_json_strings(value: &mut serde_json::Value) -> bool {
             }
         }),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_sensitive_text;
+
+    #[test]
+    fn redaction_preserves_json_with_unescaped_tool_text() {
+        let redacted = redact_sensitive_text(r#"{ "output": "token=demo-value" }"#);
+        let parsed: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(parsed["output"], "token=<redacted>");
+
+        let unchanged = r#"{ "output": "ordinary text" }"#;
+        assert_eq!(redact_sensitive_text(unchanged), unchanged);
     }
 }

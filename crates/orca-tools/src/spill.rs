@@ -13,8 +13,10 @@ pub(crate) fn completed_text(
     fallback: impl FnOnce(String) -> (String, bool),
 ) -> ToolResult {
     if let Some((output, spill)) = preview(spill_dir, &request.id, &text) {
-        let mut result = ToolResult::completed(request, output, true);
-        result.set_spill(spill);
+        let mut result = ToolResult::completed(request, output, spill.is_some());
+        if let Some(spill) = spill {
+            result.set_spill(spill);
+        }
         return result;
     }
     let (output, truncated) = fallback(text);
@@ -28,21 +30,37 @@ pub(crate) fn shorten_result(result: &mut ToolResult, spill_dir: Option<&Path>) 
         && let Some((output, spill)) = preview(spill_dir, &result.id, text)
     {
         result.output = Some(output);
-        result.set_spill(spill);
+        if let Some(spill) = spill {
+            result.set_spill(spill);
+        }
     }
 }
 
-fn preview(spill_dir: Option<&Path>, id: &str, text: &str) -> Option<(String, ToolOutputSpill)> {
+fn preview(
+    spill_dir: Option<&Path>,
+    id: &str,
+    text: &str,
+) -> Option<(String, Option<ToolOutputSpill>)> {
     let dir = spill_dir?;
     // No ordinary token spans fewer than one byte.
     if text.len() <= MAX_INLINE_TOKENS {
         return None;
     }
     let tokenizer = cl100k_base_singleton();
-    let tokens = tokenizer.encode_ordinary(text);
-    if tokens.len() <= MAX_INLINE_TOKENS {
+    let original_tokens = tokenizer.encode_ordinary(text);
+    if original_tokens.len() <= MAX_INLINE_TOKENS {
         return None;
     }
+    let redacted = orca_core::history_redaction::redact_sensitive_text(text);
+    let tokens = if redacted == text {
+        original_tokens
+    } else {
+        tokenizer.encode_ordinary(&redacted)
+    };
+    if tokens.len() <= MAX_INLINE_TOKENS {
+        return Some((redacted, None));
+    }
+    let text = redacted.as_str();
     let reference = |bytes| ToolOutputSpill::new(dir.to_owned(), id.to_owned(), bytes);
     let notice_tokens = tokenizer
         .encode_ordinary(&reference(text.len())?.notice())
@@ -65,14 +83,44 @@ fn preview(spill_dir: Option<&Path>, id: &str, text: &str) -> Option<(String, To
         }
         retained = retained.checked_sub(count - MAX_INLINE_TOKENS)?;
     };
-    let saved = orca_core::history_redaction::redact_sensitive_text(text);
-    orca_platform::fs::write_confined_private(&spill.path(), saved.as_bytes()).ok()?;
-    Some((output, spill))
+    orca_platform::fs::write_confined_private(&spill.path(), text.as_bytes()).ok()?;
+    Some((output, Some(spill)))
 }
 
 pub(crate) enum ReadTarget {
     Workspace(PathBuf),
     Spill(PathBuf, File),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview;
+
+    #[test]
+    fn spill_preview_uses_the_redacted_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = format!(
+            "{}\ntoken=\"{} fixture-value\"",
+            " public".repeat(16_000),
+            " private".repeat(16_000),
+        );
+        let (preview, spill) = preview(Some(dir.path()), "call-demo", &output).unwrap();
+        let spill = spill.unwrap();
+        let saved = std::fs::read_to_string(spill.path()).unwrap();
+        assert!(saved.ends_with("token=\"<redacted>\""));
+        assert!(spill.preview(&preview).ends_with("token=\"<redacted>\""));
+        assert!(!preview.contains("fixture-value"));
+    }
+
+    #[test]
+    fn a_redacted_result_that_fits_stays_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = format!("token=\"{}\"", " private".repeat(16_000));
+        let (output, spill) = preview(Some(dir.path()), "call-demo", &input).unwrap();
+        assert_eq!(output, "token=\"<redacted>\"");
+        assert!(spill.is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 }
 
 pub(crate) fn resolve_read_path(
