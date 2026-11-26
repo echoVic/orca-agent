@@ -21,6 +21,7 @@ pub enum ToolName {
     TaskSendInput,
     TaskWait,
     Edit,
+    ApplyPatch,
     WriteFile,
     GitStatus,
     RunScript,
@@ -77,6 +78,7 @@ impl ToolName {
             "task_send_input" => Self::TaskSendInput,
             "task_wait" => Self::TaskWait,
             "edit" => Self::Edit,
+            "apply_patch" => Self::ApplyPatch,
             "write_file" => Self::WriteFile,
             "git_status" => Self::GitStatus,
             "run_script" => Self::RunScript,
@@ -145,6 +147,7 @@ impl ToolName {
             Self::TaskSendInput => "task_send_input",
             Self::TaskWait => "task_wait",
             Self::Edit => "edit",
+            Self::ApplyPatch => "apply_patch",
             Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
             Self::RunScript => "run_script",
@@ -199,6 +202,7 @@ impl ToolName {
             Self::TaskSendInput => "task_send_input",
             Self::TaskWait => "task_wait",
             Self::Edit => "edit",
+            Self::ApplyPatch => "apply_patch",
             Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
             Self::RunScript => "run_script",
@@ -255,6 +259,7 @@ impl ToolName {
             "task_send_input" => Self::TaskSendInput,
             "task_wait" => Self::TaskWait,
             "edit" => Self::Edit,
+            "apply_patch" => Self::ApplyPatch,
             "write_file" => Self::WriteFile,
             "git_status" => Self::GitStatus,
             "run_script" => Self::RunScript,
@@ -604,6 +609,9 @@ impl ToolStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileChangePreview {
+    Patch {
+        text: String,
+    },
     UnifiedDiff {
         text: String,
         truncated: bool,
@@ -612,6 +620,27 @@ pub enum FileChangePreview {
         path: String,
         max_input_bytes: usize,
     },
+}
+
+impl FileChangePreview {
+    pub fn patch_diff(&self) -> Option<&str> {
+        match self {
+            Self::Patch { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    pub fn display_text(&self) -> String {
+        match self {
+            Self::UnifiedDiff { text, .. } | Self::Patch { text } => text.clone(),
+            Self::Omitted {
+                path,
+                max_input_bytes,
+            } => {
+                format!("[Diff preview omitted for {path}: input exceeds {max_input_bytes} bytes]")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

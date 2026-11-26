@@ -249,6 +249,20 @@ impl RewindTurn {
     /// Errors never propagate: they are recorded as snapshot limitations so
     /// the tool keeps executing and the checkpoint is honest about its gaps.
     pub(crate) fn capture_pre_image(&self, cwd: &Path, request: &ToolRequest) {
+        if request.name == ToolName::ApplyPatch {
+            let paths = orca_tools::apply_patch::checked_paths(request, cwd);
+            let mut state = lock_state(&self.inner);
+            for path in paths {
+                let relative = path.strip_prefix(&state.root).ok().and_then(Path::to_str);
+                if let Some(relative) = relative {
+                    let resolved = resolve_request_path(&state.root, &state.root, relative);
+                    Self::capture_path(&mut state, resolved);
+                } else {
+                    state.limitations.insert("outside_root".to_string());
+                }
+            }
+            return;
+        }
         if !matches!(request.name, ToolName::Edit | ToolName::WriteFile) {
             return;
         }
@@ -262,7 +276,12 @@ impl RewindTurn {
             return;
         };
         let mut state = lock_state(&self.inner);
-        let resolved = match resolve_request_path(&state.root, cwd, path) {
+        let resolved = resolve_request_path(&state.root, cwd, path);
+        Self::capture_path(&mut state, resolved);
+    }
+
+    fn capture_path(state: &mut RewindTurnState, resolved: Result<(String, PathBuf), String>) {
+        let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(limitation) => {
                 state.limitations.insert(limitation);

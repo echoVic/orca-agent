@@ -246,6 +246,7 @@ pub(crate) fn omit_unavailable_session_tools(
 ) {
     tools.retain(|tool| match tool.name.as_str() {
         "run_script" => config.tools.script.enabled,
+        "apply_patch" => config.tools.apply_patch,
         "workflow_send_message"
         | "workflow_read_messages"
         | "workflow_clear_messages"
@@ -420,6 +421,12 @@ pub fn validate_tool_invocation(
                 .error
                 .clone()
                 .unwrap_or_else(|| "custom agent tool is not allowed".into()),
+        });
+    }
+    if invocation.effective.name == ToolName::ApplyPatch && !config.tools.apply_patch {
+        return Err(ToolExecutionFailure {
+            request: invocation.effective.clone(),
+            message: "apply_patch is turned off. Enable it with [tools] apply_patch = true.".into(),
         });
     }
     validate_shell_readiness(invocation, config)?;
@@ -760,6 +767,75 @@ mod tests {
         .into_iter()
         .map(|tool| tool.name)
         .collect()
+    }
+
+    #[test]
+    fn apply_patch_is_absent_unless_enabled() {
+        let mut config = config_with_external(Vec::new());
+        let registry = McpRegistry::default();
+        let requested = request(
+            ToolName::plain("apply_patch"),
+            ActionKind::Read,
+            None,
+            Some(r#"{"input":"*** Begin Patch\n*** Add File: a\n+a\n*** End Patch"}"#),
+        );
+        for enabled in [false, true] {
+            if enabled {
+                config.tools = toml::from_str("apply_patch = true").unwrap();
+            }
+            let mut tools = provider_tool_schema_override(
+                0,
+                &SubagentType::General,
+                AgentToolPolicyContext::unrestricted(),
+                &registry,
+                &[],
+            )
+            .unwrap();
+            super::omit_unavailable_session_tools(&mut tools, &config, false);
+            assert_eq!(schema_names(&tools).contains(&"apply_patch"), enabled);
+            assert!(schema_names(&tools).contains(&"edit"));
+            let invocation = prepare_tool_invocation(&requested, 0, &registry, &config);
+            assert_eq!(
+                validate_tool_invocation(&invocation, &registry, &config).is_ok(),
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn apply_patch_needs_the_same_approval_as_edit() {
+        use orca_core::approval_types::ApprovalDecision;
+        let mut config = config_with_external(Vec::new());
+        config.tools = toml::from_str("apply_patch = true").unwrap();
+        let registry = McpRegistry::default();
+        for (name, args) in [
+            (
+                ToolName::Edit,
+                r#"{"path":"a","old_text":"old","new_text":"new"}"#,
+            ),
+            (
+                ToolName::plain("apply_patch"),
+                r#"{"input":"*** Begin Patch\n*** Add File: a\n+a\n*** End Patch"}"#,
+            ),
+        ] {
+            let requested = request(name, ActionKind::Read, None, Some(args));
+            let invocation = prepare_tool_invocation(&requested, 0, &registry, &config);
+            let approval = approval_request_for_invocation(&invocation).unwrap();
+            assert_eq!(approval.action, ActionKind::Write);
+            for (mode, expected) in [
+                (ApprovalMode::Suggest, ApprovalDecision::Ask),
+                (ApprovalMode::Plan, ApprovalDecision::Deny),
+            ] {
+                let decision = crate::runtime_approval::resolve_for_request(
+                    &orca_approval::ApprovalPolicy::new(mode),
+                    &approval,
+                    &invocation.effective,
+                    requested.name.as_str(),
+                    approval.target.as_deref(),
+                );
+                assert_eq!(decision.decision, expected);
+            }
+        }
     }
 
     #[test]

@@ -576,6 +576,73 @@ fn turn_capture_records_pre_images_before_writes() {
     assert!(!stats.omitted);
 }
 
+#[test]
+fn rewind_restores_every_file_a_patch_changed() {
+    let mut fixture = Fixture::new();
+    fixture.append_turn("apply the patch", "patched");
+    let cwd = fixture.cwd().canonicalize().unwrap();
+    for (name, text) in [
+        ("update", "old\n"),
+        ("delete", "removed\n"),
+        ("move", "original\n"),
+    ] {
+        fixture.write_workspace_file(name, text);
+    }
+    let mut config = orca_core::config::RunConfig::default();
+    config.cwd = Some(cwd.clone());
+    config.history_mode = orca_core::config::HistoryMode::Record;
+    let mut conversation = Conversation::new();
+    conversation.add_system("system".into());
+    conversation.add_user("apply the patch".into());
+    let turn = crate::rewind::begin_turn(
+        &config,
+        &cwd,
+        "patch-turn",
+        &conversation,
+        Some(&mut fixture.writer),
+    )
+    .unwrap();
+    let request = ToolRequest {
+        id: "patch".into(),
+        name: ToolName::plain("apply_patch"),
+        action: ActionKind::Write,
+        target: None,
+        raw_arguments: Some(serde_json::json!({"input": "*** Begin Patch\n*** Update File: update\n@@\n-old\n+changed\n*** Delete File: delete\n*** Update File: move\n*** Move to: moved\n@@\n-original\n+new\n*** Add File: new/created\n+added\n*** End Patch"}).to_string()),
+    };
+    turn.capture_pre_image(&cwd, &request);
+    let result = orca_tools::registry::default_tool_registry()
+        .execute(&request, &orca_tools::ToolContext::new(&cwd));
+    assert_eq!(
+        result.status,
+        orca_core::tool_types::ToolStatus::Completed,
+        "{:?}",
+        result.error
+    );
+    let snapshot = turn.finish_record().unwrap().unwrap();
+    assert_eq!(snapshot.files.len(), 5);
+    let store = fixture.store();
+    let plan = build_plan(
+        &cwd,
+        &store,
+        &[snapshot_view(&snapshot)],
+        PlanOptions { target_ordinal: 0 },
+    )
+    .unwrap();
+    let report = Applier::new(cwd.clone(), store, fixture.store_dir().join("journals"))
+        .apply(&plan)
+        .unwrap();
+    assert!(!report.partial);
+    for (name, text) in [
+        ("update", "old\n"),
+        ("delete", "removed\n"),
+        ("move", "original\n"),
+    ] {
+        assert_eq!(std::fs::read_to_string(cwd.join(name)).unwrap(), text);
+    }
+    assert!(!cwd.join("moved").exists());
+    assert!(!cwd.join("new/created").exists());
+}
+
 fn write_request(path: &str) -> ToolRequest {
     ToolRequest {
         id: format!("call-{path}"),

@@ -3,7 +3,7 @@ use std::io;
 use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
 use orca_core::config::RunConfig;
-use orca_core::tool_types::{ToolRequest, ToolResult};
+use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 
 use crate::runtime_permission::TurnPermissionOverlay;
 
@@ -70,9 +70,8 @@ impl<'a> RuntimeToolApprovalPolicy<'a> {
             .clone()
             .unwrap_or_else(|| request.name.as_str().to_string());
         let target = approval.target.clone().or_else(|| request.target.clone());
-        let decision = self
-            .policy
-            .resolve_for_tool(&approval, &tool, target.as_deref());
+        let decision =
+            resolve_for_request(self.policy, &approval, request, &tool, target.as_deref());
         if self.permission_overlay.strict_auto_review()
             && decision.decision == ApprovalDecision::Allow
         {
@@ -91,6 +90,28 @@ impl<'a> RuntimeToolApprovalPolicy<'a> {
             }
         }
     }
+}
+
+pub(crate) fn resolve_for_request(
+    policy: &ApprovalPolicy,
+    approval: &ApprovalRequest,
+    request: &ToolRequest,
+    tool: &str,
+    target: Option<&str>,
+) -> ApprovalResolution {
+    if request.name == ToolName::ApplyPatch {
+        let paths = orca_tools::apply_patch::requested_paths(request);
+        return paths
+            .iter()
+            .map(|path| policy.resolve_for_tool(approval, tool, Some(path)))
+            .max_by_key(|resolution| match resolution.decision {
+                ApprovalDecision::Deny => 2,
+                ApprovalDecision::Ask => 1,
+                ApprovalDecision::Allow => 0,
+            })
+            .unwrap_or_else(|| policy.resolve_for_tool(approval, tool, None));
+    }
+    policy.resolve_for_tool(approval, tool, target)
 }
 
 impl<'a> RuntimeConfigApprovalHandler<'a> {

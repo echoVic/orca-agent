@@ -7,8 +7,7 @@ use orca_core::external_config::ExternalToolConfig;
 use orca_core::tool_types::{ToolName, ToolOutputTruncation, ToolRequest, ToolResult};
 use orca_mcp::{McpElicitationHandler, McpRegistry};
 
-#[cfg(test)]
-mod apply_patch;
+pub mod apply_patch;
 pub mod bash;
 pub mod deepseek_web;
 pub mod edit;

@@ -117,7 +117,8 @@ impl SurfaceToolCompletionReceipt {
             serde_json::to_vec(result).expect("surface tool result serializes"),
         );
         let file_change_digest = result.file_change.as_ref().and_then(|change| match change {
-            SurfaceFileChange::UnifiedDiff { digest, .. } => Some(digest.clone()),
+            SurfaceFileChange::UnifiedDiff { digest, .. }
+            | SurfaceFileChange::Patch { digest, .. } => Some(*digest),
             SurfaceFileChange::PreviewOmitted { .. } => None,
         });
         Self {
@@ -554,6 +555,10 @@ pub enum AssistantPatch {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SurfaceFileChange {
+    Patch {
+        text: DisplayText,
+        digest: Sha256Digest,
+    },
     UnifiedDiff {
         path: CanonicalPath,
         text: DisplayText,

@@ -696,6 +696,23 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     ));
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
+            "apply_patch",
+            "Apply a patch to one or more workspace files. The whole patch is checked before any writes. If any check fails, no files are written. Use *** Add File, *** Delete File or *** Update File headers. Updates use @@ hunks with context lines prefixed by a space, removals by -, and additions by +. An update can include *** Move to immediately after its header. Example:\n*** Begin Patch\n*** Add File: notes.txt\n+Hello\n*** End Patch",
+            json!({
+                "type": "object",
+                "properties": { "input": { "type": "string" } },
+                "required": ["input"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::filesystem_write(),
+            ToolExposure::Direct,
+            RendererHint::Write,
+            false,
+        ),
+        BuiltinExecutor::ApplyPatch,
+    ));
+    registry.register(BuiltinTool::new(
+        conservative_builtin_spec(
             "write_file",
             "Create or overwrite a file with the given content. Use for creating new files or completely replacing file contents.",
             json!({
@@ -2106,6 +2123,9 @@ impl Tool for BuiltinTool {
             BuiltinExecutor::Edit => {
                 edit::execute_or_cancel(request, ctx.cwd, || ctx.is_cancelled())
             }
+            BuiltinExecutor::ApplyPatch => {
+                crate::apply_patch::execute(request, ctx.cwd, || ctx.is_cancelled())
+            }
             BuiltinExecutor::WriteFile => write_file::execute(request, ctx.cwd),
             BuiltinExecutor::GitStatus => {
                 git::status_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
@@ -2209,6 +2229,7 @@ enum BuiltinExecutor {
     TaskWait,
     SubagentMessage,
     Edit,
+    ApplyPatch,
     WriteFile,
     GitStatus,
     RunScript,

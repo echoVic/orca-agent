@@ -1,10 +1,15 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::file_admission::{MAX_EDIT_FILE_BYTES, read_text_file_with_limit};
+use orca_core::tool_types::{FileChangePreview, ToolRequest, ToolResult, truncate_output};
+
+use crate::file_admission::{
+    MAX_DIFF_OUTPUT_BYTES, MAX_EDIT_FILE_BYTES, build_file_change_preview_with_headers,
+    read_text_file_with_limit,
+};
 use crate::resolve_workspace_path;
 
 #[derive(Debug)]
@@ -171,9 +176,19 @@ pub(crate) struct PlannedOp {
     pub(crate) move_to: Option<PlannedTarget>,
     pub(crate) before: Option<String>,
     pub(crate) after: Option<String>,
+    added: usize,
+    removed: usize,
 }
 
 pub(crate) fn preflight(patch: &Patch, cwd: &Path) -> Result<Plan, PatchError> {
+    preflight_or_cancel(patch, cwd, &|| false)
+}
+
+fn preflight_or_cancel(
+    patch: &Patch,
+    cwd: &Path,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Plan, PatchError> {
     let root = cwd
         .canonicalize()
         .map_err(|error| PatchError(format!("cannot resolve workspace: {error}")))?;
@@ -186,27 +201,43 @@ pub(crate) fn preflight(patch: &Patch, cwd: &Path) -> Result<Plan, PatchError> {
             PatchOp::Update { path, move_to, .. } => ("update", path, move_to.as_deref()),
         };
         let planned = (|| {
-            let target = resolve_target(cwd, &root, path, &mut seen)?;
+            if should_cancel() {
+                return Err("patch cancelled".into());
+            }
+            let removes_source = matches!(op, PatchOp::Delete { .. }) || destination.is_some();
+            let target = resolve_target(cwd, &root, path, removes_source, &mut seen)?;
             let move_to = destination
-                .map(|dest| resolve_target(cwd, &root, dest, &mut seen))
+                .map(|dest| resolve_target(cwd, &root, dest, false, &mut seen))
                 .transpose()?;
             if let Some(dest) = &move_to {
                 require_missing(dest)?;
             }
-            let (before, after) = match op {
+            let (before, after, (added, removed)) = match op {
                 PatchOp::Add { lines, .. } => {
                     require_missing(&target)?;
                     let mut text = lines.join("\n");
                     if !lines.is_empty() {
                         text.push('\n');
                     }
-                    (None, Some(text))
+                    (None, Some(text), (lines.len(), 0))
                 }
-                PatchOp::Delete { .. } => (Some(read_existing(&target)?), None),
+                PatchOp::Delete { .. } => {
+                    let before = read_existing(&target, should_cancel)?;
+                    let removed = before.lines().count();
+                    (Some(before), None, (0, removed))
+                }
                 PatchOp::Update { hunks, .. } => {
-                    let before = read_existing(&target)?;
+                    let before = read_existing(&target, should_cancel)?;
                     let after = apply_hunks(&before, hunks)?;
-                    (Some(before), Some(after))
+                    let counts = hunks.iter().flat_map(|hunk| &hunk.lines).fold(
+                        (0, 0),
+                        |(added, removed), line| match line {
+                            HunkLine::Add(_) => (added + 1, removed),
+                            HunkLine::Remove(_) => (added, removed + 1),
+                            HunkLine::Context(_) => (added, removed),
+                        },
+                    );
+                    (Some(before), Some(after), counts)
                 }
             };
             if let Some(after) = &after
@@ -219,6 +250,8 @@ pub(crate) fn preflight(patch: &Patch, cwd: &Path) -> Result<Plan, PatchError> {
                 move_to,
                 before,
                 after,
+                added,
+                removed,
             })
         })()
         .map_err(|reason: String| {
@@ -233,11 +266,12 @@ fn resolve_target(
     cwd: &Path,
     root: &Path,
     label: &str,
+    removes_source: bool,
     seen: &mut HashSet<PathBuf>,
 ) -> Result<PlannedTarget, String> {
     let path = resolve_workspace_path(cwd, Some(label))?;
     let mut ancestor = path.as_path();
-    let canonical = loop {
+    let (canonical, directory) = loop {
         match fs::symlink_metadata(ancestor) {
             Ok(metadata) => {
                 let canonical = ancestor
@@ -247,15 +281,20 @@ fn resolve_target(
                     return Err(format!("path escapes workspace: {label}"));
                 }
                 if ancestor == path {
-                    break canonical;
+                    if removes_source && metadata.is_symlink() {
+                        return Err(format!("cannot delete or move symbolic link {label}"));
+                    }
+                    let directory = canonical.parent().unwrap_or(root).to_path_buf();
+                    break (canonical, directory);
                 }
                 if !metadata.is_dir() && !canonical.is_dir() {
                     return Err(format!("a parent of {label} is not a directory"));
                 }
-                break canonical.join(
+                let resolved = canonical.join(
                     path.strip_prefix(ancestor)
                         .expect("ancestor of resolved path"),
                 );
+                break (resolved, canonical);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 ancestor = ancestor
@@ -265,22 +304,58 @@ fn resolve_target(
             Err(error) => return Err(format!("cannot resolve {label}: {error}")),
         }
     };
-    if seen.contains(&canonical) {
+    let key = if ignores_case(&directory) {
+        PathBuf::from(canonical.to_string_lossy().to_lowercase())
+    } else {
+        canonical.clone()
+    };
+    if seen.contains(&key) {
         return Err(format!("repeated path: {label}"));
     }
     if seen
         .iter()
-        .any(|previous| previous.starts_with(&canonical) || canonical.starts_with(previous))
+        .any(|previous| previous.starts_with(&key) || key.starts_with(previous))
     {
         return Err(format!(
             "file path conflicts with another operation: {label}"
         ));
     }
-    seen.insert(canonical.clone());
+    seen.insert(key);
     Ok(PlannedTarget {
         path: canonical,
         label: label.to_owned(),
     })
+}
+
+#[cfg(windows)]
+fn ignores_case(_: &Path) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn ignores_case(directory: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    // Look up a different spelling of an existing directory, without
+    // creating a probe file during preflight.
+    for directory in directory.ancestors() {
+        let Some(name) = directory.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let mut alternate = name.to_lowercase();
+        if alternate == name {
+            alternate = name.to_uppercase();
+        }
+        if alternate == name {
+            continue;
+        }
+        let Ok(actual) = fs::metadata(directory) else {
+            continue;
+        };
+        return fs::metadata(directory.with_file_name(alternate))
+            .is_ok_and(|other| actual.dev() == other.dev() && actual.ino() == other.ino());
+    }
+    false
 }
 
 fn require_missing(target: &PlannedTarget) -> Result<(), String> {
@@ -291,8 +366,11 @@ fn require_missing(target: &PlannedTarget) -> Result<(), String> {
     }
 }
 
-fn read_existing(target: &PlannedTarget) -> Result<String, String> {
-    read_text_file_with_limit(&target.path, MAX_EDIT_FILE_BYTES, || false).map_err(|error| {
+fn read_existing(
+    target: &PlannedTarget,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<String, String> {
+    read_text_file_with_limit(&target.path, MAX_EDIT_FILE_BYTES, should_cancel).map_err(|error| {
         if error.is_not_found() {
             format!("{} does not exist", target.label)
         } else {
@@ -387,12 +465,389 @@ fn find_match(source: &[&str], old: &[&str], end_of_file: bool) -> Result<usize,
     Err("context was not found")
 }
 
+#[derive(serde::Deserialize)]
+struct PatchArgs {
+    input: String,
+}
+
+fn parse_request(request: &ToolRequest) -> Result<Patch, PatchError> {
+    let raw = request
+        .raw_arguments
+        .as_deref()
+        .ok_or("missing patch arguments")?;
+    let args: PatchArgs = serde_json::from_str(raw)
+        .map_err(|error| PatchError(format!("invalid patch arguments: {error}")))?;
+    parse_patch(&args.input)
+}
+
+/// The paths named by the patch, including both ends of a move.
+pub fn requested_paths(request: &ToolRequest) -> Vec<String> {
+    let Ok(patch) = parse_request(request) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for op in patch.ops {
+        match op {
+            PatchOp::Add { path, .. } | PatchOp::Delete { path } => paths.push(path),
+            PatchOp::Update { path, move_to, .. } => {
+                paths.push(path);
+                paths.extend(move_to);
+            }
+        }
+    }
+    paths
+}
+
+/// Resolve a patch's checked file paths for capturing rewind pre-images.
+pub fn checked_paths(request: &ToolRequest, cwd: &Path) -> Vec<PathBuf> {
+    let Ok(plan) = parse_request(request).and_then(|patch| preflight(&patch, cwd)) else {
+        return Vec::new();
+    };
+    plan.ops
+        .into_iter()
+        .flat_map(|op| std::iter::once(op.target.path).chain(op.move_to.map(|target| target.path)))
+        .collect()
+}
+
+/// Preview a patch as a sequence of unified diff sections without writing.
+pub fn preview(request: &ToolRequest, cwd: &Path) -> Option<String> {
+    let plan = preflight(&parse_request(request).ok()?, cwd).ok()?;
+    Some(patch_diff(&plan.ops))
+}
+
+pub(crate) fn execute(
+    request: &ToolRequest,
+    cwd: &Path,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
+    match parse_request(request).and_then(|patch| preflight_or_cancel(&patch, cwd, &should_cancel))
+    {
+        Ok(plan) => commit(request, &plan, &should_cancel),
+        Err(error) => ToolResult::failed(request, format!("patch preflight failed: {error}"), None),
+    }
+}
+
+fn commit(request: &ToolRequest, plan: &Plan, should_cancel: &dyn Fn() -> bool) -> ToolResult {
+    let mut written = Vec::new();
+    for (index, op) in plan.ops.iter().enumerate() {
+        let outcome = if should_cancel() {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "patch cancelled").into())
+        } else {
+            op.write()
+        };
+        if let Err(WriteFailure { error, changed }) = outcome {
+            let failed = op.label();
+            let pending = plan.ops[index + 1..]
+                .iter()
+                .map(PlannedOp::label)
+                .collect::<Vec<_>>();
+            let mut result =
+                ToolResult::failed(request, format!("failed to apply {failed}: {error}"), None);
+            let written = if written.is_empty() {
+                "(none)".into()
+            } else {
+                written.join("\n")
+            };
+            let pending = if pending.is_empty() {
+                "(none)".into()
+            } else {
+                pending.join(", ")
+            };
+            result.output = Some(format!(
+                "Written:\n{written}\nFailed: {failed}\nNot attempted: {pending}\nReason: {error}"
+            ));
+            let mut diff = patch_diff(&plan.ops[..index]);
+            if let Some(target) = changed {
+                if let Some(output) = &mut result.output {
+                    output.push_str(&format!("\nPartially written: {}", target.label));
+                }
+                diff.push_str(&op.partial_preview(target));
+                diff = truncate_output(diff, MAX_DIFF_OUTPUT_BYTES).0;
+            }
+            return if diff.is_empty() {
+                result
+            } else {
+                result.with_file_change_preview(FileChangePreview::Patch { text: diff })
+            };
+        }
+        written.push(op.summary());
+    }
+    with_committed_preview(
+        ToolResult::completed(request, written.join("\n"), false),
+        &plan.ops,
+    )
+}
+
+fn with_committed_preview(result: ToolResult, committed: &[PlannedOp]) -> ToolResult {
+    if committed.is_empty() {
+        return result;
+    }
+    result.with_file_change_preview(FileChangePreview::Patch {
+        text: patch_diff(committed),
+    })
+}
+
+fn patch_diff(ops: &[PlannedOp]) -> String {
+    let mut diff = String::new();
+    for op in ops {
+        diff.push_str(&op.preview());
+        if diff.len() > MAX_DIFF_OUTPUT_BYTES {
+            return truncate_output(diff, MAX_DIFF_OUTPUT_BYTES).0;
+        }
+    }
+    diff
+}
+
+impl PlannedOp {
+    fn label(&self) -> String {
+        match &self.move_to {
+            Some(dest) => format!("{} -> {}", self.target.label, dest.label),
+            None => self.target.label.clone(),
+        }
+    }
+
+    fn summary(&self) -> String {
+        let kind = match (&self.move_to, &self.before, &self.after) {
+            (Some(_), _, _) => "moved",
+            (_, None, _) => "added",
+            (_, _, None) => "deleted",
+            _ => "updated",
+        };
+        format!(
+            "{kind} {} (+{} -{})",
+            self.label(),
+            self.added,
+            self.removed
+        )
+    }
+
+    fn write(&self) -> Result<(), WriteFailure<'_>> {
+        match (&self.move_to, &self.before, &self.after) {
+            (_, _, None) => Ok(fs::remove_file(&self.target.path)?),
+            (Some(dest), _, Some(text)) => {
+                let permissions = fs::metadata(&self.target.path)?.permissions();
+                create_file(dest, text)?
+                    .set_permissions(permissions)
+                    .map_err(|error| WriteFailure::after_write(error, dest))?;
+                fs::remove_file(&self.target.path)
+                    .map_err(|error| WriteFailure::after_write(error, dest))
+            }
+            (_, None, Some(text)) => create_file(&self.target, text).map(|_| ()),
+            (_, Some(_), Some(text)) => fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&self.target.path)?
+                .write_all(text.as_bytes())
+                .map_err(|error| WriteFailure::after_write(error, &self.target)),
+        }
+    }
+
+    fn partial_preview(&self, target: &PlannedTarget) -> String {
+        let Ok(after) = read_existing(target, &|| false) else {
+            return format!("[Diff preview unavailable for {}]\n", target.label);
+        };
+        let before = if target.path == self.target.path {
+            self.before.as_deref()
+        } else {
+            None
+        };
+        let old_header = if before.is_some() {
+            format!("a/{}", target.label)
+        } else {
+            "/dev/null".into()
+        };
+        let new_header = format!("b/{}", target.label);
+        render_preview(
+            &target.label,
+            &old_header,
+            &new_header,
+            before,
+            Some(&after),
+        )
+    }
+
+    fn preview(&self) -> String {
+        let old_header = if self.before.is_some() {
+            format!("a/{}", self.target.label)
+        } else {
+            "/dev/null".into()
+        };
+        let new_header = if self.after.is_some() {
+            format!("b/{}", self.move_to.as_ref().unwrap_or(&self.target).label)
+        } else {
+            "/dev/null".into()
+        };
+        render_preview(
+            &self.target.label,
+            &old_header,
+            &new_header,
+            self.before.as_deref(),
+            self.after.as_deref(),
+        )
+    }
+}
+
+fn render_preview(
+    label: &str,
+    old_header: &str,
+    new_header: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> String {
+    let preview =
+        build_file_change_preview_with_headers(label, old_header, new_header, before, after);
+    if matches!(&preview, FileChangePreview::UnifiedDiff { text, .. } if text.is_empty()) {
+        return format!("--- {old_header}\n+++ {new_header}\n");
+    }
+    let mut text = preview.display_text();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+struct WriteFailure<'a> {
+    error: io::Error,
+    changed: Option<&'a PlannedTarget>,
+}
+
+impl From<io::Error> for WriteFailure<'_> {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            changed: None,
+        }
+    }
+}
+
+impl<'a> WriteFailure<'a> {
+    fn after_write(error: io::Error, target: &'a PlannedTarget) -> Self {
+        Self {
+            error,
+            changed: Some(target),
+        }
+    }
+}
+
+fn create_file<'a>(target: &'a PlannedTarget, text: &str) -> Result<fs::File, WriteFailure<'a>> {
+    if let Some(parent) = target.path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target.path)?;
+    file.write_all(text.as_bytes())
+        .map_err(|error| WriteFailure::after_write(error, target))?;
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    fn request(body: &str) -> orca_core::tool_types::ToolRequest {
+        use orca_core::{
+            approval_types::ActionKind,
+            tool_types::{ToolName, ToolRequest},
+        };
+        ToolRequest {
+            id: "patch-test".into(),
+            name: ToolName::plain("apply_patch"),
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({"input": format!("*** Begin Patch\n{body}\n*** End Patch")})
+                    .to_string(),
+            ),
+        }
+    }
+
+    #[test]
+    fn apply_patch_applies_a_multi_file_patch() {
+        use orca_core::tool_types::ToolStatus;
+        let dir = TempDir::new().unwrap();
+        for (name, text) in [
+            ("update", "old\n"),
+            ("delete", "remove\n"),
+            ("move", "before\n"),
+        ] {
+            fs::write(dir.path().join(name), text).unwrap();
+        }
+        let execute = |body| {
+            crate::registry::default_tool_registry()
+                .execute(&request(body), &crate::ToolContext::new(dir.path()))
+        };
+        let rejected =
+            execute("*** Add File: untouched\n+new\n*** Update File: update\n@@\n-missing\n+new");
+        assert_eq!(rejected.status, ToolStatus::Failed);
+        assert!(!dir.path().join("untouched").exists());
+
+        let result = execute(
+            "*** Add File: nested/new\n+hello\n*** Update File: update\n@@\n-old\n+new\n*** Delete File: delete\n*** Update File: move\n*** Move to: moved\n@@\n-before\n+after",
+        );
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        for (name, text) in [
+            ("nested/new", "hello\n"),
+            ("update", "new\n"),
+            ("moved", "after\n"),
+        ] {
+            assert_eq!(fs::read_to_string(dir.path().join(name)).unwrap(), text);
+        }
+        assert!(!dir.path().join("delete").exists());
+        assert!(!dir.path().join("move").exists());
+        let output = result.output.unwrap();
+        for change in [
+            "added nested/new (+1 -0)",
+            "updated update (+1 -1)",
+            "deleted delete (+0 -1)",
+            "moved move -> moved (+1 -1)",
+        ] {
+            assert!(output.contains(change), "{output}");
+        }
+        let preview = result.file_change_preview.unwrap();
+        let diff = preview.patch_diff().expect("multi-file preview");
+        for header in [
+            "+++ b/nested/new",
+            "+++ b/update",
+            "--- a/delete",
+            "--- a/move",
+            "+++ b/moved",
+        ] {
+            assert!(diff.contains(header), "{diff}");
+        }
+    }
+
+    #[test]
+    fn a_commit_failure_reports_written_failed_and_not_attempted() {
+        use orca_core::tool_types::ToolStatus;
+        let dir = TempDir::new().unwrap();
+        let request = request(
+            "*** Add File: one\n+1\n*** Add File: two\n+2\n*** Add File: three\n+3\n*** Add File: four\n+4\n*** Add File: five\n+5",
+        );
+        let patch = parse_request(&request).unwrap();
+        let planned = preflight(&patch, dir.path()).unwrap();
+        // A file appears between the preflight and the first write.
+        fs::write(dir.path().join("three"), "existing\n").unwrap();
+
+        let result = commit(&request, &planned, &|| false);
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(result.output.as_deref().unwrap().starts_with(
+            "Written:\nadded one (+1 -0)\nadded two (+1 -0)\nFailed: three\nNot attempted: four, five\nReason: "
+        ));
+        assert!(result.error.as_deref().unwrap().contains("three"));
+        assert_eq!(fs::read_to_string(dir.path().join("one")).unwrap(), "1\n");
+        assert_eq!(fs::read_to_string(dir.path().join("two")).unwrap(), "2\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("three")).unwrap(),
+            "existing\n"
+        );
+        assert!(!dir.path().join("four").exists());
+        assert!(!dir.path().join("five").exists());
+    }
 
     fn plan(body: &str, cwd: &Path) -> Result<Plan, PatchError> {
         preflight(
@@ -422,6 +877,71 @@ mod tests {
         assert_eq!(op.target.path, root.join("old"));
         assert_eq!(op.move_to.as_ref().unwrap().path, root.join("new"));
         assert_eq!(op.before.as_deref(), Some("content"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_or_moving_a_link_leaves_its_target_intact() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        fs::write(&target, "original\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        for body in [
+            "*** Delete File: link",
+            "*** Update File: link\n*** Move to: moved",
+        ] {
+            let error = plan(body, dir.path()).unwrap_err().to_string();
+            assert!(error.contains("symbolic link"), "{error}");
+            assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
+            assert!(link.is_symlink());
+        }
+    }
+
+    #[test]
+    fn case_aliases_on_a_case_insensitive_volume_are_repeated_paths() {
+        let dir = TempDir::new().unwrap();
+        let probe = dir.path().join("case-probe");
+        fs::write(&probe, "").unwrap();
+        if !dir.path().join("CASE-PROBE").exists() {
+            return;
+        }
+        let error = plan(
+            "*** Add File: nested/New\n+first\n*** Add File: NESTED/new\n+second",
+            dir.path(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("repeated path"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_move_reports_its_written_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let source_dir = dir.path().join("source");
+        fs::create_dir(&source_dir).unwrap();
+        fs::write(source_dir.join("a"), "before\n").unwrap();
+        let saved_permissions = fs::metadata(&source_dir).unwrap().permissions();
+        fs::set_permissions(&source_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = crate::registry::default_tool_registry().execute(
+            &request("*** Update File: source/a\n*** Move to: dest\n@@\n-before\n+after"),
+            &crate::ToolContext::new(dir.path()),
+        );
+        fs::set_permissions(&source_dir, saved_permissions).unwrap();
+        if !source_dir.join("a").exists() {
+            return;
+        }
+        assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("dest")).unwrap(),
+            "after\n"
+        );
+        assert!(result.output.unwrap().contains("Partially written: dest"));
+        let preview = result.file_change_preview.unwrap().display_text();
+        assert!(preview.contains("+++ b/dest"));
+        assert!(!preview.contains("--- a/source/a"));
     }
 
     #[test]

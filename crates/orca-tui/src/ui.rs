@@ -3698,7 +3698,8 @@ fn append_message_lines(
         } => {
             let neutral_completed =
                 status == "completed" && matches!(kind.as_deref(), Some("empty" | "no_matches"));
-            let is_edit = diff.is_some() || matches!(name.as_str(), "edit" | "write_file");
+            let is_edit =
+                diff.is_some() || matches!(name.as_str(), "edit" | "write_file" | "apply_patch");
             let icon = match status.as_str() {
                 "completed" if is_edit => "✎",
                 "completed" => "✓",

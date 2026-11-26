@@ -5774,6 +5774,12 @@ fn surface_file_change(
 ) -> Option<surface::SurfaceFileChange> {
     use orca_core::tool_types::FileChangePreview;
     let named = match preview {
+        FileChangePreview::Patch { text } => {
+            return Some(surface::SurfaceFileChange::Patch {
+                digest: surface::Sha256Digest::digest(text),
+                text: surface::DisplayText::new(text.clone()),
+            });
+        }
         FileChangePreview::UnifiedDiff { .. } => target?,
         FileChangePreview::Omitted { path, .. } => target.unwrap_or(path),
     };
@@ -5789,6 +5795,7 @@ fn surface_file_change(
     }
     let path = surface::CanonicalPath::try_new(resolved).ok()?;
     Some(match preview {
+        FileChangePreview::Patch { .. } => unreachable!("patch preview is handled above"),
         FileChangePreview::UnifiedDiff { text, .. } => surface::SurfaceFileChange::UnifiedDiff {
             path,
             digest: surface::Sha256Digest::digest(text),

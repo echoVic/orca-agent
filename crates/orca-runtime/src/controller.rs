@@ -975,10 +975,8 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
     }
 }
 
-/// A turn applied writes when its transcript records a successful `edit` or
-/// `write_file` tool result. Those tools are the ones that carry a
-/// `file_change_preview`; the preview itself is not retained on the tool
-/// message, so the completed result is the durable signal.
+/// A successful file-writing tool result is the transcript's durable signal
+/// that a write landed. The live task receipt also covers partial patches.
 fn turn_writes_applied(messages: &[Message]) -> bool {
     let write_tool_call_ids = messages
         .iter()
@@ -993,6 +991,7 @@ fn turn_writes_applied(messages: &[Message]) -> bool {
                 Some(
                     orca_core::tool_types::ToolName::Edit
                         | orca_core::tool_types::ToolName::WriteFile
+                        | orca_core::tool_types::ToolName::ApplyPatch
                 )
             )
         })

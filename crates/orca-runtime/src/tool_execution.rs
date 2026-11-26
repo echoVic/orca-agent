@@ -294,13 +294,15 @@ impl ToolExecutionCompletion {
 /// The diff an edit or write would make, for its approval to show.
 fn file_change_preview_text(request: &tool_types::ToolRequest, cwd: &Path) -> Option<String> {
     let preview = match request.name {
+        tool_types::ToolName::ApplyPatch => return orca_tools::apply_patch::preview(request, cwd),
         tool_types::ToolName::Edit => orca_tools::edit::preview(request, cwd),
         tool_types::ToolName::WriteFile => orca_tools::write_file::preview(request, cwd),
         _ => None,
     }?;
     match preview {
         tool_types::FileChangePreview::UnifiedDiff { text, .. } => Some(text),
-        tool_types::FileChangePreview::Omitted { .. } => None,
+        tool_types::FileChangePreview::Omitted { .. }
+        | tool_types::FileChangePreview::Patch { .. } => None,
     }
 }
 
@@ -1327,10 +1329,8 @@ impl ToolExecutionActor {
                 call_id: &execution_request.id,
             });
         }
-        // Capture the write target's pre-image before the tool can touch it.
-        // This runs on the dispatch path so no `edit`/`write_file` can bypass
-        // the checkpoint; capture failures are recorded on the turn and never
-        // block the tool.
+        // Capture file pre-images before dispatch. The turn records capture
+        // failures as limitations while the tool continues.
         if let Some(stores) = extension_stores
             && let Some(turn) = stores.thread_store().get::<crate::rewind::RewindTurn>()
         {
@@ -1389,11 +1389,14 @@ impl ToolExecutionActor {
             },
         };
         let result = dispatch.result;
-        if result.kind == tool_types::ToolResultKind::Success
-            && matches!(
-                execution_request.name,
-                tool_types::ToolName::Edit | tool_types::ToolName::WriteFile
-            )
+        let write_applied = match execution_request.name {
+            tool_types::ToolName::Edit | tool_types::ToolName::WriteFile => {
+                result.kind == tool_types::ToolResultKind::Success
+            }
+            tool_types::ToolName::ApplyPatch => result.file_change_preview.is_some(),
+            _ => false,
+        };
+        if write_applied
             && let Some(task_id) = root_task_id
             && let Err(error) = task_registry.record_applied_write(task_id)
         {
@@ -1474,7 +1477,7 @@ impl ToolExecutionActor {
             && agent_common::requires_approval(approval.action)
         {
             let approval_decision = RuntimeToolApprovalPolicy::new(policy, permission_overlay)
-                .resolve(approval.clone(), tool_request);
+                .resolve(approval.clone(), &invocation.effective);
             let mut event_error = None;
             if emit_deltas {
                 retain_first_io_error(

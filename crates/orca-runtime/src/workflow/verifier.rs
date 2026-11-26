@@ -183,5 +183,13 @@ fn contract_failures(evidence: &WorkflowEvidenceBundle) -> Vec<String> {
 }
 
 fn is_source_mutation_tool(name: &str) -> bool {
-    matches!(name, "edit" | "write_file")
+    matches!(name, "edit" | "write_file" | "apply_patch")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn completed_patches_count_as_workflow_mutations() {
+        assert!(super::is_source_mutation_tool("apply_patch"));
+    }
 }

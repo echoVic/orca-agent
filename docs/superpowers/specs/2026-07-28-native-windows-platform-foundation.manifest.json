@@ -30,6 +30,12 @@
   ],
   "foundation_exceptions": [
     [
+      "apply-patch-unix-path-and-fixtures",
+      "crates/orca-tools/src/apply_patch.rs",
+      "unix_std_api",
+      3
+    ],
+    [
       "computer-use-nonblocking-stdin",
       "crates/orca-computer-use/src/driver_input.rs",
       "unix_libc_process",
