@@ -26,7 +26,7 @@ pub use crate::thread_store::{
     rename_session, search_sessions,
 };
 
-const SESSION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SESSION_SCHEMA_VERSION: u32 = 1;
 
 /// Serializes tests that deliberately share process-wide state (the session
 /// index, the task registry index, recorded sessions under the process-wide

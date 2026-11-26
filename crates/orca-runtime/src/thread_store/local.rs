@@ -18,7 +18,7 @@ use super::projection::{
     conversation_records_to_thread_items, conversation_records_to_thread_turns,
     is_surface_coordinator_record, normalized_stored_messages, stored_message_to_thread_json,
 };
-use super::reader::iter_records;
+use super::reader::{is_ignorable_search_line, iter_records};
 use super::session_index::{self, SessionSummaryPage};
 use super::types::{
     SessionMeta, SessionRecord, SessionSummary, SessionTranscript, SortDirection,
@@ -733,6 +733,9 @@ impl RipgrepSearchCollector {
         let Some(line_text) = value["data"]["lines"]["text"].as_str() else {
             return;
         };
+        if is_ignorable_search_line(line_text) {
+            return;
+        }
         let path = PathBuf::from(path_text);
         let (line, _) = truncate_output(
             line_text.trim_end_matches('\n').to_string(),
@@ -883,7 +886,7 @@ fn push_search_hit(
     // A bounded index scan may be incomplete without making its prefix
     // unusable for search or turning a large transcript into a corrupt one.
     if let Ok(summary) = summarize_session_with_archive_flag(path, archived) {
-        if summary.health == StoredSessionHealth::Quarantined {
+        if summary.health.blocks_mutation() {
             return;
         }
         hits.push(SearchHit {

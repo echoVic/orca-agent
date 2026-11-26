@@ -7,8 +7,9 @@ use super::assets::{self, HydrateImages};
 use super::types::{SessionRecord, StoredSessionHealth, StoredSessionHealthIssue};
 use super::writer::{
     MAX_SESSION_LINE_BYTES, open_regular_history_file, parse_session_record, read_bounded_line,
-    session_health_error,
+    session_health_error, validate_session_record,
 };
+use crate::history::SESSION_SCHEMA_VERSION;
 
 /// A scan budget is an inspection policy, never a transcript validity limit.
 #[derive(Clone, Copy)]
@@ -85,6 +86,16 @@ pub(crate) struct SessionRecords {
 
 pub(crate) fn iter_records(path: &Path, images: HydrateImages) -> io::Result<SessionRecords> {
     SessionRecords::open(path, None, images)
+}
+
+/// Raw search matches have not passed through the transcript iterator.
+pub(super) fn is_ignorable_search_line(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| {
+        value["ignorable"] == true
+            && value["type"].is_string()
+            && !assets::is_asset_record(&value)
+            && matches!(parse_session_record(text), Err("unknown_record_type"))
+    })
 }
 
 /// Read preview bytes even for tool images omitted by normal session resume.
@@ -178,16 +189,100 @@ impl SessionRecords {
             code: code.to_owned(),
             line: Some(self.line_number),
             offset: Some(offset),
+            record_type: None,
         });
     }
 
     fn fail(&mut self, code: &str, offset: u64) -> Option<io::Result<SessionRecord>> {
-        self.stop(StoredSessionHealth::Quarantined, code, offset);
+        self.stop_with_error(StoredSessionHealth::Quarantined, code, offset, None)
+    }
+
+    fn stop_with_error(
+        &mut self,
+        health: StoredSessionHealth,
+        code: &str,
+        offset: u64,
+        record_type: Option<String>,
+    ) -> Option<io::Result<SessionRecord>> {
+        self.stop(health, code, offset);
+        if let Some(issue) = &mut self.issue {
+            issue.record_type = record_type;
+        }
         Some(Err(session_health_error(
             &self.path,
             self.health,
             self.issue.as_ref(),
         )))
+    }
+
+    fn handle_parse_error(
+        &mut self,
+        code: &'static str,
+        offset: u64,
+        terminated: bool,
+    ) -> Option<io::Result<SessionRecord>> {
+        if code == "incomplete_record" && !terminated && !self.compressed {
+            self.stop(
+                StoredSessionHealth::RecoverableTail,
+                "recoverable_tail",
+                offset,
+            );
+            return None;
+        }
+        if code == "newer_schema_version" {
+            return self.stop_with_error(StoredSessionHealth::NewerVersion, code, offset, None);
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(self.text()) else {
+            return self.fail(code, offset);
+        };
+        if assets::is_asset_record(&value) {
+            let record = assets::hydrate(&self.path, value, self.images)
+                .map_err(|_| "invalid_image_asset")
+                .and_then(|value| {
+                    serde_json::from_value(value).map_err(|_| "malformed_asset_record")
+                })
+                .and_then(|record| match validate_session_record(record) {
+                    Err("unknown_record_type") => Err("malformed_asset_record"),
+                    result => result,
+                });
+            return match record {
+                Ok(record) => Some(Ok(record)),
+                Err("newer_schema_version") => self.stop_with_error(
+                    StoredSessionHealth::NewerVersion,
+                    "newer_schema_version",
+                    offset,
+                    None,
+                ),
+                Err(code) => self.fail(code, offset),
+            };
+        }
+        if value["type"] == "session.meta"
+            && value["schema_version"]
+                .as_u64()
+                .is_some_and(|version| version > u64::from(SESSION_SCHEMA_VERSION))
+        {
+            return self.stop_with_error(
+                StoredSessionHealth::NewerVersion,
+                "newer_schema_version",
+                offset,
+                None,
+            );
+        }
+        if code == "unknown_record_type" {
+            let Some(tag) = value["type"].as_str() else {
+                return self.fail("malformed_record", offset);
+            };
+            if value["ignorable"] == true {
+                return Some(Ok(SessionRecord::Ignorable(std::mem::take(&mut self.line))));
+            }
+            return self.stop_with_error(
+                StoredSessionHealth::NewerVersion,
+                code,
+                offset,
+                Some(tag.chars().take(128).collect()),
+            );
+        }
+        self.fail(code, offset)
     }
 }
 
@@ -267,33 +362,10 @@ impl Iterator for SessionRecords {
                 Ok(text) => text.trim_end_matches(['\r', '\n']),
                 Err(_) => return self.fail("invalid_utf8", start),
             };
-            let parsed = parse_session_record(text).or_else(|code| {
-                let Ok(value) = serde_json::from_str(text) else {
-                    return Err(code);
-                };
-                if !assets::is_asset_record(&value) {
-                    return Err(code);
-                }
-                let value = assets::hydrate(&self.path, value, self.images)
-                    .map_err(|_| "invalid_image_asset")?;
-                let record: SessionRecord =
-                    serde_json::from_value(value).map_err(|_| "malformed_asset_record")?;
-                super::writer::validate_session_record(record)
-            });
-            match parsed {
-                Ok(record) => {
-                    return Some(Ok(record));
-                }
-                Err("incomplete_record") if !terminated && !self.compressed => {
-                    self.stop(
-                        StoredSessionHealth::RecoverableTail,
-                        "recoverable_tail",
-                        start,
-                    );
-                    return None;
-                }
-                Err(code) => return self.fail(code, start),
-            }
+            return match parse_session_record(text) {
+                Ok(record) => Some(Ok(record)),
+                Err(code) => self.handle_parse_error(code, start, terminated),
+            };
         }
         None
     }

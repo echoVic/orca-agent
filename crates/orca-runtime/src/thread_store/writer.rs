@@ -75,6 +75,7 @@ impl SessionScan {
             code: code.into(),
             line,
             offset,
+            record_type: None,
         });
         self
     }
@@ -279,11 +280,18 @@ fn repair_incomplete_final_record(file: &mut File) -> io::Result<()> {
 }
 
 pub(crate) fn write_record_line(mut writer: impl Write, record: &SessionRecord) -> io::Result<()> {
+    if let SessionRecord::Ignorable(bytes) = record {
+        debug_assert!(!bytes.is_empty());
+        return Ok(());
+    }
     let redacted = redact_session_record(record);
     writer.write_all(&bounded_json_line(&redacted)?)
 }
 
 fn encode_record_line(path: &Path, record: &SessionRecord) -> io::Result<Vec<u8>> {
+    if matches!(record, SessionRecord::Ignorable(_)) {
+        return Ok(Vec::new());
+    }
     let redacted = redact_session_record(record);
     // Validate the hydrated representation too. A small reference envelope
     // must not expand past the reader's allocation bound.
@@ -442,6 +450,9 @@ fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionSca
         let Ok(record) = record else {
             break;
         };
+        if matches!(record, SessionRecord::Ignorable(_)) {
+            continue;
+        }
         scan.records.push(record);
         if collect_lines {
             // Preserve physical line numbers, including blank JSONL lines.
@@ -524,6 +535,10 @@ pub(super) fn parse_session_record(line: &str) -> Result<SessionRecord, &'static
 
 pub(super) fn validate_session_record(value: SessionRecord) -> Result<SessionRecord, &'static str> {
     match &value {
+        SessionRecord::Unrecognized => Err("unknown_record_type"),
+        SessionRecord::Meta(meta) if meta.schema_version > history::SESSION_SCHEMA_VERSION => {
+            Err("newer_schema_version")
+        }
         SessionRecord::Message { id, turn_id, .. } if id.is_some() != turn_id.is_some() => {
             Err("invalid_conversation_identity")
         }
@@ -587,6 +602,24 @@ struct StoredSessionHealthError {
 
 impl std::fmt::Display for StoredSessionHealthError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.health == StoredSessionHealth::NewerVersion {
+            write!(
+                formatter,
+                "stored session {} was written by a newer version of Orca",
+                self.path.display()
+            )?;
+            if let Some(record_type) = self
+                .issue
+                .as_ref()
+                .and_then(|issue| issue.record_type.as_ref())
+            {
+                write!(
+                    formatter,
+                    " (it contains a {record_type:?} record this version does not know)"
+                )?;
+            }
+            return write!(formatter, ", please upgrade Orca to open it");
+        }
         let detail = self
             .issue
             .as_ref()
@@ -1438,6 +1471,7 @@ pub(crate) fn transcript_from_records(
             // File snapshots and retention watermarks are audit data for
             // `/rewind`; they never add or remove conversation messages.
             SessionRecord::FileSnapshot(_) | SessionRecord::SnapshotRetention(_) => {}
+            SessionRecord::Ignorable(_) | SessionRecord::Unrecognized => {}
             SessionRecord::SessionRewind(record) => {
                 apply_rewind_to_transcript(
                     &mut messages,
@@ -1616,6 +1650,7 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
         SessionRecord::SnapshotRetention(record) => {
             redact_string_in_place(&mut record.session_id);
         }
+        SessionRecord::Ignorable(_) | SessionRecord::Unrecognized => {}
     }
     redacted
 }

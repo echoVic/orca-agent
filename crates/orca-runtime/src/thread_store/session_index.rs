@@ -140,6 +140,7 @@ fn list_page_filtered(
                         code: "scan_failed".to_string(),
                         line: None,
                         offset: None,
+                        record_type: None,
                     });
                     cached.path = path.clone();
                     cached.archived = archived;
@@ -669,6 +670,7 @@ fn unreadable_summary(path: &Path, archived: bool, updated_at_ms: i64) -> Sessio
             code: "scan_failed".to_string(),
             line: None,
             offset: None,
+            record_type: None,
         }),
         source_fingerprint: None,
         storage_identity,

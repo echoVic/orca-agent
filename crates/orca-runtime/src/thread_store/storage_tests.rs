@@ -1,5 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use orca_core::conversation::{Conversation, ImageDetail, ImageInput, ImageSource, Message};
@@ -7,14 +8,228 @@ use orca_core::thread_identity::TurnId;
 use orca_core::tool_images::SUPERSEDED_TOOL_IMAGE_NOTE;
 
 use super::assets::{self, HydrateImages};
+use super::local::sessions_dir;
 use super::reader::INDEX_BUDGET;
 use super::retention::{SessionRetentionPolicy, retain_sessions};
-use super::types::{SessionRecord, StoredMessage, StoredSessionHealth};
+use super::types::{
+    SessionRecord, SortDirection, StoredMessage, StoredSessionHealth, ThreadSortKey, ThreadStore,
+};
 use super::writer::{
     MAX_SESSION_LINE_BYTES, read_records, read_session_meta, read_transcript, scan_session,
     write_record_line,
 };
 use super::{JsonlThreadStore, SessionWriter};
+
+const SESSION_META: &str = r#"{"type":"session.meta","schema_version":1,"session_id":"compat","cwd":"/workspace","provider":"mock","title":"compat","created_at":"2026-11-27T00:00:00Z"}"#;
+const FIRST_MESSAGE: &str = r#"{"type":"conversation.message","message":{"role":"user","content":"before compatibility marker"}}"#;
+const SECOND_MESSAGE: &str = r#"{"type":"conversation.message","message":{"role":"user","content":"after compatibility marker"}}"#;
+const UNKNOWN_RECORD: &str = r#"{"type":"future.thing","x":1}"#;
+
+fn write_compat_session(directory: &Path, meta: &str, between: &str) -> PathBuf {
+    fs::create_dir_all(directory).unwrap();
+    let path = directory.join("compat.jsonl");
+    fs::write(
+        &path,
+        format!("{meta}\n{FIRST_MESSAGE}\n{between}{SECOND_MESSAGE}\n"),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn an_unknown_record_type_reports_newer_version() {
+    let root = tempfile::tempdir().unwrap();
+    let path = write_compat_session(root.path(), SESSION_META, &format!("{UNKNOWN_RECORD}\n"));
+    let scan = scan_session(&path).unwrap();
+    assert_eq!(scan.health.as_str(), "newer_version");
+    let issue = scan.health_issue.unwrap();
+    assert_eq!(issue.code, "unknown_record_type");
+    assert_eq!(issue.record_type.as_deref(), Some("future.thing"));
+    let error = read_transcript(&path).unwrap_err().to_string();
+    for text in ["newer version of Orca", "future.thing", "upgrade"] {
+        assert!(error.contains(text), "{error}");
+    }
+}
+
+#[test]
+fn an_ignorable_unknown_record_is_skipped() {
+    let root = tempfile::tempdir().unwrap();
+    crate::history::with_test_orca_home(root.path(), |_| {
+        let path = write_compat_session(
+            &sessions_dir(),
+            SESSION_META,
+            concat!(r#"{"type":"future.thing","ignorable":true,"x":1}"#, "\n"),
+        );
+        assert_eq!(
+            scan_session(&path).unwrap().health,
+            StoredSessionHealth::Healthy
+        );
+        let transcript = read_transcript(&path).unwrap();
+        assert!(
+            matches!(transcript.messages.as_slice(), [Message::User { content: before, .. }, Message::User { content: after, .. }]
+            if before == "before compatibility marker" && after == "after compatibility marker")
+        );
+        let hits = JsonlThreadStore::new()
+            .search_sessions("future.thing", false)
+            .unwrap();
+        assert!(hits.is_empty(), "{hits:?}");
+    });
+}
+
+#[test]
+fn only_boolean_true_marks_a_record_ignorable() {
+    let root = tempfile::tempdir().unwrap();
+    for flag in [r#""yes""#, "1"] {
+        let path = write_compat_session(
+            root.path(),
+            SESSION_META,
+            &format!("{{\"type\":\"future.thing\",\"ignorable\":{flag}}}\n"),
+        );
+        let scan = scan_session(&path).unwrap();
+        assert_eq!(scan.health.as_str(), "newer_version", "ignorable: {flag}");
+        assert_eq!(scan.health_issue.unwrap().code, "unknown_record_type");
+    }
+}
+
+#[test]
+fn a_newer_schema_version_reports_newer_version() {
+    let root = tempfile::tempdir().unwrap();
+    let meta = SESSION_META.replace(r#""schema_version":1"#, r#""schema_version":2"#);
+    let path = write_compat_session(root.path(), &meta, "");
+    let scan = scan_session(&path).unwrap();
+    assert_eq!(scan.health.as_str(), "newer_version");
+    assert_eq!(scan.health_issue.unwrap().code, "newer_schema_version");
+}
+
+#[test]
+fn session_meta_accepts_unknown_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let meta = format!(
+        "{},\"added_later\":true}}",
+        SESSION_META.trim_end_matches('}')
+    );
+    let path = write_compat_session(root.path(), &meta, "");
+    assert_eq!(
+        scan_session(&path).unwrap().health,
+        StoredSessionHealth::Healthy
+    );
+}
+
+#[test]
+fn a_known_type_with_bad_fields_still_quarantines() {
+    let root = tempfile::tempdir().unwrap();
+    for record in [
+        r#"{"type":"conversation.message","message":42,"ignorable":true}"#,
+        r#"{"type":"session.record_with_assets","ignorable":true}"#,
+    ] {
+        let path = write_compat_session(root.path(), SESSION_META, &format!("{record}\n"));
+        let scan = scan_session(&path).unwrap();
+        assert_eq!(scan.health, StoredSessionHealth::Quarantined);
+        assert_eq!(
+            scan.health_issue.unwrap().code,
+            if record.contains("with_assets") {
+                "invalid_image_asset"
+            } else {
+                "malformed_record"
+            }
+        );
+    }
+}
+
+#[test]
+fn the_first_problem_in_the_file_decides_its_health() {
+    let root = tempfile::tempdir().unwrap();
+    let path = write_compat_session(root.path(), SESSION_META, &format!("{UNKNOWN_RECORD}\n"));
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(br#"{"type":"conversation.message","message":{"role":"user""#)
+        .unwrap();
+    assert_eq!(
+        scan_session(&path).unwrap().health.as_str(),
+        "newer_version"
+    );
+
+    let path = write_compat_session(
+        root.path(),
+        SESSION_META,
+        &format!("not JSON\n{UNKNOWN_RECORD}\n"),
+    );
+    assert_eq!(
+        scan_session(&path).unwrap().health,
+        StoredSessionHealth::Quarantined
+    );
+}
+
+#[test]
+fn listing_reports_newer_version() {
+    let root = tempfile::tempdir().unwrap();
+    crate::history::with_test_orca_home(root.path(), |_| {
+        let path = write_compat_session(
+            &sessions_dir(),
+            SESSION_META,
+            &format!("{UNKNOWN_RECORD}\n"),
+        );
+        let store = JsonlThreadStore::new();
+        let sessions = store
+            .list_sessions_with_archived(usize::MAX, false)
+            .unwrap();
+        let summary = sessions
+            .iter()
+            .find(|summary| summary.path == path)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(summary).unwrap()["health"],
+            "newer_version"
+        );
+
+        let page = store
+            .search_threads(
+                "compatibility marker",
+                None,
+                20,
+                false,
+                ThreadSortKey::UpdatedAt,
+                SortDirection::Desc,
+            )
+            .unwrap();
+        assert!(page.data.is_empty());
+        assert!(
+            page.diagnostics
+                .iter()
+                .any(
+                    |diagnostic| diagnostic.storage_identity == summary.storage_identity
+                        && diagnostic.health.as_str() == "newer_version"
+                )
+        );
+
+        let target = root.path().join("export.jsonl");
+        let error = store
+            .export_session(&summary.storage_identity, &target)
+            .unwrap_err();
+        assert!(error.to_string().contains("upgrade Orca"));
+        assert!(!target.exists());
+    });
+}
+
+#[test]
+fn resume_of_a_newer_session_is_refused_with_the_upgrade_message() {
+    let root = tempfile::tempdir().unwrap();
+    crate::history::with_test_orca_home(root.path(), |_| {
+        let path = write_compat_session(
+            &sessions_dir(),
+            SESSION_META,
+            &format!("{UNKNOWN_RECORD}\n"),
+        );
+        let before = fs::read(&path).unwrap();
+        let store = JsonlThreadStore::new();
+        for error in [
+            store.load_session("compat").unwrap_err(),
+            store.rename_session("compat", "new title").unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("upgrade Orca"), "{error}");
+        }
+        assert_eq!(fs::read(path).unwrap(), before);
+    });
+}
 
 fn image_message(size: usize) -> Message {
     Message::user_with_images(
