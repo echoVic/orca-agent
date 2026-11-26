@@ -60,36 +60,21 @@ struct PlannedEdit {
     updated: String,
 }
 
-#[derive(Default)]
-pub(crate) struct LineEndingCounts {
-    crlf: usize,
-    lf: usize,
-    previous_was_cr: bool,
-}
-
-impl LineEndingCounts {
-    pub(crate) fn add(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            if byte == b'\n' {
-                if self.previous_was_cr {
-                    self.crlf += 1;
-                } else {
-                    self.lf += 1;
-                }
+pub(crate) fn crlf_majority(bytes: &[u8]) -> bool {
+    let mut crlf = 0;
+    let mut lf = 0;
+    let mut previous_was_cr = false;
+    for &byte in bytes {
+        if byte == b'\n' {
+            if previous_was_cr {
+                crlf += 1;
+            } else {
+                lf += 1;
             }
-            self.previous_was_cr = byte == b'\r';
         }
+        previous_was_cr = byte == b'\r';
     }
-
-    pub(crate) fn crlf_majority(&self) -> bool {
-        self.crlf > self.lf
-    }
-}
-
-pub(crate) fn crlf_majority(text: &str) -> bool {
-    let mut counts = LineEndingCounts::default();
-    counts.add(text.as_bytes());
-    counts.crlf_majority()
+    crlf > lf
 }
 
 fn normalize_for_edit(text: &str, crlf: bool) -> Cow<'_, str> {
@@ -119,7 +104,7 @@ fn plan_edit(
     }
     let contents = read_text_file_with_limit(&path, MAX_EDIT_FILE_BYTES, should_cancel)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let crlf = crlf_majority(&contents);
+    let crlf = crlf_majority(contents.as_bytes());
     let matching_contents = normalize_for_edit(&contents, crlf);
     let old = normalize_for_edit(&old, crlf);
     let new = normalize_for_edit(&new, crlf);

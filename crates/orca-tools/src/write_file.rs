@@ -1,17 +1,19 @@
 use std::fs;
-use std::ops::ControlFlow;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use orca_core::tool_types::{FileChangePreview, ToolRequest, ToolResult};
 
-use crate::edit::{LineEndingCounts, crlf_majority};
+use crate::edit::crlf_majority;
 use crate::file_admission::{
-    FileAdmissionError, MAX_DIFF_INPUT_BYTES, build_file_change_preview, read_text_file_with_limit,
-    stream_utf8_file,
+    FileAdmissionError, MAX_DIFF_INPUT_BYTES, build_file_change_preview, open_regular_file,
+    read_text_file_with_limit,
 };
 
+const LINE_ENDING_SAMPLE_BYTES: usize = 64 * 1024;
+
 pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
-    let plan = match plan_write(request, cwd) {
+    let plan = match plan_write(request, cwd, false) {
         Ok(plan) => plan,
         Err(error) => return ToolResult::failed(request, error, None),
     };
@@ -40,7 +42,7 @@ pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
 /// The diff this write would make, without writing it or creating its
 /// directory, for an approval to show. `None` when the write could not apply.
 pub fn preview(request: &ToolRequest, cwd: &Path) -> Option<FileChangePreview> {
-    plan_write(request, cwd).ok().map(|plan| plan.preview)
+    plan_write(request, cwd, true).ok().map(|plan| plan.preview)
 }
 
 struct PlannedWrite {
@@ -50,7 +52,11 @@ struct PlannedWrite {
     preview: FileChangePreview,
 }
 
-fn plan_write(request: &ToolRequest, cwd: &Path) -> Result<PlannedWrite, String> {
+fn plan_write(
+    request: &ToolRequest,
+    cwd: &Path,
+    preview_only: bool,
+) -> Result<PlannedWrite, String> {
     let raw = request
         .raw_arguments
         .as_deref()
@@ -85,22 +91,18 @@ fn plan_write(request: &ToolRequest, cwd: &Path) -> Result<PlannedWrite, String>
         return Err(format!("path escapes workspace: {}", path_str));
     }
 
-    let before = read_text_file_with_limit(&normalized, MAX_DIFF_INPUT_BYTES, || false);
+    let before = (content.len() <= MAX_DIFF_INPUT_BYTES)
+        .then(|| read_text_file_with_limit(&normalized, MAX_DIFF_INPUT_BYTES, || false));
     let keep_crlf = content.contains('\n')
         && !content.contains("\r\n")
-        && match &before {
-            Ok(text) => crlf_majority(text),
-            Err(FileAdmissionError::TooLarge { .. }) => stream_utf8_file(
-                &normalized,
-                LineEndingCounts::default(),
-                || false,
-                |counts, bytes| {
-                    counts.add(bytes);
-                    ControlFlow::Continue(())
-                },
-            )
-            .is_ok_and(|file| file.value.crlf_majority()),
-            Err(_) => false,
+        && match before.as_ref() {
+            Some(Ok(text)) => {
+                crlf_majority(&text.as_bytes()[..text.len().min(LINE_ENDING_SAMPLE_BYTES)])
+            }
+            None | Some(Err(FileAdmissionError::TooLarge { .. })) if !preview_only => {
+                file_starts_with_crlf_majority(&normalized)
+            }
+            _ => false,
         };
     let content = if keep_crlf {
         content.replace('\n', "\r\n")
@@ -108,17 +110,11 @@ fn plan_write(request: &ToolRequest, cwd: &Path) -> Result<PlannedWrite, String>
         content.to_string()
     };
     let preview = match before {
-        Ok(before) if content.len() <= MAX_DIFF_INPUT_BYTES => {
-            build_file_change_preview(path_str, Some(&before), Some(&content))
-        }
-        Err(error) if error.is_not_found() && content.len() <= MAX_DIFF_INPUT_BYTES => {
+        Some(Ok(before)) => build_file_change_preview(path_str, Some(&before), Some(&content)),
+        Some(Err(error)) if error.is_not_found() => {
             build_file_change_preview(path_str, None, Some(&content))
         }
-        Ok(_) | Err(FileAdmissionError::TooLarge { .. }) => FileChangePreview::Omitted {
-            path: path_str.to_string(),
-            max_input_bytes: MAX_DIFF_INPUT_BYTES,
-        },
-        Err(_) => FileChangePreview::Omitted {
+        _ => FileChangePreview::Omitted {
             path: path_str.to_string(),
             max_input_bytes: MAX_DIFF_INPUT_BYTES,
         },
@@ -130,6 +126,17 @@ fn plan_write(request: &ToolRequest, cwd: &Path) -> Result<PlannedWrite, String>
         content,
         preview,
     })
+}
+
+fn file_starts_with_crlf_majority(path: &Path) -> bool {
+    let Ok((file, _)) = open_regular_file(path) else {
+        return false;
+    };
+    let mut sample = Vec::new();
+    file.take(LINE_ENDING_SAMPLE_BYTES as u64)
+        .read_to_end(&mut sample)
+        .is_ok()
+        && crlf_majority(&sample)
 }
 
 #[cfg(test)]
@@ -197,16 +204,31 @@ mod tests {
     }
 
     #[test]
+    fn write_file_samples_the_start_of_a_large_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.txt");
+        let before = "a!\r\n".repeat(1024 * 1024 / 4) + &"b\n".repeat(10 * 1024 * 1024 / 2);
+        fs::write(&path, before).unwrap();
+        let request = make_request("test.txt", "one\nthree\n");
+
+        let result = execute(&request, dir.path());
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one\r\nthree\r\n");
+        assert!(matches!(
+            result.file_change_preview.as_deref(),
+            Some(FileChangePreview::Omitted { .. })
+        ));
+    }
+
+    #[test]
     fn overwriting_a_crlf_file_too_large_to_preview_keeps_crlf() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.txt");
-        // Make one of the CRLF pairs straddle a read chunk boundary.
-        let mut before =
-            "a".repeat(orca_core::retained_output::RETAINED_OUTPUT_READ_CHUNK_BYTES - 1);
-        before.push_str("\r\n");
+        // Count the last complete pair in the sample and ignore a trailing CR.
+        let mut before = "a".repeat(LINE_ENDING_SAMPLE_BYTES - 3);
+        before.push_str("\r\n\r\n");
         before.push_str(&"b".repeat(MAX_DIFF_INPUT_BYTES));
-        before.push('\n');
-        before.push_str("c\r\n");
         fs::write(&path, before).unwrap();
         let request = make_request("test.txt", "one\nthree\n");
 
