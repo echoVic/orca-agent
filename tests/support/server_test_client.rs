@@ -1585,9 +1585,13 @@ mod tests {
 
     #[test]
     fn exit_timeout_reports_recent_protocol_transcript() {
-        let client = scripted_client(
+        let mut client = scripted_client(
             "trap '' TERM; printf '{\"id\":\"turn\",\"event\":\"turn_started\"}\\n'; while :; do sleep 1; done",
         );
+        // The line is what the timeout has to report, and once it is out the
+        // shell ignores TERM: a shell that had not got that far in 50 ms (as
+        // under a loaded parallel run) died of the TERM with nothing to report.
+        client.expect_event("turn", "turn_started");
 
         let error = client
             .wait_with_output_timeout(Duration::from_millis(50))
