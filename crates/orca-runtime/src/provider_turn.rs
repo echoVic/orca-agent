@@ -944,6 +944,11 @@ impl RuntimeProviderResponseStep {
         }
         if step_snapshot.turn_context.emit_deltas {
             sink.emit(completion_event)?;
+            if !events.has_publication_store()
+                && let Some(writer) = history_writer.as_deref_mut()
+            {
+                writer.append_message(&completed_response.assistant_message())?;
+            }
         }
         record_assistant_response_for_agent(
             conversation,

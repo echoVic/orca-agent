@@ -14,8 +14,7 @@ pub use auth::{MCP_AUTH_REQUIRED, McpAuthKind, is_auth_required};
 pub use client::McpRequestError;
 pub use registry::{
     McpChangeSubscription, McpLoadedTools, McpPromptExpansion, McpRegistry, McpRegistrySnapshot,
-    McpServerState, McpServerStatus, McpToolSelectionWriter, canonical_server_name,
-    initialize_registry,
+    McpServerState, McpServerStatus, canonical_server_name, initialize_registry,
 };
 pub use transport::{
     McpElicitationHandler, McpElicitationMode, McpElicitationRequest, McpElicitationResponse,

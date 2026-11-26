@@ -20,6 +20,21 @@ use super::writer::{
 };
 use super::{JsonlThreadStore, SessionWriter};
 
+// This transcript was also opened with the v0.5.24 reader.
+#[test]
+fn a_recorded_mcp_tool_load_is_compatible_with_v0_5_24() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp-tool-load.jsonl");
+    fs::write(&path, include_bytes!("fixtures/mcp-tool-load.jsonl")).unwrap();
+    let transcript = read_transcript(&path).unwrap();
+    assert!(transcript.meta.additional_fields.is_empty());
+    assert!(transcript.messages.iter().any(|message| {
+        matches!(message, Message::Tool { terminal: Some(terminal), .. }
+            if terminal.mcp_tool_load.as_ref().is_some_and(|load|
+                load.server == "catalog" && load.names.iter().eq(["lookup_01"])))
+    }));
+}
+
 const SESSION_META: &str = r#"{"type":"session.meta","schema_version":1,"session_id":"compat","cwd":"/workspace","provider":"mock","title":"compat","created_at":"2026-11-27T00:00:00Z"}"#;
 const FIRST_MESSAGE: &str = r#"{"type":"conversation.message","message":{"role":"user","content":"before compatibility marker"}}"#;
 const SECOND_MESSAGE: &str = r#"{"type":"conversation.message","message":{"role":"user","content":"after compatibility marker"}}"#;

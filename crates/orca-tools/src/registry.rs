@@ -2458,7 +2458,9 @@ impl Tool for McpLoadTools {
             Err(error) => return ToolResult::invalid_input(request, error.to_string()),
         };
         match registry.load_tools(&self.server, &args.names) {
-            Ok(output) => ToolResult::completed(request, output, false),
+            Ok((output, load)) => {
+                ToolResult::completed(request, output, false).with_mcp_tool_load(load)
+            }
             Err(error) => ToolResult::failed(request, error, None),
         }
     }

@@ -2091,27 +2091,6 @@ impl SessionWriter {
         })
     }
 
-    pub(crate) fn save_mcp_tool_selection(
-        path: &Path,
-        loaded: &orca_mcp::McpLoadedTools,
-    ) -> io::Result<()> {
-        let selection = serde_json::to_value(loaded).map_err(io::Error::other)?;
-        let _lock = acquire_file_lock(path)?;
-        let mut records = iter_records(path, HydrateImages::All)?.require_metadata();
-        let Some(SessionRecord::Meta(mut meta)) = records.next().transpose()? else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "missing session metadata",
-            ));
-        };
-        meta.additional_fields
-            .insert("loaded_mcp_tools".into(), selection);
-        rewrite_records_unlocked(
-            path,
-            std::iter::once(Ok(SessionRecord::Meta(meta))).chain(records),
-        )
-    }
-
     pub fn enter_turn(&mut self, turn_id: TurnId) {
         self.turn_id = Some(turn_id);
     }

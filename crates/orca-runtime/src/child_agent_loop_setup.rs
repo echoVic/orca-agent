@@ -147,6 +147,7 @@ fn build_child_agent_loop_setup(
     let mcp_registry =
         orca_mcp::initialize_registry(&config.mcp_servers, config.mcp_credentials_path.clone());
     mcp_registry.wait_for_startup(&|| false);
+    let mcp_registry = crate::mcp_startup::restore_tool_scope(mcp_registry, &conversation);
     let provider_tools = crate::extension::ExtensionData::new("child-session");
     let mut provider_config =
         child_provider_config(config, request, cwd, &mcp_registry, &provider_tools);

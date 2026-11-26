@@ -3404,15 +3404,31 @@ while IFS= read -r line; do
             delayed_mcp_server(dir.path(), 0, 2),
             "on-demand",
         )];
-        let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
-        let id = session.session_id().unwrap().to_string();
+        let mut thread = RuntimeThread::start(&config, "MCP").unwrap();
+        let id = thread.session().session_id().unwrap().to_string();
         let provider = serve_scripted_provider(
             &mut config,
             [load_mcp_tools(["lookup_01".into()]), scripted_reply()],
         );
-        run_mcp_test_prompt(&config, &mut session);
+        assert_eq!(
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("Find a record"),
+                    io::sink()
+                )
+                .unwrap(),
+            RunStatus::Success
+        );
         provider.join().unwrap();
-        drop(session);
+        let transcript = crate::history::load_session(&id).unwrap();
+        assert!(
+            !transcript
+                .meta
+                .additional_fields
+                .contains_key("loaded_mcp_tools")
+        );
+        drop(thread);
         config.history_mode = HistoryMode::Resume(id);
         let mut resumed = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
         let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
@@ -3422,6 +3438,68 @@ while IFS= read -r line; do
             mcp_only_names(&requests[0]),
             ["mcp__catalog__load_tools", "mcp__catalog__lookup_01"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_at_an_earlier_message_drops_later_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.history_mode = HistoryMode::Record;
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let mut thread = RuntimeThread::start(&config, "MCP").unwrap();
+        let id = thread.session().session_id().unwrap().to_string();
+        let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+        assert_eq!(
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("Find a record"),
+                    io::sink()
+                )
+                .unwrap(),
+            RunStatus::Success
+        );
+        provider.join().unwrap();
+        let boundary = thread
+            .session()
+            .conversation_records()
+            .unwrap()
+            .last()
+            .unwrap()
+            .item_id
+            .clone()
+            .unwrap();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [load_mcp_tools(["lookup_01".into()]), scripted_reply()],
+        );
+        assert_eq!(
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("Find a record"),
+                    io::sink()
+                )
+                .unwrap(),
+            RunStatus::Success
+        );
+        provider.join().unwrap();
+        drop(thread);
+        config.history_mode = HistoryMode::ResumeAt {
+            selector: id,
+            resume_at: boundary.to_string(),
+        };
+        let mut resumed = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+        run_mcp_test_prompt(&config, &mut resumed);
+        let requests = provider.join().unwrap();
+        assert_eq!(mcp_only_names(&requests[0]), ["mcp__catalog__load_tools"]);
     }
 
     #[cfg(unix)]

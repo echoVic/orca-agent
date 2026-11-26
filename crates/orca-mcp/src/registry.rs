@@ -22,6 +22,7 @@ use orca_core::mcp_types::{
     ResourcesListResult, ToolsListResult, canonical_mcp_name, tool_is_enabled,
 };
 use orca_core::tool_images::tool_image;
+use orca_core::tool_types::McpToolLoad;
 
 /// The MCP servers of a session and their tools. Clones share one registry,
 /// so a server reconnected through any clone serves every holder's next
@@ -163,12 +164,10 @@ struct McpRegistryInner {
 }
 
 pub type McpLoadedTools = BTreeMap<String, BTreeSet<String>>;
-pub type McpToolSelectionWriter = Box<dyn Fn(&McpLoadedTools) -> std::io::Result<()> + Send + Sync>;
 
 #[derive(Default)]
 struct McpToolScope {
     loaded: McpLoadedTools,
-    persist: Option<McpToolSelectionWriter>,
 }
 
 impl McpToolScope {
@@ -176,14 +175,7 @@ impl McpToolScope {
         let Some(loaded) = self.loaded.get_mut(&server.name) else {
             return;
         };
-        let before = loaded.len();
         loaded.retain(|name| server.tools.iter().any(|tool| tool.name == *name));
-        if before != loaded.len()
-            && let Some(persist) = &self.persist
-            && let Err(error) = persist(&self.loaded)
-        {
-            eprintln!("orca: warning: failed to save MCP tool selection: {error}");
-        }
     }
 }
 
@@ -1243,16 +1235,12 @@ impl McpRegistry {
     }
 
     /// Create a session's selection while sharing the server connections.
-    pub fn with_tool_scope(
-        &self,
-        loaded: McpLoadedTools,
-        persist: Option<McpToolSelectionWriter>,
-    ) -> Self {
+    pub fn with_tool_scope(&self, loaded: McpLoadedTools) -> Self {
         let mut inner = self.write();
         if !inner.servers.iter().any(McpServerEntry::is_on_demand) {
             return self.clone();
         }
-        let mut selection = McpToolScope { loaded, persist };
+        let mut selection = McpToolScope { loaded };
         for server in &inner.servers {
             if server.is_on_demand() && server.state == McpServerState::Ready {
                 selection.retain_offered(server);
@@ -1308,7 +1296,11 @@ impl McpRegistry {
             .collect()
     }
 
-    pub fn load_tools(&self, server: &str, names: &[String]) -> Result<String, String> {
+    pub fn load_tools(
+        &self,
+        server: &str,
+        names: &[String],
+    ) -> Result<(String, Option<McpToolLoad>), String> {
         let inner = self.read();
         let server = inner
             .servers
@@ -1330,30 +1322,33 @@ impl McpRegistry {
             ));
         }
         if names.is_empty() {
-            return Ok(format!(
-                "Valid tools: {}",
-                valid.into_iter().collect::<Vec<_>>().join(", ")
+            return Ok((
+                format!(
+                    "Valid tools: {}",
+                    valid.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+                None,
             ));
         }
         let mut scope = self
             .tool_scope
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let mut updated = scope.loaded.clone();
-        updated
-            .entry(server.name.clone())
+        let load = McpToolLoad {
+            server: server.name.clone(),
+            names: names.iter().cloned().collect(),
+        };
+        scope
+            .loaded
+            .entry(load.server.clone())
             .or_default()
-            .extend(names.iter().cloned());
-        if updated != scope.loaded {
-            if let Some(persist) = &scope.persist {
-                persist(&updated)
-                    .map_err(|error| format!("Could not save MCP tool selection: {error}"))?;
-            }
-            scope.loaded = updated;
-        }
-        Ok(format!(
-            "MCP tools available on the next request: {}",
-            names.join(", ")
+            .extend(load.names.iter().cloned());
+        Ok((
+            format!(
+                "MCP tools available on the next request: {}",
+                names.join(", ")
+            ),
+            Some(load),
         ))
     }
 

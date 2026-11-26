@@ -653,6 +653,12 @@ impl Default for ToolInvocationStarted {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpToolLoad {
+    pub server: String,
+    pub names: std::collections::BTreeSet<String>,
+}
+
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ToolTerminal {
@@ -677,6 +683,8 @@ pub struct ToolTerminal {
         skip_serializing_if = "ToolInvocationStarted::is_unknown"
     )]
     pub started: ToolInvocationStarted,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_load: Option<McpToolLoad>,
 }
 
 impl ToolTerminal {
@@ -704,6 +712,7 @@ impl ToolTerminal {
             kind,
             source,
             started,
+            mcp_tool_load: None,
         })
     }
 
@@ -741,6 +750,8 @@ struct ToolTerminalWire {
     source: ToolTerminalSource,
     #[serde(default, rename = "invocation_started")]
     started: ToolInvocationStarted,
+    #[serde(default)]
+    mcp_tool_load: Option<McpToolLoad>,
 }
 
 impl<'de> Deserialize<'de> for ToolTerminal {
@@ -758,6 +769,10 @@ impl<'de> Deserialize<'de> for ToolTerminal {
             wire.source,
             wire.started,
         )
+        .map(|mut terminal| {
+            terminal.mcp_tool_load = wire.mcp_tool_load;
+            terminal
+        })
         .map_err(serde::de::Error::custom)
     }
 }
@@ -1139,6 +1154,11 @@ impl ToolResult {
 
     pub fn with_images(mut self, images: Vec<ImageInput>) -> Self {
         self.images = images;
+        self
+    }
+
+    pub fn with_mcp_tool_load(mut self, load: Option<McpToolLoad>) -> Self {
+        self.terminal.mcp_tool_load = load;
         self
     }
 

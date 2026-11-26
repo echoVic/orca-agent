@@ -4,8 +4,32 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use orca_core::conversation::{Conversation, Message};
+use orca_core::tool_types::ToolStatus;
 use orca_mcp::{McpChangeSubscription, McpRegistry, McpServerState};
 use orca_provider::tool_schema::DEEPSEEK_MAX_TOOLS;
+
+pub(crate) fn restore_tool_scope(
+    registry: McpRegistry,
+    conversation: &Conversation,
+) -> McpRegistry {
+    let mut loaded = orca_mcp::McpLoadedTools::new();
+    for message in &conversation.messages {
+        if let Message::Tool {
+            terminal: Some(terminal),
+            ..
+        } = message
+            && terminal.status == ToolStatus::Completed
+            && let Some(load) = &terminal.mcp_tool_load
+        {
+            loaded
+                .entry(load.server.clone())
+                .or_default()
+                .extend(load.names.iter().cloned());
+        }
+    }
+    registry.with_tool_scope(loaded)
+}
 
 pub(crate) fn refresh_request_instructions(
     conversation: &mut orca_core::conversation::Conversation,
