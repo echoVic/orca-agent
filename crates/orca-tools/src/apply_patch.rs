@@ -1304,23 +1304,40 @@ mod tests {
         }
     }
 
+    fn platform_temp_dir() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        assert!(dir.path().is_absolute(), "temp directory must be absolute");
+        dir
+    }
+
     #[test]
     fn an_outside_path_rejects_the_whole_patch() {
-        let dir = TempDir::new().unwrap();
+        let dir = platform_temp_dir();
+        let outside_dir = platform_temp_dir();
         fs::write(dir.path().join("source"), "old\n").unwrap();
+        let outside = outside_dir.path().join("outside");
+        let outside = outside.to_str().unwrap();
         for body in [
-            "*** Add File: ../outside\n+bad",
-            "*** Delete File: ../outside",
-            "*** Update File: ../outside\n@@\n+x",
-            "*** Update File: source\n*** Move to: ../outside\n@@\n+x",
+            format!("*** Add File: {outside}\n+bad"),
+            format!("*** Delete File: {outside}"),
+            format!("*** Update File: {outside}\n@@\n+x"),
+            format!("*** Update File: source\n*** Move to: {outside}\n@@\n+x"),
         ] {
             let patch = format!("*** Add File: staged\n+x\n{body}");
-            assert!(
-                plan(&patch, dir.path())
-                    .unwrap_err()
-                    .to_string()
-                    .contains("escapes workspace")
-            );
+            let error = plan(&patch, dir.path()).unwrap_err().to_string();
+            assert!(error.contains("escapes workspace"), "{error}");
+            assert!(!dir.path().join("staged").exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_and_root_relative_paths_are_rejected() {
+        let dir = platform_temp_dir();
+        for path in [r"C:outside", r"\outside"] {
+            let patch = format!("*** Add File: staged\n+x\n*** Add File: {path}\n+bad");
+            let error = plan(&patch, dir.path()).unwrap_err().to_string();
+            assert!(error.contains("unsupported Windows path"), "{error}");
             assert!(!dir.path().join("staged").exists());
         }
     }
