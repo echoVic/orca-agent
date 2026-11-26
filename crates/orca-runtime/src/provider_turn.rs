@@ -168,15 +168,7 @@ impl<'a> ProviderStepBatcher<'a> {
                     extend_partial_reply(&mut self.delivered, step);
                 }
             }
-            Err(error)
-                if self.cancel.is_cancelled()
-                    && matches!(
-                        error.kind(),
-                        io::ErrorKind::PermissionDenied
-                            | io::ErrorKind::Interrupted
-                            | io::ErrorKind::NotConnected
-                            | io::ErrorKind::BrokenPipe
-                    ) => {}
+            Err(_) if self.cancel.is_cancelled() => {}
             Err(error) => return Err(error),
         }
         self.pending.clear();
@@ -1668,8 +1660,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_step_batcher_preserves_cancellation_when_publication_closes() {
-        for kind in [io::ErrorKind::NotConnected, io::ErrorKind::BrokenPipe] {
+    fn provider_step_batcher_preserves_cancellation_when_publication_fails() {
+        for kind in [
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::Other,
+        ] {
             for cancelled in [false, true] {
                 let ingress = ClosedProviderIngress(kind);
                 let identity = response_identity();
@@ -1678,6 +1674,7 @@ mod tests {
                     cancel.cancel();
                 }
                 let mut batcher = ProviderStepBatcher::new(Some(&ingress), &identity, &cancel);
+                batcher.delivered.content = "earlier text".to_string();
                 let result = batcher
                     .push(ProviderStep::MessageDelta("pending text".to_string()))
                     .and_then(|()| batcher.flush());
@@ -1686,7 +1683,8 @@ mod tests {
                 if let Err(error) = result {
                     assert_eq!(error.kind(), kind);
                 }
-                assert!(batcher.delivered.content.is_empty());
+                assert_eq!(batcher.delivered.content, "earlier text");
+                assert_eq!(batcher.pending.is_empty(), cancelled);
             }
         }
     }

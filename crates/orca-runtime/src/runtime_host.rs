@@ -44028,9 +44028,18 @@ mod tests {
         let transcript = SessionStore::new()
             .load_session(thread.thread_id())
             .unwrap();
-        assert_eq!(transcript.messages.iter().filter(|message| matches!(message,
-            Message::Assistant { content: Some(text), cut_short: Some(orca_core::conversation::CutShort::Interrupted), tool_calls, .. } if text == "Mock slow stream started.Mock slow stream completed." && tool_calls.is_empty()
-        )).count(), 1);
+        let replies: Vec<_> = transcript
+            .messages
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant { .. }))
+            .collect();
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert!(matches!(replies[0], Message::Assistant {
+            content: Some(text),
+            cut_short: Some(orca_core::conversation::CutShort::Interrupted),
+            tool_calls,
+            ..
+        } if text == "Mock slow stream started.Mock slow stream completed." && tool_calls.is_empty()));
         host.shutdown().expect("shutdown host");
     }
 
