@@ -772,7 +772,7 @@ impl<'a> RuntimeTaskActor<'a> {
         let resolution = crate::runtime_approval::resolve_for_request(
             policy,
             &approval,
-            request,
+            &[],
             request.name.as_str(),
             request.target.as_deref(),
         );

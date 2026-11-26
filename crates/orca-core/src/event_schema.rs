@@ -662,6 +662,9 @@ impl EventFactory {
         if result.terminal().source != ToolTerminalSource::Observed {
             payload["terminal_source"] = json!(result.terminal().source);
         }
+        if !result.file_effects.is_empty() {
+            payload["file_effects"] = json!(result.file_effects);
+        }
         if let Some(preview) = result.file_change_preview.as_deref() {
             payload["diff"] = json!(preview.display_text());
         }

@@ -152,6 +152,13 @@
   ],
   "deferred_boundaries": [
     [
+      "tool-execution-patch-alias-fixture",
+      "crates/orca-runtime/src/tool_execution.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "computer-use-live-macos-process-cleanup",
       "crates/orca-computer-use/tests/live_macos.rs",
       "unix_libc_process",

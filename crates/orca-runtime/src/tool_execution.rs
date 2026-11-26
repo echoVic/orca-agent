@@ -236,6 +236,7 @@ pub(crate) struct ToolApprovalGateContext<'a, W: io::Write> {
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) tool_request: &'a tool_types::ToolRequest,
     pub(crate) invocation: &'a ToolInvocation,
+    pub(crate) prepared_patch: Option<&'a orca_tools::apply_patch::PreparedPatch>,
     pub(crate) turn_store: Option<&'a crate::extension::ExtensionData>,
     pub(crate) policy: &'a ApprovalPolicy,
     pub(crate) permission_overlay: &'a mut TurnPermissionOverlay,
@@ -294,7 +295,6 @@ impl ToolExecutionCompletion {
 /// The diff an edit or write would make, for its approval to show.
 fn file_change_preview_text(request: &tool_types::ToolRequest, cwd: &Path) -> Option<String> {
     let preview = match request.name {
-        tool_types::ToolName::ApplyPatch => return orca_tools::apply_patch::preview(request, cwd),
         tool_types::ToolName::Edit => orca_tools::edit::preview(request, cwd),
         tool_types::ToolName::WriteFile => orca_tools::write_file::preview(request, cwd),
         _ => None,
@@ -1065,6 +1065,9 @@ impl ToolExecutionActor {
         let permission_overlay = permission_overlay.expect("tool execution permission overlay");
         let mut invocation =
             prepare_tool_invocation(tool_request, subagent_depth, mcp_registry, config);
+        let mut prepared_patch = None;
+        let rewind_turn = extension_stores
+            .and_then(|stores| stores.thread_store().get::<crate::rewind::RewindTurn>());
         let failure = match validate_tool_invocation(&invocation, mcp_registry, config) {
             Err(error) => {
                 let mut result = error.into_result();
@@ -1117,6 +1120,38 @@ impl ToolExecutionActor {
                 })
                 .err()
                 .map(|error| tool_types::ToolResult::failed_before_start(tool_request, error, None))
+            }
+            Ok(()) if invocation.effective.name == tool_types::ToolName::ApplyPatch => {
+                let prepare = || -> Result<_, String> {
+                    if approval_already_resolved {
+                        return Err("the prepared patch is no longer available; submit the patch again for approval".into());
+                    }
+                    let patch =
+                        orca_tools::apply_patch::prepare(&invocation.effective, cwd, || {
+                            cancel.is_cancelled()
+                        })
+                        .map_err(|error| format!("patch preflight failed: {error}"))?;
+                    if !matches!(
+                        config.history_mode,
+                        orca_core::config::HistoryMode::Disabled
+                    ) {
+                        crate::rewind::validate_patch_paths(&patch)?;
+                    }
+                    Ok(patch)
+                };
+                match prepare() {
+                    Ok(patch) => {
+                        invocation.effective.target =
+                            Some(patch.approval_targets().collect::<Vec<_>>().join(", "));
+                        prepared_patch = Some(std::sync::Arc::new(patch));
+                        None
+                    }
+                    Err(error) => Some(tool_types::ToolResult::failed_before_start(
+                        tool_request,
+                        error,
+                        None,
+                    )),
+                }
             }
             Ok(()) => None,
         };
@@ -1171,6 +1206,7 @@ impl ToolExecutionActor {
                 sink,
                 tool_request,
                 invocation: &invocation,
+                prepared_patch: prepared_patch.as_deref(),
                 turn_store: extension_stores.map(|stores| stores.turn_store()),
                 policy,
                 permission_overlay,
@@ -1282,7 +1318,7 @@ impl ToolExecutionActor {
             provider_response_ingress,
             Some(cancel),
         );
-        let invocation = match hook_execution.outcome {
+        let mut invocation = match hook_execution.outcome {
             Ok(invocation) => invocation,
             Err(outcome) => {
                 return Ok(ToolExecutionCompletion::from_pair_with_event_error(
@@ -1291,6 +1327,16 @@ impl ToolExecutionActor {
                 ));
             }
         };
+        if prepared_patch.is_some()
+            && invocation.effective.name == tool_types::ToolName::ApplyPatch
+            && approval_bound_request.as_ref().is_some_and(|approved| {
+                approved.raw_arguments == invocation.effective.raw_arguments
+            })
+        {
+            invocation.effective.target = approval_bound_request
+                .as_ref()
+                .and_then(|approved| approved.target.clone());
+        }
         if approval_bound_request.as_ref().is_some_and(|approved| {
             approved.id != invocation.effective.id
                 || approved.name.as_str() != invocation.effective.name.as_str()
@@ -1321,6 +1367,32 @@ impl ToolExecutionActor {
             ));
         }
         let execution_request = &invocation.effective;
+        let patch_capture = match (rewind_turn.as_deref(), prepared_patch.as_deref()) {
+            (Some(turn), Some(patch)) => match turn.prepare_patch_capture(patch) {
+                Ok(capture) => Some(capture),
+                Err(error) => {
+                    let result = tool_types::ToolResult::failed_before_start(
+                        execution_request,
+                        format!("could not capture patch for rewind: {error}"),
+                        None,
+                    );
+                    let event_error = publish_tool_call_completed(
+                        events,
+                        sink,
+                        execution_request,
+                        &result,
+                        emit_deltas,
+                        provider_response_ingress,
+                    )
+                    .err();
+                    return Ok(ToolExecutionCompletion::from_pair_with_event_error(
+                        (RunStatus::Failed, result),
+                        event_error,
+                    ));
+                }
+            },
+            _ => None,
+        };
         if let (Some(registry), Some(extension_stores)) = (extension_registry, extension_stores) {
             registry.on_tool_start(ToolStartInput {
                 thread_store: extension_stores.thread_store(),
@@ -1331,8 +1403,8 @@ impl ToolExecutionActor {
         }
         // Capture file pre-images before dispatch. The turn records capture
         // failures as limitations while the tool continues.
-        if let Some(stores) = extension_stores
-            && let Some(turn) = stores.thread_store().get::<crate::rewind::RewindTurn>()
+        if prepared_patch.is_none()
+            && let Some(turn) = rewind_turn.as_deref()
         {
             turn.capture_pre_image(cwd, execution_request);
         }
@@ -1344,6 +1416,7 @@ impl ToolExecutionActor {
                 events,
                 sink,
                 execution_request,
+                prepared_patch,
                 goal_mode,
                 headless,
                 subagent_depth,
@@ -1389,11 +1462,14 @@ impl ToolExecutionActor {
             },
         };
         let result = dispatch.result;
+        if let (Some(turn), Some(capture)) = (rewind_turn.as_deref(), patch_capture) {
+            turn.record_patch_effects(capture, &result.file_effects);
+        }
         let write_applied = match execution_request.name {
             tool_types::ToolName::Edit | tool_types::ToolName::WriteFile => {
                 result.kind == tool_types::ToolResultKind::Success
             }
-            tool_types::ToolName::ApplyPatch => result.file_change_preview.is_some(),
+            tool_types::ToolName::ApplyPatch => !result.file_effects.is_empty(),
             _ => false,
         };
         if write_applied
@@ -1454,6 +1530,7 @@ impl ToolExecutionActor {
             sink,
             tool_request,
             invocation,
+            prepared_patch,
             turn_store,
             policy,
             permission_overlay,
@@ -1473,11 +1550,20 @@ impl ToolExecutionActor {
             return ApprovalGateExecution::default();
         }
 
-        if let Some(approval) = approval_request_for_invocation(invocation)
+        if let Some(mut approval) = approval_request_for_invocation(invocation)
             && agent_common::requires_approval(approval.action)
         {
+            let targets: Vec<_> = prepared_patch
+                .into_iter()
+                .flat_map(|patch| patch.approval_targets())
+                .collect();
             let approval_decision = RuntimeToolApprovalPolicy::new(policy, permission_overlay)
-                .resolve(approval.clone(), &invocation.effective);
+                .resolve_with_targets(approval.clone(), &invocation.effective, &targets);
+            if matches!(approval_decision, RuntimeApprovalDecision::Ask(_)) {
+                approval.preview = prepared_patch
+                    .map(|patch| patch.preview())
+                    .or(approval.preview);
+            }
             let mut event_error = None;
             if emit_deltas {
                 retain_first_io_error(
@@ -1506,7 +1592,7 @@ impl ToolExecutionActor {
                         );
                     }
                 }
-                RuntimeApprovalDecision::Ask(mut approval) => {
+                RuntimeApprovalDecision::Ask(_) => {
                     if approval.preview.is_none() {
                         approval.preview = file_change_preview_text(&invocation.effective, cwd);
                     }
@@ -2397,6 +2483,7 @@ mod tests {
                 sink: &mut sink,
                 tool_request: &request,
                 invocation: &invocation,
+                prepared_patch: None,
                 turn_store: None,
                 policy: &policy,
                 permission_overlay: &mut overlay,
@@ -2512,6 +2599,7 @@ mod tests {
             sink: &mut sink,
             tool_request: &request,
             invocation: &invocation,
+            prepared_patch: None,
             turn_store: None,
             policy: &policy,
             permission_overlay: &mut overlay,
@@ -3307,6 +3395,7 @@ mod tests {
                 sink: &mut sink,
                 tool_request: &request,
                 invocation: &invocation,
+                prepared_patch: None,
                 turn_store: None,
                 policy: &policy,
                 permission_overlay: &mut overlay,
@@ -3358,6 +3447,7 @@ mod tests {
             sink: &mut sink,
             tool_request: &request,
             invocation: &invocation,
+            prepared_patch: None,
             turn_store: None,
             policy: &policy,
             permission_overlay: &mut overlay,
@@ -3430,6 +3520,269 @@ mod tests {
 
         assert_eq!(completion.status, RunStatus::ApprovalRequired);
         assert!(!marker.exists(), "the command must not run before approval");
+    }
+
+    fn execute_patch_test(
+        cwd: &std::path::Path,
+        config: &RunConfig,
+        body: &str,
+        handler: Option<&(dyn super::RuntimeApprovalHandler + Send + Sync)>,
+        rewind: Option<crate::rewind::RewindTurn>,
+    ) -> super::ToolExecutionCompletion {
+        let request = ToolRequest {
+            id: "patch".into(),
+            name: ToolName::ApplyPatch,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({"input": format!("*** Begin Patch\n{body}\n*** End Patch")})
+                    .to_string(),
+            ),
+        };
+        let policy = policy_for_tool_execution(config);
+        let mut events = EventFactory::new("patch-test".into());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let thread_store = ExtensionData::new("patch-thread");
+        let turn_store = ExtensionData::new("patch-turn");
+        if let Some(rewind) = rewind {
+            thread_store.insert(rewind);
+        }
+        ToolExecutionActor::new("patch-test")
+            .execute_with_event_error(
+                config,
+                &mut events,
+                &mut sink,
+                &request,
+                ToolExecutionContext::new(cwd, 0, false, &policy)
+                    .with_services(
+                        &ProjectInstructions::default(),
+                        &MemoryBlock::default(),
+                        &McpRegistry::default(),
+                        &HookRunner::default(),
+                    )
+                    .with_runtime(
+                        &mut CostTracker::new(None),
+                        &orca_core::cancel::CancelToken::new(),
+                        &TaskRegistry::new("patch-test".into()),
+                        &mut Vec::new(),
+                        None,
+                    )
+                    .with_extensions(
+                        &ExtensionRegistryBuilder::new().build(),
+                        RuntimeExtensionStores::new(&thread_store, &turn_store),
+                    )
+                    .with_approval_handler(handler)
+                    .with_permission_overlay(&mut TurnPermissionOverlay::default()),
+                unused_child_executor,
+                unused_child_executor,
+                false,
+                None,
+                false,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn apply_patch_approval_checks_normalized_move_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "old\n").unwrap();
+        let mut config = config_with_permission_rules(PermissionRules {
+            rules: vec![PermissionRule::new(
+                "apply_patch",
+                "private/**",
+                Decision::Deny,
+            )],
+        });
+        config.tools.apply_patch = true;
+        config.approval_mode = ApprovalMode::AutoEdit;
+        let completion = execute_patch_test(
+            dir.path(),
+            &config,
+            "*** Update File: a\n*** Move to: ./private/a",
+            None,
+            None,
+        );
+        assert_eq!(
+            completion.result.status,
+            orca_core::tool_types::ToolStatus::Denied
+        );
+        assert!(!dir.path().join("private").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_patch_approval_checks_the_effective_alias_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("private")).unwrap();
+        std::fs::write(dir.path().join("private/a"), "old\n").unwrap();
+        std::os::unix::fs::symlink("private", dir.path().join("alias")).unwrap();
+        let mut config = config_with_permission_rules(PermissionRules {
+            rules: vec![PermissionRule::new(
+                "apply_patch",
+                "private/**",
+                Decision::Deny,
+            )],
+        });
+        config.tools.apply_patch = true;
+        config.approval_mode = ApprovalMode::AutoEdit;
+        let completion = execute_patch_test(
+            dir.path(),
+            &config,
+            "*** Update File: alias/a\n@@\n-old\n+new",
+            None,
+            None,
+        );
+        assert_eq!(
+            completion.result.status,
+            orca_core::tool_types::ToolStatus::Denied
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("private/a")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn apply_patch_rewind_exclusions_fail_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_permission_rules(PermissionRules::default());
+        config.tools.apply_patch = true;
+        config.history_mode = orca_core::config::HistoryMode::Record;
+        config.approval_mode = ApprovalMode::AutoEdit;
+        let completion = execute_patch_test(
+            dir.path(),
+            &config,
+            "*** Add File: staged\n+x\n*** Add File: target/generated.txt\n+x",
+            None,
+            None,
+        );
+        assert!(
+            completion
+                .result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("rewind") && error.contains("target"))
+        );
+        assert!(!dir.path().join("staged").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_patch_rewind_removes_effects_of_a_failed_dispatch() {
+        use orca_core::tool_types::{FileEffect, ToolStatus};
+        let mut fixture = crate::rewind_tests::Fixture::new();
+        fixture.append_turn("apply the patch", "patched");
+        let cwd = fixture.cwd().canonicalize().unwrap();
+        let mut config = config_with_permission_rules(PermissionRules::default());
+        config.tools.apply_patch = true;
+        config.approval_mode = ApprovalMode::AutoEdit;
+        config.history_mode = orca_core::config::HistoryMode::Record;
+        let mut conversation = orca_core::conversation::Conversation::new();
+        conversation.add_user("apply the patch".into());
+        let turn = crate::rewind::begin_turn(
+            &config,
+            &cwd,
+            "patch-turn",
+            &conversation,
+            Some(&mut fixture.writer),
+        )
+        .unwrap();
+        let result = execute_patch_test(
+            &cwd,
+            &config,
+            &format!(
+                "*** Add File: first\n+new\n*** Add File: fresh/{}\n+x\n*** Add File: last\n+x",
+                "a".repeat(256)
+            ),
+            None,
+            Some(turn.clone()),
+        )
+        .result;
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(
+            result.file_effects,
+            [
+                FileEffect::Written("first".into()),
+                FileEffect::CreatedDirectory("fresh".into())
+            ]
+        );
+        let output = result.output.as_deref().unwrap();
+        assert!(
+            output.contains("created directory fresh") && output.contains("Not attempted: last"),
+            "{output}"
+        );
+        let diff = result.file_change_preview.as_ref().unwrap().display_text();
+        assert!(
+            diff.contains("+++ b/first") && !diff.contains("b/last"),
+            "{diff}"
+        );
+        assert_eq!(std::fs::read_to_string(cwd.join("first")).unwrap(), "new\n");
+        assert!(cwd.join("fresh").is_dir() && !cwd.join("last").exists());
+        let snapshot = turn.finish_record().unwrap().unwrap();
+        assert_eq!(
+            snapshot
+                .files
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
+        assert_eq!(snapshot.created_directories, ["fresh"]);
+        let store = fixture.store();
+        let plan = orca_rewind::build_plan(
+            &cwd,
+            &store,
+            &[crate::rewind_tests::snapshot_view(&snapshot)],
+            orca_rewind::PlanOptions { target_ordinal: 0 },
+        )
+        .unwrap();
+        let report =
+            orca_rewind::Applier::new(cwd.clone(), store, fixture.store_dir().join("journals"))
+                .apply(&plan)
+                .unwrap();
+        assert_eq!(report.deleted, 2);
+        assert!(!cwd.join("first").exists() && !cwd.join("fresh").exists());
+    }
+
+    #[test]
+    fn apply_patch_approval_keeps_the_preview_bound_to_the_prepared_file() {
+        struct ApproveAfterEdit(std::path::PathBuf);
+        impl super::RuntimeApprovalHandler for ApproveAfterEdit {
+            fn resolve_interactive(
+                &self,
+                approval: &orca_core::approval_types::ApprovalRequest,
+                _: &ToolRequest,
+            ) -> std::io::Result<orca_core::approval_types::ApprovalResolution> {
+                assert_eq!(approval.target.as_deref(), Some("a"));
+                assert!(approval.preview.as_deref().unwrap().contains("+new"));
+                std::fs::write(&self.0, "old\nunrelated edit\n").unwrap();
+                Ok(orca_core::approval_types::ApprovalResolution {
+                    id: approval.id.clone(),
+                    decision: orca_core::approval_types::ApprovalDecision::Allow,
+                    reason: "approved".into(),
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a");
+        std::fs::write(&file, "old\n").unwrap();
+        let mut config = config_with_permission_rules(PermissionRules::default());
+        config.approval_mode = ApprovalMode::Suggest;
+        config.tools.apply_patch = true;
+        let result = execute_patch_test(
+            dir.path(),
+            &config,
+            "*** Update File: ./a\n@@\n-old\n+new",
+            Some(&ApproveAfterEdit(file.clone())),
+            None,
+        )
+        .result;
+        assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+        assert!(result.file_effects.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "old\nunrelated edit\n"
+        );
     }
 
     #[test]

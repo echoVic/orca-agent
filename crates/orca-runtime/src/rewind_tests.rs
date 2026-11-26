@@ -27,17 +27,17 @@ use orca_rewind::{
 };
 use tempfile::TempDir;
 
-struct Fixture {
+pub(crate) struct Fixture {
     _home_guard: TestOrcaHomeGuard,
     home: TempDir,
     cwd: TempDir,
-    writer: SessionWriter,
+    pub(crate) writer: SessionWriter,
     session_id: String,
     transcript: PathBuf,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let home = tempfile::tempdir().expect("temporary ORCA_HOME");
         let home_guard = redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().expect("workspace");
@@ -61,11 +61,11 @@ impl Fixture {
         }
     }
 
-    fn cwd(&self) -> &Path {
+    pub(crate) fn cwd(&self) -> &Path {
         self.cwd.path()
     }
 
-    fn append_turn(&mut self, prompt: &str, reply: &str) {
+    pub(crate) fn append_turn(&mut self, prompt: &str, reply: &str) {
         self.writer.enter_turn(TurnId::new());
         self.writer
             .append_message(&Message::user(prompt.to_string()))
@@ -88,7 +88,7 @@ impl Fixture {
             .collect()
     }
 
-    fn store(&self) -> RewindStore {
+    pub(crate) fn store(&self) -> RewindStore {
         let store_dir = self
             .home
             .path()
@@ -98,7 +98,7 @@ impl Fixture {
         RewindStore::open(&store_dir).expect("rewind store")
     }
 
-    fn store_dir(&self) -> PathBuf {
+    pub(crate) fn store_dir(&self) -> PathBuf {
         self.home
             .path()
             .join("rewind")
@@ -123,6 +123,7 @@ impl Fixture {
         change_stats: Option<SnapshotChangeStats>,
     ) -> FileSnapshotRecord {
         FileSnapshotRecord {
+            created_directories: Vec::new(),
             schema_version: 1,
             snapshot_id: format!("snap_{ordinal}"),
             session_id: self.session_id.clone(),
@@ -163,10 +164,11 @@ fn blob_ref(pre: &PreImage) -> BlobRef {
     }
 }
 
-fn snapshot_view(record: &FileSnapshotRecord) -> SnapshotView {
+pub(crate) fn snapshot_view(record: &FileSnapshotRecord) -> SnapshotView {
     SnapshotView {
         ordinal: record.ordinal,
         at_message_id: record.at_message_id.clone(),
+        created_directories: record.created_directories.clone(),
         files: record
             .files
             .iter()
@@ -609,9 +611,10 @@ fn rewind_restores_every_file_a_patch_changed() {
         target: None,
         raw_arguments: Some(serde_json::json!({"input": "*** Begin Patch\n*** Update File: update\n@@\n-old\n+changed\n*** Delete File: delete\n*** Update File: move\n*** Move to: moved\n@@\n-original\n+new\n*** Add File: new/created\n+added\n*** End Patch"}).to_string()),
     };
-    turn.capture_pre_image(&cwd, &request);
-    let result = orca_tools::registry::default_tool_registry()
-        .execute(&request, &orca_tools::ToolContext::new(&cwd));
+    let prepared = orca_tools::apply_patch::prepare(&request, &cwd, || false).unwrap();
+    let capture = turn.prepare_patch_capture(&prepared).unwrap();
+    let result = prepared.commit(&request, || false);
+    turn.record_patch_effects(capture, &result.file_effects);
     assert_eq!(
         result.status,
         orca_core::tool_types::ToolStatus::Completed,
@@ -640,7 +643,7 @@ fn rewind_restores_every_file_a_patch_changed() {
         assert_eq!(std::fs::read_to_string(cwd.join(name)).unwrap(), text);
     }
     assert!(!cwd.join("moved").exists());
-    assert!(!cwd.join("new/created").exists());
+    assert!(!cwd.join("new").exists());
 }
 
 fn write_request(path: &str) -> ToolRequest {

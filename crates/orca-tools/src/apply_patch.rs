@@ -4,8 +4,12 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use orca_core::tool_types::{FileChangePreview, ToolRequest, ToolResult, truncate_output};
-use orca_platform::fs::{FileAccess, FileIdentity, VerifiedDirectory, file_links, stale_path};
+use orca_core::tool_types::{
+    FileChangePreview, FileEffect, ToolRequest, ToolResult, truncate_output,
+};
+use orca_platform::fs::{
+    FileAccess, FileIdentity, VerifiedDirectory, file_links, file_mode, stale_path,
+};
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
@@ -21,7 +25,7 @@ const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MATCH_WORK: usize = 256 * 1024 * 1024;
 
 #[derive(Debug)]
-pub(crate) struct PatchError(String);
+pub struct PatchError(String);
 
 impl fmt::Display for PatchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -180,10 +184,10 @@ fn parse_hunk<'a>(
 }
 
 #[derive(Debug)]
-pub(crate) struct Plan {
+pub struct PreparedPatch {
     root: PathBuf,
     root_identity: FileIdentity,
-    pub(crate) ops: Vec<PlannedOp>,
+    ops: Vec<PlannedOp>,
 }
 
 #[derive(Debug)]
@@ -193,6 +197,9 @@ pub(crate) struct PlannedTarget {
     ancestor: PathBuf,
     ancestor_identity: FileIdentity,
     case_insensitive: bool,
+    relative: String,
+    requested_relative: String,
+    mode: Option<u32>,
     identity: Option<FileIdentity>,
 }
 
@@ -206,7 +213,8 @@ pub(crate) struct PlannedOp {
     removed: usize,
 }
 
-pub(crate) fn preflight(patch: &Patch, cwd: &Path) -> Result<Plan, PatchError> {
+#[cfg(test)]
+fn preflight(patch: &Patch, cwd: &Path) -> Result<PreparedPatch, PatchError> {
     preflight_or_cancel(patch, cwd, &|| false)
 }
 
@@ -214,7 +222,7 @@ fn preflight_or_cancel(
     patch: &Patch,
     cwd: &Path,
     should_cancel: &dyn Fn() -> bool,
-) -> Result<Plan, PatchError> {
+) -> Result<PreparedPatch, PatchError> {
     let root = cwd
         .canonicalize()
         .map_err(|error| PatchError(format!("cannot resolve workspace: {error}")))?;
@@ -304,7 +312,7 @@ fn preflight_or_cancel(
         })?;
         ops.push(planned);
     }
-    Ok(Plan {
+    Ok(PreparedPatch {
         root,
         root_identity,
         ops,
@@ -382,6 +390,11 @@ fn resolve_target(
             "file path conflicts with another operation: {label}"
         ));
     }
+    let relative = workspace_label(root, &canonical)?;
+    let requested_relative = workspace_label(cwd, &path)?;
+    if relative.is_empty() {
+        return Err("patch target must name a file inside the workspace".into());
+    }
     seen.insert(key);
     Ok(PlannedTarget {
         path: canonical,
@@ -389,8 +402,30 @@ fn resolve_target(
         ancestor: directory,
         ancestor_identity: verified.identity().map_err(|error| error.to_string())?,
         case_insensitive,
+        relative,
+        requested_relative,
+        mode: None,
         identity: None,
     })
+}
+
+fn workspace_label(root: &Path, path: &Path) -> Result<String, String> {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(Path::to_str)
+        .map(|label| {
+            if cfg!(windows) {
+                label.replace('\\', "/")
+            } else {
+                label.to_owned()
+            }
+        })
+        .ok_or_else(|| {
+            format!(
+                "cannot express {} relative to the workspace",
+                path.display()
+            )
+        })
 }
 
 fn path_key(path: &Path, case_insensitive: bool) -> PathBuf {
@@ -415,7 +450,7 @@ fn read_existing(
     target: &mut PlannedTarget,
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<String, String> {
-    let read = || -> io::Result<(FileIdentity, String)> {
+    let read = || -> io::Result<(FileIdentity, Option<u32>, String)> {
         let directory = VerifiedDirectory::open(&target.ancestor)?;
         if directory.identity()? != target.ancestor_identity
             || target.path.parent() != Some(&target.ancestor)
@@ -427,9 +462,13 @@ fn read_existing(
         }
         let file = directory.open_file(target.file_name(), FileAccess::Read)?;
         let identity = single_link_identity(&file)?;
-        Ok((identity, read_opened(&file, should_cancel)?))
+        Ok((
+            identity,
+            file_mode(&file)?,
+            read_opened(&file, should_cancel)?,
+        ))
     };
-    let (identity, before) = read().map_err(|error| {
+    let (identity, mode, before) = read().map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             format!("{} does not exist", target.label)
         } else {
@@ -437,6 +476,7 @@ fn read_existing(
         }
     })?;
     target.identity = Some(identity);
+    target.mode = mode;
     Ok(before)
 }
 
@@ -467,8 +507,9 @@ impl PlannedTarget {
 
     fn parent_for_write(
         &self,
-        plan: &Plan,
+        plan: &PreparedPatch,
         created: &mut HashMap<PathBuf, FileIdentity>,
+        effects: &mut Vec<FileEffect>,
     ) -> io::Result<VerifiedDirectory> {
         // Unix directory descriptors keep operations on the checked directory
         // even if another process moves it after the walk.
@@ -503,7 +544,9 @@ impl PlannedTarget {
                     return Err(stale_path());
                 }
             } else {
+                let label = workspace_label(&plan.root, &next).map_err(io::Error::other)?;
                 directory.create_directory(component)?;
+                effects.push(FileEffect::CreatedDirectory(label));
                 directory = directory.child(component)?;
                 created.insert(key, directory.identity()?);
             }
@@ -696,39 +739,49 @@ fn parse_request(request: &ToolRequest) -> Result<Patch, PatchError> {
     parse_patch(&args.input)
 }
 
-/// The paths named by the patch, including both ends of a move.
-pub fn requested_paths(request: &ToolRequest) -> Vec<String> {
-    let Ok(patch) = parse_request(request) else {
-        return Vec::new();
-    };
-    let mut paths = Vec::new();
-    for op in patch.ops {
-        match op {
-            PatchOp::Add { path, .. } | PatchOp::Delete { path } => paths.push(path),
-            PatchOp::Update { path, move_to, .. } => {
-                paths.push(path);
-                paths.extend(move_to);
-            }
-        }
+/// Prepare the paths and file contents once for this invocation.
+pub fn prepare(
+    request: &ToolRequest,
+    cwd: &Path,
+    should_cancel: impl Fn() -> bool,
+) -> Result<PreparedPatch, PatchError> {
+    preflight_or_cancel(&parse_request(request)?, cwd, &should_cancel)
+}
+
+impl PreparedPatch {
+    pub fn root(&self) -> &Path {
+        &self.root
     }
-    paths
-}
 
-/// Resolve a patch's checked file paths for capturing rewind pre-images.
-pub fn checked_paths(request: &ToolRequest, cwd: &Path) -> Vec<PathBuf> {
-    let Ok(plan) = parse_request(request).and_then(|patch| preflight(&patch, cwd)) else {
-        return Vec::new();
-    };
-    plan.ops
-        .into_iter()
-        .flat_map(|op| std::iter::once(op.target.path).chain(op.move_to.map(|target| target.path)))
-        .collect()
-}
+    pub fn approval_targets(&self) -> impl Iterator<Item = &str> {
+        self.ops
+            .iter()
+            .flat_map(|op| std::iter::once(&op.target).chain(op.move_to.as_ref()))
+            .flat_map(|target| {
+                std::iter::once(target.relative.as_str()).chain(
+                    (target.requested_relative != target.relative)
+                        .then_some(target.requested_relative.as_str()),
+                )
+            })
+    }
 
-/// Preview a patch as a sequence of unified diff sections without writing.
-pub fn preview(request: &ToolRequest, cwd: &Path) -> Option<String> {
-    let plan = preflight(&parse_request(request).ok()?, cwd).ok()?;
-    Some(patch_diff(&plan.ops))
+    pub fn pre_images(&self) -> impl Iterator<Item = (&str, Option<(&str, Option<u32>)>)> {
+        self.ops.iter().flat_map(|op| {
+            let source = (
+                &*op.target.relative,
+                op.before.as_deref().map(|before| (before, op.target.mode)),
+            );
+            std::iter::once(source).chain(op.move_to.as_ref().map(|dest| (&*dest.relative, None)))
+        })
+    }
+
+    pub fn preview(&self) -> String {
+        patch_diff(&self.ops)
+    }
+
+    pub fn commit(&self, request: &ToolRequest, should_cancel: impl Fn() -> bool) -> ToolResult {
+        commit(request, self, &should_cancel)
+    }
 }
 
 pub(crate) fn execute(
@@ -736,30 +789,53 @@ pub(crate) fn execute(
     cwd: &Path,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
-    match parse_request(request).and_then(|patch| preflight_or_cancel(&patch, cwd, &should_cancel))
-    {
-        Ok(plan) => commit(request, &plan, &should_cancel),
+    match prepare(request, cwd, &should_cancel) {
+        Ok(plan) => plan.commit(request, &should_cancel),
         Err(error) => ToolResult::failed(request, format!("patch preflight failed: {error}"), None),
     }
 }
 
-fn commit(request: &ToolRequest, plan: &Plan, should_cancel: &dyn Fn() -> bool) -> ToolResult {
+fn commit(
+    request: &ToolRequest,
+    plan: &PreparedPatch,
+    should_cancel: &dyn Fn() -> bool,
+) -> ToolResult {
     let mut written = Vec::new();
+    let mut effects = Vec::new();
     let mut created = HashMap::new();
     for (index, op) in plan.ops.iter().enumerate() {
-        let outcome = if should_cancel() {
+        let first_effect = effects.len();
+        let cancelled = should_cancel();
+        let outcome = if cancelled {
             Err(io::Error::new(io::ErrorKind::Interrupted, "patch cancelled").into())
         } else {
-            op.write(plan, &mut created)
+            op.write(plan, &mut created, &mut effects)
         };
+        for effect in &effects[first_effect..] {
+            if let FileEffect::CreatedDirectory(path) = effect {
+                written.push(format!("created directory {path}"));
+            }
+        }
         if let Err(WriteFailure { error, changed }) = outcome {
-            let failed = op.label();
-            let pending = plan.ops[index + 1..]
+            let failed = if cancelled {
+                "(none)".to_owned()
+            } else {
+                op.label()
+            };
+            let pending = plan.ops[index + usize::from(!cancelled)..]
                 .iter()
                 .map(PlannedOp::label)
                 .collect::<Vec<_>>();
-            let mut result =
-                ToolResult::failed(request, format!("failed to apply {failed}: {error}"), None);
+            let mut result = if cancelled && effects.is_empty() {
+                ToolResult::cancelled_before_start(request, "patch cancelled")
+            } else {
+                let message = if cancelled {
+                    error.to_string()
+                } else {
+                    format!("failed to apply {failed}: {error}")
+                };
+                ToolResult::failed(request, message, None)
+            };
             let written = if written.is_empty() {
                 "(none)".into()
             } else {
@@ -773,6 +849,7 @@ fn commit(request: &ToolRequest, plan: &Plan, should_cancel: &dyn Fn() -> bool) 
             result.output = Some(format!(
                 "Written:\n{written}\nFailed: {failed}\nNot attempted: {pending}\nReason: {error}"
             ));
+            result.file_effects = effects;
             let mut diff = patch_diff(&plan.ops[..index]);
             if let Some(target) = changed {
                 if let Some(output) = &mut result.output {
@@ -789,10 +866,9 @@ fn commit(request: &ToolRequest, plan: &Plan, should_cancel: &dyn Fn() -> bool) 
         }
         written.push(op.summary());
     }
-    with_committed_preview(
-        ToolResult::completed(request, written.join("\n"), false),
-        &plan.ops,
-    )
+    let mut result = ToolResult::completed(request, written.join("\n"), false);
+    result.file_effects = effects;
+    with_committed_preview(result, &plan.ops)
 }
 
 fn with_committed_preview(result: ToolResult, committed: &[PlannedOp]) -> ToolResult {
@@ -840,31 +916,36 @@ impl PlannedOp {
 
     fn write(
         &self,
-        plan: &Plan,
+        plan: &PreparedPatch,
         created: &mut HashMap<PathBuf, FileIdentity>,
+        effects: &mut Vec<FileEffect>,
     ) -> Result<(), WriteFailure<'_>> {
-        let parent = self.target.parent_for_write(plan, created)?;
+        let parent = self.target.parent_for_write(plan, created, effects)?;
         match (&self.move_to, &self.before, &self.after) {
             (_, Some(before), None) => {
                 let file = self
                     .target
                     .verify_existing(&parent, FileAccess::Delete, before)?;
-                Ok(parent.remove_file(self.target.file_name(), &file)?)
+                parent.remove_file(self.target.file_name(), &file)?;
+                effects.push(FileEffect::Deleted(self.target.relative.clone()));
+                Ok(())
             }
             (Some(dest), Some(before), Some(text)) => {
                 let file = self
                     .target
                     .verify_existing(&parent, FileAccess::Delete, before)?;
                 let permissions = file.metadata()?.permissions();
-                let destination = dest.parent_for_write(plan, created)?;
-                create_file(&destination, dest, text)?
+                let destination = dest.parent_for_write(plan, created, effects)?;
+                create_file(&destination, dest, text, effects)?
                     .set_permissions(permissions)
                     .map_err(|error| WriteFailure::after_write(error, dest))?;
                 parent
                     .remove_file(self.target.file_name(), &file)
-                    .map_err(|error| WriteFailure::after_write(error, dest))
+                    .map_err(|error| WriteFailure::after_write(error, dest))?;
+                effects.push(FileEffect::Deleted(self.target.relative.clone()));
+                Ok(())
             }
-            (_, None, Some(text)) => create_file(&parent, &self.target, text).map(|_| ()),
+            (_, None, Some(text)) => create_file(&parent, &self.target, text, effects).map(|_| ()),
             (_, Some(before), Some(text)) => {
                 let mut file = self
                     .target
@@ -872,6 +953,7 @@ impl PlannedOp {
                 // A writer holding the same inode can still edit it or add a
                 // hard link between validation and truncation.
                 file.set_len(0)?;
+                effects.push(FileEffect::Written(self.target.relative.clone()));
                 use std::io::{Seek, SeekFrom};
                 file.seek(SeekFrom::Start(0))
                     .and_then(|_| file.write_all(text.as_bytes()))
@@ -979,8 +1061,10 @@ fn create_file<'a>(
     directory: &VerifiedDirectory,
     target: &'a PlannedTarget,
     text: &str,
+    effects: &mut Vec<FileEffect>,
 ) -> Result<fs::File, WriteFailure<'a>> {
     let mut file = directory.create_file(target.file_name())?;
+    effects.push(FileEffect::Written(target.relative.clone()));
     file.write_all(text.as_bytes())
         .map_err(|error| WriteFailure::after_write(error, target))?;
     Ok(file)
@@ -1093,7 +1177,7 @@ mod tests {
         assert!(!dir.path().join("five").exists());
     }
 
-    fn plan(body: &str, cwd: &Path) -> Result<Plan, PatchError> {
+    fn plan(body: &str, cwd: &Path) -> Result<PreparedPatch, PatchError> {
         preflight(
             &parse_patch(&format!("*** Begin Patch\n{body}\n*** End Patch")).unwrap(),
             cwd,
@@ -1371,6 +1455,39 @@ mod tests {
                 .is_some_and(|error| error.contains("repeated path"))
         );
         assert_eq!(dir.path().read_dir().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn patch_reports_cancellation_before_an_operation_as_not_attempted() {
+        let dir = TempDir::new().unwrap();
+        let body = "*** Add File: a\n+x";
+        let result = commit(&request(body), &plan(body, dir.path()).unwrap(), &|| true);
+        let output = result.output.as_deref().unwrap();
+        assert!(
+            output.contains("Failed: (none)\nNot attempted: a"),
+            "{output}"
+        );
+        assert!(!dir.path().join("a").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_reports_a_directory_created_before_a_failed_file() {
+        let dir = TempDir::new().unwrap();
+        let result = execute(
+            &request(&format!("*** Add File: fresh/{}\n+x", "a".repeat(256))),
+            dir.path(),
+            || false,
+        );
+        assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+        assert!(
+            result
+                .output
+                .as_deref()
+                .unwrap()
+                .contains("created directory fresh")
+        );
+        assert!(dir.path().join("fresh").is_dir());
     }
 
     #[test]

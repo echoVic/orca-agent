@@ -829,7 +829,7 @@ mod tests {
                 let decision = crate::runtime_approval::resolve_for_request(
                     &orca_approval::ApprovalPolicy::new(mode),
                     &approval,
-                    &invocation.effective,
+                    &[],
                     requested.name.as_str(),
                     approval.target.as_deref(),
                 );

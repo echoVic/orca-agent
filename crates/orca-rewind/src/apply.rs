@@ -19,7 +19,7 @@ use crate::MAX_SNAPSHOT_FILE_BYTES;
 use crate::error::RewindError;
 use crate::path::{
     BoundedFile, atomic_publish, excluded_directory, file_sha256, read_regular_file,
-    resolve_inside, sha256_hex, sync_dir, validate_digest,
+    resolve_directory, resolve_inside, sha256_hex, sync_dir, validate_digest,
 };
 use crate::plan::{PlanSkip, PlannedDelete, PlannedWrite, RestorePlan, skip_reason};
 use crate::store::RewindStore;
@@ -187,7 +187,7 @@ impl Applier {
             }
         }
 
-        if writes.is_empty() && deletes.is_empty() {
+        if writes.is_empty() && deletes.is_empty() && plan.remove_directories.is_empty() {
             return Ok(report);
         }
 
@@ -240,6 +240,28 @@ impl Applier {
             report.deleted += 1;
         }
 
+        for path in &plan.remove_directories {
+            if let Err(error) = self.remove_created_directory(path, &mut journal) {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) {
+                    report.skipped.push(PlanSkip {
+                        path: path.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+                report.partial = true;
+                let _ = journal.append(&JournalEntry::Failed {
+                    path: path.clone(),
+                    message: error.to_string(),
+                });
+                return Ok(report);
+            }
+            report.deleted += 1;
+        }
+
         if let Err(error) = journal.append(&JournalEntry::Committed {
             op_id: op_id.clone(),
         }) {
@@ -272,7 +294,10 @@ impl Applier {
                 serde_json::from_str(line).map_err(|error| RewindError::JournalCorrupt {
                     detail: format!("{line:?}: {error}"),
                 })?;
-            if matches!(entry, JournalEntry::Applied { .. }) {
+            if matches!(
+                entry,
+                JournalEntry::Applied { .. } | JournalEntry::RemovedDirectory { .. }
+            ) {
                 applied.push(entry);
             }
         }
@@ -281,6 +306,14 @@ impl Applier {
         let pre_dir = op_dir.join("pre");
         let mut report = RollbackReport::default();
         for entry in applied.iter().rev() {
+            if let JournalEntry::RemovedDirectory { path } = entry {
+                let absolute = resolve_directory(&self.root, path)?;
+                if !absolute.exists() {
+                    fs::create_dir(absolute)?;
+                    report.restored += 1;
+                }
+                continue;
+            }
             let JournalEntry::Applied { path, previous, .. } = entry else {
                 continue;
             };
@@ -354,6 +387,27 @@ impl Applier {
 
     fn journal_path(&self, op_id: &str) -> PathBuf {
         self.journal_dir.join(format!("{op_id}.jsonl"))
+    }
+
+    fn remove_created_directory(&self, path: &str, journal: &mut JournalWriter) -> io::Result<()> {
+        if excluded_directory(path).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory is excluded",
+            ));
+        }
+        let absolute = resolve_directory(&self.root, path)?;
+        if !absolute.symlink_metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "expected a created directory",
+            ));
+        }
+        // Keep entries added since the patch by removing empty directories only.
+        fs::remove_dir(absolute)?;
+        journal.append(&JournalEntry::RemovedDirectory {
+            path: path.to_owned(),
+        })
     }
 
     fn apply_write(
@@ -443,6 +497,9 @@ enum JournalEntry {
         action: JournalAction,
         sha256: String,
         previous: PreviousState,
+    },
+    RemovedDirectory {
+        path: String,
     },
     Failed {
         path: String,
@@ -710,6 +767,7 @@ mod tests {
                 JournalEntry::Applied { .. } => "applied",
                 JournalEntry::Failed { .. } => "failed",
                 JournalEntry::Committed { .. } => "committed",
+                JournalEntry::RemovedDirectory { .. } => "removed_directory",
             })
             .collect();
         assert_eq!(kinds, vec!["intent", "applied", "failed"]);
@@ -982,6 +1040,7 @@ mod tests {
             },
         );
         let snapshot = SnapshotView {
+            created_directories: Vec::new(),
             ordinal: 1,
             at_message_id: "item_1".to_string(),
             files,

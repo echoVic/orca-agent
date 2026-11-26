@@ -2753,6 +2753,10 @@ fn parse_child_tool_events(bytes: &[u8]) -> Vec<WorkflowEvidenceToolEvent> {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             is_mcp: name.starts_with("mcp__"),
+            file_effect_count: payload
+                .get("file_effects")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
         };
         if let Some(id) = id {
             events_by_id
@@ -2777,6 +2781,7 @@ fn merge_tool_event(existing: &mut WorkflowEvidenceToolEvent, update: &WorkflowE
         existing.error = update.error.clone();
     }
     existing.is_mcp |= update.is_mcp;
+    existing.file_effect_count = existing.file_effect_count.max(update.file_effect_count);
 }
 
 fn workflow_phase_summaries(state: &WorkflowRunState) -> Vec<WorkflowPhaseTaskSummary> {

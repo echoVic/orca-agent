@@ -201,7 +201,7 @@ fn execute(request: &RewindCommandRequest) -> io::Result<RewindReport> {
 
         files_report = RewindFilesReport {
             changed: plan.writes.len() as u64,
-            deleted: plan.deletes.len() as u64,
+            deleted: (plan.deletes.len() + plan.remove_directories.len()) as u64,
             unchanged: plan.unchanged,
             skipped: plan
                 .skipped
@@ -383,6 +383,7 @@ fn snapshot_views(snapshots: &[FileSnapshotRecord]) -> Vec<SnapshotView> {
         .map(|snapshot| SnapshotView {
             ordinal: snapshot.ordinal,
             at_message_id: snapshot.at_message_id.clone(),
+            created_directories: snapshot.created_directories.clone(),
             files: snapshot
                 .files
                 .iter()
@@ -785,6 +786,7 @@ mod tests {
         fixture
             .writer
             .append_file_snapshot(FileSnapshotRecord {
+                created_directories: Vec::new(),
                 schema_version: 1,
                 snapshot_id: "snap_test".to_string(),
                 session_id: fixture.session_id.clone(),

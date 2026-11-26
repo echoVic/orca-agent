@@ -165,10 +165,12 @@ fn contract_failures(evidence: &WorkflowEvidenceBundle) -> Vec<String> {
 
     if contract.mutation_policy == Some(WorkflowMutationPolicy::ReadOnly) {
         for event in tool_events.iter().filter(|event| {
-            event.status.as_deref() == Some("completed") && is_source_mutation_tool(&event.name)
+            event.file_effect_count > 0
+                || (event.status.as_deref() == Some("completed")
+                    && is_source_mutation_tool(&event.name))
         }) {
             failures.push(format!(
-                "read-only mutation policy was violated by completed `{}` tool call{}",
+                "read-only mutation policy was violated by `{}` tool call{}",
                 event.name,
                 event
                     .target

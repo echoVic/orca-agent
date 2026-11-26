@@ -19,6 +19,20 @@ pub fn file_links(file: &File) -> io::Result<FileLinks> {
     platform::file_links(file)
 }
 
+/// Permission bits used to restore the file where the host supports Unix modes.
+pub fn file_mode(file: &File) -> io::Result<Option<u32>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(Some(file.metadata()?.permissions().mode()))
+    }
+    #[cfg(windows)]
+    {
+        let _ = file;
+        Ok(None)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum FileAccess {
     Read,

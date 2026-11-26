@@ -829,6 +829,22 @@ impl ToolServiceUsage {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "path", rename_all = "snake_case")]
+pub enum FileEffect {
+    Written(String),
+    Deleted(String),
+    CreatedDirectory(String),
+}
+
+impl FileEffect {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Written(path) | Self::Deleted(path) | Self::CreatedDirectory(path) => path,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolResult {
     pub id: String,
@@ -840,6 +856,8 @@ pub struct ToolResult {
     pub images: Vec<ImageInput>,
     #[serde(skip)]
     pub file_change_preview: Option<Arc<FileChangePreview>>,
+    #[serde(skip)]
+    pub file_effects: Vec<FileEffect>,
     /// What the tool wrote for the person watching while it ran, when that
     /// is to be kept with the conversation. It is never sent to the model.
     /// Only `run_script` sets it, to the lines that say what its calls did.
@@ -908,6 +926,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -929,6 +948,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -965,6 +985,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -1019,6 +1040,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -1040,6 +1062,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -1061,6 +1084,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -1095,6 +1119,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -1140,6 +1165,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }

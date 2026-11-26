@@ -63,7 +63,7 @@ pub(crate) const EXCLUDED_DIRECTORIES: [&str; 4] = [".git", ".orca", "target", "
 ///
 /// Only *parent* components are inspected: the final component is the file
 /// name, so a regular file literally named `target` remains restorable.
-pub(crate) fn excluded_directory(rel: &str) -> Option<&'static str> {
+pub fn excluded_directory(rel: &str) -> Option<&'static str> {
     let mut components = Path::new(rel)
         .components()
         .filter_map(|component| match component {
@@ -165,6 +165,14 @@ pub fn file_sha256(path: &Path) -> io::Result<Option<String>> {
 /// (it cannot contain a symlink below a missing directory); the caller (the
 /// applier) will then fail with a normal `NotFound` IO error.
 pub fn resolve_inside(root: &Path, rel: &str) -> io::Result<PathBuf> {
+    resolve_path(root, rel, false)
+}
+
+pub(crate) fn resolve_directory(root: &Path, rel: &str) -> io::Result<PathBuf> {
+    resolve_path(root, rel, true)
+}
+
+fn resolve_path(root: &Path, rel: &str, directory: bool) -> io::Result<PathBuf> {
     if rel.is_empty() {
         return Err(escape(rel, "empty path"));
     }
@@ -218,8 +226,8 @@ pub fn resolve_inside(root: &Path, rel: &str) -> io::Result<PathBuf> {
                     return Err(escape(rel, "symlink component"));
                 }
                 if index == last {
-                    if !file_type.is_file() {
-                        return Err(escape(rel, "final component is not a regular file"));
+                    if (directory && !file_type.is_dir()) || (!directory && !file_type.is_file()) {
+                        return Err(escape(rel, "final component has the wrong type"));
                     }
                 } else if !file_type.is_dir() {
                     return Err(escape(rel, "non-directory component"));

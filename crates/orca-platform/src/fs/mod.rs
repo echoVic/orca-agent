@@ -7,7 +7,7 @@ mod path;
 
 pub use atomic::{AtomicWritePolicy, atomic_write, atomic_write_private, atomic_write_with};
 pub use directory::{
-    FileAccess, FileIdentity, FileLinks, VerifiedDirectory, file_links, stale_path,
+    FileAccess, FileIdentity, FileLinks, VerifiedDirectory, file_links, file_mode, stale_path,
 };
 pub use lock::ExclusiveFileLock;
 pub use long_path::extended_length_path;
