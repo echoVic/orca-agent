@@ -490,7 +490,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         safe_local_read_builtin_spec(
             "read_file",
-            "Read a workspace file by line. For a saved tool result, use its absolute path and set unit to bytes to page by byte.",
+            "Read the contents of a file at the given path relative to workspace root.",
             json!({
                 "type": "object",
                 "properties": {
@@ -501,17 +501,17 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "offset": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "1-based starting line, or starting byte when unit is bytes."
+                        "description": "1-based line or byte."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Number of lines to read, or bytes when unit is bytes."
+                        "description": "Line or byte count."
                     },
                     "unit": {
                         "type": "string",
                         "enum": ["bytes"],
-                        "description": "Select byte paging for a saved tool result. Omit to read by line."
+                        "description": "Lines unless set for a saved result's absolute path."
                     }
                 },
                 "required": ["path"],
