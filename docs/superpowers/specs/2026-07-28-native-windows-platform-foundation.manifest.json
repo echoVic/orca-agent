@@ -503,6 +503,13 @@
       "windows-test-portability"
     ],
     [
+      "tools-grep-test-unix-fixture",
+      "crates/orca-tools/src/grep.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "process-helper-shells",
       "crates/orca-tools/src/process.rs",
       "unix_shell_spawn",
