@@ -96,22 +96,45 @@ impl DeepSeekRequestError {
             _ => "DeepSeek provider error",
         }
         .to_string();
+        let suffix = match (self.http_status, self.request_id.as_deref()) {
+            (Some(status), Some(id)) => format!(" (HTTP {status}, request id {id})"),
+            (Some(status), None) => format!(" (HTTP {status})"),
+            (None, Some(id)) => format!(" (request id {id})"),
+            (None, None) => String::new(),
+        };
         if !self.message.is_empty() {
             message.push_str(": ");
-            message.push_str(&self.message);
-        }
-        match (self.http_status, self.request_id.as_deref()) {
-            (Some(status), Some(id)) => {
-                message.push_str(&format!(" (HTTP {status}, request id {id})"))
+            if self.http_status.is_some() {
+                // Leave room for the status and request ID in the TUI diagnostic.
+                const DIAGNOSTIC_LIMIT: usize = 4 * 1024;
+                const TRUNCATED: &str = "… [truncated]";
+                let available = DIAGNOSTIC_LIMIT.saturating_sub(message.len() + suffix.len());
+                if self.message.len() > available {
+                    let prefix = self
+                        .message
+                        .floor_char_boundary(available.saturating_sub(TRUNCATED.len()));
+                    message.push_str(&self.message[..prefix]);
+                    message.push_str(TRUNCATED);
+                } else {
+                    message.push_str(&self.message);
+                }
+            } else {
+                message.push_str(&self.message);
             }
-            (Some(status), None) => message.push_str(&format!(" (HTTP {status})")),
-            (None, Some(id)) => message.push_str(&format!(" (request id {id})")),
-            (None, None) => {}
         }
-        (
-            ProviderError::with_http(self.kind, message, self.http_status, self.request_id),
-            self.usage,
-        )
+        message.push_str(&suffix);
+        let diagnostic = if self.http_status.is_some() {
+            // The HTTP client already redacted the bounded body before the metadata was added.
+            ProviderError {
+                kind: self.kind,
+                message,
+                http_status: self.http_status,
+                request_id: self.request_id,
+            }
+        } else {
+            ProviderError::new(self.kind, message)
+        };
+        (diagnostic, self.usage)
     }
 }
 

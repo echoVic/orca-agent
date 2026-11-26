@@ -99,14 +99,7 @@ impl GenerationContextController {
                 ProviderStep::Retry(retry)
                     if active_generation || foregrounded_background.is_some() =>
                 {
-                    let retry = retry.clone().map(|mut retry| {
-                        retry.reason = crate::thread_store::redact_sensitive_text(&retry.reason)
-                            .chars()
-                            .take(200)
-                            .collect();
-                        retry
-                    });
-                    retries.push(retry);
+                    retries.push(retry.clone());
                     continue;
                 }
                 _ => continue,

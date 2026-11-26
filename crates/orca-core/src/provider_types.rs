@@ -83,7 +83,7 @@ impl ProviderError {
     ) -> Self {
         Self {
             kind,
-            message: message.into(),
+            message: crate::redaction::redact_sensitive_text(&message.into()),
             http_status,
             request_id,
         }

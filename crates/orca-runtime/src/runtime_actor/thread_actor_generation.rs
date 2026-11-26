@@ -1993,10 +1993,14 @@ impl ThreadActor {
     ) -> io::Result<()> {
         self.commit_surface_provider_attempt_failure(active, fence, identity, None)?;
         active.surface_execution_failure = Some(surface::GenerationExecutionFailureClass::Provider);
-        active.surface_execution_failure_diagnostic = Some(surface_safe_diagnostic(
-            message,
-            "provider execution failed with an invalid diagnostic",
-        ));
+        active.surface_execution_failure_diagnostic = Some(
+            surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
+                surface::SafeDiagnosticText::try_new(
+                    "provider execution failed with an invalid diagnostic",
+                )
+                .expect("fixed diagnostic is bounded")
+            }),
+        );
         Ok(())
     }
 
@@ -2027,11 +2031,7 @@ impl ThreadActor {
             let batch = self.surface_event_batch_with_commit_id(events, None);
             self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?;
         }
-        if let Some(mut retry) = retry {
-            retry.reason = crate::thread_store::redact_sensitive_text(&retry.reason)
-                .chars()
-                .take(200)
-                .collect();
+        if let Some(retry) = retry {
             self.resident_surface
                 .hub
                 .publish_provider_retry(&fence.operation_id, Some(retry));

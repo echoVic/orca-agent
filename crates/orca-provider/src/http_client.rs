@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ const STREAMING_IDLE_READ_TIMEOUT_SECS: u64 = 300;
 pub(crate) const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 const TRANSIENT_ERROR_BODY_TIMEOUT: Duration = Duration::from_millis(250);
-const RETRY_ERROR_PREFIX_BYTES: usize = 1024;
+const ERROR_BODY_LIMIT: usize = 4 * 1024;
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 1000;
 const MAX_BACKOFF_MS: u64 = 60_000;
@@ -485,9 +486,14 @@ pub(crate) fn execute_with_retry_details(
                 if !retryable || attempt >= MAX_RETRIES || !budget.can_retry() {
                     let mut failure = HttpFailure::new(status, resp.headers());
                     failure.exhausted = retryable;
-                    failure.body = resp
-                        .text()
-                        .unwrap_or_else(|error| format!("response body read failed: {error}"));
+                    let length = resp.content_length();
+                    let mut body = Vec::new();
+                    failure.body = match resp.take(ERROR_BODY_LIMIT as u64).read_to_end(&mut body) {
+                        Err(error) if body.is_empty() => {
+                            format!("response body read failed: {error}")
+                        }
+                        _ => error_body_text(&body, error_body_may_continue(length, body.len())),
+                    };
                     return Err(RequestFailure::Http(failure));
                 }
                 // The next admission enforces Retry-After for this and peer calls.
@@ -574,19 +580,11 @@ pub(crate) async fn execute_streaming_with_retry_details(
                     return Ok(resp);
                 }
                 if !is_retryable_status(status.as_u16()) {
-                    return Err(streaming_http_failure(resp, cancel, false, false).await);
+                    return Err(streaming_http_failure(resp, cancel, false).await);
                 }
                 let retry_after = extend_cooldown(key, resp.headers());
                 let will_retry = attempt < MAX_RETRIES && budget.can_retry();
-                let delay = retry_after
-                    .map_or_else(|| compute_backoff(attempt), |_| cooldown_remaining(key));
-                let failure = streaming_http_failure(
-                    resp,
-                    cancel,
-                    true,
-                    will_retry && budget.can_wait(delay),
-                )
-                .await;
+                let failure = streaming_http_failure(resp, cancel, true).await;
                 if !will_retry {
                     budget.set_retry_quota_key(retry_after.map(|_| key));
                     return Err(failure);
@@ -684,7 +682,7 @@ pub(crate) async fn execute_streaming_once_with_budget(
                 status.as_u16()
             );
         }
-        return Err(streaming_http_failure(response, cancel, false, false).await);
+        return Err(streaming_http_failure(response, cancel, false).await);
     }
     Ok(response)
 }
@@ -693,16 +691,15 @@ async fn streaming_http_failure(
     response: Response,
     cancel: &CancelToken,
     exhausted: bool,
-    prefix_only: bool,
 ) -> RequestFailure {
     let mut failure = HttpFailure::new(response.status(), response.headers());
     failure.exhausted = exhausted;
-    let body = if is_retryable_status(failure.status.as_u16()) {
-        transient_error_text(response, cancel, prefix_only).await
+    let timeout = if is_retryable_status(failure.status.as_u16()) {
+        TRANSIENT_ERROR_BODY_TIMEOUT
     } else {
-        response_text_with_cancel(response, cancel).await
+        streaming_idle_read_timeout()
     };
-    failure.body = match body {
+    failure.body = match error_response_text(response, cancel, timeout).await {
         Ok(body) => body,
         Err(message) if cancel.is_cancelled() => return RequestFailure::Other(message),
         Err(message) => message,
@@ -710,36 +707,54 @@ async fn streaming_http_failure(
     RequestFailure::Http(failure)
 }
 
-async fn transient_error_text(
+async fn error_response_text(
     mut response: Response,
     cancel: &CancelToken,
-    prefix_only: bool,
+    timeout: Duration,
 ) -> Result<String, String> {
+    let length = response.content_length();
     let mut body = Vec::new();
-    let limit = if prefix_only {
-        RETRY_ERROR_PREFIX_BYTES
-    } else {
-        usize::MAX
-    };
+    let mut cut_chunk = false;
     let read = async {
-        while body.len() < limit
+        while body.len() < ERROR_BODY_LIMIT
             && let Some(chunk) = response.chunk().await?
         {
-            body.extend_from_slice(&chunk[..chunk.len().min(limit - body.len())]);
+            let remaining = ERROR_BODY_LIMIT - body.len();
+            cut_chunk = chunk.len() > remaining;
+            body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
         }
         Ok::<_, reqwest::Error>(())
     };
     tokio::select! {
         biased;
         _ = wait_for_cancel(cancel) => return Err("request cancelled".into()),
-        result = tokio::time::timeout(TRANSIENT_ERROR_BODY_TIMEOUT, read) => {
-            if let Ok(Err(error)) = result && body.is_empty() {
-                return Err(format!("response body read failed: {error}"));
+        result = tokio::time::timeout(timeout, read) => match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if body.is_empty() => return Err(format!("response body read failed: {error}")),
+            Err(_) if body.is_empty() && timeout != TRANSIENT_ERROR_BODY_TIMEOUT => {
+                return Err(format!("response body idle read timed out after {timeout:?}"));
             }
+            _ => cut_chunk = true,
         }
     }
-    // A stalled body can still provide useful text before the next wait begins.
-    Ok(String::from_utf8_lossy(&body).into_owned())
+    Ok(error_body_text(
+        &body,
+        cut_chunk || error_body_may_continue(length, body.len()),
+    ))
+}
+
+fn error_body_may_continue(length: Option<u64>, read: usize) -> bool {
+    length.map_or(read == ERROR_BODY_LIMIT, |length| length > read as u64)
+}
+
+fn error_body_text(body: &[u8], truncated: bool) -> String {
+    let mut text = orca_core::redaction::redact_sensitive_text(&String::from_utf8_lossy(body));
+    let bounded = text.floor_char_boundary(ERROR_BODY_LIMIT);
+    if truncated || bounded < text.len() {
+        text.truncate(bounded);
+        text.push_str("… [truncated]");
+    }
+    text
 }
 
 // Redirects are explicit so every transport hop uses the same admission gate
@@ -942,26 +957,6 @@ async fn send_built_streaming_request(
                 request = follow;
             }
             Err(error) => return Ok((Err(error), key)),
-        }
-    }
-}
-
-async fn response_text_with_cancel(
-    response: Response,
-    cancel: &CancelToken,
-) -> Result<String, String> {
-    tokio::select! {
-        biased;
-        _ = wait_for_cancel(cancel) => Err("request cancelled".to_string()),
-        result = tokio::time::timeout(streaming_idle_read_timeout(), response.text()) => {
-            match result {
-                Ok(Ok(body)) => Ok(body),
-                Ok(Err(error)) => Err(format!("response body read failed: {error}")),
-                Err(_) => Err(format!(
-                    "response body idle read timed out after {:?}",
-                    streaming_idle_read_timeout()
-                )),
-            }
         }
     }
 }

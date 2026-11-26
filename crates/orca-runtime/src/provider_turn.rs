@@ -1990,6 +1990,7 @@ mod tests {
 
     fn run_retry_fixture(
         responses: Vec<String>,
+        observer: Option<std::sync::Arc<dyn orca_core::event_sink::EventObserver>>,
     ) -> (
         RuntimeModelResponse,
         Vec<serde_json::Value>,
@@ -2036,7 +2037,16 @@ mod tests {
                     }
                 }
                 reader.read_exact(&mut vec![0; content_length]).unwrap();
-                socket.write_all(reply.as_bytes()).unwrap();
+                if let Err(error) = socket.write_all(reply.as_bytes()) {
+                    assert!(
+                        reply.len() > 4096
+                            && matches!(
+                                error.kind(),
+                                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                            ),
+                        "{error}"
+                    );
+                }
             }
         });
 
@@ -2082,7 +2092,8 @@ mod tests {
                     conversation: &mut conversation,
                     cost_tracker: &mut tracker,
                     events: &mut EventFactory::new(id.into()),
-                    sink: &mut EventSink::new(&mut output, OutputFormat::Jsonl),
+                    sink: &mut EventSink::new(&mut output, OutputFormat::Jsonl)
+                        .with_optional_observer(observer),
                     history_writer: None,
                 },
             })
@@ -2111,7 +2122,7 @@ mod tests {
     #[test]
     fn a_retry_is_reported_before_the_backoff() {
         let (response, events, _) =
-            run_retry_fixture(vec![BUSY_HTTP.into(), retry_sse(RETRY_SUCCESS)]);
+            run_retry_fixture(vec![BUSY_HTTP.into(), retry_sse(RETRY_SUCCESS)], None);
         assert_eq!(response.response.assistant_content.as_deref(), Some("done"));
         let retries: Vec<_> = events
             .iter()
@@ -2135,7 +2146,7 @@ mod tests {
 
     #[test]
     fn no_retry_is_announced_after_the_last_attempt() {
-        let (response, events, _) = run_retry_fixture(vec![BUSY_HTTP.into(); 5]);
+        let (response, events, _) = run_retry_fixture(vec![BUSY_HTTP.into(); 5], None);
         let attempts: Vec<_> = events
             .iter()
             .filter(|event| event["type"] == "provider.retry")
@@ -2151,6 +2162,64 @@ mod tests {
         );
     }
 
+    fn retry_http_error(status: u16, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status} Failure\r\nX-Request-Id: runtime-fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        )
+    }
+
+    #[test]
+    fn a_secret_in_an_error_body_never_reaches_jsonl() {
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_events = observed.clone();
+        let observer =
+            std::sync::Arc::new(move |event: &orca_core::event_schema::EventEnvelope| {
+                observed_events
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+                Ok(())
+            });
+        let (response, jsonl, _) = run_retry_fixture(
+            vec![
+                retry_http_error(503, concat!("api_key: ", "fixture-private-token")),
+                retry_sse(RETRY_SUCCESS),
+            ],
+            Some(observer),
+        );
+        assert_eq!(response.response.assistant_content.as_deref(), Some("done"));
+        for events in [&jsonl, &*observed.lock().unwrap()] {
+            assert!(events.iter().any(|event| event["type"] == "provider.retry"));
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !event.to_string().contains("fixture-private-token"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_huge_final_error_body_is_bounded() {
+        let body = format!("<html>{}</html>", "x".repeat(4 * 1024 * 1024 - 13));
+        for (status, mut replies) in [(400, vec![]), (503, vec![BUSY_HTTP.into(); 4])] {
+            replies.push(retry_http_error(status, &body));
+            let (response, _, _) = run_retry_fixture(replies, None);
+            let message = &response.response.error().unwrap().message;
+            assert!(
+                message.len() < 5 * 1024,
+                "HTTP {status}: {} bytes",
+                message.len()
+            );
+            assert!(
+                crate::surface::SafeDiagnosticText::try_new(message.as_str()).is_ok(),
+                "HTTP {status} diagnostic must fit the TUI surface"
+            );
+            assert!(message.contains("… [truncated]"));
+            assert!(message.ends_with(&format!("(HTTP {status}, request id runtime-fixture)")));
+        }
+    }
+
     #[test]
     fn the_context_meter_counts_one_attempt() {
         let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
@@ -2159,10 +2228,13 @@ mod tests {
             format!("{RETRY_USAGE}data: [DONE]\n\n"),
             RETRY_USAGE.into(),
         ] {
-            let (response, events, usage) = run_retry_fixture(vec![
-                retry_sse(&failed),
-                retry_sse(&format!("{RETRY_USAGE}{RETRY_SUCCESS}")),
-            ]);
+            let (response, events, usage) = run_retry_fixture(
+                vec![
+                    retry_sse(&failed),
+                    retry_sse(&format!("{RETRY_USAGE}{RETRY_SUCCESS}")),
+                ],
+                None,
+            );
             assert_eq!(response.response.assistant_content.as_deref(), Some("done"));
             assert_eq!(usage.input_tokens, 2000);
             let context = events
