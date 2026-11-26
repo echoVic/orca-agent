@@ -21,11 +21,14 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use orca_core::tool_types::ToolOutputTruncation;
 use rquickjs::allocator::{Allocator, RustAllocator};
 use rquickjs::context::{EvalOptions, intrinsic};
 use rquickjs::promise::PromiseState;
 use rquickjs::{Context, Ctx, Exception, Function, Object, Promise, Runtime, Value as JsValue};
 use serde_json::Value;
+
+use super::log_capture::LogCapture;
 
 const PRELUDE: &str = include_str!("prelude.js");
 /// The name a script's errors give for where they happened.
@@ -121,12 +124,29 @@ impl ScriptEngine {
         answer: &mut dyn FnMut(Vec<ScriptToolCall>) -> Vec<Result<String, String>>,
         stop: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> io::Result<ScriptOutcome> {
+        Self::run_with_output_policy(
+            script,
+            limits,
+            ToolOutputTruncation::default(),
+            answer,
+            stop,
+        )
+    }
+
+    pub(super) fn run_with_output_policy(
+        script: &str,
+        limits: ScriptEngineLimits,
+        output_policy: ToolOutputTruncation,
+        answer: &mut dyn FnMut(Vec<ScriptToolCall>) -> Vec<Result<String, String>>,
+        stop: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> io::Result<ScriptOutcome> {
         let watch = Arc::new(Watch {
             stopped: AtomicU8::new(RUNNING),
             engine: AtomicU8::new(WATCHED),
             stop,
             // A wall clock too long to add to now never runs out.
             deadline: Instant::now().checked_add(limits.wall_clock),
+            log: Arc::new(LogCapture::new(output_policy)),
         });
         let (to_caller, from_engine) = mpsc::channel();
         let (to_engine, from_caller) = mpsc::channel();
@@ -193,6 +213,8 @@ struct Watch {
     stop: Arc<dyn Fn() -> bool + Send + Sync>,
     /// `None` when the wall clock is too long to be reached.
     deadline: Option<Instant>,
+    // The caller can report the log even when QuickJS is still in a native call.
+    log: Arc<LogCapture>,
 }
 
 impl Watch {
@@ -233,7 +255,7 @@ impl Watch {
                 io::ErrorKind::Interrupted,
                 "the script was cancelled",
             ))),
-            OUT_OF_TIME => Some(Ok(failed(&format!(
+            OUT_OF_TIME => Some(Ok(self.failed_with_log(format!(
                 "the script ran longer than {} and was stopped",
                 seconds(limits.wall_clock)
             )))),
@@ -243,6 +265,11 @@ impl Watch {
             ))),
             _ => None,
         }
+    }
+
+    fn failed_with_log(&self, mut error: String) -> ScriptOutcome {
+        self.log.append_to_stop_error(&mut error);
+        ScriptOutcome::Failed { error }
     }
 }
 
@@ -481,9 +508,7 @@ impl Told {
     }
 }
 
-/// The two native functions the prelude is given: `start_call(tool,
-/// arguments)`, which records a call and returns its number, and
-/// `finish(kind, text)`, which records how the script ended.
+/// The prelude's private bridges for starting calls and finishing.
 fn natives<'js>(
     ctx: &Ctx<'js>,
     told: &Rc<RefCell<Told>>,
@@ -537,10 +562,24 @@ fn drive<'js>(
 ) -> io::Result<ScriptOutcome> {
     let told = Rc::new(RefCell::new(Told::default()));
     let (start_call, finish) = natives(ctx, &told).map_err(engine_error)?;
+    let log_line = ending
+        .watch
+        .log
+        .bridge(ctx, {
+            let watch = Arc::clone(ending.watch);
+            move || watch.is_stopped()
+        })
+        .map_err(engine_error)?;
 
     let install: Function = ctx.eval(PRELUDE).map_err(engine_error)?;
     let api: Object = install
-        .call((start_call, finish, MAIN_OPEN.len()))
+        .call((
+            start_call,
+            finish,
+            log_line,
+            ending.watch.log.byte_budget(),
+            MAIN_OPEN.len(),
+        ))
         .map_err(engine_error)?;
     let run: Function = api.get("run").map_err(engine_error)?;
     let deliver: Function = api.get("deliver").map_err(engine_error)?;
@@ -636,7 +675,7 @@ fn drive<'js>(
 /// was refused failed for want of memory: QuickJS may throw `null` or
 /// anything else when it cannot allocate the error itself.
 struct Ending<'a> {
-    watch: &'a Watch,
+    watch: &'a Arc<Watch>,
     refused: &'a AtomicBool,
     limits: ScriptEngineLimits,
 }
@@ -651,7 +690,7 @@ impl Ending<'_> {
             return stopped;
         }
         if self.refused.load(Ordering::SeqCst) {
-            return Ok(failed(&format!(
+            return Ok(self.watch.failed_with_log(format!(
                 "the script used more than {} MiB",
                 self.limits.memory_bytes / (1024 * 1024)
             )));

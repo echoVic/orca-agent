@@ -9,7 +9,9 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
-use orca_provider::tool_schema::ProviderToolDefinition;
+use orca_provider::tool_schema::{
+    DEEPSEEK_MAX_TOOLS, ProviderToolDefinition, limit_tool_definitions_by_source,
+};
 use orca_tools::schema::{ToolPolicy, canonical_tool_definitions, normalize_tool_request};
 
 use crate::hooks::{HookOutcome, tool_request_with_hook_outcome};
@@ -218,6 +220,18 @@ pub(crate) fn provider_config_for_agent_loop(
             || tool_policy.allowed_tools().is_some()
         {
             tools.retain(|tool| tool.name != "computer");
+        }
+        if config.provider == orca_core::config::ProviderKind::DeepSeek {
+            let dropped = limit_tool_definitions_by_source(tools, DEEPSEEK_MAX_TOOLS, |name| {
+                registry
+                    .get(name)
+                    .map(|tool| matches!(tool.spec().name, ToolName::Mcp(_)))
+            });
+            if let Some(warnings) =
+                session_tools.get::<std::sync::Arc<crate::mcp_startup::McpStartupWarnings>>()
+            {
+                warnings.report_tool_limit(dropped);
+            }
         }
     }
     let mut provider_config = ProviderConfig {
@@ -850,14 +864,14 @@ mod tests {
 
     #[test]
     fn apply_patch_flag_off_preserves_the_serialized_provider_prefix() {
-        // Captured at 4d273a1d from a build before the tool was registered.
+        // Based on 4d273a1d, with the shell prompt updated for background command notices.
         assert_eq!(
             patch_prefix_digests(),
             [
-                "8f7559eb034375f7ee2c01101dd5ca199c676bb7af998b3df8ca1dc920aca208",
-                "b22f1f3be11229309cd48cac4dabcf29cf1032907995b0d09a37d49c78b067a9",
+                "0ec8ac37238f427f1445fdd17a28d0af9823a1c0051301926c7304a17d926575",
+                "67153d849b28d61ed7ecaeb0689006469f8a44f33950fb60c27f01cd15c8e59f",
                 "68749227d4876f14951bf6ee157821e43d1a4948e61881c1d243a2521f7d4f88",
-                "3f0f8ad71a7ac3c4ffa314fbf2f21d4924e343b1df20ec0f09631c7fd8fd9c1b",
+                "4e0dff83a26d4d174e1eea88677e76d50725a18924c1757bfdb411d011191384",
             ]
         );
     }
@@ -967,6 +981,44 @@ mod tests {
                 assert_eq!(decision.decision, expected);
             }
         }
+    }
+
+    #[test]
+    fn mock_provider_keeps_all_130_tools() {
+        let config = RunConfig {
+            provider: ProviderKind::Mock,
+            ..RunConfig::default()
+        };
+        let expected_names: Vec<_> = (0..130).map(|i| format!("mcp__docs__t{i:03}")).collect();
+        let registry = McpRegistry::from_tools_for_test(
+            expected_names
+                .iter()
+                .enumerate()
+                .map(|(i, schema_name)| McpTool {
+                    server: "docs".to_string(),
+                    name: format!("t{i:03}"),
+                    schema_name: schema_name.clone(),
+                    description: None,
+                    input_schema: json!({"type": "object"}),
+                    read_only: true,
+                })
+                .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_config_for_agent_loop(
+            &config,
+            dir.path(),
+            0,
+            &SubagentType::General,
+            AgentToolPolicyContext::new(Some(&expected_names), None),
+            &registry,
+            &crate::extension::ExtensionData::new("schema-test"),
+        );
+        let definitions = provider.tools_override.unwrap();
+        assert_eq!(definitions.len(), 130);
+        let mut names = schema_names(&definitions);
+        names.sort_unstable();
+        assert_eq!(names, expected_names);
     }
 
     #[test]

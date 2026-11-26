@@ -54,7 +54,7 @@ pub mod lifecycle;
 mod mcp_catalog;
 pub use mcp_catalog::mcp_catalog_snapshot;
 mod mcp_startup;
-pub use mcp_startup::mcp_startup_warnings;
+pub use mcp_startup::{mcp_startup_warnings, mcp_startup_warnings_with_external_tools};
 pub mod memory;
 pub mod mentions;
 pub mod model_response;

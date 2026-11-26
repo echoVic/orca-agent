@@ -9,6 +9,7 @@
 
 pub(crate) mod calls;
 pub mod engine;
+mod log_capture;
 
 use std::io;
 use std::path::Path;
@@ -191,12 +192,13 @@ fn run_script<W: io::Write>(context: RunScriptContext<'_, W>) -> ToolResult {
         }
     };
 
-    let outcome = ScriptEngine::run(
+    let outcome = ScriptEngine::run_with_output_policy(
         &script,
         ScriptEngineLimits {
             wall_clock,
             memory_bytes: settings.memory_limit_bytes(),
         },
+        config.tools.output_truncation,
         &mut |batch| {
             let answers = calls.answer(batch);
             show(calls.drain_report());
@@ -336,6 +338,27 @@ impl ScriptToolExecutor for ReadOnlyToolExecutor<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_stopped_log_uses_the_output_policy_budget() {
+        let outcome = super::ScriptEngine::run_with_output_policy(
+            r#"console.log("x".repeat(12_000)); while (true) {}"#,
+            super::ScriptEngineLimits {
+                wall_clock: std::time::Duration::from_millis(400),
+                memory_bytes: 8 * 1024 * 1024,
+            },
+            super::ToolOutputTruncation::tokens(4096),
+            &mut |_| unreachable!("no tool calls"),
+            std::sync::Arc::new(|| false),
+        )
+        .unwrap();
+        let super::ScriptOutcome::Failed { error } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(error.contains("ran longer than"), "{error}");
+        let (_, kept) = error.split_once("Logged before it was stopped:\n").unwrap();
+        assert_eq!(kept.len(), 12_000);
+    }
+
     use super::*;
 
     #[test]

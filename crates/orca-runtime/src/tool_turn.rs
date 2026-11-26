@@ -1613,21 +1613,32 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
 
     let budget_exhaustion = subagent_budget_exhaustion_error(config, tool_request, cost_tracker);
     let mut event_error = execution.event_error;
+    let (record_outcome, committed) = sampling_state
+        .record_normal_tool_result(
+            conversation,
+            history_writer.as_deref_mut(),
+            tool_request,
+            &execution.result,
+            execution.status.clone(),
+            emit_deltas,
+        )
+        .map_err(|error| RuntimeNormalToolTurnFailure {
+            error,
+            child_budget_usage,
+            service_usage,
+        })?;
+    if committed
+        && !execution.result.observed_shell_completions.is_empty()
+        && let Some(service) = extensions.and_then(|extensions| {
+            extensions
+                .stores()
+                .thread_store()
+                .get::<crate::terminal_service::TerminalService>()
+        })
+    {
+        service.observe_completions(execution.result.observed_shell_completions.clone());
+    }
     if budget_exhaustion.is_some() {
-        sampling_state
-            .record_normal_tool_result(
-                conversation,
-                history_writer.as_deref_mut(),
-                tool_request,
-                &execution.result,
-                execution.status.clone(),
-                emit_deltas,
-            )
-            .map_err(|error| RuntimeNormalToolTurnFailure {
-                error,
-                child_budget_usage,
-                service_usage,
-            })?;
         let totals = cost_tracker.totals();
         if emit_deltas {
             if let Err(error) = sink.emit(events.usage_updated(totals))
@@ -1651,20 +1662,6 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
             terminal: None,
         }
     } else {
-        let record_outcome = sampling_state
-            .record_normal_tool_result(
-                conversation,
-                history_writer.as_deref_mut(),
-                tool_request,
-                &execution.result,
-                execution.status.clone(),
-                emit_deltas,
-            )
-            .map_err(|error| RuntimeNormalToolTurnFailure {
-                error,
-                child_budget_usage,
-                service_usage,
-            })?;
         if execution.disposition == RuntimeToolTurnDisposition::StopTurn {
             ToolTurnOutcome::Return {
                 status: execution.status,
@@ -2633,7 +2630,7 @@ mod tests {
         );
         let result = ToolResult::denied(&request, "needs approval");
 
-        let outcome = sampling_state
+        let (outcome, _) = sampling_state
             .record_normal_tool_result(
                 &mut conversation,
                 None,
@@ -2666,7 +2663,7 @@ mod tests {
         let request = request(ToolName::Subagent, ActionKind::Agent, Some("audit"), None);
         let result = ToolResult::failed(&request, "child failed", None);
 
-        let outcome = sampling_state
+        let (outcome, _) = sampling_state
             .record_normal_tool_result(
                 &mut conversation,
                 None,
@@ -2695,7 +2692,7 @@ mod tests {
             None,
         );
 
-        let outcome = sampling_state
+        let (outcome, _) = sampling_state
             .record_normal_tool_result(
                 &mut conversation,
                 None,
@@ -2730,7 +2727,7 @@ mod tests {
         );
         let result = ToolResult::cancelled(&request, "user input cancelled", None);
 
-        let outcome = sampling_state
+        let (outcome, _) = sampling_state
             .record_normal_tool_result(
                 &mut conversation,
                 None,
@@ -2776,7 +2773,7 @@ mod tests {
         );
         let result = ToolResult::indeterminate(&request, "interaction channel closed");
 
-        let outcome = sampling_state
+        let (outcome, _) = sampling_state
             .record_normal_tool_result(
                 &mut conversation,
                 None,
