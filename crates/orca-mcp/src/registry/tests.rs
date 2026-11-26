@@ -38,6 +38,90 @@ fn stdio_fixture_config(name: &str, server: &std::path::Path) -> McpServerConfig
 }
 
 #[cfg(unix)]
+fn server_with_instructions(
+    name: &str,
+    dir: &std::path::Path,
+    instructions: Option<Value>,
+) -> McpServerConfig {
+    let path = dir.join(format!("{name}.sh"));
+    let mut result = serde_json::json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "serverInfo": {"name": name, "version": "1"},
+    });
+    if let Some(instructions) = instructions {
+        result["instructions"] = instructions;
+    }
+    std::fs::write(
+        &path,
+        format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":1,"result":%s}}\n' '{result}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[]}}}}\n'
+      ;;
+  esac
+done
+"#
+        ),
+    )
+    .expect("write MCP fixture");
+    stdio_fixture_config(name, &path)
+}
+
+#[cfg(unix)]
+#[test]
+fn initialize_keeps_server_instructions() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let z = server_with_instructions(
+        "z",
+        dir.path(),
+        Some(serde_json::json!("Use search before fetch.")),
+    );
+    let a = server_with_instructions("a", dir.path(), Some(serde_json::json!("Fetch by ID.")));
+    let registry = connected_registry(&[z, a], None);
+
+    assert_eq!(
+        registry.server_instructions(),
+        [
+            ("z".to_string(), "Use search before fetch.".to_string()),
+            ("a".to_string(), "Fetch by ID.".to_string()),
+        ]
+    );
+
+    server_with_instructions("z", dir.path(), None);
+    registry.reconnect_server("z").expect("reconnect z");
+    assert_eq!(
+        registry.server_instructions(),
+        [("a".to_string(), "Fetch by ID.".to_string())]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn initialize_ignores_blank_or_non_string_instructions() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let configs = [
+        Some(serde_json::json!("   ")),
+        Some(serde_json::json!(3)),
+        Some(Value::Null),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, value)| server_with_instructions(&format!("s{i}"), dir.path(), value))
+    .collect::<Vec<_>>();
+    let registry = connected_registry(&configs, None);
+
+    assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+    assert!(registry.server_instructions().is_empty());
+}
+
+#[cfg(unix)]
 #[test]
 fn stdio_fixture_config_runs_shell_script_through_sh() {
     let config = stdio_fixture_config("templates", std::path::Path::new("/tmp/mcp.sh"));
@@ -267,6 +351,7 @@ fn call_tool_or_cancel_waits_for_transport_cleanup() {
                 server_name: "slow".to_string(),
                 credentials_path: None,
                 capabilities: McpServerCapabilities::resource_capable_for_test(),
+                instructions: Mutex::default(),
                 reconnect_failure: Mutex::default(),
                 stop: Arc::default(),
                 transport: Mutex::new(Arc::new(CleanupAwareTransport {
@@ -369,6 +454,7 @@ fn registry_with_call_tool_result(content: Value) -> (McpRegistry, McpToolRef) {
                 server_name: "screen".to_string(),
                 credentials_path: None,
                 capabilities: McpServerCapabilities::default(),
+                instructions: Mutex::default(),
                 reconnect_failure: Mutex::default(),
                 stop: Arc::default(),
                 transport: Mutex::new(Arc::new(StaticCallToolTransport { content })),
@@ -1426,6 +1512,7 @@ fn registry_call_tool_routes_elicitation_handler_to_transport() {
                 server_name: "prompts".to_string(),
                 credentials_path: None,
                 capabilities: McpServerCapabilities::default(),
+                instructions: Mutex::default(),
                 reconnect_failure: Mutex::default(),
                 stop: Arc::default(),
                 transport: Mutex::new(Arc::new(ElicitingTransport)),
@@ -2740,6 +2827,7 @@ fn client_with(config: McpServerConfig, transport: impl McpTransport + 'static) 
         config,
         credentials_path: None,
         capabilities: McpServerCapabilities::default(),
+        instructions: Mutex::default(),
         reconnect_failure: Mutex::default(),
         stop: Arc::default(),
         transport: Mutex::new(Arc::new(transport)),

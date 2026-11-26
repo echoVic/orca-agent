@@ -20,6 +20,7 @@ pub(crate) struct McpClient {
     /// Where a reconnect looks for a stored OAuth login.
     pub(crate) credentials_path: Option<PathBuf>,
     pub(crate) capabilities: McpServerCapabilities,
+    pub(crate) instructions: Mutex<Option<String>>,
     /// Stops its server, through whichever transport it has.
     pub(crate) stop: Arc<McpConnectionStop>,
     /// Why a reconnect of a stdio server failed, unless one has connected
@@ -36,6 +37,14 @@ pub(crate) struct McpClient {
 pub(crate) struct McpServerCapabilities {
     pub(crate) resources: bool,
     pub(crate) prompts: bool,
+}
+
+pub(crate) fn instructions_from_initialize_result(value: &Value) -> Option<String> {
+    value
+        .get("instructions")?
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_owned)
 }
 
 impl McpServerCapabilities {
@@ -116,6 +125,13 @@ pub(crate) enum ReconnectFailure {
 }
 
 impl McpClient {
+    pub(crate) fn instructions(&self) -> Option<String> {
+        self.instructions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Calls the tool `name`. A failed call is never sent again, but a
     /// failure that stopped the server connects it again first, as
     /// [`Self::request`] does, so that the next call can go through.
@@ -347,9 +363,10 @@ impl McpClient {
             }
             current.terminate();
             let began = Instant::now();
-            *current = self
+            let connected = self
                 .connect(&config, should_cancel)
                 .map_err(|error| failure(Some(began), error))?;
+            self.replace_connection(&mut current, connected);
         } else {
             if !Arc::ptr_eq(
                 &*self
@@ -360,7 +377,7 @@ impl McpClient {
                 return Ok(Reconnected::AlreadyReplaced);
             }
             let began = Instant::now();
-            let transport = self
+            let connected = self
                 .connect(&config, should_cancel)
                 .map_err(|error| failure(Some(began), error))?;
             let mut current = self
@@ -369,9 +386,21 @@ impl McpClient {
             if !Arc::ptr_eq(&current, failed) {
                 return Ok(Reconnected::AlreadyReplaced);
             }
-            *current = transport;
+            self.replace_connection(&mut current, connected);
         }
         Ok(Reconnected::Replaced)
+    }
+
+    fn replace_connection(
+        &self,
+        current: &mut Arc<dyn McpTransport>,
+        (transport, instructions): (Arc<dyn McpTransport>, Option<String>),
+    ) {
+        *current = transport;
+        *self
+            .instructions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = instructions;
     }
 
     /// Keeps the stdio reconnect failure record in step with `outcome`:
@@ -409,13 +438,16 @@ impl McpClient {
         &self,
         config: &McpServerConfig,
         should_cancel: &dyn Fn() -> bool,
-    ) -> Result<Arc<dyn McpTransport>, String> {
+    ) -> Result<(Arc<dyn McpTransport>, Option<String>), String> {
         let transport = self.stop.start(&self.server_name, || {
             transport::connect_with_credentials(config, self.credentials_path.clone())
         })?;
-        transport.initialize_or_cancel(should_cancel)?;
+        let initialize_result = transport.initialize_or_cancel(should_cancel)?;
         let _ = transport.list_tools_or_cancel(None, should_cancel)?;
-        Ok(transport)
+        Ok((
+            transport,
+            instructions_from_initialize_result(&initialize_result),
+        ))
     }
 
     pub(crate) fn lock_transport(&self) -> Result<MutexGuard<'_, Arc<dyn McpTransport>>, String> {

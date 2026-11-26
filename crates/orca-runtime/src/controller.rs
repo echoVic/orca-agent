@@ -518,6 +518,16 @@ impl<'a> ThreadTurnContext<'a> {
             config.auto_memory && !matches!(config.history_mode, HistoryMode::Disabled),
             request.prompt_placement() == ThreadTurnPromptPlacement::ExistingTurn,
         );
+        let mcp_instructions = parts
+            .mcp_registry
+            .server_instructions()
+            .into_iter()
+            .map(|(name, text)| format!("Instructions from MCP server '{name}':\n{text}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        parts
+            .conversation
+            .replace_mcp_context((!mcp_instructions.is_empty()).then_some(mcp_instructions));
         if request.prompt_placement() != ThreadTurnPromptPlacement::ExistingTurn {
             parts
                 .conversation

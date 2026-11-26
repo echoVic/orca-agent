@@ -9,7 +9,9 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::auth::is_auth_required;
-use crate::client::{McpClient, McpRequestError, McpServerCapabilities};
+use crate::client::{
+    McpClient, McpRequestError, McpServerCapabilities, instructions_from_initialize_result,
+};
 use crate::connection_stop::McpConnectionStop;
 use crate::transport::{self, McpElicitationHandler, McpTransport};
 use orca_core::conversation::ImageInput;
@@ -542,6 +544,7 @@ fn connect_server_with_transport(
         server_name: server_name.to_string(),
         credentials_path,
         capabilities,
+        instructions: Mutex::new(instructions_from_initialize_result(&initialize_result)),
         reconnect_failure: Mutex::default(),
         stop,
         transport: Mutex::new(transport),
@@ -1037,6 +1040,7 @@ impl McpRegistry {
                     server_name: server.clone(),
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    instructions: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceTransport {
@@ -1071,6 +1075,7 @@ impl McpRegistry {
                         server_name: server,
                         credentials_path: None,
                         capabilities: McpServerCapabilities::resource_capable_for_test(),
+                        instructions: Mutex::default(),
                         reconnect_failure: Mutex::default(),
                         stop: Arc::default(),
                         transport: Mutex::new(Arc::from(transport)),
@@ -1099,6 +1104,20 @@ impl McpRegistry {
     /// The tools of every connected server, in config order.
     pub fn tools(&self) -> Vec<McpTool> {
         self.read().tools.clone()
+    }
+
+    /// Instructions from connected servers, in configuration order.
+    pub fn server_instructions(&self) -> Vec<(String, String)> {
+        let inner = self.read();
+        inner
+            .servers
+            .iter()
+            .filter(|server| server.state == McpServerState::Ready)
+            .filter_map(|server| {
+                let instructions = inner.clients.get(&server.name)?.instructions()?;
+                Some((server.name.clone(), instructions))
+            })
+            .collect()
     }
 
     /// The prompts of every connected server, in config order.
@@ -1499,6 +1518,7 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    instructions: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceListingTransport {
@@ -1525,6 +1545,7 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    instructions: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceListingTransport {
@@ -1619,6 +1640,7 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    instructions: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceTemplateListingTransport {
@@ -1645,6 +1667,7 @@ impl McpRegistry {
                     server_name: server,
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
+                    instructions: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceTemplateListingTransport {

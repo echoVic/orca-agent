@@ -2125,6 +2125,34 @@ mod tests {
     }
 
     #[test]
+    fn internal_context_includes_mcp_instructions_last() {
+        use orca_core::conversation::MCP_CONTEXT_MAX_TOKENS;
+
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".to_string());
+        conv.add_user("find the record".to_string());
+        let instructions = format!(
+            "Instructions from MCP server 'z':\nUse search before fetch.\n\nInstructions from MCP server 'a':\n{} tail",
+            " fetch".repeat(5_000)
+        );
+        conv.replace_mcp_context(Some(instructions.clone()));
+
+        let messages = conversation_to_api_messages(&conv);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content.as_deref(), Some("system prompt"));
+        assert_eq!(messages[1].content.as_deref(), Some("find the record"));
+        assert_eq!(messages[2].role, "system");
+        let overlay = messages[2].content.as_deref().unwrap();
+        assert!(overlay.starts_with("Instructions from MCP server 'z':\nUse search before fetch.\n\nInstructions from MCP server 'a':\n"));
+        assert_eq!(
+            crate::context::DefaultTokenCounter.count_text(overlay),
+            MCP_CONTEXT_MAX_TOKENS
+        );
+        assert!(instructions.starts_with(overlay));
+        assert!(!overlay.ends_with("tail"));
+    }
+
+    #[test]
     fn internal_context_is_a_separate_system_message_after_the_history() {
         let mut conv = Conversation::new();
         conv.add_system("system prompt".to_string());
