@@ -153,6 +153,29 @@ pub fn execute_external_tool_with_policy_or_cancel_with_profile(
     execution_profile: orca_core::capability::ExecutionProfile,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
+    execute_in_session(
+        config,
+        request,
+        cwd,
+        output_truncation,
+        shell_timeout,
+        execution_profile,
+        None,
+        should_cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_in_session(
+    config: &ExternalToolConfig,
+    request: &ToolRequest,
+    cwd: &Path,
+    output_truncation: ToolOutputTruncation,
+    shell_timeout: Option<Duration>,
+    execution_profile: orca_core::capability::ExecutionProfile,
+    spill_dir: Option<&Path>,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let args = request.raw_arguments.as_deref().unwrap_or("{}");
     let shell =
         match orca_platform::shell::ShellResolver::for_current_host().resolve_from_environment() {
@@ -292,10 +315,15 @@ pub fn execute_external_tool_with_policy_or_cancel_with_profile(
         return result;
     }
     if output.status.success() && !output.timed_out {
-        let (result_output, truncated) = truncate_output_with_policy(stdout, output_truncation);
-        let result_output =
-            process::preserve_ingress_omission_notice(result_output, output.stdout_omitted_bytes);
-        return ToolResult::completed(request, result_output, ingress_truncated || truncated);
+        // Keep the process output admission limit and preserve its existing result when reached.
+        let spill_dir = (output.stdout_omitted_bytes == 0)
+            .then_some(spill_dir)
+            .flatten();
+        return crate::spill::completed_text(request, stdout, spill_dir, |text| {
+            let (text, truncated) = truncate_output_with_policy(text, output_truncation);
+            let text = process::preserve_ingress_omission_notice(text, output.stdout_omitted_bytes);
+            (text, ingress_truncated || truncated)
+        });
     }
 
     let stdout = stdout.trim();

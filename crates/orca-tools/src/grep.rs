@@ -35,6 +35,16 @@ pub fn execute_or_cancel(
     max_bytes: usize,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
+    execute_in_session(request, cwd, max_bytes, None, should_cancel)
+}
+
+pub(crate) fn execute_in_session(
+    request: &ToolRequest,
+    cwd: &Path,
+    max_bytes: usize,
+    spill_dir: Option<&Path>,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let args = parse_args(request);
     let pattern = args.pattern.as_deref().or(request
         .target
@@ -45,7 +55,7 @@ pub fn execute_or_cancel(
     };
 
     let requested_path = args.path.as_deref().unwrap_or(".");
-    let search_path = match crate::resolve_workspace_path(cwd, Some(requested_path)) {
+    let search_path = match crate::spill::resolve_read_path(cwd, Some(requested_path), spill_dir) {
         Ok(path) => path,
         Err(message) => return ToolResult::failed(request, message, None),
     };

@@ -305,7 +305,7 @@ impl InteractiveSession {
             Some(&memory),
             None,
         );
-        let (conversation, loaded_transcript) = match &config.history_mode {
+        let (mut conversation, loaded_transcript) = match &config.history_mode {
             HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => {
                 let transcript = match preloaded {
                     Some(t) => t,
@@ -439,8 +439,22 @@ impl InteractiveSession {
                         config.additional_working_directories.clone();
                     meta
                 });
+                let spill = crate::thread_store::spill::directory(&meta.session_id);
+                if let Some(parent) = &meta.parent_id {
+                    crate::thread_store::spill::carry_into_fork(
+                        parent,
+                        &meta.session_id,
+                        &mut conversation.messages,
+                    );
+                }
                 session_id = Some(meta.session_id.clone());
-                start_writer_with_messages(&store, meta, &conversation)
+                let writer = start_writer_with_messages(&store, meta, &conversation);
+                if writer.is_none()
+                    && let Err(error) = crate::thread_store::spill::remove(spill.as_deref())
+                {
+                    tracing::warn!(%error, "could not remove incomplete fork's saved tool results");
+                }
+                writer
             }
         };
 
@@ -458,7 +472,13 @@ impl InteractiveSession {
             TaskRegistry::attach_for_cwd(task_session_id, &cwd)
         } else {
             TaskRegistry::new_for_cwd(task_session_id, &cwd)
-        };
+        }
+        .with_spill_directory(writer.as_ref().and_then(|writer| {
+            writer
+                .session_id()
+                .as_deref()
+                .and_then(crate::thread_store::spill::directory)
+        }));
 
         let auto_memory_worker = (config.auto_memory
             && !matches!(config.history_mode, HistoryMode::Disabled))
@@ -1248,6 +1268,67 @@ mod tests {
             assert!(contents.contains(&"current durable prompt"));
             assert!(contents.contains(&"current durable response"));
             assert!(!contents.contains(&"stale historical prompt"));
+        });
+    }
+
+    #[test]
+    fn a_fork_keeps_its_own_copy_of_inherited_large_tool_results() {
+        with_orca_home(|home| {
+            let cwd = tempdir().unwrap();
+            let mut parent =
+                history::SessionWriter::start(cwd.path(), "deepseek", None, "parent").unwrap();
+            let parent_id = parent.session_id().unwrap();
+            let parent_dir = crate::thread_store::spill::directory(&parent_id).unwrap();
+            assert!(parent_dir.starts_with(home));
+            std::fs::create_dir_all(&parent_dir).unwrap();
+            let file = parent_dir.join("fetch.txt");
+            std::fs::write(&file, "full page").unwrap();
+            parent.enter_turn(TurnId::new());
+            parent
+                .append_message(&Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![orca_core::conversation::RawToolCall {
+                        id: "fetch".into(),
+                        function_name: "web_fetch".into(),
+                        arguments: "{}".into(),
+                    }],
+                    pinned: false,
+                })
+                .unwrap();
+            let request = orca_core::tool_types::ToolRequest {
+                id: "fetch".into(),
+                name: orca_core::tool_types::ToolName::WebFetch,
+                action: orca_core::approval_types::ActionKind::Network,
+                target: None,
+                raw_arguments: None,
+            };
+            let notice =
+                orca_core::tool_types::tool_output_spill_notice(42, &file.display().to_string());
+            let result = ToolResult::completed(&request, format!("head\n\ntail\n\n{notice}"), true);
+            super::record_tool_result_for_agent(
+                &mut Conversation::new(),
+                Some(&mut parent),
+                &result,
+                true,
+            )
+            .unwrap();
+            drop(parent);
+            let fork = InteractiveSession::new_with_preloaded(
+                &config(cwd.path().to_owned(), HistoryMode::Fork(parent_id.clone())),
+                "fork",
+                None,
+            )
+            .unwrap();
+            let fork_dir = fork.task_registry().spill_directory().unwrap();
+            let fork_file = fork_dir.join("fetch.txt");
+            assert!(fork.conversation().messages.iter().any(|message| {
+                message
+                    .content_str()
+                    .is_some_and(|text| text.contains(&fork_file.display().to_string()))
+            }));
+            history::delete_session(&parent_id).unwrap();
+            assert_eq!(std::fs::read_to_string(fork_file).unwrap(), "full page");
         });
     }
 

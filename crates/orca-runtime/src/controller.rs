@@ -4616,6 +4616,7 @@ mod tests {
         let cancel = CancelToken::new();
         let results = crate::runtime_readonly_tool_turn::execute_readonly_batch(
             crate::runtime_readonly_tool_turn::RuntimeReadonlyBatchContext {
+                spill_directory: None,
                 cwd: dir.path(),
                 events: &mut events,
                 sink: &mut sink,

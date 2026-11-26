@@ -232,6 +232,20 @@ fn legacy_inline_images_remain_readable() {
 }
 
 #[test]
+fn spill_files_are_removed_with_their_session() {
+    crate::history::with_redirected_orca_home("spill-lifecycle", |home| {
+        let writer = SessionWriter::start(home, "mock", None, "spill").unwrap();
+        let id = writer.session_id().unwrap();
+        let spill = home.join("session-results").join(&id).join("spill");
+        fs::create_dir_all(&spill).unwrap();
+        fs::write(spill.join("call.txt"), "result").unwrap();
+        drop(writer);
+        JsonlThreadStore::new().delete_session(&id).unwrap();
+        assert!(!spill.exists());
+    });
+}
+
+#[test]
 fn assets_survive_fork_rename_archive_compress_and_portable_export() {
     crate::history::with_redirected_orca_home("asset-lifecycle", |home| {
         let store = JsonlThreadStore::new();

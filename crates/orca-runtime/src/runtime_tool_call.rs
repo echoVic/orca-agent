@@ -42,6 +42,7 @@ const NORMAL_TOOL_ADMISSION_STARTED: u8 = 1;
 const NORMAL_TOOL_ADMISSION_CANCELLED: u8 = 2;
 
 pub(crate) struct RuntimeReadonlyToolInvocation {
+    pub(crate) spill_directory: Option<PathBuf>,
     pub(crate) request: ToolRequest,
     pub(crate) cwd: PathBuf,
     pub(crate) mcp_registry: McpRegistry,
@@ -364,21 +365,14 @@ impl RuntimeReadonlyToolExecutor for DefaultRuntimeReadonlyToolExecutor {
         invocation: &RuntimeReadonlyToolInvocation,
         cancel: &CancelToken,
     ) -> ToolResult {
-        orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_profile(
-            &invocation.request,
-            &invocation.cwd,
-            &[],
-            &invocation.mcp_registry,
-            &[],
-            invocation.output_truncation,
-            READONLY_TOOL_TIMEOUT_SECS,
-            None,
-            orca_core::capability::ExecutionProfile::ReadOnly,
-            // web_search, web_fetch and read_document are not concurrent-safe,
-            // so they never reach this batch and need no DeepSeek access here.
-            None,
-            || cancel.is_cancelled(),
-        )
+        let cancelled = || cancel.is_cancelled();
+        let ctx = orca_tools::ToolContext::new(&invocation.cwd)
+            .with_output_truncation(invocation.output_truncation)
+            .with_shell_timeout(Some(Duration::from_secs(READONLY_TOOL_TIMEOUT_SECS)))
+            .with_execution_profile(orca_core::capability::ExecutionProfile::ReadOnly)
+            .with_spill_directory(invocation.spill_directory.as_deref())
+            .with_cancel(&cancelled);
+        orca_tools::execute_in_context(&invocation.request, &invocation.mcp_registry, &[], ctx)
     }
 }
 
@@ -1232,6 +1226,7 @@ pub(crate) mod tests {
 
     fn invocation(id: &str) -> RuntimeReadonlyToolInvocation {
         RuntimeReadonlyToolInvocation {
+            spill_directory: None,
             request: ToolRequest {
                 id: id.to_string(),
                 name: ToolName::ReadFile,

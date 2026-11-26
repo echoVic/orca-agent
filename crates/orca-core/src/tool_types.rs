@@ -6,6 +6,29 @@ use std::sync::Arc;
 use crate::approval_types::ActionKind;
 use crate::conversation::ImageInput;
 
+const SPILL_NOTICE_PREFIX: &str = " bytes omitted. The full result is saved at ";
+const SPILL_NOTICE_SUFFIX: &str =
+    "; read it with read_file using offset and limit, or search it with grep.]";
+
+pub fn tool_output_spill_notice(omitted: usize, path: &str) -> String {
+    format!("[{omitted}{SPILL_NOTICE_PREFIX}{path}{SPILL_NOTICE_SUFFIX}")
+}
+
+pub fn trailing_tool_output_spill_notice(text: &str) -> Option<&str> {
+    let (_, notice) = text.rsplit_once("\n\n")?;
+    parse_tool_output_spill_notice(notice).map(|_| notice)
+}
+
+pub fn parse_tool_output_spill_notice(notice: &str) -> Option<(usize, &std::path::Path)> {
+    let (omitted, path) = notice
+        .strip_prefix('[')?
+        .strip_suffix(SPILL_NOTICE_SUFFIX)?
+        .split_once(SPILL_NOTICE_PREFIX)?;
+    let omitted = omitted.parse().ok()?;
+    let path = std::path::Path::new(path);
+    path.is_absolute().then_some((omitted, path))
+}
+
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

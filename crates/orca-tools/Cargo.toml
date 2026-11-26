@@ -23,12 +23,13 @@ libc = { workspace = true }
 similar = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
+tempfile = { workspace = true }
+tiktoken-rs = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }
 seccompiler = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 orca-core = { path = "../orca-core", features = ["test-utils"] }
 orca-mcp = { path = "../orca-mcp", features = ["test-utils"] }

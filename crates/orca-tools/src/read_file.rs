@@ -7,7 +7,6 @@ use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind};
 
 use crate::file_admission::{BoundedTextOutput, FileAdmissionError, stream_utf8_file};
 use crate::read_document::document_kind;
-use crate::resolve_workspace_path;
 
 #[derive(Debug, Default, Deserialize)]
 struct ReadFileArgs {
@@ -26,9 +25,19 @@ pub fn execute_or_cancel(
     max_bytes: usize,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
+    execute_in_session(request, cwd, max_bytes, None, should_cancel)
+}
+
+pub(crate) fn execute_in_session(
+    request: &ToolRequest,
+    cwd: &Path,
+    max_bytes: usize,
+    spill_dir: Option<&Path>,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let args = parse_args(request);
     let target = args.path.as_deref().or(request.target.as_deref());
-    let path = match resolve_workspace_path(cwd, target) {
+    let path = match crate::spill::resolve_read_path(cwd, target, spill_dir) {
         Ok(p) => p,
         Err(error) => return ToolResult::failed(request, error, None),
     };

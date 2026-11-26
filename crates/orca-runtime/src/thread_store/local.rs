@@ -326,8 +326,10 @@ pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
     })?;
     let _owner = super::retention::acquire_idle_owner(&path)?;
     let _lock = acquire_file_lock(&path)?;
+    let spill = super::spill::directory_for_transcript(&path);
     fs::remove_file(&path)?;
     assets::remove_directory(&path)?;
+    super::spill::remove(spill.as_deref())?;
     #[cfg(not(test))]
     let _ = session_index::remove_path(&path);
     Ok(path)

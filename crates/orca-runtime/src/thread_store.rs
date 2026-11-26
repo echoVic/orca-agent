@@ -9,6 +9,7 @@ mod retention;
 mod rewind_records_tests;
 #[cfg_attr(test, allow(dead_code))]
 mod session_index;
+pub(crate) mod spill;
 #[cfg(test)]
 mod storage_tests;
 mod types;

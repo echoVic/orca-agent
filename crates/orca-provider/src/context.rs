@@ -2266,15 +2266,24 @@ fn cache_aware_micro_compaction(
 }
 
 fn micro_compact_tool_output(content: &str) -> String {
-    let head: String = content.chars().take(320).collect();
-    let tail_vec: Vec<char> = content.chars().rev().take(320).collect();
+    let notice = orca_core::tool_types::trailing_tool_output_spill_notice(content);
+    let preview = notice.map_or(content, |notice| {
+        content[..content.len() - notice.len()].trim_end()
+    });
+    let head: String = preview.chars().take(320).collect();
+    let tail_vec: Vec<char> = preview.chars().rev().take(320).collect();
     let tail: String = tail_vec.into_iter().rev().collect();
-    format!(
+    let mut reduced = format!(
         "[tool output micro-compact]\noriginal_bytes: {}\nhead:\n{}\n\ntail:\n{}",
         content.len(),
         head.trim_end(),
         tail.trim_start()
-    )
+    );
+    if let Some(notice) = notice {
+        reduced.push_str("\n\n");
+        reduced.push_str(notice);
+    }
+    reduced
 }
 
 #[cfg(test)]
@@ -2283,6 +2292,17 @@ mod cache_aware_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn micro_compaction_keeps_the_spill_path() {
+        let path = format!("/session/spill/{}.txt", "long".repeat(75));
+        let notice = format!(
+            "[123 bytes omitted. The full result is saved at {path}; read it with read_file using offset and limit, or search it with grep.]"
+        );
+        let content = format!("{}\n\n{notice}", "output ".repeat(2000));
+        let compacted = micro_compact_tool_output(&content);
+        assert!(compacted.ends_with(&notice));
+    }
+
     use super::*;
     use orca_core::cancel::CancelToken;
     use orca_core::conversation::{ImageSource, RawToolCall};

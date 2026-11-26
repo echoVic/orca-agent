@@ -2674,6 +2674,7 @@ dependencies = [
  "sha2 0.11.0",
  "similar",
  "tempfile",
+ "tiktoken-rs",
  "tokio",
  "toml 1.1.7+spec-1.1.0",
  "url",

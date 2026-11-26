@@ -89,7 +89,10 @@ fn session_bytes(path: &Path) -> io::Result<u64> {
     if !metadata.file_type().is_file() {
         return Err(io::Error::other("retention requires a regular transcript"));
     }
-    let mut bytes = metadata.len();
+    let spill = super::spill::directory_for_transcript(path);
+    let mut bytes = metadata
+        .len()
+        .saturating_add(super::spill::size(spill.as_deref())?);
     let root = assets::directory(path);
     match fs::symlink_metadata(&root) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(bytes),
@@ -207,9 +210,12 @@ pub fn retain_sessions(
                 report.skipped.push(candidate.path.clone());
                 continue;
             }
+            let spill = super::spill::directory_for_transcript(&candidate.path);
             fs::remove_file(&candidate.path)
                 .map_err(|error| retention_error(&report, &candidate.path, false, error))?;
             assets::remove_directory(&candidate.path)
+                .map_err(|error| retention_error(&report, &candidate.path, true, error))?;
+            super::spill::remove(spill.as_deref())
                 .map_err(|error| retention_error(&report, &candidate.path, true, error))?;
             let _ = session_index::remove_path(&candidate.path);
             report.bytes_after = report.bytes_after.saturating_sub(candidate.bytes);
