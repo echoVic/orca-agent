@@ -432,6 +432,7 @@ fn collect_until(
                         return batches;
                     }
                 }
+                SurfaceSubscriptionItem::ProviderRetry { .. } => continue,
                 SurfaceSubscriptionItem::Gap { required } => {
                     panic!("surface subscription gapped: {:?}", required.reason)
                 }
