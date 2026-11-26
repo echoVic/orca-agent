@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 
 use super::local::{
     collect_session_files, is_regular_history_file, orca_home, storage_identity_for_path,
@@ -16,8 +16,9 @@ use super::local::{
 use super::types::{SessionMeta, SessionSummary, StoredSessionHealth, StoredSessionHealthIssue};
 
 const DATABASE_FILENAME: &str = "sessions-index.sqlite3";
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 6;
 const RECENT_SEED_LIMIT: usize = 20;
+const SUMMARY_REFRESH_LIMIT: usize = 8;
 
 static BACKFILLS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static RECENT_TOUCHES: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
@@ -68,8 +69,10 @@ fn list_page_filtered(
     search_term: Option<&str>,
     cwd: Option<&str>,
 ) -> io::Result<SessionSummaryPage> {
-    let mut connection = open_index(&home)?;
+    let mut connection = open_index(home)?;
     seed_recent_if_empty(&mut connection, home, include_archived)?;
+    let (mut refreshed, refresh_pending) =
+        refresh_cached_summaries(&mut connection, include_archived)?;
     spawn_backfill_if_needed(home.to_path_buf());
 
     let page_size = limit.max(1);
@@ -126,7 +129,10 @@ fn list_page_filtered(
                 continue;
             }
             let cached_summary = serde_json::from_str::<SessionSummary>(&summary_json).ok();
-            let mut summary = match summarize_session_with_archive_flag(&path, archived) {
+            let scan = refreshed
+                .remove(&path)
+                .map_or_else(|| summarize_session_with_archive_flag(&path, archived), Ok);
+            let mut summary = match scan {
                 Ok(summary) => summary,
                 Err(_error) => {
                     // Keep the old catalog row visible even if a transient read
@@ -140,6 +146,7 @@ fn list_page_filtered(
                         code: "scan_failed".to_string(),
                         line: None,
                         offset: None,
+                        record_type: None,
                     });
                     cached.path = path.clone();
                     cached.archived = archived;
@@ -183,7 +190,8 @@ fn list_page_filtered(
 
     let has_more = sessions.len() > page_size;
     sessions.truncate(page_size);
-    let backfill_complete = backfill_complete(&connection)?;
+    // A later batch can uncover additional matches, just like backfill.
+    let backfill_complete = !refresh_pending && backfill_complete(&connection)?;
     let next_offset =
         (has_more || !backfill_complete).then(|| offset.saturating_add(sessions.len()));
     Ok(SessionSummaryPage {
@@ -191,6 +199,74 @@ fn list_page_filtered(
         next_offset,
         backfill_complete,
     })
+}
+
+fn refresh_cached_summaries(
+    connection: &mut Connection,
+    include_archived: bool,
+) -> io::Result<(HashMap<PathBuf, SessionSummary>, bool)> {
+    let has_outdated_rows = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions
+             WHERE summary_version < ?1 AND (?2 OR archived = 0))",
+            params![SCHEMA_VERSION, include_archived],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(io::Error::other)?;
+    if !has_outdated_rows {
+        return Ok((HashMap::new(), false));
+    }
+
+    // Older summaries can lack a title or cwd the reader now understands.
+    // Select and update a batch together so other pages pick up where it left off.
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(io::Error::other)?;
+    let mut statement = transaction
+        .prepare(
+            "SELECT path, archived FROM sessions
+             WHERE summary_version < ?1 AND (?2 OR archived = 0)
+             ORDER BY summary_version, updated_at_ms, path
+             LIMIT ?3",
+        )
+        .map_err(io::Error::other)?;
+    let rows = statement
+        .query_map(
+            params![SCHEMA_VERSION, include_archived, SUMMARY_REFRESH_LIMIT + 1],
+            |row| {
+                Ok((
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    row.get::<_, bool>(1)?,
+                ))
+            },
+        )
+        .map_err(io::Error::other)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(io::Error::other)?;
+    drop(statement);
+
+    let refresh_pending = rows.len() > SUMMARY_REFRESH_LIMIT;
+    let mut refreshed = HashMap::new();
+    for (path, archived) in rows.into_iter().take(SUMMARY_REFRESH_LIMIT) {
+        if !is_regular_history_file(&path) {
+            remove_path_with_connection(&transaction, &path)?;
+            continue;
+        }
+        #[cfg(test)]
+        tests::REFRESH_READS.with(|reads| reads.set(reads.get() + 1));
+        match summarize_session_with_archive_flag(&path, archived) {
+            Ok(summary) => {
+                upsert_summary_with_connection(&transaction, &summary)?;
+                refreshed.insert(path, summary);
+            }
+            Err(_) => {
+                // The file stopped being a regular history file before the scan.
+                remove_path_with_connection(&transaction, &path)?;
+            }
+        }
+    }
+    transaction.commit().map_err(io::Error::other)?;
+    Ok((refreshed, refresh_pending))
 }
 
 pub(crate) fn upsert_meta(path: &Path, meta: &SessionMeta, archived: bool) -> io::Result<()> {
@@ -380,7 +456,7 @@ fn is_corrupt_database(error: &rusqlite::Error) -> bool {
 }
 
 fn open_and_initialize(path: &Path) -> rusqlite::Result<Connection> {
-    let connection = Connection::open(path)?;
+    let mut connection = Connection::open(path)?;
     connection.busy_timeout(Duration::from_secs(2))?;
     connection.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -390,24 +466,51 @@ fn open_and_initialize(path: &Path) -> rusqlite::Result<Connection> {
                  value TEXT NOT NULL
              );",
     )?;
-    let schema_version = connection
+    let current = SCHEMA_VERSION.to_string();
+    if read_schema_version(&connection)?.as_deref() != Some(current.as_str()) {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match read_schema_version(&transaction)?.as_deref() {
+            Some(version) if version == current => {}
+            Some("4") => {
+                let has_sessions = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'sessions' AND type = 'table')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if has_sessions {
+                    transaction.execute_batch(
+                        "ALTER TABLE sessions ADD COLUMN summary_version INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+            }
+            Some("5") => {}
+            Some(_) => transaction.execute_batch(
+                "DROP TABLE IF EXISTS sessions;
+                 DELETE FROM index_meta;",
+            )?,
+            None => {}
+        }
+        initialize_sessions_table(&transaction)?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO index_meta(key, value) VALUES('schema_version', ?1)",
+            [current],
+        )?;
+        transaction.commit()?;
+    }
+    Ok(connection)
+}
+
+fn read_schema_version(connection: &Connection) -> rusqlite::Result<Option<String>> {
+    connection
         .query_row(
             "SELECT value FROM index_meta WHERE key = 'schema_version'",
             [],
-            |row| row.get::<_, String>(0),
+            |row| row.get(0),
         )
-        .optional()?;
-    match schema_version.as_deref() {
-        Some("4") => {}
-        Some(_) => {
-            connection.execute_batch(
-                "DROP TABLE IF EXISTS sessions;
-                     DELETE FROM index_meta;",
-            )?;
-            write_schema_version(&connection)?;
-        }
-        None => write_schema_version(&connection)?,
-    }
+        .optional()
+}
+
+fn initialize_sessions_table(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS sessions (
                  path TEXT PRIMARY KEY,
@@ -420,22 +523,16 @@ fn open_and_initialize(path: &Path) -> rusqlite::Result<Connection> {
                  health TEXT NOT NULL DEFAULT 'healthy',
                  health_issue_json TEXT,
                  source_fingerprint TEXT,
-                 storage_identity TEXT NOT NULL DEFAULT ''
+                 storage_identity TEXT NOT NULL DEFAULT '',
+                 summary_version INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS sessions_recency
                  ON sessions(archived, updated_at_ms DESC, created_at_ms DESC, session_id DESC);
              CREATE INDEX IF NOT EXISTS sessions_session_id
-                 ON sessions(session_id, archived, updated_at_ms DESC);",
-    )?;
-    Ok(connection)
-}
-
-fn write_schema_version(connection: &Connection) -> rusqlite::Result<()> {
-    connection.execute(
-        "INSERT OR REPLACE INTO index_meta(key, value) VALUES('schema_version', ?1)",
-        [SCHEMA_VERSION.to_string()],
-    )?;
-    Ok(())
+                 ON sessions(session_id, archived, updated_at_ms DESC);
+             CREATE INDEX IF NOT EXISTS sessions_summary_version
+                 ON sessions(summary_version, updated_at_ms, path);",
+    )
 }
 
 fn seed_recent_if_empty(
@@ -561,8 +658,8 @@ fn upsert_summary_with_connection(
         .execute(
             "INSERT INTO sessions(
                  path, session_id, archived, title, created_at_ms, updated_at_ms, summary_json,
-                 health, health_issue_json, source_fingerprint, storage_identity
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 health, health_issue_json, source_fingerprint, storage_identity, summary_version
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(path) DO UPDATE SET
                  session_id = excluded.session_id,
                  archived = excluded.archived,
@@ -573,7 +670,8 @@ fn upsert_summary_with_connection(
                  health = excluded.health,
                  health_issue_json = excluded.health_issue_json,
                  source_fingerprint = excluded.source_fingerprint,
-                 storage_identity = excluded.storage_identity",
+                 storage_identity = excluded.storage_identity,
+                 summary_version = excluded.summary_version",
             params![
                 summary.path.to_string_lossy(),
                 summary.session_id,
@@ -590,7 +688,8 @@ fn upsert_summary_with_connection(
                     .transpose()
                     .map_err(io::Error::other)?,
                 summary.source_fingerprint,
-                summary.storage_identity
+                summary.storage_identity,
+                SCHEMA_VERSION,
             ],
         )
         .map_err(io::Error::other)?;
@@ -669,6 +768,7 @@ fn unreadable_summary(path: &Path, archived: bool, updated_at_ms: i64) -> Sessio
             code: "scan_failed".to_string(),
             line: None,
             offset: None,
+            record_type: None,
         }),
         source_fingerprint: None,
         storage_identity,
@@ -778,6 +878,149 @@ mod tests {
     use super::*;
     use crate::history;
     use crate::thread_store::types::SessionRecord;
+
+    thread_local! {
+        pub(super) static REFRESH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn a_filtered_page_does_not_reread_already_refreshed_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let session = write_legacy_session(home.path(), 0);
+        fs::write(&session.path, "not a session\n").unwrap();
+        let quarantined = summarize_session_with_archive_flag(&session.path, false).unwrap();
+        assert_eq!(quarantined.health, StoredSessionHealth::Quarantined);
+        let connection = open_index(home.path()).unwrap();
+        upsert_summary_with_connection(&connection, &quarantined).unwrap();
+        connection
+            .execute_batch(
+                "UPDATE sessions SET summary_version = 5;
+                 INSERT INTO index_meta VALUES('backfill_complete', '1');",
+            )
+            .unwrap();
+
+        REFRESH_READS.with(|reads| reads.set(0));
+        let page = list_page_at(home.path(), 0, 20, false, Some("different title")).unwrap();
+        assert!(page.sessions.is_empty());
+        assert_eq!(REFRESH_READS.with(|reads| reads.replace(0)), 1);
+
+        let page = list_page_at(home.path(), 0, 20, false, Some("another title")).unwrap();
+        assert!(page.sessions.is_empty());
+        assert_eq!(REFRESH_READS.with(|reads| reads.get()), 0);
+    }
+
+    #[test]
+    fn a_filtered_page_refreshes_a_bounded_batch_of_in_scope_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let connection = open_index(home.path()).unwrap();
+        for index in 0..10 {
+            let mut cached = write_legacy_session(home.path(), index);
+            cached.title.clear();
+            cached.health = StoredSessionHealth::Quarantined;
+            cached.archived = index == 0;
+            cached.updated_at = DateTime::from_timestamp_millis(index as i64).unwrap();
+            upsert_summary_with_connection(&connection, &cached).unwrap();
+        }
+        connection
+            .execute_batch(
+                "UPDATE sessions SET summary_version = 5;
+                 INSERT INTO index_meta VALUES('backfill_complete', '1');",
+            )
+            .unwrap();
+
+        REFRESH_READS.with(|reads| reads.set(0));
+        let search = Some("indexed session 09");
+        let first = list_page_at(home.path(), 0, 20, false, search).unwrap();
+        assert_eq!(REFRESH_READS.with(|reads| reads.replace(0)), 8);
+        assert!(first.sessions.is_empty());
+        assert_eq!(first.next_offset, Some(0));
+
+        let second =
+            list_page_at(home.path(), first.next_offset.unwrap(), 20, false, search).unwrap();
+        assert_eq!(REFRESH_READS.with(|reads| reads.replace(0)), 1);
+        assert_eq!(second.sessions.len(), 1);
+        assert_eq!(second.sessions[0].session_id, "session-09");
+        assert_eq!(second.next_offset, None);
+
+        let archived = list_page_at(home.path(), 0, 20, true, Some("indexed session 00")).unwrap();
+        assert_eq!(REFRESH_READS.with(|reads| reads.get()), 1);
+        assert_eq!(archived.sessions.len(), 1);
+        assert!(archived.sessions[0].archived);
+    }
+
+    #[test]
+    fn an_upgraded_index_lists_a_session_the_old_reader_quarantined() {
+        let home = tempfile::tempdir().unwrap();
+        let original = write_legacy_session(home.path(), 0);
+        let metadata = fs::read_to_string(&original.path).unwrap();
+        fs::write(
+            &original.path,
+            format!("{{\"type\":\"future.note\",\"ignorable\":true}}\n{metadata}"),
+        )
+        .unwrap();
+
+        let connection = Connection::open(home.path().join(DATABASE_FILENAME)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE index_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO index_meta VALUES('schema_version', '4'), ('backfill_complete', '1');
+                 CREATE TABLE sessions (
+                     path TEXT PRIMARY KEY, session_id TEXT NOT NULL, archived INTEGER NOT NULL,
+                     title TEXT NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                     summary_json TEXT NOT NULL, health TEXT NOT NULL DEFAULT 'healthy',
+                     health_issue_json TEXT, source_fingerprint TEXT, storage_identity TEXT NOT NULL DEFAULT ''
+                 );",
+            )
+            .unwrap();
+        let current = summarize_session_with_archive_flag(&original.path, false).unwrap();
+        let mut old =
+            unreadable_summary(&original.path, false, current.updated_at.timestamp_millis());
+        old.health_issue = Some(StoredSessionHealthIssue {
+            code: "malformed_record".to_owned(),
+            line: Some(1),
+            offset: Some(0),
+            record_type: None,
+        });
+        old.source_fingerprint = current.source_fingerprint;
+        let mut summary_json = serde_json::to_value(&old).unwrap();
+        summary_json["health_issue"]
+            .as_object_mut()
+            .unwrap()
+            .remove("record_type");
+        connection
+            .execute(
+                "INSERT INTO sessions VALUES(?1, ?2, 0, ?3, ?4, ?4, ?5, 'quarantined', ?6, ?7, ?2)",
+                params![
+                    original.path.to_string_lossy(),
+                    old.storage_identity,
+                    old.title,
+                    old.updated_at.timestamp_millis(),
+                    summary_json.to_string(),
+                    summary_json["health_issue"].to_string(),
+                    old.source_fingerprint,
+                ],
+            )
+            .unwrap();
+
+        let cwd = home.path().to_str().unwrap();
+        let page = list_page_filtered(home.path(), 0, 20, false, None, Some(cwd)).unwrap();
+        assert_eq!(page.sessions.len(), 1);
+        assert_eq!(page.sessions[0].session_id, original.session_id);
+        assert_eq!(page.sessions[0].health, StoredSessionHealth::Healthy);
+
+        // Version 5 could record a quarantine without a searchable title.
+        upsert_summary_with_connection(&connection, &old).unwrap();
+        connection
+            .execute_batch(
+                "UPDATE index_meta SET value = '5' WHERE key = 'schema_version';
+                 UPDATE sessions SET summary_version = 5;",
+            )
+            .unwrap();
+        let page = list_page_at(home.path(), 0, 20, false, Some(&original.title)).unwrap();
+        assert_eq!(page.sessions.len(), 1);
+        assert_eq!(page.sessions[0].session_id, original.session_id);
+        assert_eq!(page.sessions[0].health, StoredSessionHealth::Healthy);
+    }
 
     #[test]
     fn index_pages_searches_and_tracks_session_lifecycle() {
@@ -1152,7 +1395,7 @@ mod tests {
             index_meta,
             vec![
                 ("backfill_complete".to_string(), "1".to_string()),
-                ("schema_version".to_string(), "4".to_string()),
+                ("schema_version".to_string(), "6".to_string()),
             ]
         );
         let cached: SessionSummary = serde_json::from_str(
