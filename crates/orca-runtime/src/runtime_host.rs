@@ -15056,10 +15056,21 @@ enum SurfaceBackgroundTransfer {
 
 impl std::fmt::Debug for RuntimeSurfaceBackgroundControl {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never waits for the transfer's lock, so a format of the control
+        // while that lock is held, on this thread too, cannot deadlock:
+        // `pending` is then left unknown.
+        let pending = match self.transfer.try_lock() {
+            Ok(state) => Some(!matches!(*state, SurfaceBackgroundTransfer::None)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(!matches!(
+                *poisoned.into_inner(),
+                SurfaceBackgroundTransfer::None
+            )),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
         formatter
             .debug_struct("RuntimeSurfaceBackgroundControl")
             .field("requested", &self.requested)
-            .field("pending", &self.has_pending_transfer())
+            .field("pending", &pending)
             .field(
                 "kept_subagents_root",
                 &self
@@ -15137,12 +15148,15 @@ impl RuntimeSurfaceBackgroundControl {
         if !matches!(*state, SurfaceBackgroundTransfer::Waiting(_)) || !self.kept_subagents_run() {
             return;
         }
-        let SurfaceBackgroundTransfer::Waiting(transfer) = std::mem::take(&mut *state) else {
-            unreachable!("the waiting hand-off was matched");
-        };
-        self.requested.store(false, Ordering::Release);
-        drop(state);
-        transfer.refuse_while_kept_subagents_run();
+        match std::mem::take(&mut *state) {
+            SurfaceBackgroundTransfer::Waiting(transfer) => {
+                self.requested.store(false, Ordering::Release);
+                drop(state);
+                transfer.refuse_while_kept_subagents_run();
+            }
+            // Not waiting after all: what was taken is put back as it was.
+            other => *state = other,
+        }
     }
 
     /// The hand-off the generation suspended for, or one still waiting
@@ -34679,18 +34693,11 @@ mod tests {
             .expect("shutdown ended record subagent host");
     }
 
-    /// A sync agent that runs in the parent's process without a thread of
-    /// its own (here, one isolated in a worktree) is shown running as the
-    /// turn's, but only its parent's cancel reaches it: a person's stop of
-    /// it is refused, as before the TUI kept its agents, and leaves its
-    /// record running, not stopping.
-    #[test]
-    fn a_persons_stop_of_an_agent_without_a_thread_of_its_own_is_refused() {
-        let cwd = tempfile::tempdir().unwrap();
-        // A worktree needs a repository with a commit.
+    /// Makes `cwd` a repository with one commit, which a worktree needs.
+    fn a_repository_with_a_commit(cwd: &std::path::Path) {
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
-                .current_dir(cwd.path())
+                .current_dir(cwd)
                 .args(args)
                 .output()
                 .expect("run git");
@@ -34699,9 +34706,20 @@ mod tests {
         git(&["init", "-q"]);
         git(&["config", "user.email", "orca@example.test"]);
         git(&["config", "user.name", "Orca Test"]);
-        std::fs::write(cwd.path().join("file.txt"), "placeholder").unwrap();
+        std::fs::write(cwd.join("file.txt"), "placeholder").unwrap();
         git(&["add", "file.txt"]);
         git(&["commit", "-q", "-m", "seed"]);
+    }
+
+    /// A sync agent that runs in the parent's process without a thread of
+    /// its own (here, one isolated in a worktree) is shown running as the
+    /// turn's, but only its parent's cancel reaches it: a person's stop of
+    /// it is refused, as before the TUI kept its agents, and leaves its
+    /// record running, not stopping.
+    #[test]
+    fn a_persons_stop_of_an_agent_without_a_thread_of_its_own_is_refused() {
+        let cwd = tempfile::tempdir().unwrap();
+        a_repository_with_a_commit(cwd.path());
         let host = RuntimeHost::start().expect("start threadless subagent stop host");
         let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
             &host,
@@ -34861,6 +34879,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_ne!(queued.id, running[0].task_id.as_str());
+        // Its record says it gets a thread of its own before it has one.
+        assert!(queued.control.gets_a_thread_of_its_own());
+        assert!(!queued.control.runs_on_its_own_thread());
         let snapshot = read_snapshot();
         assert!(
             snapshot
@@ -36116,15 +36137,21 @@ mod tests {
     /// async one running too: refused at once. A person then stops the sync
     /// agent, so the turn streams again while its async agent runs, which
     /// is where a hand-off used to happen: the turn is not moved then
-    /// either, and ends where it ran.
+    /// either, and ends where it ran. Both agents run until released, so
+    /// the async one is still running when the sync one has ended.
     #[test]
     fn a_turn_waiting_on_a_sync_subagent_is_not_moved_to_the_background() {
         let cwd = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        let release = ReleaseMarker(markers.path().join("release the agents"));
         let host = RuntimeHost::start().expect("start host");
         let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
             &host,
             cwd.path(),
-            "subagent async_then_sync mock_stream_delay_ms 3000",
+            &format!(
+                "subagent async_then_sync mock_stream_release_marker {}",
+                release.0.display()
+            ),
         );
         let surface = thread.surface();
         let read_snapshot = || {
@@ -36141,6 +36168,16 @@ mod tests {
         let surface::SurfaceSubagentOwner::Generation { fence } = agent.owner.clone() else {
             panic!("the agent is not its parent turn's: {:?}", agent.owner);
         };
+        // Both were accepted to run on threads of their own.
+        for kept in [&agent, &sync_agent] {
+            assert!(
+                registry
+                    .get(kept.task_id.as_str())
+                    .expect("the agent's record")
+                    .control
+                    .gets_a_thread_of_its_own()
+            );
+        }
 
         let answer = ask_to_move_the_turn_to_the_background(&attachment, &fence)
             .recv_timeout(Duration::from_secs(2))
@@ -36177,6 +36214,7 @@ mod tests {
             TaskStatus::Running
         );
 
+        release.release();
         let (record, _, shown) = kept_agent_end(
             &registry,
             read_snapshot,
@@ -36270,13 +36308,196 @@ mod tests {
         host.shutdown().expect("shutdown host");
     }
 
-    /// On a host that keeps its subagents, a turn with none running is
-    /// moved to the background as before, a child of it that runs in a
-    /// worker process included: such a child is recorded without a launch
-    /// intent, and goes on in its own process whatever its parent's turn
-    /// does.
+    /// The generation's own check, where it would suspend, decides whatever
+    /// the turn's actor answered when it was asked: a hand-off that waits
+    /// is refused there, and dropped, once a kept subagent of the turn
+    /// runs, and is taken there when none does.
     #[test]
-    fn a_turn_without_running_kept_subagents_is_moved_to_the_background_as_before() {
+    fn the_generations_check_refuses_a_waiting_hand_off_while_a_kept_subagent_runs() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "a client to answer",
+            )
+            .expect("start thread");
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &thread.surface(),
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        );
+        let fence = recovery_matrix_fence();
+        let ask = || {
+            let (reply, answer) = std::sync::mpsc::sync_channel(1);
+            let transfer = PendingSurfaceBackgroundTransfer {
+                request_id: surface_request_id(),
+                fence: fence.clone(),
+                client: attachment.client.clone(),
+                reply,
+            };
+            (transfer, answer)
+        };
+        let registry = crate::tasks::TaskRegistry::new("the generation's check".into());
+        let turn = registry.create_main_session("the turn".into());
+        let control = RuntimeSurfaceBackgroundControl::default()
+            .refused_while_kept_subagents_run(registry.clone(), turn.id.clone());
+
+        // Asked while none runs: the request waits for the generation.
+        let (transfer, answer) = ask();
+        control.request(transfer);
+        assert!(matches!(
+            *control.transfer(),
+            SurfaceBackgroundTransfer::Waiting(_)
+        ));
+        assert!(answer.try_recv().is_err());
+        // A kept subagent of the turn starts on a thread of its own before
+        // the generation reaches its check.
+        let kept = registry.create_subagent_with_parent("kept".into(), None, Some(turn.id.clone()));
+        registry.mark_running(&kept.id).expect("the agent runs");
+        let kept_control = registry.get(&kept.id).expect("the agent's record").control;
+        kept_control.mark_runs_on_its_own_thread();
+        assert!(!control.take_suspension_request());
+        assert!(matches!(
+            *control.transfer(),
+            SurfaceBackgroundTransfer::None
+        ));
+        let refused = answer
+            .try_recv()
+            .expect("the waiting hand-off was not answered");
+        assert!(
+            refused_while_its_subagents_run(&refused, &fence),
+            "{}",
+            background_answer_shown(&refused)
+        );
+
+        // Once that agent has ended and said so, the next request is taken.
+        registry
+            .complete(&kept.id, "done".into())
+            .expect("the agent ends");
+        kept_control.mark_end_reported();
+        let (transfer, answer) = ask();
+        control.request(transfer);
+        assert!(matches!(
+            *control.transfer(),
+            SurfaceBackgroundTransfer::Waiting(_)
+        ));
+        assert!(control.take_suspension_request());
+        assert!(matches!(
+            *control.transfer(),
+            SurfaceBackgroundTransfer::HandingOff(_)
+        ));
+        assert!(answer.try_recv().is_err());
+        drop(control);
+        host.shutdown().expect("shutdown host");
+    }
+
+    /// The background key while the turn waits on a sync agent that runs in
+    /// this process without a thread of its own (here, one isolated in a
+    /// worktree): the host does not keep such an agent, so the key is not
+    /// refused. The request waits for the turn, as on a host that keeps
+    /// none, and the turn is moved to the background once the agent ends.
+    #[test]
+    fn a_turn_waiting_on_a_sync_subagent_without_a_thread_of_its_own_is_moved_after_it() {
+        let cwd = tempfile::tempdir().unwrap();
+        a_repository_with_a_commit(cwd.path());
+        let markers = tempfile::tempdir().unwrap();
+        let release = ReleaseMarker(markers.path().join("release the agent"));
+        let host = RuntimeHost::start().expect("start host");
+        host.handle().keep_subagents_in_process();
+        let _stops_agents = StopsKeptAgents(host.handle());
+        let child_prompt = format!("mock_stream_release_marker {}", release.0.display());
+        let (thread, attachment, operation_id, fence) = start_parent_turn_to_move(
+            &host,
+            cwd.path(),
+            &format!("subagent worktree sync {child_prompt}"),
+            ApprovalMode::FullAuto,
+        );
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let agent = loop {
+            let found = read_snapshot()
+                .subagents
+                .iter()
+                .find(|subagent| {
+                    subagent.description.as_str() == child_prompt
+                        && subagent.status == surface::SurfaceSubagentStatus::Running
+                })
+                .cloned();
+            if let Some(agent) = found {
+                break agent;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the agent never showed running: {:?}",
+                read_snapshot().subagents
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let record = registry
+            .get(agent.task_id.as_str())
+            .expect("the agent's record");
+        assert_eq!(record.worker_pid, None);
+        assert!(record.subagent_launch_intent.is_some());
+        assert!(!record.control.gets_a_thread_of_its_own());
+        assert!(!record.control.runs_on_its_own_thread());
+
+        let answer = ask_to_move_the_turn_to_the_background(&attachment, &fence);
+        if let Ok(answer) = answer.recv_timeout(Duration::from_millis(300)) {
+            panic!(
+                "the request was answered while the agent ran: {}",
+                background_answer_shown(&answer)
+            );
+        }
+        assert_eq!(
+            registry
+                .get(agent.task_id.as_str())
+                .expect("the agent's record")
+                .status,
+            TaskStatus::Running
+        );
+
+        release.release();
+        let answer = answer
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("the request was never answered");
+        assert!(
+            matches!(
+                answer,
+                Ok(surface::MutationReply::Committed {
+                    value: surface::TransferBackgroundOutput::HandedOff { .. },
+                    ..
+                })
+            ),
+            "{}",
+            background_answer_shown(&answer)
+        );
+        let record = registry
+            .get(agent.task_id.as_str())
+            .expect("the agent's record");
+        assert_eq!(record.status, TaskStatus::Completed, "{:?}", record.error);
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id);
+        host.shutdown().expect("shutdown host");
+    }
+
+    /// On a host that keeps its subagents, a turn whose only running child
+    /// runs in a worker process is moved to the background as before: that
+    /// child goes on in its own process whatever its parent's turn does.
+    /// No worker is started here: the child's record is made by hand in the
+    /// shape a launch in a worker process leaves, with no launch intent, not
+    /// accepted for a thread of its own, and with a worker pid.
+    #[test]
+    fn a_turn_whose_running_child_is_in_a_worker_process_is_moved_to_the_background() {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start host");
         host.handle().keep_subagents_in_process();
@@ -36306,6 +36527,12 @@ mod tests {
         registry
             .mark_running(&detached.id)
             .expect("the detached child runs");
+        registry
+            .mark_worker_spawned(&detached.id, 4242)
+            .expect("the detached child has a worker");
+        let record = registry.get(&detached.id).expect("the detached child");
+        assert!(record.subagent_launch_intent.is_none());
+        assert!(!record.control.gets_a_thread_of_its_own());
 
         let answer = ask_to_move_the_turn_to_the_background(&attachment, &fence)
             .recv_timeout(SURFACE_TEST_TIMEOUT)

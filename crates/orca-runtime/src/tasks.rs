@@ -1412,6 +1412,15 @@ pub struct TaskControl {
     /// its process, so after a restart there is no turn it could describe,
     /// and a record loaded then reads false, as a stop of it should.
     runs_on_its_own_thread: Arc<AtomicBool>,
+    /// Whether a subagent was accepted to run on a thread of its own in
+    /// this process: its turn sets `runs_on_its_own_thread` once that
+    /// thread starts, and until then, queued for capacity or not yet
+    /// started, its record says so already. Fixed when the record is
+    /// created, from what its worker will do. A subagent accepted to run in
+    /// this process without a thread of its own, one launched in a worker
+    /// process, and a record loaded from disk, whose launch belongs to an
+    /// earlier process, read false.
+    gets_a_thread_of_its_own: bool,
     /// Set once a subagent whose turn ran on a thread of its own is done
     /// saying how it ended, whether its parent took that end or not. Its
     /// record ends before it says so, so in between its parent's surface
@@ -1446,6 +1455,12 @@ impl TaskControl {
     /// control's `cancel` ends.
     pub(crate) fn runs_on_its_own_thread(&self) -> bool {
         self.runs_on_its_own_thread.load(Ordering::Acquire)
+    }
+
+    /// Whether the subagent was accepted to run on a thread of its own in
+    /// this process, started or not.
+    pub(crate) fn gets_a_thread_of_its_own(&self) -> bool {
+        self.gets_a_thread_of_its_own
     }
 
     /// Marks the task's turn, run on a thread of its own, as done saying
@@ -3393,6 +3408,7 @@ impl TaskRegistry {
             pause: Arc::new(AtomicBool::new(false)),
             stopped_by_person: Arc::new(AtomicBool::new(false)),
             runs_on_its_own_thread: Arc::new(AtomicBool::new(false)),
+            gets_a_thread_of_its_own: false,
             end_reported: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
         };
@@ -3495,15 +3511,26 @@ impl TaskRegistry {
         agent_type: Option<String>,
         parent_task_id: Option<String>,
     ) -> TaskHandle {
-        self.create_subagent_with_parent_and_intent(description, agent_type, parent_task_id, None)
+        self.create_subagent_with_parent_and_intent(
+            description,
+            agent_type,
+            parent_task_id,
+            None,
+            false,
+        )
     }
 
+    /// Records a subagent, with `launch_intent` when it is accepted to run
+    /// in this process, and `gets_a_thread_of_its_own` when its worker will
+    /// run it there on a thread of its own: the record says so from the
+    /// moment it can be seen.
     pub(crate) fn create_subagent_with_parent_and_intent(
         &self,
         description: String,
         agent_type: Option<String>,
         parent_task_id: Option<String>,
         launch_intent: Option<QueuedSubagentLaunchIntent>,
+        gets_a_thread_of_its_own: bool,
     ) -> TaskHandle {
         if let Some(intent) = &launch_intent {
             intent
@@ -3528,6 +3555,7 @@ impl TaskRegistry {
             pause: Arc::new(AtomicBool::new(false)),
             stopped_by_person: Arc::new(AtomicBool::new(false)),
             runs_on_its_own_thread: Arc::new(AtomicBool::new(false)),
+            gets_a_thread_of_its_own,
             end_reported: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
         };
@@ -3668,6 +3696,7 @@ impl TaskRegistry {
             pause: Arc::new(AtomicBool::new(false)),
             stopped_by_person: Arc::new(AtomicBool::new(false)),
             runs_on_its_own_thread: Arc::new(AtomicBool::new(false)),
+            gets_a_thread_of_its_own: false,
             end_reported: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
         };
@@ -3762,6 +3791,7 @@ impl TaskRegistry {
             pause: Arc::new(AtomicBool::new(false)),
             stopped_by_person: Arc::new(AtomicBool::new(false)),
             runs_on_its_own_thread: Arc::new(AtomicBool::new(false)),
+            gets_a_thread_of_its_own: false,
             end_reported: Arc::new(AtomicBool::new(false)),
             worker: Arc::new(Mutex::new(None)),
         };
@@ -5646,19 +5676,25 @@ impl TaskRegistry {
         }
     }
 
-    /// Whether a subagent below `root_id` that runs in this process, and not
-    /// in a worker process, has not ended: its record is still active, or
-    /// it ran on a thread of its own and has not finished saying how it
-    /// ended. A child launched in a worker process never counts: it is
-    /// recorded without a launch intent and gets a worker pid. A lock that
-    /// a panic poisoned answers that one has not ended.
+    /// Whether a subagent below `root_id` that runs on a thread of its own
+    /// in this process, or was accepted to and has not started it yet, has
+    /// not ended: its record is still active, or it ran on that thread and
+    /// has not finished saying how it ended.
+    ///
+    /// Only such a subagent counts. One accepted to run in this process
+    /// without a thread of its own (a sync child with a custom type, an
+    /// isolation, a finite budget or a resume) is recorded with a launch
+    /// intent too, but not as getting a thread, and runs within its
+    /// parent's call. One launched in a worker process is recorded with
+    /// neither and gets a worker pid. A lock that a panic poisoned answers
+    /// that one has not ended.
     pub(crate) fn has_unended_subagent_in_process_below(&self, root_id: &str) -> bool {
         self.with_tasks(|tasks| {
             tasks.values().any(|record| {
                 let own_thread = record.control.runs_on_its_own_thread();
                 record.task_type == TaskType::Subagent
                     && record.worker_pid.is_none()
-                    && (record.subagent_launch_intent.is_some() || own_thread)
+                    && (own_thread || record.control.gets_a_thread_of_its_own())
                     && (record.status.is_active() || (own_thread && !record.control.end_reported()))
                     && task_depth_below(tasks, &record.id, root_id).is_some()
             })
@@ -6869,6 +6905,7 @@ fn new_task_control() -> TaskControl {
         pause: Arc::new(AtomicBool::new(false)),
         stopped_by_person: Arc::new(AtomicBool::new(false)),
         runs_on_its_own_thread: Arc::new(AtomicBool::new(false)),
+        gets_a_thread_of_its_own: false,
         end_reported: Arc::new(AtomicBool::new(false)),
         worker: Arc::new(Mutex::new(None)),
     }
@@ -11643,9 +11680,9 @@ while :; do :; done
         }
     }
 
-    /// A turn's subagents that run in this process count until each has
-    /// ended and, when it ran on a thread of its own, said so. One launched
-    /// in a worker process never counts, nor does another turn's.
+    /// A turn's subagents that run on a thread of their own in this
+    /// process count, from when each is accepted for one, until each has
+    /// ended and said how. Another turn's never count.
     #[test]
     fn a_turns_unended_subagents_in_this_process_are_found_below_it() {
         let cwd = tempfile::tempdir().unwrap();
@@ -11654,29 +11691,28 @@ while :; do :; done
         let other_turn = registry.create_main_session("another turn".into());
         assert!(!registry.has_unended_subagent_in_process_below(&turn.id));
 
-        // Launched in a worker process: no launch intent, a worker pid.
-        let detached =
-            registry.create_subagent_with_parent("detached".into(), None, Some(turn.id.clone()));
-        registry.mark_running(&detached.id).unwrap();
-        registry.mark_worker_spawned(&detached.id, 4242).unwrap();
-        // Another turn's, run in this process.
+        // Another turn's.
         let elsewhere = registry.create_subagent_with_parent_and_intent(
             "elsewhere".into(),
             None,
             Some(other_turn.id.clone()),
             Some(queued_launch_intent(cwd.path())),
+            true,
         );
         assert!(!registry.has_unended_subagent_in_process_below(&turn.id));
         assert!(registry.has_unended_subagent_in_process_below(&other_turn.id));
         registry.fail(&elsewhere.id, "never ran".into()).unwrap();
 
-        // This turn's, admitted with its launch intent: it counts from then.
+        // This turn's, accepted for a thread of its own: it counts while it
+        // waits for its place, before that thread exists.
         let kept = registry.create_subagent_with_parent_and_intent(
             "kept".into(),
             None,
             Some(turn.id.clone()),
             Some(queued_launch_intent(cwd.path())),
+            true,
         );
+        assert_eq!(registry.get(&kept.id).unwrap().status, TaskStatus::Queued);
         assert!(registry.has_unended_subagent_in_process_below(&turn.id));
         registry.mark_running(&kept.id).unwrap();
         let control = registry.get(&kept.id).unwrap().control;
@@ -11696,28 +11732,64 @@ while :; do :; done
             None,
             Some(kept.id.clone()),
             Some(queued_launch_intent(cwd.path())),
+            true,
         );
         assert!(registry.has_unended_subagent_in_process_below(&turn.id));
         registry.fail(&nested.id, "never ran".into()).unwrap();
         assert!(!registry.has_unended_subagent_in_process_below(&turn.id));
     }
 
-    /// A subagent that ran in this process without a thread of its own has
-    /// nothing left to say once its record has ended.
+    /// What makes a turn's subagent count, one condition at a time: a
+    /// launch intent alone does not, a thread of its own alone does, and a
+    /// worker process alone takes away one that would.
     #[test]
-    fn a_subagent_without_a_thread_of_its_own_has_ended_with_its_record() {
+    fn only_a_subagent_on_a_thread_of_its_own_in_this_process_counts() {
         let cwd = tempfile::tempdir().unwrap();
-        let registry = TaskRegistry::new("threadless-subagent".into());
+        let registry = TaskRegistry::new("one-condition-at-a-time".into());
         let turn = registry.create_main_session("the turn".into());
+
+        // A launch intent alone: a child accepted to run in this process
+        // without a thread of its own runs within its parent's call, and
+        // does not count, queued, running or ended.
         let threadless = registry.create_subagent_with_parent_and_intent(
             "threadless".into(),
             None,
             Some(turn.id.clone()),
             Some(queued_launch_intent(cwd.path())),
+            false,
         );
+        assert!(!registry.has_unended_subagent_in_process_below(&turn.id));
         registry.mark_running(&threadless.id).unwrap();
-        assert!(registry.has_unended_subagent_in_process_below(&turn.id));
+        assert!(!registry.has_unended_subagent_in_process_below(&turn.id));
         registry.complete(&threadless.id, "done".into()).unwrap();
+        assert!(!registry.has_unended_subagent_in_process_below(&turn.id));
+
+        // A thread of its own alone: a child whose worker made its record,
+        // with no launch intent, counts once its turn runs on that thread,
+        // until it has said how it ended.
+        let unadmitted =
+            registry.create_subagent_with_parent("unadmitted".into(), None, Some(turn.id.clone()));
+        registry.mark_running(&unadmitted.id).unwrap();
+        assert!(!registry.has_unended_subagent_in_process_below(&turn.id));
+        let control = registry.get(&unadmitted.id).unwrap().control;
+        control.mark_runs_on_its_own_thread();
+        assert!(registry.has_unended_subagent_in_process_below(&turn.id));
+        registry.complete(&unadmitted.id, "done".into()).unwrap();
+        control.mark_end_reported();
+        assert!(!registry.has_unended_subagent_in_process_below(&turn.id));
+
+        // A worker pid alone: a running child that would count does not
+        // once it is recorded in a worker process.
+        let in_a_worker = registry.create_subagent_with_parent_and_intent(
+            "in a worker".into(),
+            None,
+            Some(turn.id.clone()),
+            Some(queued_launch_intent(cwd.path())),
+            true,
+        );
+        registry.mark_running(&in_a_worker.id).unwrap();
+        assert!(registry.has_unended_subagent_in_process_below(&turn.id));
+        registry.mark_worker_spawned(&in_a_worker.id, 4242).unwrap();
         assert!(!registry.has_unended_subagent_in_process_below(&turn.id));
     }
 
@@ -11736,6 +11808,7 @@ while :; do :; done
                 Some("stable-root".into()),
                 now_ms(),
                 Some(queued_launch_intent(cwd.path())),
+                false,
             )
             .unwrap();
         assert_eq!(
@@ -11773,6 +11846,7 @@ while :; do :; done
                 Some("stable-root".into()),
                 now_ms(),
                 Some(queued_launch_intent(cwd.path())),
+                false,
             )
             .unwrap();
         registry

@@ -480,6 +480,9 @@ impl RuntimeToolCallRuntime {
             batch_id: invocation.batch_id.clone(),
             batch_size: invocation.batch_size,
         };
+        // The queue runs it without the controller when it is a resume,
+        // which `gets_a_thread_of_its_own` already answers no for.
+        let gets_a_thread_of_its_own = gets_a_thread_of_its_own(&invocation);
         let submission = registry
             .execution_scope(&limits)
             .submit_subagent_with_intent(
@@ -488,6 +491,7 @@ impl RuntimeToolCallRuntime {
                 invocation.root_task_id.clone(),
                 now_unix_ms(),
                 Some(launch_intent),
+                gets_a_thread_of_its_own,
             );
         let result = match submission {
             Err(error) => ToolResult::failed_before_start(&tool_request, error.message(), None),
@@ -650,6 +654,7 @@ impl RuntimeSubagentBatch {
             parent,
             now_unix_ms(),
             Some(launch_intent),
+            gets_a_thread_of_its_own(&invocation),
         ) {
             Ok(submission) => submission,
             Err(refusal) => {
@@ -1659,8 +1664,8 @@ fn threaded_sync_surface_activity(
 /// a checkpoint (the hosted path refuses `resume_from`), and has no finite
 /// budget (a budgeted child is run without the controller).
 ///
-/// This rule must stay at least as strict as the test in
-/// `run_subagent_worker` that runs a child on a thread: every child it lets
+/// This rule must stay at least as strict as `runs_through_the_controller`,
+/// the test by which a worker runs a child on a thread: every child it lets
 /// through must be one that test also runs on a thread, or a child placed
 /// here for a thread of its own would run without one.
 pub(crate) fn child_qualifies_for_thread(
@@ -1675,12 +1680,11 @@ pub(crate) fn child_qualifies_for_thread(
         && request.resume_from.is_none()
 }
 
-fn run_subagent_worker(
-    invocation: RuntimeSubagentInvocation,
-    lifecycle: RuntimeSessionLifecycle,
-    started_task: RuntimeTaskLifecycle,
-    cancel: CancelToken,
-) -> RuntimeSubagentCallOutput {
+/// Whether a worker runs `invocation` through the agent controller, on a
+/// hosted thread, rather than within the call that started it: there is a
+/// controller to host it, and the child has no isolation, is not a custom
+/// agent and does not continue one.
+fn runs_through_the_controller(invocation: &RuntimeSubagentInvocation) -> bool {
     let resumes_custom = invocation
         .request
         .resume_from
@@ -1690,11 +1694,33 @@ fn run_subagent_worker(
                 .and_then(|coordinator| coordinator.prepared(selector))
                 .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
         });
-    if invocation.agent_controller.is_some()
+    invocation.agent_controller.is_some()
         && invocation.request.isolation == SubagentIsolation::None
         && !matches!(invocation.request.subagent_type, SubagentType::Custom(_))
         && !resumes_custom
-    {
+}
+
+/// Whether the worker that runs `invocation` gives the child's turn a
+/// thread of its own that its record's stop ends, which
+/// `run_threaded_agent_worker` marks once that thread starts: the child
+/// runs through the controller, reports to a surface, and is not a
+/// resume, which that path refuses before it starts (a worker runs every
+/// child in sync mode). It is asked when the child is accepted, of the
+/// invocation its worker will run, so the child's record says so before
+/// any thread exists, a child queued for capacity included.
+fn gets_a_thread_of_its_own(invocation: &RuntimeSubagentInvocation) -> bool {
+    invocation.request.resume_from.is_none()
+        && invocation.activity_ingress.is_some()
+        && runs_through_the_controller(invocation)
+}
+
+fn run_subagent_worker(
+    invocation: RuntimeSubagentInvocation,
+    lifecycle: RuntimeSessionLifecycle,
+    started_task: RuntimeTaskLifecycle,
+    cancel: CancelToken,
+) -> RuntimeSubagentCallOutput {
+    if runs_through_the_controller(&invocation) {
         return run_threaded_agent_worker(invocation, lifecycle, started_task, cancel);
     }
     let RuntimeSubagentInvocation {
