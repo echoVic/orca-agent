@@ -1,10 +1,13 @@
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use orca_core::tool_types::{FileChangePreview, ToolRequest, ToolResult};
 
+use crate::edit::{LineEndingCounts, crlf_majority};
 use crate::file_admission::{
     FileAdmissionError, MAX_DIFF_INPUT_BYTES, build_file_change_preview, read_text_file_with_limit,
+    stream_utf8_file,
 };
 
 pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
@@ -83,12 +86,33 @@ fn plan_write(request: &ToolRequest, cwd: &Path) -> Result<PlannedWrite, String>
     }
 
     let before = read_text_file_with_limit(&normalized, MAX_DIFF_INPUT_BYTES, || false);
+    let keep_crlf = content.contains('\n')
+        && !content.contains("\r\n")
+        && match &before {
+            Ok(text) => crlf_majority(text),
+            Err(FileAdmissionError::TooLarge { .. }) => stream_utf8_file(
+                &normalized,
+                LineEndingCounts::default(),
+                || false,
+                |counts, bytes| {
+                    counts.add(bytes);
+                    ControlFlow::Continue(())
+                },
+            )
+            .is_ok_and(|file| file.value.crlf_majority()),
+            Err(_) => false,
+        };
+    let content = if keep_crlf {
+        content.replace('\n', "\r\n")
+    } else {
+        content.to_string()
+    };
     let preview = match before {
         Ok(before) if content.len() <= MAX_DIFF_INPUT_BYTES => {
-            build_file_change_preview(path_str, Some(&before), Some(content))
+            build_file_change_preview(path_str, Some(&before), Some(&content))
         }
         Err(error) if error.is_not_found() && content.len() <= MAX_DIFF_INPUT_BYTES => {
-            build_file_change_preview(path_str, None, Some(content))
+            build_file_change_preview(path_str, None, Some(&content))
         }
         Ok(_) | Err(FileAdmissionError::TooLarge { .. }) => FileChangePreview::Omitted {
             path: path_str.to_string(),
@@ -103,7 +127,7 @@ fn plan_write(request: &ToolRequest, cwd: &Path) -> Result<PlannedWrite, String>
     Ok(PlannedWrite {
         path: normalized,
         display_path: path_str.to_string(),
-        content: content.to_string(),
+        content,
         preview,
     })
 }
@@ -148,6 +172,81 @@ mod tests {
                 serde_json::json!({ "path": path, "content": content }).to_string(),
             ),
         }
+    }
+
+    #[test]
+    fn writing_lf_text_over_a_crlf_file_keeps_crlf() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.txt");
+        let before = "one\r\ntwo\r\n";
+        fs::write(&path, before).unwrap();
+        let request = make_request("test.txt", "one\nthree\n");
+
+        let result = execute(&request, dir.path());
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(text, "one\r\nthree\r\n");
+        assert_eq!(
+            result.file_change_preview.as_deref(),
+            Some(&build_file_change_preview(
+                "test.txt",
+                Some(before),
+                Some(&text),
+            ))
+        );
+    }
+
+    #[test]
+    fn overwriting_a_crlf_file_too_large_to_preview_keeps_crlf() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.txt");
+        // Make one of the CRLF pairs straddle a read chunk boundary.
+        let mut before =
+            "a".repeat(orca_core::retained_output::RETAINED_OUTPUT_READ_CHUNK_BYTES - 1);
+        before.push_str("\r\n");
+        before.push_str(&"b".repeat(MAX_DIFF_INPUT_BYTES));
+        before.push('\n');
+        before.push_str("c\r\n");
+        fs::write(&path, before).unwrap();
+        let request = make_request("test.txt", "one\nthree\n");
+
+        let result = execute(&request, dir.path());
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one\r\nthree\r\n");
+        assert!(matches!(
+            result.file_change_preview.as_deref(),
+            Some(FileChangePreview::Omitted { .. })
+        ));
+    }
+
+    #[test]
+    fn content_with_crlf_is_written_as_given() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, "one\r\ntwo\r\n").unwrap();
+        let text = "one\r\nthree\n";
+
+        assert_eq!(
+            execute(&make_request("test.txt", text), dir.path()).status,
+            ToolStatus::Completed
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn a_new_file_is_written_as_given() {
+        let dir = TempDir::new().unwrap();
+        let text = "one\r\nthree\n";
+
+        assert_eq!(
+            execute(&make_request("test.txt", text), dir.path()).status,
+            ToolStatus::Completed
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("test.txt")).unwrap(),
+            text
+        );
     }
 
     #[test]
