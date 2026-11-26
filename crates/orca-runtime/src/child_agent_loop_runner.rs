@@ -248,8 +248,9 @@ where
             }
         }
 
+        let compaction_config = child_compaction_config(config, lease, context.child_cost_tracker);
         let prepared = prepare_child_agent_request_with_cost(
-            config,
+            &compaction_config,
             &mut setup,
             context.cwd,
             context.hooks,
@@ -341,8 +342,9 @@ where
             );
         }
 
+        let compaction_config = child_compaction_config(config, lease, context.child_cost_tracker);
         let provider_error_decision = handle_child_agent_provider_error_with_usage(
-            config,
+            &compaction_config,
             &mut setup,
             context.cwd,
             context.hooks,
@@ -547,8 +549,9 @@ where
         }
 
         let before = context.child_cost_tracker.totals();
+        let compaction_config = child_compaction_config(config, lease, context.child_cost_tracker);
         let prepared = prepare_child_agent_request_with_cost(
-            config,
+            &compaction_config,
             &mut setup,
             context.cwd,
             context.hooks,
@@ -647,8 +650,9 @@ where
             );
         }
 
+        let compaction_config = child_compaction_config(config, lease, context.child_cost_tracker);
         let provider_error_decision = handle_child_agent_provider_error_with_usage(
-            config,
+            &compaction_config,
             &mut setup,
             context.cwd,
             context.hooks,
@@ -861,6 +865,29 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
     Ok(decision)
 }
 
+/// The child may hold a smaller operation lease than its session limit. Use
+/// the remaining lease cost on the tracker's scale for each replay boundary.
+fn child_compaction_config(
+    config: &RunConfig,
+    lease: &crate::budget_controller::BudgetLease,
+    tracker: &CostTracker,
+) -> RunConfig {
+    let mut config = config.clone();
+    if let Some(limit) = lease.spec().max_cost_usd_micros {
+        let remaining = limit.saturating_sub(lease.usage().cost_usd_micros);
+        let total_limit = crate::cost::usd_to_micros(tracker.totals().estimated_cost_usd)
+            .saturating_add(remaining);
+        config.budget.max_cost_usd_micros = Some(
+            config
+                .budget
+                .max_cost_usd_micros
+                .unwrap_or(u64::MAX)
+                .min(total_limit),
+        );
+    }
+    config
+}
+
 fn record_child_provider_usage(
     usage: Option<orca_core::provider_types::Usage>,
     child_cost_tracker: &mut CostTracker,
@@ -900,6 +927,25 @@ mod tests {
     use crate::lifecycle::run_status_from_tool_status;
     use orca_core::event_schema::RunStatus;
     use orca_core::tool_types::ToolStatus;
+
+    #[test]
+    fn child_compaction_uses_the_remaining_lease_cost() {
+        use crate::budget_controller::BudgetController;
+        use crate::cost::CostTracker;
+        use orca_core::budget::BudgetSpec;
+        let config = orca_core::config::RunConfig::default();
+        let mut parent = BudgetController::new(BudgetSpec::default());
+        let mut lease = parent
+            .child_lease(BudgetSpec {
+                max_cost_usd_micros: Some(100),
+                ..Default::default()
+            })
+            .unwrap();
+        lease.record_cost_usd_micros(75).unwrap();
+        let tracker = CostTracker::new(None);
+        let compact = super::child_compaction_config(&config, &lease, &tracker);
+        assert_eq!(compact.budget.max_cost_usd_micros, Some(25));
+    }
 
     #[test]
     fn child_agent_tool_terminal_status_preserves_cancelled_and_unknown_outcomes() {

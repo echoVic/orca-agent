@@ -976,6 +976,35 @@ pub fn compact_with_summary_for_trigger(
     cancel: Option<&CancelToken>,
     emergency: bool,
 ) -> CompactionResult {
+    compact_with_summary_settled(
+        provider_kind,
+        conversation,
+        context_config,
+        provider_config,
+        cancel,
+        emergency,
+        &mut |_, _| true,
+    )
+}
+
+/// Settle the replay response before another paid summary can start. Returning
+/// false stops the remote chain while preserving the response's observation.
+pub fn compact_with_summary_settled(
+    provider_kind: ProviderKind,
+    conversation: &Conversation,
+    context_config: &ContextConfig,
+    provider_config: &ProviderConfig,
+    cancel: Option<&CancelToken>,
+    emergency: bool,
+    settle_usage: &mut dyn FnMut(&str, Option<Usage>) -> bool,
+) -> CompactionResult {
+    let mut adoption = ReplayAdoption {
+        measured: measure_prompt(conversation, provider_config),
+        emergency,
+        max_tokens: context_config.max_tokens,
+        stopped: !settle_usage(&crate::replay_prefix::model(provider_config), None),
+        settle_usage,
+    };
     let started = Instant::now();
     let mut observation = CompactionObservation::new();
     let (compacted, kind) = compact_with_summary_observed(
@@ -984,7 +1013,7 @@ pub fn compact_with_summary_for_trigger(
         context_config,
         provider_config,
         cancel,
-        emergency,
+        &mut adoption,
         &mut observation,
     );
     observation.measure_retained_history(conversation, &compacted, provider_config);
@@ -1002,10 +1031,13 @@ fn compact_with_summary_observed(
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
     cancel: Option<&CancelToken>,
-    emergency: bool,
+    adoption: &mut ReplayAdoption<'_>,
     observation: &mut CompactionObservation,
 ) -> (Conversation, CompactionKind) {
     let normalized = normalized_for_compaction(conversation);
+    if adoption.stopped {
+        return (normalized, CompactionKind::LocalTruncation);
+    }
     // Measure the history the usage anchor was recorded on: a repair that
     // moves messages before its boundary would drop the anchor from the
     // normalized copy. The estimate is the same either way, since the
@@ -1041,10 +1073,7 @@ fn compact_with_summary_observed(
         &normalized,
         context_config,
         provider_config,
-        ReplayAdoption {
-            measured,
-            emergency,
-        },
+        adoption,
         cancel,
         observation,
     ) {
@@ -1111,9 +1140,9 @@ fn replay_summary(
     provider_kind: ProviderKind,
     conversation: &Conversation,
     partition: &CompactionPartition,
-    context_config: &ContextConfig,
     provider_config: &ProviderConfig,
     cancel: Option<&CancelToken>,
+    adoption: &mut ReplayAdoption<'_>,
     observation: &mut CompactionObservation,
 ) -> Option<String> {
     if provider_kind != ProviderKind::DeepSeek
@@ -1123,9 +1152,10 @@ fn replay_summary(
         return None;
     }
     let counter = DefaultTokenCounter;
-    let input_budget = context_config
+    let input_budget = adoption
         .max_tokens
-        .checked_sub(REPLAY_REQUEST_OUTPUT_TOKENS as usize)?;
+        .checked_sub(REPLAY_REQUEST_OUTPUT_TOKENS as usize)?
+        .checked_sub(REQUEST_MARGIN_TOKENS)?;
     let model = crate::replay_prefix::model(provider_config);
     let crate::replay_prefix::ReplayPrefix {
         mut messages,
@@ -1133,9 +1163,11 @@ fn replay_summary(
         tools,
     } = crate::replay_prefix::load(conversation, partition.cut, provider_config, &model)?;
     let instruction = ApiMessage::user(REPLAY_SUMMARY_INSTRUCTION.to_string());
-    let prompt_tokens = estimated_tokens
-        + instruction.estimated_tokens(&counter)
-        + serialized_tools_tokens(&tools, &counter);
+    let prompt_tokens = adoption.measured.calibrate_compacted_estimate(
+        estimated_tokens
+            + instruction.estimated_tokens(&counter)
+            + serialized_tools_tokens(&tools, &counter),
+    );
     messages.push(serde_json::value::to_raw_value(&instruction).ok()?);
     if prompt_tokens > input_budget || cancel.is_some_and(CancelToken::is_cancelled) {
         return None;
@@ -1148,6 +1180,7 @@ fn replay_summary(
         REPLAY_REQUEST_OUTPUT_TOKENS,
         cancel,
     );
+    adoption.stopped = !(adoption.settle_usage)(&model, response.usage);
     let request_index = observation.summary_requests.len();
     let summary = observed_summary_response(
         provider_kind,
@@ -1156,8 +1189,12 @@ fn replay_summary(
         &response,
         cancel,
         observation,
-    )?;
-    let checkpoint = bounded_summary(&summary, REPLAY_VISIBLE_TOKENS);
+    );
+    if adoption.stopped {
+        observation.summary_requests[request_index].outcome = "budget_stopped";
+        return None;
+    }
+    let checkpoint = bounded_summary(&summary?, REPLAY_VISIBLE_TOKENS);
     let collapsed_tokens = partition
         .collapsed
         .iter()
@@ -1176,10 +1213,12 @@ fn summary_budget(config: &ContextConfig) -> usize {
     (config.target_compaction_limit() / 4).clamp(32, 2_048)
 }
 
-#[derive(Clone, Copy)]
-struct ReplayAdoption {
+struct ReplayAdoption<'a> {
     measured: PromptMeasurement,
     emergency: bool,
+    max_tokens: usize,
+    settle_usage: &'a mut dyn FnMut(&str, Option<Usage>) -> bool,
+    stopped: bool,
 }
 
 /// Summaries read original evidence, not the discarded trial micro pass.
@@ -1188,7 +1227,7 @@ fn summarize_collapsed_messages(
     conversation: &Conversation,
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
-    adoption: ReplayAdoption,
+    adoption: &mut ReplayAdoption<'_>,
     cancel: Option<&CancelToken>,
     observation: &mut CompactionObservation,
 ) -> Option<(Conversation, String)> {
@@ -1207,12 +1246,12 @@ fn summarize_collapsed_messages(
         provider_kind,
         conversation,
         &partition,
-        context_config,
         provider_config,
         cancel,
+        adoption,
         observation,
     );
-    if cancel.is_some_and(CancelToken::is_cancelled) {
+    if adoption.stopped || cancel.is_some_and(CancelToken::is_cancelled) {
         return None;
     }
     let CompactionPartition {
@@ -4256,9 +4295,12 @@ mod tests {
             &conv,
             &config,
             &provider_config,
-            ReplayAdoption {
+            &mut ReplayAdoption {
                 measured: measure_prompt(&conv, &provider_config),
                 emergency: false,
+                max_tokens: config.max_tokens,
+                settle_usage: &mut |_, _| true,
+                stopped: false,
             },
             None,
             &mut CompactionObservation::new(),

@@ -340,7 +340,9 @@ pub(crate) fn prepare_child_agent_request_with_cost(
         None,
     );
     if let Some(tracker) = cost_tracker {
-        compaction = compaction.with_cost_tracker(tracker);
+        compaction = compaction
+            .with_cost_tracker(tracker)
+            .with_max_cost(config.budget.max_cost_usd_micros);
     }
     Ok(compaction
         .prepare_request(&mut setup.conversation)?
@@ -395,7 +397,9 @@ pub(crate) fn handle_child_agent_provider_error_with_cost(
                 None,
             );
             if let Some(tracker) = cost_tracker {
-                compaction = compaction.with_cost_tracker(tracker);
+                compaction = compaction
+                    .with_cost_tracker(tracker)
+                    .with_max_cost(config.budget.max_cost_usd_micros);
             }
             if compaction.compact_after_provider_error_retry(&mut setup.conversation, trigger)? {
                 setup.compaction_retry.record_prompt_too_long_retry();

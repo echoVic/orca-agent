@@ -1091,8 +1091,6 @@ impl RuntimeTurnProviderCycleStep {
             }
         };
 
-        let cost_before_compaction =
-            crate::cost::usd_to_micros(input.cost_tracker.totals().estimated_cost_usd);
         let provider_error_outcome = {
             let (conversation, history_writer) = input.conversation.parts_mut();
             self.provider_error_step.handle(
@@ -1109,14 +1107,12 @@ impl RuntimeTurnProviderCycleStep {
                 )
                 .with_cancel(capabilities.cancel)
                 .with_deadline(input.operation.remaining_deadline()?)
-                .with_cost_tracker(input.cost_tracker),
+                .with_cost_tracker(input.cost_tracker)
+                .with_operation(input.operation),
                 conversation,
             )?
         };
-        if let Err(stop) = input
-            .operation
-            .record_compaction_cost(cost_before_compaction, input.cost_tracker)?
-        {
+        if let Err(stop) = input.operation.sync_wall_time()? {
             let (_, history_writer) = input.conversation.parts_mut();
             let terminal = input.operation.commit_budget_stop_with_boundary(
                 turn_context.turn_id.as_str(),

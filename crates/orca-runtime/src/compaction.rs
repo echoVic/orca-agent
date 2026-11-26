@@ -8,7 +8,7 @@ use orca_core::config::OutputFormat;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::hook_types::HookEvent;
-use orca_core::provider_types::{ProviderResponse, ProviderStep};
+use orca_core::provider_types::{ProviderResponse, ProviderStep, Usage};
 use orca_core::subagent_types::SubagentType;
 use orca_provider::{ProviderConfig, context};
 
@@ -237,22 +237,6 @@ pub(crate) fn compaction_observation_payload(
             .map(|usage| usage.cache_tokens as f64 / usage.input_tokens as f64)
     );
     payload
-}
-
-pub(crate) fn record_checkpoint_usage(
-    tracker: &mut CostTracker,
-    observation: &context::CompactionObservation,
-) -> bool {
-    let mut recorded = false;
-    for request in &observation.summary_requests {
-        if request.purpose == context::REPLAY_SUMMARY_PURPOSE
-            && let Some(usage) = request.usage.filter(|usage| !usage.is_empty())
-        {
-            tracker.add_model_usage(&request.model, usage);
-            recorded = true;
-        }
-    }
-    recorded
 }
 
 impl RuntimeCompactionOutcome {
@@ -632,6 +616,8 @@ pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
     sink: &'a mut EventSink<W>,
     history_writer: Option<&'a mut SessionWriter>,
     cost_tracker: Option<&'a mut CostTracker>,
+    operation: Option<&'a mut crate::operation_context::OperationContext>,
+    max_cost_usd_micros: Option<u64>,
     cancel: Option<&'a CancelToken>,
     deadline: Option<Instant>,
     deadline_cancel: Option<CompactionDeadlineCancellation>,
@@ -658,6 +644,8 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             sink,
             history_writer,
             cost_tracker: None,
+            operation: None,
+            max_cost_usd_micros: None,
             cancel: None,
             deadline: None,
             deadline_cancel: None,
@@ -678,6 +666,19 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
 
     pub(crate) fn with_cost_tracker(mut self, tracker: &'a mut CostTracker) -> Self {
         self.cost_tracker = Some(tracker);
+        self
+    }
+
+    pub(crate) fn with_operation(
+        mut self,
+        operation: &'a mut crate::operation_context::OperationContext,
+    ) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
+    pub(crate) fn with_max_cost(mut self, limit: Option<u64>) -> Self {
+        self.max_cost_usd_micros = limit;
         self
     }
 
@@ -885,17 +886,63 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         } else {
             self.context_config
         };
-        let mut compaction = context::compact_with_summary_for_trigger(
+        let cancel = self.cancel_token().cloned();
+        let mut recorded = false;
+        let mut settlement_error = None;
+        let mut budget_stopped = false;
+        let mut settle = |model: &str, usage: Option<Usage>| {
+            let before = self
+                .cost_tracker
+                .as_deref()
+                .map(|tracker| crate::cost::usd_to_micros(tracker.totals().estimated_cost_usd))
+                .unwrap_or(0);
+            if let Some(tracker) = self.cost_tracker.as_deref_mut()
+                && let Some(usage) = usage.filter(|usage| !usage.is_empty())
+            {
+                tracker.add_model_usage(model, usage);
+                recorded = true;
+            }
+            let settled = (|| -> io::Result<bool> {
+                if let Some(operation) = self.operation.as_deref_mut() {
+                    if let Some(tracker) = self.cost_tracker.as_deref()
+                        && operation.record_compaction_cost(before, tracker)?.is_err()
+                    {
+                        return Ok(false);
+                    }
+                    if operation.sync_wall_time()?.is_err() {
+                        return Ok(false);
+                    }
+                }
+                let spent = self
+                    .cost_tracker
+                    .as_deref()
+                    .map(|tracker| crate::cost::usd_to_micros(tracker.totals().estimated_cost_usd))
+                    .unwrap_or(0);
+                Ok(self.max_cost_usd_micros.is_none_or(|limit| spent <= limit))
+            })();
+            match settled {
+                Ok(proceed) => {
+                    budget_stopped = !proceed;
+                    proceed
+                }
+                Err(error) => {
+                    settlement_error = Some(error);
+                    false
+                }
+            }
+        };
+        let mut compaction = context::compact_with_summary_settled(
             self.provider,
             conversation,
             context_config,
             self.provider_config,
-            self.cancel_token(),
+            cancel.as_ref(),
             trigger.is_emergency(),
+            &mut settle,
         );
-        if let Some(tracker) = self.cost_tracker.as_deref_mut()
-            && record_checkpoint_usage(tracker, &compaction.observation)
+        if recorded
             && self.turn_context.emit_deltas
+            && let Some(tracker) = self.cost_tracker.as_deref()
         {
             let totals = tracker.totals();
             self.sink.emit(self.events.usage_updated(totals))?;
@@ -903,11 +950,14 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
                 writer.append_usage(totals)?;
             }
         }
+        if let Some(error) = settlement_error {
+            return Err(error);
+        }
         let after = context::measure_prompt(&compaction.conversation, self.provider_config);
-        if !self.worth_adopting(trigger, before, after) {
+        if budget_stopped || !self.worth_adopting(trigger, before, after) {
             // Nothing worth keeping: keep the history as it was, persist
             // nothing, and hold pressure compaction until the prompt grows.
-            if !trigger.is_emergency() {
+            if !budget_stopped && !trigger.is_emergency() {
                 conversation.compaction_hold = Some(before.tokens);
             }
             compaction.observation.measure_retained_history(

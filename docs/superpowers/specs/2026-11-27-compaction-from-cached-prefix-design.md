@@ -24,7 +24,7 @@ dsh summarizes in a different way:
    - Deep compaction first tries a replay summary: the prefix of the last successful ordinary request through the compaction cut, with the same routed model, reasoning mode and effective tools and one user message appended. The message's text is fixed in the code (below).
    - Only if the replay cannot run, or its result is rejected, does it fall back to today's hierarchical summary, and then to truncation.
 2. **When replay is skipped.**
-   - The request plus the output allowance would exceed the model's context window. This happens when compaction runs because the window was exceeded.
+   - The calibrated provider token count, output allowance and ordinary request margin would exceed the model's context window. This happens when compaction runs because the window was exceeded.
    - The provider errors or the turn is cancelled.
    - There is no matching in-memory request, as on a resumed session before its first successful ordinary request, or the cut extends past the history that request covered.
    - The reply contains tool calls; they are dropped and the attempt counts as failed.
@@ -49,7 +49,7 @@ dsh summarizes in a different way:
    When the conversation already holds a summary, the checkpoint keeps the facts in it that are still true, drops stale ones, and merges them. The next request frames the baseline and its updates as quoted content.
 4. **Output budget.** 16,384 tokens for the visible checkpoint, with the request's `max_tokens` large enough for reasoning as well. A summary over 16,384 tokens is cut the way summaries are cut today.
 5. **Retention.** Compaction preserves the recent tail and pinned messages. Replay must leave reply room, and pressure compaction must reach the soft line or save at least 10% of the prompt. Backoff begins after the fallback chain finds no candidate worth keeping.
-6. **Cost accounting.** The replay request's usage is counted like any compaction request today, in the session's cost, the `--max-cost-usd` budget and the cost meters.
+6. **Cost accounting.** Returned replay usage settles at the request boundary, including rejected replies. A cost or operation-budget stop ends the remote chain before Flash fallback. Automatic requests settle directly into the operation controller. Manual and child requests check their session limit, and a child's remaining lease cost bounds replay as well. Session totals and the compaction observation each retain their own view of the same receipt.
 
 ## Non-goals
 

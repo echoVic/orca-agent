@@ -99,8 +99,6 @@ impl RuntimeTurnOpeningStep {
         // Compute once before compaction/hooks; every summary shares this
         // fixed operation deadline instead of renewing a per-request timeout.
         let deadline = input.operation.remaining_deadline()?;
-        let spent_before =
-            crate::cost::usd_to_micros(input.cost_tracker.totals().estimated_cost_usd);
         let compaction_model = input.model.route(ModelRouteContext {
             subagent_type: turn_context.subagent_type,
             subagent_model: input.model_override,
@@ -121,10 +119,9 @@ impl RuntimeTurnOpeningStep {
         .with_cancel(input.cancel)
         .with_deadline(deadline)
         .with_cost_tracker(input.cost_tracker)
+        .with_operation(input.operation)
         .prepare_request(input.conversation)?;
-        let budget = input
-            .operation
-            .record_compaction_cost(spent_before, input.cost_tracker)?;
+        let budget = input.operation.sync_wall_time()?;
         // Local fallback can make the prompt fit after cancellation/expiry.
         // Stop before turn hooks, image routing or the main model request.
         if input.cancel.is_cancelled() {
@@ -253,20 +250,30 @@ mod tests {
         RuntimeTurnOpeningResult,
         Duration,
         orca_core::cost_types::UsageTotals,
+        usize,
     ) {
         let cancel = CancelToken::new();
         let server_cancel = cancel.clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = request_count.clone();
         let server = std::thread::spawn(move || {
-            for warming in [true, false] {
+            for index in 0..8 {
+                let warming = index == 0;
                 let started = Instant::now();
                 let mut stream = loop {
                     match listener.accept() {
                         Ok((stream, _)) => break stream,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            if started.elapsed() > Duration::from_secs(3) {
+                            if started.elapsed()
+                                > if index < 2 {
+                                    Duration::from_secs(3)
+                                } else {
+                                    Duration::from_millis(250)
+                                }
+                            {
                                 return;
                             }
                             std::thread::sleep(Duration::from_millis(5));
@@ -274,6 +281,7 @@ mod tests {
                         Err(error) => panic!("accept summary: {error}"),
                     }
                 };
+                captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
@@ -367,12 +375,19 @@ mod tests {
             .unwrap();
         let elapsed = started.elapsed();
         server.join().unwrap();
-        (result, elapsed, cost.totals())
+        (
+            result,
+            elapsed,
+            cost.totals(),
+            request_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_sub(1),
+        )
     }
 
     #[test]
     fn automatic_opening_summary_obeys_remaining_operation_wall_time() {
-        let (result, elapsed, _) = opening_summary_case(Some(500), false, None);
+        let (result, elapsed, _, _) = opening_summary_case(Some(500), false, None);
         assert!(
             elapsed < Duration::from_millis(900),
             "automatic summary exceeded remaining operation wall time: {elapsed:?}"
@@ -394,7 +409,7 @@ mod tests {
 
     #[test]
     fn automatic_opening_summary_cancellation_stops_before_main_model() {
-        let (result, elapsed, _) = opening_summary_case(None, true, None);
+        let (result, elapsed, _, _) = opening_summary_case(None, true, None);
         assert!(
             elapsed < Duration::from_millis(900),
             "automatic summary ignored cancellation: {elapsed:?}"
@@ -412,8 +427,29 @@ mod tests {
     }
 
     #[test]
+    fn a_billed_rejected_replay_that_exhausts_the_budget_starts_no_fallback() {
+        let (result, _, totals, requests) = opening_summary_case(None, false, Some(1));
+        assert!(matches!(
+            result,
+            RuntimeTurnOpeningResult::Return(AgentLoopResult {
+                terminal: orca_core::budget::OperationTerminal::Stopped {
+                    reason: orca_core::budget::StopReason::CostBudget { .. },
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(totals.input_tokens, 4_000);
+        assert_eq!(totals.output_tokens, 90);
+        assert_eq!(
+            requests, 1,
+            "a billed rejected checkpoint exhausted the operation budget"
+        );
+    }
+
+    #[test]
     fn compaction_checkpoint_usage_can_exhaust_the_operation_budget() {
-        let (result, _, totals) = opening_summary_case(None, false, Some(1));
+        let (result, _, totals, _) = opening_summary_case(None, false, Some(1));
         assert_eq!(totals.input_tokens, 4_000);
         assert_eq!(totals.cache_tokens, 1_000);
         assert!(matches!(

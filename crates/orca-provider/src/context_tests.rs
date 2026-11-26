@@ -1457,6 +1457,92 @@ mod replay_compaction {
     }
 
     #[test]
+    fn a_replay_cost_receipt_stops_the_remote_chain_before_fallback() {
+        let server = server(json!({"content": "incomplete checkpoint"}), "stop");
+        let mut provider = server.config();
+        provider.model = Some(orca_core::model::PRO_MODEL.to_string());
+        let conversation = conversation();
+        warm(&server, &conversation, &provider);
+        let mut receipt = None;
+        let result = compact_with_summary_settled(
+            ProviderKind::DeepSeek,
+            &conversation,
+            &wide_config(),
+            &provider,
+            None,
+            false,
+            &mut |model, usage| {
+                if let Some(usage) = usage {
+                    receipt = Some((model.to_string(), usage));
+                    return false;
+                }
+                true
+            },
+        );
+        assert_eq!(
+            receipt,
+            Some((
+                orca_core::model::PRO_MODEL.to_string(),
+                Usage {
+                    input_tokens: 2500,
+                    output_tokens: 90,
+                    cache_tokens: 2048,
+                }
+            ))
+        );
+        assert!(matches!(result.kind, CompactionKind::LocalTruncation));
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(result.observation.summary_requests.len(), 1);
+        assert_eq!(
+            result.observation.summary_requests[0].outcome,
+            "budget_stopped"
+        );
+    }
+
+    #[test]
+    fn replay_admission_uses_provider_calibration_and_the_request_margin() {
+        for (words, calibrated) in [(55_000, true), (60_000, false)] {
+            let server = server(json!({"content": CHECKPOINT}), "stop");
+            let mut conversation = Conversation::new();
+            conversation.add_system("instructions".to_string());
+            conversation.add_user("evidence ".repeat(words));
+            conversation.add_user("current request".to_string());
+            let mut provider = server.config();
+            provider.model = Some(orca_core::model::PRO_MODEL.to_string());
+            warm(&server, &conversation, &provider);
+            if calibrated {
+                let estimated = wire_equivalent_tokens(&conversation, &provider);
+                conversation.record_usage_anchor(
+                    (estimated * 3 / 2) as u64,
+                    estimated,
+                    conversation.messages.len(),
+                );
+            }
+            let config = config(30_000, 100_000);
+            let result =
+                compact_with_summary(ProviderKind::DeepSeek, &conversation, &config, &provider);
+            assert!(
+                matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == FALLBACK)
+            );
+            assert!(
+                result
+                    .observation
+                    .summary_requests
+                    .iter()
+                    .all(|request| request.purpose != REPLAY_SUMMARY_PURPOSE)
+            );
+            assert!(
+                server
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.model == orca_core::model::FLASH_MODEL)
+            );
+        }
+    }
+
+    #[test]
     fn replay_is_skipped_when_it_would_not_fit() {
         let server = server(json!({"content": CHECKPOINT}), "stop");
         let result = compact(&server, &conversation(), 33_000);

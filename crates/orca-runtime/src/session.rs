@@ -930,7 +930,8 @@ impl InteractiveSession {
             has_images: false,
         });
         provider_config.model = Some(model.actual_model);
-        let compaction = orca_provider::context::compact_with_summary_cancellable(
+        let mut recorded = false;
+        let compaction = orca_provider::context::compact_with_summary_settled(
             config.provider,
             &candidate,
             &orca_provider::context::ContextConfig::for_model_with_runtime(
@@ -939,17 +940,24 @@ impl InteractiveSession {
                 config.reasoning_effort,
             ),
             &provider_config,
-            cancel,
+            Some(cancel),
+            false,
+            &mut |model, usage| {
+                if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
+                    self.cost_tracker.add_model_usage(model, usage);
+                    recorded = true;
+                }
+                config.budget.max_cost_usd_micros.is_none_or(|limit| {
+                    crate::cost::usd_to_micros(self.cost_tracker.totals().estimated_cost_usd)
+                        <= limit
+                })
+            },
         );
         let strategy = match &compaction.kind {
             orca_provider::context::CompactionKind::LocalTruncation => "local_truncation",
             orca_provider::context::CompactionKind::RemoteSummary(_) => "remote_summary",
         };
-        let usage = crate::compaction::record_checkpoint_usage(
-            &mut self.cost_tracker,
-            &compaction.observation,
-        )
-        .then(|| self.cost_tracker.totals());
+        let usage = recorded.then(|| self.cost_tracker.totals());
         if let (Some(writer), Some(totals)) = (&mut self.writer, usage) {
             writer.append_usage(totals)?;
         }
