@@ -281,6 +281,23 @@ impl OperationContext {
         Ok(result)
     }
 
+    pub(crate) fn record_compaction_cost(
+        &mut self,
+        before_usd_micros: u64,
+        tracker: &crate::cost::CostTracker,
+    ) -> io::Result<Result<(), BudgetStop>> {
+        let after = crate::cost::usd_to_micros(tracker.totals().estimated_cost_usd);
+        let delta = after.saturating_sub(before_usd_micros);
+        if delta == 0 {
+            return Ok(Ok(()));
+        }
+        let accounting_id = format!(
+            "compaction:{}",
+            orca_core::thread_identity::ConversationItemId::new()
+        );
+        self.record_cost_usd_micros(delta, &accounting_id)
+    }
+
     /// Publishes elapsed wall time so a long provider call stops promptly at
     /// the next accounting boundary instead of only at the next turn admit.
     pub(crate) fn sync_wall_time(&mut self) -> io::Result<Result<(), BudgetStop>> {

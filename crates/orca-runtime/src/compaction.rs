@@ -12,6 +12,7 @@ use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
 use orca_provider::{ProviderConfig, context};
 
+use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::lifecycle::RuntimeTurnContext;
 use crate::session::InteractiveSession;
@@ -186,7 +187,7 @@ pub(crate) struct RuntimeCompactionOutcome {
 
 // Pricing stays in runtime, beside the existing price book; provider keeps the
 // actual response usage even when the summary is not adopted.
-fn compaction_observation_payload(
+pub(crate) fn compaction_observation_payload(
     observation: &context::CompactionObservation,
 ) -> serde_json::Value {
     use orca_core::provider_types::Usage;
@@ -236,6 +237,22 @@ fn compaction_observation_payload(
             .map(|usage| usage.cache_tokens as f64 / usage.input_tokens as f64)
     );
     payload
+}
+
+pub(crate) fn record_checkpoint_usage(
+    tracker: &mut CostTracker,
+    observation: &context::CompactionObservation,
+) -> bool {
+    let mut recorded = false;
+    for request in &observation.summary_requests {
+        if request.purpose == context::REPLAY_SUMMARY_PURPOSE
+            && let Some(usage) = request.usage.filter(|usage| !usage.is_empty())
+        {
+            tracker.add_model_usage(&request.model, usage);
+            recorded = true;
+        }
+    }
+    recorded
 }
 
 impl RuntimeCompactionOutcome {
@@ -453,7 +470,8 @@ pub fn run_tui_agent_turn_compaction<W: io::Write>(
         &mut sink,
         runtime_parts.writer,
     )
-    .with_cancel(input.cancel);
+    .with_cancel(input.cancel)
+    .with_cost_tracker(runtime_parts.cost_tracker);
     let compacted = compaction.compact_if_needed(runtime_parts.conversation)?;
     let pressure = context::context_pressure(
         runtime_parts.conversation,
@@ -503,7 +521,8 @@ pub fn handle_tui_agent_provider_error<W: io::Write>(
                 &mut sink,
                 runtime_parts.writer,
             )
-            .with_cancel(input.cancel);
+            .with_cancel(input.cancel)
+            .with_cost_tracker(runtime_parts.cost_tracker);
             let shrunk = compaction
                 .compact_after_provider_error_retry(runtime_parts.conversation, trigger)?;
             if shrunk {
@@ -628,6 +647,7 @@ pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
     events: &'a mut EventFactory,
     sink: &'a mut EventSink<W>,
     history_writer: Option<&'a mut SessionWriter>,
+    cost_tracker: Option<&'a mut CostTracker>,
     cancel: Option<&'a CancelToken>,
     deadline: Option<Instant>,
     deadline_cancel: Option<CompactionDeadlineCancellation>,
@@ -653,6 +673,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             events,
             sink,
             history_writer,
+            cost_tracker: None,
             cancel: None,
             deadline: None,
             deadline_cancel: None,
@@ -668,6 +689,11 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     pub(crate) fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
         self.deadline = deadline;
         self.deadline_cancel = None;
+        self
+    }
+
+    pub(crate) fn with_cost_tracker(mut self, tracker: &'a mut CostTracker) -> Self {
+        self.cost_tracker = Some(tracker);
         self
     }
 
@@ -891,6 +917,16 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
                 self.provider_config,
             )
         };
+        if let Some(tracker) = self.cost_tracker.as_deref_mut()
+            && record_checkpoint_usage(tracker, &compaction.observation)
+            && self.turn_context.emit_deltas
+        {
+            let totals = tracker.totals();
+            self.sink.emit(self.events.usage_updated(totals))?;
+            if let Some(writer) = self.history_writer.as_deref_mut() {
+                writer.append_usage(totals)?;
+            }
+        }
         let after = context::measure_prompt(&compaction.conversation, self.provider_config);
         if !self.worth_adopting(trigger, before, after) {
             // Nothing worth keeping: keep the history as it was, persist

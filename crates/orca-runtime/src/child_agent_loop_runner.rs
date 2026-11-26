@@ -15,9 +15,9 @@ use crate::child_agent_loop_setup::{
     try_prepare_child_agent_loop,
 };
 use crate::child_agent_provider_turn::{
-    ChildAgentProviderErrorDecision, ChildAgentProviderTurn, handle_child_agent_provider_error,
-    prepare_child_agent_request, route_child_agent_model, run_child_agent_provider_turn,
-    run_child_agent_provider_turn_observed,
+    ChildAgentProviderErrorDecision, ChildAgentProviderTurn,
+    handle_child_agent_provider_error_with_cost, prepare_child_agent_request_with_cost,
+    route_child_agent_model, run_child_agent_provider_turn, run_child_agent_provider_turn_observed,
 };
 use crate::child_agent_response_folding::{
     ChildAgentProviderResponseFold, ChildAgentToolContext, ChildAgentToolExecution,
@@ -248,9 +248,26 @@ where
             }
         }
 
-        if let Err(message) =
-            prepare_child_agent_request(config, &mut setup, context.cwd, context.hooks)?
-        {
+        let prepared = prepare_child_agent_request_with_cost(
+            config,
+            &mut setup,
+            context.cwd,
+            context.hooks,
+            Some(context.child_cost_tracker),
+        )?;
+        if let Err(stop) = sync_child_cost_to_lease(
+            lease,
+            context.child_cost_tracker,
+            &mut recorded_cost_usd_micros,
+        ) {
+            return finish_lightweight_child_result(
+                &setup,
+                lease,
+                checkpoint_observer,
+                child_lease_stop_result(stop),
+            );
+        }
+        if let Err(message) = prepared {
             let result = ChildAgentResult {
                 status: RunStatus::Failed,
                 final_message: None,
@@ -529,9 +546,33 @@ where
             }
         }
 
-        if let Err(message) =
-            prepare_child_agent_request(config, &mut setup, context.cwd, context.hooks)?
+        let before = context.child_cost_tracker.totals();
+        let prepared = prepare_child_agent_request_with_cost(
+            config,
+            &mut setup,
+            context.cwd,
+            context.hooks,
+            Some(context.child_cost_tracker),
+        )?;
+        let totals = context.child_cost_tracker.totals();
+        if totals != before
+            && let Some(observer) = observer
         {
+            observer.publish_activity(ChildAgentActivity::Usage(totals))?;
+        }
+        if let Err(stop) = sync_child_cost_to_lease(
+            lease,
+            context.child_cost_tracker,
+            &mut recorded_cost_usd_micros,
+        ) {
+            return finish_lightweight_child_result(
+                &setup,
+                lease,
+                checkpoint_observer,
+                child_lease_stop_result(stop),
+            );
+        }
+        if let Err(message) = prepared {
             let result = ChildAgentResult {
                 status: RunStatus::Failed,
                 final_message: None,
@@ -802,7 +843,22 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
         record_child_provider_usage(response.usage, child_cost_tracker, observer)?;
     }
 
-    handle_child_agent_provider_error(config, setup, cwd, hooks, response)
+    let before = child_cost_tracker.totals();
+    let decision = handle_child_agent_provider_error_with_cost(
+        config,
+        setup,
+        cwd,
+        hooks,
+        response,
+        Some(child_cost_tracker),
+    )?;
+    let totals = child_cost_tracker.totals();
+    if totals != before
+        && let Some(observer) = observer
+    {
+        observer.publish_activity(ChildAgentActivity::Usage(totals))?;
+    }
+    Ok(decision)
 }
 
 fn record_child_provider_usage(

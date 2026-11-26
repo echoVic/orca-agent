@@ -425,13 +425,11 @@ pub async fn call_streaming_async_with_retry_budget(
     mut on_step: impl FnMut(&ProviderStep),
 ) -> ProviderResponse {
     match request_chat_streaming_with_budget(
-        conversation,
+        StreamingRequest::Turn(conversation),
         config,
         cancel,
         &mut on_step,
         budget,
-        None,
-        false,
     )
     .await
     {
@@ -487,16 +485,16 @@ pub async fn call_streaming_async_bounded_with_retry_budget(
     retry_budget: &RetryBudget,
     mut on_step: impl FnMut(&ProviderStep),
 ) -> ProviderResponse {
-    let mut config = config.clone();
-    config.tools_override = Some(Vec::new());
     let request = request_chat_streaming_with_budget(
-        conversation,
-        &config,
+        StreamingRequest::Auxiliary {
+            conversation,
+            max_tokens: max_tokens.clamp(1, 2_048),
+            accept_truncated_partial: true,
+        },
+        config,
         cancel,
         &mut on_step,
         retry_budget,
-        Some(max_tokens.clamp(1, 2_048)),
-        true,
     );
     match tokio::time::timeout(timeout.max(Duration::from_millis(1)), request).await {
         Ok(Ok(response)) => response,
@@ -537,13 +535,11 @@ async fn request_chat_streaming(
     on_step: &mut impl FnMut(&ProviderStep),
 ) -> Result<ProviderResponse, DeepSeekRequestError> {
     request_chat_streaming_with_budget(
-        conversation,
+        StreamingRequest::Turn(conversation),
         config,
         cancel,
         on_step,
         &RetryBudget::default(),
-        None,
-        false,
     )
     .await
 }
@@ -563,11 +559,44 @@ fn chat_max_tokens(config: &ProviderConfig) -> u32 {
 
 /// Runs a bounded auxiliary completion through the production serializer, SSE
 /// parser and cancellation path, with one HTTP attempt and thinking disabled.
-/// Callers must supply a tool-free config. No tool/empty-response recovery loop.
 pub fn call_summary(
     conversation: &Conversation,
     config: &ProviderConfig,
     max_tokens: u32,
+    cancel: Option<&CancelToken>,
+) -> ProviderResponse {
+    call_summary_request(
+        StreamingRequest::Auxiliary {
+            conversation,
+            max_tokens: max_tokens.clamp(1, 2_048),
+            accept_truncated_partial: false,
+        },
+        config,
+        cancel,
+    )
+}
+
+pub(crate) fn call_replay_summary(
+    messages: Vec<ApiMessage>,
+    tools: Vec<Value>,
+    config: &ProviderConfig,
+    max_tokens: u32,
+    cancel: Option<&CancelToken>,
+) -> ProviderResponse {
+    call_summary_request(
+        StreamingRequest::Replay {
+            messages,
+            tools,
+            max_tokens,
+        },
+        config,
+        cancel,
+    )
+}
+
+fn call_summary_request(
+    request: StreamingRequest<'_>,
+    config: &ProviderConfig,
     cancel: Option<&CancelToken>,
 ) -> ProviderResponse {
     let default_cancel = CancelToken::new();
@@ -575,15 +604,13 @@ pub fn call_summary(
     let result = std::thread::scope(|scope| {
         scope
             .spawn(|| {
-                let mut config = config.clone();
-                config.tools_override = Some(vec![]);
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|error| DeepSeekRequestError::new(error.to_string()))?;
                 runtime.block_on(request_chat_streaming_with_budget(
-                    conversation,
-                    &config,
+                    request,
+                    config,
                     cancel,
                     &mut |_| {},
                     &RetryBudget::new(
@@ -591,8 +618,6 @@ pub fn call_summary(
                         Duration::from_secs(120),
                         Some(std::time::Instant::now() + Duration::from_secs(120)),
                     ),
-                    Some(max_tokens.clamp(1, 2_048)),
-                    false,
                 ))
             })
             .join()
@@ -612,14 +637,26 @@ pub fn call_summary(
     }
 }
 
+enum StreamingRequest<'a> {
+    Turn(&'a Conversation),
+    Auxiliary {
+        conversation: &'a Conversation,
+        max_tokens: u32,
+        accept_truncated_partial: bool,
+    },
+    Replay {
+        messages: Vec<ApiMessage>,
+        tools: Vec<Value>,
+        max_tokens: u32,
+    },
+}
+
 async fn request_chat_streaming_with_budget(
-    conversation: &Conversation,
+    request: StreamingRequest<'_>,
     config: &ProviderConfig,
     cancel: &CancelToken,
     on_step: &mut impl FnMut(&ProviderStep),
     retry_budget: &RetryBudget,
-    summary_budget: Option<u32>,
-    accept_truncated_partial: bool,
 ) -> Result<ProviderResponse, DeepSeekRequestError> {
     let api_key = config.api_key.as_deref().ok_or_else(|| {
         "DEEPSEEK_API_KEY is required (set via env var or ~/.orca/auth.json)".to_string()
@@ -629,16 +666,42 @@ async fn request_chat_streaming_with_budget(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let streaming_client = crate::http_client::streaming_client()?;
 
-    let messages = conversation_to_api_messages(conversation);
     let definitions = config.tools_override.as_deref().unwrap_or(&[]);
-    let tools = cap_tools_for_deepseek(deepseek_tools_schema(definitions));
-    let strict_applied = deepseek_strict_tools_schema_for_endpoint(definitions, base_url).is_some();
-    let primary_tools = deepseek_primary_request_tools(config);
+    let interactive = matches!(request, StreamingRequest::Turn(_));
+    let accept_truncated_partial = matches!(
+        request,
+        StreamingRequest::Auxiliary {
+            accept_truncated_partial: true,
+            ..
+        }
+    );
+    let auxiliary = matches!(request, StreamingRequest::Auxiliary { .. });
+    let (messages, tools, max_tokens) = match request {
+        StreamingRequest::Turn(conversation) => (
+            conversation_to_api_messages(conversation),
+            deepseek_primary_request_tools(config),
+            chat_max_tokens(config),
+        ),
+        StreamingRequest::Auxiliary {
+            conversation,
+            max_tokens,
+            ..
+        } => (
+            conversation_to_api_messages(conversation),
+            Vec::new(),
+            max_tokens,
+        ),
+        StreamingRequest::Replay {
+            messages,
+            tools,
+            max_tokens,
+        } => (messages, tools, max_tokens),
+    };
 
     let mut request = ChatRequest {
         model: model.to_string(),
         messages,
-        thinking: if summary_budget.is_some() {
+        thinking: if auxiliary {
             ThinkingConfig {
                 thinking_type: "disabled",
             }
@@ -649,9 +712,9 @@ async fn request_chat_streaming_with_budget(
         stream_options: Some(StreamOptions {
             include_usage: true,
         }),
-        tools: Some(primary_tools),
-        max_tokens: Some(summary_budget.unwrap_or_else(|| chat_max_tokens(config))),
-        reasoning_effort: summary_budget.is_none().then_some(config.reasoning_effort),
+        tools: Some(tools),
+        max_tokens: Some(max_tokens),
+        reasoning_effort: (!auxiliary).then_some(config.reasoning_effort),
     };
 
     let mut empty_response_retries = 0;
@@ -659,7 +722,7 @@ async fn request_chat_streaming_with_budget(
     let mut suppress_retry_reasoning = false;
     let mut accumulated_usage = None;
     loop {
-        let response_result = if summary_budget.is_some() {
+        let response_result = if !interactive {
             crate::http_client::execute_streaming_once_with_budget(
                 streaming_client
                     .post(&url)
@@ -683,11 +746,12 @@ async fn request_chat_streaming_with_budget(
             // Strict mode is Beta; if the server rejects the strict schema, retry
             // once with the plain tool list rather than failing the whole turn.
             Err(error)
-                if summary_budget.is_none()
-                    && strict_applied
-                    && is_strict_schema_rejection(&error) =>
+                if interactive
+                    && is_strict_schema_rejection(&error)
+                    && deepseek_strict_tools_schema_for_endpoint(definitions, base_url)
+                        .is_some() =>
             {
-                request.tools = Some(tools.clone());
+                request.tools = Some(cap_tools_for_deepseek(deepseek_tools_schema(definitions)));
                 crate::http_client::execute_streaming_with_retry_budget(
                     &streaming_client,
                     |client| client.post(&url).bearer_auth(api_key).json(&request),
@@ -730,7 +794,7 @@ async fn request_chat_streaming_with_budget(
             Ok(result) => result,
             Err(error)
                 if !emitted_step
-                    && summary_budget.is_none()
+                    && interactive
                     && stream_integrity_retries < STREAM_INTEGRITY_RETRIES
                     && crate::streaming::is_stream_integrity_error(&error.message) =>
             {
@@ -749,9 +813,8 @@ async fn request_chat_streaming_with_budget(
 
         merge_usage(&mut accumulated_usage, stream_result.usage);
 
-        let bounded_summary_truncated = accept_truncated_partial
-            && summary_budget.is_some()
-            && stream_result.finish_reason.as_deref() == Some("length");
+        let bounded_summary_truncated =
+            accept_truncated_partial && stream_result.finish_reason.as_deref() == Some("length");
         match stream_result.finish_reason.as_deref() {
             Some("length") if !bounded_summary_truncated => {
                 return Err(DeepSeekRequestError::with_usage(
@@ -817,7 +880,7 @@ async fn request_chat_streaming_with_budget(
                 .iter()
                 .any(|step| matches!(step, ProviderStep::Error(_)))
         {
-            if summary_budget.is_none() && empty_response_retries < EMPTY_RESPONSE_RETRIES {
+            if interactive && empty_response_retries < EMPTY_RESPONSE_RETRIES {
                 empty_response_retries += 1;
                 suppress_retry_reasoning = emitted_reasoning;
                 add_empty_response_recovery_instruction(&mut request);
@@ -2972,13 +3035,15 @@ mod tests {
         let cancel = CancelToken::new();
 
         let response = request_chat_streaming_with_budget(
-            &conversation,
+            StreamingRequest::Auxiliary {
+                conversation: &conversation,
+                max_tokens: 256,
+                accept_truncated_partial: true,
+            },
             &config,
             &cancel,
             &mut |_| {},
             &RetryBudget::default(),
-            Some(256),
-            true,
         )
         .await
         .expect("bounded completion should preserve a useful partial report");

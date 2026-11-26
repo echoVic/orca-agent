@@ -655,6 +655,9 @@ struct SummaryRequest {
     messages: Vec<SummaryMessage>,
     max_tokens: u32,
     thinking: SummaryThinking,
+    model: String,
+    reasoning_effort: Option<String>,
+    tools: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -678,6 +681,18 @@ struct SummaryServer {
 
 impl SummaryServer {
     fn new(status: u16, finish_reason: &'static str) -> Self {
+        Self::with_reply(status, move |_| {
+            serde_json::json!({
+                "choices": [{"delta": {"content": "Preserve MIDDLE_REQUIRED_FACT and pending work."}, "finish_reason": finish_reason}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 12, "prompt_cache_hit_tokens": 64}
+            })
+        })
+    }
+
+    fn with_reply(
+        status: u16,
+        reply: impl Fn(&SummaryRequest) -> serde_json::Value + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -695,14 +710,8 @@ impl SummaryServer {
                             .unwrap();
                         let body = read_request(&mut stream);
                         let request: SummaryRequest = serde_json::from_str(&body).unwrap();
+                        let body = format!("data: {}\n\ndata: [DONE]\n\n", reply(&request));
                         captured.lock().unwrap().push(request);
-                        let body = format!(
-                            "data: {}\n\ndata: [DONE]\n\n",
-                            serde_json::json!({
-                                "choices": [{"delta": {"content": "Preserve MIDDLE_REQUIRED_FACT and pending work."}, "finish_reason": finish_reason}],
-                                "usage": {"prompt_tokens": 100, "completion_tokens": 12, "prompt_cache_hit_tokens": 64}
-                            })
-                        );
                         write!(stream, "HTTP/1.1 {status} Response\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1032,4 +1041,201 @@ fn replay_instruction_names_the_eight_sections() {
             "Critical context",
         ],
     );
+}
+
+mod replay_compaction {
+    use super::*;
+    use serde_json::{Value, json};
+
+    const CHECKPOINT: &str = "## Primary request and intent\n- Preserve the deployment decision.\n\
+## Key technical concepts\n- Use the deployment notes.\n\
+## Files and code\n(none)\n\
+## Errors and fixes\n(none)\n\
+## Pending work\n- Finish the rollout.\n\
+## Current work\n- Read the deployment notes.\n\
+## Next step\n- Verify the rollout.\n\
+## Critical context\n- MIDDLE_REQUIRED_FACT";
+    const FALLBACK: &str = "Hierarchical summary kept MIDDLE_REQUIRED_FACT.";
+
+    fn conversation() -> Conversation {
+        let mut conversation = Conversation::new();
+        conversation.add_system("session instructions".to_string());
+        conversation.add_user("deployment MIDDLE_REQUIRED_FACT ".repeat(500));
+        conversation.add_assistant(Some("deployment notes read".to_string()), None, vec![]);
+        conversation.add_user("continue rollout".to_string());
+        conversation
+    }
+
+    fn server(replay_delta: Value, replay_finish: &'static str) -> SummaryServer {
+        SummaryServer::with_reply(200, move |request| {
+            let replay = request.model == orca_core::model::PRO_MODEL;
+            let (delta, finish_reason) = if replay {
+                (replay_delta.clone(), replay_finish)
+            } else {
+                (json!({"content": FALLBACK}), "stop")
+            };
+            json!({
+                "choices": [{"delta": delta, "finish_reason": finish_reason}],
+                "usage": {"prompt_tokens": 2500, "completion_tokens": 90, "prompt_cache_hit_tokens": 2048}
+            })
+        })
+    }
+
+    fn compact(
+        server: &SummaryServer,
+        conversation: &Conversation,
+        window: usize,
+    ) -> CompactionResult {
+        let mut config = config(1_000, 1_500);
+        config.max_tokens = window;
+        let mut provider = server.config();
+        provider.model = Some(orca_core::model::PRO_MODEL.to_string());
+        provider.reasoning_effort = ReasoningEffort::High;
+        provider.tools_override = Some(
+            ["zeta", "alpha"]
+                .map(|name| crate::tool_schema::ProviderToolDefinition {
+                    name: name.to_string(),
+                    description: format!("Read {name}"),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                    strict_capable: false,
+                })
+                .to_vec(),
+        );
+        compact_with_summary(ProviderKind::DeepSeek, conversation, &config, &provider)
+    }
+
+    fn assert_fallback(delta: Value, finish_reason: &'static str) {
+        let server = server(delta, finish_reason);
+        let result = compact(&server, &conversation(), 100_000);
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == FALLBACK)
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].model, orca_core::model::PRO_MODEL);
+        assert_eq!(requests[1].model, orca_core::model::auxiliary_model());
+        assert_eq!(result.observation.summary_requests[0].outcome, "failed");
+        assert!(result.observation.summary_requests[0].usage.is_some());
+        assert_eq!(result.observation.summary_requests[1].outcome, "succeeded");
+    }
+
+    #[test]
+    fn deep_compaction_uses_the_replay_checkpoint() {
+        let server = server(json!({"content": CHECKPOINT}), "stop");
+        let result = compact(&server, &conversation(), 100_000);
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == CHECKPOINT)
+        );
+        assert_eq!(
+            result.conversation.summary.baseline.as_deref(),
+            Some(CHECKPOINT)
+        );
+        let requests = server.requests.lock().unwrap();
+        let [request] = requests.as_slice() else {
+            panic!("expected one checkpoint request, got {}", requests.len())
+        };
+        assert_eq!(request.model, orca_core::model::PRO_MODEL);
+        assert_eq!(request.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(request.thinking.kind, "enabled");
+        assert_eq!(request.max_tokens, 32_768);
+        assert_eq!(
+            request
+                .tools
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["alpha", "zeta"]
+        );
+        assert_eq!(
+            request.messages.last().unwrap().content,
+            REPLAY_SUMMARY_INSTRUCTION
+        );
+    }
+
+    #[test]
+    fn replay_is_skipped_when_it_would_not_fit() {
+        let server = server(json!({"content": CHECKPOINT}), "stop");
+        let result = compact(&server, &conversation(), 33_000);
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == FALLBACK)
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, orca_core::model::auxiliary_model());
+    }
+
+    #[test]
+    fn a_reply_with_tool_calls_falls_back() {
+        assert_fallback(
+            json!({"content": CHECKPOINT, "tool_calls": [{
+                "index": 0, "id": "call-1", "type": "function",
+                "function": {"name": "alpha", "arguments": "{}"}
+            }]}),
+            "tool_calls",
+        );
+    }
+
+    #[test]
+    fn an_empty_or_reasoning_only_reply_falls_back() {
+        for delta in [json!({}), json!({"reasoning_content": "Planning only"})] {
+            assert_fallback(delta, "stop");
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_not_smaller_than_the_range_falls_back() {
+        assert_fallback(
+            json!({"content": "checkpoint detail ".repeat(3500)}),
+            "stop",
+        );
+    }
+
+    #[test]
+    fn a_replay_checkpoint_replaces_the_previous_summary() {
+        let server = server(json!({"content": CHECKPOINT}), "stop");
+        let mut conversation = conversation();
+        conversation.summary.baseline = Some("prior baseline".to_string());
+        conversation.summary.deltas = vec!["prior delta".to_string()];
+        let result = compact(&server, &conversation, 100_000);
+        assert_eq!(
+            result.conversation.summary.baseline.as_deref(),
+            Some(CHECKPOINT)
+        );
+        assert!(result.conversation.summary.deltas.is_empty());
+        assert_eq!(
+            result.conversation.rolling_summary.as_deref(),
+            Some(CHECKPOINT)
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].messages[1].content,
+            "[Summary baseline]\nprior baseline"
+        );
+        assert_eq!(
+            requests[0].messages[2].content,
+            "[Summary update 1]\nprior delta"
+        );
+    }
+
+    #[test]
+    fn replay_usage_is_recorded_in_the_observation() {
+        let server = server(json!({"content": CHECKPOINT}), "stop");
+        let result = compact(&server, &conversation(), 100_000);
+        let [request] = result.observation.summary_requests.as_slice() else {
+            panic!("expected a single observation")
+        };
+        assert_eq!(request.purpose, "replay");
+        assert_eq!(request.model, orca_core::model::PRO_MODEL);
+        assert_eq!(
+            request.usage,
+            Some(Usage {
+                input_tokens: 2500,
+                output_tokens: 90,
+                cache_tokens: 2048
+            })
+        );
+        assert_eq!(request.outcome, "succeeded");
+        assert!(!request.summary_cache_hit);
+    }
 }

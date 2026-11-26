@@ -169,7 +169,6 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) image_route: ImageRouteDecision,
     pub(crate) runtime_system_messages: &'a [String],
     pub(crate) context_config: &'a context::ContextConfig,
-    pub(crate) base_provider_config: &'a ProviderConfig,
     pub(crate) capabilities: RuntimeStepCapabilitySnapshot<'a>,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) events: &'a mut EventFactory,
@@ -1089,6 +1088,8 @@ impl RuntimeTurnProviderCycleStep {
             }
         };
 
+        let cost_before_compaction =
+            crate::cost::usd_to_micros(input.cost_tracker.totals().estimated_cost_usd);
         let provider_error_outcome = {
             let (conversation, history_writer) = input.conversation.parts_mut();
             self.provider_error_step.handle(
@@ -1096,7 +1097,7 @@ impl RuntimeTurnProviderCycleStep {
                 &mut RuntimeCompactionStep::new(
                     input.provider,
                     input.context_config,
-                    input.base_provider_config,
+                    input.turn_provider_config,
                     turn_context.clone(),
                     capabilities.hooks,
                     input.events,
@@ -1104,10 +1105,28 @@ impl RuntimeTurnProviderCycleStep {
                     history_writer,
                 )
                 .with_cancel(capabilities.cancel)
-                .with_deadline(input.operation.remaining_deadline()?),
+                .with_deadline(input.operation.remaining_deadline()?)
+                .with_cost_tracker(input.cost_tracker),
                 conversation,
             )?
         };
+        if let Err(stop) = input
+            .operation
+            .record_compaction_cost(cost_before_compaction, input.cost_tracker)?
+        {
+            let (_, history_writer) = input.conversation.parts_mut();
+            let terminal = input.operation.commit_budget_stop_with_boundary(
+                turn_context.turn_id.as_str(),
+                input.events.run_id(),
+                history_writer,
+                &input.cost_tracker.totals(),
+                None,
+                stop,
+            )?;
+            return Ok(RuntimeTurnProviderCycleResult::Return(
+                AgentLoopResult::budget_stop(terminal, stop),
+            ));
+        }
         if let RuntimeProviderErrorStepOutcome::Failed(error) = &provider_error_outcome
             && let Some(ingress) = turn_context.provider_response_ingress()
         {
@@ -2943,7 +2962,6 @@ mod tests {
                     image_route: ImageRouteDecision::None,
                     runtime_system_messages: &[],
                     context_config: &context_config,
-                    base_provider_config: &provider_config,
                     capabilities: RuntimeStepCapabilitySnapshot::new(
                         &instructions,
                         &memory,

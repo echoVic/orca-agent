@@ -13,7 +13,7 @@ use orca_core::provider_types::{ProviderErrorKind, ProviderResponse, Usage};
 use tiktoken_rs::cl100k_base_singleton;
 
 use crate::ProviderConfig;
-use crate::deepseek_http::ApiMessage;
+use crate::deepseek_http::{self, ApiMessage};
 
 const DEFAULT_MAX_TOKENS: usize = 1_000_000;
 // Hard compaction ceiling as a fraction of the context window. The reply
@@ -747,11 +747,15 @@ fn tools_schema_tokens_with_counter(
     provider_config: &ProviderConfig,
     counter: &impl TokenCounter,
 ) -> usize {
-    let tools = crate::deepseek_http::deepseek_primary_request_tools(provider_config);
+    let tools = deepseek_http::deepseek_primary_request_tools(provider_config);
+    serialized_tools_tokens(&tools, counter)
+}
+
+fn serialized_tools_tokens(tools: &[serde_json::Value], counter: &impl TokenCounter) -> usize {
     if tools.is_empty() {
         return 0;
     }
-    let serialized = serde_json::to_string(&tools).unwrap_or_else(|_| String::from("[]"));
+    let serialized = serde_json::to_string(tools).unwrap_or_else(|_| String::from("[]"));
     counter.count_text(&serialized)
 }
 
@@ -1028,6 +1032,9 @@ const BASELINE_REBUILD_TOKEN_THRESHOLD: usize = 2000;
 const SUMMARY_INPUT_TOKENS: usize = 4_096;
 const SUMMARY_OUTPUT_TOKENS: usize = 512;
 const MAX_SUMMARY_REQUESTS: usize = 32;
+const REPLAY_REQUEST_OUTPUT_TOKENS: u32 = 32_768;
+const REPLAY_VISIBLE_TOKENS: usize = 16_384;
+pub const REPLAY_SUMMARY_PURPOSE: &str = "replay";
 
 const REPLAY_SUMMARY_INSTRUCTION: &str = "Write a checkpoint of the conversation above so that the work can continue from it after the earlier messages are removed. Use exactly these sections, in this order, as Markdown headings:
 
@@ -1049,9 +1056,74 @@ Rules:
 - Do not call any tools. Reply with the checkpoint only.";
 
 fn replay_summary_messages(conversation: &Conversation, cut: usize) -> Vec<ApiMessage> {
-    let mut messages = crate::deepseek_http::conversation_prefix_to_api_messages(conversation, cut);
+    let mut messages = deepseek_http::conversation_prefix_to_api_messages(conversation, cut);
     messages.push(ApiMessage::user(REPLAY_SUMMARY_INSTRUCTION.to_string()));
     messages
+}
+
+fn replay_summary(
+    provider_kind: ProviderKind,
+    conversation: &Conversation,
+    partition: &CompactionPartition,
+    context_config: &ContextConfig,
+    provider_config: &ProviderConfig,
+    cancel: Option<&CancelToken>,
+    observation: &mut CompactionObservation,
+) -> Option<String> {
+    if provider_kind != ProviderKind::DeepSeek
+        || provider_config.api_key.is_none()
+        || cancel.is_some_and(CancelToken::is_cancelled)
+    {
+        return None;
+    }
+    let counter = DefaultTokenCounter;
+    let input_budget = context_config
+        .max_tokens
+        .checked_sub(REPLAY_REQUEST_OUTPUT_TOKENS as usize)?;
+    let messages = replay_summary_messages(conversation, partition.cut);
+    let tools = deepseek_http::deepseek_primary_request_tools(provider_config);
+    let prompt_tokens = messages
+        .iter()
+        .map(|message| message.estimated_tokens(&counter))
+        .sum::<usize>()
+        + serialized_tools_tokens(&tools, &counter);
+    if prompt_tokens > input_budget || cancel.is_some_and(CancelToken::is_cancelled) {
+        return None;
+    }
+
+    let model = orca_core::model::canonical_model_name(
+        provider_config
+            .model
+            .as_deref()
+            .unwrap_or(deepseek_http::DEFAULT_MODEL),
+    );
+    let response = deepseek_http::call_replay_summary(
+        messages,
+        tools,
+        provider_config,
+        REPLAY_REQUEST_OUTPUT_TOKENS,
+        cancel,
+    );
+    let request_index = observation.summary_requests.len();
+    let summary = observed_summary_response(
+        provider_kind,
+        REPLAY_SUMMARY_PURPOSE,
+        model,
+        &response,
+        cancel,
+        observation,
+    )?;
+    let checkpoint = bounded_summary(&summary, REPLAY_VISIBLE_TOKENS);
+    let collapsed_tokens = partition
+        .collapsed
+        .iter()
+        .map(message_tokens)
+        .sum::<usize>();
+    if checkpoint.is_empty() || counter.count_text(&checkpoint) >= collapsed_tokens {
+        observation.summary_requests[request_index].outcome = "failed";
+        return None;
+    }
+    Some(checkpoint)
 }
 
 fn summary_budget(config: &ContextConfig) -> usize {
@@ -1067,24 +1139,44 @@ fn summarize_collapsed_messages(
     cancel: Option<&CancelToken>,
     observation: &mut CompactionObservation,
 ) -> Option<(Conversation, String)> {
-    let CompactionPartition {
-        prefix,
-        collapsed,
-        kept,
-        ..
-    } = partition_for_compaction(
+    let partition = partition_for_compaction(
         conversation,
         context_config,
         &DefaultTokenCounter,
         tools_schema_tokens_with_counter(provider_config, &DefaultTokenCounter),
     )?;
-    if collapsed.is_empty() || kept.is_empty() {
+    if partition.kept.is_empty() || cancel.is_some_and(CancelToken::is_cancelled) {
         return None;
     }
 
+    let checkpoint = replay_summary(
+        provider_kind,
+        conversation,
+        &partition,
+        context_config,
+        provider_config,
+        cancel,
+        observation,
+    );
     if cancel.is_some_and(CancelToken::is_cancelled) {
         return None;
     }
+    let CompactionPartition {
+        prefix,
+        collapsed,
+        kept,
+        ..
+    } = partition;
+    let mut result = Conversation::new();
+    result.messages = prefix;
+    result.messages.extend(kept);
+    result.internal_context = conversation.internal_context.clone();
+    if let Some(checkpoint) = checkpoint {
+        result.rolling_summary = Some(checkpoint.clone());
+        result.summary.baseline = Some(checkpoint.clone());
+        return Some((result, checkpoint));
+    }
+
     let rendered = render_summary_delta(&collapsed);
     let budget = summary_budget(context_config);
     let mut requests_left = MAX_SUMMARY_REQUESTS;
@@ -1112,10 +1204,6 @@ fn summarize_collapsed_messages(
         )?
     };
 
-    let mut result = Conversation::new();
-    result.messages = prefix;
-    result.messages.extend(kept);
-    result.internal_context = conversation.internal_context.clone();
     result.rolling_summary = Some(new_delta.clone());
 
     let mut summary = conversation.summary.clone();
@@ -1538,11 +1626,11 @@ fn request_summary(
     }
     emit_summary_telemetry(purpose, false, rendered);
 
-    let summary_model = orca_core::model::auxiliary_model().to_string();
+    let summary_model = orca_core::model::auxiliary_model();
     let summary_config = ProviderConfig {
         api_key: provider_config.api_key.clone(),
         base_url: provider_config.base_url.clone(),
-        model: Some(summary_model),
+        model: Some(summary_model.to_string()),
         reasoning_effort: provider_config.reasoning_effort,
         tools_override: Some(Vec::new()),
         mcp_registry: None,
@@ -1580,8 +1668,14 @@ fn request_summary(
     } else {
         crate::call(provider_kind, &summary_conversation, &summary_config)
     };
-    let summary =
-        observed_summary_response(provider_kind, purpose, &response, cancel, observation)?;
+    let summary = observed_summary_response(
+        provider_kind,
+        purpose,
+        summary_model,
+        &response,
+        cancel,
+        observation,
+    )?;
     let summary = bounded_summary(&summary, output_tokens);
     if provider_kind == ProviderKind::DeepSeek {
         crate::summary_cache::store(&cache_key, &summary);
@@ -1592,6 +1686,7 @@ fn request_summary(
 fn observed_summary_response(
     provider_kind: ProviderKind,
     purpose: &str,
+    model: &str,
     response: &ProviderResponse,
     cancel: Option<&CancelToken>,
     observation: &mut CompactionObservation,
@@ -1604,7 +1699,7 @@ fn observed_summary_response(
         .push(SummaryRequestObservation {
             purpose: purpose.to_string(),
             provider: provider_kind.as_str().to_string(),
-            model: orca_core::model::auxiliary_model().to_string(),
+            model: model.to_string(),
             outcome: if cancel.is_some_and(CancelToken::is_cancelled)
                 || response
                     .error()
@@ -2578,6 +2673,7 @@ mod tests {
                 observed_summary_response(
                     ProviderKind::DeepSeek,
                     &purpose,
+                    orca_core::model::auxiliary_model(),
                     &response,
                     Some(&cancel),
                     &mut observation,
@@ -2736,6 +2832,7 @@ mod tests {
                 observed_summary_response(
                     ProviderKind::DeepSeek,
                     "delta",
+                    orca_core::model::auxiliary_model(),
                     &response,
                     cancel,
                     &mut observation
