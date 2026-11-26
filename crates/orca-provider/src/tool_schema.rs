@@ -10,12 +10,21 @@ pub struct ProviderToolDefinition {
     pub strict_capable: bool,
 }
 
-/// Keeps Orca's tools first, then MCP tools by name, preserving the order of survivors.
+/// Keeps non-MCP tools first, then MCP tools by name, preserving survivor order.
+/// When the caller has no tool source, names beginning with `mcp__` count as MCP.
 pub fn limit_tool_definitions(
     definitions: &mut Vec<ProviderToolDefinition>,
     max: usize,
 ) -> Vec<String> {
-    limit_tools_by_name(definitions, max, |tool| &tool.name)
+    limit_tool_definitions_by_source(definitions, max, |_| None)
+}
+
+pub fn limit_tool_definitions_by_source(
+    definitions: &mut Vec<ProviderToolDefinition>,
+    max: usize,
+    is_mcp: impl Fn(&str) -> Option<bool>,
+) -> Vec<String> {
+    limit_tools(definitions, max, |tool| &tool.name, is_mcp)
 }
 
 pub(crate) fn limit_tools_by_name<T>(
@@ -23,11 +32,25 @@ pub(crate) fn limit_tools_by_name<T>(
     max: usize,
     name: impl Fn(&T) -> &str,
 ) -> Vec<String> {
+    limit_tools(tools, max, name, |_| None)
+}
+
+fn limit_tools<T>(
+    tools: &mut Vec<T>,
+    max: usize,
+    name: impl Fn(&T) -> &str,
+    is_mcp: impl Fn(&str) -> Option<bool>,
+) -> Vec<String> {
     if tools.len() <= max {
         return Vec::new();
     }
     let mut ranked = tools.iter().map(&name).enumerate().collect::<Vec<_>>();
-    ranked.sort_by_key(|&(_, name)| (name.starts_with("mcp__"), name));
+    ranked.sort_by_cached_key(|&(_, name)| {
+        (
+            is_mcp(name).unwrap_or_else(|| name.starts_with("mcp__")),
+            name,
+        )
+    });
     let mut keep = vec![true; tools.len()];
     let mut removed = Vec::with_capacity(tools.len() - max);
     for (index, name) in ranked.into_iter().skip(max) {

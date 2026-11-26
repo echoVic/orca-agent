@@ -10,7 +10,7 @@ use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 use orca_provider::tool_schema::{
-    DEEPSEEK_MAX_TOOLS, ProviderToolDefinition, limit_tool_definitions,
+    DEEPSEEK_MAX_TOOLS, ProviderToolDefinition, limit_tool_definitions_by_source,
 };
 use orca_tools::schema::{ToolPolicy, canonical_tool_definitions, normalize_tool_request};
 
@@ -134,7 +134,8 @@ impl ToolExecutionFailure {
     }
 }
 
-pub(crate) fn provider_tool_schema_override(
+#[cfg(test)]
+fn provider_tool_schema_override(
     subagent_depth: u32,
     subagent_type: &SubagentType,
     tool_policy: AgentToolPolicyContext<'_>,
@@ -145,6 +146,15 @@ pub(crate) fn provider_tool_schema_override(
         Some(mcp_registry),
         external_tools,
     );
+    provider_tool_definitions(subagent_depth, subagent_type, tool_policy, &registry)
+}
+
+fn provider_tool_definitions(
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    tool_policy: AgentToolPolicyContext<'_>,
+    registry: &orca_tools::registry::ToolRegistry,
+) -> Option<Vec<ProviderToolDefinition>> {
     let mut policy = if let Some(allowed_tools) = tool_policy.allowed_tools() {
         ToolPolicy::allowed(allowed_tools)
     } else if subagent_depth > 0 {
@@ -162,7 +172,7 @@ pub(crate) fn provider_tool_schema_override(
         policy = policy.with_report_blocker();
     }
     Some(
-        canonical_tool_definitions(&policy, &registry)
+        canonical_tool_definitions(&policy, registry)
             .into_iter()
             .filter(|definition| {
                 // A policy the model cannot act on must not be advertised.
@@ -193,13 +203,12 @@ pub(crate) fn provider_config_for_agent_loop(
     session_tools: &crate::extension::ExtensionData,
 ) -> ProviderConfig {
     let shell_readiness = crate::shell_readiness::ShellReadiness::for_config(config);
-    let mut tools_override = provider_tool_schema_override(
-        subagent_depth,
-        subagent_type,
-        tool_policy,
-        mcp_registry,
+    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp_registry),
         &config.external_tools,
     );
+    let mut tools_override =
+        provider_tool_definitions(subagent_depth, subagent_type, tool_policy, &registry);
     if let Some(tools) = tools_override.as_mut() {
         omit_unavailable_session_tools(tools, config, tool_policy.workflow_child);
         omit_unavailable_shell_launch_tools(tools, &shell_readiness);
@@ -211,7 +220,17 @@ pub(crate) fn provider_config_for_agent_loop(
         {
             tools.retain(|tool| tool.name != "computer");
         }
-        limit_tool_definitions(tools, DEEPSEEK_MAX_TOOLS);
+        let dropped = limit_tool_definitions_by_source(tools, DEEPSEEK_MAX_TOOLS, |name| {
+            registry
+                .get(name)
+                .map(|tool| matches!(tool.spec().name, ToolName::Mcp(_)))
+        });
+        if config.provider == orca_core::config::ProviderKind::DeepSeek
+            && let Some(warnings) =
+                session_tools.get::<std::sync::Arc<crate::mcp_startup::McpStartupWarnings>>()
+        {
+            warnings.report_tool_limit(dropped);
+        }
     }
     let mut provider_config = ProviderConfig {
         api_key: config.api_key.clone(),

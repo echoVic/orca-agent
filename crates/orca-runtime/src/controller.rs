@@ -1820,13 +1820,16 @@ fn run_headless<W: io::Write>(
         for error in thread.startup_warnings() {
             eprintln!("orca: warning: {error}");
         }
-        // The MCP servers connect in the background: their warnings come
-        // once none is still connecting, before the turn, which would wait
-        // for them anyway.
-        let mcp_warnings =
-            thread.wait_for_mcp_startup_warnings(&|| interrupted_exit_code(interrupted).is_some());
-        for error in mcp_warnings.unwrap_or_default() {
-            eprintln!("orca: warning: {error}");
+        // Wait before attaching the reporter so startup warnings print first.
+        if thread
+            .mcp_registry()
+            .wait_for_startup(&|| interrupted_exit_code(interrupted).is_some())
+        {
+            thread.on_mcp_warnings(|warnings| {
+                for warning in warnings {
+                    eprintln!("orca: warning: {warning}");
+                }
+            });
         }
     }
     if let Some(exit_code) = interrupted_exit_code(interrupted) {
@@ -2927,6 +2930,87 @@ while IFS= read -r line; do
             setup.conversation.mcp_instructions,
             [("catalog".into(), "Look up records by ID.".into())]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_runtime_warns_with_the_tools_a_request_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let _orca_home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.provider = ProviderKind::DeepSeek;
+        config.api_key = Some("test".into());
+        config.mcp_servers = vec![delayed_mcp_server(dir.path(), 0, 135)];
+        config.external_tools = vec![orca_core::external_config::ExternalToolConfig {
+            name: "mcp__zz_external__lookup".into(),
+            description: "Local lookup".into(),
+            action_kind: orca_core::approval_types::ActionKind::Read,
+            command: "lookup".into(),
+            schema: serde_json::json!({}),
+        }];
+        let registry = orca_mcp::initialize_registry(&config.mcp_servers, None);
+        assert!(registry.wait_for_startup(&|| false));
+        let mut session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+            &config,
+            "find a record",
+            None,
+            registry.clone(),
+        )
+        .unwrap();
+        let mut lifecycle = RuntimeSessionLifecycle::new("mcp-tool-limit");
+        let warnings =
+            crate::mcp_startup::McpStartupWarnings::watch(&registry, config.external_tools.len());
+        let (send, receive) = std::sync::mpsc::channel();
+        warnings.on_tool_limit(move |warnings| send.send(warnings).unwrap());
+        session
+            .runtime_extensions(lifecycle.run_id())
+            .insert(warnings);
+        for turn in 0..2 {
+            let (url, captured) = capture_model_request();
+            config.base_url = Some(url);
+            assert_eq!(
+                run_thread_turn_to_writer(
+                    &config,
+                    &mut session,
+                    &mut lifecycle,
+                    "find a record",
+                    Vec::new(),
+                    ControllerRunOptions::default()
+                )
+                .unwrap(),
+                RunStatus::Success
+            );
+            let request = captured.join().unwrap();
+            let sent = request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect::<std::collections::HashSet<_>>();
+            let mut dropped = registry
+                .tools()
+                .into_iter()
+                .map(|t| t.schema_name)
+                .filter(|name| !sent.contains(name.as_str()))
+                .collect::<Vec<_>>();
+            dropped.sort_unstable();
+            let reports = receive.try_iter().flatten().collect::<Vec<_>>();
+            if turn == 0 {
+                let detail = format!(
+                    "left out {} tools: {}",
+                    dropped.len(),
+                    dropped[..3].join(", ")
+                );
+                assert!(
+                    reports.iter().any(|warning| warning.contains(&detail)),
+                    "{detail}: {reports:?}"
+                );
+            } else {
+                assert!(reports.is_empty(), "{reports:?}");
+            }
+            assert!(sent.contains("mcp__zz_external__lookup"));
+        }
     }
 
     #[test]
