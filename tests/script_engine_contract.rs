@@ -315,12 +315,14 @@ fn a_promise_chain_that_never_ends_is_stopped_at_the_wall_clock() {
         "const again = () => Promise.resolve().then(again); again(); await new Promise(() => {});",
         ScriptEngineLimits {
             wall_clock: Duration::from_millis(400),
-            ..limits()
+            // Promise jobs can fill the default heap before the clock runs out.
+            memory_bytes: 512 * 1024 * 1024,
         },
         |_| Ok(String::new()),
     );
 
-    assert!(error_of(outcome).contains("ran longer than"));
+    let error = error_of(outcome);
+    assert!(error.contains("ran longer than"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
