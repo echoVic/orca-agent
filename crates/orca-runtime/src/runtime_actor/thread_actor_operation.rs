@@ -6189,8 +6189,8 @@ impl ThreadActor {
                         ..
                     }),
                 ) => Self::surface_cancellation_stop(active),
-                // The error came from the mailbox the shutdown closed after
-                // cancelling the generation (see
+                // The generation's own error, after a shutdown closed the
+                // mailbox under it: taken as the closed mailbox's doing (see
                 // `ActiveOperation::mailbox_closed_under_generation`).
                 (OperationOutcome::ExecutionFailed { .. }, _)
                     if active.mailbox_closed_under_generation =>

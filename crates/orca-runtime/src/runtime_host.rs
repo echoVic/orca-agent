@@ -15003,8 +15003,15 @@ struct ActiveOperation {
     /// (a buffered provider delta, a cancelled tool's result, an interaction)
     /// then fails with "runtime semantic ingress actor is unavailable", or is
     /// answered "runtime thread is shutting down" from the drained queue, and
-    /// the generation returns that error. The error is the shutdown's doing:
-    /// the surface terminal is the operation's cancellation, not a failure.
+    /// the generation returns that error. Such an error is taken as the
+    /// shutdown's doing: the surface terminal is the operation's
+    /// cancellation, not a failure.
+    ///
+    /// `finish_generation_inner` keeps the flag only when the generation
+    /// itself returned an execution failure, so a failure the actor meets
+    /// after the generation returned keeps its error. A generation error with
+    /// another cause inside that window is taken as the shutdown's too: the
+    /// flag cannot tell the two apart.
     mailbox_closed_under_generation: bool,
 }
 
@@ -22596,6 +22603,18 @@ impl ThreadActor {
         allow_resume: bool,
         settle_lost_goal_turn: bool,
     ) -> Result<(), RuntimeHostError> {
+        // Only the generation's own error can come from the mailbox a
+        // shutdown closed under it. A failure met below, after the
+        // generation returned (a durable write, the writer's finish,
+        // background work), is not the shutdown's doing and keeps its error.
+        if !result.as_ref().is_ok_and(|result| {
+            matches!(
+                result.outcome,
+                GenerationTaskOutcome::ExecutionFailed { .. }
+            )
+        }) {
+            active.mailbox_closed_under_generation = false;
+        }
         if active
             .surface_background_control
             .as_ref()
@@ -41533,6 +41552,96 @@ mod tests {
             .expect("shutdown returned before the generation completed");
         assert!(thread.command_tx.is_closed());
         assert!(shutdown.is_ok(), "host shutdown returned {shutdown:?}");
+    }
+
+    /// A shutdown that closes the mailbox under a running generation excuses
+    /// only the generation's own error, which the closed mailbox can cause.
+    /// A failure the actor meets after the generation has returned, here the
+    /// writer's finish of a turn that returned cancelled, is not the
+    /// shutdown's doing: the turn ends failed, with that error.
+    #[test]
+    fn host_shutdown_keeps_a_failure_met_after_the_generation_returned() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (cancel_observed_tx, _cancel_observed_rx) = mpsc::sync_channel(1);
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(CancelAwareShutdownExecutor {
+            entered: entered_tx,
+            cancel_observed: cancel_observed_tx,
+            completed: completed_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "fail the writer's finish during a host shutdown",
+            )
+            .expect("start recorded runtime thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(&attachment.baseline.snapshot, "wait for shutdown"),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("executor did not start");
+        inject_passthrough_finish_failure_once(thread.thread_id());
+
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(host.shutdown());
+        });
+        let _shutdown = shutdown_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("host shutdown hung");
+
+        let mut terminals = Vec::new();
+        while let Some(item) = subscription.try_recv() {
+            let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                continue;
+            };
+            for envelope in batch.events.as_slice() {
+                if let surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                    record,
+                }) = &envelope.event
+                    && record.operation_id == operation_id
+                {
+                    terminals.push(record.terminal.clone());
+                }
+            }
+        }
+        let [terminal] = terminals.as_slice() else {
+            panic!("expected one terminal for the turn, got {terminals:?}");
+        };
+        let surface::OperationTerminal::Failed { message, .. } = terminal else {
+            panic!("the writer's failure was reported as {terminal:?}");
+        };
+        assert!(
+            message
+                .as_str()
+                .contains("injected passthrough generation finish failure"),
+            "the failure lost its error: {message:?}"
+        );
     }
 
     #[test]
