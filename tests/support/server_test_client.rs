@@ -1431,6 +1431,10 @@ mod tests {
         let mut client = scripted_client(
             "printf 'startup noise\\n{\"id\":\"turn\",\"event\":\"turn_started\"}\\n'; sleep 5",
         );
+        // The lines are what the deadline has to report: have them before the
+        // 500 ms start (a shell under a loaded parallel run had printed nothing
+        // by then).
+        client.expect_event("turn", "turn_started");
         client.set_event_timeout(Duration::from_millis(500));
 
         let started = Instant::now();
