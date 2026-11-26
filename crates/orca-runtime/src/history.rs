@@ -324,6 +324,12 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
         .find_map(|record| record.summary_state.clone())
     {
         conversation.summary = summary_state;
+        let spill_dir = crate::thread_store::spill::directory(&transcript.meta.session_id);
+        conversation.summary.tool_output_spills.retain(|spill| {
+            spill_dir
+                .as_deref()
+                .is_some_and(|dir| spill.belongs_to_directory(dir))
+        });
         conversation.rolling_summary = transcript
             .summaries
             .last()
@@ -1143,6 +1149,7 @@ mod tests {
                 &SummaryState {
                     baseline: Some("rebuilt baseline".to_string()),
                     deltas: vec!["fresh delta".to_string()],
+                    ..Default::default()
                 },
             )?;
             let transcript = load_session("latest")?;
@@ -1188,6 +1195,7 @@ mod tests {
                 &SummaryState {
                     baseline: Some("summary baseline".to_string()),
                     deltas: Vec::new(),
+                    ..Default::default()
                 },
             )?;
             writer.enter_turn(TurnId::new());

@@ -2968,6 +2968,7 @@ mod tests {
         compacted.summary = orca_core::conversation::SummaryState {
             baseline: Some("baseline".to_string()),
             deltas: vec!["delta".to_string()],
+            ..Default::default()
         };
         let identity = crate::session::ManualCompactionPersistenceIdentity {
             operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(

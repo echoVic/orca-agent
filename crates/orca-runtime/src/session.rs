@@ -456,7 +456,7 @@ impl InteractiveSession {
                     crate::thread_store::spill::carry_into_fork(
                         parent,
                         &meta.session_id,
-                        &mut conversation.messages,
+                        &mut conversation,
                     );
                 }
                 session_id = Some(meta.session_id.clone());

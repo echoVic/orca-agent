@@ -33,7 +33,11 @@ impl ToolOutputSpill {
     }
 
     pub fn belongs_to(&self, directory: &std::path::Path, tool_call_id: &str) -> bool {
-        self.directory == directory && self.tool_call_id == tool_call_id
+        self.belongs_to_directory(directory) && self.matches_call(tool_call_id)
+    }
+
+    pub fn belongs_to_directory(&self, directory: &std::path::Path) -> bool {
+        self.directory == directory
     }
 
     pub fn matches_call(&self, tool_call_id: &str) -> bool {

@@ -433,11 +433,27 @@ impl InternalContext {
 pub struct SummaryState {
     pub baseline: Option<String>,
     pub deltas: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_output_spills: Vec<crate::tool_types::ToolOutputSpill>,
 }
 
 impl SummaryState {
     pub fn is_empty(&self) -> bool {
-        self.baseline.is_none() && self.deltas.is_empty()
+        self.baseline.is_none() && self.deltas.is_empty() && self.tool_output_spills.is_empty()
+    }
+
+    pub fn spill_notices(&self) -> Option<String> {
+        if self.tool_output_spills.is_empty() {
+            return None;
+        }
+        let mut notices = String::from(
+            "[Saved results from earlier tool calls. Read a path with read_file or search it with grep.]",
+        );
+        for spill in &self.tool_output_spills {
+            notices.push('\n');
+            notices.push_str(&spill.path().to_string_lossy());
+        }
+        Some(notices)
     }
 
     pub fn latest_rolling(&self) -> Option<&str> {
@@ -455,6 +471,9 @@ impl SummaryState {
         }
         for delta in &self.deltas {
             total += counter.count(delta);
+        }
+        if let Some(notices) = self.spill_notices() {
+            total += counter.count(&notices);
         }
         total
     }

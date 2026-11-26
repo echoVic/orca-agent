@@ -863,6 +863,8 @@ pub(crate) struct StoredChildSummaryState {
     baseline: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     deltas: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_output_spills: Vec<orca_core::tool_types::ToolOutputSpill>,
 }
 
 impl From<&SummaryState> for StoredChildSummaryState {
@@ -870,6 +872,7 @@ impl From<&SummaryState> for StoredChildSummaryState {
         Self {
             baseline: summary.baseline.clone(),
             deltas: summary.deltas.clone(),
+            tool_output_spills: summary.tool_output_spills.clone(),
         }
     }
 }
@@ -879,6 +882,7 @@ impl From<&StoredChildSummaryState> for SummaryState {
         Self {
             baseline: summary.baseline.clone(),
             deltas: summary.deltas.clone(),
+            tool_output_spills: summary.tool_output_spills.clone(),
         }
     }
 }

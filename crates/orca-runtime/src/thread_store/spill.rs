@@ -20,13 +20,29 @@ pub(crate) fn directory(id: &str) -> Option<PathBuf> {
 pub(crate) fn carry_into_fork(
     parent_id: &str,
     fork_id: &str,
-    messages: &mut [orca_core::conversation::Message],
+    conversation: &mut orca_core::conversation::Conversation,
 ) {
     use orca_core::conversation::Message;
     let (Some(parent), Some(fork)) = (directory(parent_id), directory(fork_id)) else {
         return;
     };
-    for message in messages {
+    conversation.summary.tool_output_spills.retain_mut(|spill| {
+        if !spill.belongs_to_directory(&parent) {
+            return false;
+        }
+        let inherited = spill.in_directory(fork.clone());
+        match copy_spill_file(&spill.path(), &inherited.path()) {
+            Ok(()) => {
+                *spill = inherited;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not copy a saved tool result into the fork");
+                false
+            }
+        }
+    });
+    for message in &mut conversation.messages {
         let Message::Tool {
             tool_call_id,
             content,
@@ -79,7 +95,13 @@ pub(super) fn omit_from_export(record: &mut super::types::SessionRecord) {
     match record {
         SessionRecord::Message { message, .. } => omit(message),
         SessionRecord::ManualCompactionSnapshot(snapshot) => {
-            snapshot.messages.iter_mut().for_each(omit)
+            snapshot.messages.iter_mut().for_each(omit);
+            snapshot.summary_state.tool_output_spills.clear();
+        }
+        SessionRecord::ContextSummary(record) => {
+            if let Some(summary) = &mut record.summary_state {
+                summary.tool_output_spills.clear();
+            }
         }
         _ => {}
     }
