@@ -209,6 +209,17 @@ pub(crate) struct ApiMessage {
 }
 
 impl ApiMessage {
+    pub(crate) fn user(content: String) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: Some(content),
+            images: Vec::new(),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
     pub(crate) fn estimated_tokens(&self, counter: &impl crate::context::TokenCounter) -> usize {
         let mut tokens = 4 + self
             .content
@@ -1092,6 +1103,21 @@ fn turn_went_on_after(messages: &[Message]) -> Vec<bool> {
 }
 
 pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<ApiMessage> {
+    serialize_conversation_messages(conversation, None)
+}
+
+/// `cut` is a unit boundary in the normalized compaction conversation.
+pub(crate) fn conversation_prefix_to_api_messages(
+    conversation: &Conversation,
+    cut: usize,
+) -> Vec<ApiMessage> {
+    serialize_conversation_messages(conversation, Some(cut))
+}
+
+fn serialize_conversation_messages(
+    conversation: &Conversation,
+    cut: Option<usize>,
+) -> Vec<ApiMessage> {
     let mut messages: Vec<ApiMessage> = Vec::new();
     let needs_normalization = conversation.messages.iter().any(|message| {
         matches!(message, Message::Tool { .. })
@@ -1130,7 +1156,10 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
         .take_while(|message| matches!(message, Message::System { pinned: false, .. }))
         .count();
     let went_on = turn_went_on_after(source_messages);
-    for (index, msg) in source_messages.iter().enumerate() {
+    // The full history determines which images and reasoning the ordinary
+    // request sends, even when we only need a prefix of that request.
+    let end = cut.unwrap_or(source_messages.len());
+    for (index, msg) in source_messages[..end].iter().enumerate() {
         let api_msg = match msg {
             Message::System { content, .. } => {
                 let result = ApiMessage {
@@ -1209,11 +1238,14 @@ pub(crate) fn conversation_to_api_messages(conversation: &Conversation) -> Vec<A
     inject_summary_messages(&conversation.summary, &mut injected);
     // Keep every leading instruction message immutable; the summary changes
     // only on compaction, so it can sit ahead of the history.
-    messages.splice(prefix_len..prefix_len, injected);
+    let summary_position = prefix_len.min(end);
+    messages.splice(summary_position..summary_position, injected);
 
     // Plan, goal, memory, and mode state change mid-session. Sent last, a
     // change costs only this message instead of the cached history prefix.
-    if let Some(overlay) = render_internal_context(conversation) {
+    if cut.is_none()
+        && let Some(overlay) = render_internal_context(conversation)
+    {
         messages.push(ApiMessage {
             role: "system".to_string(),
             content: Some(overlay),

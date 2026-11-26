@@ -13,6 +13,7 @@ use orca_core::provider_types::{ProviderErrorKind, ProviderResponse, Usage};
 use tiktoken_rs::cl100k_base_singleton;
 
 use crate::ProviderConfig;
+use crate::deepseek_http::ApiMessage;
 
 const DEFAULT_MAX_TOKENS: usize = 1_000_000;
 // Hard compaction ceiling as a fraction of the context window. The reply
@@ -1028,6 +1029,31 @@ const SUMMARY_INPUT_TOKENS: usize = 4_096;
 const SUMMARY_OUTPUT_TOKENS: usize = 512;
 const MAX_SUMMARY_REQUESTS: usize = 32;
 
+const REPLAY_SUMMARY_INSTRUCTION: &str = "Write a checkpoint of the conversation above so that the work can continue from it after the earlier messages are removed. Use exactly these sections, in this order, as Markdown headings:
+
+## Primary request and intent
+## Key technical concepts
+## Files and code
+## Errors and fixes
+## Pending work
+## Current work
+## Next step
+## Critical context
+
+Rules:
+- Use terse bullets. Write \"(none)\" under a section with nothing to say.
+- Keep exact file paths, commands, error messages, identifiers and signatures.
+- Keep the user's corrections and preferences, verbatim when short.
+- Under Pending work, list background commands, subagents, and plan or goal items that are not finished.
+- If the conversation contains an earlier summary, keep what is still true in it, drop what is no longer true, and merge the rest into this checkpoint.
+- Do not call any tools. Reply with the checkpoint only.";
+
+fn replay_summary_messages(conversation: &Conversation, cut: usize) -> Vec<ApiMessage> {
+    let mut messages = crate::deepseek_http::conversation_prefix_to_api_messages(conversation, cut);
+    messages.push(ApiMessage::user(REPLAY_SUMMARY_INSTRUCTION.to_string()));
+    messages
+}
+
 fn summary_budget(config: &ContextConfig) -> usize {
     (config.target_compaction_limit() / 4).clamp(32, 2_048)
 }
@@ -1045,6 +1071,7 @@ fn summarize_collapsed_messages(
         prefix,
         collapsed,
         kept,
+        ..
     } = partition_for_compaction(
         conversation,
         context_config,
@@ -1164,6 +1191,7 @@ struct CompactionPartition {
     prefix: Vec<Message>,
     collapsed: Vec<Message>,
     kept: Vec<Message>,
+    cut: usize,
 }
 
 // Only unpinned leading system messages are immutable instructions. A pinned
@@ -1297,12 +1325,14 @@ fn partition_for_compaction(
 
     let mut kept = vec![];
     let mut collapsed = vec![];
+    let mut cut = prefix.len();
     for (unit, keep) in units.iter().zip(retain) {
         for message in &messages[unit.range.clone()] {
             if keep || message.is_pinned() {
                 kept.push(message.clone());
             } else {
                 collapsed.push(message.clone());
+                cut = unit.range.end;
             }
         }
     }
@@ -1310,6 +1340,7 @@ fn partition_for_compaction(
         prefix,
         collapsed,
         kept,
+        cut,
     })
 }
 
@@ -4144,6 +4175,7 @@ mod tests {
             prefix,
             collapsed,
             kept,
+            ..
         } = partition_for_compaction(&conv, &config, &FixedCounter, 0)
             .expect("partition should split this conversation");
 

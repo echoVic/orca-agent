@@ -947,3 +947,89 @@ fn hierarchical_work_limit_falls_back_without_unbounded_requests() {
     );
     assert_eq!(left, 1);
 }
+
+#[test]
+fn replay_messages_equal_the_next_request_up_to_the_cut() {
+    let mut conversation = Conversation::new();
+    conversation.add_system("system prompt".to_string());
+    conversation.summary.baseline = Some("previous checkpoint".to_string());
+    conversation
+        .summary
+        .deltas
+        .push("recent summary update".to_string());
+    tool_turn(&mut conversation, 0, 10);
+    conversation.add_assistant(Some("evidence checked".to_string()), None, vec![]);
+    conversation.add_user("next request".to_string());
+    conversation.replace_plan_state("plan overlay".to_string());
+
+    let next = crate::deepseek_http::conversation_to_api_messages(&conversation);
+    let replay = replay_summary_messages(&conversation, 4);
+    assert_eq!(replay.len(), 7);
+    assert_eq!(
+        serde_json::to_vec(&replay[..6]).unwrap(),
+        serde_json::to_vec(&next[..6]).unwrap(),
+    );
+    assert_eq!(
+        serde_json::to_value(&replay[6]).unwrap(),
+        serde_json::json!({"role": "user", "content": REPLAY_SUMMARY_INSTRUCTION}),
+    );
+}
+
+#[test]
+fn replay_keeps_reasoning_content_as_the_next_request_would() {
+    let mut conversation = Conversation::new();
+    tool_turn(&mut conversation, 0, 10);
+    conversation.add_assistant(
+        Some("one finding".to_string()),
+        Some("compare evidence".to_string()),
+        vec![],
+    );
+    conversation.add_assistant(Some("another finding".to_string()), None, vec![]);
+
+    let next = crate::deepseek_http::conversation_to_api_messages(&conversation);
+    let replay = replay_summary_messages(&conversation, 4);
+    for (index, reasoning) in [(1, "inspect the evidence"), (3, "compare evidence")] {
+        assert_eq!(replay[index].reasoning_content.as_deref(), Some(reasoning));
+        assert_eq!(
+            replay[index].reasoning_content,
+            next[index].reasoning_content
+        );
+    }
+}
+
+#[test]
+fn replay_cuts_where_the_partition_cuts() {
+    let mut conversation = Conversation::new();
+    conversation.add_system("system prompt".to_string());
+    tool_turn(&mut conversation, 0, 500);
+    tool_turn(&mut conversation, 1, 10);
+
+    let partition =
+        partition_for_compaction(&conversation, &config(180, 1_000), &DefaultTokenCounter, 0)
+            .expect("the first tool unit must be collapsed");
+    assert_eq!(partition.cut, 4);
+    let replay = replay_summary_messages(&conversation, partition.cut);
+    assert_eq!(replay.len(), 5);
+    assert_eq!(replay[3].tool_call_id.as_deref(), Some("call-0"));
+    assert_eq!(replay[4].role, "user");
+}
+
+#[test]
+fn replay_instruction_names_the_eight_sections() {
+    assert_eq!(
+        REPLAY_SUMMARY_INSTRUCTION
+            .lines()
+            .filter_map(|line| line.strip_prefix("## "))
+            .collect::<Vec<_>>(),
+        [
+            "Primary request and intent",
+            "Key technical concepts",
+            "Files and code",
+            "Errors and fixes",
+            "Pending work",
+            "Current work",
+            "Next step",
+            "Critical context",
+        ],
+    );
+}
