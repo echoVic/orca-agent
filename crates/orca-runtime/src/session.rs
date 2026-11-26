@@ -1334,6 +1334,22 @@ mod tests {
                 true,
             )
             .unwrap();
+            // A result shown on the event stream may also be persisted in JSONL.
+            use orca_core::event_schema::{
+                EVENT_SCHEMA_VERSION, EventEnvelope, EventFactory, EventPublicationStore,
+            };
+            result.output = Some(result.spill.as_ref().unwrap().render("head\n\ntail"));
+            let event = EventFactory::new("fork-spill".into()).tool_call_completed(&result);
+            parent
+                .append_semantic_event(&EventEnvelope {
+                    version: EVENT_SCHEMA_VERSION.into(),
+                    run_id: event.run_id,
+                    seq: 0,
+                    timestamp_ms: 0,
+                    event_type: event.event_type,
+                    payload: event.payload,
+                })
+                .unwrap();
             drop(parent);
             let store = crate::thread_store::JsonlThreadStore::new();
             let exported = home.join("portable-spill.jsonl");

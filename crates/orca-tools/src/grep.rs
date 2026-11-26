@@ -57,34 +57,14 @@ pub(crate) fn execute_in_session(
     };
 
     let requested_path = args.path.as_deref().unwrap_or(".");
-    let search_path = match crate::spill::resolve_read_path(cwd, Some(requested_path), spill_dir) {
-        Ok(ReadTarget::Workspace(path)) => path,
-        Ok(ReadTarget::Spill(path, file)) => {
-            let regex = match Regex::new(pattern) {
-                Ok(regex) => regex,
-                Err(error) => return ToolResult::failed(request, error.to_string(), None),
-            };
-            let mut collector = GrepPageCollector::new(
-                args.offset.unwrap_or(0),
-                normalized_head_limit(args.head_limit),
-                max_bytes.max(1),
-            );
-            if !search_file(
-                file,
-                &path,
-                &regex,
-                max_bytes,
-                &mut collector,
-                &should_cancel,
-            ) {
-                return ToolResult::cancelled(request, GREP_CANCELLED, None);
-            }
-            return render_search(request, collector, max_bytes);
-        }
-        Err(message) => return ToolResult::failed(request, message, None),
-    };
+    let (search_path, spill) =
+        match crate::spill::resolve_read_path(cwd, Some(requested_path), spill_dir) {
+            Ok(ReadTarget::Workspace(path)) => (path, None),
+            Ok(ReadTarget::Spill(path, file)) => (path, Some(file)),
+            Err(message) => return ToolResult::failed(request, message, None),
+        };
 
-    if !search_path.exists() {
+    if spill.is_none() && !search_path.exists() {
         return ToolResult::completed_kind(
             request,
             "(no matches)".to_string(),
@@ -93,7 +73,9 @@ pub(crate) fn execute_in_session(
         );
     }
 
-    let rg_path = if Path::new(requested_path).is_absolute() {
+    let rg_path = if spill.is_some() {
+        Path::new("-")
+    } else if Path::new(requested_path).is_absolute() {
         search_path.as_path()
     } else {
         let relative = search_path
@@ -116,6 +98,21 @@ pub(crate) fn execute_in_session(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::process::prepare_non_interactive_command(&mut command);
+    if let Some(file) = spill.as_ref() {
+        let input = match file.try_clone() {
+            Ok(input) => input,
+            Err(error) => {
+                return ToolResult::failed(
+                    request,
+                    format!("could not read saved tool result: {error}"),
+                    None,
+                );
+            }
+        };
+        // Pass the already verified file as stdin, so the helper never
+        // resolves its pathname again.
+        command.stdin(Stdio::from(input));
+    }
     let offset = args.offset.unwrap_or(0);
     let limit = normalized_head_limit(args.head_limit);
     let collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
@@ -176,14 +173,35 @@ pub(crate) fn execute_in_session(
             let stderr = output.stderr_text().trim().to_string();
             ToolResult::failed(request, stderr, output.status.code())
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => execute_in_process(
-            request,
-            cwd,
-            pattern,
-            &search_path,
-            max_bytes,
-            &should_cancel,
-        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(file) = spill {
+                let regex = match Regex::new(pattern) {
+                    Ok(regex) => regex,
+                    Err(error) => return ToolResult::failed(request, error.to_string(), None),
+                };
+                let mut collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
+                if !search_file(
+                    file,
+                    &search_path,
+                    &regex,
+                    MAX_GREP_LINE_BYTES,
+                    &mut collector,
+                    &should_cancel,
+                ) {
+                    return ToolResult::cancelled(request, GREP_CANCELLED, None);
+                }
+                render_search(request, collector, max_bytes)
+            } else {
+                execute_in_process(
+                    request,
+                    cwd,
+                    pattern,
+                    &search_path,
+                    max_bytes,
+                    &should_cancel,
+                )
+            }
+        }
         Err(error) => ToolResult::failed(request, format!("failed to run rg: {error}"), None),
     }
 }
@@ -245,7 +263,7 @@ fn execute_in_process(
             file,
             path.strip_prefix(cwd).unwrap_or(path),
             &regex,
-            max_bytes,
+            max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES),
             &mut collector,
             should_cancel,
         ) {
@@ -259,13 +277,12 @@ fn search_file(
     file: File,
     path: &Path,
     regex: &Regex,
-    max_bytes: usize,
+    max_line_bytes: usize,
     collector: &mut GrepPageCollector,
     should_cancel: &dyn Fn() -> bool,
 ) -> bool {
     let mut reader = BufReader::new(file);
     let path = path.to_string_lossy().replace('\\', "/");
-    let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
     let mut line_number = 1;
     while let Some(line) = read_bounded_line(&mut reader, max_line_bytes) {
         if should_cancel() {

@@ -24,7 +24,7 @@ pub fn write_confined_private(path: &Path, contents: &[u8]) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             use std::io::Read;
             let mut file = directory.open_regular(name)?;
-            // A successful retry must still replace a file from an older
+            // A successful retry must still restrict a file from an older
             // version if it lacks the current private permissions.
             let mut saved = Vec::new();
             (&mut file)
@@ -297,10 +297,12 @@ mod platform {
             contents: &[u8],
         ) -> io::Result<()> {
             use std::io::Write;
+            use std::os::windows::fs::OpenOptionsExt;
             let staged = self.path.join(staged);
             let mut file = fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .open(&staged)?;
             let result = (|| {
                 super::super::atomic::restrict_to_owner(&file)?;

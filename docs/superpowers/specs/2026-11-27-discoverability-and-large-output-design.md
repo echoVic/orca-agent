@@ -21,7 +21,7 @@ Date: 2026-11-27. Size: project (four parts that can ship separately). It draws 
   `[{omitted} bytes omitted. The full result is saved at {path}; read it with read_file using unit=bytes, offset and limit, or search it with grep.]`
 - **The paths must be readable.** `read_file` and `grep` accept paths under the session's spill directory as a read-only exception to the workspace rule. That directory and nothing else; no writes.
 - **The micro-compaction marker** of a saved result keeps the path, so the full text stays reachable after it is trimmed.
-- **Clean-up.** Spill files are deleted with their session. A storage failure keeps today's behaviour, with no spill.
+- **Session lifecycle.** Forks copy the saved redacted result into the new session. Session deletion removes its saved files and can be retried if cleanup fails. Portable exports keep the preview and say that the full result was not exported. A storage failure keeps today's behaviour, with no spill.
 
 ## 2. The model knows which skills exist
 

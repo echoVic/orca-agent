@@ -2203,7 +2203,7 @@ impl ThreadActor {
             source,
             invocation_started,
         };
-        let output = result.output.as_deref().map(surface_persisted_display_text);
+        let output = result.output_preview().map(surface_persisted_display_text);
         let error = result.error.as_deref().map(surface_persisted_display_text);
         let content = output
             .clone()

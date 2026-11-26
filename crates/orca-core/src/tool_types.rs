@@ -950,6 +950,17 @@ impl ToolResult {
         self.terminal.truncated = truncated;
     }
 
+    /// A preview for event and display records. Saved-result locations are
+    /// rendered from the reference on the model-facing conversation item.
+    pub fn output_preview(&self) -> Option<&str> {
+        self.output.as_deref().map(|output| {
+            self.spill
+                .as_ref()
+                .filter(|spill| spill.matches_call(&self.id))
+                .map_or(output, |spill| spill.preview(output))
+        })
+    }
+
     pub fn set_spill(&mut self, spill: ToolOutputSpill) {
         debug_assert!(spill.matches_call(&self.id));
         self.terminal.spill = Some(Box::new(spill));

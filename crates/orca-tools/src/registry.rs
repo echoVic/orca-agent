@@ -2737,6 +2737,29 @@ mod tests {
         assert!(result.output.unwrap().contains("2:needle"));
     }
 
+    #[test]
+    fn grep_matches_beyond_the_start_of_a_long_spill_line() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let file = spill.path().join("call.txt");
+        std::fs::write(
+            &file,
+            format!("{}needle{}", "x".repeat(100_000), "y".repeat(100_000)),
+        )
+        .unwrap();
+        let result = spill_read(
+            ToolName::Grep,
+            json!({"path": file, "pattern": "needle"}),
+            cwd.path(),
+            spill.path(),
+        );
+        assert_ne!(
+            result.kind,
+            orca_core::tool_types::ToolResultKind::NoMatches
+        );
+        assert_eq!(result.status, ToolStatus::Completed);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_symlink_in_the_spill_dir_is_refused() {
@@ -2806,11 +2829,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let spill = root.path().join("spill");
         let words = " hello".repeat(10_000);
-        let text = format!("{words} api_key=fixture-value {words}");
+        let value = "fixture-value";
+        let text = format!("{words}\napi_key={value}\n{words}");
         mcp_spill_result(spill_session_context(cwd.path(), &spill), &text);
         let saved = std::fs::read_to_string(spill.join("mcp-result.txt")).unwrap();
-        assert!(saved.contains("api_key=<redacted>"));
-        assert!(!saved.contains("fixture-value"));
+        let resource: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert!(
+            resource["contents"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\napi_key=<redacted>\n")
+        );
+        assert!(!saved.contains(value));
     }
 
     #[test]

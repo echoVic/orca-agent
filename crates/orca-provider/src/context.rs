@@ -1320,7 +1320,19 @@ fn render_summary_evidence(messages: &[Message]) -> String {
         .cloned()
         .map(|mut message| {
             match &mut message {
-                Message::Tool { content, .. } => *content = render_tool_output(content).0,
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                    terminal,
+                    ..
+                } => {
+                    *content = render_tool_output(tool_output_for_summary(
+                        content,
+                        tool_call_id,
+                        terminal.as_ref(),
+                    ))
+                    .0;
+                }
                 Message::Assistant {
                     reasoning_content,
                     tool_calls,
@@ -1685,6 +1697,17 @@ impl RenderedSummaryDelta {
     }
 }
 
+fn tool_output_for_summary<'a>(
+    content: &'a str,
+    tool_call_id: &str,
+    terminal: Option<&orca_core::tool_types::ToolTerminal>,
+) -> &'a str {
+    terminal
+        .and_then(|terminal| terminal.spill.as_ref())
+        .filter(|spill| spill.matches_call(tool_call_id))
+        .map_or(content, |spill| spill.preview(content))
+}
+
 /// Render the collapsed delta with the unified tool-output tier ruleset.
 /// Both tool outputs and natural-language turns (user / assistant) go through
 /// a single layered policy (`render_tool_output`): identical inputs always
@@ -1705,7 +1728,11 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
                 pinned,
                 ..
             } => {
-                let (rendered, compacted) = render_tool_output(content);
+                let (rendered, compacted) = render_tool_output(tool_output_for_summary(
+                    content,
+                    tool_call_id,
+                    terminal.as_ref(),
+                ));
                 if compacted {
                     compacted_tool_outputs += 1;
                 }
