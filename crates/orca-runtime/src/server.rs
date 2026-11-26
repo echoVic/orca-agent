@@ -6755,6 +6755,63 @@ enabled = true
     }
 
     #[test]
+    fn stateless_adapter_shutdown_cancels_a_turn_waiting_for_user_input() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"waiting","op":"submit","prompt":"ask Continue?"}"#,
+                Arc::clone(&writer),
+            )
+            .expect("start stateless turn that asks for input");
+            wait_for_event(&writer, Duration::from_secs(5), |event| {
+                event["event"] == "user_input_request"
+            })
+            .expect("user input request published");
+
+            // The shutdown cancels the request, then closes the thread's
+            // mailbox while the cancelled tool's result is still on its way.
+            state
+                .threads
+                .shutdown()
+                .expect("shutdown JSONL runtime adapter");
+
+            let events = parse_jsonl(&writer.lock().expect("writer").clone());
+            let terminals = events
+                .iter()
+                .filter(|event| event["id"] == "waiting" && event["event"] == "turn_completed")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                terminals.len(),
+                1,
+                "shutdown must emit one terminal: {events:?}"
+            );
+            assert_eq!(
+                terminals[0]["status"], "cancelled",
+                "a host closing during a turn sees it cancelled: {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event["id"] == "waiting" && event["event"] == "error"),
+                "the mailbox the shutdown closed must not reach the host as an error: {events:?}"
+            );
+
+            state
+                .shutdown(JsonlSupervisorCloseTrigger::NonIo(
+                    JsonlNonIoCloseTrigger::SupervisorShutdown,
+                ))
+                .expect("close supervisor after adapter shutdown");
+        });
+    }
+
+    #[test]
     fn submit_turn_started_event_preserves_task_lifecycle_metadata() {
         let input = Cursor::new(br#"{"id":7,"op":"submit","prompt":"reply once"}"#.to_vec());
         let output = SharedVecWriter::default();

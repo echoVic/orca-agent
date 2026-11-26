@@ -14998,6 +14998,14 @@ struct ActiveOperation {
     surface_execution_failure: Option<surface::GenerationExecutionFailureClass>,
     surface_execution_failure_diagnostic: Option<surface::SafeDiagnosticText>,
     surface_background_control: Option<Arc<RuntimeSurfaceBackgroundControl>>,
+    /// A shutdown closed this actor's mailbox while the generation was still
+    /// running, after cancelling it. What the generation sends on its way out
+    /// (a buffered provider delta, a cancelled tool's result, an interaction)
+    /// then fails with "runtime semantic ingress actor is unavailable", or is
+    /// answered "runtime thread is shutting down" from the drained queue, and
+    /// the generation returns that error. The error is the shutdown's doing:
+    /// the surface terminal is the operation's cancellation, not a failure.
+    mailbox_closed_under_generation: bool,
 }
 
 enum QueuedJsonlResumePreparation {
@@ -18928,6 +18936,8 @@ impl ThreadActor {
                                     self.active = Some(active);
                                     continue;
                                 }
+                                active.mailbox_closed_under_generation =
+                                    !active.generation.join.is_finished();
                                 command_rx.close();
                                 active.generation.cancel.cancel();
                                 Self::drain_closed_thread_commands(&mut command_rx);
@@ -18967,6 +18977,9 @@ impl ThreadActor {
                                 self.active = Some(active);
                                 continue;
                             }
+                            // Taken before the terminalization cancels the
+                            // generation; see `mailbox_closed_under_generation`.
+                            let ended_before_close = active.generation.join.is_finished();
                             if let Err(error) = self
                                 .commit_surface_terminalization(&mut active, terminalization)
                             {
@@ -19005,6 +19018,7 @@ impl ThreadActor {
                                 self.active = Some(active);
                                 continue;
                             }
+                            active.mailbox_closed_under_generation = !ended_before_close;
                             command_rx.close();
                             active.generation.cancel.cancel();
                             Self::drain_closed_thread_commands(&mut command_rx);
@@ -20440,6 +20454,7 @@ impl ThreadActor {
                     surface_execution_failure: None,
                     surface_execution_failure_diagnostic: None,
                     surface_background_control: None,
+                    mailbox_closed_under_generation: false,
                 });
                 let _ = reply.send(Ok(OperationHandle {
                     operation_id,

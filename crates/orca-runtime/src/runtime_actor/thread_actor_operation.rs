@@ -6188,33 +6188,14 @@ impl ThreadActor {
                         status: RunStatus::Cancelled,
                         ..
                     }),
-                ) => {
-                    let cause = active
-                        .surface_terminalization
-                        .unwrap_or(surface::TerminalizationCause::UserCancel);
-                    let terminal = match cause {
-                        surface::TerminalizationCause::HostShutdown => {
-                            surface::OperationTerminal::Shutdown {
-                                reason: surface::SurfaceShutdownReason::HostShutdown,
-                            }
-                        }
-                        surface::TerminalizationCause::ThreadClose => {
-                            surface::OperationTerminal::Shutdown {
-                                reason: surface::SurfaceShutdownReason::ThreadClose,
-                            }
-                        }
-                        surface::TerminalizationCause::GoalPause => {
-                            surface::OperationTerminal::Cancelled {
-                                reason: surface::CancelReason::GoalPause,
-                            }
-                        }
-                        surface::TerminalizationCause::UserCancel => {
-                            surface::OperationTerminal::Cancelled {
-                                reason: surface::CancelReason::User,
-                            }
-                        }
-                    };
-                    (surface::GenerationStopReason::Cancelled { cause }, terminal)
+                ) => Self::surface_cancellation_stop(active),
+                // The error came from the mailbox the shutdown closed after
+                // cancelling the generation (see
+                // `ActiveOperation::mailbox_closed_under_generation`).
+                (OperationOutcome::ExecutionFailed { .. }, _)
+                    if active.mailbox_closed_under_generation =>
+                {
+                    Self::surface_cancellation_stop(active)
                 }
                 (
                     OperationOutcome::Completed(RunStatus::Blocked { blocker }),
@@ -6706,6 +6687,29 @@ impl ThreadActor {
         }
         self.cache_surface_terminal(value.clone());
         Ok(Some(value))
+    }
+
+    fn surface_cancellation_stop(
+        active: &ActiveOperation,
+    ) -> (surface::GenerationStopReason, surface::OperationTerminal) {
+        let cause = active
+            .surface_terminalization
+            .unwrap_or(surface::TerminalizationCause::UserCancel);
+        let terminal = match cause {
+            surface::TerminalizationCause::HostShutdown => surface::OperationTerminal::Shutdown {
+                reason: surface::SurfaceShutdownReason::HostShutdown,
+            },
+            surface::TerminalizationCause::ThreadClose => surface::OperationTerminal::Shutdown {
+                reason: surface::SurfaceShutdownReason::ThreadClose,
+            },
+            surface::TerminalizationCause::GoalPause => surface::OperationTerminal::Cancelled {
+                reason: surface::CancelReason::GoalPause,
+            },
+            surface::TerminalizationCause::UserCancel => surface::OperationTerminal::Cancelled {
+                reason: surface::CancelReason::User,
+            },
+        };
+        (surface::GenerationStopReason::Cancelled { cause }, terminal)
     }
 
     pub(super) fn surface_completion_proof(
