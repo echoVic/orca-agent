@@ -233,7 +233,7 @@ fn pinned_notices_in_every_turn_do_not_block_compaction() {
             message
                 .content
                 .as_deref()
-                .is_some_and(|content| content.starts_with("[Summary baseline]"))
+                .is_some_and(|content| content.contains("\n\n[Summary baseline]\n"))
         })
         .expect("compaction must produce a summary baseline");
     let first_notice_index = api_messages
@@ -1188,6 +1188,19 @@ mod replay_compaction {
     }
 
     #[test]
+    fn a_checkpoint_without_the_eight_headings_falls_back() {
+        for checkpoint in [
+            CHECKPOINT.replace("## Next step\n", ""),
+            CHECKPOINT
+                .replace("## Next step", "## placeholder")
+                .replace("## Critical context", "## Next step")
+                .replace("## placeholder", "## Critical context"),
+        ] {
+            assert_fallback(json!({"content": checkpoint}), "stop");
+        }
+    }
+
+    #[test]
     fn a_reply_with_tool_calls_falls_back() {
         assert_fallback(
             json!({"content": CHECKPOINT, "tool_calls": [{
@@ -1208,7 +1221,7 @@ mod replay_compaction {
     #[test]
     fn a_checkpoint_not_smaller_than_the_range_falls_back() {
         assert_fallback(
-            json!({"content": "checkpoint detail ".repeat(3500)}),
+            json!({"content": format!("{CHECKPOINT}\n{}", "checkpoint detail ".repeat(3500))}),
             "stop",
         );
     }
@@ -1233,7 +1246,10 @@ mod replay_compaction {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].messages[1].text(),
-            "[Summary baseline]\nprior baseline"
+            format!(
+                "{}[Summary baseline]\nprior baseline",
+                deepseek_http::SUMMARY_PREAMBLE
+            )
         );
         assert_eq!(
             requests[0].messages[2].text(),
@@ -1264,7 +1280,8 @@ mod replay_compaction {
 
     #[test]
     fn a_checkpoint_that_leaves_no_room_for_a_reply_falls_back() {
-        let server = server(json!({"content": "fact ".repeat(5_000)}), "stop");
+        let checkpoint = format!("{CHECKPOINT}\n{}", "fact ".repeat(5_000));
+        let server = server(json!({"content": checkpoint}), "stop");
         let mut conversation = Conversation::new();
         conversation.add_system("instructions".to_string());
         conversation.add_user("evidence ".repeat(8_000));
@@ -1320,7 +1337,11 @@ mod replay_compaction {
 
     #[test]
     fn replay_preserves_tool_images_on_a_model_that_accepts_them() {
-        let server = SummaryServer::new(200, "stop");
+        let server = SummaryServer::with_reply(200, |_| {
+            json!({
+                "choices": [{"delta": {"content": CHECKPOINT}, "finish_reason": "stop"}]
+            })
+        });
         let conversation = conversation_with_historical_tool_image();
         let mut config = config(1_000, 1_500);
         config.max_tokens = 100_000;
