@@ -34636,23 +34636,30 @@ mod tests {
             .stop(agent.task_id.as_str(), "Task stopped".to_string())
             .expect("end the agent's record");
         // The agent reports its stream's start and then waits; its task's
-        // revision holds still from then on.
-        let shown = || {
-            read_snapshot()
-                .tasks
-                .iter()
-                .find(|task| task.task_id == agent.task_id)
-                .map(|task| (task.revision, task.status))
-                .expect("the agent's task")
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // revision holds still from then on. That report is its fourth,
+        // after its start, its thread and its turn, and changes nothing but
+        // the revisions, so it is waited for by the agent's revision: a quiet
+        // spell is no sign of it, as a loaded machine can send it later.
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
         let before = loop {
-            let first = shown();
-            std::thread::sleep(Duration::from_millis(300));
-            if shown() == first {
-                break first;
+            let snapshot = read_snapshot();
+            let streaming = snapshot
+                .subagents
+                .iter()
+                .any(|subagent| subagent.task_id == agent.task_id && subagent.revision.get() >= 4);
+            if streaming {
+                break snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == agent.task_id)
+                    .map(|task| (task.revision, task.status))
+                    .expect("the agent's task");
             }
-            assert!(Instant::now() < deadline, "the agent kept reporting");
+            assert!(
+                Instant::now() < deadline,
+                "the agent never reported its stream's start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(before.1, surface::SurfaceTaskStatus::Running);
 
