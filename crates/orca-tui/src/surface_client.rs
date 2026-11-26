@@ -1828,6 +1828,7 @@ pub(crate) fn launch_workflow(
         .name(format!("tui-workflow-{}", output.workflow.task_id.as_str()))
         .spawn(move || {
             let mut notification_sent = false;
+            let mut retry_visible = false;
             loop {
                 let Some(item) = subscription.recv_timeout(Duration::from_millis(100)) else {
                     continue;
@@ -1876,9 +1877,9 @@ pub(crate) fn launch_workflow(
                         operation_id,
                         retry,
                     } => {
-                        if let Some(event) = projection.project_provider_retry(&operation_id, retry)
-                        {
-                            let _ = monitor_events.send(event);
+                        if operation_id == monitor_operation_id {
+                            retry_visible = retry.is_some();
+                            let _ = monitor_events.send(TuiEvent::ProviderRetry(retry));
                         }
                     }
                     SurfaceSubscriptionItem::Gap { required } => {
@@ -1894,6 +1895,9 @@ pub(crate) fn launch_workflow(
                     }
                     SurfaceSubscriptionItem::Sealed { .. } => break,
                 }
+            }
+            if retry_visible {
+                let _ = monitor_events.send(TuiEvent::ProviderRetry(None));
             }
             detach(&monitor_surface, &monitor_client);
         })
@@ -4173,6 +4177,115 @@ mod tests {
             Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
             None => unsafe { std::env::remove_var("ORCA_HOME") },
         }
+    }
+
+    #[test]
+    fn launched_workflow_monitor_receives_provider_retry_and_clear() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        assert!(orca_runtime::workflow::host::WorkflowHost::node_available());
+        let home = crate::test_support::isolate_orca_home();
+        let cwd = tempfile::tempdir().unwrap();
+        let workflows = cwd.path().join(".orca/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join("tui-retry.js"),
+            "export const meta = { name: 'tui-retry', description: 'tui retry', phases: ['main'] };\nexport default await phase('main', async () => agent('respond with hello'));",
+        ).unwrap();
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            cwd.path(),
+            home.path(),
+            orca_core::config::folder_trust::TrustLevel::Trusted,
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            for (status, headers, body) in [
+                (
+                    "429 Too Many Requests",
+                    "Retry-After: 1\r\nX-Request-Id: workflow-wait\r\n",
+                    "",
+                ),
+                ("200 OK", "Content-Type: text/event-stream\r\n", body),
+            ] {
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "workflow request never arrived");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                loop {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&chunk[..count]);
+                    let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = String::from_utf8_lossy(&request[..end])
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|v| v.parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                write!(socket, "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(cwd.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        config.provider = orca_core::config::ProviderKind::DeepSeek;
+        config.api_key = Some("workflow-fixture-key".into());
+        config.base_url = Some(base_url);
+        let host = RuntimeHost::start().unwrap();
+        let thread = host
+            .start_thread(config, "typed TUI workflow retry")
+            .unwrap();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        launch_workflow(&thread.typed_surface(), "tui-retry", None, &event_tx).unwrap();
+        server.join().unwrap();
+        let mut retry_events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while let Ok(event) = event_rx.recv_deadline(deadline) {
+            if let TuiEvent::ProviderRetry(retry) = event {
+                let cleared = retry.is_none();
+                retry_events.push(retry);
+                if cleared {
+                    break;
+                }
+            }
+        }
+        thread.shutdown().unwrap();
+        host.shutdown().unwrap();
+        let [Some(retry), None] = retry_events.as_slice() else {
+            panic!("expected a workflow retry and clear, got {retry_events:?}");
+        };
+        assert_eq!(retry.attempt, 1);
+        assert!(retry.delay_ms > 0);
+        assert!(
+            retry
+                .reason
+                .contains("(HTTP 429, request id workflow-wait)")
+        );
     }
 
     #[test]

@@ -3010,8 +3010,9 @@ impl ThreadActor {
             tool_use_id: surface_tool_use_id,
         };
         let returned_workflow = final_workflow;
-        let runner =
-            runner.with_progress_ingress(Some(Arc::new(RuntimeSurfaceWorkflowLifecycleIngress {
+        let runner = runner
+            .with_provider_retries(self.resident_surface.hub.clone(), operation_id.clone())
+            .with_progress_ingress(Some(Arc::new(RuntimeSurfaceWorkflowLifecycleIngress {
                 command_tx: self.handle.command_tx.clone(),
                 fence: generation_fence,
             })));
