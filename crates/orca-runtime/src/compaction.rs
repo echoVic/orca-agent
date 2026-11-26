@@ -363,16 +363,6 @@ pub(crate) fn child_unrecoverable_overflow_message(provider_message: &str) -> St
     )
 }
 
-// The compacted history carries no usage anchor. Scale its estimate by the
-// ratio the provider's count showed for the history it replaces, never down.
-fn calibrated_prompt_tokens(estimated: usize, reference: context::PromptMeasurement) -> usize {
-    if reference.tokens <= reference.estimated {
-        return estimated;
-    }
-    let scaled = estimated as u128 * reference.tokens as u128 / reference.estimated.max(1) as u128;
-    usize::try_from(scaled).unwrap_or(usize::MAX)
-}
-
 /// A pressure compaction is kept only when it brings the prompt under the soft
 /// line or cuts it by at least this share. Under a pinned prompt that alone is
 /// past the line, folding one small tool exchange saves a few percent and only
@@ -981,7 +971,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             outcome,
             RuntimeCompactionAdoption {
                 adopted: true,
-                prompt_tokens: calibrated_prompt_tokens(after.estimated, before),
+                prompt_tokens: before.calibrate_compacted_estimate(after.estimated),
             },
         ))
     }
@@ -1001,7 +991,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             return true;
         }
         let saved = before.estimated - after.estimated;
-        calibrated_prompt_tokens(after.estimated, before) <= self.context_config.soft_limit()
+        before.calibrate_compacted_estimate(after.estimated) <= self.context_config.soft_limit()
             || saved.saturating_mul(100)
                 >= before
                     .estimated

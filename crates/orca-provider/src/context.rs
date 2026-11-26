@@ -675,6 +675,18 @@ pub struct PromptMeasurement {
     pub tokens: usize,
 }
 
+impl PromptMeasurement {
+    /// Scale a compacted prompt by this measurement's provider-to-estimate
+    /// ratio, keeping at least the wire estimate.
+    pub fn calibrate_compacted_estimate(self, estimated: usize) -> usize {
+        if self.tokens <= self.estimated {
+            return estimated;
+        }
+        let scaled = estimated as u128 * self.tokens as u128 / self.estimated.max(1) as u128;
+        usize::try_from(scaled).unwrap_or(usize::MAX)
+    }
+}
+
 // A reported count this far from Orca's estimate of the same request does not
 // describe that request (usage merged across retries); measure from the
 // estimate instead.
@@ -1006,6 +1018,7 @@ fn compact_with_summary_observed(
         &normalized,
         context_config,
         provider_config,
+        measured,
         cancel,
         observation,
     ) {
@@ -1081,6 +1094,19 @@ fn replay_summary(
         .max_tokens
         .checked_sub(REPLAY_REQUEST_OUTPUT_TOKENS as usize)?;
     let messages = replay_summary_messages(conversation, partition.cut);
+    let model = orca_core::model::canonical_model_name(
+        provider_config
+            .model
+            .as_deref()
+            .unwrap_or(deepseek_http::DEFAULT_MODEL),
+    );
+    if !orca_core::model::accepts_tool_images(model)
+        && messages
+            .iter()
+            .any(|message| message.role == "tool" && !message.images.is_empty())
+    {
+        return None;
+    }
     let tools = deepseek_http::deepseek_primary_request_tools(provider_config);
     let prompt_tokens = messages
         .iter()
@@ -1091,12 +1117,6 @@ fn replay_summary(
         return None;
     }
 
-    let model = orca_core::model::canonical_model_name(
-        provider_config
-            .model
-            .as_deref()
-            .unwrap_or(deepseek_http::DEFAULT_MODEL),
-    );
     let response = deepseek_http::call_replay_summary(
         messages,
         tools,
@@ -1136,6 +1156,7 @@ fn summarize_collapsed_messages(
     conversation: &Conversation,
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
+    measured: PromptMeasurement,
     cancel: Option<&CancelToken>,
     observation: &mut CompactionObservation,
 ) -> Option<(Conversation, String)> {
@@ -1149,6 +1170,7 @@ fn summarize_collapsed_messages(
         return None;
     }
 
+    let replay_request_index = observation.summary_requests.len();
     let checkpoint = replay_summary(
         provider_kind,
         conversation,
@@ -1174,7 +1196,12 @@ fn summarize_collapsed_messages(
     if let Some(checkpoint) = checkpoint {
         result.rolling_summary = Some(checkpoint.clone());
         result.summary.baseline = Some(checkpoint.clone());
-        return Some((result, checkpoint));
+        let estimated = wire_equivalent_tokens(&result, provider_config);
+        let prompt_tokens = measured.calibrate_compacted_estimate(estimated);
+        if context_config.request_reply_budget(prompt_tokens).is_some() {
+            return Some((result, checkpoint));
+        }
+        observation.summary_requests[replay_request_index].outcome = "failed";
     }
 
     let rendered = render_summary_delta(&collapsed);
@@ -4187,6 +4214,7 @@ mod tests {
             &conv,
             &config,
             &provider_config,
+            measure_prompt(&conv, &provider_config),
             None,
             &mut CompactionObservation::new(),
         )

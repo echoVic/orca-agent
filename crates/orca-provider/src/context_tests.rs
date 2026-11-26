@@ -663,7 +663,14 @@ struct SummaryRequest {
 #[derive(Debug, Deserialize)]
 struct SummaryMessage {
     role: String,
-    content: String,
+    #[serde(default)]
+    content: serde_json::Value,
+}
+
+impl SummaryMessage {
+    fn text(&self) -> &str {
+        self.content.as_str().expect("expected text content")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -838,13 +845,13 @@ fn hierarchy_bounds_requests_preserves_middle_evidence_and_reuses_cached_results
         requests
             .iter()
             .all(|request| request.messages[0].role == "system"
-                && DefaultTokenCounter.count_text(&request.messages[1].content)
+                && DefaultTokenCounter.count_text(request.messages[1].text())
                     <= SUMMARY_INPUT_TOKENS + 100)
     );
     assert!(
         requests
             .iter()
-            .any(|request| request.messages[1].content.contains("MIDDLE_REQUIRED_FACT"))
+            .any(|request| request.messages[1].text().contains("MIDDLE_REQUIRED_FACT"))
     );
     drop(requests);
     let again = compact_with_summary(
@@ -1066,6 +1073,22 @@ mod replay_compaction {
         conversation
     }
 
+    fn conversation_with_historical_tool_image() -> Conversation {
+        let mut conversation = conversation();
+        tool_turn(&mut conversation, 0, 10);
+        let Some(Message::Tool { images, .. }) = conversation.messages.last_mut() else {
+            panic!("expected tool result");
+        };
+        images.push(ImageInput {
+            source: ImageSource::Url {
+                url: "https://example.test/snapshot.png".to_string(),
+            },
+            detail: ImageDetail::Low,
+        });
+        conversation.add_user("current request".to_string());
+        conversation
+    }
+
     fn server(replay_delta: Value, replay_finish: &'static str) -> SummaryServer {
         SummaryServer::with_reply(200, move |request| {
             let replay = request.model == orca_core::model::PRO_MODEL;
@@ -1147,7 +1170,7 @@ mod replay_compaction {
             ["alpha", "zeta"]
         );
         assert_eq!(
-            request.messages.last().unwrap().content,
+            request.messages.last().unwrap().text(),
             REPLAY_SUMMARY_INSTRUCTION
         );
     }
@@ -1209,11 +1232,11 @@ mod replay_compaction {
         let requests = server.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].messages[1].content,
+            requests[0].messages[1].text(),
             "[Summary baseline]\nprior baseline"
         );
         assert_eq!(
-            requests[0].messages[2].content,
+            requests[0].messages[2].text(),
             "[Summary update 1]\nprior delta"
         );
     }
@@ -1237,5 +1260,93 @@ mod replay_compaction {
         );
         assert_eq!(request.outcome, "succeeded");
         assert!(!request.summary_cache_hit);
+    }
+
+    #[test]
+    fn a_checkpoint_that_leaves_no_room_for_a_reply_falls_back() {
+        let server = server(json!({"content": "fact ".repeat(5_000)}), "stop");
+        let mut conversation = Conversation::new();
+        conversation.add_system("instructions".to_string());
+        conversation.add_user("evidence ".repeat(8_000));
+        conversation.add_user("current ".repeat(22_000));
+        let mut config = config(27_000, 60_000);
+        config.reserved_for_response = 16_384;
+        let mut provider = server.config();
+        provider.model = Some(orca_core::model::PRO_MODEL.to_string());
+        let estimated = wire_equivalent_tokens(&conversation, &provider);
+        conversation.record_usage_anchor(
+            (estimated * 3 / 2) as u64,
+            estimated,
+            conversation.messages.len(),
+        );
+
+        let result =
+            compact_with_summary(ProviderKind::DeepSeek, &conversation, &config, &provider);
+        let prompt_tokens = wire_equivalent_tokens(&result.conversation, &provider) * 3 / 2;
+        assert!(
+            config.request_reply_budget(prompt_tokens).is_some(),
+            "compacted prompt of {prompt_tokens} tokens left no room for a reply"
+        );
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == FALLBACK)
+        );
+        assert_eq!(result.observation.summary_requests[0].outcome, "failed");
+        assert!(result.observation.summary_requests[0].usage.is_some());
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests[0].model, orca_core::model::PRO_MODEL);
+        assert!(requests.len() > 1);
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.model == orca_core::model::FLASH_MODEL)
+        );
+    }
+
+    #[test]
+    fn replay_falls_back_when_the_model_cannot_receive_historical_tool_images() {
+        let server = server(json!({"content": CHECKPOINT}), "stop");
+        let result = compact(&server, &conversation_with_historical_tool_image(), 100_000);
+        let requests = server.requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.model == orca_core::model::FLASH_MODEL)
+        );
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == FALLBACK)
+        );
+    }
+
+    #[test]
+    fn replay_preserves_tool_images_on_a_model_that_accepts_them() {
+        let server = SummaryServer::new(200, "stop");
+        let conversation = conversation_with_historical_tool_image();
+        let mut config = config(1_000, 1_500);
+        config.max_tokens = 100_000;
+        let mut provider = server.config();
+        provider.model = Some(orca_core::model::FLASH_MODEL.to_string());
+
+        let result =
+            compact_with_summary(ProviderKind::DeepSeek, &conversation, &config, &provider);
+        assert!(matches!(result.kind, CompactionKind::RemoteSummary(_)));
+        let requests = server.requests.lock().unwrap();
+        let [request] = requests.as_slice() else {
+            panic!("expected one checkpoint request, got {}", requests.len());
+        };
+        assert_eq!(
+            request.messages.last().unwrap().text(),
+            REPLAY_SUMMARY_INSTRUCTION
+        );
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|message| { message.role == "assistant" && message.content.is_null() })
+        );
+        assert!(request.messages.iter().any(|message| {
+            message.role == "tool"
+                && message.content[1]["image_url"]["url"] == "https://example.test/snapshot.png"
+        }));
     }
 }
