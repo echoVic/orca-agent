@@ -289,6 +289,8 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
         &mut conversation,
         Path::new(&transcript.meta.cwd),
         &transcript.messages,
+        &transcript.nested_instructions,
+        &transcript.written_instruction_sources,
     );
     let mut restored_messages = replay_compactions_for_resume(
         &transcript.messages,
@@ -307,7 +309,7 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
                 pinned: false,
             } if !content.starts_with(
                 "[Earlier conversation history was truncated to fit context window]"
-            ) && !is_delivered_notice(content) && !crate::instructions::is_nested_message(content)
+            ) && !is_delivered_notice(content)
         )
     })
     .collect::<Vec<_>>();
@@ -1060,6 +1062,8 @@ mod tests {
             completion_error: None,
             next_event_seq: 0,
             semantic_events: Vec::new(),
+            nested_instructions: Vec::new(),
+            written_instruction_sources: Vec::new(),
             path: cwd.join("reasoning-only.jsonl"),
         };
 

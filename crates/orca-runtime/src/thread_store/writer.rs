@@ -103,6 +103,13 @@ pub(crate) fn read_manual_compaction_snapshot(
         conversation.messages = record.messages.into_iter().map(Message::from).collect();
         conversation.rolling_summary = record.rolling_summary;
         conversation.summary = record.summary_state;
+        conversation.nested_instructions.versions = record
+            .nested_instructions
+            .into_iter()
+            .map(|version| (version.identity.source.clone(), version))
+            .collect();
+        conversation.nested_instructions.written_sources =
+            record.written_instruction_sources.into_iter().collect();
         ManualCompactionDurableSnapshot {
             operation_id: record.operation_id,
             strategy: record.strategy,
@@ -1365,11 +1372,29 @@ pub(crate) fn transcript_from_records(
     let mut completion_error = None;
     let mut next_event_seq = 0;
     let mut semantic_events = Vec::new();
+    let mut nested_instructions = BTreeMap::new();
+    let mut written_instruction_sources = Vec::new();
 
     for record in records {
         match record? {
             SessionRecord::Meta(m) => meta = Some(m),
             SessionRecord::Message { message, .. } => {
+                if let StoredMessage::System {
+                    content,
+                    nested_instruction: Some(identity),
+                    ..
+                } = &message
+                {
+                    written_instruction_sources
+                        .retain(|path| path != &identity.workspace.join(&identity.source));
+                    nested_instructions.insert(
+                        identity.source.clone(),
+                        orca_core::conversation::NestedInstructionVersion {
+                            identity: *identity.clone(),
+                            content: content.clone(),
+                        },
+                    );
+                }
                 messages.push(message.into());
             }
             SessionRecord::Completed { status, error, .. } => {
@@ -1388,6 +1413,10 @@ pub(crate) fn transcript_from_records(
             SessionRecord::ContextSummary(record) => summaries.push(record),
             SessionRecord::ManualCompactionSnapshot(record) => {
                 let after_messages = record.messages.len();
+                written_instruction_sources = record.written_instruction_sources;
+                for version in record.nested_instructions {
+                    nested_instructions.insert(version.identity.source.clone(), version);
+                }
                 messages = record.messages.into_iter().map(Message::from).collect();
                 compactions.clear();
                 summaries.clear();
@@ -1481,6 +1510,8 @@ pub(crate) fn transcript_from_records(
         next_event_seq,
         semantic_events,
         path: path.to_path_buf(),
+        nested_instructions: nested_instructions.into_values().collect(),
+        written_instruction_sources,
     })
 }
 
@@ -1553,6 +1584,9 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
         SessionRecord::ManualCompactionSnapshot(record) => {
             for message in &mut record.messages {
                 redact_stored_message(message);
+            }
+            for version in &mut record.nested_instructions {
+                redact_string_in_place(&mut version.content);
             }
             if let Some(summary) = &mut record.rolling_summary {
                 redact_string_in_place(summary);
@@ -1899,6 +1933,26 @@ impl SessionWriter {
         self.append_conversation_record(record)
     }
 
+    pub(crate) fn append_nested_instruction(
+        &mut self,
+        version: &orca_core::conversation::NestedInstructionVersion,
+    ) -> io::Result<()> {
+        let message = StoredMessage::System {
+            content: version.content.clone(),
+            pinned: false,
+            nested_instruction: Some(Box::new(version.identity.clone())),
+        };
+        let record = match &self.turn_id {
+            Some(turn) => StoredConversationRecord::identified(
+                ConversationItemId::new(),
+                turn.clone(),
+                message,
+            ),
+            None => StoredConversationRecord::legacy(message),
+        };
+        self.append_conversation_record(record)
+    }
+
     pub(crate) fn append_legacy_message(&mut self, message: &Message) -> io::Result<()> {
         self.append_conversation_record(StoredConversationRecord::legacy(StoredMessage::from(
             message,
@@ -2233,6 +2287,22 @@ impl SessionWriter {
             messages: messages.iter().map(StoredMessage::from).collect(),
             rolling_summary: conversation.rolling_summary.clone(),
             summary_state: conversation.summary.clone(),
+            nested_instructions: conversation
+                .nested_instructions
+                .versions
+                .values()
+                .cloned()
+                .collect(),
+            written_instruction_sources: {
+                let mut sources = conversation
+                    .nested_instructions
+                    .written_sources
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                sources.sort();
+                sources
+            },
         });
         let result = write_durable_record(&self.path, &record);
         #[cfg(test)]

@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use orca_core::conversation::{Conversation, Message};
+use orca_core::conversation::{
+    Conversation, InternalContextKind, InternalContextOrigin, Message, NestedInstructionSource,
+    NestedInstructionVersion,
+};
 use sha2::{Digest, Sha256};
 
 use crate::history::SessionWriter;
@@ -14,11 +17,15 @@ const CHAIN_BYTES: usize = 65_536;
 const BUDGET_NOTE: &str = "\n\n[Instruction budget: ";
 const ADDITIONAL: &str = "Additional instructions for ";
 const UPDATED: &str = "Updated instructions for ";
+const NESTED_CONTEXT: &str = "nested-project-instructions";
+const PROJECT_OPEN: &str = "<project-instructions>\n";
+const PROJECT_CLOSE: &str = "</project-instructions>";
 
 #[derive(Clone, Debug, Default)]
 pub struct ProjectInstructions {
     sections: Vec<InstructionSection>,
     trusted_workspace: Option<PathBuf>,
+    trust_home: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,7 +44,7 @@ impl ProjectInstructions {
             return None;
         }
 
-        let mut block = String::from("<project-instructions>\n");
+        let mut block = String::from(PROJECT_OPEN);
         for (index, section) in self.sections.iter().enumerate() {
             if index > 0 {
                 block.push('\n');
@@ -48,7 +55,7 @@ impl ProjectInstructions {
             block.push_str(section.content.trim());
             block.push('\n');
         }
-        block.push_str("</project-instructions>");
+        block.push_str(PROJECT_CLOSE);
         Some(block)
     }
 }
@@ -114,6 +121,7 @@ fn load_for_cwd_with_home(
     Ok(ProjectInstructions {
         sections,
         trusted_workspace,
+        trust_home: orca_home_path.map(Path::to_owned),
     })
 }
 
@@ -129,17 +137,14 @@ fn apply_prompt_budget(sections: &mut Vec<InstructionSection>) {
     for section in sections.iter_mut() {
         section.content = section.content.trim().to_owned();
     }
-    fit_chain(
-        sections,
-        |section| section.source.to_string_lossy().len() + 6,
-        false,
-    );
+    fit_root_chain(sections, |section| {
+        section.source.to_string_lossy().len() + 6
+    });
 }
 
-fn fit_chain(
+fn fit_root_chain(
     sections: &mut Vec<InstructionSection>,
     overhead: impl Fn(&InstructionSection) -> usize,
-    record_digest: bool,
 ) {
     let mut remaining = sections
         .iter()
@@ -164,15 +169,7 @@ fn fit_chain(
     }
     sections.drain(..skip);
     let section = sections.last_mut().unwrap();
-    let digest = if record_digest {
-        format!(
-            " Full text digest {}.",
-            orca_core::hex::lower(&Sha256::digest(&section.content))
-        )
-    } else {
-        String::new()
-    };
-    let mut note = format!("{BUDGET_NOTE}Cut {}.{digest}", section.source.display());
+    let mut note = format!("{BUDGET_NOTE}Cut {}.", section.source.display());
     if !dropped.is_empty() {
         note.push_str(&format!(" Dropped {}.", dropped.join(", ")));
     }
@@ -190,69 +187,211 @@ fn fit_chain(
     section.content.push_str(&note);
 }
 
-fn nested_scope(source: &Path) -> String {
+fn display_source(source: &Path) -> String {
     source
-        .parent()
-        .expect("nested instruction directory")
         .components()
         .map(|part| part.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
 }
 
-fn nested_header(source: &Path, updated: bool) -> String {
-    let dir = nested_scope(source);
-    let prefix = if updated { UPDATED } else { ADDITIONAL };
-    format!("{prefix}{dir}/ from {dir}/AGENTS.md:\n")
+fn escape_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
-fn nested_parts(content: &str) -> Option<(&str, &str, bool)> {
-    const SEPARATOR: &str = "/ from ";
-    let (rest, updated) = if let Some(rest) = content.strip_prefix(ADDITIONAL) {
-        (rest, false)
+fn escape_path(path: &str) -> String {
+    escape_text(path)
+        .replace('\r', "&#13;")
+        .replace('\n', "&#10;")
+}
+
+fn nested_header(identity: &NestedInstructionSource) -> String {
+    let source = escape_path(&display_source(&identity.source));
+    let scope = source.strip_suffix(INSTRUCTIONS_FILE).unwrap_or(&source);
+    let prefix = if identity.updated {
+        UPDATED
     } else {
-        (content.strip_prefix(UPDATED)?, true)
+        ADDITIONAL
     };
-    for (end, _) in rest.match_indices(":\n") {
-        let Some(repeated) = rest[..end].strip_suffix("/AGENTS.md") else {
-            continue;
+    format!("# {prefix}{scope} from {source}:\n")
+}
+
+pub(crate) fn render_nested_record(identity: &NestedInstructionSource, content: &str) -> String {
+    format!(
+        "{PROJECT_OPEN}{}{}\n{PROJECT_CLOSE}",
+        nested_header(identity),
+        escape_text(content)
+    )
+}
+
+fn trusted_source(workspace: &Path, source: &Path, home: &Path) -> bool {
+    use std::path::Component;
+    source
+        .file_name()
+        .is_some_and(|name| name == INSTRUCTIONS_FILE)
+        && source
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+        && source.parent().is_some_and(|parent| {
+            !parent.as_os_str().is_empty()
+                && orca_core::config::folder_trust::is_trusted_project_scope(
+                    workspace,
+                    &workspace.join(parent),
+                    home,
+                )
+        })
+}
+
+fn render_effective_chain(conversation: &mut Conversation, workspace: &Path, home: Option<&Path>) {
+    let mut versions = conversation
+        .nested_instructions
+        .versions
+        .values()
+        .filter(|version| {
+            version.identity.workspace == workspace
+                && home
+                    .is_some_and(|home| trusted_source(workspace, &version.identity.source, home))
+        })
+        .collect::<Vec<_>>();
+    versions.sort_by_key(|version| {
+        (
+            version.identity.source.components().count(),
+            &version.identity.source,
+        )
+    });
+    let block = if versions.is_empty() {
+        None
+    } else {
+        Some(fit_nested_chain(&versions))
+    };
+    conversation.replace_internal_context(
+        NESTED_CONTEXT,
+        InternalContextKind::ProjectInstructions,
+        InternalContextOrigin::System,
+        block,
+        CHAIN_BYTES,
+    );
+}
+
+fn fit_nested_chain(versions: &[&NestedInstructionVersion]) -> String {
+    let sections = versions
+        .iter()
+        .map(|version| {
+            let mut rendered = nested_header(&version.identity);
+            rendered.push_str(&escape_text(&version.content));
+            rendered.push('\n');
+            rendered
+        })
+        .collect::<Vec<_>>();
+    let room = CHAIN_BYTES - PROJECT_OPEN.len() - PROJECT_CLOSE.len();
+    let mut remaining = sections.iter().map(String::len).sum::<usize>();
+    let mut dropped = Vec::new();
+    for (index, (version, section)) in versions.iter().zip(&sections).enumerate() {
+        let source = escape_path(&display_source(&version.identity.source));
+        let dropped_note = if dropped.is_empty() {
+            String::new()
+        } else {
+            format!(" Dropped {}.", dropped.join(", "))
         };
-        let middle = repeated.len().saturating_sub(SEPARATOR.len()) / 2;
-        if let Some((left, right)) = repeated.split_at_checked(middle)
-            && !left.is_empty()
-            && right.strip_prefix(SEPARATOR) == Some(left)
+        let note = if dropped.is_empty() {
+            String::new()
+        } else {
+            format!("{BUDGET_NOTE}{}]\n", dropped_note.trim_start())
+        };
+        if remaining + note.len() <= room
+            && !versions[index..]
+                .iter()
+                .any(|version| version.identity.shortened)
         {
-            return Some((left, &rest[end + 2..], updated));
+            return format!(
+                "{PROJECT_OPEN}{}{note}{PROJECT_CLOSE}",
+                sections[index..].concat()
+            );
         }
+        if index + 1 < sections.len() {
+            remaining -= section.len();
+            dropped.push(source);
+            continue;
+        }
+        let mut note = format!("{BUDGET_NOTE}Cut {source}.{dropped_note}]\n");
+        let header = nested_header(&version.identity);
+        let note_room = room.saturating_sub(header.len());
+        if note_room < "…]\n".len() {
+            return format!(
+                "{PROJECT_OPEN}[Instruction budget: Dropped nested instructions because the source path exceeds the budget.]\n{PROJECT_CLOSE}"
+            );
+        }
+        if note.len() > note_room {
+            note.truncate(note.floor_char_boundary(note_room.saturating_sub("…]\n".len())));
+            note.push_str("…]\n");
+        }
+        let body = &section[header.len()..section.len() - 1];
+        let body_room = room.saturating_sub(header.len() + note.len());
+        let mut end = body.floor_char_boundary(body_room);
+        if let Some((start, _)) = body[..end].rmatch_indices(['&', ';']).next()
+            && body.as_bytes()[start] == b'&'
+        {
+            end = start;
+        }
+        return format!(
+            "{PROJECT_OPEN}{header}{}{note}{PROJECT_CLOSE}",
+            &body[..end]
+        );
     }
-    None
+    unreachable!("a nested chain has a source")
 }
 
-pub(crate) fn is_nested_message(content: &str) -> bool {
-    nested_parts(content).is_some()
-}
-
-fn instruction_digest(body: &str) -> String {
-    let Some((text, note)) = body
-        .rsplit_once(BUDGET_NOTE)
-        .filter(|(_, note)| note.ends_with(']'))
-    else {
-        return orca_core::hex::lower(&Sha256::digest(body));
-    };
-    if let Some((_, value)) = note.split_once(" Full text digest ")
-        && let Some((hex, _)) = value.split_once('.')
-        && hex.len() == 64
-        && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return hex.to_owned();
+fn read_nested_source(path: &Path) -> io::Result<(String, String, bool)> {
+    let mut file = orca_platform::fs::open_confined_regular(path)?;
+    let mut digest = Sha256::new();
+    let mut retained = Vec::new();
+    let mut buffer = [0u8; 8192 + 3];
+    let mut pending = 0;
+    let mut shortened = false;
+    loop {
+        let read = match file.read(&mut buffer[pending..]) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        digest.update(&buffer[pending..pending + read]);
+        let bytes = &buffer[..pending + read];
+        let valid = match std::str::from_utf8(bytes) {
+            Ok(_) => bytes.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        };
+        if !shortened {
+            let text = std::str::from_utf8(&bytes[..valid]).expect("checked UTF-8 prefix");
+            let len = text.floor_char_boundary(CHAIN_BYTES - retained.len());
+            retained.extend_from_slice(&bytes[..len]);
+            shortened = len < valid;
+        }
+        pending = bytes.len() - valid;
+        buffer.copy_within(valid..valid + pending, 0);
     }
-    orca_core::hex::lower(&Sha256::digest(text))
+    if pending != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incomplete UTF-8 in project instructions",
+        ));
+    }
+    Ok((
+        String::from_utf8(retained).expect("checked UTF-8 prefix"),
+        orca_core::hex::lower(&digest.finalize()),
+        shortened,
+    ))
 }
 
 pub(crate) fn restore_nested_state(
     conversation: &mut Conversation,
     cwd: &Path,
     messages: &[Message],
+    versions: &[NestedInstructionVersion],
+    written_sources: &[PathBuf],
 ) {
     use orca_core::tool_types::ToolStatus;
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
@@ -291,21 +430,35 @@ pub(crate) fn restore_nested_state(
                         .insert(path);
                 }
             }
-            Message::System { content, .. } => {
-                if let Some((dir, body, updated)) = nested_parts(content) {
-                    conversation
-                        .nested_instructions
-                        .versions
-                        .insert(dir.to_owned(), (instruction_digest(body), updated));
-                    conversation
-                        .nested_instructions
-                        .written_sources
-                        .remove(&cwd.join(dir).join(INSTRUCTIONS_FILE));
-                }
-            }
             _ => {}
         }
     }
+    conversation
+        .nested_instructions
+        .written_sources
+        .extend(written_sources.iter().cloned());
+    for version in versions
+        .iter()
+        .filter(|version| version.identity.workspace == cwd)
+    {
+        conversation
+            .nested_instructions
+            .written_sources
+            .remove(&cwd.join(&version.identity.source));
+        conversation
+            .nested_instructions
+            .versions
+            .insert(version.identity.source.clone(), version.clone());
+    }
+    render_effective_chain(conversation, &cwd, orca_core::home::orca_home().as_deref());
+}
+
+pub(crate) fn refresh_nested_instructions(conversation: &mut Conversation, cwd: &Path) {
+    if conversation.nested_instructions.versions.is_empty() {
+        return;
+    }
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_owned());
+    render_effective_chain(conversation, &cwd, orca_core::home::orca_home().as_deref());
 }
 
 impl ProjectInstructions {
@@ -315,7 +468,11 @@ impl ProjectInstructions {
         mut writer: Option<&mut SessionWriter>,
     ) {
         let touches = std::mem::take(&mut conversation.nested_instructions.pending_touches);
-        let Some(root) = &self.trusted_workspace else {
+        let Some((root, home)) = self
+            .trusted_workspace
+            .as_ref()
+            .zip(self.trust_home.as_deref())
+        else {
             return;
         };
         let touches = touches
@@ -337,97 +494,53 @@ impl ProjectInstructions {
             .enumerate()
             .filter_map(|(index, (path, wrote_agents))| wrote_agents.then_some((path, index)))
             .collect::<HashMap<_, _>>();
-        if touches.is_empty() {
-            return;
-        }
-        let mut visible = conversation
-            .messages
-            .iter()
-            .filter_map(|message| {
-                let Message::System { content, .. } = message else {
-                    return None;
-                };
-                let (scope, body, _) = nested_parts(content)?;
-                Some((scope.to_owned(), instruction_digest(body)))
-            })
-            .collect::<HashMap<_, _>>();
         for (index, (path, written_agents)) in touches.iter().enumerate() {
-            let Some(parent) = path.parent() else {
+            let Some(parent) = path.parent().filter(|parent| parent.starts_with(root)) else {
                 continue;
             };
-            if !parent.starts_with(root) {
-                continue;
-            }
             if *written_agents && parent != root {
                 conversation
                     .nested_instructions
                     .written_sources
                     .insert(path.clone());
             }
-            let mut sections = parent
-                .ancestors()
-                .take_while(|dir| *dir != root)
-                .filter_map(|dir| {
-                    let source = dir.join(INSTRUCTIONS_FILE);
-                    if last_writes
-                        .get(&source)
-                        .is_some_and(|write| *write >= index)
-                        || source.canonicalize().ok().as_ref() != Some(&source)
-                    {
-                        return None;
-                    }
-                    let content = fs::read_to_string(&source).ok()?;
-                    Some(InstructionSection {
-                        source: source.strip_prefix(root).ok()?.to_owned(),
-                        content,
-                    })
-                })
-                .collect::<Vec<_>>();
-            sections.reverse();
-            fit_chain(
-                &mut sections,
-                |section| nested_header(&section.source, false).len(),
-                true,
-            );
-            for section in sections {
-                let dir = nested_scope(&section.source);
-                let version = instruction_digest(&section.content);
-                let was_written = conversation
-                    .nested_instructions
-                    .written_sources
-                    .remove(&root.join(&section.source));
-                let previous = conversation.nested_instructions.versions.get(&dir);
-                let already_recorded = previous.is_some_and(|(seen, _)| *seen == version);
-                if already_recorded && visible.get(&dir) == Some(&version) {
+            for dir in parent.ancestors().take_while(|dir| *dir != root) {
+                let path = dir.join(INSTRUCTIONS_FILE);
+                let source = path.strip_prefix(root).expect("workspace ancestor");
+                if last_writes.get(&path).is_some_and(|write| *write >= index)
+                    || !trusted_source(root, source, home)
+                {
                     continue;
                 }
-                let updated = match previous {
-                    Some((_, updated)) if already_recorded => *updated,
-                    Some(_) => true,
-                    None => was_written,
+                let Ok((content, digest, shortened)) = read_nested_source(&path) else {
+                    continue;
                 };
-                visible.insert(dir.clone(), version.clone());
-                conversation
-                    .nested_instructions
-                    .versions
-                    .insert(dir, (version, updated));
-                let message = Message::system(format!(
-                    "{}{}",
-                    nested_header(&section.source, updated),
-                    section.content
-                ));
-                // If compaction removed this version, make it available on this
-                // touch using the existing transcript record.
-                if !already_recorded
-                    && let Some(writer) = writer.as_deref_mut()
-                    && let Err(error) = writer.append_message(&message)
+                let state = &mut conversation.nested_instructions;
+                let written = state.written_sources.remove(&path);
+                let previous = state.versions.get(source);
+                if previous.is_some_and(|previous| previous.identity.digest == digest) {
+                    continue;
+                }
+                let version = NestedInstructionVersion {
+                    identity: NestedInstructionSource {
+                        workspace: root.clone(),
+                        source: source.to_owned(),
+                        digest,
+                        updated: previous.is_some() || written,
+                        shortened,
+                    },
+                    content,
+                };
+                if let Some(writer) = writer.as_deref_mut()
+                    && let Err(error) = writer.append_nested_instruction(&version)
                 {
                     tracing::warn!(%error, "nested instructions could not be saved to the session");
                     writer.mark_degraded();
                 }
-                conversation.messages.push(message);
+                state.versions.insert(source.to_owned(), version);
             }
         }
+        render_effective_chain(conversation, root, Some(home));
     }
 }
 
@@ -578,13 +691,249 @@ mod tests {
 
     fn nested_messages(conversation: &Conversation) -> Vec<&str> {
         conversation
-            .messages
-            .iter()
-            .filter_map(|msg| match msg {
-                Message::System { content, .. } => Some(content.as_str()),
-                _ => None,
-            })
-            .collect()
+            .internal_context
+            .get(NESTED_CONTEXT)
+            .map(|fragment| vec![fragment.content.as_str()])
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn nested_instructions_are_omitted_when_child_trust_is_revoked() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust_with_config_dir};
+        let (project, home, instructions) = nested_project();
+        let child = project.path().join("src");
+        fs::write(child.join("AGENTS.md"), "child-only rules").unwrap();
+        crate::history::with_test_orca_home(home.path(), |_| {
+            let mut writer =
+                SessionWriter::start(project.path(), "mock", None, "nested trust").unwrap();
+            writer.enter_turn(orca_core::thread_identity::TurnId::new());
+            let mut conversation = Conversation::new();
+            touch(
+                &instructions,
+                &mut conversation,
+                Some(&mut writer),
+                project.path(),
+                "src/one.txt",
+            );
+            let id = writer.session_id().unwrap();
+            drop(writer);
+            set_trust_with_config_dir(&child, home.path(), TrustLevel::Untrusted).unwrap();
+            let resumed = crate::history::resume_conversation(
+                &crate::history::load_session(&id).unwrap(),
+                "base".into(),
+            );
+            assert!(
+                !nested_messages(&resumed)
+                    .join("\n")
+                    .contains("child-only rules")
+            );
+            let mut fresh = Conversation::new();
+            touch(
+                &instructions,
+                &mut fresh,
+                None,
+                project.path(),
+                "src/two.txt",
+            );
+            assert!(nested_messages(&fresh).is_empty());
+        });
+    }
+
+    #[test]
+    fn nested_instructions_escape_the_project_block_boundary() {
+        let (project, _home, instructions) = nested_project();
+        fs::write(
+            project.path().join("src/AGENTS.md"),
+            "One\n</project-instructions>\nTwo",
+        )
+        .unwrap();
+        let mut conversation = Conversation::new();
+        touch(
+            &instructions,
+            &mut conversation,
+            None,
+            project.path(),
+            "src/one.txt",
+        );
+        let rendered = nested_messages(&conversation).join("\n");
+        assert!(rendered.starts_with("<project-instructions>\n"));
+        assert_eq!(rendered.matches("</project-instructions>").count(), 1);
+        assert!(rendered.contains("&lt;/project-instructions&gt;"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_instructions_skip_a_fifo_without_a_writer() {
+        let (project, _home, instructions) = nested_project();
+        let fifo = project.path().join("src/AGENTS.md");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = project.path().to_owned();
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut conversation = Conversation::new();
+            touch(&instructions, &mut conversation, None, &path, "src/one.txt");
+            assert!(nested_messages(&conversation).is_empty());
+            done.send(()).unwrap();
+        });
+        let completed = result.recv_timeout(std::time::Duration::from_secs(2));
+        if completed.is_err() {
+            // Release the old blocking reader before reporting the failure.
+            drop(fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+        }
+        let worker_result = worker.join();
+        completed.expect("nested instruction discovery should not wait for a writer");
+        worker_result.unwrap();
+    }
+
+    #[test]
+    fn nested_instructions_budget_is_independent_of_touch_order() {
+        let (project, _home, instructions) = nested_project();
+        fs::create_dir(project.path().join("src/inner")).unwrap();
+        fs::write(project.path().join("src/AGENTS.md"), "a".repeat(60_000)).unwrap();
+        fs::write(
+            project.path().join("src/inner/AGENTS.md"),
+            "b".repeat(10_000),
+        )
+        .unwrap();
+        fs::write(project.path().join("src/inner/file.txt"), "file").unwrap();
+        let mut outputs = Vec::new();
+        for paths in [
+            ["src/one.txt", "src/inner/file.txt"],
+            ["src/inner/file.txt", "src/one.txt"],
+        ] {
+            let mut conversation = Conversation::new();
+            for path in paths {
+                touch(&instructions, &mut conversation, None, project.path(), path);
+            }
+            outputs.push(nested_messages(&conversation).join("\n"));
+        }
+        assert!(
+            outputs
+                .iter()
+                .all(|output| !output.contains(&"a".repeat(80)))
+        );
+        assert_eq!(outputs[0], outputs[1]);
+    }
+
+    #[test]
+    fn nested_instructions_dedup_across_redaction_and_a_manual_snapshot() {
+        use orca_core::config::{HistoryMode, ModelRuntimeConfig, ProviderKind, RunConfig};
+        let (project, home, instructions) = nested_project();
+        let cwd = project.path();
+        let rule = "Keep this rule. api_key=sample-value";
+        fs::write(cwd.join("src/AGENTS.md"), rule).unwrap();
+        crate::history::with_test_orca_home(home.path(), |_| {
+            let config = RunConfig {
+                cwd: Some(cwd.to_owned()),
+                history_mode: HistoryMode::Record,
+                provider: ProviderKind::Mock,
+                model_runtime: ModelRuntimeConfig {
+                    soft_compact_token_limit: Some(4_000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut session = crate::session::InteractiveSession::new_with_preloaded(
+                &config,
+                "nested snapshot",
+                None,
+            )
+            .unwrap();
+            let mut conversation =
+                std::mem::replace(session.conversation_mut(), Conversation::new());
+            let writer = session.writer_mut().unwrap();
+            writer.enter_turn(orca_core::thread_identity::TurnId::new());
+            let old = "old history marker ".repeat(3_500);
+            writer.append_message(&Message::user(old.clone())).unwrap();
+            conversation.add_user(old);
+            touch(
+                &instructions,
+                &mut conversation,
+                Some(writer),
+                cwd,
+                "src/one.txt",
+            );
+            let id = writer.session_id().unwrap();
+            let transcript = crate::history::load_session(&id).unwrap();
+            assert_eq!(
+                transcript.nested_instructions[0].identity.digest,
+                orca_core::hex::lower(&Sha256::digest(rule))
+            );
+            assert_eq!(
+                transcript.nested_instructions[0].identity.workspace,
+                cwd.canonicalize().unwrap()
+            );
+            let mut ordinary = crate::history::resume_conversation(&transcript, "base".into());
+            let before_touch = nested_messages(&ordinary).join("\n");
+            touch(
+                &instructions,
+                &mut ordinary,
+                Some(writer),
+                cwd,
+                "src/two.txt",
+            );
+            assert_eq!(nested_messages(&ordinary), [before_touch.as_str()]);
+            assert_eq!(
+                crate::history::load_session(&id).unwrap().messages.len(),
+                transcript.messages.len()
+            );
+            writer
+                .append_message(&Message::user("retained tail".into()))
+                .unwrap();
+            conversation.add_user("retained tail".into());
+            *session.conversation_mut() = conversation;
+            let identity = crate::session::ManualCompactionPersistenceIdentity {
+                operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .unwrap(),
+                snapshot_id: uuid::Uuid::now_v7().to_string(),
+            };
+            let operation_id = identity.operation_id.clone();
+            let outcome = session
+                .compact(&config, cwd, &orca_core::cancel::CancelToken::new(), |_| {
+                    Ok(identity)
+                })
+                .unwrap();
+            assert!(outcome.before.messages.iter().any(|msg| {
+                msg.content_str()
+                    .is_some_and(|text| text.starts_with("old history marker"))
+            }));
+            assert!(!outcome.after.messages.iter().any(|msg| {
+                msg.content_str()
+                    .is_some_and(|text| text.starts_with("old history marker"))
+            }));
+            let snapshot = session
+                .manual_compaction_snapshot(&operation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.conversation.nested_instructions.versions.len(), 1);
+            let mut resumed = crate::history::resume_conversation(
+                &crate::history::load_session(&id).unwrap(),
+                "base".into(),
+            );
+            let before = nested_messages(&resumed).join("\n");
+            let count = crate::history::load_session(&id).unwrap().messages.len();
+            touch(
+                &instructions,
+                &mut resumed,
+                session.writer_mut(),
+                cwd,
+                "src/two.txt",
+            );
+            assert!(before.contains("Keep this rule. api_key=&lt;redacted&gt;"));
+            assert_eq!(nested_messages(&resumed), [before.as_str()]);
+            assert_eq!(
+                crate::history::load_session(&id).unwrap().messages.len(),
+                count
+            );
+        });
     }
 
     #[test]
@@ -603,7 +952,9 @@ mod tests {
         }
         assert_eq!(
             nested_messages(&conversation),
-            ["Additional instructions for src/ from src/AGENTS.md:\nNested rules"]
+            [
+                "<project-instructions>\n# Additional instructions for src/ from src/AGENTS.md:\nNested rules\n</project-instructions>"
+            ]
         );
     }
 
@@ -617,7 +968,9 @@ mod tests {
                 touch(&instructions, &mut conversation, None, project.path(), path);
             }
         }
-        assert_eq!(nested_messages(&conversation).len(), 2);
+        let messages = nested_messages(&conversation).join("\n");
+        assert!(!messages.contains("First version"));
+        assert_eq!(messages.matches("Second version").count(), 1);
     }
 
     #[test]
@@ -635,8 +988,8 @@ mod tests {
             );
         }
         assert_eq!(
-            nested_messages(&conversation)[1],
-            "Updated instructions for src/ from src/AGENTS.md:\nAfter"
+            nested_messages(&conversation)[0],
+            "<project-instructions>\n# Updated instructions for src/ from src/AGENTS.md:\nAfter\n</project-instructions>"
         );
     }
 
@@ -665,7 +1018,9 @@ mod tests {
         }
         assert_eq!(
             nested_messages(&conversation),
-            ["Updated instructions for src/ from src/AGENTS.md:\nWritten rule"]
+            [
+                "<project-instructions>\n# Updated instructions for src/ from src/AGENTS.md:\nWritten rule\n</project-instructions>"
+            ]
         );
     }
 
@@ -721,10 +1076,102 @@ mod tests {
     }
 
     #[test]
-    fn nested_instructions_survive_resume_without_repeating() {
+    fn root_instructions_preserve_the_full_provider_request() {
+        fn request_body(conversation: &Conversation) -> Vec<u8> {
+            use std::io::{BufRead, BufReader, Read, Write};
+            use std::net::TcpListener;
+            use std::time::{Duration, Instant};
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let stop = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < stop =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("provider fixture: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let mut body = vec![0; length.unwrap()];
+                reader.read_exact(&mut body).unwrap();
+                let reply = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+                body
+            });
+            let config = orca_provider::ProviderConfig {
+                api_key: Some("local-fixture".into()),
+                base_url: Some(url),
+                model: Some("deepseek-flash".into()),
+                tools_override: Some(vec![]),
+                reasoning_effort: Default::default(),
+                mcp_registry: None,
+                external_tools: vec![],
+                max_output_tokens: Some(1024),
+            };
+            let result = orca_provider::deepseek_http::call(conversation, &config);
+            assert_eq!(result.assistant_content.as_deref(), Some("ok"));
+            server.join().unwrap()
+        }
+
         let (project, _home, instructions) = nested_project();
+        let startup = |instructions| {
+            crate::agent_common::build_agent_system_prompt(
+                project.path(),
+                0,
+                &orca_core::subagent_types::SubagentType::General,
+                instructions,
+                orca_core::approval_types::ApprovalMode::Suggest,
+                None,
+            )
+        };
+        let base = startup(None);
+        let plain = crate::system_prompt::build_system_prompt_for_tools(project.path(), None);
+        assert!(base.starts_with(&plain));
+        let boundary = plain.len();
+        let expected = format!(
+            "{}\n\n<project-instructions>\n# {}\nRoot rules\n</project-instructions>{}",
+            &base[..boundary],
+            project.path().join("AGENTS.md").display(),
+            &base[boundary..]
+        );
+        let conversation = |system| {
+            let mut conversation = Conversation::new();
+            conversation.add_system(system);
+            conversation.add_user("Check the project".into());
+            conversation
+        };
+        assert_eq!(
+            request_body(&conversation(startup(Some(&instructions)))),
+            request_body(&conversation(expected))
+        );
+    }
+
+    #[test]
+    fn nested_instructions_survive_resume_without_repeating() {
+        let (project, home, instructions) = nested_project();
         fs::write(project.path().join("src/AGENTS.md"), "Keep this rule").unwrap();
-        crate::history::with_redirected_orca_home("nested-instructions", |_| {
+        crate::history::with_test_orca_home(home.path(), |_| {
             let mut writer =
                 SessionWriter::start(project.path(), "mock", None, "instructions").unwrap();
             writer.enter_turn(orca_core::thread_identity::TurnId::new());
@@ -787,9 +1234,9 @@ mod tests {
 
     #[test]
     fn nested_instructions_remain_after_compaction_and_resume() {
-        let (project, _home, instructions) = nested_project();
+        let (project, home, instructions) = nested_project();
         fs::write(project.path().join("src/AGENTS.md"), "Keep this rule").unwrap();
-        crate::history::with_redirected_orca_home("nested-compaction", |_| {
+        crate::history::with_test_orca_home(home.path(), |_| {
             let mut writer =
                 SessionWriter::start(project.path(), "mock", None, "instructions").unwrap();
             let id = writer.session_id().unwrap();
@@ -824,8 +1271,7 @@ mod tests {
             assert_eq!(
                 nested_messages(&resumed),
                 [
-                    "base",
-                    "Additional instructions for src/ from src/AGENTS.md:\nKeep this rule"
+                    "<project-instructions>\n# Additional instructions for src/ from src/AGENTS.md:\nKeep this rule\n</project-instructions>"
                 ]
             );
         });
@@ -892,8 +1338,7 @@ mod tests {
             assert_eq!(
                 nested_messages(&resumed),
                 [
-                    "base",
-                    "Updated instructions for src/ from src/AGENTS.md:\nWritten rule"
+                    "<project-instructions>\n# Updated instructions for src/ from src/AGENTS.md:\nWritten rule\n</project-instructions>"
                 ]
             );
         });

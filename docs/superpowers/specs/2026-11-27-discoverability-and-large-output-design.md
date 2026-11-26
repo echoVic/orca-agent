@@ -68,12 +68,12 @@ Date: 2026-11-27. Size: project (four parts that can ship separately). It draws 
 **Today.** Orca loads `~/.orca/AGENTS.md`, the trusted folder's root `AGENTS.md` and `.orca/rules/*.md` once per session into the system prompt (`crates/orca-runtime/src/instructions.rs`). An `AGENTS.md` in a subdirectory is never seen, and nothing bounds the total size.
 
 **Change.**
-- **Nested files.** When a successful `read_file`, `write_file` or `edit` touches a file below a directory that holds an `AGENTS.md`, between the workspace root and the file, that file's text is appended once, before the next request, as a system message:
+- **Nested files.** When a successful `read_file`, `write_file` or `edit` touches a file below a directory that holds an `AGENTS.md`, between the workspace root and the file, Orca checks the source directory's current trust and opens a regular file without following links. The file appears before the next request inside a `<project-instructions>` block under the heading:
   `Additional instructions for {dir}/ from {dir}/AGENTS.md:`
-  A later change to the file appends `Updated instructions …`.
+  A later change replaces the active text and uses `Updated instructions …`. Orca records a workspace-relative source, its workspace, and the digest of the full file with each newly seen version. A manual snapshot preserves this state. Resume checks trust again before restoring the block.
 - **Budgets.**
   - Each chain has its own budget of 65,536 bytes: user-global, project root, and nested.
-  - Past a budget, the broadest files are dropped first and the most specific is cut last, with a note naming what was left out.
+  - The nested budget includes previously discovered sources. Orca drops the broadest files first and cuts the most specific last, with a note naming what was left out.
   - The project root's chain keeps today's content when it fits.
 
 ## Non-goals

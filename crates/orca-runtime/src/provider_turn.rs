@@ -433,6 +433,7 @@ impl RuntimeProviderTurnStep {
             sink,
             mut history_writer,
         } = input.io;
+        crate::instructions::refresh_nested_instructions(conversation, input.turn_context.cwd);
         let cwd_display = input.turn_context.cwd.display().to_string();
         let emit_deltas = input.turn_context.emit_deltas;
         let pre_model_outcome = match input.actor.run_pre_model_hook_with_cancel(

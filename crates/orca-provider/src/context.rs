@@ -1089,6 +1089,7 @@ fn summarize_collapsed_messages(
     result.messages = prefix;
     result.messages.extend(kept);
     result.internal_context = conversation.internal_context.clone();
+    result.nested_instructions = conversation.nested_instructions.clone();
     result.rolling_summary = Some(new_delta.clone());
 
     let mut summary = conversation.summary.clone();

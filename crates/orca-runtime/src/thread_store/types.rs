@@ -8,7 +8,9 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{
     ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileNetworkAccess,
 };
-use orca_core::conversation::{ImageInput, Message, RawToolCall};
+use orca_core::conversation::{
+    ImageInput, Message, NestedInstructionSource, NestedInstructionVersion, RawToolCall,
+};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::EventEnvelope;
 use orca_core::plan_types::PlanItem;
@@ -168,6 +170,8 @@ pub struct SessionTranscript {
     pub next_event_seq: u64,
     pub semantic_events: Vec<EventEnvelope>,
     pub path: PathBuf,
+    pub nested_instructions: Vec<NestedInstructionVersion>,
+    pub written_instruction_sources: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -180,6 +184,10 @@ pub(crate) struct ManualCompactionSnapshotRecord {
     pub messages: Vec<StoredMessage>,
     pub rolling_summary: Option<String>,
     pub summary_state: orca_core::conversation::SummaryState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_instructions: Vec<NestedInstructionVersion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub written_instruction_sources: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -515,6 +523,8 @@ pub(crate) enum StoredMessage {
         content: String,
         #[serde(default)]
         pinned: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nested_instruction: Option<Box<NestedInstructionSource>>,
     },
     User {
         content: String,
@@ -696,6 +706,8 @@ enum StoredMessageWire {
         content: String,
         #[serde(default)]
         pinned: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nested_instruction: Option<Box<NestedInstructionSource>>,
     },
     User {
         content: String,
@@ -729,7 +741,15 @@ impl<'de> Deserialize<'de> for StoredMessage {
         D: Deserializer<'de>,
     {
         match StoredMessageWire::deserialize(deserializer)? {
-            StoredMessageWire::System { content, pinned } => Ok(Self::System { content, pinned }),
+            StoredMessageWire::System {
+                content,
+                pinned,
+                nested_instruction,
+            } => Ok(Self::System {
+                content,
+                pinned,
+                nested_instruction,
+            }),
             StoredMessageWire::User {
                 content,
                 images,
@@ -776,6 +796,7 @@ impl From<&Message> for StoredMessage {
             Message::System { content, pinned } => Self::System {
                 content: content.clone(),
                 pinned: *pinned,
+                nested_instruction: None,
             },
             Message::User {
                 content,
@@ -817,7 +838,19 @@ impl From<&Message> for StoredMessage {
 impl From<StoredMessage> for Message {
     fn from(message: StoredMessage) -> Self {
         match message {
-            StoredMessage::System { content, pinned } => Self::System { content, pinned },
+            StoredMessage::System {
+                content,
+                pinned,
+                nested_instruction,
+            } => Self::System {
+                content: match nested_instruction {
+                    Some(identity) => {
+                        crate::instructions::render_nested_record(&identity, &content)
+                    }
+                    None => content,
+                },
+                pinned,
+            },
             StoredMessage::User {
                 content,
                 images,

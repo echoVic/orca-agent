@@ -325,6 +325,7 @@ pub enum InternalContextKind {
     Goal,
     Plan,
     Skill,
+    ProjectInstructions,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -474,11 +475,26 @@ pub struct UsageAnchor {
     boundary: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NestedInstructionSource {
+    pub workspace: PathBuf,
+    pub source: PathBuf,
+    pub digest: String,
+    pub updated: bool,
+    pub shortened: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NestedInstructionVersion {
+    pub identity: NestedInstructionSource,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct NestedInstructionState {
     pub pending_touches: Vec<(PathBuf, bool)>,
     pub written_sources: HashSet<PathBuf>,
-    pub versions: HashMap<String, (String, bool)>,
+    pub versions: std::collections::BTreeMap<PathBuf, NestedInstructionVersion>,
 }
 
 #[derive(Debug)]
@@ -510,7 +526,7 @@ impl Clone for Conversation {
             usage_anchor: self.usage_anchor,
             compaction_hold: self.compaction_hold,
             retained_tool_images: None,
-            nested_instructions: NestedInstructionState::default(),
+            nested_instructions: self.nested_instructions.clone(),
         }
     }
 }

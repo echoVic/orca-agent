@@ -2625,6 +2625,8 @@ fn transcript(session_id: &str) -> history::SessionTranscript {
         completion_error: None,
         next_event_seq: 0,
         semantic_events: Vec::new(),
+        nested_instructions: Vec::new(),
+        written_instruction_sources: Vec::new(),
         path: std::env::temp_dir().join("resumed-goal.jsonl"),
     }
 }

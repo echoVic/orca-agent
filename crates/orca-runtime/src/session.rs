@@ -177,6 +177,7 @@ pub(crate) fn bootstrap_agent_conversation(
         conv.strip_legacy_pinned_volatile();
         conv.strip_legacy_summary_messages();
         conv.unpin_delivered_notices();
+        crate::instructions::refresh_nested_instructions(&mut conv, cwd);
         conv
     } else {
         let mut conversation = Conversation::new();
@@ -325,6 +326,7 @@ impl InteractiveSession {
                 conv.strip_legacy_pinned_volatile();
                 conv.strip_legacy_summary_messages();
                 conv.unpin_delivered_notices();
+                crate::instructions::refresh_nested_instructions(&mut conv, &cwd);
                 (conv, Some(transcript))
             }
             HistoryMode::ResumeAt {
@@ -344,6 +346,7 @@ impl InteractiveSession {
                 conv.strip_legacy_pinned_volatile();
                 conv.strip_legacy_summary_messages();
                 conv.unpin_delivered_notices();
+                crate::instructions::refresh_nested_instructions(&mut conv, &cwd);
                 (conv, Some(transcript))
             }
             HistoryMode::Record | HistoryMode::Disabled => {
@@ -1012,6 +1015,12 @@ fn start_writer_with_messages(
         Ok(mut writer) => {
             for message in &conversation.messages {
                 if let Err(error) = writer.append_legacy_message(message) {
+                    eprintln!("orca: warning: history write failed: {error}");
+                    return None;
+                }
+            }
+            for version in conversation.nested_instructions.versions.values() {
+                if let Err(error) = writer.append_nested_instruction(version) {
                     eprintln!("orca: warning: history write failed: {error}");
                     return None;
                 }
