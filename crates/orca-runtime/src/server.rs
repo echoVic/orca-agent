@@ -2926,7 +2926,10 @@ mod tests {
                 script.to_string(),
             ]
         } else {
-            vec!["sh".to_string(), "-lc".to_string(), script.to_string()]
+            // Not a login shell (`-lc`): that reads the host's profile, which
+            // on a developer's machine can take seconds (nvm.sh alone took
+            // 2.6 s on one) and ran into these tests' 5 s command timeouts.
+            vec!["sh".to_string(), "-c".to_string(), script.to_string()]
         }
     }
 

@@ -178,7 +178,11 @@ fn platform_command(unix: &str, windows: &str) -> Vec<String> {
     #[cfg(not(windows))]
     {
         let _ = windows;
-        vec!["sh".to_string(), "-lc".to_string(), unix.to_string()]
+        // Not a login shell (`-lc`): that reads the host's profile, which on
+        // a developer's machine can take seconds (nvm.sh alone took 2.6 s on
+        // one) before the command runs, and these tests' waits are for the
+        // command. Like `-NoProfile` above.
+        vec!["sh".to_string(), "-c".to_string(), unix.to_string()]
     }
 }
 
