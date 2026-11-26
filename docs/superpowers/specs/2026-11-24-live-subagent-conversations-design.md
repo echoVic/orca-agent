@@ -104,9 +104,9 @@ them.`), and quitting stops them so they are recorded as stopped.
 ### Moving main to the background
 
 Stage 1 left a main turn whose agents run in the TUI's process free to be
-moved to the background; that gap is closed by refusal: Ctrl+B on such a
-turn shows `This turn cannot move to the background while its subagents
-are running.`, and the turn stays in the foreground.
+moved to the background; that gap is closed by refusal. Ctrl+B on such a
+turn shows this line, and the turn stays in the foreground:
+`This turn cannot move to the background while its subagents are running.`
 
 ### The card
 
