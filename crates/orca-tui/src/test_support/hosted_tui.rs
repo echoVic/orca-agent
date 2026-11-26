@@ -31,7 +31,8 @@ pub(crate) const WAIT: Duration = Duration::from_secs(20);
 /// `delay_secs`, and then offers one tool, `search`, and one prompt,
 /// `review_pr <pr>`, which it expands to "Review pull request <pr>."
 /// While `<dir>/refuse` exists, it exits at once instead, and while
-/// `<dir>/silent` exists, it never answers.
+/// `<dir>/silent` exists, it never answers. The one launch that finds
+/// `<dir>/silent-once` renames it to `silent-once.taken` and never answers.
 #[cfg(unix)]
 pub(crate) fn mcp_server(name: &str, dir: &Path, delay_secs: u64) -> McpServerConfig {
     let script = dir.join("server.sh");
@@ -40,7 +41,8 @@ pub(crate) fn mcp_server(name: &str, dir: &Path, delay_secs: u64) -> McpServerCo
         r#"state_dir="$1"
 printf '%s\n' "$$" >> "$state_dir/pids"
 [ -f "$state_dir/refuse" ] && exit 0
-if [ -f "$state_dir/silent" ]; then
+if [ -f "$state_dir/silent" ] ||
+  mv "$state_dir/silent-once" "$state_dir/silent-once.taken" 2>/dev/null; then
   while IFS= read -r line; do :; done
   exit 0
 fi

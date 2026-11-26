@@ -1218,6 +1218,11 @@ done
             orca_mcp::initialize_registry(&[mcp_server("docs", fixture.path(), 1)], None);
         assert!(registry.wait_for_startup(&|| false));
 
+        // The server this reconnect starts never answers, so it is still
+        // connecting when the newer one comes, however late that is. With
+        // an answering server, a newer reconnect a second late would find
+        // it connected, not overtake it.
+        std::fs::write(fixture.path().join("silent-once"), "").expect("silence one launch");
         let overtaken = std::thread::spawn({
             let registry = registry.clone();
             move || reconnect_prestarted(&registry, "docs")
@@ -1225,6 +1230,14 @@ done
         // Once its server has started, a newer reconnect overtakes it, which
         // stops that server: it fails with what it hit there.
         wait_for_launches(fixture.path(), 2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !fixture.path().join("silent-once.taken").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second launch never went silent"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(registry.reconnect_server("docs").is_ok());
 
         assert_eq!(
