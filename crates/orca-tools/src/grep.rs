@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
@@ -56,7 +57,7 @@ pub fn execute_or_cancel(
 
     let mut command = Command::new("rg");
     command
-        .args(["--line-number", "--no-heading", pattern, &search_path])
+        .args(rg_args(pattern, Path::new(&search_path)))
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -131,6 +132,17 @@ pub fn execute_or_cancel(
         ),
         Err(error) => ToolResult::failed(request, format!("failed to run rg: {error}"), None),
     }
+}
+
+fn rg_args(pattern: &str, search_path: &Path) -> Vec<OsString> {
+    vec![
+        "--no-config".into(),
+        "--line-number".into(),
+        "--no-heading".into(),
+        format!("--regexp={pattern}").into(),
+        "--".into(),
+        search_path.as_os_str().to_owned(),
+    ]
 }
 
 fn execute_in_process(
@@ -361,6 +373,81 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolResultKind, ToolStatus};
 
     use super::*;
+
+    #[test]
+    fn rg_args_pass_the_pattern_and_path_as_values() {
+        assert_eq!(
+            rg_args("-> Result", Path::new("src")),
+            [
+                "--no-config",
+                "--line-number",
+                "--no-heading",
+                "--regexp=-> Result",
+                "--",
+                "src",
+            ]
+            .map(std::ffi::OsString::from),
+        );
+    }
+
+    #[test]
+    fn a_pattern_starting_with_a_dash_is_searched_literally() {
+        let cwd = temp_dir("grep-dash-pattern");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::write(cwd.join("lib.rs"), "fn load() -> Result<()> {\nfn other() {}\n")
+            .expect("write fixture");
+
+        let result = execute(&grep_request(r#"{"pattern":"-> Result","path":"."}"#), &cwd, 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let output = result.output.as_deref().expect("grep output");
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("fn load() -> Result<()> {"), "{output}");
+    }
+
+    #[test]
+    fn a_pattern_naming_an_rg_option_is_searched_literally() {
+        let cwd = temp_dir("grep-option-name");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::write(cwd.join("notes.txt"), "pass --files to list them\n").expect("write fixture");
+        fs::write(cwd.join("other.txt"), "nothing here\n").expect("write fixture");
+
+        let result = execute(&grep_request(r#"{"pattern":"--files"}"#), &cwd, 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let output = result.output.as_deref().expect("grep output");
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("pass --files to list them"), "{output}");
+    }
+
+    #[test]
+    fn a_pattern_with_an_equals_sign_is_searched_literally() {
+        let cwd = temp_dir("grep-equals-pattern");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::write(cwd.join("notes.txt"), "a=b\nab\n").expect("write fixture");
+
+        let result = execute(&grep_request(r#"{"pattern":"a=b"}"#), &cwd, 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let output = result.output.as_deref().expect("grep output");
+        assert_eq!(output.lines().count(), 1);
+        assert!(output.contains("a=b"), "{output}");
+    }
+
+    #[test]
+    fn an_empty_pattern_still_matches_every_line() {
+        let cwd = temp_dir("grep-empty-pattern");
+        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::write(cwd.join("notes.txt"), "first line\nsecond line\n").expect("write fixture");
+
+        let result = execute(&grep_request(r#"{"pattern":""}"#), &cwd, 4096);
+
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let output = result.output.as_deref().expect("grep output");
+        assert_eq!(output.lines().count(), 2);
+        assert!(output.contains("first line"), "{output}");
+        assert!(output.contains("second line"), "{output}");
+    }
 
     #[test]
     fn missing_search_path_completes_with_no_matches() {
@@ -594,6 +681,16 @@ mod tests {
             assert_eq!(result.error.as_deref(), Some("grep was cancelled"));
         }
         let _ = fs::remove_dir_all(&cwd);
+    }
+
+    fn grep_request(arguments: &str) -> ToolRequest {
+        ToolRequest {
+            id: "grep-1".to_string(),
+            name: ToolName::Grep,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(arguments.to_string()),
+        }
     }
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
