@@ -2009,7 +2009,7 @@ mod tests {
     async fn diagnostic_rejects_unusable_request_ids() {
         for id in [
             "Bearer opaque-demo-value",
-            "Basic dGVzdDpmaXh0dXJl",
+            "Basic opaque-demo-value",
             "sk-demo-value",
             "ghp_demo_value",
             "eyJhbGciOiJIUzI1NiJ9.demo.signature",
@@ -2021,6 +2021,14 @@ mod tests {
             assert_eq!(error.request_id, None);
             assert_eq!(error.message, "DeepSeek provider error: missing (HTTP 404)");
         }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_hides_an_echo_of_the_outgoing_key() {
+        let error =
+            streamed_http_error(404, "x-request-id: test-key\r\n", "gateway echoed test-key").await;
+        assert_eq!(error.request_id, None);
+        assert!(error.message.contains("gateway echoed <redacted>"));
     }
 
     #[tokio::test]

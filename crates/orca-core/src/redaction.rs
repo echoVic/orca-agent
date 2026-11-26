@@ -108,6 +108,7 @@ fn is_sensitive_key(key: &str) -> bool {
     }
     let key = key.to_ascii_lowercase();
     key.contains("api_key")
+        || key.contains("api-key")
         || key.contains("apikey")
         || key.contains("token")
         || key.contains("password")
@@ -219,6 +220,14 @@ mod tests {
                 "Authorization: <redacted>; next=visible"
             );
         }
+    }
+
+    #[test]
+    fn diagnostic_redaction_covers_api_key_headers() {
+        assert_eq!(
+            redact_sensitive_text(&format!("X-API-Key: {}", "opaque-example")),
+            "X-API-Key: <redacted>"
+        );
     }
 
     #[test]

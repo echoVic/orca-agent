@@ -358,12 +358,17 @@ async fn admit_async(
     }
 }
 
-fn admit_blocking(key: [u8; 32], budget: &RetryBudget, cancel: &CancelToken) -> Result<(), String> {
+fn admit_blocking(
+    key: [u8; 32],
+    previous_key: Option<[u8; 32]>,
+    budget: &RetryBudget,
+    cancel: &CancelToken,
+) -> Result<(), String> {
     loop {
         if cancel.is_cancelled() {
             return Err("request cancelled".into());
         }
-        let delay = cooldown_delay(key, None, Duration::ZERO);
+        let delay = cooldown_delay(key, previous_key, Duration::ZERO);
         if delay.is_zero() {
             return budget.charge_send();
         }
@@ -387,11 +392,16 @@ pub(crate) struct HttpFailure {
 }
 
 impl HttpFailure {
-    fn new(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> Self {
+    fn new(
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        credentials: &RequestCredentials,
+    ) -> Self {
         let request_id = ["x-request-id", "request-id", "x-deepseek-request-id"]
             .into_iter()
             .find_map(|name| headers.get(name))
             .and_then(|value| value.to_str().ok())
+            .filter(|id| !credentials.values().any(|value| id.contains(value)))
             .and_then(validated_request_id);
         Self {
             status,
@@ -407,6 +417,40 @@ impl HttpFailure {
         }
         self.body = reason;
         RequestFailure::Http(self)
+    }
+}
+
+struct RequestCredentials(Vec<reqwest::header::HeaderValue>);
+
+impl RequestCredentials {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        Self(
+            [
+                "authorization",
+                "proxy-authorization",
+                "x-api-key",
+                "api-key",
+            ]
+            .into_iter()
+            .filter_map(|name| headers.get(name).cloned())
+            .collect(),
+        )
+    }
+
+    fn values(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().filter_map(|header| {
+            let text = header.to_str().ok()?.trim();
+            let value = match text.split_once([' ', '\t']) {
+                Some((scheme, value))
+                    if scheme.eq_ignore_ascii_case("bearer")
+                        || scheme.eq_ignore_ascii_case("basic") =>
+                {
+                    value.trim()
+                }
+                _ => text,
+            };
+            (!value.is_empty()).then_some(value)
+        })
     }
 }
 
@@ -542,22 +586,25 @@ pub(crate) fn execute_with_retry_details(
     let client = client()?;
     let mut attempt: u32 = 0;
     let mut previous_failure: Option<HttpFailure> = None;
+    let mut previous_key = None;
     loop {
         let request = build_request(client)
             .build()
             .map_err(|e| format!("request build failed: {e}"))?;
         let sends_before = budget.attempts();
         let previous = previous_failure.take();
-        let (result, key) =
-            send_built_blocking_request(client, request, cancel, budget).map_err(|reason| {
-                match previous {
-                    Some(failure) if budget.attempts() == sends_before => {
-                        failure.retry_refused(reason, cancel)
-                    }
-                    _ => reason.into(),
+        let HttpSend {
+            response,
+            key,
+            credentials,
+        } = send_built_blocking_request(client, request, cancel, budget, previous_key.take())
+            .map_err(|reason| match previous {
+                Some(failure) if budget.attempts() == sends_before => {
+                    failure.retry_refused(reason, cancel)
                 }
+                _ => reason.into(),
             })?;
-        match result {
+        match response {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -567,7 +614,7 @@ pub(crate) fn execute_with_retry_details(
                 let retry_after = retryable
                     .then(|| extend_cooldown(key, resp.headers()))
                     .flatten();
-                let mut failure = HttpFailure::new(status, resp.headers());
+                let mut failure = HttpFailure::new(status, resp.headers(), &credentials);
                 if !retryable || attempt >= MAX_RETRIES || !budget.can_retry() {
                     failure.exhausted = retryable;
                     let length = resp.content_length();
@@ -576,7 +623,11 @@ pub(crate) fn execute_with_retry_details(
                         Err(error) if body.is_empty() => {
                             format!("response body read failed: {error}")
                         }
-                        _ => error_body_text(&body, error_body_may_continue(length, body.len())),
+                        _ => error_body_text(
+                            &body,
+                            error_body_may_continue(length, body.len()),
+                            &credentials,
+                        ),
                     };
                     return Err(RequestFailure::Http(failure));
                 }
@@ -587,6 +638,7 @@ pub(crate) fn execute_with_retry_details(
                     return Err(failure.retry_refused(reason, cancel));
                 }
                 previous_failure = Some(failure);
+                previous_key = Some(key);
             }
             Err(err) => {
                 if attempt >= MAX_RETRIES || !budget.can_retry() || !is_retryable_error(&err) {
@@ -657,24 +709,28 @@ pub(crate) async fn execute_streaming_with_retry_details(
             }
         })
         .await;
-        let (result, key) = match send {
+        let HttpSend {
+            response,
+            key,
+            credentials,
+        } = match send {
             Ok(sent) => sent,
             Err(message) if !cancel.is_cancelled() && budget.attempts() == sends_before => {
                 return Err(previous_failure.unwrap_or_else(|| message.into()));
             }
             Err(message) => return Err(message.into()),
         };
-        let (failure, retry_after) = match result {
+        let (failure, retry_after) = match response {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
                     return Ok(resp);
                 }
                 if !is_retryable_status(status.as_u16()) {
-                    return Err(streaming_http_failure(resp, cancel, false).await);
+                    return Err(streaming_http_failure(resp, cancel, false, &credentials).await);
                 }
                 let retry_after = extend_cooldown(key, resp.headers());
-                let failure = streaming_http_failure(resp, cancel, true).await;
+                let failure = streaming_http_failure(resp, cancel, true, &credentials).await;
                 if attempt >= MAX_RETRIES || !budget.can_retry() {
                     return Err(failure);
                 }
@@ -730,10 +786,13 @@ pub(crate) async fn execute_streaming_once_with_budget(
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build_split();
     let request = request.map_err(|e| format!("request build failed: {e}"))?;
-    let (result, key) =
-        send_built_streaming_request(&client, request, cancel, budget, Duration::ZERO, |_| {})
-            .await?;
-    let response = result.map_err(|error| format!("request failed after 1 attempt: {error}"))?;
+    let HttpSend {
+        response,
+        key,
+        credentials,
+    } = send_built_streaming_request(&client, request, cancel, budget, Duration::ZERO, |_| {})
+        .await?;
+    let response = response.map_err(|error| format!("request failed after 1 attempt: {error}"))?;
     let status = response.status();
     if is_retryable_status(status.as_u16()) {
         extend_cooldown(key, response.headers());
@@ -745,7 +804,7 @@ pub(crate) async fn execute_streaming_once_with_budget(
                 status.as_u16()
             );
         }
-        return Err(streaming_http_failure(response, cancel, false).await);
+        return Err(streaming_http_failure(response, cancel, false, &credentials).await);
     }
     Ok(response)
 }
@@ -754,15 +813,16 @@ async fn streaming_http_failure(
     response: Response,
     cancel: &CancelToken,
     exhausted: bool,
+    credentials: &RequestCredentials,
 ) -> RequestFailure {
-    let mut failure = HttpFailure::new(response.status(), response.headers());
+    let mut failure = HttpFailure::new(response.status(), response.headers(), credentials);
     failure.exhausted = exhausted;
     let timeout = if is_retryable_status(failure.status.as_u16()) {
         TRANSIENT_ERROR_BODY_TIMEOUT
     } else {
         streaming_idle_read_timeout()
     };
-    failure.body = match error_response_text(response, cancel, timeout).await {
+    failure.body = match error_response_text(response, cancel, timeout, credentials).await {
         Ok(body) => body,
         Err(message) if cancel.is_cancelled() => return RequestFailure::Other(message),
         Err(message) => message,
@@ -774,6 +834,7 @@ async fn error_response_text(
     mut response: Response,
     cancel: &CancelToken,
     timeout: Duration,
+    credentials: &RequestCredentials,
 ) -> Result<String, String> {
     let length = response.content_length();
     let mut body = Vec::new();
@@ -803,6 +864,7 @@ async fn error_response_text(
     Ok(error_body_text(
         &body,
         cut_chunk || error_body_may_continue(length, body.len()),
+        credentials,
     ))
 }
 
@@ -810,8 +872,14 @@ fn error_body_may_continue(length: Option<u64>, read: usize) -> bool {
     length.map_or(read == ERROR_BODY_LIMIT, |length| length > read as u64)
 }
 
-fn error_body_text(body: &[u8], truncated: bool) -> String {
-    let mut text = orca_core::redaction::redact_sensitive_text(&String::from_utf8_lossy(body));
+fn error_body_text(body: &[u8], truncated: bool, credentials: &RequestCredentials) -> String {
+    let body = String::from_utf8_lossy(body);
+    let mut text = orca_core::redaction::redact_sensitive_text(&body);
+    for value in credentials.values() {
+        if text.contains(value) {
+            text = text.replace(value, "<redacted>");
+        }
+    }
     let bounded = text.floor_char_boundary(ERROR_BODY_LIMIT);
     if truncated || bounded < text.len() {
         text.truncate(bounded);
@@ -919,14 +987,19 @@ fn request_retry_budget(
     Ok(scoped)
 }
 
-type HttpSendResult<T> = Result<(Result<T, reqwest::Error>, [u8; 32]), String>;
+struct HttpSend<T> {
+    response: Result<T, reqwest::Error>,
+    key: [u8; 32],
+    credentials: RequestCredentials,
+}
 
 fn send_built_blocking_request(
     client: &BlockingClient,
     mut request: reqwest::blocking::Request,
     cancel: &CancelToken,
     budget: &RetryBudget,
-) -> HttpSendResult<BlockingResponse> {
+    mut previous_key: Option<[u8; 32]>,
+) -> Result<HttpSend<BlockingResponse>, String> {
     let scoped = request_retry_budget(
         budget,
         Some(
@@ -939,15 +1012,20 @@ fn send_built_blocking_request(
     let budget = &scoped;
     loop {
         let key = quota_key(request.url(), request.headers());
-        admit_blocking(key, budget, cancel)?;
+        admit_blocking(key, previous_key.take(), budget, cancel)?;
         *request.timeout_mut() = budget.remaining_time()?;
         let replay = request.try_clone();
+        let credentials = RequestCredentials::from_headers(request.headers());
         match client.execute(request) {
             Ok(response) => {
                 let Some(next) =
                     redirect_target(response.status(), response.headers(), response.url())?
                 else {
-                    return Ok((Ok(response), key));
+                    return Ok(HttpSend {
+                        response: Ok(response),
+                        key,
+                        credentials,
+                    });
                 };
                 let mut follow = replay.ok_or("provider redirect body cannot be replayed")?;
                 let mut method = follow.method().clone();
@@ -965,7 +1043,13 @@ fn send_built_blocking_request(
                 *follow.url_mut() = next;
                 request = follow;
             }
-            Err(error) => return Ok((Err(error), key)),
+            Err(error) => {
+                return Ok(HttpSend {
+                    response: Err(error),
+                    key,
+                    credentials,
+                });
+            }
         }
     }
 }
@@ -977,7 +1061,7 @@ async fn send_built_streaming_request(
     budget: &RetryBudget,
     backoff: Duration,
     mut on_admission: impl FnMut(Option<Duration>),
-) -> HttpSendResult<Response> {
+) -> Result<HttpSend<Response>, String> {
     let scoped = request_retry_budget(budget, request.timeout().copied())?;
     let budget = &scoped;
     let mut initial_hop = true;
@@ -1002,6 +1086,7 @@ async fn send_built_streaming_request(
         initial_hop = false;
         *request.timeout_mut() = budget.remaining_time()?;
         let replay = request.try_clone();
+        let credentials = RequestCredentials::from_headers(request.headers());
         let result = tokio::select! {
             biased;
             _ = wait_for_cancel(cancel) => return Err("request cancelled".into()),
@@ -1015,7 +1100,11 @@ async fn send_built_streaming_request(
                 let Some(next) =
                     redirect_target(response.status(), response.headers(), response.url())?
                 else {
-                    return Ok((Ok(response), key));
+                    return Ok(HttpSend {
+                        response: Ok(response),
+                        key,
+                        credentials,
+                    });
                 };
                 let mut follow = replay.ok_or("provider redirect body cannot be replayed")?;
                 let mut method = follow.method().clone();
@@ -1033,7 +1122,13 @@ async fn send_built_streaming_request(
                 *follow.url_mut() = next;
                 request = follow;
             }
-            Err(error) => return Ok((Err(error), key)),
+            Err(error) => {
+                return Ok(HttpSend {
+                    response: Err(error),
+                    key,
+                    credentials,
+                });
+            }
         }
     }
 }
@@ -1209,6 +1304,26 @@ mod tests {
         let error = crate::deepseek_http::provider_request_error(failure);
         assert_eq!(server.join().unwrap(), 1);
         assert_eq!(budget.attempts(), 1);
+        assert_eq!(error.http_status, Some(429));
+        assert_eq!(error.request_id.as_deref(), Some("retry-429"));
+        assert!(error.message.contains("exceeds retry deadline"));
+    }
+
+    #[test]
+    fn blocking_retry_checks_the_redirected_cooldown_before_restarting() {
+        let redirect = "HTTP/1.1 307 Temporary Redirect\r\nLocation: /quota\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (url, server) =
+            retry_response_server(vec![redirect.into(), retry_response(30), redirect.into()]);
+        let budget = RetryBudget::new(
+            5,
+            Duration::from_secs(120),
+            Some(Instant::now() + Duration::from_secs(3)),
+        );
+        let failure =
+            execute_with_retry_details(|c| c.get(&url), &budget, &CancelToken::new()).unwrap_err();
+        let error = crate::deepseek_http::provider_request_error(failure);
+        assert_eq!(server.join().unwrap(), 2);
+        assert_eq!(budget.attempts(), 2);
         assert_eq!(error.http_status, Some(429));
         assert_eq!(error.request_id.as_deref(), Some("retry-429"));
         assert!(error.message.contains("exceeds retry deadline"));
