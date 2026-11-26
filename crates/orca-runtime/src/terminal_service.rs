@@ -339,7 +339,12 @@ impl TerminalService {
         let (sender, receiver) = mpsc::sync_channel(TERMINAL_COMMAND_CAPACITY);
         let supervisor = thread::Builder::new()
             .name("orca-terminal-supervisor".to_string())
-            .spawn(move || run_terminal_supervisor(task_registry, end_sink, receiver))
+            .spawn(move || {
+                run_terminal_supervisor(
+                    TerminalServiceState::new(task_registry, end_sink),
+                    receiver,
+                )
+            })
             .expect("terminal supervisor thread must start");
         Self {
             sender,
@@ -717,12 +722,7 @@ fn receive_response<T>(receiver: Receiver<T>, operation: &str) -> io::Result<T> 
     })
 }
 
-fn run_terminal_supervisor(
-    task_registry: TaskRegistry,
-    end_sink: Option<ShellTaskEndSink>,
-    receiver: Receiver<TerminalCommand>,
-) {
-    let mut state = TerminalServiceState::new(task_registry, end_sink);
+fn run_terminal_supervisor(mut state: TerminalServiceState, receiver: Receiver<TerminalCommand>) {
     loop {
         match receiver.recv_timeout(POLL_INTERVAL) {
             Ok(TerminalCommand::Start {
@@ -830,6 +830,7 @@ fn run_terminal_supervisor(
                     .retain(|completion| !task_ids.contains(&completion.task_id));
             }
             Ok(TerminalCommand::ReadCompletions { drain, response }) => {
+                let _ = state.reap();
                 let completions = if drain {
                     state.completions.drain(..).collect()
                 } else {
@@ -1109,6 +1110,11 @@ impl TerminalServiceState {
     fn reap(&mut self) -> io::Result<()> {
         let mut outputs = self.manager.reap_requested_stops_preserving_output()?;
         outputs.extend(self.manager.reap_completed_preserving_output()?);
+        let reaped_at = Instant::now();
+        outputs.sort_by(|left, right| {
+            (left.exited_at.unwrap_or(reaped_at), &left.task_id)
+                .cmp(&(right.exited_at.unwrap_or(reaped_at), &right.task_id))
+        });
         for output in outputs {
             self.record_terminal(&output);
         }
@@ -1141,7 +1147,7 @@ impl TerminalServiceState {
                 terminal.deadline_source = Some(source);
             }
             session.terminal = Some(terminal);
-            session.completed_at = Some(Instant::now());
+            session.completed_at = Some(output.exited_at.unwrap_or_else(Instant::now));
             if let Some(request) = session.pending_network_block.take() {
                 let _ = request.resolve(RuntimeNetworkBlockDecision::Deny);
             }
@@ -2383,6 +2389,115 @@ mod tests {
         assert!(ends[0].deadline_reached, "{:?}", ends[0]);
     }
 
+    fn start_gated_command(state: &mut TerminalServiceState, cwd: &Path) -> ShellSessionHandle {
+        use orca_platform::shell::{ShellKind, ShellResolver};
+        let command = match ShellResolver::for_current_host()
+            .resolve_from_environment()
+            .unwrap()
+            .kind()
+        {
+            ShellKind::Posix | ShellKind::GitBash => "read -r line",
+            ShellKind::PowerShell(_) => "$null = [Console]::ReadLine()",
+            ShellKind::Cmd => "set /p line=",
+        };
+        let overlay = TurnPermissionOverlay::default();
+        let (command, _, _, _) =
+            prepare_shell_command(request(command, cwd, &overlay, ShellTerminalMode::pipe()))
+                .unwrap();
+        let handle = state.manager.spawn(command).unwrap();
+        state.sessions.insert(
+            handle.id.clone(),
+            TerminalSessionState::from_handle(&handle, "gated command".into(), None, None),
+        );
+        state.mark_background(&handle.id);
+        handle
+    }
+
+    fn wait_for_process_exits(state: &mut TerminalServiceState, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state
+            .manager
+            .list()
+            .iter()
+            .filter(|session| session.status == TaskStatus::Completed)
+            .count()
+            != count
+        {
+            assert!(
+                Instant::now() < deadline,
+                "expected {count} commands to exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_command_that_exited_before_the_boundary_is_delivered_there() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut state = TerminalServiceState::new(TaskRegistry::new("boundary".into()), None);
+        let handle = start_gated_command(&mut state, cwd.path());
+        state.manager.write_stdin(&handle.id, "finish\n").unwrap();
+        wait_for_process_exits(&mut state, 1);
+        assert!(state.completions.is_empty());
+
+        let (sender, receiver) = mpsc::channel();
+        let (response, snapshot) = mpsc::sync_channel(1);
+        sender
+            .send(TerminalCommand::ReadCompletions {
+                drain: false,
+                response,
+            })
+            .unwrap();
+        drop(sender);
+        run_terminal_supervisor(state, receiver);
+        let notices = snapshot.recv().unwrap();
+        assert_eq!(
+            notices
+                .iter()
+                .map(|notice| &notice.task_id)
+                .collect::<Vec<_>>(),
+            vec![&handle.task_id]
+        );
+    }
+
+    #[test]
+    fn exits_found_in_one_reap_are_delivered_in_a_stable_order() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut state = TerminalServiceState::new(TaskRegistry::new("ordered-exits".into()), None);
+        for _ in 0..4 {
+            start_gated_command(&mut state, cwd.path());
+        }
+        let mut sessions = state.manager.list();
+        let first = sessions.pop().unwrap();
+        state.manager.write_stdin(&first.id, "finish\n").unwrap();
+        wait_for_process_exits(&mut state, 1);
+        for session in &sessions {
+            state.manager.write_stdin(&session.id, "finish\n").unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for session in &sessions {
+            while !state.manager.has_exited_for_test(&session.id).unwrap() {
+                assert!(Instant::now() < deadline, "expected {} to exit", session.id);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let mut expected = sessions
+            .into_iter()
+            .map(|session| session.task_id)
+            .collect::<Vec<_>>();
+        expected.sort();
+        expected.insert(0, first.task_id);
+        state.reap().unwrap();
+        assert_eq!(
+            state
+                .completions
+                .iter()
+                .map(|notice| notice.task_id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
     #[test]
     fn an_end_recorded_before_its_call_yields_is_reported_when_it_does() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2407,6 +2522,7 @@ mod tests {
             exit_code: Some(0),
             status: TaskStatus::Completed,
             termination: ShellSessionTermination::Exited,
+            exited_at: None,
             requested_terminal: ShellTerminalMode::pipe(),
             effective_terminal: ShellTerminalMode::pipe(),
         });
