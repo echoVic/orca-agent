@@ -296,3 +296,20 @@ orca trust remove --cwd ./project
 
 The closest explicit ancestor decision applies to a nested directory. A closer
 explicit untrusted decision overrides a broader trusted ancestor.
+
+## Project instructions
+
+Orca loads the user-wide `AGENTS.md` from `$ORCA_HOME`. For a trusted project,
+it also loads the root `AGENTS.md` and `.orca/rules/*.md` at session startup.
+
+Put instructions for a specific area in a subdirectory's `AGENTS.md`. After a
+successful `read_file`, `write_file`, or `edit`, Orca checks for `AGENTS.md`
+files between the trusted workspace root and the affected file. It adds each
+new version to the conversation before the next model request and preserves
+that record when you resume. If the model writes an `AGENTS.md`, Orca adds it
+on the next touch in its scope.
+
+User-wide instructions, project-root instructions, and each chain of nested
+instructions each have a 65,536-byte budget. If a chain exceeds its budget,
+Orca drops the broadest files first and cuts the most specific file if needed.
+The budget notice names the files it dropped or cut.
