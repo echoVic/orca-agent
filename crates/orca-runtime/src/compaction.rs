@@ -363,12 +363,6 @@ pub(crate) fn child_unrecoverable_overflow_message(provider_message: &str) -> St
     )
 }
 
-/// A pressure compaction is kept only when it brings the prompt under the soft
-/// line or cuts it by at least this share. Under a pinned prompt that alone is
-/// past the line, folding one small tool exchange saves a few percent and only
-/// discards the agent's recent results (#175). Emergencies keep any reduction.
-const PRESSURE_COMPACTION_MIN_GAIN_PERCENT: usize = 10;
-
 /// After a pressure compaction found nothing worth keeping, the next one waits
 /// until the prompt has grown by this share past where it was tried.
 const PRESSURE_COMPACTION_RETRY_GROWTH_PERCENT: usize = 10;
@@ -891,22 +885,14 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         } else {
             self.context_config
         };
-        let mut compaction = if let Some(cancel) = self.cancel_token() {
-            context::compact_with_summary_cancellable(
-                self.provider,
-                conversation,
-                context_config,
-                self.provider_config,
-                cancel,
-            )
-        } else {
-            context::compact_with_summary(
-                self.provider,
-                conversation,
-                context_config,
-                self.provider_config,
-            )
-        };
+        let mut compaction = context::compact_with_summary_for_trigger(
+            self.provider,
+            conversation,
+            context_config,
+            self.provider_config,
+            self.cancel_token(),
+            trigger.is_emergency(),
+        );
         if let Some(tracker) = self.cost_tracker.as_deref_mut()
             && record_checkpoint_usage(tracker, &compaction.observation)
             && self.turn_context.emit_deltas
@@ -984,18 +970,12 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         before: context::PromptMeasurement,
         after: context::PromptMeasurement,
     ) -> bool {
-        if after.estimated >= before.estimated {
-            return false;
-        }
-        if trigger.is_emergency() {
-            return true;
-        }
-        let saved = before.estimated - after.estimated;
-        before.calibrate_compacted_estimate(after.estimated) <= self.context_config.soft_limit()
-            || saved.saturating_mul(100)
-                >= before
-                    .estimated
-                    .saturating_mul(PRESSURE_COMPACTION_MIN_GAIN_PERCENT)
+        context::worth_adopting_compaction(
+            before,
+            after.estimated,
+            self.context_config.soft_limit(),
+            trigger.is_emergency(),
+        )
     }
 
     fn emit_compaction_completed(&mut self, outcome: &RuntimeCompactionOutcome) -> io::Result<()> {

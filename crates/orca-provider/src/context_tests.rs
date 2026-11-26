@@ -1227,6 +1227,45 @@ mod replay_compaction {
     }
 
     #[test]
+    fn a_replay_checkpoint_that_fails_the_gain_rule_falls_back_to_the_hierarchy() {
+        let checkpoint = format!("{CHECKPOINT}\n{}", "fact ".repeat(15_000));
+        let server = server(json!({"content": checkpoint}), "stop");
+        let mut conversation = Conversation::new();
+        conversation.add_system("instructions".to_string());
+        conversation.add_user("evidence ".repeat(20_000));
+        conversation.add_system_pinned("keep this notice".to_string());
+        let current = "current ".repeat(138_000);
+        conversation.add_user(current.clone());
+        let config = config(140_000, 256_000);
+        let mut provider = server.config();
+        provider.model = Some(orca_core::model::PRO_MODEL.to_string());
+
+        let result =
+            compact_with_summary(ProviderKind::DeepSeek, &conversation, &config, &provider);
+
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == FALLBACK)
+        );
+        assert!(measure_prompt(&result.conversation, &provider).tokens <= config.soft_limit());
+        assert_eq!(
+            result.conversation.last_user_message(),
+            Some(current.as_str())
+        );
+        assert!(result.conversation.messages.iter().any(|message| {
+            message.is_pinned() && message.content_str() == Some("keep this notice")
+        }));
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests[0].model, orca_core::model::PRO_MODEL);
+        assert_eq!(result.observation.summary_requests[0].outcome, "failed");
+        assert!(requests.len() > 1);
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.model == orca_core::model::FLASH_MODEL)
+        );
+    }
+
+    #[test]
     fn a_replay_checkpoint_replaces_the_previous_summary() {
         let server = server(json!({"content": CHECKPOINT}), "stop");
         let mut conversation = conversation();

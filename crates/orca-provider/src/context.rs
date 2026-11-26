@@ -687,6 +687,24 @@ impl PromptMeasurement {
     }
 }
 
+/// The same gain rule applies when choosing a replay and when retaining the
+/// runtime's final candidate. An emergency keeps any reduction.
+pub fn worth_adopting_compaction(
+    before: PromptMeasurement,
+    after_estimated: usize,
+    soft_limit: usize,
+    emergency: bool,
+) -> bool {
+    const MIN_GAIN_PERCENT: usize = 10;
+    if after_estimated >= before.estimated {
+        return false;
+    }
+    emergency
+        || before.calibrate_compacted_estimate(after_estimated) <= soft_limit
+        || (before.estimated - after_estimated).saturating_mul(100)
+            >= before.estimated.saturating_mul(MIN_GAIN_PERCENT)
+}
+
 // A reported count this far from Orca's estimate of the same request does not
 // describe that request (usage merged across retries); measure from the
 // estimate instead.
@@ -849,12 +867,13 @@ pub fn compact_with_summary(
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
 ) -> CompactionResult {
-    compact_with_summary_inner(
+    compact_with_summary_for_trigger(
         provider_kind,
         conversation,
         context_config,
         provider_config,
         None,
+        false,
     )
 }
 
@@ -865,12 +884,13 @@ pub fn compact_with_summary_cancellable(
     provider_config: &ProviderConfig,
     cancel: &CancelToken,
 ) -> CompactionResult {
-    compact_with_summary_inner(
+    compact_with_summary_for_trigger(
         provider_kind,
         conversation,
         context_config,
         provider_config,
         Some(cancel),
+        false,
     )
 }
 
@@ -948,12 +968,13 @@ pub fn summarize_range(
     })
 }
 
-fn compact_with_summary_inner(
+pub fn compact_with_summary_for_trigger(
     provider_kind: ProviderKind,
     conversation: &Conversation,
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
     cancel: Option<&CancelToken>,
+    emergency: bool,
 ) -> CompactionResult {
     let started = Instant::now();
     let mut observation = CompactionObservation::new();
@@ -963,6 +984,7 @@ fn compact_with_summary_inner(
         context_config,
         provider_config,
         cancel,
+        emergency,
         &mut observation,
     );
     observation.measure_retained_history(conversation, &compacted, provider_config);
@@ -980,6 +1002,7 @@ fn compact_with_summary_observed(
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
     cancel: Option<&CancelToken>,
+    emergency: bool,
     observation: &mut CompactionObservation,
 ) -> (Conversation, CompactionKind) {
     let normalized = normalized_for_compaction(conversation);
@@ -1018,7 +1041,10 @@ fn compact_with_summary_observed(
         &normalized,
         context_config,
         provider_config,
-        measured,
+        ReplayAdoption {
+            measured,
+            emergency,
+        },
         cancel,
         observation,
     ) {
@@ -1158,13 +1184,19 @@ fn summary_budget(config: &ContextConfig) -> usize {
     (config.target_compaction_limit() / 4).clamp(32, 2_048)
 }
 
+#[derive(Clone, Copy)]
+struct ReplayAdoption {
+    measured: PromptMeasurement,
+    emergency: bool,
+}
+
 /// Summaries read original evidence, not the discarded trial micro pass.
 fn summarize_collapsed_messages(
     provider_kind: ProviderKind,
     conversation: &Conversation,
     context_config: &ContextConfig,
     provider_config: &ProviderConfig,
-    measured: PromptMeasurement,
+    adoption: ReplayAdoption,
     cancel: Option<&CancelToken>,
     observation: &mut CompactionObservation,
 ) -> Option<(Conversation, String)> {
@@ -1205,8 +1237,15 @@ fn summarize_collapsed_messages(
         result.rolling_summary = Some(checkpoint.clone());
         result.summary.baseline = Some(checkpoint.clone());
         let estimated = wire_equivalent_tokens(&result, provider_config);
-        let prompt_tokens = measured.calibrate_compacted_estimate(estimated);
-        if context_config.request_reply_budget(prompt_tokens).is_some() {
+        let prompt_tokens = adoption.measured.calibrate_compacted_estimate(estimated);
+        if context_config.request_reply_budget(prompt_tokens).is_some()
+            && worth_adopting_compaction(
+                adoption.measured,
+                estimated,
+                context_config.soft_limit(),
+                adoption.emergency,
+            )
+        {
             return Some((result, checkpoint));
         }
         observation.summary_requests[replay_request_index].outcome = "failed";
@@ -4225,7 +4264,10 @@ mod tests {
             &conv,
             &config,
             &provider_config,
-            measure_prompt(&conv, &provider_config),
+            ReplayAdoption {
+                measured: measure_prompt(&conv, &provider_config),
+                emergency: false,
+            },
             None,
             &mut CompactionObservation::new(),
         )
