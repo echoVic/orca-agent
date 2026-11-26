@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::io;
 use std::path::Path;
+use std::time::Instant;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
@@ -315,7 +316,7 @@ pub fn prepare_child_agent_request(
     cwd: &Path,
     hooks: &HookRunner,
 ) -> io::Result<Result<(), String>> {
-    prepare_child_agent_request_with_cost(config, setup, cwd, hooks, None)
+    prepare_child_agent_request_with_cost(config, setup, cwd, hooks, None, None)
 }
 
 pub(crate) fn prepare_child_agent_request_with_cost(
@@ -324,6 +325,7 @@ pub(crate) fn prepare_child_agent_request_with_cost(
     cwd: &Path,
     hooks: &HookRunner,
     cost_tracker: Option<&mut CostTracker>,
+    deadline: Option<Instant>,
 ) -> io::Result<Result<(), String>> {
     let mut events = EventFactory::new("child-agent-compaction".to_string());
     let mut sink = EventSink::new(child_event_output(), config.output_format);
@@ -338,7 +340,8 @@ pub(crate) fn prepare_child_agent_request_with_cost(
         &mut events,
         &mut sink,
         None,
-    );
+    )
+    .with_deadline(deadline);
     if let Some(tracker) = cost_tracker {
         compaction = compaction
             .with_cost_tracker(tracker)
@@ -358,7 +361,7 @@ pub fn handle_child_agent_provider_error(
     hooks: &HookRunner,
     response: &ProviderResponse,
 ) -> io::Result<Option<ChildAgentProviderErrorDecision>> {
-    handle_child_agent_provider_error_with_cost(config, setup, cwd, hooks, response, None)
+    handle_child_agent_provider_error_with_cost(config, setup, cwd, hooks, response, None, None)
 }
 
 pub(crate) fn handle_child_agent_provider_error_with_cost(
@@ -368,6 +371,7 @@ pub(crate) fn handle_child_agent_provider_error_with_cost(
     hooks: &HookRunner,
     response: &ProviderResponse,
     cost_tracker: Option<&mut CostTracker>,
+    deadline: Option<Instant>,
 ) -> io::Result<Option<ChildAgentProviderErrorDecision>> {
     let Some(error) = response.steps.iter().find_map(|step| match step {
         ProviderStep::Error(message) => Some(message.clone()),
@@ -392,7 +396,8 @@ pub(crate) fn handle_child_agent_provider_error_with_cost(
                 &mut events,
                 &mut sink,
                 None,
-            );
+            )
+            .with_deadline(deadline);
             if let Some(tracker) = cost_tracker {
                 compaction = compaction
                     .with_cost_tracker(tracker)

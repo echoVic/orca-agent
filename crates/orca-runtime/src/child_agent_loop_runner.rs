@@ -255,6 +255,7 @@ where
             context.cwd,
             context.hooks,
             Some(context.child_cost_tracker),
+            lease.wall_time_deadline(),
         )?;
         if let Err(stop) = sync_child_cost_to_lease(
             lease,
@@ -350,7 +351,7 @@ where
             context.hooks,
             &response,
             context.child_cost_tracker,
-            None,
+            lease.wall_time_deadline(),
         )?;
         if let Err(stop) = sync_child_cost_to_lease(
             lease,
@@ -556,13 +557,8 @@ where
             context.cwd,
             context.hooks,
             Some(context.child_cost_tracker),
+            lease.wall_time_deadline(),
         )?;
-        let totals = context.child_cost_tracker.totals();
-        if totals != before
-            && let Some(observer) = observer
-        {
-            observer.publish_activity(ChildAgentActivity::Usage(totals))?;
-        }
         if let Err(stop) = sync_child_cost_to_lease(
             lease,
             context.child_cost_tracker,
@@ -575,6 +571,7 @@ where
                 child_lease_stop_result(stop),
             );
         }
+        publish_changed_child_usage(context.child_cost_tracker, before, observer)?;
         if let Err(message) = prepared {
             let result = ChildAgentResult {
                 status: RunStatus::Failed,
@@ -650,6 +647,7 @@ where
             );
         }
 
+        let before = context.child_cost_tracker.totals();
         let compaction_config = child_compaction_config(config, lease, context.child_cost_tracker);
         let provider_error_decision = handle_child_agent_provider_error_with_usage(
             &compaction_config,
@@ -658,7 +656,7 @@ where
             context.hooks,
             &response,
             context.child_cost_tracker,
-            observer,
+            lease.wall_time_deadline(),
         )?;
         if let Err(stop) = sync_child_cost_to_lease(
             lease,
@@ -672,6 +670,7 @@ where
                 child_lease_stop_result(stop),
             );
         }
+        publish_changed_child_usage(context.child_cost_tracker, before, observer)?;
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
@@ -837,32 +836,39 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
     hooks: &HookRunner,
     response: &ProviderResponse,
     child_cost_tracker: &mut CostTracker,
-    observer: Option<&dyn ChildAgentActivityPublisher>,
+    deadline: Option<std::time::Instant>,
 ) -> io::Result<Option<ChildAgentProviderErrorDecision>> {
     let has_provider_error = response
         .steps
         .iter()
         .any(|step| matches!(step, ProviderStep::Error(_)));
     if has_provider_error {
-        record_child_provider_usage(response.usage, child_cost_tracker, observer)?;
+        record_child_provider_usage(response.usage, child_cost_tracker, None)?;
     }
 
-    let before = child_cost_tracker.totals();
-    let decision = handle_child_agent_provider_error_with_cost(
+    handle_child_agent_provider_error_with_cost(
         config,
         setup,
         cwd,
         hooks,
         response,
         Some(child_cost_tracker),
-    )?;
-    let totals = child_cost_tracker.totals();
+        deadline,
+    )
+}
+
+fn publish_changed_child_usage(
+    tracker: &CostTracker,
+    before: orca_core::cost_types::UsageTotals,
+    observer: Option<&dyn ChildAgentActivityPublisher>,
+) -> io::Result<()> {
+    let totals = tracker.totals();
     if totals != before
         && let Some(observer) = observer
     {
         observer.publish_activity(ChildAgentActivity::Usage(totals))?;
     }
-    Ok(decision)
+    Ok(())
 }
 
 /// The child may hold a smaller operation lease than its session limit. Use

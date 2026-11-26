@@ -921,7 +921,10 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
                     .as_deref()
                     .map(|tracker| crate::cost::usd_to_micros(tracker.totals().estimated_cost_usd))
                     .unwrap_or(0);
-                Ok(self.max_cost_usd_micros.is_none_or(|limit| spent <= limit))
+                Ok(self
+                    .deadline
+                    .is_none_or(|deadline| Instant::now() < deadline)
+                    && self.max_cost_usd_micros.is_none_or(|limit| spent <= limit))
             })();
             match settled {
                 Ok(proceed) => {
