@@ -16,6 +16,7 @@
   const { stringify } = JSON;
   const slice = Function.prototype.call.bind(String.prototype.slice);
   const charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
+  const toWellFormed = Function.prototype.call.bind(String.prototype.toWellFormed);
   const RealmPromise = Promise;
   const RealmError = Error;
   const RealmTypeError = TypeError;
@@ -60,8 +61,9 @@
           end -= 1;
         }
       }
-      // A UTF-16 unit needs at most three UTF-8 bytes at the Rust boundary.
-      logBudget = __orcaLogLine(slice(line, 0, end));
+      // Replace unmatched surrogates in the bounded prefix before passing it to Rust.
+      const prefix = toWellFormed(slice(line, 0, end));
+      logBudget = __orcaLogLine(prefix);
     }
     logged.push(line);
   }

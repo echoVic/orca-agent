@@ -254,6 +254,25 @@ fn a_script_stopped_by_the_clock_keeps_its_log() {
 }
 
 #[test]
+fn a_stopped_script_keeps_logging_after_an_unmatched_surrogate() {
+    let (outcome, _) = run_batches(
+        r#"console.log("\ud800"); console.log("checkpoint"); while (true) {}"#,
+        ScriptEngineLimits {
+            wall_clock: orca_runtime::script::script_wall_clock(0),
+            ..limits()
+        },
+        |_| Ok(String::new()),
+    );
+
+    let error = error_of(outcome);
+    assert!(error.contains("the script ran longer than"), "{error}");
+    assert!(
+        error.contains("Logged before it was stopped:\n\u{fffd}\ncheckpoint"),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_script_over_its_memory_keeps_its_log() {
     let (outcome, _) = run_batches(
         r#"console.log("before");
