@@ -71,6 +71,7 @@ pub struct InteractiveSession {
 pub(crate) struct InteractiveSessionRuntimeParts<'a> {
     pub conversation: &'a mut Conversation,
     pub writer: Option<&'a mut SessionWriter>,
+    pub recorded: bool,
     pub instructions: &'a ProjectInstructions,
     pub cost_tracker: &'a mut CostTracker,
     pub mcp_registry: &'a McpRegistry,
@@ -774,6 +775,7 @@ impl InteractiveSession {
         InteractiveSessionRuntimeParts {
             conversation: &mut self.conversation,
             writer: self.writer.as_mut(),
+            recorded: self.session_id.is_some(),
             instructions: &self.instructions,
             cost_tracker: &mut self.cost_tracker,
             mcp_registry: &self.mcp_registry,

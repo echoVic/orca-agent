@@ -853,7 +853,11 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
                     .with_mcp_elicitation_handler(request.mcp_elicitation_handler()),
                 events,
                 sink,
-                AgentConversationContext::borrowed(parts.conversation, parts.writer),
+                AgentConversationContext::borrowed(
+                    parts.conversation,
+                    parts.writer,
+                    parts.recorded,
+                ),
                 tool_policy,
             )
         })();
@@ -3032,6 +3036,56 @@ mod tests {
         registry.mark_subagent_result_pending(&child.id);
         registry.complete(&child.id, "child-result".into()).unwrap();
         child.id
+    }
+
+    #[test]
+    fn turn_keeps_notices_pending_when_a_recorded_session_loses_its_writer() {
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(cwd.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.history_mode = HistoryMode::Record;
+        let mut thread = RuntimeThread::start(&config, "keep pending notices").unwrap();
+        let session = thread.session_mut();
+        let path = session.writer_mut().unwrap().path().to_path_buf();
+        let backup = path.with_extension("backup");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        session.append_message(&Message::pinned_system("test write".into()));
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        assert!(session.session_id().is_some());
+        assert!(session.writer_mut().is_none());
+
+        let registry = session.task_registry().clone();
+        let child = finish_child(&registry);
+        let shell = queue_shell_completion(&thread, &config, cwd.path());
+        let service = thread
+            .thread_extensions_handle()
+            .get::<TerminalService>()
+            .unwrap();
+        assert_eq!(
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("mock_system_echo"),
+                    io::sink()
+                )
+                .unwrap(),
+            RunStatus::Success
+        );
+
+        let pending = service.pending_completions();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].task_id, shell);
+        assert_eq!(
+            registry.get(&child).unwrap().result_delivery,
+            crate::tasks::ResultDelivery::Pending
+        );
+        assert_eq!(
+            shell_completion_messages(thread.session().conversation()).count(),
+            0
+        );
     }
 
     #[test]

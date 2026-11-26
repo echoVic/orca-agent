@@ -460,6 +460,9 @@ fn deliver_loop_notices<W: io::Write>(
     input: &mut RuntimeTurnLoopInput<'_, '_, W>,
     include_shell: bool,
 ) -> io::Result<bool> {
+    if !input.prepared_conversation.can_deliver_notices() {
+        return Ok(false);
+    }
     let registry = input.loop_state.runtime.task_registry;
     let parent = input
         .request
@@ -966,7 +969,7 @@ mod tests {
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let mut conversation = Conversation::new();
         let mut prepared_conversation = RuntimeConversationBootstrapStep::new().prepare(
-            AgentConversationContext::borrowed(&mut conversation, None),
+            AgentConversationContext::borrowed(&mut conversation, None, false),
             cwd.path(),
             "continue",
             0,
@@ -1181,7 +1184,7 @@ mod tests {
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let mut conversation = Conversation::new();
         let mut prepared_conversation = RuntimeConversationBootstrapStep::new().prepare(
-            AgentConversationContext::borrowed(&mut conversation, None),
+            AgentConversationContext::borrowed(&mut conversation, None, false),
             cwd.path(),
             "continue",
             0,
