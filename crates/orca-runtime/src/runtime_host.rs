@@ -35554,7 +35554,8 @@ mod tests {
         // end is still the tool the agent was in. Nothing makes the report
         // come after the turn is over; it does because the agent's tool takes
         // longer to stop than the turn (when this was written, the report
-        // came 120-240 ms after the turn was over).
+        // came 120-240 ms after the turn was over). The order is forced in
+        // `an_agent_that_reports_after_its_parent_turn_was_interrupted_is_shown_ending`.
         let history = &shown.subagent_activity_history;
         assert_eq!(
             history
@@ -35580,21 +35581,30 @@ mod tests {
         host.shutdown().expect("shutdown interrupted tool host");
     }
 
-    /// The turn is sent to the background while it keeps an async agent
-    /// running. Once the hand-off is done the turn's generation is over, so
-    /// the parent's surface refuses what the agent reports from then on.
-    /// The agent's own end, when it comes, is still taken: its row ends,
-    /// once, as the agent ended, and its record is not failed for want of a
-    /// surface to show its end on.
+    /// Esc on the parent's turn while it keeps an async agent running, and
+    /// the agent reports after the turn is over: the parent's surface
+    /// refuses that report, as it refuses anything an ended turn's agent
+    /// reports but its end. The agent's end, when it comes, is still taken:
+    /// its row ends, once, as the agent ended, its record is not failed for
+    /// want of a surface to show its end on, and the refused report never
+    /// lands.
+    ///
+    /// The end is `cancelled` here because Esc stops the agents the turn
+    /// keeps. The order is forced, not observed: the agent's stream, once
+    /// cancelled, waits for the marker before it ends with the usage the
+    /// agent then reports, and the marker is written only once
+    /// `interrupt_parent_turn` has seen the turn end.
     #[test]
-    fn an_agent_left_running_by_a_backgrounded_turn_is_shown_ending() {
+    fn an_agent_that_reports_after_its_parent_turn_was_interrupted_is_shown_ending() {
         let cwd = tempfile::tempdir().unwrap();
-        let host = RuntimeHost::start().expect("start backgrounded parent host");
-        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
-            &host,
-            cwd.path(),
-            "subagent async_then_sync mock_stream_delay_ms 3000",
+        let host = RuntimeHost::start().expect("start interrupted parent host");
+        let marker = ReleaseMarker(cwd.path().join("agent-reports-after-its-turn"));
+        let description = format!(
+            "mock_stream_usage_after_cancel_marker {}",
+            marker.0.display()
         );
+        let (thread, attachment, operation_id, _stops_agents) =
+            start_keeping_parent_turn(&host, cwd.path(), &format!("subagent async {description}"));
         let surface = thread.surface();
         let mut subscription = surface
             .claim_subscription(&attachment.subscription)
@@ -35608,8 +35618,7 @@ mod tests {
             .snapshot
         };
         let registry = thread.task_registry();
-        let agents = kept_agents_under_way(read_snapshot, &["async child", "sync child"]);
-        let (agent, sync_agent) = (agents[0].clone(), agents[1].clone());
+        let agent = kept_agents_under_way(read_snapshot, &[description.as_str()]).remove(0);
         let surface::SurfaceSubagentOwner::Generation { fence } = agent.owner.clone() else {
             panic!("the agent is not its parent turn's: {:?}", agent.owner);
         };
@@ -35618,77 +35627,48 @@ mod tests {
             &mut subscription,
             &agent.task_id,
             &agent.subagent_id,
-            surface::SurfaceTaskStatus::Completed,
+            surface::SurfaceTaskStatus::Cancelled,
             &mut seen,
         );
 
-        // The hand-off waits for the turn's sync agent; a person stops it.
-        let client = attachment.client.clone();
-        let transfer_fence = fence.clone();
-        let transfer = std::thread::spawn(move || {
-            client.transfer_background(
-                surface_request_id(),
-                surface::BackgroundTarget::ActiveGeneration {
-                    fence: transfer_fence,
-                },
-            )
-        });
-        std::thread::sleep(Duration::from_millis(300));
-        let (reply, _) = stop_agent_as_a_person(&attachment, read_snapshot, &sync_agent.task_id);
-        assert!(
-            matches!(reply, surface::MutationReply::Committed { .. }),
-            "the sync agent's stop was not answered"
+        interrupt_parent_turn(&attachment, &operation_id);
+        // The turn's generation is over while the agent still runs.
+        let snapshot = read_snapshot();
+        assert!(snapshot.foreground_operation.is_none());
+        assert_eq!(
+            surface::generation_phase(&snapshot, &fence),
+            Some(surface::GenerationPhase::Stopped)
         );
-        let handed_off = transfer
-            .join()
-            .expect("the hand-off's thread")
-            .expect("hand the turn off");
-        assert!(
-            matches!(
-                handed_off,
-                surface::MutationReply::Committed {
-                    value: surface::TransferBackgroundOutput::HandedOff { .. },
-                    ..
-                }
-            ),
-            "the turn was not handed off"
+        let before_end = snapshot
+            .subagents
+            .iter()
+            .find(|subagent| subagent.subagent_id == agent.subagent_id)
+            .cloned()
+            .expect("the agent on the parent's surface");
+        assert_eq!(
+            before_end.status,
+            surface::SurfaceSubagentStatus::Running,
+            "the agent ended before the turn's generation did"
         );
-        // The turn's generation is over while the async agent still runs.
-        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
-        loop {
-            let snapshot = read_snapshot();
-            if surface::generation_phase(&snapshot, &fence)
-                == Some(surface::GenerationPhase::Stopped)
-            {
-                assert_eq!(
-                    snapshot
-                        .subagents
-                        .iter()
-                        .find(|subagent| subagent.subagent_id == agent.subagent_id)
-                        .map(|subagent| subagent.status),
-                    Some(surface::SurfaceSubagentStatus::Running),
-                    "the agent ended before the turn's generation did"
-                );
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the handed-off generation never stopped: {:?}",
-                surface::generation_phase(&snapshot, &fence)
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        let record = registry.get(agent.task_id.as_str()).expect("the record");
+        assert!(
+            record.status.is_active() && record.stop_requested,
+            "{:?}",
+            record.status
+        );
 
+        // The agent reports its usage, then ends.
+        marker.release();
         let (record, task, shown) = kept_agent_end(
             &registry,
             read_snapshot,
             &agent.task_id,
             Duration::from_secs(10),
         );
-        assert_eq!(record.status, TaskStatus::Completed, "{:?}", record.error);
+        assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
         assert_eq!(record.error, None);
-        assert_eq!(task.status, surface::SurfaceTaskStatus::Completed);
-        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Completed);
+        assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
         assert_eq!(
             shown.owner,
             surface::SurfaceSubagentOwner::Generation {
@@ -35696,27 +35676,35 @@ mod tests {
             }
         );
         assert_eq!(shown.usage, record.usage.map(surface_usage_totals));
+        // Only the end landed after the turn was over: the refused report
+        // did not, before it or after it.
+        assert_eq!(
+            shown.revision.get(),
+            before_end.revision.get() + 1,
+            "{:?}",
+            shown.subagent_activity_history
+        );
+        assert_eq!(
+            shown
+                .subagent_activity_history
+                .last()
+                .map(|entry| entry.activity.as_str()),
+            Some("completed")
+        );
         std::thread::sleep(Duration::from_millis(300));
         subagent_terminals_seen(
             &mut subscription,
             &agent.task_id,
             &agent.subagent_id,
-            surface::SurfaceTaskStatus::Completed,
+            surface::SurfaceTaskStatus::Cancelled,
             &mut seen,
         );
         assert_eq!(
             seen,
             (1, 1),
-            "(task Completed patches, subagent terminal patches)"
+            "(task Cancelled patches, subagent terminal patches)"
         );
-
-        let _ = attachment
-            .client
-            .cancel_operation(surface_request_id(), operation_id.clone());
-        let _ = attachment
-            .client
-            .wait_operation_terminal(surface_request_id(), operation_id);
-        host.shutdown().expect("shutdown backgrounded parent host");
+        host.shutdown().expect("shutdown interrupted parent host");
     }
 
     /// A host that does not keep its children in its process has no way to

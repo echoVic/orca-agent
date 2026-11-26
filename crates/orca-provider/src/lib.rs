@@ -587,6 +587,36 @@ async fn call_streaming_async_with_output_budget(
                     usage: None,
                 };
             }
+            // A stream that, once cancelled, ends with usage, and only once
+            // the marker exists: it runs until it is cancelled (30 s at most),
+            // then waits for the marker (10 s at most) and ends with usage
+            // for its caller to report. A cancelled stream sends no step, so
+            // the usage is the one thing its caller can report after the
+            // cancel.
+            if let Some(marker) = mock_stream_usage_after_cancel_marker(conversation) {
+                let started = ProviderStep::MessageDelta(
+                    "Mock usage-after-cancel stream started.".to_string(),
+                );
+                on_step(&started);
+                let cancelled = !sleep_with_cancel(Duration::from_secs(30), cancel).await;
+                if cancelled {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                    while !marker.exists() && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                return ProviderResponse {
+                    steps: vec![started],
+                    assistant_content: Some("Mock usage-after-cancel stream started.".to_string()),
+                    assistant_reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(Usage {
+                        input_tokens: 120,
+                        output_tokens: 30,
+                        cache_tokens: 10,
+                    }),
+                };
+            }
             if let Some(release_marker) = mock_stream_release_marker(conversation) {
                 let started =
                     ProviderStep::MessageDelta("Mock release-marker stream started.".to_string());
@@ -864,6 +894,18 @@ fn mock_stream_slow_cancel_ms(conversation: &Conversation) -> Option<u64> {
         .strip_prefix("mock_stream_slow_cancel_ms ")
         .and_then(|delay| delay.trim().parse::<u64>().ok())
         .map(|delay| delay.min(10_000))
+}
+
+fn mock_stream_usage_after_cancel_marker(
+    conversation: &Conversation,
+) -> Option<std::path::PathBuf> {
+    let marker = conversation
+        .last_user_message()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("mock_stream_usage_after_cancel_marker ")?
+        .trim();
+    (!marker.is_empty()).then(|| std::path::PathBuf::from(marker))
 }
 
 fn mock_stream_release_marker(conversation: &Conversation) -> Option<std::path::PathBuf> {
@@ -2644,6 +2686,67 @@ mod tests {
         assert!(
             ended_after_cancel >= Duration::from_millis(250),
             "the stream ended {ended_after_cancel:?} after its cancel"
+        );
+    }
+
+    #[test]
+    fn mock_stream_usage_after_cancel_marker_ends_with_usage_once_cancelled_and_marked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("usage");
+        let mut conversation = Conversation::new();
+        conversation.add_user(format!(
+            "mock_stream_usage_after_cancel_marker {}",
+            marker.display()
+        ));
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+            max_output_tokens: None,
+        };
+        let cancel = CancelToken::new();
+        let canceller = cancel.clone();
+        let writer_marker = marker.clone();
+        let marked_at = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            canceller.cancel();
+            std::thread::sleep(Duration::from_millis(300));
+            let marked_at = std::time::Instant::now();
+            std::fs::write(&writer_marker, b"").expect("write marker");
+            marked_at
+        });
+        let mut deltas = Vec::new();
+
+        let response = call_streaming(
+            ProviderKind::Mock,
+            &conversation,
+            &config,
+            &cancel,
+            &mut |step| {
+                if let ProviderStep::MessageDelta(text) = step {
+                    deltas.push(text.clone());
+                }
+            },
+        );
+        let ended_at = std::time::Instant::now();
+        let marked_at = marked_at.join().expect("marker writer");
+
+        assert_eq!(
+            deltas,
+            vec!["Mock usage-after-cancel stream started.".to_string()]
+        );
+        assert!(ended_at >= marked_at, "the stream ended before its marker");
+        assert_eq!(
+            response.usage,
+            Some(Usage {
+                input_tokens: 120,
+                output_tokens: 30,
+                cache_tokens: 10,
+            })
         );
     }
 
