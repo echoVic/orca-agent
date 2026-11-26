@@ -229,6 +229,7 @@ fn filtered_tools_are_not_registered() {
                     server: tool.server.clone(),
                     tool: tool.name.clone(),
                     schema_name: tool.schema_name.clone(),
+                    session_generation: None,
                 },
             )
         })
@@ -369,6 +370,7 @@ fn call_tool_or_cancel_waits_for_transport_cleanup() {
                 server: tool.server,
                 tool: tool.name,
                 schema_name: tool.schema_name,
+                session_generation: None,
             },
         )]),
         ..Default::default()
@@ -470,6 +472,7 @@ fn registry_with_call_tool_result(content: Value) -> (McpRegistry, McpToolRef) {
                 server: tool.server,
                 tool: tool.name,
                 schema_name: tool.schema_name,
+                session_generation: None,
             },
         )]),
         ..Default::default()
@@ -1284,7 +1287,17 @@ fn a_cancellable_call_to_a_remote_server_waiting_for_the_transport_returns_when_
     // A remote server's transport is never restarted before a request, so
     // its call waits for the transport only to send itself.
     let answer = cancelled_while_the_transport_is_held(&client, |should_cancel| {
-        client.call_tool("echo", serde_json::json!({}), None, Some(should_cancel))
+        client.call_tool(
+            &McpToolRef {
+                server: client.server_name.clone(),
+                tool: "echo".into(),
+                schema_name: "echo".into(),
+                session_generation: None,
+            },
+            serde_json::json!({}),
+            None,
+            Some(should_cancel),
+        )
     });
 
     assert_eq!(answer.unwrap_err(), "MCP tool call cancelled");
@@ -1553,6 +1566,7 @@ fn registry_call_tool_routes_elicitation_handler_to_transport() {
                 server: tool.server,
                 tool: tool.name,
                 schema_name: tool.schema_name,
+                session_generation: None,
             },
         )]),
         ..Default::default()
@@ -4866,6 +4880,7 @@ fn a_snapshot_never_mixes_two_states_of_a_server() {
             generation: FIRST_CONNECTION,
             stop: Arc::default(),
             tools: Vec::new(),
+            tool_session_generation: None,
             tool_warnings: Vec::new(),
             prompts: Vec::new(),
             prompts_error: None,

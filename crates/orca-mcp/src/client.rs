@@ -7,9 +7,9 @@ use serde_json::Value;
 
 use crate::connection_stop::McpConnectionStop;
 use crate::legacy_sse::MCP_SSE_EVENT_STREAM_CLOSED;
-use crate::registry::{McpToolListing, list_server_tools};
+use crate::registry::{McpToolListing, list_transport_tools};
 use crate::transport::{self, McpElicitationHandler, McpTransport};
-use orca_core::mcp_types::{McpServerConfig, McpToolLoading, McpTransportKind};
+use orca_core::mcp_types::{McpServerConfig, McpToolLoading, McpToolRef, McpTransportKind};
 
 // `McpCallOutput` lives with the registry that returns it. This keeps its old
 // path, `orca_mcp::client::McpCallOutput`, which `orca-tools` names.
@@ -152,25 +152,26 @@ impl McpClient {
     /// [`Self::request`] does, so that the next call can go through.
     pub(crate) fn call_tool(
         &self,
-        name: &str,
+        tool: &McpToolRef,
         arguments: Value,
         elicitation_handler: Option<&dyn McpElicitationHandler>,
         should_cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<Value, String> {
         self.request_or_cancel(
             should_cancel.unwrap_or(&|| false),
-            |transport| match should_cancel {
-                Some(should_cancel) => transport.call_tool_with_elicitation_handler_or_cancel(
-                    name,
+            |transport| {
+                let generation = transport.session_generation();
+                if self.config.tool_loading == McpToolLoading::OnDemand
+                    && generation != 0 && tool.session_generation != Some(generation)
+                {
+                    return Err(format!("MCP server '{}' changed its tools. Review its current tools and submit the tool call again.", self.server_name));
+                }
+                transport.call_tool_with_elicitation_handler_or_cancel(
+                    &tool.tool,
                     arguments,
                     elicitation_handler,
-                    should_cancel,
-                ),
-                None => transport.call_tool_with_elicitation_handler(
-                    name,
-                    arguments,
-                    elicitation_handler,
-                ),
+                    should_cancel.unwrap_or(&|| false),
+                )
             },
         )
         .map_err(|error| error.to_string())
@@ -258,9 +259,12 @@ impl McpClient {
             if self.config.tool_loading == McpToolLoading::OnDemand
                 && transport.session_generation() != generation
             {
-                let tools = list_server_tools(&self.config, &self.server_name, |cursor| {
-                    transport.list_tools(cursor)
-                })
+                let tools = list_transport_tools(
+                    &self.config,
+                    &self.server_name,
+                    transport.as_ref(),
+                    &|| false,
+                )
                 .unwrap_or_else(|error| McpToolListing::unavailable(&self.server_name, error));
                 *self
                     .reconnected_tools
@@ -488,9 +492,12 @@ impl McpClient {
         })?;
         let initialize_result = transport.initialize_or_cancel(should_cancel)?;
         let tools = if config.tool_loading == McpToolLoading::OnDemand {
-            Some(list_server_tools(config, &self.server_name, |cursor| {
-                transport.list_tools_or_cancel(cursor, should_cancel)
-            })?)
+            Some(list_transport_tools(
+                config,
+                &self.server_name,
+                transport.as_ref(),
+                should_cancel,
+            )?)
         } else {
             let _ = transport.list_tools_or_cancel(None, should_cancel)?;
             None

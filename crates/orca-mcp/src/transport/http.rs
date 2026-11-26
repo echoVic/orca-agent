@@ -15,7 +15,7 @@ use reqwest::header::{ACCEPT, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use orca_core::capability::CapabilityReceipt;
-use orca_core::mcp_types::McpServerConfig;
+use orca_core::mcp_types::{McpServerConfig, McpToolLoading};
 
 use crate::auth::{AuthAttempt, RemoteAuth, is_auth_required};
 use crate::legacy_sse::LegacySseTransport;
@@ -27,6 +27,8 @@ pub(crate) const MAX_SSE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// A streamable HTTP POST accepts both ways a server may answer it.
 pub(crate) const HTTP_ACCEPT: &str = "application/json, text/event-stream";
+
+static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
@@ -67,6 +69,7 @@ pub(super) struct StreamableHttpTransport {
     auth: Arc<RemoteAuth>,
     session: Mutex<HttpSession>,
     session_generation: AtomicU64,
+    renew_tool_calls: bool,
     next_id: Mutex<u64>,
     client: reqwest::blocking::Client,
     startup_timeout: Duration,
@@ -175,6 +178,7 @@ impl StreamableHttpTransport {
             auth,
             session: Mutex::new(HttpSession::default()),
             session_generation: AtomicU64::new(0),
+            renew_tool_calls: config.tool_loading != McpToolLoading::OnDemand,
             next_id: Mutex::new(1),
             client: crate::http::blocking_client().map_err(|error| {
                 format!(
@@ -361,6 +365,10 @@ impl StreamableHttpTransport {
             .get(MCP_SESSION_ID_HEADER)
             .filter(|id| !id.is_empty())
             .cloned();
+        self.session_generation.store(
+            NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         let protocol_version = match negotiated_protocol_version(&self.server_name, &result) {
             Ok(version) => version,
             Err(error) => {
@@ -377,7 +385,6 @@ impl StreamableHttpTransport {
             protocol_version,
         };
         self.notify("notifications/initialized", json!({}), self.startup_timeout)?;
-        self.session_generation.fetch_add(1, Ordering::Relaxed);
         Ok(result)
     }
 
@@ -507,13 +514,7 @@ impl StreamableHttpTransport {
             Err(error) if error.ended_session() => {}
             first => return first.map_err(HttpRequestError::into_message),
         }
-        self.start_session().map_err(|error| {
-            format!(
-                "MCP server '{}' ended its session, and starting a new one failed: {}",
-                self.server_name,
-                error.into_message()
-            )
-        })?;
+        self.renew_session()?;
         retry().map_err(|error| {
             if error.ended_session() {
                 format!(
@@ -527,6 +528,16 @@ impl StreamableHttpTransport {
         })
     }
 
+    fn renew_session(&self) -> Result<(), String> {
+        self.start_session().map(|_| ()).map_err(|error| {
+            format!(
+                "MCP server '{}' ended its session, and starting a new one failed: {}",
+                self.server_name,
+                error.into_message()
+            )
+        })
+    }
+
     fn request_with_timeout_or_cancel(
         &self,
         method: &str,
@@ -536,6 +547,16 @@ impl StreamableHttpTransport {
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, String> {
         let first = self.stream_request(method, params.clone(), timeout, handler, should_cancel);
+        if method == "tools/call"
+            && !self.renew_tool_calls
+            && first.as_ref().is_err_and(HttpRequestError::ended_session)
+        {
+            self.renew_session()?;
+            return Err(format!(
+                "MCP server '{}' renewed its session. Review its current tools and submit the tool call again.",
+                self.server_name
+            ));
+        }
         self.retry_in_new_session(first, || {
             self.stream_request(method, params, timeout, handler, should_cancel)
         })
@@ -3009,7 +3030,13 @@ mod tests {
         assert!(registry.wait_for_startup(&|| false));
         registry.load_tools("docs", &["echo".into()]).unwrap();
         let echo = registry.resolve_agent_tool("mcp__docs__echo").unwrap();
-        registry.call_tool(&echo, json!({"text":"test"})).unwrap();
+        let error = registry
+            .call_tool(&echo, json!({"text":"test"}))
+            .unwrap_err();
+        assert!(error.contains("submit the tool call again"), "{error}");
+        assert_eq!(server.requests_for("tools/call").len(), 1);
+        assert!(registry.call_tool(&echo, json!({})).is_err());
+        assert_eq!(server.requests_for("tools/call").len(), 1);
         assert_eq!(
             registry
                 .tools()
@@ -3020,6 +3047,16 @@ mod tests {
         );
         assert!(registry.resolve_agent_tool("mcp__docs__echo").is_none());
         assert!(registry.resolve_agent_tool("mcp__docs__search").is_none());
+        registry.load_tools("docs", &["search".into()]).unwrap();
+        let search = registry.resolve_agent_tool("mcp__docs__search").unwrap();
+        registry
+            .call_tool(&search, json!({"text":"new request"}))
+            .unwrap();
+        assert!(
+            server
+                .session_trail()
+                .ends_with(&["tools/list s2".into(), "tools/call s2".into()])
+        );
     }
 
     #[test]
@@ -4039,6 +4076,13 @@ mod tests {
                 "description": "echoes its text",
                 "inputSchema": {"type": "object"}
             }]}),
+            Some("tools/call")
+                if behavior.renew_tools_on_call
+                    && session == Some("s2")
+                    && request.body["params"]["name"] != "search" =>
+            {
+                return write_http_status(stream, 400);
+            }
             Some("tools/call") if behavior.elicit => {
                 return elicit_before_answering(stream, id, log);
             }

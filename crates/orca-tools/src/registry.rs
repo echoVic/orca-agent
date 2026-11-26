@@ -2513,13 +2513,27 @@ impl Tool for McpProxyTool {
         let Some(registry) = ctx.mcp_registry else {
             return ToolResult::failed(request, "MCP registry is not initialized", None);
         };
-        let Some(tool_ref) = registry.resolve_agent_tool(&self.tool.schema_name) else {
+        let Some(tool_ref) = registry.resolve_agent_tool_for_definition(&self.tool) else {
             return ToolResult::failed(
                 request,
                 format!("unknown MCP tool: {}", self.tool.schema_name),
                 None,
             );
         };
+        if tool_ref.session_generation.is_some()
+            && request.action
+                != if self.tool.read_only {
+                    ActionKind::Read
+                } else {
+                    ActionKind::Write
+                }
+        {
+            return ToolResult::failed(
+                request,
+                "MCP tool permissions changed. Review the tool and submit the call again.",
+                None,
+            );
+        }
         let arguments = match request
             .raw_arguments
             .as_deref()

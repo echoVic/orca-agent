@@ -194,6 +194,7 @@ struct McpServerEntry {
     /// Its registered tools.
     tools: Vec<McpTool>,
     tool_warnings: Vec<String>,
+    tool_session_generation: Option<u64>,
     /// The prompts it offers.
     prompts: Vec<McpPrompt>,
     /// Why its prompts could not be listed, when `prompts/list` failed.
@@ -243,6 +244,13 @@ impl McpRegistryInner {
             .flat_map(|server| server.tools.iter().cloned())
             .collect();
         self.lookup = tool_lookup(&self.tools);
+        for server in &self.servers {
+            for tool in &server.tools {
+                if let Some(reference) = self.lookup.get_mut(&tool.schema_name) {
+                    reference.session_generation = server.tool_session_generation;
+                }
+            }
+        }
     }
 
     /// Every configured server and how it stands, in config order.
@@ -371,6 +379,7 @@ impl McpRegistryInner {
             .errors
             .retain(|error| !server.tool_warnings.contains(error));
         server.tool_warnings = listing.warnings;
+        server.tool_session_generation = listing.session_generation;
         server.tools = take_tool_names(
             &server_name,
             listing.tools,
@@ -474,6 +483,7 @@ pub fn initialize_registry(
             stop,
             tools: Vec::new(),
             tool_warnings: Vec::new(),
+            tool_session_generation: None,
             prompts: Vec::new(),
             prompts_error: None,
             errors: Vec::new(),
@@ -520,6 +530,7 @@ fn tool_lookup(tools: &[McpTool]) -> HashMap<String, McpToolRef> {
                     server: tool.server.clone(),
                     tool: tool.name.clone(),
                     schema_name: tool.schema_name.clone(),
+                    session_generation: None,
                 },
             )
         })
@@ -576,7 +587,7 @@ fn connect_server_with_transport(
 ) -> Result<ConnectedServer, String> {
     let initialize_result = transport.initialize()?;
     let capabilities = McpServerCapabilities::from_initialize_result(&initialize_result);
-    let tools = list_server_tools(config, server_name, |cursor| transport.list_tools(cursor))?;
+    let tools = list_transport_tools(config, server_name, transport.as_ref(), &|| false)?;
     let mut warnings = Vec::new();
 
     let client = McpClient {
@@ -620,6 +631,7 @@ fn connect_server_with_transport(
         return Err(error);
     }
 
+    let tools = client.take_reconnected_tools().unwrap_or(tools);
     Ok(ConnectedServer {
         client,
         tools,
@@ -630,6 +642,7 @@ fn connect_server_with_transport(
 }
 
 pub(crate) struct McpToolListing {
+    session_generation: Option<u64>,
     tools: Vec<McpTool>,
     warnings: Vec<String>,
 }
@@ -637,6 +650,7 @@ pub(crate) struct McpToolListing {
 impl McpToolListing {
     pub(crate) fn unavailable(server: &str, error: String) -> Self {
         Self {
+            session_generation: None,
             tools: Vec::new(),
             warnings: vec![format!(
                 "MCP server '{server}' could not refresh its tools: {error}"
@@ -645,7 +659,34 @@ impl McpToolListing {
     }
 }
 
-pub(crate) fn list_server_tools(
+pub(crate) fn list_transport_tools(
+    config: &McpServerConfig,
+    server: &str,
+    transport: &dyn McpTransport,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<McpToolListing, String> {
+    let mut page_generation = None;
+    let mut spans_sessions = false;
+    let mut listing = list_server_tools(config, server, |cursor| {
+        let page = transport.list_tools_or_cancel(cursor, should_cancel)?;
+        let current = transport.session_generation();
+        if page_generation.is_some_and(|previous| previous != current) {
+            spans_sessions = true;
+            return Err(format!("MCP server '{server}' renewed during tools/list"));
+        }
+        page_generation = Some(current);
+        Ok(page)
+    })?;
+    if config.tool_loading == McpToolLoading::OnDemand {
+        if spans_sessions {
+            listing.tools.clear();
+        }
+        listing.session_generation = page_generation.filter(|generation| *generation != 0);
+    }
+    Ok(listing)
+}
+
+fn list_server_tools(
     config: &McpServerConfig,
     server_name: &str,
     mut fetch: impl FnMut(Option<&str>) -> Result<Value, String>,
@@ -689,7 +730,11 @@ pub(crate) fn list_server_tools(
         })
         .collect();
 
-    Ok(McpToolListing { tools, warnings })
+    Ok(McpToolListing {
+        session_generation: None,
+        tools,
+        warnings,
+    })
 }
 
 /// The most pages a list is read to: a server that has more is cut off.
@@ -1353,8 +1398,31 @@ impl McpRegistry {
     }
 
     pub fn resolve_agent_tool(&self, schema_name: &str) -> Option<McpToolRef> {
+        self.resolve_agent_tool_matching(schema_name, None)
+    }
+
+    /// Resolve a call against the schema that the caller just validated.
+    pub fn resolve_agent_tool_for_definition(&self, definition: &McpTool) -> Option<McpToolRef> {
+        self.resolve_agent_tool_matching(&definition.schema_name, Some(definition))
+    }
+
+    fn resolve_agent_tool_matching(
+        &self,
+        schema_name: &str,
+        definition: Option<&McpTool>,
+    ) -> Option<McpToolRef> {
         let inner = self.read();
         let tool = inner.lookup.get(schema_name)?;
+        if tool.session_generation.is_some()
+            && let Some(definition) = definition
+            && !inner.tools.iter().any(|current| {
+                current.schema_name == schema_name
+                    && current.input_schema == definition.input_schema
+                    && current.read_only == definition.read_only
+            })
+        {
+            return None;
+        }
         if let Some(server) = inner
             .servers
             .iter()
@@ -2023,12 +2091,7 @@ impl McpRegistry {
         let client = self
             .client(&tool_ref.server)
             .ok_or_else(|| format!("MCP server '{}' is not connected", tool_ref.server))?;
-        let result = client.call_tool(
-            &tool_ref.tool,
-            arguments,
-            elicitation_handler,
-            should_cancel,
-        );
+        let result = client.call_tool(tool_ref, arguments, elicitation_handler, should_cancel);
         self.note_answer(&tool_ref.server, &client, &result);
         let result: CallToolResult = serde_json::from_value(result?)
             .map_err(|error| format!("invalid MCP tool result: {error}"))?;

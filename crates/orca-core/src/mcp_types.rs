@@ -161,6 +161,8 @@ pub struct McpToolRef {
     pub server: String,
     pub tool: String,
     pub schema_name: String,
+    #[serde(skip)]
+    pub session_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
