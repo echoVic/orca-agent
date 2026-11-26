@@ -2916,7 +2916,11 @@ mod tests {
         }
     }
 
-    fn queue_shell_completion(thread: &RuntimeThread, config: &RunConfig, cwd: &Path) -> String {
+    fn start_shell_for_notice(
+        thread: &RuntimeThread,
+        config: &RunConfig,
+        cwd: &Path,
+    ) -> (Arc<TerminalService>, String) {
         let extensions = thread.thread_extensions_handle();
         let service = extensions
             .get_or_init(|| TerminalService::new(thread.session().task_registry().clone()));
@@ -2926,7 +2930,7 @@ mod tests {
                 crate::terminal_service::TerminalExecRequest {
                     lifetime: crate::tasks::TaskLifetime::Task,
                     command: &command_after_release("release-notice", "notified"),
-                    cwd: cwd,
+                    cwd,
                     additional_roots: &[],
                     config,
                     permission_overlay: &overlay,
@@ -2944,12 +2948,16 @@ mod tests {
             )
             .expect("start background terminal");
         assert_eq!(started.status, "running", "{started:?}");
+        (service, started.task_id)
+    }
+
+    fn release_shell_for_notice(service: &TerminalService, cwd: &Path, task_id: &str) {
         std::fs::write(cwd.join("release-notice"), "").unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !service
             .pending_completions()
             .iter()
-            .any(|notice| notice.task_id == started.task_id)
+            .any(|notice| notice.task_id == task_id)
         {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2957,7 +2965,12 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        started.task_id
+    }
+
+    fn queue_shell_completion(thread: &RuntimeThread, config: &RunConfig, cwd: &Path) -> String {
+        let (service, task_id) = start_shell_for_notice(thread, config, cwd);
+        release_shell_for_notice(&service, cwd, &task_id);
+        task_id
     }
 
     #[test]
@@ -3206,8 +3219,22 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_completion_during_a_turn_reaches_the_next_model_request() {
+    fn scripted_tool_call(name: &str, arguments: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"choices": [{
+            "delta": {"reasoning_content": "Call the tool.", "tool_calls": [{ "index": 0, "id": "shell-test", "type": "function",
+                "function": {"name": name, "arguments": arguments.to_string()}}]},
+            "finish_reason": "tool_calls"
+        }]})
+    }
+
+    fn scripted_reply() -> serde_json::Value {
+        serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})
+    }
+
+    fn serve_scripted_provider<const N: usize>(
+        config: &mut RunConfig,
+        responses: [serde_json::Value; N],
+    ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
 
@@ -3217,19 +3244,7 @@ mod tests {
         let provider = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let mut received = Vec::new();
-            let arguments = serde_json::json!({
-                "command": command_after_release("release-first", "first-output"),
-                "yield_time_ms": 10
-            });
-            let tool = serde_json::json!({"choices": [{
-                "delta": {"reasoning_content": "Run the command.", "tool_calls": [{ "index": 0, "id": "shell-test", "type": "function",
-                    "function": {"name": "bash", "arguments": arguments.to_string()}}]},
-                "finish_reason": "tool_calls"
-            }]});
-            let reply = serde_json::json!({"choices": [{
-                "delta": {"content": "done"}, "finish_reason": "stop"
-            }]});
-            for response in [tool, reply] {
+            for response in responses {
                 let mut socket = loop {
                     match listener.accept() {
                         Ok((socket, _)) => break socket,
@@ -3243,6 +3258,7 @@ mod tests {
                         Err(error) => panic!("accept: {error}"),
                     }
                 };
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -3268,13 +3284,31 @@ mod tests {
             }
             received
         });
+        config.provider = ProviderKind::DeepSeek;
+        config.api_key = Some("test-only".into());
+        config.base_url = Some(format!("http://{address}"));
+        provider
+    }
+
+    #[test]
+    fn a_completion_during_a_turn_reaches_the_next_model_request() {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = config(SubagentConfig::default());
         config.cwd = Some(cwd.path().into());
         config.approval_mode = ApprovalMode::FullAuto;
-        config.provider = ProviderKind::DeepSeek;
-        config.api_key = Some("test-only".into());
-        config.base_url = Some(format!("http://{address}"));
+        let provider = serve_scripted_provider(
+            &mut config,
+            [
+                scripted_tool_call(
+                    "bash",
+                    serde_json::json!({
+                        "command": command_after_release("release-first", "first-output"),
+                        "yield_time_ms": 10
+                    }),
+                ),
+                scripted_reply(),
+            ],
+        );
         let mut thread = RuntimeThread::start(&config, "same-turn notice").unwrap();
         let (result, tasks) =
             run_turn_with_shell_completions(&mut thread, &config, cwd.path(), false, || Ok(()));
@@ -3292,6 +3326,107 @@ mod tests {
         assert!(notices[0].contains(&tasks[0]));
         assert!(notices[0].contains("first-output"));
         assert_eq!(result.unwrap(), RunStatus::Success);
+    }
+
+    #[test]
+    fn a_failed_tool_result_commit_keeps_the_notice() {
+        use orca_core::event_schema::{EventEnvelope, EventType};
+
+        for tool in ["task_wait", "task_read_output"] {
+            let cwd = tempfile::tempdir().unwrap();
+            let _home = crate::history::redirect_test_orca_home(cwd.path());
+            let mut config = config(SubagentConfig::default());
+            config.cwd = Some(cwd.path().into());
+            config.approval_mode = ApprovalMode::FullAuto;
+            config.history_mode = HistoryMode::Record;
+            let mut thread = RuntimeThread::start(&config, "failed tool result commit").unwrap();
+            let (service, task_id) = start_shell_for_notice(&thread, &config, cwd.path());
+            let arguments = if tool == "task_wait" {
+                serde_json::json!({"task_ids": [&task_id], "wait_ms": 5000})
+            } else {
+                serde_json::json!({"task_id": &task_id, "cursor": 0})
+            };
+            let provider =
+                serve_scripted_provider(&mut config, [scripted_tool_call(tool, arguments)]);
+            let path = thread
+                .session_mut()
+                .runtime_parts()
+                .writer
+                .unwrap()
+                .path()
+                .to_path_buf();
+            let backup = path.with_extension("backup");
+            let (transcript, saved) = (path.clone(), backup.clone());
+            let workdir = cwd.path().to_path_buf();
+            let release_service = Arc::clone(&service);
+            let id = task_id.clone();
+            let request = ThreadTurnRequest::new("collect a finished command").with_event_observer(
+                Arc::new(move |event: &EventEnvelope| {
+                    match event.event_type {
+                        EventType::ModelResponseCompleted => {
+                            release_shell_for_notice(&release_service, &workdir, &id)
+                        }
+                        EventType::ToolCallCompleted => {
+                            std::fs::rename(&transcript, &saved)?;
+                            std::fs::create_dir(&transcript)?;
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                }),
+            );
+            let result = thread.run_request(&config, &request, io::sink());
+            assert!(path.is_dir(), "{tool} did not reach its result: {result:?}");
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(backup, path).unwrap();
+            provider.join().unwrap();
+            let notices = service.pending_completions();
+            assert_eq!(
+                notices
+                    .iter()
+                    .map(|notice| &notice.task_id)
+                    .collect::<Vec<_>>(),
+                vec![&task_id],
+                "{tool}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stopping_an_already_finished_command_withdraws_its_notice() {
+        use orca_core::event_schema::{EventEnvelope, EventType};
+        use orca_core::tool_types::ToolStatus;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut thread = RuntimeThread::start(&config, "stop finished command").unwrap();
+        let (service, task_id) = start_shell_for_notice(&thread, &config, cwd.path());
+        let release_service = Arc::clone(&service);
+        let id = task_id.clone();
+        let workdir = cwd.path().to_path_buf();
+        let request = ThreadTurnRequest::new(format!("task_stop {task_id}")).with_event_observer(
+            Arc::new(move |event: &EventEnvelope| {
+                if event.event_type == EventType::ModelResponseCompleted
+                    && !workdir.join("release-notice").exists()
+                {
+                    release_shell_for_notice(&release_service, &workdir, &id);
+                }
+                Ok(())
+            }),
+        );
+        assert_eq!(
+            thread.run_request(&config, &request, io::sink()).unwrap(),
+            RunStatus::Success
+        );
+        let conversation = thread.session().conversation();
+        assert!(conversation.messages.iter().any(|message| matches!(message,
+            Message::Tool { content, terminal: Some(terminal), .. }
+                if terminal.status == ToolStatus::Failed && content.contains("task is already completed")
+        )));
+        assert_eq!(shell_completion_messages(conversation).count(), 0);
+        assert!(service.pending_completions().is_empty());
     }
 
     fn run_with_completion_during_final_answer(

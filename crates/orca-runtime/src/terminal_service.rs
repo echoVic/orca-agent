@@ -104,6 +104,7 @@ enum TerminalCommand {
         session_id: String,
         max_output_bytes: usize,
         output_offset: Option<usize>,
+        observe_completion: bool,
         response: SyncSender<io::Result<TerminalServiceOutput>>,
     },
     MarkBackground {
@@ -443,14 +444,7 @@ impl TerminalService {
         cursor: usize,
         max_output_bytes: usize,
     ) -> io::Result<Option<TerminalServiceOutput>> {
-        let output = self.read_output_at_or_cursor(task_id, Some(cursor), max_output_bytes)?;
-        if output
-            .as_ref()
-            .is_some_and(|output| output.status != "running")
-        {
-            self.observe_completions(vec![task_id.to_owned()]);
-        }
-        Ok(output)
+        self.read_output_at_or_cursor(task_id, Some(cursor), max_output_bytes)
     }
 
     /// Samples a task for a wait. The wait acknowledges completions when it
@@ -485,6 +479,7 @@ impl TerminalService {
             session_id,
             max_output_bytes,
             output_offset: cursor,
+            observe_completion: false,
             response,
         })?;
         Ok(Some(receive_response(receiver, "terminal read")??))
@@ -685,6 +680,7 @@ impl TerminalService {
             session_id: session_id.to_string(),
             max_output_bytes,
             output_offset,
+            observe_completion: true,
             response,
         })?;
         receive_response(receiver, "terminal poll")?
@@ -778,9 +774,15 @@ fn run_terminal_supervisor(mut state: TerminalServiceState, receiver: Receiver<T
                 session_id,
                 max_output_bytes,
                 output_offset,
+                observe_completion,
                 response,
             }) => {
-                let result = state.poll(&session_id, max_output_bytes, output_offset);
+                let result = state.poll(
+                    &session_id,
+                    max_output_bytes,
+                    output_offset,
+                    observe_completion,
+                );
                 let _ = response.send(result);
             }
             Ok(TerminalCommand::MarkBackground { session_id }) => {
@@ -888,6 +890,7 @@ impl TerminalServiceState {
         session_id: &str,
         max_output_bytes: usize,
         output_offset: Option<usize>,
+        observe_completion: bool,
     ) -> io::Result<TerminalServiceOutput> {
         self.reap()?;
         let (task_id, cursor, requested_terminal, effective_terminal, terminal) =
@@ -933,7 +936,7 @@ impl TerminalServiceState {
             if let Some(session) = self.sessions.get_mut(session_id) {
                 session.cursor = output.next_offset;
             }
-            if terminal.status != TaskStatus::Running {
+            if observe_completion && terminal.status != TaskStatus::Running {
                 self.observe_completion(session_id);
             }
             // A session that reached EOF stays addressable until the retention
@@ -2701,7 +2704,7 @@ mod tests {
     }
 
     #[test]
-    fn a_completion_collected_by_task_wait_is_not_announced() {
+    fn task_wait_reports_which_shell_completion_was_observed() {
         use orca_core::approval_types::ActionKind;
         use orca_core::tool_types::{InterruptSemantics, ToolName, ToolRequest, ToolStatus};
 
@@ -2736,11 +2739,15 @@ mod tests {
             serde_json::from_str(&result.output.expect("wait result")).unwrap();
         assert_eq!(payload["tasks"][0]["status"], "completed");
         assert_eq!(payload["tasks"][0]["output"], "collected by wait");
-        assert!(service.drain_completions().is_empty());
+        assert_eq!(
+            result.observed_shell_completions,
+            vec![started.task_id.clone()]
+        );
+        assert_eq!(service.pending_completions()[0].task_id, started.task_id);
     }
 
     #[test]
-    fn a_completion_read_at_an_explicit_cursor_is_not_announced() {
+    fn reading_at_an_explicit_cursor_leaves_the_notice_for_the_commit() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (service, registry) = service(temp.path());
         let started = start_output_command(&service, temp.path());
@@ -2752,7 +2759,7 @@ mod tests {
             .unwrap();
         assert_eq!(page.status, "completed");
         assert_eq!(page.output, "collected at cursor zero");
-        assert!(service.drain_completions().is_empty());
+        assert_eq!(service.pending_completions()[0].task_id, started.task_id);
     }
 
     #[test]

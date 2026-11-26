@@ -626,6 +626,7 @@ fn settle_children_before_return<W: io::Write>(
                         state_change: false,
                         baseline: Vec::new(),
                         result: None,
+                        observed_shell_completions: Vec::new(),
                     }),
                 )
                 .map_err(io::Error::other)?;
@@ -726,7 +727,7 @@ fn park_pending_task_wait<W: io::Write>(
                 std::time::Duration::from_millis(50),
             );
         };
-        let completed_shells = observations
+        wait.observed_shell_completions = observations
             .iter()
             .flatten()
             .filter(|view| {
@@ -743,9 +744,6 @@ fn park_pending_task_wait<W: io::Write>(
         registry
             .set_pending_wait(task_id, Some(wait.clone()))
             .map_err(io::Error::other)?;
-        if let Some(service) = terminal_service(input) {
-            service.observe_completions(completed_shells);
-        }
     }
     // Persist the exact observation before delivery, so replay cannot change
     // timing fields and inject a second copy after a crash before acknowledgement.
@@ -776,6 +774,9 @@ fn park_pending_task_wait<W: io::Write>(
         input.prepared_conversation,
         input.operation.controller.usage(),
     )?;
+    if let Some(service) = terminal_service(input) {
+        service.observe_completions(wait.observed_shell_completions);
+    }
     registry
         .set_pending_wait(task_id, None)
         .map_err(io::Error::other)?;
@@ -1072,6 +1073,7 @@ mod tests {
                                 state_change: false,
                                 baseline: Vec::new(),
                                 result: None,
+                                observed_shell_completions: Vec::new(),
                             }),
                         )
                         .unwrap();
