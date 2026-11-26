@@ -2908,6 +2908,7 @@ mod tests {
                 crate::runtime_conversation_bootstrap::AgentConversationContext::borrowed(
                     &mut conversation,
                     None,
+                    false,
                 ),
                 cwd.path(),
                 "continue",

@@ -2,6 +2,7 @@ use std::io;
 
 use orca_approval::ApprovalPolicy;
 use orca_core::config::{ProviderKind, RunConfig};
+use orca_core::conversation::{Conversation, Message};
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
 use orca_core::model::ModelSelection;
@@ -19,6 +20,7 @@ use crate::runtime_conversation_bootstrap::RuntimePreparedConversation;
 use crate::runtime_turn_iteration::{
     RuntimeTurnIterationInput, RuntimeTurnIterationResult, RuntimeTurnIterationStep,
 };
+use crate::terminal_service::TerminalService;
 use crate::tool_invocation::AgentToolPolicyContext;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::workflow::runner::SharedEventBuffer;
@@ -291,7 +293,7 @@ impl RuntimeTurnLoopStep {
         let mut summary_provider_config = None;
         loop {
             park_pending_task_wait(&mut input)?;
-            deliver_child_results(&mut input)?;
+            deliver_loop_notices(&mut input, true)?;
             if let Some(task_id) = input.request.turn_context.task_id.as_deref() {
                 let registry = input.loop_state.runtime.task_registry;
                 let messages = registry.pending_child_messages(task_id);
@@ -454,11 +456,11 @@ fn direct_subagent_children_settled(
     Ok(!first.status.is_active() && children.all(|task| !task.status.is_active()))
 }
 
-/// Drain at every settled model boundary, not only when a new user turn starts.
-fn deliver_child_results<W: io::Write>(
+fn deliver_loop_notices<W: io::Write>(
     input: &mut RuntimeTurnLoopInput<'_, '_, W>,
+    include_shell: bool,
 ) -> io::Result<bool> {
-    if conversation_has_open_tool_calls(input.prepared_conversation.checkpoint_parts().0) {
+    if !input.prepared_conversation.can_deliver_notices() {
         return Ok(false);
     }
     let registry = input.loop_state.runtime.task_registry;
@@ -468,33 +470,80 @@ fn deliver_child_results<W: io::Write>(
         .task_id
         .as_deref()
         .or(input.request.turn_context.root_task_id);
-    let results = registry.claim_subagent_results_for_parent(parent);
-    let delivered = !results.is_empty();
-    for result in results {
-        let ack = crate::tasks::DeliveryAck::from(&result);
-        let content = result.model_notification();
-        let (conversation, mut writer) = input.prepared_conversation.parts_mut();
-        let present = conversation.messages.iter().any(|message|
-            matches!(message, orca_core::conversation::Message::System { content: text, .. } if text == &content));
+    let service = include_shell.then(|| terminal_service(input)).flatten();
+    let usage = input.operation.controller.usage();
+    let (conversation, writer, observer) = input
+        .prepared_conversation
+        .parts_mut_with_checkpoint_observer();
+    deliver_boundary_notices(
+        conversation,
+        writer,
+        registry,
+        parent,
+        service.as_deref(),
+        |conversation| checkpoint_child(conversation, observer, usage),
+    )
+}
+
+/// Append and acknowledge notices at a settled tool boundary, child results first.
+pub(crate) fn deliver_boundary_notices(
+    conversation: &mut Conversation,
+    mut writer: Option<&mut crate::thread_store::SessionWriter>,
+    registry: &crate::tasks::TaskRegistry,
+    parent: Option<&str>,
+    terminal: Option<&TerminalService>,
+    mut checkpoint: impl FnMut(&Conversation) -> io::Result<()>,
+) -> io::Result<bool> {
+    if conversation_has_open_tool_calls(conversation) {
+        return Ok(false);
+    }
+    let mut append = |content: String| {
         if let Some(writer) = writer.as_deref_mut() {
-            if let Err(error) = writer.append_system_delivery_once(&content) {
-                registry.release_subagent_result_claim(&ack);
-                return Err(error);
-            }
+            writer.append_system_delivery_once(&content)?;
         }
-        if !present {
+        if !conversation.messages.iter().any(
+            |message| matches!(message, Message::System { content: text, .. } if text == &content),
+        ) {
             conversation.add_system(content);
         }
-        if let Err(error) = emit_safe_child_checkpoint(
-            input.prepared_conversation,
-            input.operation.controller.usage(),
-        ) {
+        checkpoint(conversation)
+    };
+    let mut children = registry
+        .claim_subagent_results_for_parent(parent)
+        .into_iter();
+    let delivered_children = children.len() != 0;
+    while let Some(child) = children.next() {
+        let ack = crate::tasks::DeliveryAck::from(&child);
+        if let Err(error) = append(child.model_notification()) {
             registry.release_subagent_result_claim(&ack);
+            for remaining in children {
+                registry
+                    .release_subagent_result_claim(&crate::tasks::DeliveryAck::from(&remaining));
+            }
             return Err(error);
         }
         registry.ack_subagent_result(&ack);
     }
-    Ok(delivered)
+    if let Some(service) = terminal {
+        for completion in service.pending_completions() {
+            append(completion.model_notification())?;
+            service.observe_completions(vec![completion.task_id]);
+        }
+    }
+    Ok(delivered_children)
+}
+
+fn terminal_service<W: io::Write>(
+    input: &RuntimeTurnLoopInput<'_, '_, W>,
+) -> Option<std::sync::Arc<TerminalService>> {
+    input
+        .loop_state
+        .runtime
+        .extensions
+        .extension_context()
+        .stores()
+        .thread_store()
+        .get::<TerminalService>()
 }
 
 /// Whether a turn that ended on its own still owes the model a steer input:
@@ -580,6 +629,7 @@ fn settle_children_before_return<W: io::Write>(
                         state_change: false,
                         baseline: Vec::new(),
                         result: None,
+                        observed_shell_completions: Vec::new(),
                     }),
                 )
                 .map_err(io::Error::other)?;
@@ -603,7 +653,8 @@ fn settle_children_before_return<W: io::Write>(
         }
     }
     input.operation.refresh_child_budgets()?;
-    Ok(deliver_child_results(input)? || waited)
+    let delivered_children = deliver_loop_notices(input, false)?;
+    Ok(delivered_children || waited)
 }
 
 /// A wait owns no execution slot after its tool boundary is durably settled.
@@ -679,6 +730,14 @@ fn park_pending_task_wait<W: io::Write>(
                 std::time::Duration::from_millis(50),
             );
         };
+        wait.observed_shell_completions = observations
+            .iter()
+            .flatten()
+            .filter(|view| {
+                view.task_type == orca_core::task_types::TaskType::Shell && view.is_terminal()
+            })
+            .map(|view| view.task_id.clone())
+            .collect();
         wait.result = Some(format!(
             "[Task wait result id={}] {}",
             wait.tool_call_id,
@@ -718,6 +777,9 @@ fn park_pending_task_wait<W: io::Write>(
         input.prepared_conversation,
         input.operation.controller.usage(),
     )?;
+    if let Some(service) = terminal_service(input) {
+        service.observe_completions(wait.observed_shell_completions);
+    }
     registry
         .set_pending_wait(task_id, None)
         .map_err(io::Error::other)?;
@@ -733,6 +795,14 @@ fn emit_safe_child_checkpoint(
     usage: orca_core::budget::BudgetUsage,
 ) -> io::Result<()> {
     let (conversation, observer) = prepared_conversation.checkpoint_parts();
+    checkpoint_child(conversation, observer, usage)
+}
+
+fn checkpoint_child(
+    conversation: &Conversation,
+    observer: Option<&dyn crate::child_agent_types::ChildAgentCheckpointSink>,
+    usage: orca_core::budget::BudgetUsage,
+) -> io::Result<()> {
     let Some(observer) = observer else {
         return Ok(());
     };
@@ -899,7 +969,7 @@ mod tests {
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let mut conversation = Conversation::new();
         let mut prepared_conversation = RuntimeConversationBootstrapStep::new().prepare(
-            AgentConversationContext::borrowed(&mut conversation, None),
+            AgentConversationContext::borrowed(&mut conversation, None, false),
             cwd.path(),
             "continue",
             0,
@@ -1006,6 +1076,7 @@ mod tests {
                                 state_change: false,
                                 baseline: Vec::new(),
                                 result: None,
+                                observed_shell_completions: Vec::new(),
                             }),
                         )
                         .unwrap();
@@ -1113,7 +1184,7 @@ mod tests {
         let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
         let mut conversation = Conversation::new();
         let mut prepared_conversation = RuntimeConversationBootstrapStep::new().prepare(
-            AgentConversationContext::borrowed(&mut conversation, None),
+            AgentConversationContext::borrowed(&mut conversation, None, false),
             cwd.path(),
             "continue",
             0,

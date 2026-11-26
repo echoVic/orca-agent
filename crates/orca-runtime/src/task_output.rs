@@ -109,6 +109,14 @@ impl TaskOutputStore {
     }
 
     pub(crate) fn archived_shell(&self, shell_id: &str) -> io::Result<ArchivedShell> {
+        self.with_archive(|archive| archive.shell(shell_id))
+    }
+
+    pub(crate) fn archived_shell_id(&self, task_id: &str) -> io::Result<String> {
+        self.with_archive(|archive| archive.finished_shell_id(task_id))
+    }
+
+    fn with_archive<T>(&self, read: impl FnOnce(&OutputArchive) -> io::Result<T>) -> io::Result<T> {
         let inner = self.inner.lock().expect("task output store poisoned");
         inner.check_archive()?;
         let archive = inner.archive.as_ref().ok_or_else(|| {
@@ -117,10 +125,8 @@ impl TaskOutputStore {
                 "no persistent output archive for this session",
             )
         })?;
-        archive
-            .lock()
-            .expect("output archive poisoned")
-            .shell(shell_id)
+        let archive = archive.lock().expect("output archive poisoned");
+        read(&archive)
     }
 
     pub(crate) fn finish_shell(

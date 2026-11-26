@@ -912,6 +912,9 @@ pub struct ToolResult {
     /// when the call returns, so it never enters a transcript.
     #[serde(skip)]
     pub service_usage: ToolServiceUsage,
+    /// Shell notices this result makes redundant after it joins the conversation.
+    #[serde(skip)]
+    pub observed_shell_completions: Vec<String>,
 }
 
 impl Deref for ToolResult {
@@ -991,6 +994,7 @@ impl ToolResult {
             touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -1013,6 +1017,7 @@ impl ToolResult {
             touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -1050,6 +1055,7 @@ impl ToolResult {
             touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -1105,6 +1111,7 @@ impl ToolResult {
             touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -1127,6 +1134,7 @@ impl ToolResult {
             touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -1149,6 +1157,7 @@ impl ToolResult {
             touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -1184,6 +1193,7 @@ impl ToolResult {
             touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -1230,6 +1240,7 @@ impl ToolResult {
             touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
+            observed_shell_completions: Vec::new(),
         }
     }
 
@@ -1278,6 +1289,14 @@ impl ToolOutputTruncation {
     pub fn limit(self) -> usize {
         match self {
             Self::Bytes { limit } | Self::Tokens { limit } => limit,
+        }
+    }
+
+    /// Byte budget for retaining the output text, before any truncation notice.
+    pub fn retained_byte_budget(self) -> usize {
+        match self.normalized() {
+            Self::Bytes { limit } => limit,
+            Self::Tokens { limit } => approx_bytes_for_tokens(limit),
         }
     }
 
@@ -1359,8 +1378,8 @@ fn truncate_output_tokens(output: String, max_tokens: usize) -> (String, bool) {
     }
 
     let line_count = output.lines().count();
-    let byte_budget = approx_bytes_for_tokens(max_tokens);
-    let (snippet, _) = truncate_output_bytes(output, byte_budget.max(1));
+    let byte_budget = ToolOutputTruncation::tokens(max_tokens).retained_byte_budget();
+    let (snippet, _) = truncate_output_bytes(output, byte_budget);
     (
         format!(
             "Warning: truncated tool output\nOriginal token count: {original_tokens}\nOriginal line count: {line_count}\n\n{snippet}"

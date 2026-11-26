@@ -18,7 +18,7 @@ use super::projection::{
     conversation_records_to_thread_items, conversation_records_to_thread_turns,
     is_surface_coordinator_record, normalized_stored_messages, stored_message_to_thread_json,
 };
-use super::reader::iter_records;
+use super::reader::{is_ignorable_search_line, iter_records};
 use super::session_index::{self, SessionSummaryPage};
 use super::types::{
     SessionMeta, SessionRecord, SessionSummary, SessionTranscript, SortDirection,
@@ -302,7 +302,7 @@ impl JsonlThreadStore {
             target,
             orca_platform::fs::AtomicWritePolicy::NoFollow,
             |output| {
-                for record in iter_records(&path, HydrateImages::All)? {
+                for record in iter_records(&path, HydrateImages::All)?.require_metadata() {
                     let mut record = record?;
                     super::spill::omit_from_export(&mut record);
                     super::writer::write_record_line(&mut *output, &record)?;
@@ -662,6 +662,9 @@ pub(crate) fn storage_identity_for_path(path: &Path) -> String {
 
 pub fn search_sessions(query: &str, include_archived: bool) -> io::Result<Vec<SearchHit>> {
     let mut hits = Vec::new();
+    // The in-process backend searches only the inspected prefix. Ripgrep can
+    // also match raw lines past that limit, with each hit checked against the
+    // bounded catalog health and its own skippable marker.
     let used_ripgrep = search_roots_with_ripgrep(query, include_archived, &mut hits)?;
     let mut seen: HashSet<(PathBuf, usize)> = hits
         .iter()
@@ -737,6 +740,9 @@ impl RipgrepSearchCollector {
         let Some(line_text) = value["data"]["lines"]["text"].as_str() else {
             return;
         };
+        if is_ignorable_search_line(line_text) {
+            return;
+        }
         let path = PathBuf::from(path_text);
         let (line, _) = truncate_output(
             line_text.trim_end_matches('\n').to_string(),
@@ -872,13 +878,16 @@ fn push_matching_lines(
     path: &Path,
     archived: bool,
     query: &str,
-    lines: &[String],
+    lines: &[Option<String>],
     hits: &mut Vec<SearchHit>,
     seen: &mut HashSet<(PathBuf, usize)>,
 ) {
     for (index, line) in lines.iter().enumerate() {
         let line_number = index + 1;
-        if line.contains(query) && seen.insert((path.to_path_buf(), line_number)) {
+        if let Some(line) = line
+            && line.contains(query)
+            && seen.insert((path.to_path_buf(), line_number))
+        {
             push_search_hit(path, archived, line_number, line.clone(), hits);
         }
     }
@@ -894,7 +903,7 @@ fn push_search_hit(
     // A bounded index scan may be incomplete without making its prefix
     // unusable for search or turning a large transcript into a corrupt one.
     if let Ok(summary) = summarize_session_with_archive_flag(path, archived) {
-        if summary.health == StoredSessionHealth::Quarantined {
+        if summary.health.blocks_mutation() {
             return;
         }
         hits.push(SearchHit {
@@ -1102,7 +1111,7 @@ impl ThreadStore for JsonlThreadStore {
             )
         })?;
         let _lock = acquire_file_lock(&path)?;
-        let records = iter_records(&path, HydrateImages::All)?;
+        let records = iter_records(&path, HydrateImages::All)?.require_metadata();
         let mut patched = false;
         let records = records.map(|record| {
             let mut record = record?;
@@ -1147,12 +1156,6 @@ impl ThreadStore for JsonlThreadStore {
             Ok(record)
         });
         rewrite_records_unlocked(&path, records)?;
-        if !patched {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "session transcript has no metadata record",
-            ));
-        }
         let summary = summarize_session_with_archive_flag(&path, path.starts_with(archive_dir()))?;
         #[cfg(not(test))]
         let _ = session_index::upsert_summary(&summary);
@@ -1589,6 +1592,52 @@ mod tests {
             }
         }))
         .expect("match json")
+    }
+
+    #[test]
+    fn an_empty_query_does_not_match_a_skipped_record() {
+        let home = tempfile::tempdir().unwrap();
+        crate::history::with_test_orca_home(home.path(), |_| {
+            let root = sessions_dir();
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("compat.jsonl");
+            let meta = serde_json::to_string(&SessionRecord::Meta(crate::history::create_meta(
+                home.path(),
+                "mock",
+                None,
+                "searchable session",
+            )))
+            .unwrap();
+            let skipped = r#"{"type":"future.note","ignorable":true}"#;
+            let message = r#"{"type":"conversation.message","message":{"role":"user","content":"after skipped record"}}"#;
+            let lines = [meta.as_str(), "", skipped, message];
+            fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+            let mut hits = Vec::new();
+            search_root_in_process(&root, false, "", &mut hits, &mut HashSet::new()).unwrap();
+            assert_eq!(
+                hits.iter().map(|hit| hit.line_number).collect::<Vec<_>>(),
+                [1, 2, 4]
+            );
+
+            let mut collector = RipgrepSearchCollector::new();
+            for (index, line) in lines.iter().enumerate() {
+                let frame = match_line(&path, line, index + 1);
+                collector.push(orca_tools::process::BoundedLine {
+                    bytes: &frame,
+                    observed_bytes: frame.len(),
+                    omitted_bytes: 0,
+                });
+            }
+            assert_eq!(
+                collector
+                    .matches
+                    .iter()
+                    .map(|hit| hit.line_number)
+                    .collect::<Vec<_>>(),
+                [1, 2, 4]
+            );
+        });
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub(crate) enum AgentConversationContext<'a> {
     Borrowed {
         conversation: &'a mut Conversation,
         history_writer: Option<&'a mut SessionWriter>,
+        recorded: bool,
         checkpoint_observer: Option<&'a dyn ChildAgentCheckpointSink>,
     },
 }
@@ -26,6 +27,7 @@ pub(crate) enum AgentConversationContext<'a> {
 pub(crate) struct RuntimePreparedConversation<'a> {
     conversation: RuntimePreparedConversationStorage<'a>,
     history_writer: Option<&'a mut SessionWriter>,
+    recorded: bool,
     checkpoint_observer: Option<&'a dyn ChildAgentCheckpointSink>,
 }
 
@@ -44,10 +46,12 @@ impl<'a> AgentConversationContext<'a> {
     pub(crate) fn borrowed(
         conversation: &'a mut Conversation,
         history_writer: Option<&'a mut SessionWriter>,
+        recorded: bool,
     ) -> Self {
         Self::Borrowed {
             conversation,
             history_writer,
+            recorded,
             checkpoint_observer: None,
         }
     }
@@ -59,6 +63,7 @@ impl<'a> AgentConversationContext<'a> {
         Self::Borrowed {
             conversation,
             history_writer: None,
+            recorded: false,
             checkpoint_observer: Some(checkpoint_observer),
         }
     }
@@ -98,15 +103,18 @@ impl RuntimeConversationBootstrapStep {
                     ),
                 ),
                 history_writer: None,
+                recorded: false,
                 checkpoint_observer,
             },
             AgentConversationContext::Borrowed {
                 conversation,
                 history_writer,
+                recorded,
                 checkpoint_observer,
             } => RuntimePreparedConversation {
                 conversation: RuntimePreparedConversationStorage::Borrowed(conversation),
                 history_writer,
+                recorded,
                 checkpoint_observer,
             },
         };
@@ -116,6 +124,10 @@ impl RuntimeConversationBootstrapStep {
 }
 
 impl RuntimePreparedConversation<'_> {
+    pub(crate) fn can_deliver_notices(&self) -> bool {
+        !self.recorded || self.history_writer.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn conversation_mut(&mut self) -> &mut Conversation {
         match &mut self.conversation {

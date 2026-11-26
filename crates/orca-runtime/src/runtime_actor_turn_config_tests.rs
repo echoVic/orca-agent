@@ -28,7 +28,7 @@ fn turn_config_actor(cwd: &std::path::Path) -> ThreadActor {
         task_registry: prepared.thread.session().task_registry().clone(),
         mcp_registry: mcp.clone(),
         mcp_registry_owned: Arc::new(AtomicBool::new(false)),
-        mcp_startup: crate::mcp_startup::McpStartupWarnings::watch(&mcp),
+        mcp_startup: crate::mcp_startup::McpStartupWarnings::watch(&mcp, 0),
         command_tx,
         surface: surface_handle,
         prompt_queue_updates: tokio::sync::watch::channel(

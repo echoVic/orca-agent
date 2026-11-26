@@ -509,7 +509,7 @@ pub(crate) fn announce_runtime_ready(
             // those their startup left, however often the thread is shown
             // again.
             let mcp_warnings_tx = event_tx.clone();
-            thread.on_mcp_startup_warnings(move |warnings| {
+            thread.on_mcp_warnings(move |warnings| {
                 for warning in warnings {
                     let _ = mcp_warnings_tx.send(TuiEvent::StartupWarning(warning));
                 }
