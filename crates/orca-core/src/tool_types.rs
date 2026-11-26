@@ -1159,6 +1159,14 @@ impl ToolOutputTruncation {
         }
     }
 
+    /// Byte budget for retaining the output text, before any truncation notice.
+    pub fn retained_byte_budget(self) -> usize {
+        match self.normalized() {
+            Self::Bytes { limit } => limit,
+            Self::Tokens { limit } => approx_bytes_for_tokens(limit),
+        }
+    }
+
     pub fn normalized(self) -> Self {
         match self {
             Self::Bytes { limit } => Self::Bytes {
@@ -1237,8 +1245,8 @@ fn truncate_output_tokens(output: String, max_tokens: usize) -> (String, bool) {
     }
 
     let line_count = output.lines().count();
-    let byte_budget = approx_bytes_for_tokens(max_tokens);
-    let (snippet, _) = truncate_output_bytes(output, byte_budget.max(1));
+    let byte_budget = ToolOutputTruncation::tokens(max_tokens).retained_byte_budget();
+    let (snippet, _) = truncate_output_bytes(output, byte_budget);
     (
         format!(
             "Warning: truncated tool output\nOriginal token count: {original_tokens}\nOriginal line count: {line_count}\n\n{snippet}"

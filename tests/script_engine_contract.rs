@@ -274,6 +274,21 @@ fn a_script_over_its_memory_keeps_its_log() {
 }
 
 #[test]
+fn a_huge_log_line_keeps_its_prefix() {
+    let (outcome, _) = run_batches(
+        r#"console.log("漢".repeat(1_900_000)); while (true) {}"#,
+        ScriptEngineLimits {
+            wall_clock: Duration::from_secs(1),
+            memory_bytes: 8 * 1024 * 1024,
+        },
+        |_| Ok(String::new()),
+    );
+    let error = error_of(outcome);
+    assert!(error.contains("ran longer than"), "{error}");
+    assert!(error.contains(&"漢".repeat(100)), "{error}");
+}
+
+#[test]
 fn kept_log_lines_are_bounded() {
     let (outcome, _) = run_batches(
         r#"console.log("first");
@@ -290,6 +305,7 @@ fn kept_log_lines_are_bounded() {
     let prefix = "the script ran longer than 1s and was stopped\n\nLogged before it was stopped:\n";
     assert!(error.starts_with(&format!("{prefix}first")));
     assert!(error.len() <= prefix.len() + MAX_TOOL_OUTPUT_BYTES);
+    assert!(error.contains(&"x".repeat(100)));
 }
 
 #[test]
