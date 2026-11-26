@@ -49,6 +49,17 @@ Corrupt records still block recovery. A bounded catalog or search scan may
 report `inspection_limited`, which is not corruption and does not disable
 resume or fork. Resume independently validates the complete history.
 
+If a session uses a newer transcript schema or contains a required record this
+version does not recognize, the picker shows **Newer version** (`newer_version`).
+The session can be opened after upgrading Orca. In the meantime, resume, fork,
+and transcript edits are blocked.
+
+Use `"ignorable": true` on a new record type only if older Orca versions can
+safely skip it. Orca reads past unrecognized records with this flag and keeps
+their original bytes and position when it rewrites or exports the transcript.
+New record types are required by default. New fields in `session.meta` are
+accepted. Increase `schema_version` for changes that require a newer reader.
+
 New inline images are stored by SHA-256 in the transcript's sibling
 `SESSION.jsonl.assets/` directory. Repeated uses within a session share one
 blob. The versioned JSONL envelope records the digest, decoded length and

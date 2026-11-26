@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::assets::{self, HydrateImages};
-use super::types::{SessionRecord, StoredSessionHealth, StoredSessionHealthIssue};
+use super::types::{SessionMeta, SessionRecord, StoredSessionHealth, StoredSessionHealthIssue};
 use super::writer::{
     MAX_SESSION_LINE_BYTES, open_regular_history_file, parse_session_record, read_bounded_line,
     session_health_error, validate_session_record,
@@ -82,6 +82,15 @@ pub(crate) struct SessionRecords {
     done: bool,
     pub health: StoredSessionHealth,
     pub issue: Option<StoredSessionHealthIssue>,
+    /// Catalog metadata can be read from a newer header without replaying it.
+    pub(super) newer_meta: Option<SessionMeta>,
+}
+
+#[derive(serde::Deserialize)]
+struct SessionSchemaHeader {
+    #[serde(rename = "type")]
+    record_type: String,
+    schema_version: u64,
 }
 
 pub(crate) fn iter_records(path: &Path, images: HydrateImages) -> io::Result<SessionRecords> {
@@ -173,6 +182,7 @@ impl SessionRecords {
             done: false,
             health: StoredSessionHealth::Healthy,
             issue: None,
+            newer_meta: None,
         })
     }
 
@@ -229,9 +239,6 @@ impl SessionRecords {
             );
             return None;
         }
-        if code == "newer_schema_version" {
-            return self.stop_with_error(StoredSessionHealth::NewerVersion, code, offset, None);
-        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(self.text()) else {
             return self.fail(code, offset);
         };
@@ -246,20 +253,15 @@ impl SessionRecords {
                     result => result,
                 });
             return match record {
-                Ok(record) => Some(Ok(record)),
-                Err("newer_schema_version") => self.stop_with_error(
-                    StoredSessionHealth::NewerVersion,
-                    "newer_schema_version",
-                    offset,
-                    None,
-                ),
+                Ok(record) => self.check_record_version(record, offset),
                 Err(code) => self.fail(code, offset),
             };
         }
         if value["type"] == "session.meta"
-            && value["schema_version"]
-                .as_u64()
-                .is_some_and(|version| version > u64::from(SESSION_SCHEMA_VERSION))
+            && serde_json::from_str::<SessionSchemaHeader>(self.text()).is_ok_and(|header| {
+                header.record_type == "session.meta"
+                    && header.schema_version > u64::from(SESSION_SCHEMA_VERSION)
+            })
         {
             return self.stop_with_error(
                 StoredSessionHealth::NewerVersion,
@@ -283,6 +285,25 @@ impl SessionRecords {
             );
         }
         self.fail(code, offset)
+    }
+
+    fn check_record_version(
+        &mut self,
+        record: SessionRecord,
+        offset: u64,
+    ) -> Option<io::Result<SessionRecord>> {
+        match record {
+            SessionRecord::Meta(meta) if meta.schema_version > SESSION_SCHEMA_VERSION => {
+                self.newer_meta = Some(meta);
+                self.stop_with_error(
+                    StoredSessionHealth::NewerVersion,
+                    "newer_schema_version",
+                    offset,
+                    None,
+                )
+            }
+            record => Some(Ok(record)),
+        }
     }
 }
 
@@ -363,7 +384,7 @@ impl Iterator for SessionRecords {
                 Err(_) => return self.fail("invalid_utf8", start),
             };
             return match parse_session_record(text) {
-                Ok(record) => Some(Ok(record)),
+                Ok(record) => self.check_record_version(record, start),
                 Err(code) => self.handle_parse_error(code, start, terminated),
             };
         }

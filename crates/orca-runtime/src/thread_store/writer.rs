@@ -281,17 +281,13 @@ fn repair_incomplete_final_record(file: &mut File) -> io::Result<()> {
 
 pub(crate) fn write_record_line(mut writer: impl Write, record: &SessionRecord) -> io::Result<()> {
     if let SessionRecord::Ignorable(bytes) = record {
-        debug_assert!(!bytes.is_empty());
-        return Ok(());
+        return writer.write_all(bytes);
     }
     let redacted = redact_session_record(record);
     writer.write_all(&bounded_json_line(&redacted)?)
 }
 
 fn encode_record_line(path: &Path, record: &SessionRecord) -> io::Result<Vec<u8>> {
-    if matches!(record, SessionRecord::Ignorable(_)) {
-        return Ok(Vec::new());
-    }
     let redacted = redact_session_record(record);
     // Validate the hydrated representation too. A small reference envelope
     // must not expand past the reader's allocation bound.
@@ -400,16 +396,20 @@ fn write_records_to(
     target_path: &Path,
     records: impl IntoIterator<Item = io::Result<SessionRecord>>,
 ) -> io::Result<()> {
+    let lines = records.into_iter().map(|record| match record? {
+        SessionRecord::Ignorable(bytes) => Ok(bytes),
+        record => encode_record_line(target_path, &record),
+    });
     if target_path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
         let mut encoder = zstd::stream::write::Encoder::new(file, 3)?;
-        for record in records {
-            encoder.write_all(&encode_record_line(target_path, &record?)?)?;
+        for line in lines {
+            encoder.write_all(&line?)?;
         }
         encoder.finish()?;
     } else {
         let mut writer = io::BufWriter::new(file);
-        for record in records {
-            writer.write_all(&encode_record_line(target_path, &record?)?)?;
+        for line in lines {
+            writer.write_all(&line?)?;
         }
         writer.flush()?;
     }
@@ -460,6 +460,9 @@ fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionSca
                 .resize(reader.line_number as usize, String::new());
             *scan.lines.last_mut().expect("current line") = reader.text().to_owned();
         }
+    }
+    if let Some(meta) = reader.newer_meta {
+        scan.records.push(SessionRecord::Meta(meta));
     }
     scan.health = reader.health;
     scan.health_issue = reader.issue;
@@ -536,9 +539,6 @@ pub(super) fn parse_session_record(line: &str) -> Result<SessionRecord, &'static
 pub(super) fn validate_session_record(value: SessionRecord) -> Result<SessionRecord, &'static str> {
     match &value {
         SessionRecord::Unrecognized => Err("unknown_record_type"),
-        SessionRecord::Meta(meta) if meta.schema_version > history::SESSION_SCHEMA_VERSION => {
-            Err("newer_schema_version")
-        }
         SessionRecord::Message { id, turn_id, .. } if id.is_some() != turn_id.is_some() => {
             Err("invalid_conversation_identity")
         }
@@ -2732,6 +2732,7 @@ mod tests {
             additional_working_directories: Vec::new(),
             metadata_writable_directories: Vec::new(),
             network_domain_permissions: Default::default(),
+            additional_fields: Default::default(),
         };
         write_record(&path, &SessionRecord::Meta(meta)).expect("write metadata");
         let writer = SessionWriter {

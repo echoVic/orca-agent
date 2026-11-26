@@ -115,6 +115,9 @@ pub struct SessionMeta {
     pub metadata_writable_directories: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+    /// Fields written by newer versions are carried through transcript rewrites.
+    #[serde(flatten)]
+    pub additional_fields: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

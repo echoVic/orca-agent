@@ -99,6 +99,45 @@ fn a_newer_schema_version_reports_newer_version() {
     let scan = scan_session(&path).unwrap();
     assert_eq!(scan.health.as_str(), "newer_version");
     assert_eq!(scan.health_issue.unwrap().code, "newer_schema_version");
+
+    let changed_shape = r#"{"type":"session.meta","schema_version":2,"metadata":{}}"#;
+    let path = write_compat_session(root.path(), changed_shape, "");
+    assert_eq!(
+        scan_session(&path).unwrap().health.as_str(),
+        "newer_version"
+    );
+
+    let duplicated_version = SESSION_META.replace(
+        r#""schema_version":1"#,
+        r#""schema_version":1,"schema_version":2"#,
+    );
+    let path = write_compat_session(root.path(), &duplicated_version, "");
+    let scan = scan_session(&path).unwrap();
+    assert_eq!(scan.health, StoredSessionHealth::Quarantined);
+    assert_eq!(scan.health_issue.unwrap().code, "malformed_record");
+}
+
+#[test]
+fn newer_schema_metadata_remains_visible_in_project_listings() {
+    let root = tempfile::tempdir().unwrap();
+    let meta = format!(
+        "{},\"parent_id\":\"parent-thread\"}}",
+        SESSION_META
+            .replace(r#""schema_version":1"#, r#""schema_version":2"#)
+            .trim_end_matches('}')
+    );
+    crate::history::with_test_orca_home(root.path(), |_| {
+        let path = write_compat_session(&sessions_dir(), &meta, "");
+        let page = crate::history::list_session_page_in_cwd(0, 20, "/workspace").unwrap();
+        let summary = page
+            .sessions
+            .iter()
+            .find(|summary| summary.path == path)
+            .expect("session stays in its project");
+        assert_eq!(summary.health.as_str(), "newer_version");
+        assert_eq!(summary.parent_id.as_deref(), Some("parent-thread"));
+        assert!(summary.is_child_thread());
+    });
 }
 
 #[test]
@@ -108,11 +147,25 @@ fn session_meta_accepts_unknown_fields() {
         "{},\"added_later\":true}}",
         SESSION_META.trim_end_matches('}')
     );
-    let path = write_compat_session(root.path(), &meta, "");
-    assert_eq!(
-        scan_session(&path).unwrap().health,
-        StoredSessionHealth::Healthy
-    );
+    crate::history::with_test_orca_home(root.path(), |_| {
+        let path = write_compat_session(&sessions_dir(), &meta, "");
+        assert_eq!(
+            scan_session(&path).unwrap().health,
+            StoredSessionHealth::Healthy
+        );
+
+        let store = JsonlThreadStore::new();
+        store.rename_session("compat", "renamed").unwrap();
+        let export = root.path().join("portable.jsonl");
+        store.export_session("compat", &export).unwrap();
+        for transcript in [path, export] {
+            let bytes = fs::read(transcript).unwrap();
+            let meta: serde_json::Value =
+                serde_json::from_slice(bytes.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+            assert_eq!(meta["added_later"], true);
+            assert_eq!(meta["title"], "renamed");
+        }
+    });
 }
 
 #[test]
@@ -229,6 +282,50 @@ fn resume_of_a_newer_session_is_refused_with_the_upgrade_message() {
         }
         assert_eq!(fs::read(path).unwrap(), before);
     });
+}
+
+#[test]
+fn a_rewrite_keeps_an_ignorable_line_in_place() {
+    const SKIPPED_LINE: &str =
+        " \t{ \"x\": [1,  2], \"ignorable\": true, \"type\": \"future.thing\" } \t\r\n";
+    for compressed in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        crate::history::with_test_orca_home(root.path(), |_| {
+            let path = write_compat_session(&sessions_dir(), SESSION_META, SKIPPED_LINE);
+            let store = JsonlThreadStore::new();
+            let path = if compressed {
+                store.compress_session("compat").unwrap()
+            } else {
+                path
+            };
+            assert_eq!(store.rename_session("compat", "renamed").unwrap(), path);
+
+            let bytes = fs::read(&path).unwrap();
+            let rewritten = if compressed {
+                zstd::stream::decode_all(bytes.as_slice()).unwrap()
+            } else {
+                bytes
+            };
+            let export = root.path().join("portable.jsonl");
+            store.export_session("compat", &export).unwrap();
+            for bytes in [rewritten, fs::read(export).unwrap()] {
+                let lines = bytes
+                    .split_inclusive(|byte| *byte == b'\n')
+                    .collect::<Vec<_>>();
+                assert_eq!(lines.len(), 4);
+                assert_eq!(lines[2], SKIPPED_LINE.as_bytes());
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(lines[0]).unwrap()["title"],
+                    "renamed"
+                );
+                for (index, expected) in [(1, FIRST_MESSAGE), (3, SECOND_MESSAGE)] {
+                    let actual = serde_json::from_slice::<serde_json::Value>(lines[index]).unwrap();
+                    let expected = serde_json::from_str::<serde_json::Value>(expected).unwrap();
+                    assert_eq!(actual["message"]["content"], expected["message"]["content"]);
+                }
+            }
+        });
+    }
 }
 
 fn image_message(size: usize) -> Message {
