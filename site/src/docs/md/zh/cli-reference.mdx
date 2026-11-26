@@ -108,7 +108,7 @@ orca rewind [SESSION_ID] [--last] [--at MESSAGE_ID]
 `session.rewind` 记录并在恢复会话时重放。会话保留最近 100 个检查点；被淘汰的
 旧检查点只能用 `conversation` 模式回退。`--rollback OP_ID` 回滚一次中断的恢复
 （journal 保留时），`--prune` 清理无引用的检查点 blob。检查点要求会话已记录
-历史，并且只记录 `edit` / `write_file` 触及的文件；`ORCA_DISABLE_FILE_HISTORY=1`
+历史，并且只记录 `edit`、`write_file` 或 `apply_patch` 触及的文件；`ORCA_DISABLE_FILE_HISTORY=1`
 可关闭捕获。对应 TUI 命令是 `/rewind`。
 
 ## `orca exec`

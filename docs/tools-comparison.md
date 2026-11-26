@@ -162,7 +162,8 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 | 能力 | 当前差距 | 建议优先级 |
 |------|----------|------------|
 | Notebook 读取 | `read_file` 读 UTF-8 文本；PDF、Word、PowerPoint 和图片由 `read_document` 经 DeepSeek OCR 读取（需要官方 endpoint），图片还不能直接交给模型看 | P2 |
-| apply_patch freeform | 仍以 JSON `edit` / `write_file` 为主 | P2 |
+
+多文件补丁已支持。`apply_patch` 接收 JSON `input` 字符串，可在一次调用中新增、修改、删除和移动多个文件。默认关闭，在配置中设置 `[tools] apply_patch = true` 后启用。
 
 ## 可靠性保证
 
@@ -183,7 +184,6 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 ### 中期
 
 1. 支持图片/PDF/Notebook 读取。
-2. 将 `apply_patch` 做成 grammar-backed freeform tool。
 
 ### 长期
 

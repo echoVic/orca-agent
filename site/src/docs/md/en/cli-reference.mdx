@@ -123,7 +123,7 @@ replayed on resume. A session keeps its most recent 100 checkpoints; evicted
 ones support the `conversation` mode only. `--rollback OP_ID` rolls back an
 interrupted restore that left a journal, and `--prune` removes checkpoint
 blobs no retained snapshot references. Checkpoints require a session that
-records history and only cover files written by `edit` / `write_file`; set
+records history and only cover files changed by `edit`, `write_file`, or `apply_patch`; set
 `ORCA_DISABLE_FILE_HISTORY=1` to disable capture. The TUI equivalent is
 `/rewind`.
 
