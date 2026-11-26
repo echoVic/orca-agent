@@ -1170,6 +1170,7 @@ impl ToolExecutionActor {
                         &event_request,
                         Some(mcp_registry),
                         &config.external_tools,
+                        config.tools.apply_patch,
                     ),
                 );
             }
@@ -1240,6 +1241,7 @@ impl ToolExecutionActor {
                                 &event_request,
                                 Some(mcp_registry),
                                 &config.external_tools,
+                                config.tools.apply_patch,
                             ),
                         );
                     }
@@ -1273,6 +1275,7 @@ impl ToolExecutionActor {
                     &event_request,
                     Some(mcp_registry),
                     &config.external_tools,
+                    config.tools.apply_patch,
                 ),
             );
             if event_error.is_some() {
@@ -1967,7 +1970,7 @@ fn finish_approval_gate_terminal<W: io::Write>(
     if emit_deltas {
         retain_first_io_error(
             &mut event_error,
-            emit_tool_call_requested(events, sink, tool_request, None, &[]),
+            emit_tool_call_requested(events, sink, tool_request, None, &[], false),
         );
     }
     retain_first_io_error(
@@ -2022,9 +2025,10 @@ fn emit_tool_call_requested(
     request: &tool_types::ToolRequest,
     mcp_registry: Option<&McpRegistry>,
     external_tools: &[orca_core::external_config::ExternalToolConfig],
+    apply_patch: bool,
 ) -> io::Result<()> {
     let registry =
-        orca_tools::registry::tool_registry_with_mcp_and_external(mcp_registry, external_tools);
+        orca_tools::registry::tool_registry_for_session(mcp_registry, external_tools, apply_patch);
     let event =
         RuntimeTaskActor::tool_call_requested_event_with_registry_for(events, request, &registry);
     sink.emit(event)

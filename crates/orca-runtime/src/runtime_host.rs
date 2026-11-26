@@ -8071,9 +8071,10 @@ fn reconcile_durable_provider_outcomes_on_start(
             return Ok(());
         };
         let registry = registry.get_or_init(|| {
-            orca_tools::registry::tool_registry_with_mcp_and_external(
+            orca_tools::registry::tool_registry_for_session(
                 Some(thread.session().mcp_registry()),
                 &config.external_tools,
+                config.tools.apply_patch,
             )
         });
         // Recorded before the completion named its tool calls: name them the
@@ -14958,6 +14959,7 @@ struct TypedProviderBackground {
     task_id: surface::SurfaceTaskId,
     task_registry: TaskRegistry,
     external_tools: Vec<orca_core::external_config::ExternalToolConfig>,
+    apply_patch: bool,
     outcome: Arc<Mutex<Option<TypedProviderBackgroundOutcome>>>,
 }
 
@@ -21987,6 +21989,7 @@ impl ThreadActor {
                 task_id: pending.surface_task_id,
                 task_registry: pending.task_registry.clone(),
                 external_tools: pending.active.config.external_tools.clone(),
+                apply_patch: pending.active.config.tools.apply_patch,
                 outcome: Arc::new(Mutex::new(None)),
             }),
         )

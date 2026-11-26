@@ -212,7 +212,7 @@ impl ToolRegistry {
             return Some(ResolvedTool {
                 tool,
                 spec: tool.spec(),
-                requested_name: ToolName::from_str(name)?,
+                requested_name: tool.spec().name.clone(),
             });
         }
         let idx = self.aliases.get(name)?;
@@ -450,7 +450,7 @@ fn value_type(value: &Value) -> &'static str {
 
 static DEFAULT_REGISTRY: LazyLock<ToolRegistry> = LazyLock::new(|| {
     let mut registry = ToolRegistry::new();
-    register_builtin_tools(&mut registry);
+    register_builtin_tools(&mut registry, false);
     registry
 });
 
@@ -462,8 +462,16 @@ pub fn tool_registry_with_mcp_and_external(
     mcp_registry: Option<&McpRegistry>,
     external_tools: &[ExternalToolConfig],
 ) -> ToolRegistry {
+    tool_registry_for_session(mcp_registry, external_tools, false)
+}
+
+pub fn tool_registry_for_session(
+    mcp_registry: Option<&McpRegistry>,
+    external_tools: &[ExternalToolConfig],
+    apply_patch: bool,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    register_builtin_tools(&mut registry);
+    register_builtin_tools(&mut registry, apply_patch);
     for tool in external_tools {
         registry.register(ExternalTool::new(tool.clone()));
     }
@@ -475,7 +483,7 @@ pub fn tool_registry_with_mcp_and_external(
     registry
 }
 
-fn register_builtin_tools(registry: &mut ToolRegistry) {
+fn register_builtin_tools(registry: &mut ToolRegistry, apply_patch: bool) {
     registry.register(BuiltinTool::new(
         safe_local_read_builtin_spec(
             "read_file",
@@ -694,8 +702,11 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         ),
         BuiltinExecutor::Edit,
     ));
-    registry.register(BuiltinTool::new(
-        conservative_builtin_spec(
+    if apply_patch {
+        registry.register(BuiltinTool::new(
+        ToolSpec {
+            name: ToolName::ApplyPatch,
+            ..conservative_builtin_spec(
             "apply_patch",
             "Apply a patch to one or more workspace files. The whole patch is checked before any writes. If any check fails, no files are written. Use *** Add File, *** Delete File or *** Update File headers. Updates use @@ hunks with context lines prefixed by a space, removals by -, and additions by +. An update can include *** Move to immediately after its header. Example:\n*** Begin Patch\n*** Add File: notes.txt\n+Hello\n*** End Patch",
             json!({
@@ -708,9 +719,11 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
             ToolExposure::Direct,
             RendererHint::Write,
             false,
-        ),
+        )
+        },
         BuiltinExecutor::ApplyPatch,
     ));
+    }
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "write_file",

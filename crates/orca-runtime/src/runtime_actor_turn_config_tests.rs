@@ -238,7 +238,7 @@ fn record_legacy_turn_tool_approval(
 ) {
     let snapshot = actor.resident_surface.coordinator.state().snapshot();
     let tool = actor
-        .surface_tool_for_runtime_request(snapshot, &fence, request, &active.config.external_tools)
+        .surface_tool_for_runtime_request(snapshot, &fence, request, &active.config)
         .unwrap();
     let authority = ThreadActor::surface_authority_for_tool(snapshot, &fence, &tool).unwrap();
     let intent = surface::ToolInvocationIntent::before_invocation(tool.clone(), authority.clone());
@@ -695,6 +695,7 @@ async fn background_response_classifies_external_tools_with_turn_override() {
             task_id,
             task_registry: active.task_registry.clone(),
             external_tools: active.config.external_tools.clone(),
+            apply_patch: active.config.tools.apply_patch,
             outcome: Arc::new(Mutex::new(Some(TypedProviderBackgroundOutcome {
                 response: Some(response),
                 status: RunStatus::Success,

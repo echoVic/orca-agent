@@ -84,9 +84,10 @@ impl RuntimeNormalToolInvocation {
         task_registry: Option<&TaskRegistry>,
         permission_overlay: TurnPermissionOverlay,
     ) -> Self {
-        let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        let registry = orca_tools::registry::tool_registry_for_session(
             Some(mcp_registry),
             external_tools,
+            config.tools.apply_patch,
         );
         let control = registry
             .control_semantics(&request.name)

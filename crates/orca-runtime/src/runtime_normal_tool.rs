@@ -90,12 +90,6 @@ pub(crate) fn execute_runtime_normal_tool(
     context: &mut RuntimeNormalToolWorkerContext<'_>,
 ) -> ToolResult {
     match invocation.request.name {
-        ToolName::ApplyPatch if !invocation.config.tools.apply_patch => {
-            return ToolResult::invalid_input(
-                &invocation.request,
-                "apply_patch is turned off. Enable it with [tools] apply_patch = true.",
-            );
-        }
         ToolName::ApplyPatch => {
             return match &invocation.prepared_patch {
                 Some(prepared) => {

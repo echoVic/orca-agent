@@ -1106,7 +1106,7 @@ mod tests {
             fs::write(dir.path().join(name), text).unwrap();
         }
         let execute = |body| {
-            crate::registry::default_tool_registry()
+            crate::registry::tool_registry_for_session(None, &[], true)
                 .execute(&request(body), &crate::ToolContext::new(dir.path()))
         };
         let rejected =
@@ -1253,7 +1253,7 @@ mod tests {
         fs::write(source_dir.join("a"), "before\n").unwrap();
         let saved_permissions = fs::metadata(&source_dir).unwrap().permissions();
         fs::set_permissions(&source_dir, fs::Permissions::from_mode(0o555)).unwrap();
-        let result = crate::registry::default_tool_registry().execute(
+        let result = crate::registry::tool_registry_for_session(None, &[], true).execute(
             &request("*** Update File: source/a\n*** Move to: dest\n@@\n-before\n+after"),
             &crate::ToolContext::new(dir.path()),
         );
