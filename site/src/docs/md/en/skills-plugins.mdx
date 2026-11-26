@@ -3,13 +3,18 @@
 A skill is a directory containing a SKILL.md instruction file. Orca discovers
 skills from:
 
-1. $ORCA_HOME/skills, or ~/.orca/skills when ORCA_HOME is unset;
-2. ~/.agents/skills;
-3. .orca/skills inside a trusted project; and
-4. .agents/skills inside a trusted project.
+1. `.orca/skills` in a trusted project.
+2. `.agents/skills` in a trusted project.
+3. `$ORCA_HOME/skills`, or `~/.orca/skills` when `ORCA_HOME` is unset.
+4. `~/.agents/skills`.
 
-Project skills are ignored until the workspace is trusted. This prevents a
-newly opened repository from silently injecting instructions.
+For duplicate IDs, the first matching location wins. Orca uses the nearest
+ancestor containing `.git` as the project root, or the workspace root outside
+Git. Trust that directory to enable its project skills.
+
+At the start of each turn, Orca gives the model a catalog of skill IDs and
+descriptions so it can call `read_skill` when a task matches. The catalog is
+limited to 4,096 tokens. `list_skills` shows the full list.
 
 ## Minimal skill
 
@@ -40,7 +45,10 @@ $rust-review:permissions Review the permission changes.
 ~~~
 
 The optional text after the colon is substituted for `{{arg}}` in the skill
-body. In the TUI, discovered skills are also available through mention search.
+body. Orca adds the mentioned body to the conversation once per version and
+keeps it available for follow-up prompts until context compaction. When a
+body exceeds 4,096 tokens, Orca points to `read_skill` for the rest. The TUI
+also shows discovered skills in mention search.
 
 There is no public command for loading or unloading a skill. Add, edit, or
 remove its SKILL.md file, then start the task that mentions it.
