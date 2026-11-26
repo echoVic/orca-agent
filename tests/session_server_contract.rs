@@ -5972,6 +5972,143 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
     assert!(output.stderr.is_empty());
 }
 
+// Two hosts on one ORCA_HOME (an IDE and a CLI server, two windows): each
+// `--mode server` keeps its shell tasks in the one fixed task session
+// "server-shell", whose output archive the first server holds while it runs.
+#[test]
+#[ignore = "known product bug, not fixed: two servers on one ORCA_HOME share the \"server-shell\" task session, so the second cannot run command/exec (\"task output archive owner: another process already owns the lock\"); see between-C-report.md, \"Product bug found, not fixed: two servers on one home\""]
+fn server_mode_two_servers_on_one_home_each_run_command_exec() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
+    let home = tempdir().expect("shared orca home");
+    let first_workspace = tempdir().expect("first workspace");
+    let second_workspace = tempdir().expect("second workspace");
+    let started_marker = first_workspace.path().join("command-started");
+    let release_marker = first_workspace.path().join("command-release");
+    let completed_marker = first_workspace.path().join("command-completed");
+    let first_command = platform_fixture_command_with_args(
+        "touch $1; while test ! -e $2; do sleep 0.05; done; printf first-done; touch $3",
+        &format!(
+            "const fs = require('fs'); fs.writeFileSync({}, ''); const poll = setInterval(() => {{ if (fs.existsSync({})) {{ clearInterval(poll); process.stdout.write('first-done'); fs.writeFileSync({}, ''); }} }}, 50);",
+            javascript_path(&started_marker),
+            javascript_path(&release_marker),
+            javascript_path(&completed_marker)
+        ),
+        &[
+            started_marker.to_str().expect("started marker path"),
+            release_marker.to_str().expect("release marker path"),
+            completed_marker.to_str().expect("completed marker path"),
+        ],
+    );
+    let spawn_server = |workspace: &Path| {
+        orca_command()
+            .env("ORCA_HOME", home.path())
+            .args([
+                "--mode",
+                "server",
+                "--provider",
+                "mock",
+                "--cwd",
+                workspace.to_str().unwrap(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn orca server")
+    };
+
+    // The first server is running a command: it has opened "server-shell".
+    let mut first = spawn_server(first_workspace.path());
+    {
+        let stdin = first.stdin_mut();
+        let request = serde_json::json!({
+            "id": "first-cmd",
+            "method": "command/exec",
+            "params": {
+                "command": first_command,
+                "processId": "first-1",
+                "cwd": first_workspace.path().to_str().unwrap(),
+            }
+        });
+        writeln!(stdin, "{request}").expect("write first command/exec");
+        stdin.flush().expect("flush first command/exec");
+    }
+    first.expect_event("first-cmd", "command_exec_started");
+    wait_for_path(&started_marker);
+
+    // A second server on the same home runs a command of its own.
+    let mut second = spawn_server(second_workspace.path());
+    {
+        let stdin = second.stdin_mut();
+        let request = serde_json::json!({
+            "id": "second-cmd",
+            "method": "command/exec",
+            "params": {
+                "command": platform_fixture_command(
+                    "printf second-ok",
+                    "process.stdout.write('second-ok')"
+                ),
+                "cwd": second_workspace.path().to_str().unwrap(),
+            }
+        });
+        writeln!(stdin, "{request}").expect("write second command/exec");
+        stdin.flush().expect("flush second command/exec");
+    }
+    let second_events =
+        second.drain_events_until_event_or_error("second-cmd", "command_exec_completed");
+    let second_result = second_events
+        .iter()
+        .find(|event| event["id"] == "second-cmd")
+        .expect("second command/exec result");
+    assert_eq!(
+        second_result["event"], "command_exec_completed",
+        "a second server on the home could not run a command while the first ran one: {second_result}"
+    );
+    assert_eq!(second_result["stdout"], "second-ok");
+
+    // And the first server's command still completes for its own client.
+    std::fs::write(&release_marker, "release").expect("write release marker");
+    wait_for_path(&completed_marker);
+    {
+        let stdin = first.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"first-list","method":"command/exec/list","params":{{}}}}"#
+        )
+        .expect("write command/exec/list");
+        stdin.flush().expect("flush command/exec/list");
+    }
+    let first_events = first.drain_events_until_event_or_error("first-list", "command_exec_listed");
+    let first_result = first_events
+        .iter()
+        .find(|event| event["id"] == "first-cmd")
+        .unwrap_or_else(|| panic!("first command/exec result: {first_events:?}"));
+    assert_eq!(first_result["event"], "command_exec_completed");
+    assert_eq!(first_result["exitCode"], 0);
+    assert_eq!(first_result["stdout"], "first-done");
+
+    second.close_stdin();
+    assert_eq!(
+        second
+            .wait_with_output()
+            .expect("second server")
+            .status
+            .code(),
+        Some(0)
+    );
+    first.close_stdin();
+    assert_eq!(
+        first
+            .wait_with_output()
+            .expect("first server")
+            .status
+            .code(),
+        Some(0)
+    );
+}
+
 #[test]
 fn server_mode_command_exec_write_requires_input_or_close() {
     if host_refuses_restricted_shells() {
