@@ -747,6 +747,22 @@ impl RipgrepSearchCollector {
     }
 }
 
+fn ripgrep_search_command(query: &str, roots: &[PathBuf]) -> Command {
+    let mut command = Command::new("rg");
+    command
+        .arg("--no-config")
+        .arg("--json")
+        .arg("--fixed-strings")
+        .arg("--glob")
+        .arg("*.jsonl")
+        .arg(format!("--regexp={query}"))
+        .arg("--")
+        .args(roots)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
 fn search_roots_with_ripgrep(
     query: &str,
     include_archived: bool,
@@ -763,16 +779,7 @@ fn search_roots_with_ripgrep(
         return Ok(true);
     }
 
-    let mut command = Command::new("rg");
-    command
-        .arg("--json")
-        .arg("--fixed-strings")
-        .arg("--glob")
-        .arg("*.jsonl")
-        .arg(query)
-        .args(&roots)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = ripgrep_search_command(query, &roots);
     orca_tools::process::prepare_non_interactive_command(&mut command);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (child, process_job, _receipt) =
@@ -1620,6 +1627,70 @@ mod tests {
         });
 
         assert!(collector.matches.is_empty());
+    }
+
+    fn record_searchable_session(workspace: &Path, text: &str) -> String {
+        let store = JsonlThreadStore::new();
+        let mut session = store
+            .create_live_thread(workspace, "mock", None, "search transcript")
+            .expect("create transcript");
+        let session_id = session.thread_id().to_string();
+        session
+            .writer_mut()
+            .enter_turn(orca_core::thread_identity::TurnId::new());
+        session
+            .writer_mut()
+            .append_message(&orca_core::conversation::Message::user(text.to_string()))
+            .expect("write searchable message");
+        session.complete("success").expect("complete transcript");
+        session_id
+    }
+
+    #[test]
+    fn session_search_passes_the_query_and_roots_as_values() {
+        let roots = [PathBuf::from("sessions"), PathBuf::from("archived")];
+        let command = ripgrep_search_command("-> Result", &roots);
+
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--no-config",
+                "--json",
+                "--fixed-strings",
+                "--glob",
+                "*.jsonl",
+                "--regexp=-> Result",
+                "--",
+                "sessions",
+                "archived",
+            ]
+            .map(std::ffi::OsStr::new),
+        );
+    }
+
+    #[test]
+    fn a_session_search_for_text_starting_with_a_dash_finds_it() {
+        let home = tempfile::tempdir().expect("temporary Orca home");
+        crate::history::with_test_orca_home(home.path(), |home| {
+            let session_id = record_searchable_session(home, "-> Result");
+
+            let hits = search_sessions("-> Result", false).expect("search for text");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].session_id, session_id);
+        });
+    }
+
+    #[test]
+    fn a_session_search_for_an_rg_option_name_is_literal() {
+        let home = tempfile::tempdir().expect("temporary Orca home");
+        crate::history::with_test_orca_home(home.path(), |home| {
+            let session_id = record_searchable_session(home, "see --help for details");
+            record_searchable_session(home, "see the help page for details");
+
+            let hits = search_sessions("--help", false).expect("search for text");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].session_id, session_id);
+        });
     }
 
     #[test]
