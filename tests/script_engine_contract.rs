@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use orca_core::tool_types::MAX_TOOL_OUTPUT_BYTES;
 use orca_runtime::script::engine::{
     ScriptEngine, ScriptEngineLimits, ScriptOutcome, ScriptToolCall,
 };
@@ -234,6 +235,64 @@ fn a_script_that_never_returns_is_stopped_at_the_wall_clock() {
 }
 
 #[test]
+fn a_script_stopped_by_the_clock_keeps_its_log() {
+    let (outcome, _) = run_batches(
+        r#"console.log("first"); console.log("second"); while (true) {}"#,
+        ScriptEngineLimits {
+            wall_clock: orca_runtime::script::script_wall_clock(0),
+            ..limits()
+        },
+        |_| Ok(String::new()),
+    );
+
+    let error = error_of(outcome);
+    assert!(error.contains("the script ran longer than"), "{error}");
+    assert!(
+        error.contains("Logged before it was stopped:\nfirst\nsecond"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_script_over_its_memory_keeps_its_log() {
+    let (outcome, _) = run_batches(
+        r#"console.log("before");
+           const held = []; while (true) { held.push("x".repeat(1024 * 1024) + held.length); }"#,
+        ScriptEngineLimits {
+            memory_bytes: 8 * 1024 * 1024,
+            ..limits()
+        },
+        |_| Ok(String::new()),
+    );
+
+    let error = error_of(outcome);
+    assert!(error.contains("the script used more than 8 MiB"), "{error}");
+    assert!(
+        error.contains("Logged before it was stopped:\nbefore"),
+        "{error}"
+    );
+}
+
+#[test]
+fn kept_log_lines_are_bounded() {
+    let (outcome, _) = run_batches(
+        r#"console.log("first");
+           for (let i = 0; i < 20; i++) { console.log("x".repeat(1024 * 1024)); }
+           while (true) {}"#,
+        ScriptEngineLimits {
+            wall_clock: orca_runtime::script::script_wall_clock(0),
+            ..limits()
+        },
+        |_| Ok(String::new()),
+    );
+
+    let error = error_of(outcome);
+    let prefix = "the script ran longer than 1s and was stopped\n\nLogged before it was stopped:\n";
+    assert!(error.starts_with(&format!("{prefix}first")));
+    assert!(error.len() <= prefix.len() + MAX_TOOL_OUTPUT_BYTES);
+}
+
+#[test]
 fn a_promise_chain_that_never_ends_is_stopped_at_the_wall_clock() {
     let started = Instant::now();
     let (outcome, _) = run_batches(
@@ -336,11 +395,11 @@ fn a_large_tool_result_within_the_memory_limit_is_handed_over_whole() {
 }
 
 #[test]
-fn cancelling_stops_a_running_script() {
+fn a_cancelled_script_still_ends_as_interrupted() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let started = Instant::now();
     let result = ScriptEngine::run(
-        r#"await tools.read_file({ path: "a" }); while (true) {}"#,
+        r#"console.log("before"); await tools.read_file({ path: "a" }); while (true) {}"#,
         limits(),
         &mut |calls| {
             cancelled.store(true, Ordering::Relaxed);
@@ -411,7 +470,12 @@ fn running_out_of_memory_while_reporting_an_error_names_the_limit() {
         |_| Ok(String::new()),
     );
 
-    assert_eq!(error_of(outcome), "the script used more than 8 MiB");
+    let error = error_of(outcome);
+    let prefix = "the script used more than 8 MiB\n\nLogged before it was stopped:\n";
+    assert_eq!(
+        error.strip_prefix(prefix),
+        Some("x".repeat(MAX_TOOL_OUTPUT_BYTES).as_str())
+    );
 }
 
 #[test]
@@ -435,7 +499,7 @@ fn a_script_has_the_language_and_its_tools_and_nothing_else() {
         r#"let imported = "refused";
            try { await import("node:os"); imported = "imported"; } catch (error) {}
            return {
-             missing: [typeof process, typeof require, typeof fetch, typeof setTimeout, typeof setInterval, typeof queueMicrotask, typeof performance, typeof navigator, typeof std, typeof os],
+             missing: [typeof process, typeof require, typeof fetch, typeof setTimeout, typeof setInterval, typeof queueMicrotask, typeof performance, typeof navigator, typeof std, typeof os, typeof __orcaLogLine],
              imported,
              added: Object.getOwnPropertyNames(globalThis).filter((name) => !ECMASCRIPT.includes(name)).sort(),
            };"#

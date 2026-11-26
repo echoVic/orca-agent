@@ -191,12 +191,13 @@ fn run_script<W: io::Write>(context: RunScriptContext<'_, W>) -> ToolResult {
         }
     };
 
-    let outcome = ScriptEngine::run(
+    let outcome = ScriptEngine::run_with_output_policy(
         &script,
         ScriptEngineLimits {
             wall_clock,
             memory_bytes: settings.memory_limit_bytes(),
         },
+        config.tools.output_truncation,
         &mut |batch| {
             let answers = calls.answer(batch);
             show(calls.drain_report());

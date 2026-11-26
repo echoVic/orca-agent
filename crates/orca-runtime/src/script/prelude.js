@@ -1,4 +1,4 @@
-(function (startCall, finish, firstLineShift) {
+(function (startCall, finish, __orcaLogLine, firstLineShift) {
   "use strict";
 
   // A function set here is handed the frames of the calls beneath the error,
@@ -48,7 +48,9 @@
   }
 
   function log(...values) {
-    logged.push(values.map((value) => show(value)).join(" "));
+    const line = values.map((value) => show(value)).join(" ");
+    __orcaLogLine(line);
+    logged.push(line);
   }
 
   // An error as the model should read it: what it is, and where in the script.
