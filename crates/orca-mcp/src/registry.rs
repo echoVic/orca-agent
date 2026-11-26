@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{
@@ -17,9 +17,9 @@ use crate::transport::{self, McpElicitationHandler, McpTransport};
 use orca_core::conversation::ImageInput;
 use orca_core::mcp_types::{
     CallToolResult, GetPromptResult, McpContent, McpPrompt, McpPromptContent, McpPromptDescriptor,
-    McpResource, McpResourceTemplate, McpServerConfig, McpTool, McpToolRef, McpTransportKind,
-    PromptsListResult, ReadResourceResult, ResourceTemplatesListResult, ResourcesListResult,
-    ToolsListResult, canonical_mcp_name, tool_is_enabled,
+    McpResource, McpResourceTemplate, McpServerConfig, McpTool, McpToolLoading, McpToolRef,
+    McpTransportKind, PromptsListResult, ReadResourceResult, ResourceTemplatesListResult,
+    ResourcesListResult, ToolsListResult, canonical_mcp_name, tool_is_enabled,
 };
 use orca_core::tool_images::tool_image;
 
@@ -33,6 +33,7 @@ use orca_core::tool_images::tool_image;
 #[derive(Clone)]
 pub struct McpRegistry {
     shared: Arc<McpRegistryShared>,
+    tool_scope: Arc<Mutex<McpToolScope>>,
 }
 
 impl Default for McpRegistry {
@@ -148,6 +149,7 @@ struct McpRegistryInner {
     /// Every configured server that has a name, in config order.
     servers: Vec<McpServerEntry>,
     clients: HashMap<String, Arc<McpClient>>,
+    tool_scopes: Vec<Weak<Mutex<McpToolScope>>>,
     /// The tools of every server, in config order.
     tools: Vec<McpTool>,
     lookup: HashMap<String, McpToolRef>,
@@ -158,6 +160,31 @@ struct McpRegistryInner {
     /// Whether the registry was closed ([`McpRegistry::close`]): its servers
     /// are stopped for good, and no connection is put in place any more.
     closed: bool,
+}
+
+pub type McpLoadedTools = BTreeMap<String, BTreeSet<String>>;
+pub type McpToolSelectionWriter = Box<dyn Fn(&McpLoadedTools) -> std::io::Result<()> + Send + Sync>;
+
+#[derive(Default)]
+struct McpToolScope {
+    loaded: McpLoadedTools,
+    persist: Option<McpToolSelectionWriter>,
+}
+
+impl McpToolScope {
+    fn retain_offered(&mut self, server: &McpServerEntry) {
+        let Some(loaded) = self.loaded.get_mut(&server.name) else {
+            return;
+        };
+        let before = loaded.len();
+        loaded.retain(|name| server.tools.iter().any(|tool| tool.name == *name));
+        if before != loaded.len()
+            && let Some(persist) = &self.persist
+            && let Err(error) = persist(&self.loaded)
+        {
+            eprintln!("orca: warning: failed to save MCP tool selection: {error}");
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -174,6 +201,7 @@ struct McpServerEntry {
     stop: Arc<McpConnectionStop>,
     /// Its registered tools.
     tools: Vec<McpTool>,
+    tool_warnings: Vec<String>,
     /// The prompts it offers.
     prompts: Vec<McpPrompt>,
     /// Why its prompts could not be listed, when `prompts/list` failed.
@@ -196,6 +224,14 @@ struct McpServerStartup {
 }
 
 impl McpServerEntry {
+    fn is_on_demand(&self) -> bool {
+        self.config.tool_loading == McpToolLoading::OnDemand
+    }
+
+    fn loader_name(&self) -> String {
+        format!("mcp__{}__load_tools", self.name)
+    }
+
     fn status(&self) -> McpServerStatus {
         McpServerStatus {
             name: self.name.clone(),
@@ -240,11 +276,15 @@ impl McpRegistryInner {
             if server.startup.is_none() && server.state != McpServerState::Starting {
                 server.startup = Some(McpServerStartup {
                     status: server.status(),
-                    tool_names: server
-                        .tools
-                        .iter()
-                        .map(|tool| tool.schema_name.clone())
-                        .collect(),
+                    tool_names: if server.is_on_demand() && server.state == McpServerState::Ready {
+                        vec![server.loader_name()]
+                    } else {
+                        server
+                            .tools
+                            .iter()
+                            .map(|tool| tool.schema_name.clone())
+                            .collect()
+                    },
                 });
             }
         }
@@ -295,26 +335,15 @@ impl McpRegistryInner {
         connected: Result<ConnectedServer, String>,
     ) -> Option<Arc<McpClient>> {
         let server_name = self.servers[index].name.clone();
-        let mut taken = self
-            .servers
-            .iter()
-            .filter(|server| server.name != server_name)
-            .flat_map(|server| server.tools.iter().map(|tool| tool.schema_name.clone()))
-            .collect::<HashSet<_>>();
         let server = &mut self.servers[index];
         server.errors.clear();
         let replaced = match connected {
             Ok(connected) => {
-                server.tools = take_tool_names(
-                    &server_name,
-                    connected.tools,
-                    &mut taken,
-                    &mut server.errors,
-                );
                 server.prompts = connected.prompts;
                 server.prompts_error = connected.prompts_error;
-                server.errors.extend(connected.warnings);
+                server.errors = connected.warnings;
                 server.state = McpServerState::Ready;
+                self.replace_tools(index, connected.tools);
                 self.clients.insert(server_name, Arc::new(connected.client))
             }
             Err(error) => {
@@ -329,6 +358,46 @@ impl McpRegistryInner {
         self.index_tools();
         self.note_startup_ends();
         replaced
+    }
+
+    fn replace_tools(&mut self, index: usize, listing: McpToolListing) {
+        let server_name = self.servers[index].name.clone();
+        let mut taken = self
+            .servers
+            .iter()
+            .filter(|server| server.name != server_name)
+            .flat_map(|server| server.tools.iter().map(|tool| tool.schema_name.clone()))
+            .chain(
+                self.servers
+                    .iter()
+                    .filter(|server| server.is_on_demand())
+                    .map(McpServerEntry::loader_name),
+            )
+            .collect::<HashSet<_>>();
+        let server = &mut self.servers[index];
+        server
+            .errors
+            .retain(|error| !server.tool_warnings.contains(error));
+        server.tool_warnings = listing.warnings;
+        server.tools = take_tool_names(
+            &server_name,
+            listing.tools,
+            &mut taken,
+            &mut server.tool_warnings,
+        );
+        server.errors.extend(server.tool_warnings.iter().cloned());
+        if server.is_on_demand() {
+            self.tool_scopes.retain(|scope| {
+                let Some(scope) = scope.upgrade() else {
+                    return false;
+                };
+                scope
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain_offered(server);
+                true
+            });
+        }
     }
 }
 
@@ -412,6 +481,7 @@ pub fn initialize_registry(
             generation,
             stop,
             tools: Vec::new(),
+            tool_warnings: Vec::new(),
             prompts: Vec::new(),
             prompts_error: None,
             errors: Vec::new(),
@@ -478,7 +548,7 @@ fn failed_state(error: &str) -> McpServerState {
 /// A server that answered, and what it offers.
 struct ConnectedServer {
     client: McpClient,
-    tools: Vec<McpTool>,
+    tools: McpToolListing,
     prompts: Vec<McpPrompt>,
     /// Why its prompts could not be listed, when `prompts/list` failed.
     prompts_error: Option<String>,
@@ -514,30 +584,8 @@ fn connect_server_with_transport(
 ) -> Result<ConnectedServer, String> {
     let initialize_result = transport.initialize()?;
     let capabilities = McpServerCapabilities::from_initialize_result(&initialize_result);
+    let tools = list_server_tools(config, server_name, |cursor| transport.list_tools(cursor))?;
     let mut warnings = Vec::new();
-    let (listed_tools, warning) = collect_pages(|cursor| {
-        let list: ToolsListResult = serde_json::from_value(transport.list_tools(cursor)?)
-            .map_err(|error| format!("invalid tools/list result for '{server_name}': {error}"))?;
-        Ok((list.tools, list.next_cursor))
-    })?;
-    warnings.extend(warning.map(|warning| incomplete_list(server_name, "tools/list", &warning)));
-
-    let tools = listed_tools
-        .into_iter()
-        .filter(|tool| tool_is_enabled(config, &tool.name))
-        .map(|tool| {
-            let tool_name = canonical_mcp_name(&tool.name);
-            let read_only = tool.is_read_only();
-            McpTool {
-                server: server_name.to_string(),
-                name: tool.name,
-                schema_name: format!("mcp__{server_name}__{tool_name}"),
-                description: tool.description,
-                input_schema: normalize_schema(tool.input_schema),
-                read_only,
-            }
-        })
-        .collect();
 
     let client = McpClient {
         config: config.clone(),
@@ -545,6 +593,7 @@ fn connect_server_with_transport(
         credentials_path,
         capabilities,
         instructions: Mutex::new(instructions_from_initialize_result(&initialize_result)),
+        reconnected_tools: Mutex::default(),
         reconnect_failure: Mutex::default(),
         stop,
         transport: Mutex::new(transport),
@@ -586,6 +635,69 @@ fn connect_server_with_transport(
         prompts_error,
         warnings,
     })
+}
+
+pub(crate) struct McpToolListing {
+    tools: Vec<McpTool>,
+    warnings: Vec<String>,
+}
+
+impl McpToolListing {
+    pub(crate) fn unavailable(server: &str, error: String) -> Self {
+        Self {
+            tools: Vec::new(),
+            warnings: vec![format!(
+                "MCP server '{server}' could not refresh its tools: {error}"
+            )],
+        }
+    }
+}
+
+pub(crate) fn list_server_tools(
+    config: &McpServerConfig,
+    server_name: &str,
+    mut fetch: impl FnMut(Option<&str>) -> Result<Value, String>,
+) -> Result<McpToolListing, String> {
+    let mut warnings = Vec::new();
+    let (listed_tools, warning) = collect_pages(|cursor| {
+        let list: ToolsListResult = serde_json::from_value(fetch(cursor)?)
+            .map_err(|error| format!("invalid tools/list result for '{server_name}': {error}"))?;
+        Ok((list.tools, list.next_cursor))
+    })?;
+    warnings.extend(warning.map(|warning| incomplete_list(server_name, "tools/list", &warning)));
+
+    let tools = listed_tools
+        .into_iter()
+        .filter(|tool| {
+            if !tool_is_enabled(config, &tool.name) {
+                return false;
+            }
+            if config.tool_loading == McpToolLoading::OnDemand
+                && canonical_mcp_name(&tool.name) == "load_tools"
+            {
+                warnings.push(format!(
+                    "MCP server '{server_name}': skipping '{}' because Orca reserves load_tools for on-demand loading",
+                    tool.name
+                ));
+                return false;
+            }
+            true
+        })
+        .map(|tool| {
+            let tool_name = canonical_mcp_name(&tool.name);
+            let read_only = tool.is_read_only();
+            McpTool {
+                server: server_name.to_string(),
+                name: tool.name,
+                schema_name: format!("mcp__{server_name}__{tool_name}"),
+                description: tool.description,
+                input_schema: normalize_schema(tool.input_schema),
+                read_only,
+            }
+        })
+        .collect();
+
+    Ok(McpToolListing { tools, warnings })
 }
 
 /// The most pages a list is read to: a server that has more is cut off.
@@ -714,7 +826,10 @@ impl McpRegistry {
     fn from_inner(mut inner: McpRegistryInner) -> Self {
         // A server with nothing to start, disabled, has started.
         inner.note_startup_ends();
+        let tool_scope = Arc::new(Mutex::new(McpToolScope::default()));
+        inner.tool_scopes.push(Arc::downgrade(&tool_scope));
         Self {
+            tool_scope,
             shared: Arc::new(McpRegistryShared {
                 inner: RwLock::new(inner),
                 subscribers: Mutex::default(),
@@ -771,6 +886,7 @@ impl McpRegistry {
     ) {
         let credentials_path = self.read().credentials_path.clone();
         let registry = Arc::downgrade(&self.shared);
+        let scope = Arc::downgrade(&self.tool_scope);
         let spawned = std::thread::Builder::new()
             .name(format!("orca-mcp-connect-{server_name}"))
             .spawn({
@@ -781,7 +897,8 @@ impl McpRegistry {
                         // Dropping the connection stops the server.
                         return;
                     };
-                    let _ = McpRegistry { shared }.finish_connecting(
+                    let tool_scope = scope.upgrade().unwrap_or_default();
+                    let _ = McpRegistry { shared, tool_scope }.finish_connecting(
                         &server_name,
                         FIRST_CONNECTION,
                         connected,
@@ -872,10 +989,27 @@ impl McpRegistry {
                 .flat_map(|startup| startup.tool_names.iter().cloned())
                 .collect();
         }
+        if inner.servers.is_empty() {
+            return inner
+                .tools
+                .iter()
+                .map(|tool| tool.schema_name.clone())
+                .collect();
+        }
         inner
-            .tools
+            .servers
             .iter()
-            .map(|tool| tool.schema_name.clone())
+            .flat_map(|server| {
+                if server.is_on_demand() && server.state == McpServerState::Ready {
+                    vec![server.loader_name()]
+                } else {
+                    server
+                        .tools
+                        .iter()
+                        .map(|tool| tool.schema_name.clone())
+                        .collect()
+                }
+            })
             .collect()
     }
 
@@ -1041,6 +1175,7 @@ impl McpRegistry {
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
                     instructions: Mutex::default(),
+                    reconnected_tools: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceTransport {
@@ -1076,6 +1211,7 @@ impl McpRegistry {
                         credentials_path: None,
                         capabilities: McpServerCapabilities::resource_capable_for_test(),
                         instructions: Mutex::default(),
+                        reconnected_tools: Mutex::default(),
                         reconnect_failure: Mutex::default(),
                         stop: Arc::default(),
                         transport: Mutex::new(Arc::from(transport)),
@@ -1104,6 +1240,172 @@ impl McpRegistry {
     /// The tools of every connected server, in config order.
     pub fn tools(&self) -> Vec<McpTool> {
         self.read().tools.clone()
+    }
+
+    /// Create a session's selection while sharing the server connections.
+    pub fn with_tool_scope(
+        &self,
+        loaded: McpLoadedTools,
+        persist: Option<McpToolSelectionWriter>,
+    ) -> Self {
+        let mut inner = self.write();
+        if !inner.servers.iter().any(McpServerEntry::is_on_demand) {
+            return self.clone();
+        }
+        let mut selection = McpToolScope { loaded, persist };
+        for server in &inner.servers {
+            if server.is_on_demand() && server.state == McpServerState::Ready {
+                selection.retain_offered(server);
+            }
+        }
+        let tool_scope = Arc::new(Mutex::new(selection));
+        inner.tool_scopes.retain(|scope| scope.strong_count() > 0);
+        inner.tool_scopes.push(Arc::downgrade(&tool_scope));
+        Self {
+            shared: Arc::clone(&self.shared),
+            tool_scope,
+        }
+    }
+
+    pub fn has_on_demand_servers(&self) -> bool {
+        self.read().servers.iter().any(McpServerEntry::is_on_demand)
+    }
+
+    /// Tool definitions paired with whether their schema is deferred for this agent.
+    pub fn agent_tools(&self) -> Vec<(McpTool, bool)> {
+        let inner = self.read();
+        let scope = self
+            .tool_scope
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        inner
+            .tools
+            .iter()
+            .filter_map(|tool| {
+                let on_demand = inner
+                    .servers
+                    .iter()
+                    .find(|server| server.name == tool.server && server.is_on_demand());
+                if on_demand.is_some_and(|server| server.state != McpServerState::Ready) {
+                    return None;
+                }
+                let deferred = on_demand.is_some()
+                    && !scope
+                        .loaded
+                        .get(&tool.server)
+                        .is_some_and(|names| names.contains(&tool.name));
+                Some((tool.clone(), deferred))
+            })
+            .collect()
+    }
+
+    pub fn on_demand_loaders(&self) -> Vec<(String, String)> {
+        self.read()
+            .servers
+            .iter()
+            .filter(|server| server.is_on_demand() && server.state == McpServerState::Ready)
+            .map(|server| (server.name.clone(), server.loader_name()))
+            .collect()
+    }
+
+    pub fn load_tools(&self, server: &str, names: &[String]) -> Result<String, String> {
+        let inner = self.read();
+        let server = inner
+            .servers
+            .iter()
+            .find(|entry| {
+                entry.name == server && entry.is_on_demand() && entry.state == McpServerState::Ready
+            })
+            .ok_or_else(|| format!("MCP server '{server}' is unavailable for on-demand loading"))?;
+        let valid = server
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<BTreeSet<_>>();
+        if let Some(unknown) = names.iter().find(|name| !valid.contains(name.as_str())) {
+            let valid = valid.into_iter().collect::<Vec<_>>().join(", ");
+            return Err(format!(
+                "Unknown tool '{unknown}' on MCP server '{}'. Valid tools: {valid}",
+                server.name
+            ));
+        }
+        if names.is_empty() {
+            return Ok(format!(
+                "Valid tools: {}",
+                valid.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        let mut scope = self
+            .tool_scope
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut updated = scope.loaded.clone();
+        updated
+            .entry(server.name.clone())
+            .or_default()
+            .extend(names.iter().cloned());
+        if updated != scope.loaded {
+            if let Some(persist) = &scope.persist {
+                persist(&updated)
+                    .map_err(|error| format!("Could not save MCP tool selection: {error}"))?;
+            }
+            scope.loaded = updated;
+        }
+        Ok(format!(
+            "MCP tools available on the next request: {}",
+            names.join(", ")
+        ))
+    }
+
+    pub fn resolve_agent_tool(&self, schema_name: &str) -> Option<McpToolRef> {
+        let inner = self.read();
+        let tool = inner.lookup.get(schema_name)?;
+        if let Some(server) = inner
+            .servers
+            .iter()
+            .find(|entry| entry.name == tool.server && entry.is_on_demand())
+        {
+            let scope = self
+                .tool_scope
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if server.state != McpServerState::Ready
+                || !scope
+                    .loaded
+                    .get(&tool.server)
+                    .is_some_and(|names| names.contains(&tool.tool))
+            {
+                return None;
+            }
+        }
+        Some(tool.clone())
+    }
+
+    /// Catalogs of connected on-demand servers in configuration order.
+    pub fn on_demand_catalogs(&self) -> Vec<(String, String)> {
+        self.read()
+            .servers
+            .iter()
+            .filter(|server| server.is_on_demand() && server.state == McpServerState::Ready)
+            .map(|server| {
+                let mut text = format!(
+                    "{}'{}':",
+                    orca_core::mcp_types::ON_DEMAND_CATALOG_PREFIX,
+                    server.name
+                );
+                for tool in &server.tools {
+                    let name = tool.name.replace(['\r', '\n'], " ");
+                    let description = tool
+                        .description
+                        .as_deref()
+                        .and_then(|value| value.lines().next())
+                        .unwrap_or("");
+                    let description = description.chars().take(160).collect::<String>();
+                    text.push_str(&format!("\n{name} — {description}"));
+                }
+                (server.name.clone(), text)
+            })
+            .collect()
     }
 
     /// Instructions from connected servers, in configuration order.
@@ -1281,12 +1583,35 @@ impl McpRegistry {
             self.fail_through(server, client, error);
             return;
         }
+        self.refresh_reconnected_tools(server, client);
         match answer {
             Ok(_) => self.mark_ready_after_success(server, client),
             Err(error) if is_auth_required(&error.to_string()) => {
                 self.mark_needs_login(server, client);
             }
             Err(_) => {}
+        }
+    }
+
+    fn refresh_reconnected_tools(&self, server: &str, client: &Arc<McpClient>) {
+        if client.config.tool_loading != McpToolLoading::OnDemand {
+            return;
+        }
+        let mut inner = self.write();
+        if !inner
+            .clients
+            .get(server)
+            .is_some_and(|current| Arc::ptr_eq(current, client))
+        {
+            return;
+        }
+        if let Some(index) = inner.servers.iter().position(|entry| entry.name == server)
+            && let Some(tools) = client.take_reconnected_tools()
+        {
+            inner.replace_tools(index, tools);
+            inner.index_tools();
+            drop(inner);
+            self.notify_subscribers();
         }
     }
 
@@ -1519,6 +1844,7 @@ impl McpRegistry {
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
                     instructions: Mutex::default(),
+                    reconnected_tools: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceListingTransport {
@@ -1546,6 +1872,7 @@ impl McpRegistry {
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
                     instructions: Mutex::default(),
+                    reconnected_tools: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceListingTransport {
@@ -1641,6 +1968,7 @@ impl McpRegistry {
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
                     instructions: Mutex::default(),
+                    reconnected_tools: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceTemplateListingTransport {
@@ -1668,6 +1996,7 @@ impl McpRegistry {
                     credentials_path: None,
                     capabilities: McpServerCapabilities::resource_capable_for_test(),
                     instructions: Mutex::default(),
+                    reconnected_tools: Mutex::default(),
                     reconnect_failure: Mutex::default(),
                     stop: Arc::default(),
                     transport: Mutex::new(Arc::new(StaticResourceTemplateListingTransport {

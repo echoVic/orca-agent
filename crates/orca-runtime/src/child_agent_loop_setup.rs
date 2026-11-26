@@ -24,6 +24,7 @@ pub struct ChildAgentLoopSetup {
     pub context_config: ContextConfig,
     pub conversation: Conversation,
     pub policy: ApprovalPolicy,
+    provider_tools: crate::extension::ExtensionData,
     pub(crate) continuation: Option<ChildAgentContinuationRuntimeState>,
     pub(crate) turn: u32,
     pub(crate) compaction_retry: RuntimeCompactionRetryState,
@@ -146,20 +147,9 @@ fn build_child_agent_loop_setup(
     let mcp_registry =
         orca_mcp::initialize_registry(&config.mcp_servers, config.mcp_credentials_path.clone());
     mcp_registry.wait_for_startup(&|| false);
-    let mut provider_config = crate::tool_invocation::provider_config_for_agent_loop(
-        config,
-        cwd,
-        request.depth,
-        &request.subagent_type,
-        crate::tool_invocation::AgentToolPolicyContext::new(
-            request.allowed_tools.as_deref(),
-            request.tool_policy_label.as_deref(),
-        )
-        .with_headless(request.headless_root)
-        .with_workflow_ipc(request.workflow_ipc.is_some()),
-        &mcp_registry,
-        &crate::extension::ExtensionData::new("child-session"),
-    );
+    let provider_tools = crate::extension::ExtensionData::new("child-session");
+    let mut provider_config =
+        child_provider_config(config, request, cwd, &mcp_registry, &provider_tools);
     crate::mcp_startup::refresh_request_instructions(&mut conversation, &mcp_registry);
     provider_config.model = Some(orca_core::model::FLASH_MODEL.to_string());
 
@@ -173,6 +163,7 @@ fn build_child_agent_loop_setup(
         .with_permission_rules(config.permission_rules.clone());
 
     ChildAgentLoopSetup {
+        provider_tools,
         mcp_registry,
         provider_config,
         context_config,
@@ -262,6 +253,56 @@ fn restore_child_agent_continuation(
 /// Advances the child loop one turn through the child's budget lease. The
 /// lease is bounded by the parent's remaining operation budget, so a child
 /// can never spend beyond what the parent reserved for it.
+impl ChildAgentLoopSetup {
+    pub(crate) fn refresh_mcp(
+        &mut self,
+        config: &RunConfig,
+        request: &ChildAgentRequest,
+        cwd: &Path,
+    ) {
+        if self.mcp_registry.has_on_demand_servers() {
+            let mut provider_config = child_provider_config(
+                config,
+                request,
+                cwd,
+                &self.mcp_registry,
+                &self.provider_tools,
+            );
+            provider_config
+                .model
+                .clone_from(&self.provider_config.model);
+            self.provider_config = provider_config;
+            crate::mcp_startup::refresh_request_instructions(
+                &mut self.conversation,
+                &self.mcp_registry,
+            );
+        }
+    }
+}
+
+fn child_provider_config(
+    config: &RunConfig,
+    request: &ChildAgentRequest,
+    cwd: &Path,
+    registry: &McpRegistry,
+    provider_tools: &crate::extension::ExtensionData,
+) -> ProviderConfig {
+    crate::tool_invocation::provider_config_for_agent_loop(
+        config,
+        cwd,
+        request.depth,
+        &request.subagent_type,
+        crate::tool_invocation::AgentToolPolicyContext::new(
+            request.allowed_tools.as_deref(),
+            request.tool_policy_label.as_deref(),
+        )
+        .with_headless(request.headless_root)
+        .with_workflow_ipc(request.workflow_ipc.is_some()),
+        registry,
+        provider_tools,
+    )
+}
+
 pub fn advance_child_agent_turn(
     setup: &mut ChildAgentLoopSetup,
     lease: &mut BudgetLease,

@@ -10,7 +10,7 @@ use crate::approval_rules::{PermissionRules, canonical_rule_tool};
 use crate::config::error_text::{data_error_text, syntax_error_text};
 use crate::config::file::USER_CONFIG_FILE;
 use crate::config::toml_text::crlf_to_lf;
-use crate::mcp_types::{McpServerConfig, McpTransportKind, canonical_mcp_name};
+use crate::mcp_types::{McpServerConfig, McpToolLoading, McpTransportKind, canonical_mcp_name};
 
 /// Parse the user-owned config file under `dir`, hand the document to `edit`
 /// for in-place mutation, and atomically write the result back, preserving
@@ -725,6 +725,9 @@ fn server_to_table(server: &McpServerConfig) -> Table {
         "transport",
         toml_edit::value(transport_str(&server.transport)),
     );
+    if server.tool_loading == McpToolLoading::OnDemand {
+        table.insert("tool_loading", toml_edit::value("on-demand"));
+    }
     if let Some(command) = &server.command {
         table.insert("command", toml_edit::value(command.as_str()));
     }

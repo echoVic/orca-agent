@@ -2972,7 +2972,6 @@ mod tests {
         delay: u32,
         tool_count: usize,
     ) -> orca_core::mcp_types::McpServerConfig {
-        let path = dir.join("catalog.sh");
         let tools = (0..tool_count)
             .map(|i| {
                 serde_json::json!({
@@ -2980,6 +2979,16 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+        delayed_mcp_server_with_tools(dir, delay, tools)
+    }
+
+    #[cfg(unix)]
+    fn delayed_mcp_server_with_tools(
+        dir: &Path,
+        delay: u32,
+        tools: Vec<serde_json::Value>,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let path = dir.join("catalog.sh");
         std::fs::write(&path, format!(r#"
 while IFS= read -r line; do
   case "$line" in
@@ -3198,6 +3207,482 @@ while IFS= read -r line; do
             }
             assert!(sent.contains("mcp__zz_external__lookup"));
         }
+    }
+
+    #[cfg(unix)]
+    fn mcp_loading_mode(
+        server: orca_core::mcp_types::McpServerConfig,
+        mode: &str,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let mut raw = serde_json::to_value(server).unwrap();
+        raw["tool_loading"] = serde_json::json!(mode);
+        serde_json::from_value(raw).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn mcp_only_names(request: &serde_json::Value) -> Vec<&str> {
+        request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .filter(|name| name.starts_with("mcp__catalog__"))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn run_mcp_test_prompt(config: &RunConfig, session: &mut InteractiveSession) {
+        assert_eq!(
+            run_thread_turn_to_writer(
+                config,
+                session,
+                &mut RuntimeSessionLifecycle::new("mcp-catalog-test"),
+                "Find a record",
+                io::sink(),
+                ControllerRunOptions::default(),
+            )
+            .unwrap(),
+            RunStatus::Success
+        );
+    }
+
+    #[cfg(unix)]
+    fn load_mcp_tools(names: impl IntoIterator<Item = String>) -> serde_json::Value {
+        scripted_tool_call(
+            "mcp__catalog__load_tools",
+            serde_json::json!({"names": names.into_iter().collect::<Vec<_>>() }),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_eager_server_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        let server = delayed_mcp_server(dir.path(), 0, 1);
+        let mut capture = |server| {
+            config.mcp_servers = vec![server];
+            let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+            let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+            run_mcp_test_prompt(&config, &mut session);
+            provider.join().unwrap().pop().unwrap()
+        };
+        let default_request = capture(server.clone());
+        let explicit_request = capture(mcp_loading_mode(server, "eager"));
+        assert_eq!(
+            mcp_only_names(&default_request),
+            ["mcp__catalog__lookup_00"]
+        );
+        assert_eq!(
+            serde_json::to_vec(&default_request["tools"]).unwrap(),
+            serde_json::to_vec(&explicit_request["tools"]).unwrap()
+        );
+        assert!(
+            !default_request["messages"]
+                .to_string()
+                .contains("On-demand tools")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_on_demand_server_offers_only_load_tools_and_a_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        let first_line = "a".repeat(160);
+        let server = delayed_mcp_server_with_tools(
+            dir.path(),
+            0,
+            vec![serde_json::json!({
+                "name": "lookup", "description": format!("{first_line}cutoff\nsecond line"), "inputSchema": {"type":"object"}
+            })],
+        );
+        config.mcp_servers = vec![mcp_loading_mode(server, "on-demand")];
+        let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+        run_mcp_test_prompt(&config, &mut session);
+        let request = provider.join().unwrap().pop().unwrap();
+        assert_eq!(mcp_only_names(&request), ["mcp__catalog__load_tools"]);
+        let loader = request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "mcp__catalog__load_tools")
+            .unwrap();
+        assert_eq!(
+            loader["function"]["parameters"]["required"],
+            serde_json::json!(["names"])
+        );
+        assert_eq!(
+            loader["function"]["parameters"]["properties"]["names"]["items"]["type"],
+            "string"
+        );
+        let messages = request["messages"].as_array().unwrap();
+        let mcp = messages.last().unwrap()["content"].as_str().unwrap();
+        assert!(mcp.contains(&format!(
+            "On-demand tools from MCP server 'catalog':\nlookup — {first_line}"
+        )));
+        assert!(!mcp.contains("cutoff"));
+        assert!(!mcp.contains("second line"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_tools_validates_every_name_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [
+                load_mcp_tools(["lookup_00".into(), "missing".into()]),
+                scripted_reply(),
+            ],
+        );
+        run_mcp_test_prompt(&config, &mut session);
+        let requests = provider.join().unwrap();
+        assert_eq!(mcp_only_names(&requests[1]), ["mcp__catalog__load_tools"]);
+        let tool_message = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(tool_message.contains("missing"), "{tool_message}");
+        assert!(
+            tool_message.contains("lookup_00") && tool_message.contains("lookup_01"),
+            "{tool_message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loaded_tools_appear_in_the_next_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [load_mcp_tools(["lookup_01".into()]), scripted_reply()],
+        );
+        run_mcp_test_prompt(&config, &mut session);
+        let requests = provider.join().unwrap();
+        assert_eq!(mcp_only_names(&requests[0]), ["mcp__catalog__load_tools"]);
+        assert_eq!(
+            mcp_only_names(&requests[1]),
+            ["mcp__catalog__load_tools", "mcp__catalog__lookup_01"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loaded_tools_survive_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.history_mode = HistoryMode::Record;
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let id = session.session_id().unwrap().to_string();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [load_mcp_tools(["lookup_01".into()]), scripted_reply()],
+        );
+        run_mcp_test_prompt(&config, &mut session);
+        provider.join().unwrap();
+        drop(session);
+        config.history_mode = HistoryMode::Resume(id);
+        let mut resumed = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+        run_mcp_test_prompt(&config, &mut resumed);
+        let requests = provider.join().unwrap();
+        assert_eq!(
+            mcp_only_names(&requests[0]),
+            ["mcp__catalog__load_tools", "mcp__catalog__lookup_01"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subagents_start_with_nothing_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let mut parent = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [load_mcp_tools(["lookup_01".into()]), scripted_reply()],
+        );
+        run_mcp_test_prompt(&config, &mut parent);
+        let requests = provider.join().unwrap();
+        assert!(mcp_only_names(&requests[1]).contains(&"mcp__catalog__lookup_01"));
+        let mut request = crate::child_agent_types::ChildAgentRequest::new(
+            "Find a record".into(),
+            SubagentType::General,
+            None,
+            1,
+            false,
+        );
+        request.allowed_tools = Some(vec![
+            "mcp__catalog__load_tools".into(),
+            "mcp__catalog__lookup_01".into(),
+        ]);
+        let setup = crate::child_agent_loop_setup::prepare_child_agent_loop(
+            &config,
+            &request,
+            dir.path(),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+        );
+        let names: Vec<_> = setup
+            .provider_config
+            .tools_override
+            .unwrap()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(names.iter().any(|name| name == "mcp__catalog__load_tools"));
+        assert!(!names.iter().any(|name| name == "mcp__catalog__lookup_01"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnect_keeps_only_offered_loaded_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let registry = orca_mcp::initialize_registry(&config.mcp_servers, None);
+        let mut session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+            &config,
+            "MCP",
+            None,
+            registry.clone(),
+        )
+        .unwrap();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [
+                load_mcp_tools(["lookup_00".into(), "lookup_01".into()]),
+                scripted_reply(),
+            ],
+        );
+        run_mcp_test_prompt(&config, &mut session);
+        let requests = provider.join().unwrap();
+        assert!(mcp_only_names(&requests[1]).contains(&"mcp__catalog__lookup_01"));
+        for offered in [
+            vec!["lookup_00", "new_tool"],
+            vec!["lookup_00", "lookup_01"],
+        ] {
+            delayed_mcp_server_with_tools(
+                dir.path(),
+                0,
+                offered
+                    .iter()
+                    .map(|name| serde_json::json!({"name": name,"inputSchema":{"type":"object"}}))
+                    .collect(),
+            );
+            registry.reconnect_server("catalog").unwrap();
+            let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+            run_mcp_test_prompt(&config, &mut session);
+            let requests = provider.join().unwrap();
+            assert_eq!(
+                mcp_only_names(&requests[0]),
+                ["mcp__catalog__load_tools", "mcp__catalog__lookup_00"]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_mcp_request_refreshes_after_loading_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let provider = serve_scripted_provider(
+            &mut config,
+            [load_mcp_tools(["lookup_01".into()]), scripted_reply()],
+        );
+        let mut child = crate::child_agent_types::ChildAgentRequest::new(
+            "Find a record".into(),
+            SubagentType::General,
+            None,
+            1,
+            false,
+        );
+        child.allowed_tools = Some(vec![
+            "mcp__catalog__load_tools".into(),
+            "mcp__catalog__lookup_01".into(),
+        ]);
+        use crate::agent_child::{ChildAgentLoopContext, run_child_agent_loop_with_tool_executor};
+        let result = run_child_agent_loop_with_tool_executor(
+            &config,
+            ChildAgentLoopContext {
+                request: &child,
+                cwd: dir.path(),
+                instructions: &ProjectInstructions::default(),
+                memory: &MemoryBlock::default(),
+                hooks: &HookRunner::new(Vec::new()),
+                child_cost_tracker: &mut CostTracker::new(None),
+                lease: None,
+            },
+            |context, _, request| {
+                let result =
+                    orca_tools::execute_with_mcp(request, dir.path(), context.mcp_registry);
+                assert_eq!(
+                    result.status,
+                    tool_types::ToolStatus::Completed,
+                    "{result:?}"
+                );
+                crate::agent_child::ChildAgentToolExecution {
+                    should_stop: false,
+                    result,
+                    child_cost: None,
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(result.status, RunStatus::Success);
+        let requests = provider.join().unwrap();
+        assert_eq!(mcp_only_names(&requests[0]), ["mcp__catalog__load_tools"]);
+        assert_eq!(
+            mcp_only_names(&requests[1]),
+            ["mcp__catalog__load_tools", "mcp__catalog__lookup_01"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_large_mcp_catalog_explains_how_to_list_omitted_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        let tools = (0..120).map(|i| serde_json::json!({
+            "name": format!("lookup_{i:03}"), "description": "one two three four ".repeat(15), "inputSchema": {"type":"object"}
+        })).collect();
+        let big = delayed_mcp_server_with_tools(dir.path(), 0, tools);
+        let other_dir = tempfile::tempdir().unwrap();
+        let mut other = delayed_mcp_server(other_dir.path(), 0, 2);
+        other.name = "other".into();
+        config.mcp_servers = vec![
+            mcp_loading_mode(big, "on-demand"),
+            mcp_loading_mode(other, "on-demand"),
+        ];
+        let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [
+                scripted_tool_call("mcp__other__load_tools", serde_json::json!({"names": []})),
+                scripted_reply(),
+            ],
+        );
+        run_mcp_test_prompt(&config, &mut session);
+        let requests = provider.join().unwrap();
+        assert!(
+            requests[0]["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("MCP catalog shortened")
+        );
+        let reply = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            reply.contains("lookup_00") && reply.contains("lookup_01"),
+            "{reply}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loaded_tools_respect_the_tool_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 135),
+            "on-demand",
+        )];
+        let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let warnings = crate::mcp_startup::McpStartupWarnings::watch(session.mcp_registry(), 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        warnings.on_tool_limit(move |warnings| send.send(warnings).unwrap());
+        session
+            .runtime_extensions("mcp-catalog-test")
+            .insert(warnings);
+        let provider = serve_scripted_provider(
+            &mut config,
+            [
+                load_mcp_tools((0..135).map(|i| format!("lookup_{i:02}"))),
+                scripted_reply(),
+            ],
+        );
+        run_mcp_test_prompt(&config, &mut session);
+        let requests = provider.join().unwrap();
+        assert_eq!(mcp_only_names(&requests[0]), ["mcp__catalog__load_tools"]);
+        assert_eq!(requests[1]["tools"].as_array().unwrap().len(), 128);
+        let sent = mcp_only_names(&requests[1]);
+        let mut dropped = session
+            .mcp_registry()
+            .tools()
+            .into_iter()
+            .map(|tool| tool.schema_name)
+            .filter(|name| !sent.contains(&name.as_str()))
+            .collect::<Vec<_>>();
+        dropped.sort_unstable();
+        let detail = format!(
+            "left out {} tools: {}",
+            dropped.len(),
+            dropped[..3].join(", ")
+        );
+        let reports = receive.try_iter().flatten().collect::<Vec<_>>();
+        assert!(
+            reports.iter().any(|warning| warning.contains(&detail)),
+            "{reports:?}"
+        );
     }
 
     #[test]

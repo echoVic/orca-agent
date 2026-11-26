@@ -468,8 +468,15 @@ pub fn tool_registry_with_mcp_and_external(
         registry.register(ExternalTool::new(tool.clone()));
     }
     if let Some(mcp_registry) = mcp_registry {
-        for tool in mcp_registry.tools() {
-            registry.register(McpProxyTool::new(tool));
+        for (server, name) in mcp_registry.on_demand_loaders() {
+            registry.register(McpLoadTools::new(server, name));
+        }
+        for (tool, deferred) in mcp_registry.agent_tools() {
+            let mut proxy = McpProxyTool::new(tool);
+            if deferred {
+                proxy.spec.exposure = ToolExposure::Deferred;
+            }
+            registry.register(proxy);
         }
     }
     registry
@@ -2395,6 +2402,68 @@ fn parse_json_arguments(request: &ToolRequest) -> Result<Value, String> {
         .map(|value| value.unwrap_or_else(|| json!({})))
 }
 
+struct McpLoadTools {
+    server: String,
+    spec: ToolSpec,
+}
+
+impl McpLoadTools {
+    fn new(server: String, name: String) -> Self {
+        let spec = ToolSpec {
+            name: ToolName::Mcp(name),
+            aliases: Vec::new(),
+            description: format!(
+                "Load tools from MCP server '{server}' by name. Pass an empty names array to list valid names. Loaded tools are available on the next model request."
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"names": {"type": "array", "items": {"type": "string"}}},
+                "required": ["names"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            capabilities: CapabilitySet::new(Vec::new()),
+            exposure: ToolExposure::Direct,
+            result_semantics: ResultSemantics::Standard,
+            interrupt_semantics: InterruptSemantics::WaitForTerminal,
+            replay_semantics: ReplaySemantics::SafeToRetry,
+            renderer: RendererHint::State,
+            concurrent_safe: false,
+        };
+        Self { server, spec }
+    }
+}
+
+impl Tool for McpLoadTools {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn is_concurrent_safe(&self, _request: &ToolRequest) -> bool {
+        false
+    }
+
+    fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
+        #[derive(serde::Deserialize)]
+        struct Arguments {
+            names: Vec<String>,
+        }
+        let Some(registry) = ctx.mcp_registry else {
+            return ToolResult::failed(request, "MCP registry is not initialized", None);
+        };
+        let args = match serde_json::from_str::<Arguments>(
+            request.raw_arguments.as_deref().unwrap_or("{}"),
+        ) {
+            Ok(args) => args,
+            Err(error) => return ToolResult::invalid_input(request, error.to_string()),
+        };
+        match registry.load_tools(&self.server, &args.names) {
+            Ok(output) => ToolResult::completed(request, output, false),
+            Err(error) => ToolResult::failed(request, error, None),
+        }
+    }
+}
+
 struct McpProxyTool {
     tool: McpTool,
     spec: ToolSpec,
@@ -2442,7 +2511,7 @@ impl Tool for McpProxyTool {
         let Some(registry) = ctx.mcp_registry else {
             return ToolResult::failed(request, "MCP registry is not initialized", None);
         };
-        let Some(tool_ref) = registry.resolve_tool(&self.tool.schema_name) else {
+        let Some(tool_ref) = registry.resolve_agent_tool(&self.tool.schema_name) else {
             return ToolResult::failed(
                 request,
                 format!("unknown MCP tool: {}", self.tool.schema_name),

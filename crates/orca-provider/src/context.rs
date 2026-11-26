@@ -635,6 +635,17 @@ fn render_mcp_instructions_with_counter(
     conversation: &Conversation,
     counter: &impl TokenCounter,
 ) -> Option<String> {
+    let has_catalog = conversation
+        .mcp_instructions
+        .iter()
+        .any(|(_, text)| text.starts_with(orca_core::mcp_types::ON_DEMAND_CATALOG_PREFIX));
+    let footer = "\n\n[MCP catalog shortened. Call the server's load_tools with {\"names\":[]} for its full list.]";
+    let token_limit = if has_catalog {
+        MCP_CONTEXT_MAX_TOKENS.saturating_sub(counter.count_text(footer) + 2)
+    } else {
+        MCP_CONTEXT_MAX_TOKENS
+    };
+    let mut shortened = false;
     let mut message = MCP_INSTRUCTIONS_PREAMBLE.to_string();
     for (name, text) in &conversation.mcp_instructions {
         let name = name.replace(['"', '<', '>'], "");
@@ -647,9 +658,11 @@ fn render_mcp_instructions_with_counter(
         let close = format!("{cut_note}{MCP_INSTRUCTIONS_CLOSE}");
         let frame_bytes = message.len() + open.len() + close.len();
         if frame_bytes >= MAX_MCP_INSTRUCTION_MESSAGE_BYTES {
+            shortened = true;
             break;
         }
         let server_end = text.floor_char_boundary(MAX_MCP_SERVER_INSTRUCTION_BYTES);
+        shortened |= server_end < text.len();
         let escaped =
             text[..server_end].replace("</mcp_server_instructions", "&lt;/mcp_server_instructions");
         let body_end = escaped.floor_char_boundary(MAX_MCP_INSTRUCTION_MESSAGE_BYTES - frame_bytes);
@@ -659,11 +672,12 @@ fn render_mcp_instructions_with_counter(
         let body_start = message.len();
         message.push_str(text);
         message.push_str(&close);
-        if counter.count_text(&message) > MCP_CONTEXT_MAX_TOKENS {
+        if counter.count_text(&message) > token_limit {
+            shortened = true;
             // Trim the body while reserving room for the note and closing tag.
             message.truncate(body_start);
             let frame_tokens = counter.count_text(&format!("{message}{close}"));
-            let mut body_budget = MCP_CONTEXT_MAX_TOKENS.saturating_sub(frame_tokens);
+            let mut body_budget = token_limit.saturating_sub(frame_tokens);
             while body_budget > 0 {
                 let body = truncate_text_to_token_limit(text, body_budget, counter);
                 if body.is_empty() {
@@ -672,18 +686,25 @@ fn render_mcp_instructions_with_counter(
                 message.push_str(&body);
                 message.push_str(&close);
                 let tokens = counter.count_text(&message);
-                if tokens <= MCP_CONTEXT_MAX_TOKENS {
+                if tokens <= token_limit {
+                    if has_catalog {
+                        message.push_str(footer);
+                    }
                     return Some(message);
                 }
                 message.truncate(body_start);
-                body_budget = body_budget.saturating_sub(tokens - MCP_CONTEXT_MAX_TOKENS);
+                body_budget = body_budget.saturating_sub(tokens - token_limit);
             }
             message.truncate(previous_end);
             break;
         }
         if body_end < escaped.len() {
+            shortened = true;
             break;
         }
+    }
+    if has_catalog && shortened {
+        message.push_str(footer);
     }
     (message.len() > MCP_INSTRUCTIONS_PREAMBLE.len()).then_some(message)
 }

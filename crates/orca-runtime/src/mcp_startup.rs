@@ -11,7 +11,15 @@ pub(crate) fn refresh_request_instructions(
     conversation: &mut orca_core::conversation::Conversation,
     registry: &orca_mcp::McpRegistry,
 ) {
-    conversation.mcp_instructions = registry.server_instructions();
+    let mut instructions = registry.server_instructions();
+    for (server, catalog) in registry.on_demand_catalogs() {
+        if let Some((_, text)) = instructions.iter_mut().find(|(name, _)| *name == server) {
+            *text = format!("{catalog}\n\n{text}");
+        } else {
+            instructions.push((server, catalog));
+        }
+    }
+    conversation.mcp_instructions = instructions;
 }
 
 /// The warnings `registry` leaves once its servers' startup has ended, in

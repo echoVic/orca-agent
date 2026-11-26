@@ -6,7 +6,7 @@ use std::io::Read;
 use std::sync::mpsc;
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -66,6 +66,7 @@ pub(super) struct StreamableHttpTransport {
     headers: HeaderMap,
     auth: Arc<RemoteAuth>,
     session: Mutex<HttpSession>,
+    session_generation: AtomicU64,
     next_id: Mutex<u64>,
     client: reqwest::blocking::Client,
     startup_timeout: Duration,
@@ -173,6 +174,7 @@ impl StreamableHttpTransport {
             headers: configured_headers(config)?,
             auth,
             session: Mutex::new(HttpSession::default()),
+            session_generation: AtomicU64::new(0),
             next_id: Mutex::new(1),
             client: crate::http::blocking_client().map_err(|error| {
                 format!(
@@ -187,6 +189,10 @@ impl StreamableHttpTransport {
 }
 
 impl McpTransport for StreamableHttpTransport {
+    fn session_generation(&self) -> u64 {
+        self.session_generation.load(Ordering::Relaxed)
+    }
+
     fn initialize(&self) -> Result<Value, String> {
         self.start_session().map_err(HttpRequestError::into_message)
     }
@@ -371,6 +377,7 @@ impl StreamableHttpTransport {
             protocol_version,
         };
         self.notify("notifications/initialized", json!({}), self.startup_timeout)?;
+        self.session_generation.fetch_add(1, Ordering::Relaxed);
         Ok(result)
     }
 
@@ -761,6 +768,12 @@ impl SseFallbackTransport {
 }
 
 impl McpTransport for SseFallbackTransport {
+    fn session_generation(&self) -> u64 {
+        self.transport
+            .get()
+            .map_or(0, |transport| transport.session_generation())
+    }
+
     fn capability_receipt(&self) -> Option<CapabilityReceipt> {
         self.transport.get()?.capability_receipt()
     }
@@ -2984,6 +2997,32 @@ mod tests {
     }
 
     #[test]
+    fn on_demand_tools_refresh_when_http_renews_a_session() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            sessions: vec!["s1", "s2"],
+            renew_tools_on_call: true,
+            ..Default::default()
+        });
+        let mut config = streamable_http_config("docs", &server);
+        config.tool_loading = orca_core::mcp_types::McpToolLoading::OnDemand;
+        let registry = crate::initialize_registry(&[config], None);
+        assert!(registry.wait_for_startup(&|| false));
+        registry.load_tools("docs", &["echo".into()]).unwrap();
+        let echo = registry.resolve_agent_tool("mcp__docs__echo").unwrap();
+        registry.call_tool(&echo, json!({"text":"test"})).unwrap();
+        assert_eq!(
+            registry
+                .tools()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            ["search"]
+        );
+        assert!(registry.resolve_agent_tool("mcp__docs__echo").is_none());
+        assert!(registry.resolve_agent_tool("mcp__docs__search").is_none());
+    }
+
+    #[test]
     fn json_and_event_stream_responses_both_work() {
         for event_stream in [false, true] {
             let server = StreamableHttpServer::start(StreamableHttpBehavior {
@@ -3727,6 +3766,7 @@ mod tests {
         /// Sessions the server ends right after they are initialized: every
         /// later request that carries one gets 404.
         ended_sessions: Vec<&'static str>,
+        renew_tools_on_call: bool,
         /// The status the server acknowledges notifications with.
         notification_status: u16,
         /// Answer requests with an SSE stream that carries a log notification
@@ -3751,6 +3791,7 @@ mod tests {
                 protocol_version: "2025-06-18",
                 sessions: Vec::new(),
                 ended_sessions: Vec::new(),
+                renew_tools_on_call: false,
                 notification_status: 202,
                 event_stream: false,
                 elicit: false,
@@ -3971,6 +4012,12 @@ mod tests {
             let Some(session) = session else {
                 return write_http_status(stream, 400);
             };
+            if behavior.renew_tools_on_call
+                && session == "s1"
+                && request.rpc_method() == Some("tools/call")
+            {
+                return write_http_status(stream, 404);
+            }
             if !behavior.sessions.contains(&session)
                 || (is_request && behavior.ended_sessions.contains(&session))
             {
@@ -3988,7 +4035,7 @@ mod tests {
         }
         let result = match request.rpc_method() {
             Some("tools/list") => json!({"tools": [{
-                "name": "echo",
+                "name": if behavior.renew_tools_on_call && session == Some("s2") { "search" } else { "echo" },
                 "description": "echoes its text",
                 "inputSchema": {"type": "object"}
             }]}),

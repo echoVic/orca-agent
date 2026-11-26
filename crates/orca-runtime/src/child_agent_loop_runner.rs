@@ -248,6 +248,7 @@ where
             }
         }
 
+        setup.refresh_mcp(config, context.request, context.cwd);
         if let Err(message) =
             prepare_child_agent_request(config, &mut setup, context.cwd, context.hooks)?
         {
@@ -529,6 +530,7 @@ where
             }
         }
 
+        setup.refresh_mcp(config, context.request, context.cwd);
         if let Err(message) =
             prepare_child_agent_request(config, &mut setup, context.cwd, context.hooks)?
         {

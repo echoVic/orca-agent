@@ -369,6 +369,12 @@ impl InteractiveSession {
             0
         };
 
+        let loaded_mcp_tools = loaded_transcript
+            .as_ref()
+            .and_then(|transcript| transcript.meta.additional_fields.get("loaded_mcp_tools"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
+
         let mut session_id = None;
         let writer = match &config.history_mode {
             HistoryMode::Disabled => None,
@@ -447,6 +453,14 @@ impl InteractiveSession {
                 start_writer_with_messages(&store, meta, &conversation)
             }
         };
+
+        let persist = writer.as_ref().map(|writer| {
+            let path = writer.path().to_path_buf();
+            let persist: orca_mcp::McpToolSelectionWriter =
+                Box::new(move |loaded| SessionWriter::save_mcp_tool_selection(&path, loaded));
+            persist
+        });
+        let mcp_registry = mcp_registry.with_tool_scope(loaded_mcp_tools, persist);
 
         let process_local_tasks = session_id.is_none() && runtime_thread_id.is_some();
         let task_session_id = session_id
