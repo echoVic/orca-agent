@@ -15,7 +15,7 @@ struct ScriptedEndpoint {
 }
 
 impl ScriptedEndpoint {
-    fn start() -> Self {
+    fn start(failures: usize) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -37,6 +37,18 @@ impl ScriptedEndpoint {
                 stream.set_read_timeout(Some(Duration::from_secs(5)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(5)))?;
                 requests.push(read_request(&stream)?);
+                if requests.len() <= failures {
+                    let retry_after = if requests.len() == 4 {
+                        "Retry-After: 1\r\n"
+                    } else {
+                        ""
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 503 Service Unavailable\r\nX-Request-Id: retry-fixture\r\n{retry_after}Content-Length: 4\r\nConnection: close\r\n\r\nbusy"
+                    )?;
+                    continue;
+                }
                 let mut body = String::new();
                 for delta in (0..200)
                     .map(|_| json!({"reasoning_content": " 思考\n\t🦀 "}))
@@ -114,10 +126,10 @@ fn read_request(stream: &TcpStream) -> io::Result<Value> {
     serde_json::from_slice(&body).map_err(io::Error::other)
 }
 
-fn run_exec(format: &str) -> String {
+fn run_exec(format: &str, failures: usize) -> String {
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
-    let mut endpoint = ScriptedEndpoint::start();
+    let mut endpoint = ScriptedEndpoint::start(failures);
     let mut child = Command::new(env!("CARGO_BIN_EXE_orca"))
         .current_dir(cwd.path())
         .env("ORCA_HOME", home.path())
@@ -174,14 +186,18 @@ fn run_exec(format: &str) -> String {
     let stderr = String::from_utf8(err.join().unwrap()).unwrap();
     let requests = endpoint.finish();
     assert!(!timed_out, "CLI timed out: {stderr}\n{stdout}");
-    assert!(status.success(), "{stderr}\n{stdout}");
-    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        status.code(),
+        Some(i32::from(failures >= 5)),
+        "{stderr}\n{stdout}"
+    );
+    assert_eq!(requests.len(), (failures + 1).min(5));
     stdout
 }
 
 #[test]
 fn exec_jsonl_coalesces_streamed_deltas_without_losing_response_text() {
-    let stdout = run_exec("jsonl");
+    let stdout = run_exec("jsonl", 0);
     let events: Vec<Value> = stdout
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -225,9 +241,65 @@ fn exec_jsonl_coalesces_streamed_deltas_without_losing_response_text() {
 
 #[test]
 fn exec_text_preserves_each_streamed_delta() {
-    let stdout = run_exec("text");
+    let stdout = run_exec("text", 0);
     assert_eq!(stdout.matches("thinking:  思考\n\t🦀 ").count(), 200);
     for text in ["Hello", " ", "世界", "!\n"] {
         assert!(stdout.contains(&format!("assistant: {text}\n")), "{stdout}");
     }
+}
+
+#[test]
+fn jsonl_exec_emits_provider_retry() {
+    let stdout = run_exec("jsonl", 1);
+    let events: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let retry = events
+        .iter()
+        .find(|event| event["type"] == "provider.retry")
+        .expect(&stdout);
+    let payload = &retry["payload"];
+    assert_eq!(payload["attempt"], 1);
+    assert_eq!(payload["max_attempts"], 5);
+    assert!(payload["delay_ms"].as_u64().unwrap() > 0);
+    assert_eq!(payload["kind"], "server");
+    assert_eq!(
+        payload["reason"],
+        "DeepSeek provider error: busy (HTTP 503, request id retry-fixture)"
+    );
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "model.response.completed")
+        .unwrap();
+    assert!(retry["seq"].as_u64() < completed["seq"].as_u64());
+}
+
+#[test]
+fn jsonl_exec_keeps_the_terminal_provider_error_after_retries() {
+    let stdout = run_exec("jsonl", 5);
+    let events: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let retries: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "provider.retry")
+        .collect();
+    assert_eq!(retries.len(), 4);
+    assert!(retries[3]["payload"]["delay_ms"].as_u64().unwrap() >= 750);
+    let end = events.last().unwrap();
+    assert_eq!(end["type"], "session.completed");
+    assert_eq!(end["payload"]["status"], "failed");
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .unwrap();
+    assert!(
+        error["payload"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("(HTTP 503, request id retry-fixture)")
+    );
+    assert!(retries.last().unwrap()["seq"].as_u64() < error["seq"].as_u64());
 }

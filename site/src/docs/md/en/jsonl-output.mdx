@@ -33,6 +33,15 @@ assistant.message.delta events for the same item. Concatenated payload.text is
 unchanged. Merged events retain the first envelope, so seq may skip values.
 model.response.completed carries the full assistant_reasoning and assistant_content.
 
+Orca emits `provider.retry` live before a scheduled retry. The payload gives
+`attempt` (the 1-based count of completed HTTP sends), `max_attempts` (the shared
+send limit), `delay_ms` (the scheduled wait including any active quota cooldown),
+`kind` (the provider error kind), and `reason` (up to 200 characters of the redacted
+diagnostic). Terminal errors retain the bounded diagnostic and any available HTTP
+status and request ID.
+After a successful retry, `context.updated` reports that attempt's input tokens.
+`usage.updated` includes usage reported by failed attempts as well.
+
 ~~~bash
 orca exec --output-format jsonl "Run the test suite" |
   jq -c 'select(.type == "tool.call.completed")'

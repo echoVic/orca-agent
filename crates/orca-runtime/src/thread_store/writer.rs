@@ -29,6 +29,7 @@ use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 
 use super::assets::{self, HydrateImages};
 use super::reader::{INDEX_BUDGET, SessionRecords, iter_records};
+use super::redact_sensitive_text;
 #[cfg(not(test))]
 use super::session_index;
 use super::types::{
@@ -1760,8 +1761,6 @@ fn redact_string_in_place(value: &mut String) {
     *value = redact_sensitive_text(value);
 }
 
-pub(crate) use orca_core::history_redaction::redact_sensitive_text;
-
 pub(crate) fn acquire_file_lock(path: &Path) -> io::Result<ExclusiveFileLock> {
     let logical_path = if path.extension().and_then(|extension| extension.to_str()) == Some("zst") {
         path.with_extension("")
@@ -3378,15 +3377,11 @@ mod tests {
     #[test]
     fn non_url_keyed_values_redact_the_entire_value_with_query_punctuation() {
         assert_eq!(
-            orca_core::history_redaction::redact_keyed_secret_values(
-                "api_key=ordinary&suffix#remainder"
-            ),
+            redact_sensitive_text("api_key=ordinary&suffix#remainder"),
             "api_key=<redacted>"
         );
         assert_eq!(
-            orca_core::history_redaction::redact_keyed_secret_values(
-                "token: ordinary#remainder&suffix"
-            ),
+            redact_sensitive_text("token: ordinary#remainder&suffix"),
             "token: <redacted>"
         );
     }
