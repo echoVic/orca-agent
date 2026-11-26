@@ -18610,10 +18610,35 @@ impl ThreadActor {
                                     self.active = Some(active);
                                     continue;
                                 }
-                                command_rx.close();
                                 active.generation.cancel.cancel();
+                                // The interrupted generation still needs its actor to
+                                // acknowledge the reply before it can finish.
+                                let generation_result = loop {
+                                    let command = tokio::select! {
+                                        biased;
+                                        result = &mut active.generation.join => break result,
+                                        command = command_rx.recv() => command,
+                                    };
+                                    match command {
+                                        Some(ThreadCommand::SurfaceCommitProviderResponse {
+                                            fence, response, reply,
+                                        }) if active.surface_operation.as_ref() == Some(&fence) => {
+                                            let result = self.commit_surface_provider_response(
+                                                &mut active, fence, &response,
+                                            );
+                                            let _ = reply.send(result);
+                                        }
+                                        Some(ThreadCommand::ShutdownThread { reply, .. }) => {
+                                            if let Some(reply) = reply {
+                                                let _ = reply.send(ThreadShutdownAck::Retry);
+                                            }
+                                        }
+                                        Some(command) => Self::reject_thread_command_unavailable(command),
+                                        None => break (&mut active.generation.join).await,
+                                    }
+                                };
+                                command_rx.close();
                                 Self::drain_closed_thread_commands(&mut command_rx);
-                                let generation_result = (&mut active.generation.join).await;
                                 let finish_result =
                                     self.finish_generation(active, generation_result, false);
                                 let background_shutdown =
@@ -39208,6 +39233,259 @@ mod tests {
             .expect("shutdown returned before the generation completed");
         assert!(thread.command_tx.is_closed());
         assert!(shutdown.is_ok(), "host shutdown returned {shutdown:?}");
+    }
+
+    #[test]
+    fn shutdown_preserves_an_acknowledged_interrupted_reply_on_restart() {
+        use orca_core::conversation::CutShort;
+
+        #[derive(Clone, Debug)]
+        struct InterruptedReplyExecutor {
+            published: SyncSender<()>,
+            finish_reply: Arc<Mutex<Receiver<()>>>,
+        }
+
+        #[derive(Debug)]
+        struct GatedReplyIngress {
+            ingress: Arc<dyn surface::RuntimeProviderResponseIngress>,
+            gate: InterruptedReplyExecutor,
+        }
+
+        impl surface::RuntimeProviderResponseIngress for GatedReplyIngress {
+            fn commit_response(&self, response: &mut RuntimeModelResponse) -> io::Result<()> {
+                self.ingress.commit_response(response)
+            }
+
+            fn commit_provider_step(
+                &self,
+                identity: &ModelResponseIdentity,
+                step: &ProviderStep,
+            ) -> io::Result<()> {
+                self.ingress.commit_provider_step(identity, step)
+            }
+
+            fn publish_provider_steps(
+                &self,
+                identity: &ModelResponseIdentity,
+                steps: &[ProviderStep],
+            ) -> io::Result<()> {
+                self.ingress.publish_provider_steps(identity, steps)?;
+                if steps
+                    .iter()
+                    .any(|step| matches!(step, ProviderStep::MessageDelta(_)))
+                {
+                    self.gate.published.send(()).unwrap();
+                    self.gate
+                        .finish_reply
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(SURFACE_TEST_TIMEOUT)
+                        .unwrap();
+                }
+                Ok(())
+            }
+
+            fn commit_tool_results(&self, results: &[ToolResult]) -> io::Result<()> {
+                self.ingress.commit_tool_results(results)
+            }
+        }
+
+        impl ThreadOperationExecutor for InterruptedReplyExecutor {
+            fn run_turn(
+                &self,
+                thread: &mut RuntimeThread,
+                request: &HostedTurnRequest,
+                generation: &GenerationContext,
+                events: &mut EventFactory,
+                writer: &mut (dyn io::Write + Send),
+                cancel: &CancelToken,
+            ) -> io::Result<ThreadOperationOutcome> {
+                let mut generation = generation.clone();
+                let ingress = generation
+                    .handlers
+                    .provider_response_ingress
+                    .take()
+                    .unwrap();
+                generation.handlers.provider_response_ingress = Some(Arc::new(GatedReplyIngress {
+                    ingress,
+                    gate: self.clone(),
+                }));
+                LegacyThreadOperationExecutor.run_turn(
+                    thread,
+                    request,
+                    &generation,
+                    events,
+                    writer,
+                    cancel,
+                )
+            }
+        }
+
+        for reason in [
+            surface::SurfaceShutdownReason::HostShutdown,
+            surface::SurfaceShutdownReason::ThreadClose,
+        ] {
+            let cwd = tempfile::tempdir().unwrap();
+            let (published_tx, published_rx) = mpsc::sync_channel(1);
+            let (finish_tx, finish_rx) = mpsc::channel();
+            let host = RuntimeHost::start_with_executor(Arc::new(InterruptedReplyExecutor {
+                published: published_tx,
+                finish_reply: Arc::new(Mutex::new(finish_rx)),
+            }))
+            .unwrap();
+            let thread = host
+                .start_thread(
+                    surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                    "interrupt and shut down",
+                )
+                .unwrap();
+            let connection =
+                surface::SurfaceConnectionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .unwrap();
+            let jsonl = thread.jsonl_surface_for_connection(connection).unwrap();
+            let surface::AttachResult::FreshAttached { attachment } =
+                jsonl.attach_fresh(surface::FreshAttachRequest {
+                    request_id: surface_request_id(),
+                    role: surface::SurfaceAttachmentRole::Jsonl,
+                    requested_capabilities: BTreeSet::from([
+                        surface::SurfaceCapability::ReadSnapshot,
+                        surface::SurfaceCapability::SubmitOperation,
+                        surface::SurfaceCapability::ControlBoundOperation,
+                    ]),
+                    interaction_capabilities: BTreeSet::new(),
+                })
+            else {
+                panic!("attach JSONL client");
+            };
+            let legacy_turn_id =
+                surface::LegacyTurnId(surface::DisplayText::new(TurnId::new().to_string()));
+            let mut intent = surface_user_turn_intent(
+                &attachment.baseline.snapshot,
+                "mock_stream_delay_ms 30000",
+            );
+            intent.correlation = surface::OperationIngressCorrelation::JsonlThreadTurn {
+                rpc_id_digest: surface_sha256(b"interrupt-then-shutdown"),
+                legacy_turn_id: legacy_turn_id.clone(),
+            };
+            let reserved = committed_surface_value(
+                attachment
+                    .client
+                    .reserve_operation(surface_request_id(), intent)
+                    .unwrap(),
+            );
+            let _admitted = committed_surface_value(
+                attachment
+                    .client
+                    .admit_reserved(
+                        surface_request_id(),
+                        reserved.operation_id,
+                        reserved.lease.lease_id,
+                    )
+                    .unwrap(),
+            );
+            published_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+            assert!(
+                fresh_surface_attachment(&thread.surface())
+                    .baseline
+                    .snapshot
+                    .assistant_streams
+                    .iter()
+                    .any(|stream| stream.text.as_str() == "Mock slow stream started.")
+            );
+            let interrupted = host
+                .handle()
+                .control_jsonl_turn(
+                    attachment.client.clone(),
+                    surface_request_id(),
+                    Some(attachment.client.thread_id().clone()),
+                    legacy_turn_id,
+                    surface::JsonlTurnControlAction::Interrupt,
+                )
+                .unwrap();
+            assert!(matches!(
+                interrupted,
+                surface::JsonlTurnControlResult::Resolved {
+                    mutation: surface::MutationReply::Committed { value, .. },
+                } if value.echo.status == surface::JsonlResolvedTurnControlStatus::Interrupted
+            ));
+            let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+            thread
+                .command_tx
+                .blocking_send(ThreadCommand::ShutdownThread {
+                    reply: Some(shutdown_tx),
+                    reason,
+                })
+                .unwrap();
+            // Wait for shutdown to stop accepting ordinary work before the
+            // generation submits the final response.
+            let (probe_tx, probe_rx) = mpsc::sync_channel(1);
+            if thread
+                .command_tx
+                .blocking_send(ThreadCommand::ReadState { reply: probe_tx })
+                .is_ok()
+            {
+                assert!(matches!(
+                    probe_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+                    Err(RuntimeHostError::ThreadUnavailable)
+                ));
+            }
+            finish_tx.send(()).unwrap();
+            assert!(matches!(
+                shutdown_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+                ThreadShutdownAck::Complete
+            ));
+            host.shutdown().unwrap();
+
+            let transcript = SessionStore::new()
+                .load_session(thread.thread_id())
+                .unwrap();
+            let replies = transcript
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Assistant {
+                        content, cut_short, ..
+                    } => Some((content.as_deref(), *cut_short)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                replies,
+                [(
+                    Some("Mock slow stream started."),
+                    Some(CutShort::Interrupted)
+                )]
+            );
+
+            let resumed_host = RuntimeHost::start().unwrap();
+            let resumed = resumed_host
+                .start_thread(
+                    surface_test_config(
+                        cwd.path().to_path_buf(),
+                        HistoryMode::Resume(thread.thread_id().to_string()),
+                    ),
+                    "restart after interrupt",
+                )
+                .unwrap();
+            let snapshot = fresh_surface_attachment(&resumed.surface())
+                .baseline
+                .snapshot;
+            let replies = snapshot
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    surface::SurfaceItem::AssistantMessage {
+                        text, cut_short, ..
+                    } => Some((text.as_str(), *cut_short)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                replies,
+                [("Mock slow stream started.", Some(CutShort::Interrupted))]
+            );
+            resumed_host.shutdown().unwrap();
+        }
     }
 
     #[test]
