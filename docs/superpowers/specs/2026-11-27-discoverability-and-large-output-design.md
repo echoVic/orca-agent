@@ -16,9 +16,9 @@ Date: 2026-11-27. Size: project (four parts that can ship separately). It draws 
 - A storage failure keeps the original result.
 
 **Change.**
-- **Which results are saved.** A completed tool result whose text exceeds 12,500 tokens is saved whole under the session's own directory in `ORCA_HOME`, one file per tool call, readable only by the user. This applies to MCP tools, external tools, `web_fetch` and `web_search`. `read_file`, `grep`, `glob`, `task_read_output` and shell tasks are never saved, because they already page.
+- **Which results are saved.** A completed tool result whose text exceeds 12,500 tokens is saved after applying history redaction under the session's own directory in `ORCA_HOME`, one file per tool call, readable only by the user. This applies to MCP tools, external tools, `web_fetch` and `web_search`. External tools whose output exceeds the 1 MiB process capture limit use the capture truncation notice. The discarded bytes are unavailable for saving. `read_file`, `grep`, `glob`, `task_read_output` and shell tasks are never saved, because they already page.
 - **What the model gets.** The head and tail within the 12,500-token budget, then the notice:
-  `[{omitted} bytes omitted. The full result is saved at {path}; read it with read_file using offset and limit, or search it with grep.]`
+  `[{omitted} bytes omitted. The full result is saved at {path}; read it with read_file using unit=bytes, offset and limit, or search it with grep.]`
 - **The paths must be readable.** `read_file` and `grep` accept paths under the session's spill directory as a read-only exception to the workspace rule. That directory and nothing else; no writes.
 - **The micro-compaction marker** of a saved result keeps the path, so the full text stays reachable after it is trimmed.
 - **Clean-up.** Spill files are deleted with their session. A storage failure keeps today's behaviour, with no spill.

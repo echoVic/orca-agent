@@ -9,7 +9,7 @@ use crate::conversation::ImageInput;
 
 const SPILL_NOTICE_PREFIX: &str = " bytes omitted. The full result is saved at ";
 const SPILL_NOTICE_SUFFIX: &str =
-    "; read it with read_file using offset and limit, or search it with grep.]";
+    "; read it with read_file using unit=bytes, offset and limit, or search it with grep.]";
 
 pub fn tool_output_spill_notice(omitted: usize, path: &str) -> String {
     format!("[{omitted}{SPILL_NOTICE_PREFIX}{path}{SPILL_NOTICE_SUFFIX}")

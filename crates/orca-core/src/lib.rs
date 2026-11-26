@@ -17,6 +17,7 @@ pub mod external_config;
 pub mod goal_runtime;
 pub mod goal_types;
 pub mod hex;
+pub mod history_redaction;
 pub mod home;
 pub mod hook_types;
 pub mod mcp_types;

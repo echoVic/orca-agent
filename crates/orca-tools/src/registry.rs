@@ -490,7 +490,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         safe_local_read_builtin_spec(
             "read_file",
-            "Read the contents of a file at the given path relative to workspace root.",
+            "Read a workspace file by line. For a saved tool result, use its absolute path and set unit to bytes to page by byte.",
             json!({
                 "type": "object",
                 "properties": {
@@ -501,12 +501,17 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "offset": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "1-based line number to start reading from. Use for large files."
+                        "description": "1-based starting line, or starting byte when unit is bytes."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Number of lines to read. Use with offset for large files."
+                        "description": "Number of lines to read, or bytes when unit is bytes."
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["bytes"],
+                        "description": "Select byte paging for a saved tool result. Omit to read by line."
                     }
                 },
                 "required": ["path"],
@@ -2653,7 +2658,7 @@ mod tests {
         assert_eq!(
             notice,
             format!(
-                "[{} bytes omitted. The full result is saved at {}; read it with read_file using offset and limit, or search it with grep.]",
+                "[{} bytes omitted. The full result is saved at {}; read it with read_file using unit=bytes, offset and limit, or search it with grep.]",
                 original.len() - head.len() - tail.len(),
                 file.display()
             )
@@ -2766,6 +2771,73 @@ mod tests {
             let allowed = spill_read(name, allowed_args, cwd.path(), spill.path());
             assert_eq!(allowed.status, ToolStatus::Completed, "{allowed:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_reads_and_writes_refuse_a_linked_ancestor() {
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        let outside_spill = outside.join("session/spill");
+        std::fs::create_dir_all(&outside_spill).unwrap();
+        std::fs::write(outside_spill.join("call.txt"), "needle").unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        let spill = alias.join("session/spill");
+        let file = spill.join("call.txt");
+        for (name, args) in [
+            (ToolName::ReadFile, json!({"path": file})),
+            (ToolName::Grep, json!({"path": file, "pattern": "needle"})),
+        ] {
+            let result = spill_read(name, args, cwd.path(), &spill);
+            assert_eq!(result.status, ToolStatus::Failed, "{result:?}");
+        }
+        mcp_spill_result(
+            spill_session_context(cwd.path(), &spill),
+            &" hello".repeat(34_000),
+        );
+        assert!(!outside_spill.join("mcp-result.txt").exists());
+    }
+
+    #[test]
+    fn spill_saves_the_history_redacted_result() {
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let spill = root.path().join("spill");
+        let words = " hello".repeat(10_000);
+        let text = format!("{words} api_key=fixture-value {words}");
+        mcp_spill_result(spill_session_context(cwd.path(), &spill), &text);
+        let saved = std::fs::read_to_string(spill.join("mcp-result.txt")).unwrap();
+        assert!(saved.contains("api_key=<redacted>"));
+        assert!(!saved.contains("fixture-value"));
+    }
+
+    #[test]
+    fn read_file_pages_a_single_long_spill_line_by_byte() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let file = spill.path().join("call.txt");
+        std::fs::write(
+            &file,
+            format!("{}needle{}", "x".repeat(100_000), "y".repeat(100_000)),
+        )
+        .unwrap();
+        let schema = default_tool_registry()
+            .get("read_file")
+            .unwrap()
+            .spec()
+            .input_schema
+            .clone();
+        let result = spill_read(
+            ToolName::ReadFile,
+            json!({"path": file, "offset": 100001, "limit": 6, "unit": "bytes"}),
+            cwd.path(),
+            spill.path(),
+        );
+        assert_eq!(result.output.as_deref(), Some("needle"));
+        assert_eq!(schema["properties"]["unit"]["enum"], json!(["bytes"]));
+        assert_eq!(schema["required"], json!(["path"]));
     }
 
     #[test]

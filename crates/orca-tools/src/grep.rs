@@ -10,6 +10,8 @@ use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_ou
 use regex::Regex;
 use serde::Deserialize;
 
+use crate::spill::ReadTarget;
+
 const DEFAULT_GREP_HEAD_LIMIT: usize = 250;
 const MAX_GREP_HEAD_LIMIT: usize = 1_000;
 const MIN_GREP_LINE_BYTES: usize = 8 * 1024;
@@ -56,7 +58,29 @@ pub(crate) fn execute_in_session(
 
     let requested_path = args.path.as_deref().unwrap_or(".");
     let search_path = match crate::spill::resolve_read_path(cwd, Some(requested_path), spill_dir) {
-        Ok(path) => path,
+        Ok(ReadTarget::Workspace(path)) => path,
+        Ok(ReadTarget::Spill(path, file)) => {
+            let regex = match Regex::new(pattern) {
+                Ok(regex) => regex,
+                Err(error) => return ToolResult::failed(request, error.to_string(), None),
+            };
+            let mut collector = GrepPageCollector::new(
+                args.offset.unwrap_or(0),
+                normalized_head_limit(args.head_limit),
+                max_bytes.max(1),
+            );
+            if !search_file(
+                file,
+                &path,
+                &regex,
+                max_bytes,
+                &mut collector,
+                &should_cancel,
+            ) {
+                return ToolResult::cancelled(request, GREP_CANCELLED, None);
+            }
+            return render_search(request, collector, max_bytes);
+        }
         Err(message) => return ToolResult::failed(request, message, None),
     };
 
@@ -191,7 +215,6 @@ fn execute_in_process(
     let offset = parse_args(request).offset.unwrap_or(0);
     let limit = normalized_head_limit(parse_args(request).head_limit);
     let mut collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
-    let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
     let mut walker = WalkBuilder::new(search_path);
     walker
         .hidden(true)
@@ -218,29 +241,57 @@ fn execute_in_process(
         let Ok(file) = File::open(path) else {
             continue;
         };
-        let mut reader = BufReader::new(file);
-        let display_path = path
-            .strip_prefix(cwd)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let mut line_number = 1;
-        while let Some(line) = read_bounded_line(&mut reader, max_line_bytes) {
-            if regex.is_match(&String::from_utf8_lossy(&line.bytes)) {
-                let prefix = format!("{display_path}:{line_number}:");
-                let mut output_line = Vec::with_capacity(prefix.len() + line.bytes.len());
-                output_line.extend_from_slice(prefix.as_bytes());
-                output_line.extend_from_slice(&line.bytes);
-                collector.push(crate::process::BoundedLine {
-                    bytes: &output_line,
-                    observed_bytes: output_line.len().saturating_add(line.omitted_bytes),
-                    omitted_bytes: line.omitted_bytes,
-                });
-            }
-            line_number += 1;
+        if !search_file(
+            file,
+            path.strip_prefix(cwd).unwrap_or(path),
+            &regex,
+            max_bytes,
+            &mut collector,
+            should_cancel,
+        ) {
+            return ToolResult::cancelled(request, GREP_CANCELLED, None);
         }
     }
+    render_search(request, collector, max_bytes)
+}
 
+fn search_file(
+    file: File,
+    path: &Path,
+    regex: &Regex,
+    max_bytes: usize,
+    collector: &mut GrepPageCollector,
+    should_cancel: &dyn Fn() -> bool,
+) -> bool {
+    let mut reader = BufReader::new(file);
+    let path = path.to_string_lossy().replace('\\', "/");
+    let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
+    let mut line_number = 1;
+    while let Some(line) = read_bounded_line(&mut reader, max_line_bytes) {
+        if should_cancel() {
+            return false;
+        }
+        if regex.is_match(&String::from_utf8_lossy(&line.bytes)) {
+            let prefix = format!("{path}:{line_number}:");
+            let mut output_line = Vec::with_capacity(prefix.len() + line.bytes.len());
+            output_line.extend_from_slice(prefix.as_bytes());
+            output_line.extend_from_slice(&line.bytes);
+            collector.push(crate::process::BoundedLine {
+                bytes: &output_line,
+                observed_bytes: output_line.len().saturating_add(line.omitted_bytes),
+                omitted_bytes: line.omitted_bytes,
+            });
+        }
+        line_number += 1;
+    }
+    true
+}
+
+fn render_search(
+    request: &ToolRequest,
+    collector: GrepPageCollector,
+    max_bytes: usize,
+) -> ToolResult {
     let no_matches = collector.total_lines == 0;
     let (output, page_truncated) = collector.render();
     if no_matches {

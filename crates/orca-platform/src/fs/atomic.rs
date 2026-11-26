@@ -25,8 +25,7 @@ pub fn atomic_write(
 
 /// Writes a file only its owner can read or write, such as one holding a
 /// credential: whatever mode an earlier version had, the file replacing it
-/// is owner-only, and so is it before any byte is written. Windows keeps the
-/// user profile's access control.
+/// is owner-only, and so is it before any byte is written.
 pub fn atomic_write_private(
     destination: &Path,
     contents: &[u8],
@@ -39,14 +38,81 @@ pub fn atomic_write_private(
 }
 
 #[cfg(unix)]
-fn restrict_to_owner(file: &File) -> io::Result<()> {
+pub(super) fn restrict_to_owner(file: &File) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 
-#[cfg(not(unix))]
-fn restrict_to_owner(_file: &File) -> io::Result<()> {
-    Ok(())
+#[cfg(windows)]
+pub(super) fn restrict_to_owner(file: &File) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile, WRITE_DAC,
+    };
+
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let acl_file = unsafe { File::from_raw_handle(handle) };
+    let mut descriptor = null_mut();
+    // OW denotes the file's owner. Protect the ACL from inherited entries.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            windows_sys::core::w!("D:P(A;;FA;;;OW)"),
+            1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut acl = null_mut();
+    let result =
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) }
+            == 0
+        {
+            Err(io::Error::last_os_error())
+        } else if present == 0 || acl.is_null() {
+            Err(io::Error::other("owner-only access list is missing"))
+        } else {
+            let status = unsafe {
+                SetSecurityInfo(
+                    acl_file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    acl,
+                    null(),
+                )
+            };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status as i32))
+            }
+        };
+    unsafe { LocalFree(descriptor) };
+    result
 }
 
 pub fn atomic_write_with<F>(

@@ -1,5 +1,4 @@
-use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn directory(id: &str) -> Option<PathBuf> {
@@ -47,7 +46,7 @@ pub(crate) fn carry_into_fork(
             continue;
         };
         let target = fork.join(name);
-        let replacement = match copy_spill_file(&parent, file, &fork, &target) {
+        let replacement = match copy_spill_file(file, &target) {
             Ok(()) => tool_output_spill_notice(omitted, &target.display().to_string()),
             Err(error) => {
                 tracing::warn!(%error, "could not copy a saved tool result into the fork");
@@ -61,20 +60,11 @@ pub(crate) fn carry_into_fork(
     }
 }
 
-fn copy_spill_file(parent: &Path, file: &Path, fork: &Path, target: &Path) -> io::Result<()> {
-    existing(Some(parent))?.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "parent spill directory is missing")
-    })?;
-    let mut source = super::writer::open_regular_history_file(file)?;
-    fs::create_dir_all(fork)?;
-    existing(Some(fork))?;
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(orca_platform::fs::extended_length_path(fork))?;
-    io::copy(&mut source, &mut temporary)?;
-    temporary
-        .persist_noclobber(orca_platform::fs::extended_length_path(target))
-        .map_err(|error| error.error)?;
-    Ok(())
+fn copy_spill_file(file: &Path, target: &Path) -> io::Result<()> {
+    let mut source = orca_platform::fs::open_confined_regular(file)?;
+    let mut contents = Vec::new();
+    source.read_to_end(&mut contents)?;
+    orca_platform::fs::write_confined_private(target, &contents)
 }
 
 pub(super) fn directory_for_transcript(path: &Path) -> Option<PathBuf> {
@@ -88,45 +78,10 @@ pub(super) fn directory_for_transcript(path: &Path) -> Option<PathBuf> {
     directory(id).or_else(|| directory(&super::writer::read_session_meta(path).ok()?.session_id))
 }
 
-fn existing(path: Option<&Path>) -> io::Result<Option<&Path>> {
-    let Some(path) = path else { return Ok(None) };
-    if let Some(parent) = path.parent() {
-        match fs::symlink_metadata(parent) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-            Ok(metadata) if !metadata.file_type().is_dir() => {
-                return Err(io::Error::other("spill session path must be a directory"));
-            }
-            _ => {}
-        }
-    }
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(Some(path)),
-        Ok(_) => Err(io::Error::other("spill path must be a directory")),
-    }
-}
-
 pub(crate) fn remove(path: Option<&Path>) -> io::Result<()> {
-    if let Some(path) = existing(path)? {
-        fs::remove_dir_all(path)?;
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir(parent);
-        }
-    }
-    Ok(())
+    path.map_or(Ok(()), orca_platform::fs::remove_confined_files)
 }
 
 pub(super) fn size(path: Option<&Path>) -> io::Result<u64> {
-    let Some(path) = existing(path)? else {
-        return Ok(0);
-    };
-    fs::read_dir(path)?.try_fold(0u64, |bytes, entry| {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            return Err(io::Error::other("retention requires regular spill files"));
-        }
-        Ok(bytes.saturating_add(entry.metadata()?.len()))
-    })
+    path.map_or(Ok(0), orca_platform::fs::confined_files_size)
 }

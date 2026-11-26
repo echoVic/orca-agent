@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::ControlFlow;
 use std::path::Path;
 
@@ -5,14 +7,18 @@ use serde::Deserialize;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind};
 
-use crate::file_admission::{BoundedTextOutput, FileAdmissionError, stream_utf8_file};
+use crate::file_admission::{
+    BoundedTextOutput, FileAdmissionError, open_regular_file, stream_utf8_reader,
+};
 use crate::read_document::document_kind;
+use crate::spill::ReadTarget;
 
 #[derive(Debug, Default, Deserialize)]
 struct ReadFileArgs {
     path: Option<String>,
     offset: Option<usize>,
     limit: Option<usize>,
+    unit: Option<String>,
 }
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
@@ -37,31 +43,30 @@ pub(crate) fn execute_in_session(
 ) -> ToolResult {
     let args = parse_args(request);
     let target = args.path.as_deref().or(request.target.as_deref());
-    let path = match crate::spill::resolve_read_path(cwd, target, spill_dir) {
-        Ok(p) => p,
+    let (path, spill) = match crate::spill::resolve_read_path(cwd, target, spill_dir) {
+        Ok(ReadTarget::Workspace(path)) => (path, None),
+        Ok(ReadTarget::Spill(path, file)) => (path, Some(file)),
         Err(error) => return ToolResult::failed(request, error, None),
     };
-    let ranged = args.offset.is_some() || args.limit.is_some();
-    let output = if ranged {
-        let offset = args.offset.unwrap_or(1).max(1);
-        stream_utf8_file(
-            &path,
-            RangeCollector::new(offset, args.limit, max_bytes),
-            &should_cancel,
-            |collector, chunk| collector.push(chunk),
-        )
-        .map(|outcome| outcome.value.finish(outcome.reached_eof))
-    } else {
-        stream_utf8_file(
-            &path,
-            BoundedTextOutput::new(max_bytes),
-            &should_cancel,
-            |output, chunk| {
-                output.append(chunk);
-                ControlFlow::Continue(())
-            },
-        )
-        .map(|outcome| outcome.value.finish())
+    let output = match (args.unit.as_deref(), spill) {
+        (Some("bytes"), Some(file)) => read_byte_page(file, &args, max_bytes, &should_cancel),
+        (Some(_), _) => {
+            return ToolResult::failed(
+                request,
+                "byte paging is only available for saved tool results",
+                None,
+            );
+        }
+        (None, spill) => {
+            let opened = match spill {
+                Some(file) => file
+                    .metadata()
+                    .map(|metadata| (file, metadata.len()))
+                    .map_err(FileAdmissionError::from),
+                None => open_regular_file(&path),
+            };
+            opened.and_then(|(file, size)| read_lines(file, size, &args, max_bytes, &should_cancel))
+        }
     };
 
     match output {
@@ -91,6 +96,61 @@ pub(crate) fn execute_in_session(
             None,
         ),
     }
+}
+
+fn read_lines(
+    file: File,
+    size: u64,
+    args: &ReadFileArgs,
+    max_bytes: usize,
+    should_cancel: impl Fn() -> bool,
+) -> Result<(String, bool), FileAdmissionError> {
+    if args.offset.is_some() || args.limit.is_some() {
+        stream_utf8_reader(
+            file,
+            size,
+            RangeCollector::new(args.offset.unwrap_or(1).max(1), args.limit, max_bytes),
+            should_cancel,
+            |collector, chunk| collector.push(chunk),
+        )
+        .map(|outcome| outcome.value.finish(outcome.reached_eof))
+    } else {
+        stream_utf8_reader(
+            file,
+            size,
+            BoundedTextOutput::new(max_bytes),
+            should_cancel,
+            |output, chunk| {
+                output.append(chunk);
+                ControlFlow::Continue(())
+            },
+        )
+        .map(|outcome| outcome.value.finish())
+    }
+}
+
+fn read_byte_page(
+    mut file: File,
+    args: &ReadFileArgs,
+    max_bytes: usize,
+    should_cancel: impl Fn() -> bool,
+) -> Result<(String, bool), FileAdmissionError> {
+    if should_cancel() {
+        return Err(FileAdmissionError::Cancelled);
+    }
+    let offset = args.offset.unwrap_or(1).saturating_sub(1) as u64;
+    let available = file.metadata()?.len().saturating_sub(offset);
+    let requested = available.min(args.limit.unwrap_or(usize::MAX) as u64);
+    let read_max = requested.min(max_bytes as u64);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut page = Vec::new();
+    file.take(read_max).read_to_end(&mut page)?;
+    // Byte ranges can split UTF-8 characters. Keep the requested offsets
+    // exact so the next page always starts where the requested range ends.
+    Ok((
+        String::from_utf8_lossy(&page).into_owned(),
+        read_max < requested,
+    ))
 }
 
 /// `text` as read_file shows a file: the numbered lines `offset` and `limit`

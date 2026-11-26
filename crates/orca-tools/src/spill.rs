@@ -1,5 +1,4 @@
-use std::fs;
-use std::io::{self, Write};
+use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolStatus, tool_output_spill_notice};
@@ -79,60 +78,34 @@ fn preview(spill_dir: Option<&Path>, id: &str, text: &str) -> Option<String> {
         }
         retained = retained.checked_sub(count - MAX_INLINE_TOKENS)?;
     };
-    save(dir, &path, text).ok()?;
+    let saved = orca_core::history_redaction::redact_sensitive_text(text);
+    orca_platform::fs::write_confined_private(&path, saved.as_bytes()).ok()?;
     Some(output)
 }
 
-fn save(dir: &Path, path: &Path, text: &str) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    check_directory(dir)?;
-    let mut staged = tempfile::NamedTempFile::new_in(orca_platform::fs::extended_length_path(dir))?;
-    staged.write_all(text.as_bytes())?;
-    match staged.persist_noclobber(orca_platform::fs::extended_length_path(path)) {
-        Ok(_) => Ok(()),
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-            if fs::symlink_metadata(path)?.file_type().is_file()
-                && fs::read(path)? == text.as_bytes()
-            {
-                Ok(())
-            } else {
-                Err(error.error)
-            }
-        }
-        Err(error) => Err(error.error),
-    }
-}
-
-fn check_directory(dir: &Path) -> io::Result<()> {
-    for path in dir.ancestors().take(2) {
-        if !fs::symlink_metadata(path)?.file_type().is_dir() {
-            return Err(io::Error::other("spill directory must be a directory"));
-        }
-    }
-    Ok(())
+pub(crate) enum ReadTarget {
+    Workspace(PathBuf),
+    Spill(PathBuf, File),
 }
 
 pub(crate) fn resolve_read_path(
     cwd: &Path,
     target: Option<&str>,
     spill_dir: Option<&Path>,
-) -> Result<PathBuf, String> {
-    crate::resolve_workspace_path(cwd, target).or_else(|error| {
-        let Some((target, dir)) = target.zip(spill_dir) else {
-            return Err(error);
-        };
+) -> Result<ReadTarget, String> {
+    if let Some((target, dir)) = target.zip(spill_dir) {
         let path = Path::new(target);
-        let Ok(relative) = path.strip_prefix(dir) else {
-            return Err(error);
-        };
-        let mut components = relative.components();
-        if !matches!(components.next(), Some(Component::Normal(_)))
-            || components.next().is_some()
-            || check_directory(dir).is_err()
-            || !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
-        {
-            return Err(error);
+        if let Ok(relative) = path.strip_prefix(dir) {
+            let mut components = relative.components();
+            if matches!(components.next(), Some(Component::Normal(_)))
+                && components.next().is_none()
+            {
+                return orca_platform::fs::open_confined_regular(path)
+                    .map(|file| ReadTarget::Spill(path.to_owned(), file))
+                    .map_err(|error| format!("cannot open spill file {} (path escapes workspace or is unavailable): {error}", path.display()));
+            }
+            return Err(format!("invalid spill file path: {}", path.display()));
         }
-        crate::resolve_workspace_path(dir, Some(target))
-    })
+    }
+    crate::resolve_workspace_path(cwd, target).map(ReadTarget::Workspace)
 }
