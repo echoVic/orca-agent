@@ -1535,6 +1535,7 @@ mod tests {
             kind: ToolResultKind::Indeterminate,
             source: ToolTerminalSource::CompatibilityRepair,
             started: ToolInvocationStarted::Unknown,
+            mcp_tool_load: None,
         };
 
         let value = serde_json::to_value(terminal).unwrap();
@@ -1542,6 +1543,7 @@ mod tests {
         assert_eq!(value["kind"], "indeterminate");
         assert_eq!(value["terminal_source"], "compatibility_repair");
         assert!(value.get("started").is_none());
+        assert!(value.get("mcp_tool_load").is_none());
         assert_eq!(
             serde_json::to_value(InterruptSemantics::CooperativeCancel).unwrap(),
             "cooperative_cancel"
@@ -1569,6 +1571,7 @@ mod tests {
                 kind: ToolResultKind::Cancelled,
                 source: ToolTerminalSource::Observed,
                 started: ToolInvocationStarted::Yes,
+                mcp_tool_load: None,
             }
         );
 
