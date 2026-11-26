@@ -206,10 +206,10 @@ kind, origin, content, and token limit. Replacement is by id, so repeated Goal
 updates do not grow history.
 
 The DeepSeek adapter renders the bounded fragments in one synthetic system
-message at the end of the request, after the conversation history. When a
-fragment changes, only that final message needs to be processed again. The
-history prefix can stay cached, and assistant tool calls stay adjacent to their
-results. Inactive Goals remove their fragment.
+message after the conversation history. MCP server guidance goes in its own
+system message immediately after the internal context. Changes to these messages
+leave the history prefix cacheable and keep assistant tool calls adjacent to
+their results. Inactive Goals remove their fragment.
 
 ## Observability
 

@@ -304,7 +304,6 @@ pub const GOAL_CONTEXT_FRAGMENT_ID: &str = "goal";
 pub const PLAN_CONTEXT_FRAGMENT_ID: &str = "plan";
 pub const SKILL_CONTEXT_FRAGMENT_ID: &str = "skill";
 pub const MEMORY_CONTEXT_FRAGMENT_ID: &str = "memory";
-pub const MCP_CONTEXT_FRAGMENT_ID: &str = "mcp";
 /// Today's date. It rides in the internal context rather than the system
 /// prompt, so the system prompt and the history stay the same across days.
 pub const DATE_CONTEXT_FRAGMENT_ID: &str = "date";
@@ -326,7 +325,6 @@ pub enum InternalContextKind {
     Goal,
     Plan,
     Skill,
-    Mcp,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -480,6 +478,8 @@ pub struct UsageAnchor {
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub internal_context: InternalContext,
+    /// Per-server guidance for the current tool set, sent in its own request message.
+    pub mcp_instructions: Vec<(String, String)>,
     pub rolling_summary: Option<String>,
     pub summary: SummaryState,
     /// Not persisted: a resumed conversation measures from a full estimate
@@ -499,6 +499,7 @@ impl Clone for Conversation {
         Self {
             messages: self.messages.clone(),
             internal_context: self.internal_context.clone(),
+            mcp_instructions: self.mcp_instructions.clone(),
             rolling_summary: self.rolling_summary.clone(),
             summary: self.summary.clone(),
             usage_anchor: self.usage_anchor,
@@ -513,6 +514,7 @@ impl Conversation {
         Self {
             messages: Vec::new(),
             internal_context: InternalContext::default(),
+            mcp_instructions: Vec::new(),
             rolling_summary: None,
             summary: SummaryState::default(),
             usage_anchor: None,
@@ -633,16 +635,6 @@ impl Conversation {
                 .filter(|text| !text.trim().is_empty())
                 .map(|text| format!("[Relevant memory]\n{text}")),
             MEMORY_CONTEXT_MAX_TOKENS,
-        );
-    }
-
-    pub fn replace_mcp_context(&mut self, content: Option<String>) {
-        self.replace_internal_context(
-            MCP_CONTEXT_FRAGMENT_ID,
-            InternalContextKind::Mcp,
-            InternalContextOrigin::System,
-            content,
-            MCP_CONTEXT_MAX_TOKENS,
         );
     }
 
@@ -1143,20 +1135,6 @@ mod tests {
                 .get(MEMORY_CONTEXT_FRAGMENT_ID)
                 .is_none()
         );
-    }
-
-    #[test]
-    fn mcp_context_renders_each_server_under_its_heading() {
-        let mut conv = Conversation::new();
-        let instructions = "Instructions from MCP server 'z':\nUse search before fetch.\n\nInstructions from MCP server 'a':\nFetch by ID.";
-        conv.replace_mcp_context(Some(instructions.to_string()));
-
-        assert_eq!(conv.internal_context.render(), instructions);
-        let fragment = conv.internal_context.get(MCP_CONTEXT_FRAGMENT_ID).unwrap();
-        assert_eq!(fragment.max_tokens, 4_096);
-
-        conv.replace_mcp_context(None);
-        assert!(conv.internal_context.is_empty());
     }
 
     #[test]
