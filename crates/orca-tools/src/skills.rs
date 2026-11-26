@@ -97,7 +97,7 @@ fn discover_with_body(
     agents_home: Option<&Path>,
     include_body: bool,
 ) -> Result<Vec<Skill>, String> {
-    let project_root = project_root(cwd);
+    let project_root = project_skill_root(cwd);
     let mut skills = Vec::new();
     if let Some(home) = orca_home {
         collect_skills(
@@ -153,16 +153,11 @@ pub fn explicit_skill_prompt_block(cwd: &Path, prompt: &str) -> Result<Option<St
         return Ok(None);
     }
     let skills = discover_from_env(cwd)?;
-    let selected: Vec<(Skill, Option<String>)> = mentioned
+    let selected: Vec<Skill> = mentioned
         .into_iter()
-        .filter_map(|(id, arg)| {
-            skills
-                .iter()
-                .find(|skill| skill.id == id)
-                .map(|skill| (skill.clone(), arg))
-        })
+        .filter_map(|(id, _)| skills.iter().find(|skill| skill.id == id).cloned())
         .collect();
-    Ok(format_skills_prompt_block_with_args(&selected))
+    Ok(format_skills_prompt_block(&selected))
 }
 
 /// Returns `(id, arg)` pairs for every `$id` or `$id:arg` mention in `text`.
@@ -221,16 +216,11 @@ pub fn mentioned_skill_ids(text: &str) -> Vec<String> {
 }
 
 pub fn format_skills_prompt_block(skills: &[Skill]) -> Option<String> {
-    let pairs: Vec<(Skill, Option<String>)> = skills.iter().map(|s| (s.clone(), None)).collect();
-    format_skills_prompt_block_with_args(&pairs)
-}
-
-pub fn format_skills_prompt_block_with_args(skills: &[(Skill, Option<String>)]) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
     let mut block = String::from("<skills>\n");
-    for (skill, arg) in skills {
+    for skill in skills {
         block.push_str(&format!(
             r#"<skill id="{}" name="{}" source="{}" path="{}">"#,
             escape_attr(&skill.id),
@@ -240,13 +230,9 @@ pub fn format_skills_prompt_block_with_args(skills: &[(Skill, Option<String>)]) 
         ));
         block.push('\n');
         if let Some(when) = &skill.when_to_use {
-            block.push_str(&format!("When to use: {when}\n"));
+            block.push_str(&format!("When to use: {}\n", escape_skill_text(when)));
         }
-        let body = if let Some(arg) = arg {
-            skill.body.replace("{{arg}}", arg)
-        } else {
-            skill.body.clone()
-        };
+        let body = escape_skill_text(&skill.body);
         block.push_str(&body);
         if !body.ends_with('\n') {
             block.push('\n');
@@ -509,7 +495,7 @@ fn valid_skill_id(id: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
-fn project_root(cwd: &Path) -> PathBuf {
+pub fn project_skill_root(cwd: &Path) -> PathBuf {
     let workspace = canonical_or_self(cwd);
     workspace
         .ancestors()
@@ -523,9 +509,12 @@ fn canonical_or_self(path: &Path) -> PathBuf {
 }
 
 fn escape_attr(value: &str) -> String {
+    escape_skill_text(value).replace('"', "&quot;")
+}
+
+fn escape_skill_text(value: &str) -> String {
     value
         .replace('&', "&amp;")
-        .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }

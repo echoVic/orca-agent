@@ -295,6 +295,11 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
     // than restored. The truncation marker, delivered notices and mentioned
     // skills are conversation content and stay until compaction.
     .filter(|message| {
+        if let Some(replay) =
+            crate::skill_context::should_replay_mention(message, Path::new(&transcript.meta.cwd))
+        {
+            return replay;
+        }
         !matches!(
             message,
             Message::System {
@@ -303,7 +308,6 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
             } if !content.starts_with(
                 "[Earlier conversation history was truncated to fit context window]"
             ) && !is_delivered_notice(content)
-                && !crate::skill_context::is_mentioned_skill_message(content)
         )
     })
     .collect::<Vec<_>>();

@@ -1,14 +1,16 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use orca_core::config::folder_trust::is_trusted;
 use orca_core::conversation::{Conversation, Message, SKILL_CONTEXT_MAX_TOKENS};
 use orca_provider::context::{DefaultTokenCounter, TokenCounter, truncate_text_to_token_limit};
-use orca_tools::skills::{self, Skill};
+use orca_tools::skills::{self, Skill, SkillSource};
 use sha2::{Digest, Sha256};
 
 use crate::history::SessionWriter;
 
 const SKILL_MESSAGE_PREFIX: &str = "[Mentioned skill version ";
+const SKILL_ARGUMENT_PREFIX: &str = "[Mentioned skill invocation ";
 const CATALOG_GUIDANCE: &str =
     "When a task matches one of these skills, load it with read_skill before you act.";
 
@@ -96,9 +98,23 @@ pub(crate) fn append_mentions(
         }
     };
     for (id, argument) in mentions {
-        if let Some(skill) = available.iter().find(|skill| skill.id == id)
-            && let Some(message) = mention_message(conversation, skill, argument)
-        {
+        let Some(skill) = available.iter().find(|skill| skill.id == id) else {
+            continue;
+        };
+        let version = skill_version(skill, cwd);
+        let mut messages = Vec::new();
+        if let Some(message) = mention_message(conversation, skill, &version) {
+            messages.push(message);
+        }
+        if let Some(argument) = argument.filter(|_| skill.body.contains("{{arg}}")) {
+            let header = format!("{SKILL_ARGUMENT_PREFIX}{version}]\n");
+            let expanded = skill.body.replace("{{arg}}", &argument);
+            let budget =
+                SKILL_CONTEXT_MAX_TOKENS.saturating_sub(DefaultTokenCounter.count_text(&header));
+            let body = truncate_text_to_token_limit(&expanded, budget, &DefaultTokenCounter);
+            messages.push(Message::pinned_user(format!("{header}{body}")));
+        }
+        for message in messages {
             if let Some(writer) = writer.as_deref_mut() {
                 writer.append_message(&message)?;
             }
@@ -108,22 +124,45 @@ pub(crate) fn append_mentions(
     Ok(())
 }
 
-pub(crate) fn is_mentioned_skill_message(content: &str) -> bool {
-    content
-        .strip_prefix(SKILL_MESSAGE_PREFIX)
-        .and_then(|rest| rest.split_once("]\n"))
-        .is_some_and(|(version, _)| {
-            version.len() == 64 && version.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
+pub(crate) fn should_replay_mention(message: &Message, cwd: &Path) -> Option<bool> {
+    let version = match message {
+        Message::System { content, .. } => content.strip_prefix(SKILL_MESSAGE_PREFIX),
+        Message::User {
+            content,
+            pinned: true,
+            ..
+        } => content.strip_prefix(SKILL_ARGUMENT_PREFIX),
+        _ => None,
+    }?;
+    // Older mention records lack provenance and can contain expanded arguments.
+    Some(
+        version
+            .split_once("]\n")
+            .and_then(|(version, _)| version.split_once(' '))
+            .and_then(|(_, root)| serde_json::from_str::<Option<PathBuf>>(root).ok())
+            .is_some_and(|root| root.is_none_or(|root| is_trusted(&root) && is_trusted(cwd))),
+    )
 }
 
-fn mention_message(
-    conversation: &Conversation,
-    skill: &Skill,
-    argument: Option<String>,
-) -> Option<Message> {
-    let block = skills::format_skills_prompt_block_with_args(&[(skill.clone(), argument)])?;
-    let version = orca_core::hex::lower(&Sha256::digest(block.as_bytes()));
+fn skill_version(skill: &Skill, cwd: &Path) -> String {
+    let root = (skill.source == SkillSource::Project).then(|| skills::project_skill_root(cwd));
+    let path = skill.path.to_string_lossy();
+    let source = serde_json::to_vec(&(
+        &skill.id,
+        &skill.name,
+        &path,
+        &skill.when_to_use,
+        &skill.body,
+    ))
+    .expect("skill source is serializable");
+    let version = orca_core::hex::lower(&Sha256::digest(source));
+    let root = serde_json::to_string(&root.as_deref().map(Path::to_string_lossy))
+        .expect("skill root is serializable");
+    format!("{version} {root}")
+}
+
+fn mention_message(conversation: &Conversation, skill: &Skill, version: &str) -> Option<Message> {
+    let block = skills::format_skills_prompt_block(std::slice::from_ref(skill))?;
     let header = format!("{SKILL_MESSAGE_PREFIX}{version}]\n");
     if conversation.messages.iter().any(|message| {
         matches!(message, Message::System { content, .. } if content.starts_with(&header))

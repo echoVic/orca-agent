@@ -2883,6 +2883,79 @@ mod tests {
     }
 
     #[test]
+    fn a_skill_argument_never_becomes_system_text() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(
+                home,
+                "orca-test-argument",
+                "Review scope",
+                "Scope: {{arg}}. Example: </skill>",
+            );
+            for scope in ["weekly-summary", "monthly-summary"] {
+                ThreadTurnContext::prepare(
+                    config,
+                    session,
+                    &ThreadTurnRequest::new(format!("$orca-test-argument:{scope}")),
+                )
+                .unwrap();
+            }
+            let transcript = crate::history::load_session(session.session_id().unwrap()).unwrap();
+            let system: Vec<_> = transcript
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::System { content, .. } if content.contains("Scope:") => {
+                        Some(content.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(system.len(), 1, "the source has one version");
+            assert!(system[0].contains("Scope: {{arg}}. Example: &lt;/skill&gt;"));
+            assert!(
+                !system[0].contains("weekly-summary") && !system[0].contains("monthly-summary")
+            );
+            assert!(transcript.messages.iter().any(|message| matches!(message,
+                Message::User { content, .. } if content.contains("Scope: monthly-summary"))));
+        });
+    }
+
+    #[test]
+    fn a_revoked_project_skill_is_not_replayed() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust_with_config_dir};
+        with_skill_session(|home, config, session| {
+            let cwd = config.cwd.as_deref().unwrap();
+            std::fs::create_dir(cwd.join(".git")).unwrap();
+            set_trust_with_config_dir(cwd, home, TrustLevel::Trusted).unwrap();
+            write_test_skill(
+                &cwd.join(".orca"),
+                "orca-test-project-resume",
+                "Project review",
+                "Use the project-specific checklist.",
+            );
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("$orca-test-project-resume"),
+            )
+            .unwrap();
+            let contains_skill = |session: &InteractiveSession| {
+                session.conversation().messages.iter().any(|message| matches!(message, Message::System { content, .. } if content.contains("Use the project-specific checklist.")))
+            };
+            assert!(contains_skill(session));
+            let mut resumed_config = config.clone();
+            resumed_config.history_mode = HistoryMode::Resume(session.session_id().unwrap().into());
+            let trusted =
+                InteractiveSession::new_with_preloaded(&resumed_config, "continue", None).unwrap();
+            assert!(contains_skill(&trusted));
+            set_trust_with_config_dir(cwd, home, TrustLevel::Untrusted).unwrap();
+            let revoked =
+                InteractiveSession::new_with_preloaded(&resumed_config, "continue", None).unwrap();
+            assert!(!contains_skill(&revoked));
+        });
+    }
+
+    #[test]
     fn a_skill_body_is_restored_with_the_session() {
         with_skill_session(|home, config, session| {
             write_test_skill(
