@@ -107,6 +107,7 @@ impl EventDraft {
         if state.next_seq == u64::MAX {
             return Err(io::Error::other("event sequence exhausted"));
         }
+        // Live envelopes share the sequence range used to recover this run.
         if let Some(store) = self.publication.store.as_deref()
             && state.next_seq >= state.reserved_until
         {

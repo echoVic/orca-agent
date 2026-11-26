@@ -1078,9 +1078,22 @@ impl SurfaceHub {
         retry: Option<ProviderRetry>,
     ) {
         let mut state = lock(&self.inner);
-        for subscriber in state.subscriptions.values_mut() {
-            if !subscriber.gapped
-                && (subscriber.queue.len() as u64) < self.config.subscriber_event_limit
+        let head = state.snapshot.cursor.clone();
+        let retained_from = state
+            .retained
+            .front()
+            .map(|batch| batch.batch.cursor_before.clone());
+        let mut overflowed = Vec::new();
+        for (attachment_id, subscriber) in &mut state.subscriptions {
+            if subscriber.gapped {
+                continue;
+            }
+            let previous_len = subscriber.queue.len();
+            subscriber.queue.retain(|item| {
+                !matches!(item, QueuedSubscriptionItem::ProviderRetry(id, _) if id == operation_id)
+            });
+            if subscriber.queue.len() < previous_len
+                || (subscriber.queue.len() as u64) < self.config.subscriber_event_limit
             {
                 subscriber
                     .queue
@@ -1088,10 +1101,23 @@ impl SurfaceHub {
                         operation_id.clone(),
                         retry.clone(),
                     ));
+            } else if retry.is_none() {
+                // The client may already have displayed the retry being cleared.
+                subscriber
+                    .queue
+                    .push_back(QueuedSubscriptionItem::Gap(SnapshotRequired {
+                        reason: SnapshotRequiredReason::SlowSubscriber,
+                        retained_from: retained_from.clone(),
+                        head: head.clone(),
+                    }));
+                subscriber.gapped = true;
+                overflowed.push(attachment_id.clone());
             }
         }
+        retire_subscriptions(&mut state, &overflowed);
         drop(state);
         self.notify.notify_all();
+        self.notify_interaction_capability_change(!overflowed.is_empty());
     }
 
     pub(crate) fn repair_committed(
@@ -1996,6 +2022,67 @@ mod tests {
         };
         batch.batch_digest = canonical_batch_digest(&batch);
         batch
+    }
+
+    #[test]
+    fn provider_retry_clear_replaces_queued_state_at_capacity() {
+        use orca_core::provider_types::{ProviderError, ProviderErrorKind};
+        use std::time::Duration;
+
+        let snapshot = reducer_snapshot();
+        let subscriber = subscriber(212, &snapshot.cursor);
+        let attachment_id = subscriber.grant.attachment_id.clone();
+        let hub = SurfaceHub::new_tui(
+            snapshot,
+            subscriber.grant.host_incarnation.clone(),
+            SurfaceHubConfig {
+                subscriber_event_limit: 2,
+                ..SurfaceHubConfig::default()
+            },
+        )
+        .unwrap();
+        lock(&hub.inner)
+            .subscriptions
+            .insert(attachment_id.clone(), subscriber);
+        let operation = SurfaceOperationId::try_from_bytes(uuid_v7_bytes(220)).unwrap();
+        let other = SurfaceOperationId::try_from_bytes(uuid_v7_bytes(221)).unwrap();
+        let error = ProviderError::new(ProviderErrorKind::RateLimit, "busy");
+        let initial = ProviderRetry::new(1, 5, Duration::from_secs(1), &error);
+        let extended = ProviderRetry::new(1, 5, Duration::from_secs(2), &error);
+        hub.publish_provider_retry(&operation, Some(initial.clone()));
+        hub.publish_provider_retry(&other, Some(initial));
+        hub.publish_provider_retry(&operation, Some(extended.clone()));
+
+        let pop = || take_subscription_item(&mut lock(&hub.inner), &attachment_id).unwrap();
+        assert!(matches!(pop(), QueuedSubscriptionItem::ProviderRetry(id, Some(_)) if id == other));
+        assert!(
+            matches!(pop(), QueuedSubscriptionItem::ProviderRetry(id, Some(retry)) if id == operation && retry == extended)
+        );
+
+        hub.publish_provider_retry(&operation, Some(extended.clone()));
+        hub.publish_provider_retry(&other, Some(extended.clone()));
+        hub.publish_provider_retry(&operation, None);
+        assert!(matches!(pop(), QueuedSubscriptionItem::ProviderRetry(id, Some(_)) if id == other));
+        assert!(
+            matches!(pop(), QueuedSubscriptionItem::ProviderRetry(id, None) if id == operation)
+        );
+        assert!(take_subscription_item(&mut lock(&hub.inner), &attachment_id).is_none());
+
+        hub.publish_provider_retry(&operation, Some(extended.clone()));
+        assert!(
+            matches!(pop(), QueuedSubscriptionItem::ProviderRetry(id, Some(_)) if id == operation)
+        );
+        hub.publish_provider_retry(&other, Some(extended.clone()));
+        let another = SurfaceOperationId::try_from_bytes(uuid_v7_bytes(222)).unwrap();
+        hub.publish_provider_retry(&another, Some(extended));
+        hub.publish_provider_retry(&operation, None);
+        assert!(matches!(pop(), QueuedSubscriptionItem::ProviderRetry(id, Some(_)) if id == other));
+        assert!(
+            matches!(pop(), QueuedSubscriptionItem::ProviderRetry(id, Some(_)) if id == another)
+        );
+        assert!(
+            matches!(pop(), QueuedSubscriptionItem::Gap(required) if required.reason == SnapshotRequiredReason::SlowSubscriber)
+        );
     }
 
     #[test]
