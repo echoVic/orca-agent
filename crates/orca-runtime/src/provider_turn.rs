@@ -1312,7 +1312,7 @@ pub(crate) fn cut_short_response(
     identity: &ModelResponseIdentity,
     reason: CutShort,
 ) -> Option<RuntimeModelResponse> {
-    if partial.content.trim().is_empty() {
+    if !partial_reply_has_visible_text(&partial.content) {
         return None;
     }
     let mut response = RuntimeModelResponse::from_parts(
@@ -1327,6 +1327,21 @@ pub(crate) fn cut_short_response(
     );
     response.cut_short = Some(reason);
     Some(response)
+}
+
+pub(crate) fn partial_reply_has_visible_text(content: &str) -> bool {
+    use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
+
+    let mut parser = ProposedPlanStreamParser::default();
+    let segments = parser.push(content);
+    segments
+        .into_iter()
+        .chain(parser.finish())
+        .any(|segment| match segment {
+            ProposedPlanSegment::Agent(text) | ProposedPlanSegment::Plan(text) => {
+                !text.trim().is_empty()
+            }
+        })
 }
 
 fn record_provider_retry<W: io::Write>(

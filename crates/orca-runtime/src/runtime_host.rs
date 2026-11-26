@@ -23845,6 +23845,7 @@ fn run_provider_background_task(
             .response
             .error()
             .and_then(|error| error.partial_reply.clone())
+        && crate::provider_turn::partial_reply_has_visible_text(&partial.content)
     {
         response.response.assistant_content = Some(partial.content);
         response.response.assistant_reasoning = partial.reasoning;
@@ -31752,6 +31753,11 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_plan_at_the_output_limit_fails_as_before() {
+        assert_kept_reply(KeptReplyFixture::EmptyPlanAtLimit, 0, None);
+    }
+
+    #[test]
     fn a_cancelled_reply_keeps_only_the_text_published_before_a_pending_plan() {
         assert_kept_reply(
             KeptReplyFixture::PendingPlanOnCancel,
@@ -31765,6 +31771,7 @@ mod tests {
         DeepSeek { partial_tool: bool, length: bool },
         BackgroundAtLimit,
         BackgroundCancelled,
+        EmptyPlanAtLimit,
         PendingPlanOnCancel,
     }
 
@@ -31797,6 +31804,7 @@ mod tests {
             KeptReplyFixture::DeepSeek { .. }
             | KeptReplyFixture::BackgroundAtLimit
             | KeptReplyFixture::BackgroundCancelled
+            | KeptReplyFixture::EmptyPlanAtLimit
             | KeptReplyFixture::PendingPlanOnCancel => {
                 let (partial_tool, length) = match fixture {
                     KeptReplyFixture::DeepSeek {
@@ -31804,9 +31812,11 @@ mod tests {
                         length,
                     } => (partial_tool, length),
                     KeptReplyFixture::BackgroundAtLimit => (true, true),
+                    KeptReplyFixture::EmptyPlanAtLimit => (false, true),
                     _ => (true, false),
                 };
                 let text = match fixture {
+                    KeptReplyFixture::EmptyPlanAtLimit => "<proposed_plan></proposed_plan>",
                     KeptReplyFixture::PendingPlanOnCancel => "First point.<proposed_plan>pending",
                     _ if length => "First point",
                     _ => "First point.",
@@ -31845,9 +31855,12 @@ mod tests {
                     if partial_tool {
                         body.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"task_list\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\n");
                     }
-                    body.push_str(&format!("data: {}\n\n", serde_json::json!({
-                        "choices": [{ "delta": { "content": text }, "finish_reason": null }]
-                    })));
+                    body.push_str(&format!(
+                        "data: {}\n\n",
+                        serde_json::json!({
+                            "choices": [{ "delta": { "content": text }, "finish_reason": null }]
+                        })
+                    ));
                     if length && !background {
                         body.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n");
                     }

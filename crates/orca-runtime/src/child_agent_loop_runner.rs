@@ -807,7 +807,7 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
         && let Some(partial) = response
             .error()
             .and_then(|error| error.partial_reply.as_ref())
-        && !partial.content.trim().is_empty()
+        && crate::provider_turn::partial_reply_has_visible_text(&partial.content)
     {
         setup.conversation.internal_context.note_assistant_turn();
         setup
