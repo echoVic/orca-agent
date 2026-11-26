@@ -286,6 +286,73 @@ fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }
 
+#[derive(Debug)]
+pub(crate) struct HttpFailure {
+    pub(crate) status: reqwest::StatusCode,
+    pub(crate) request_id: Option<String>,
+    pub(crate) body: String,
+    exhausted: bool,
+}
+
+impl HttpFailure {
+    fn new(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> Self {
+        let request_id = ["x-request-id", "request-id", "x-deepseek-request-id"]
+            .into_iter()
+            .find_map(|name| headers.get(name))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        Self {
+            status,
+            request_id,
+            body: String::new(),
+            exhausted: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RequestFailure {
+    Http(HttpFailure),
+    Other(String),
+}
+
+impl From<String> for RequestFailure {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl RequestFailure {
+    pub(crate) fn status(&self) -> Option<u16> {
+        match self {
+            Self::Http(failure) => Some(failure.status.as_u16()),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RequestFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(failure) if failure.exhausted => {
+                write!(
+                    formatter,
+                    "max retries exceeded (last status: {})",
+                    failure.status
+                )
+            }
+            Self::Http(failure) => {
+                write!(formatter, "request error ({})", failure.status)?;
+                if !failure.body.is_empty() {
+                    write!(formatter, ": {}", failure.body)?;
+                }
+                Ok(())
+            }
+            Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
 /// The blocking client, built on first use. A system that cannot build one
 /// (no CA certificates) keeps the reason, which every caller gets.
 static CLIENT: LazyLock<Result<BlockingClient, String>> = LazyLock::new(|| {
@@ -337,6 +404,14 @@ pub fn execute_with_retry_budget(
     budget: &RetryBudget,
     cancel: &CancelToken,
 ) -> Result<BlockingResponse, String> {
+    execute_with_retry_details(build_request, budget, cancel).map_err(|error| error.to_string())
+}
+
+pub(crate) fn execute_with_retry_details(
+    build_request: impl Fn(&BlockingClient) -> BlockingRequestBuilder,
+    budget: &RetryBudget,
+    cancel: &CancelToken,
+) -> Result<BlockingResponse, RequestFailure> {
     let client = client()?;
     let mut attempt: u32 = 0;
     loop {
@@ -347,14 +422,20 @@ pub fn execute_with_retry_budget(
         match result {
             Ok(resp) => {
                 let status = resp.status();
-                if !is_retryable_status(status.as_u16()) {
-                    return resp
-                        .error_for_status()
-                        .map_err(|e| format!("request error: {e}"));
+                if status.is_success() {
+                    return Ok(resp);
                 }
-                let retry_after = extend_cooldown(key, resp.headers());
-                if attempt >= MAX_RETRIES || !budget.can_retry() {
-                    return Err(format!("max retries exceeded (last status: {status})"));
+                let retryable = is_retryable_status(status.as_u16());
+                let retry_after = retryable
+                    .then(|| extend_cooldown(key, resp.headers()))
+                    .flatten();
+                if !retryable || attempt >= MAX_RETRIES || !budget.can_retry() {
+                    let mut failure = HttpFailure::new(status, resp.headers());
+                    failure.exhausted = retryable;
+                    failure.body = resp
+                        .text()
+                        .unwrap_or_else(|error| format!("response body read failed: {error}"));
+                    return Err(RequestFailure::Http(failure));
                 }
                 // The next admission enforces Retry-After for this and peer calls.
                 if retry_after.is_none() {
@@ -363,10 +444,9 @@ pub fn execute_with_retry_budget(
             }
             Err(err) => {
                 if attempt >= MAX_RETRIES || !budget.can_retry() || !is_retryable_error(&err) {
-                    return Err(format!(
-                        "request failed after {} attempts: {err}",
-                        attempt + 1
-                    ));
+                    return Err(
+                        format!("request failed after {} attempts: {err}", attempt + 1).into(),
+                    );
                 }
                 budget.wait_blocking(compute_backoff(attempt), cancel)?;
             }
@@ -390,6 +470,17 @@ pub async fn execute_streaming_with_retry_budget(
     cancel: &CancelToken,
     budget: &RetryBudget,
 ) -> Result<Response, String> {
+    execute_streaming_with_retry_details(client, build_request, cancel, budget)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn execute_streaming_with_retry_details(
+    client: &Client,
+    build_request: impl Fn(&Client) -> RequestBuilder,
+    cancel: &CancelToken,
+    budget: &RetryBudget,
+) -> Result<Response, RequestFailure> {
     let mut attempt: u32 = 0;
     loop {
         let request = build_request(client)
@@ -400,15 +491,14 @@ pub async fn execute_streaming_with_retry_budget(
             Ok(resp) => {
                 let status = resp.status();
                 if !is_retryable_status(status.as_u16()) {
-                    if status.is_client_error() || status.is_server_error() {
-                        let body = response_text_with_cancel(resp, cancel).await?;
-                        return Err(format!("request error ({status}): {body}"));
+                    if !status.is_success() {
+                        return Err(streaming_http_failure(resp, cancel, false).await);
                     }
                     return Ok(resp);
                 }
                 let retry_after = extend_cooldown(key, resp.headers());
                 if attempt >= MAX_RETRIES || !budget.can_retry() {
-                    return Err(format!("max retries exceeded (last status: {status})"));
+                    return Err(streaming_http_failure(resp, cancel, true).await);
                 }
                 if retry_after.is_none() {
                     budget.wait_async(compute_backoff(attempt), cancel).await?;
@@ -416,10 +506,9 @@ pub async fn execute_streaming_with_retry_budget(
             }
             Err(err) => {
                 if attempt >= MAX_RETRIES || !budget.can_retry() || !is_retryable_error(&err) {
-                    return Err(format!(
-                        "request failed after {} attempts: {err}",
-                        attempt + 1
-                    ));
+                    return Err(
+                        format!("request failed after {} attempts: {err}", attempt + 1).into(),
+                    );
                 }
                 budget.wait_async(compute_backoff(attempt), cancel).await?;
             }
@@ -443,13 +532,14 @@ pub(crate) async fn execute_streaming_once(
         ),
     )
     .await
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn execute_streaming_once_with_budget(
     request: RequestBuilder,
     cancel: &CancelToken,
     budget: &RetryBudget,
-) -> Result<Response, String> {
+) -> Result<Response, RequestFailure> {
     let (client, request) = request
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build_split();
@@ -460,16 +550,31 @@ pub(crate) async fn execute_streaming_once_with_budget(
     if is_retryable_status(status.as_u16()) {
         extend_cooldown(key, response.headers());
     }
-    if status.is_client_error() || status.is_server_error() {
+    if !status.is_success() {
         if std::env::var_os("ORCA_SUMMARY_DEBUG").is_some() {
             eprintln!(
                 "orca.remote_summary_http_failure status={}",
                 status.as_u16()
             );
         }
-        return Err(format!("request error ({status})"));
+        return Err(streaming_http_failure(response, cancel, false).await);
     }
     Ok(response)
+}
+
+async fn streaming_http_failure(
+    response: Response,
+    cancel: &CancelToken,
+    exhausted: bool,
+) -> RequestFailure {
+    let mut failure = HttpFailure::new(response.status(), response.headers());
+    failure.exhausted = exhausted;
+    failure.body = match response_text_with_cancel(response, cancel).await {
+        Ok(body) => body,
+        Err(message) if cancel.is_cancelled() => return RequestFailure::Other(message),
+        Err(message) => message,
+    };
+    RequestFailure::Http(failure)
 }
 
 // Redirects are explicit so every transport hop uses the same admission gate

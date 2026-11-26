@@ -63,13 +63,28 @@ pub enum ProviderErrorKind {
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 impl ProviderError {
     pub fn new(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
+        Self::with_http(kind, message, None, None)
+    }
+
+    pub fn with_http(
+        kind: ProviderErrorKind,
+        message: impl Into<String>,
+        http_status: Option<u16>,
+        request_id: Option<String>,
+    ) -> Self {
         Self {
             kind,
             message: message.into(),
+            http_status,
+            request_id,
         }
     }
 
@@ -130,7 +145,33 @@ pub struct ProviderResponse {
 mod tests {
     use serde_json::json;
 
-    use super::error_field_reports_error;
+    use super::{ProviderError, ProviderErrorKind, error_field_reports_error};
+
+    #[test]
+    fn provider_error_json_only_grows() {
+        #[derive(serde::Deserialize)]
+        struct LegacyProviderError {
+            kind: ProviderErrorKind,
+            message: String,
+        }
+
+        let plain = serde_json::to_value(ProviderError::other("x")).unwrap();
+        assert_eq!(plain, json!({"kind": "other", "message": "x"}));
+        assert_eq!(
+            serde_json::from_value::<ProviderError>(plain).unwrap(),
+            ProviderError::other("x")
+        );
+
+        let with_http = json!({
+            "kind": "server", "message": "unavailable", "http_status": 503, "request_id": "req-1"
+        });
+        let error: ProviderError = serde_json::from_value(with_http.clone()).unwrap();
+        let serialized = serde_json::to_value(error).unwrap();
+        assert_eq!(serialized, with_http);
+        let legacy: LegacyProviderError = serde_json::from_value(serialized).unwrap();
+        assert_eq!(legacy.kind, ProviderErrorKind::Server);
+        assert_eq!(legacy.message, "unavailable");
+    }
 
     #[test]
     fn error_field_reports_error_only_for_real_errors() {

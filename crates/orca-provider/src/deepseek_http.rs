@@ -17,7 +17,7 @@ use orca_core::tool_types::{ToolName, ToolRequest};
 
 use crate::ProviderConfig;
 use crate::context::render_internal_context;
-use crate::http_client::RetryBudget;
+use crate::http_client::{RequestFailure, RetryBudget};
 use crate::tool_schema::{deepseek_strict_tools_schema_for_endpoint, deepseek_tools_schema};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -38,16 +38,13 @@ struct DeepSeekRequestError {
     kind: ProviderErrorKind,
     message: String,
     usage: Option<Usage>,
+    http_status: Option<u16>,
+    request_id: Option<String>,
 }
 
 impl DeepSeekRequestError {
     fn new(message: impl Into<String>) -> Self {
-        let message = message.into();
-        Self {
-            kind: classify_deepseek_error(&message),
-            message,
-            usage: None,
-        }
+        Self::with_usage(message, None)
     }
 
     fn with_usage(message: impl Into<String>, usage: Option<Usage>) -> Self {
@@ -56,15 +53,63 @@ impl DeepSeekRequestError {
             kind: classify_deepseek_error(&message),
             message,
             usage,
+            http_status: None,
+            request_id: None,
+        }
+    }
+
+    fn from_request(error: RequestFailure, usage: Option<Usage>) -> Self {
+        match error {
+            RequestFailure::Other(message) => Self::with_usage(message, usage),
+            RequestFailure::Http(failure) => {
+                let status = failure.status.as_u16();
+                let kind = match status {
+                    429 => ProviderErrorKind::RateLimit,
+                    500..=599 => ProviderErrorKind::Server,
+                    400 | 413 if crate::context::is_prompt_too_long_error(&failure.body) => {
+                        ProviderErrorKind::ContextExceeded
+                    }
+                    _ => ProviderErrorKind::Other,
+                };
+                Self {
+                    kind,
+                    message: failure.body,
+                    usage,
+                    http_status: Some(status),
+                    request_id: failure.request_id,
+                }
+            }
         }
     }
 
     fn into_provider_error(self) -> (ProviderError, Option<Usage>) {
+        let mut message = match self.http_status {
+            Some(401 | 403) => "DeepSeek rejected the API key",
+            Some(402) => "DeepSeek reports an insufficient account balance",
+            _ if self
+                .message
+                .to_ascii_lowercase()
+                .contains("insufficient balance") =>
+            {
+                "DeepSeek reports an insufficient account balance"
+            }
+            _ => "DeepSeek provider error",
+        }
+        .to_string();
+        if !self.message.is_empty() {
+            message.push_str(": ");
+            message.push_str(&self.message);
+        }
+        match (self.http_status, self.request_id.as_deref()) {
+            (Some(status), Some(id)) => {
+                message.push_str(&format!(" (HTTP {status}, request id {id})"))
+            }
+            (Some(status), None) => message.push_str(&format!(" (HTTP {status})")),
+            (None, Some(id)) => message.push_str(&format!(" (request id {id})")),
+            (None, None) => {}
+        }
         (
-            ProviderError::new(
-                self.kind,
-                format!("DeepSeek provider error: {}", self.message),
-            ),
+            ProviderError::with_http(self.kind, message, self.http_status, self.request_id),
             self.usage,
         )
     }
@@ -88,13 +133,8 @@ fn classify_deepseek_error(message: &str) -> ProviderErrorKind {
         ProviderErrorKind::Cancelled
     } else if crate::context::is_prompt_too_long_error(message) {
         ProviderErrorKind::ContextExceeded
-    } else if lower.contains("429") || lower.contains("rate limit") {
+    } else if lower.contains("rate limit") {
         ProviderErrorKind::RateLimit
-    } else if ["500", "502", "503", "504"]
-        .into_iter()
-        .any(|status| lower.contains(status))
-    {
-        ProviderErrorKind::Server
     } else if lower.contains("idle read timed out") || lower.contains("timed out") {
         ProviderErrorKind::Timeout
     } else if lower.contains("stream ended before terminal marker") {
@@ -120,12 +160,6 @@ fn classify_deepseek_error(message: &str) -> ProviderErrorKind {
     } else {
         ProviderErrorKind::Other
     }
-}
-
-/// The beta endpoint reports strict-schema rejections as HTTP 400; both retry
-/// helpers embed the status in their error strings.
-fn is_strict_schema_rejection(error: &str) -> bool {
-    error.contains("(400") || error.contains("400 Bad Request")
 }
 
 #[derive(Debug, Serialize)]
@@ -659,7 +693,7 @@ async fn request_chat_streaming_with_budget(
             )
             .await
         } else {
-            crate::http_client::execute_streaming_with_retry_budget(
+            crate::http_client::execute_streaming_with_retry_details(
                 &streaming_client,
                 |client| client.post(&url).bearer_auth(api_key).json(&request),
                 cancel,
@@ -672,22 +706,20 @@ async fn request_chat_streaming_with_budget(
             // Strict mode is Beta; if the server rejects the strict schema, retry
             // once with the plain tool list rather than failing the whole turn.
             Err(error)
-                if summary_budget.is_none()
-                    && strict_applied
-                    && is_strict_schema_rejection(&error) =>
+                if summary_budget.is_none() && strict_applied && error.status() == Some(400) =>
             {
                 request.tools = Some(tools.clone());
-                crate::http_client::execute_streaming_with_retry_budget(
+                crate::http_client::execute_streaming_with_retry_details(
                     &streaming_client,
                     |client| client.post(&url).bearer_auth(api_key).json(&request),
                     cancel,
                     retry_budget,
                 )
                 .await
-                .map_err(|error| DeepSeekRequestError::with_usage(error, accumulated_usage))?
+                .map_err(|error| DeepSeekRequestError::from_request(error, accumulated_usage))?
             }
             Err(error) => {
-                return Err(DeepSeekRequestError::with_usage(error, accumulated_usage));
+                return Err(DeepSeekRequestError::from_request(error, accumulated_usage));
             }
         };
 
@@ -873,7 +905,7 @@ fn request_chat(
     let cancel = CancelToken::new();
     let mut accumulated_usage = None;
     for empty_attempt in 0..=EMPTY_RESPONSE_RETRIES {
-        let response = match crate::http_client::execute_with_retry_budget(
+        let response = match crate::http_client::execute_with_retry_details(
             |client| client.post(&url).bearer_auth(api_key).json(&request),
             &retry_budget,
             &cancel,
@@ -881,17 +913,17 @@ fn request_chat(
             Ok(response) => response,
             // Strict mode is Beta; if the server rejects the strict schema, retry
             // once with the plain tool list rather than failing the whole turn.
-            Err(error) if strict_applied && is_strict_schema_rejection(&error) => {
+            Err(error) if strict_applied && error.status() == Some(400) => {
                 request.tools = Some(tools.clone());
-                crate::http_client::execute_with_retry_budget(
+                crate::http_client::execute_with_retry_details(
                     |client| client.post(&url).bearer_auth(api_key).json(&request),
                     &retry_budget,
                     &cancel,
                 )
-                .map_err(|error| DeepSeekRequestError::with_usage(error, accumulated_usage))?
+                .map_err(|error| DeepSeekRequestError::from_request(error, accumulated_usage))?
             }
             Err(error) => {
-                return Err(DeepSeekRequestError::with_usage(error, accumulated_usage));
+                return Err(DeepSeekRequestError::from_request(error, accumulated_usage));
             }
         };
         let response = response.json::<ChatResponse>().map_err(|error| {
@@ -1457,12 +1489,12 @@ mod tests {
             ProviderErrorKind::MalformedResponse
         );
         assert_eq!(
-            classify_deepseek_error("request error (429 Too Many Requests): limited"),
+            classify_deepseek_error("rate limit reached"),
             ProviderErrorKind::RateLimit
         );
         assert_eq!(
-            classify_deepseek_error("max retries exceeded (last status: 503 Service Unavailable)"),
-            ProviderErrorKind::Server
+            classify_deepseek_error("max 5000 tokens per request"),
+            ProviderErrorKind::Other
         );
         assert_eq!(
             classify_deepseek_error("prompt_too_long: context length exceeded"),
@@ -1746,6 +1778,17 @@ mod tests {
     fn spawn_streaming_response_sequence_server(
         responses: Vec<&'static str>,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
+        spawn_raw_response_sequence_server(responses.into_iter().map(|response| {
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response.len(), response
+            )
+        }).collect())
+    }
+
+    fn spawn_raw_response_sequence_server(
+        responses: Vec<String>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
         let bodies = Arc::new(Mutex::new(Vec::new()));
@@ -1755,15 +1798,133 @@ mod tests {
                 let (mut stream, _) = listener.accept().expect("accept request");
                 let body = read_http_request_body(&mut stream);
                 captured.lock().expect("lock captured bodies").push(body);
-                let reply = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    response.len(),
-                    response
-                );
-                stream.write_all(reply.as_bytes()).expect("write response");
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
             }
         });
         (base_url, bodies)
+    }
+
+    fn http_error_fixture(
+        status: u16,
+        headers: &str,
+        body: &str,
+    ) -> (Conversation, ProviderConfig) {
+        let reply = format!(
+            "HTTP/1.1 {status} Failure\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base_url, _) = spawn_raw_response_sequence_server(vec![reply]);
+        let mut conversation = Conversation::new();
+        conversation.add_user("hello".to_string());
+        let config = ProviderConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            model: Some(FLASH_MODEL.to_string()),
+            reasoning_effort: orca_core::config::ReasoningEffort::default(),
+            tools_override: Some(Vec::new()),
+            mcp_registry: None,
+            external_tools: Vec::new(),
+            max_output_tokens: None,
+        };
+        (conversation, config)
+    }
+
+    async fn streamed_http_error(status: u16, headers: &str, body: &str) -> ProviderError {
+        let (conversation, config) = http_error_fixture(status, headers, body);
+        request_chat_streaming_with_budget(
+            &conversation,
+            &config,
+            &CancelToken::new(),
+            &mut |_| {},
+            &RetryBudget::new(1, Duration::from_secs(1), None),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err()
+        .into_provider_error()
+        .0
+    }
+
+    #[tokio::test]
+    async fn status_decides_the_kind() {
+        for (status, body, kind) in [
+            (429, "busy", ProviderErrorKind::RateLimit),
+            (503, "busy", ProviderErrorKind::Server),
+            (529, "busy", ProviderErrorKind::Server),
+            (
+                400,
+                "context length exceeded",
+                ProviderErrorKind::ContextExceeded,
+            ),
+            (
+                413,
+                "maximum context length",
+                ProviderErrorKind::ContextExceeded,
+            ),
+            (413, "payload too large", ProviderErrorKind::Other),
+            (401, "rate limit", ProviderErrorKind::Other),
+            (402, "context length exceeded", ProviderErrorKind::Other),
+            (403, "request cancelled", ProviderErrorKind::Other),
+            (404, "missing", ProviderErrorKind::Other),
+        ] {
+            let error = streamed_http_error(status, "", body).await;
+            assert_eq!(error.kind, kind, "{error}");
+            assert_eq!(serde_json::to_value(error).unwrap()["http_status"], status);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_error_mentioning_500_is_not_a_server_error() {
+        let error = streamed_http_error(400, "", "max 5000 tokens per request").await;
+        assert_eq!(error.kind, ProviderErrorKind::Other);
+        assert!(!error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn request_id_prefers_x_request_id() {
+        let error =
+            streamed_http_error(404, "x-request-id: a\r\nrequest-id: b\r\n", "missing").await;
+        assert_eq!(serde_json::to_value(error).unwrap()["request_id"], "a");
+        let error = streamed_http_error(404, "x-deepseek-request-id: c\r\n", "missing").await;
+        assert_eq!(serde_json::to_value(error).unwrap()["request_id"], "c");
+    }
+
+    #[test]
+    fn rejected_key_and_balance_messages() {
+        let (conversation, config) =
+            http_error_fixture(401, "x-request-id: key-1\r\n", "invalid key");
+        let (error, _) = request_chat(&conversation, &config)
+            .unwrap_err()
+            .into_provider_error();
+        assert!(
+            error.message.starts_with("DeepSeek rejected the API key"),
+            "{error}"
+        );
+        assert!(error.message.contains("invalid key"), "{error}");
+        assert!(
+            error.message.ends_with("(HTTP 401, request id key-1)"),
+            "{error}"
+        );
+
+        for (status, body) in [(402, "payment required"), (400, "Insufficient Balance")] {
+            let (conversation, config) = http_error_fixture(status, "", body);
+            let response = call_summary(&conversation, &config, 256, None);
+            let error = response.error().unwrap();
+            assert!(
+                error
+                    .message
+                    .starts_with("DeepSeek reports an insufficient account balance"),
+                "{error}"
+            );
+            assert!(error.message.contains(body), "{error}");
+            assert!(
+                error.message.ends_with(&format!("(HTTP {status})")),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -1936,22 +2097,6 @@ mod tests {
                 .pointer("/function/strict")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn strict_rejection_detection_matches_retry_helper_error_strings() {
-        assert!(is_strict_schema_rejection(
-            "request error (400 Bad Request): invalid tools"
-        ));
-        assert!(is_strict_schema_rejection(
-            "request error: HTTP status client error (400 Bad Request) for url (https://api.deepseek.com/beta/chat/completions)"
-        ));
-        assert!(!is_strict_schema_rejection(
-            "max retries exceeded (last status: 500 Internal Server Error)"
-        ));
-        assert!(!is_strict_schema_rejection(
-            "request failed after 3 attempts: connection refused"
-        ));
     }
 
     #[test]
