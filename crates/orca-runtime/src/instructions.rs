@@ -98,12 +98,13 @@ fn load_for_cwd_with_home(
             orca_core::config::folder_trust::is_trusted_with_config_dir(path, home)
         })
     };
-    if let Some(project_root) = find_project_root(cwd).filter(|root| is_trusted(root)) {
+    let project_root = find_project_root(cwd).filter(|root| is_trusted(root));
+    if let Some(project_root) = &project_root {
         let root_agents = project_root.join(INSTRUCTIONS_FILE);
         if root_agents.is_file() {
             project_sections.push(InstructionSection {
                 source: root_agents.clone(),
-                content: read_with_includes(&root_agents, &mut visited, Some(&project_root))?,
+                content: read_with_includes(&root_agents, &mut visited, Some(project_root))?,
             });
         }
 
@@ -111,13 +112,38 @@ fn load_for_cwd_with_home(
         for rule in sorted_markdown_files(&rules_dir)? {
             project_sections.push(InstructionSection {
                 source: rule.clone(),
-                content: read_with_includes(&rule, &mut visited, Some(&project_root))?,
+                content: read_with_includes(&rule, &mut visited, Some(project_root))?,
             });
+        }
+    }
+    let trusted_workspace = cwd.canonicalize().ok().filter(|path| is_trusted(path));
+    if let Some((workspace, home)) = trusted_workspace.as_deref().zip(orca_home_path) {
+        let root = project_root
+            .and_then(|root| root.canonicalize().ok())
+            .filter(|root| workspace.starts_with(root));
+        let mut scopes = match root.as_deref() {
+            Some(root) => workspace
+                .ancestors()
+                .take_while(|scope| *scope != root)
+                .collect(),
+            None => vec![workspace],
+        };
+        while let Some(scope) = scopes.pop() {
+            if !orca_core::config::folder_trust::is_trusted_project_scope(
+                root.as_deref().unwrap_or(workspace),
+                scope,
+                home,
+            ) {
+                continue;
+            }
+            let source = scope.join(INSTRUCTIONS_FILE);
+            if let Ok((content, _, _)) = read_nested_source(&source) {
+                project_sections.push(InstructionSection { source, content });
+            }
         }
     }
     apply_prompt_budget(&mut project_sections);
     sections.extend(project_sections);
-    let trusted_workspace = cwd.canonicalize().ok().filter(|path| is_trusted(path));
     Ok(ProjectInstructions {
         sections,
         trusted_workspace,
@@ -698,6 +724,27 @@ mod tests {
     }
 
     #[test]
+    fn startup_includes_the_trusted_instruction_chain_to_the_working_directory() {
+        let (project, home, _) = nested_project();
+        let src = project.path().join("src");
+        let cwd = src.join("inner");
+        fs::create_dir(&cwd).unwrap();
+        fs::write(src.join("AGENTS.md"), "Parent directory rule").unwrap();
+        fs::write(cwd.join("AGENTS.md"), "Working directory rule").unwrap();
+        fs::write(cwd.join("file.txt"), "fixture").unwrap();
+
+        let instructions = load_for_cwd_with_home(&cwd, Some(home.path())).unwrap();
+        let block = instructions.to_system_prompt_block().unwrap();
+        let root = block.find("Root rules").unwrap();
+        let parent = block.find("Parent directory rule").unwrap();
+        let child = block.find("Working directory rule").unwrap();
+        assert!(root < parent && parent < child);
+        let mut conversation = Conversation::new();
+        touch(&instructions, &mut conversation, None, &cwd, "file.txt");
+        assert!(nested_messages(&conversation).is_empty());
+    }
+
+    #[test]
     fn nested_instructions_are_omitted_when_child_trust_is_revoked() {
         use orca_core::config::folder_trust::{TrustLevel, set_trust_with_config_dir};
         let (project, home, instructions) = nested_project();
@@ -1068,9 +1115,9 @@ mod tests {
         assert_eq!(
             block,
             format!(
-                "<project-instructions>\n# {}/AGENTS.md\nRoot rules\n\n# {}/.orca/rules/build.md\nBuild rules\n</project-instructions>",
-                project.path().display(),
-                project.path().display()
+                "<project-instructions>\n# {}\nRoot rules\n\n# {}\nBuild rules\n</project-instructions>",
+                project.path().join("AGENTS.md").display(),
+                project.path().join(RULES_DIR).join("build.md").display()
             )
         );
     }
