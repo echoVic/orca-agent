@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -473,6 +474,13 @@ pub struct UsageAnchor {
     boundary: u64,
 }
 
+#[derive(Debug, Default)]
+pub struct NestedInstructionState {
+    pub pending_touches: Vec<(PathBuf, bool)>,
+    pub written_sources: HashSet<PathBuf>,
+    pub versions: HashMap<String, (String, bool)>,
+}
+
 #[derive(Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
@@ -487,6 +495,7 @@ pub struct Conversation {
     /// not try again until the prompt has grown well past it (#175).
     pub compaction_hold: Option<usize>,
     retained_tool_images: Option<RetainedToolImages>,
+    pub nested_instructions: NestedInstructionState,
 }
 
 // Prompt snapshots and inherited conversations must not publish into the
@@ -501,6 +510,7 @@ impl Clone for Conversation {
             usage_anchor: self.usage_anchor,
             compaction_hold: self.compaction_hold,
             retained_tool_images: None,
+            nested_instructions: NestedInstructionState::default(),
         }
     }
 }
@@ -515,6 +525,7 @@ impl Conversation {
             usage_anchor: None,
             compaction_hold: None,
             retained_tool_images: None,
+            nested_instructions: NestedInstructionState::default(),
         }
     }
 
@@ -530,6 +541,7 @@ impl Conversation {
     /// Adopt a compacted conversation while preserving its running read view.
     pub fn adopt(&mut self, mut replacement: Self) {
         replacement.retained_tool_images = self.retained_tool_images.take();
+        replacement.nested_instructions = std::mem::take(&mut self.nested_instructions);
         *self = replacement;
         self.refresh_retained_tool_images();
     }

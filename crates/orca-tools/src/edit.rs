@@ -39,6 +39,7 @@ pub fn execute_or_cancel(
 
     ToolResult::completed(request, format!("edited {}", plan.relative_path), false)
         .with_file_change_preview(preview)
+        .with_touched_file(plan.path)
 }
 
 /// The diff this edit would make, without writing it, for an approval to

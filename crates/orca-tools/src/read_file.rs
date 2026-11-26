@@ -71,7 +71,7 @@ pub(crate) fn execute_in_session(
             } else {
                 ToolResultKind::Success
             };
-            ToolResult::completed_kind(request, output, truncated, kind)
+            ToolResult::completed_kind(request, output, truncated, kind).with_touched_file(path)
         }
         // A document that is not text gets the tool that can read it.
         Err(FileAdmissionError::InvalidUtf8) if document_kind(&path).is_some() => {

@@ -285,6 +285,11 @@ impl JsonlThreadStore {
 pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String) -> Conversation {
     let mut conversation = Conversation::new();
     conversation.add_system(system_prompt);
+    crate::instructions::restore_nested_state(
+        &mut conversation,
+        Path::new(&transcript.meta.cwd),
+        &transcript.messages,
+    );
     let mut restored_messages = replay_compactions_for_resume(
         &transcript.messages,
         &transcript.compactions,
@@ -302,7 +307,7 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
                 pinned: false,
             } if !content.starts_with(
                 "[Earlier conversation history was truncated to fit context window]"
-            ) && !is_delivered_notice(content)
+            ) && !is_delivered_notice(content) && !crate::instructions::is_nested_message(content)
         )
     })
     .collect::<Vec<_>>();

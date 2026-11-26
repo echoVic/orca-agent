@@ -958,7 +958,8 @@ impl RuntimeProviderResponseStep {
         }
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
-        match run_tool_turns(RuntimeToolTurnsContext {
+        let instructions = step_snapshot.capabilities().instructions;
+        let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state,
             operation: Some(operation),
@@ -976,7 +977,9 @@ impl RuntimeProviderResponseStep {
                 workflow_child_executor,
                 batch_child_executor,
             },
-        })? {
+        });
+        instructions.append_nested_for_touches(conversation, history_writer);
+        match outcome? {
             ToolTurnOutcome::Continue => Ok(RuntimeProviderResponseOutcome::Continue),
             ToolTurnOutcome::Return {
                 status,

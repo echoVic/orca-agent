@@ -107,6 +107,16 @@ pub(crate) fn record_tool_result_for_agent(
         pinned: false,
     };
     conversation.add_tool_result_with_terminal(result, result_content.clone());
+    if let Some(path) = &result.touched_file {
+        let modified = matches!(
+            result.name,
+            orca_core::tool_types::ToolName::WriteFile | orca_core::tool_types::ToolName::Edit
+        );
+        conversation
+            .nested_instructions
+            .pending_touches
+            .push((path.clone(), modified));
+    }
     // Persistence is a durability concern, not an execution concern: a broken
     // transcript must not stop the tool turn. The item is already in memory, so
     // record the failure, mark the writer degraded, and let the turn continue.

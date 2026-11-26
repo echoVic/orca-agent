@@ -1,6 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::approval_types::ActionKind;
@@ -834,6 +835,8 @@ pub struct ToolResult {
     pub images: Vec<ImageInput>,
     #[serde(skip)]
     pub file_change_preview: Option<Arc<FileChangePreview>>,
+    #[serde(skip)]
+    pub touched_file: Option<PathBuf>,
     /// What the tool wrote for the person watching while it ran, when that
     /// is to be kept with the conversation. It is never sent to the model.
     /// Only `run_script` sets it, to the lines that say what its calls did.
@@ -902,6 +905,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -923,6 +927,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -959,6 +964,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -1013,6 +1019,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -1034,6 +1041,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -1055,6 +1063,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -1089,6 +1098,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
@@ -1134,9 +1144,15 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
         }
+    }
+
+    pub fn with_touched_file(mut self, path: PathBuf) -> Self {
+        self.touched_file = Some(path);
+        self
     }
 
     pub fn with_file_change_preview(mut self, preview: FileChangePreview) -> Self {
