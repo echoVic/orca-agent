@@ -3607,16 +3607,11 @@ mod tests {
         .expect("provider failure completes the turn");
 
         assert_eq!(status, RunStatus::Failed);
-        assert_eq!(
-            thread.session().completion_error(),
-            Some("mock provider error: api_key=super-secret")
-        );
+        let expected_error = Some("mock provider error: api_key=<redacted>");
+        assert_eq!(thread.session().completion_error(), expected_error);
         let transcript =
             crate::history::load_session(&thread_id).expect("failed session transcript");
-        assert_eq!(
-            transcript.completion_error.as_deref(),
-            Some("mock provider error: api_key=<redacted>")
-        );
+        assert_eq!(transcript.completion_error.as_deref(), expected_error);
         let persisted = std::fs::read_to_string(&transcript.path).expect("session JSONL");
         assert!(!persisted.contains("super-secret"));
     }

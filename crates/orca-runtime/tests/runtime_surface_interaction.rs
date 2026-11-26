@@ -1256,7 +1256,7 @@ fn truncated_provider_attempt_is_discarded_and_retried_with_new_response_identit
     assert!(matches!(
         attachment
             .client
-            .wait_operation_terminal(request_id(), operation_id)
+            .wait_operation_terminal(request_id(), operation_id.clone())
             .unwrap(),
         WaitOperationTerminalResult::Terminal { .. }
     ));
@@ -1292,13 +1292,18 @@ fn truncated_provider_attempt_is_discarded_and_retried_with_new_response_identit
     assert_eq!(usage.cache_tokens, 19);
     assert_eq!(snapshot.context.used_tokens, 103);
 
+    // The terminal wait leaves retry updates unread, so the clear supersedes the queued wait.
     let mut retry_states = Vec::new();
     while let Some(item) = subscription.try_recv() {
-        if let SurfaceSubscriptionItem::ProviderRetry { retry, .. } = item {
-            retry_states.push(retry.map(|retry| (retry.attempt, retry.max_attempts)));
+        if let SurfaceSubscriptionItem::ProviderRetry {
+            operation_id,
+            retry,
+        } = item
+        {
+            retry_states.push((operation_id, retry));
         }
     }
-    assert_eq!(retry_states, [Some((1, 5)), None]);
+    assert_eq!(retry_states, [(operation_id, None)]);
     host.shutdown().unwrap();
 }
 
