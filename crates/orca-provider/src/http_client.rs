@@ -21,6 +21,7 @@ pub(crate) const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10
 
 const TRANSIENT_ERROR_BODY_TIMEOUT: Duration = Duration::from_millis(250);
 const ERROR_BODY_LIMIT: usize = 4 * 1024;
+const REQUEST_ID_LIMIT: usize = 128;
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 1000;
 const MAX_BACKOFF_MS: u64 = 60_000;
@@ -392,7 +393,7 @@ impl HttpFailure {
             .into_iter()
             .find_map(|name| headers.get(name))
             .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
+            .and_then(validated_request_id);
         Self {
             status,
             request_id,
@@ -400,6 +401,33 @@ impl HttpFailure {
             exhausted: false,
         }
     }
+}
+
+fn validated_request_id(id: &str) -> Option<String> {
+    if id.is_empty()
+        || id.len() > REQUEST_ID_LIMIT
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return None;
+    }
+    let redacted = orca_core::redaction::redact_sensitive_text(id);
+    let lower = id.to_ascii_lowercase();
+    let credential_shaped = [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+        || (id.starts_with("eyJ") && id.matches('.').count() >= 2);
+    (redacted == id && !credential_shaped).then_some(redacted)
 }
 
 #[derive(Clone, Debug)]

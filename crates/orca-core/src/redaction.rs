@@ -15,8 +15,9 @@ fn redact_keyed_secret_values(value: &str) -> String {
             continue;
         }
 
-        let key_start = key_start_before_delimiter(bytes, index);
-        let key = trim_key_candidate(&value[key_start..index]);
+        let key_end = bytes[..index].trim_ascii_end().len();
+        let key_start = key_start_before_delimiter(bytes, key_end);
+        let key = trim_key_candidate(&value[key_start..key_end]);
         if !is_sensitive_key(key) {
             index += 1;
             continue;
@@ -37,11 +38,25 @@ fn redact_keyed_secret_values(value: &str) -> String {
         let content_end = if let Some(quote) = quote {
             quoted_value_end(bytes, content_start, quote)
         } else {
-            unquoted_value_end(
-                bytes,
-                content_start,
-                key_is_in_url_query(&value[..key_start]),
-            )
+            let url_query = key_is_in_url_query(&value[..key_start]);
+            let end = unquoted_value_end(bytes, content_start, url_query);
+            let scheme = &value[content_start..end];
+            if key.to_ascii_lowercase().contains("authorization")
+                && (scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic"))
+            {
+                let mut credential_start = end;
+                while matches!(bytes.get(credential_start), Some(b' ' | b'\t')) {
+                    credential_start += 1;
+                }
+                let credential_end = unquoted_value_end(bytes, credential_start, url_query);
+                if credential_end > credential_start {
+                    credential_end
+                } else {
+                    end
+                }
+            } else {
+                end
+            }
         };
         if content_start == content_end {
             index += 1;
@@ -189,4 +204,28 @@ fn looks_like_standalone_secret(token: &str) -> bool {
                 || lower.contains("password")
                 || lower.contains("key")
                 || lower.contains("test")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_sensitive_text;
+
+    #[test]
+    fn diagnostic_redaction_covers_unquoted_authorization_values() {
+        for scheme in ["Bearer", "bAsIc"] {
+            let input = format!("Authorization: {scheme}\topaque-demo-value; next=visible");
+            assert_eq!(
+                redact_sensitive_text(&input),
+                "Authorization: <redacted>; next=visible"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_redaction_covers_json_keys_with_whitespace_before_colon() {
+        assert_eq!(
+            redact_sensitive_text("{\"api_key\" \t: \"opaque-demo-value\"}"),
+            "{\"api_key\" \t: \"<redacted>\"}"
+        );
+    }
 }

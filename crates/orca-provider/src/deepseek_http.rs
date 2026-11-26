@@ -108,11 +108,11 @@ impl DeepSeekRequestError {
                 // Leave room for the status and request ID in the TUI diagnostic.
                 const DIAGNOSTIC_LIMIT: usize = 4 * 1024;
                 const TRUNCATED: &str = "… [truncated]";
-                let available = DIAGNOSTIC_LIMIT.saturating_sub(message.len() + suffix.len());
+                let available = DIAGNOSTIC_LIMIT - message.len() - suffix.len();
                 if self.message.len() > available {
                     let prefix = self
                         .message
-                        .floor_char_boundary(available.saturating_sub(TRUNCATED.len()));
+                        .floor_char_boundary(available - TRUNCATED.len());
                     message.push_str(&self.message[..prefix]);
                     message.push_str(TRUNCATED);
                 } else {
@@ -2003,6 +2003,42 @@ mod tests {
         assert_eq!(serde_json::to_value(error).unwrap()["request_id"], "a");
         let error = streamed_http_error(404, "x-deepseek-request-id: c\r\n", "missing").await;
         assert_eq!(serde_json::to_value(error).unwrap()["request_id"], "c");
+    }
+
+    #[tokio::test]
+    async fn diagnostic_rejects_unusable_request_ids() {
+        for id in [
+            "Bearer opaque-demo-value",
+            "Basic dGVzdDpmaXh0dXJl",
+            "sk-demo-value",
+            "ghp_demo_value",
+            "eyJhbGciOiJIUzI1NiJ9.demo.signature",
+            "req-\t1",
+            "",
+        ] {
+            let headers = format!("x-request-id: {id}\r\n");
+            let error = streamed_http_error(404, &headers, "missing").await;
+            assert_eq!(error.request_id, None);
+            assert_eq!(error.message, "DeepSeek provider error: missing (HTTP 404)");
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_limit_includes_request_id_and_status() {
+        let body = "界".repeat(2048);
+        let headers = format!("x-request-id: {}\r\n", "x".repeat(4096));
+        let error = streamed_http_error(404, &headers, &body).await;
+        assert!(error.message.len() <= 4096);
+        assert_eq!(error.request_id, None);
+        assert!(error.message.ends_with("… [truncated] (HTTP 404)"));
+
+        let error = streamed_http_error(404, "x-request-id: req-42\r\n", &body).await;
+        assert!(error.message.len() <= 4096);
+        assert!(
+            error
+                .message
+                .ends_with("… [truncated] (HTTP 404, request id req-42)")
+        );
     }
 
     #[test]
