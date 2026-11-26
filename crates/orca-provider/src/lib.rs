@@ -418,6 +418,11 @@ async fn call_streaming_async_with_output_budget(
 ) -> ProviderResponse {
     match kind {
         ProviderKind::Mock => {
+            if let Some(budget) = retry_budget
+                && let Err(error) = budget.charge_send()
+            {
+                return provider_worker_error(error);
+            }
             if current_turn_has_tool_results(conversation) {
                 let response = mock_call(conversation);
                 for step in &response.steps {

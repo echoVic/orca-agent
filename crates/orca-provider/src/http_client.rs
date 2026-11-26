@@ -4,7 +4,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use orca_core::{cancel::CancelToken, provider_types::ProviderRetry};
+use orca_core::{
+    cancel::CancelToken,
+    provider_types::{ProviderError, ProviderRetry},
+};
 use reqwest::blocking::{
     Client as BlockingClient, RequestBuilder as BlockingRequestBuilder,
     Response as BlockingResponse,
@@ -70,20 +73,25 @@ impl RetryBudget {
         self.max_attempts
     }
 
-    pub fn retry_cooldown_delay(&self) -> Duration {
-        let key = self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retry_quota_key;
-        key.map_or(Duration::ZERO, cooldown_remaining)
+    fn retry_delay(&self, backoff: Duration) -> Duration {
+        backoff.max(
+            self.retry_quota_key()
+                .map_or(Duration::ZERO, cooldown_remaining),
+        )
     }
 
-    fn set_retry_quota_key(&self, key: Option<[u8; 32]>) {
+    fn retry_quota_key(&self) -> Option<[u8; 32]> {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retry_quota_key = key;
+            .retry_quota_key
+    }
+
+    fn set_retry_quota_key(&self, key: [u8; 32]) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retry_quota_key = Some(key);
     }
 
     pub fn can_retry(&self) -> bool {
@@ -104,7 +112,7 @@ impl RetryBudget {
         }
     }
 
-    fn charge_send(&self) -> Result<(), String> {
+    pub(crate) fn charge_send(&self) -> Result<(), String> {
         self.remaining_time()?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.attempts >= self.max_attempts {
@@ -131,16 +139,15 @@ impl RetryBudget {
         Ok(())
     }
 
-    pub fn can_wait(&self, delay: Duration) -> bool {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        self.check_wait(delay, &state).is_ok()
-    }
-
-    fn reserve_wait(&self, delay: Duration) -> Result<(), String> {
+    fn reserve_wait(&self, delay: Duration) -> Result<WaitReservation<'_>, String> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.check_wait(delay, &state)?;
         state.reserved_wait = state.reserved_wait.saturating_add(delay);
-        Ok(())
+        Ok(WaitReservation {
+            budget: self,
+            started: Instant::now(),
+            delay,
+        })
     }
 
     fn record_wait(&self, started: Instant, reserved: Duration) {
@@ -153,41 +160,45 @@ impl RetryBudget {
         if cancel.is_cancelled() {
             return Err("request cancelled".into());
         }
-        self.reserve_wait(delay)?;
-        let reservation = WaitReservation {
-            budget: self,
-            started: Instant::now(),
-            delay,
-        };
-        let until = reservation
-            .started
-            .checked_add(delay)
-            .ok_or("provider retry wait out of range")?;
-        while Instant::now() < until {
-            if cancel.is_cancelled() {
-                return Err("request cancelled".into());
-            }
-            thread::sleep(
-                until
-                    .saturating_duration_since(Instant::now())
-                    .min(CANCELLATION_POLL_INTERVAL),
-            );
-        }
-        drop(reservation);
-        self.remaining_time()?;
-        Ok(())
+        let reservation = self.reserve_wait(delay)?;
+        reservation.sleep_blocking(cancel)
     }
 
-    async fn wait_async(&self, delay: Duration, cancel: &CancelToken) -> Result<(), String> {
+    /// Reports a runtime recovery only after its combined wait has been scheduled.
+    pub fn wait_before_retry(
+        &self,
+        backoff: Duration,
+        cancel: &CancelToken,
+        error: &ProviderError,
+        on_wait: impl FnOnce(ProviderRetry) -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
+        if cancel.is_cancelled() {
+            return Ok(false);
+        }
+        let delay = self.retry_delay(backoff);
+        let Ok(reservation) = self.reserve_wait(delay) else {
+            return Ok(false);
+        };
+        on_wait(ProviderRetry::new(
+            self.attempts(),
+            self.max_attempts(),
+            delay,
+            error,
+        ))?;
+        Ok(reservation.sleep_blocking(cancel).is_ok())
+    }
+
+    async fn wait_async(
+        &self,
+        delay: Duration,
+        cancel: &CancelToken,
+        on_wait: impl FnOnce(),
+    ) -> Result<(), String> {
         if cancel.is_cancelled() {
             return Err("request cancelled".into());
         }
-        self.reserve_wait(delay)?;
-        let reservation = WaitReservation {
-            budget: self,
-            started: Instant::now(),
-            delay,
-        };
+        let reservation = self.reserve_wait(delay)?;
+        on_wait();
         let result = sleep_with_cancel(delay, cancel).await;
         drop(reservation);
         result?;
@@ -200,6 +211,25 @@ struct WaitReservation<'a> {
     budget: &'a RetryBudget,
     started: Instant,
     delay: Duration,
+}
+impl WaitReservation<'_> {
+    fn sleep_blocking(self, cancel: &CancelToken) -> Result<(), String> {
+        let until = Instant::now()
+            .checked_add(self.delay)
+            .ok_or("provider retry wait out of range")?;
+        while Instant::now() < until {
+            if cancel.is_cancelled() {
+                return Err("request cancelled".into());
+            }
+            thread::sleep(
+                until
+                    .saturating_duration_since(Instant::now())
+                    .min(CANCELLATION_POLL_INTERVAL),
+            );
+        }
+        self.budget.remaining_time()?;
+        Ok(())
+    }
 }
 impl Drop for WaitReservation<'_> {
     fn drop(&mut self) {
@@ -267,7 +297,7 @@ fn cooldown_remaining(key: [u8; 32]) -> Duration {
 
 // Space admission after a cooldown. Callers recheck after each wait:
 // another 429/503 can extend the shared deadline while a slot is pending.
-fn cooldown_delay(key: [u8; 32]) -> Duration {
+fn cooldown_delay(key: [u8; 32], previous_key: Option<[u8; 32]>, backoff: Duration) -> Duration {
     let now = Instant::now();
     let mut cooldowns = COOLDOWNS.lock().unwrap_or_else(|e| e.into_inner());
     // Keep newly expired entries until admission has actually occurred. A
@@ -282,30 +312,38 @@ fn cooldown_delay(key: [u8; 32]) -> Duration {
                     })
             })
     });
-    let Some(entry) = cooldowns.get_mut(&key) else {
-        return Duration::ZERO;
-    };
-    let delay = time_until_quota_admission(entry, now);
-    if !delay.is_zero() {
-        return delay;
+    let peer_delay = previous_key
+        .and_then(|previous| cooldowns.get(&previous))
+        .map_or(Duration::ZERO, |entry| {
+            time_until_quota_admission(entry, now)
+        });
+    let delay = peer_delay
+        .max(backoff)
+        .max(cooldowns.get(&key).map_or(Duration::ZERO, |entry| {
+            time_until_quota_admission(entry, now)
+        }));
+    if delay.is_zero()
+        && let Some(entry) = cooldowns.get_mut(&key)
+    {
+        // Allocate only an immediately usable admission under the mutex.
+        entry.next_admission = now.checked_add(COOLDOWN_ADMISSION_SPACING);
     }
-    // Allocate only an immediately usable admission under the mutex. Late
-    // wakeups recheck instead of bunching preallocated, expired slots.
-    entry.next_admission = now.checked_add(COOLDOWN_ADMISSION_SPACING);
-    Duration::ZERO
+    delay
 }
 
 async fn admit_async(
     key: [u8; 32],
     budget: &RetryBudget,
     cancel: &CancelToken,
+    previous_key: Option<[u8; 32]>,
+    mut backoff: Duration,
     on_admission: &mut impl FnMut(Option<Duration>),
 ) -> Result<(), String> {
     loop {
         if cancel.is_cancelled() {
             return Err("request cancelled".into());
         }
-        let delay = cooldown_delay(key);
+        let delay = cooldown_delay(key, previous_key, backoff);
         if delay.is_zero() {
             budget.charge_send()?;
             if !cancel.is_cancelled() {
@@ -313,10 +351,10 @@ async fn admit_async(
             }
             return Ok(());
         }
-        if budget.can_wait(delay) {
-            on_admission(Some(delay));
-        }
-        budget.wait_async(delay, cancel).await?;
+        budget
+            .wait_async(delay, cancel, || on_admission(Some(delay)))
+            .await?;
+        backoff = Duration::ZERO;
     }
 }
 
@@ -325,7 +363,7 @@ fn admit_blocking(key: [u8; 32], budget: &RetryBudget, cancel: &CancelToken) -> 
         if cancel.is_cancelled() {
             return Err("request cancelled".into());
         }
-        let delay = cooldown_delay(key);
+        let delay = cooldown_delay(key, None, Duration::ZERO);
         if delay.is_zero() {
             return budget.charge_send();
         }
@@ -542,20 +580,20 @@ pub(crate) async fn execute_streaming_with_retry_details(
     recovery: Option<orca_core::provider_types::ProviderError>,
     mut on_retry: impl FnMut(Option<ProviderRetry>),
 ) -> Result<Response, RequestFailure> {
-    budget.set_retry_quota_key(None);
     let mut attempt: u32 = 0;
     let mut previous_failure: Option<RequestFailure> = None;
-    let mut pending_report = recovery.map(|error| (budget.attempts(), error));
+    let mut pending_report = recovery;
+    let mut backoff = Duration::ZERO;
     loop {
         let request = build_request(client)
             .build()
             .map_err(|e| format!("request build failed: {e}"))?;
         let sends_before = budget.attempts();
-        let retrying = previous_failure.is_some() || pending_report.is_some();
-        let send = send_built_streaming_request(client, request, cancel, budget, |wait| {
-            if let Some((attempt, error)) = pending_report.take() {
+        let retrying = pending_report.is_some();
+        let send = send_built_streaming_request(client, request, cancel, budget, backoff, |wait| {
+            if let Some(error) = pending_report.take() {
                 on_retry(Some(ProviderRetry::new(
-                    attempt,
+                    sends_before,
                     budget.max_attempts(),
                     wait.unwrap_or_default(),
                     &error,
@@ -583,10 +621,8 @@ pub(crate) async fn execute_streaming_with_retry_details(
                     return Err(streaming_http_failure(resp, cancel, false).await);
                 }
                 let retry_after = extend_cooldown(key, resp.headers());
-                let will_retry = attempt < MAX_RETRIES && budget.can_retry();
                 let failure = streaming_http_failure(resp, cancel, true).await;
-                if !will_retry {
-                    budget.set_retry_quota_key(retry_after.map(|_| key));
+                if attempt >= MAX_RETRIES || !budget.can_retry() {
                     return Err(failure);
                 }
                 (failure, retry_after)
@@ -594,7 +630,7 @@ pub(crate) async fn execute_streaming_with_retry_details(
             Err(err) => {
                 let failure = RequestFailure::Other(format!(
                     "request failed after {} attempts: {err}",
-                    attempt + 1
+                    budget.attempts()
                 ));
                 if attempt >= MAX_RETRIES || !budget.can_retry() || !is_retryable_error(&err) {
                     return Err(failure);
@@ -605,35 +641,10 @@ pub(crate) async fn execute_streaming_with_retry_details(
         if cancel.is_cancelled() {
             return Err("request cancelled".to_string().into());
         }
-        let delay = if retry_after.is_some() {
-            cooldown_remaining(key)
-        } else {
-            compute_backoff(attempt)
-        };
-        if !budget.can_wait(delay) {
-            budget.set_retry_quota_key(retry_after.map(|_| key));
-            return Err(failure);
-        }
-        let error = crate::deepseek_http::provider_request_error(failure.clone());
-        // The next admission enforces Retry-After and the shared quota spacing.
-        if retry_after.is_some() {
-            budget.set_retry_quota_key(Some(key));
-            pending_report = Some((budget.attempts(), error));
-        } else {
-            on_retry(Some(ProviderRetry::new(
-                budget.attempts(),
-                budget.max_attempts(),
-                delay,
-                &error,
-            )));
-            if let Err(message) = budget.wait_async(delay, cancel).await {
-                return Err(if cancel.is_cancelled() {
-                    message.into()
-                } else {
-                    failure
-                });
-            }
-        }
+        backoff = retry_after.map_or_else(|| compute_backoff(attempt), |_| Duration::ZERO);
+        pending_report = Some(crate::deepseek_http::provider_request_error(
+            failure.clone(),
+        ));
         previous_failure = Some(failure);
         attempt += 1;
     }
@@ -662,18 +673,17 @@ pub(crate) async fn execute_streaming_once_with_budget(
     cancel: &CancelToken,
     budget: &RetryBudget,
 ) -> Result<Response, RequestFailure> {
-    budget.set_retry_quota_key(None);
     let (client, request) = request
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build_split();
     let request = request.map_err(|e| format!("request build failed: {e}"))?;
     let (result, key) =
-        send_built_streaming_request(&client, request, cancel, budget, |_| {}).await?;
+        send_built_streaming_request(&client, request, cancel, budget, Duration::ZERO, |_| {})
+            .await?;
     let response = result.map_err(|error| format!("request failed after 1 attempt: {error}"))?;
     let status = response.status();
     if is_retryable_status(status.as_u16()) {
-        let retry_after = extend_cooldown(key, response.headers());
-        budget.set_retry_quota_key(retry_after.map(|_| key));
+        extend_cooldown(key, response.headers());
     }
     if !status.is_success() {
         if std::env::var_os("ORCA_SUMMARY_DEBUG").is_some() {
@@ -912,6 +922,7 @@ async fn send_built_streaming_request(
     mut request: reqwest::Request,
     cancel: &CancelToken,
     budget: &RetryBudget,
+    backoff: Duration,
     mut on_admission: impl FnMut(Option<Duration>),
 ) -> HttpSendResult<Response> {
     let scoped = request_retry_budget(budget, request.timeout().copied())?;
@@ -919,12 +930,22 @@ async fn send_built_streaming_request(
     let mut initial_hop = true;
     loop {
         let key = quota_key(request.url(), request.headers());
-        admit_async(key, budget, cancel, &mut |wait| {
-            if initial_hop {
-                on_admission(wait);
-            }
-        })
+        let previous_key = initial_hop.then(|| budget.retry_quota_key()).flatten();
+        let hop_backoff = if initial_hop { backoff } else { Duration::ZERO };
+        admit_async(
+            key,
+            budget,
+            cancel,
+            previous_key,
+            hop_backoff,
+            &mut |wait| {
+                if initial_hop {
+                    on_admission(wait);
+                }
+            },
+        )
         .await?;
+        budget.set_retry_quota_key(key);
         initial_hop = false;
         *request.timeout_mut() = budget.remaining_time()?;
         let replay = request.try_clone();
@@ -1931,6 +1952,66 @@ mod tests {
                 "same-quota request sent before Retry-After expired"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_cooldown_is_included_in_the_reported_delay() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        let (first_request, first_request_received) = tokio::sync::oneshot::channel();
+        let (peer_finished, wait_for_peer) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut a, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(&mut a);
+            use std::io::BufRead;
+            assert!(reader.by_ref().lines().any(|line| line.unwrap().is_empty()));
+            first_request.send(()).unwrap();
+            let (mut b, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(&mut b);
+            assert!(reader.by_ref().lines().any(|line| line.unwrap().is_empty()));
+            b.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            wait_for_peer.recv_timeout(Duration::from_secs(5)).unwrap();
+            a.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let client = streaming_client().unwrap();
+        let cancel = CancelToken::new();
+        let request = client.get(&url).build().unwrap();
+        let key = quota_key(request.url(), request.headers());
+        let budget = RetryBudget::default();
+        let mut observed = None;
+        let a = execute_streaming_with_retry_details(
+            &client,
+            |c| c.get(&url),
+            &cancel,
+            &budget,
+            None,
+            |report| {
+                if let Some(report) = report {
+                    observed = Some((report.delay_ms, cooldown_remaining(key).as_millis()));
+                    cancel.cancel();
+                }
+            },
+        );
+        let b = async {
+            first_request_received.await.unwrap();
+            execute_streaming_once(client.get(&url), &CancelToken::new())
+                .await
+                .unwrap_err();
+            peer_finished.send(()).unwrap();
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(a, b) })
+                .await
+                .unwrap();
+        assert_eq!(result.unwrap_err().to_string(), "request cancelled");
+        server.join().unwrap();
+        let (reported, remaining) = observed.unwrap();
+        assert!(remaining >= 29_000, "peer cooldown was {remaining} ms");
+        assert!(
+            u128::from(reported) >= remaining,
+            "reported {reported} ms, peer cooldown has {remaining} ms left"
+        );
+        assert_eq!(budget.attempts(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -25,9 +25,10 @@ type 和 payload 是版本化协议。消费者应保留未知事件类型，而
 
 orca exec 可能合并同一条目中连续的 assistant.reasoning.delta 或 assistant.message.delta 事件。按顺序拼接 payload.text，得到的文本保持不变。合并后的事件保留首个事件的信封，因此 seq 可能跳号。model.response.completed 中的 assistant_reasoning 和 assistant_content 包含完整回复文本。
 
-Orca 会在等待重试前发出 `provider.retry` 事件。载荷包含 `attempt`（失败的尝试序号，从 1 开始）、
-`max_attempts`（最多尝试次数）、`delay_ms`（等待毫秒数）、`kind`（提供商错误类型）和
-`reason`（最多 200 个字符）。最终失败会保留完整的错误信息，以及能够取得的 HTTP 状态码和请求 ID。
+Orca 会在等待重试前实时发出 `provider.retry` 事件。载荷包含 `attempt`（已完成的 HTTP 发送次数，从 1 开始）、
+`max_attempts`（共享的发送次数上限）、`delay_ms`（计划等待的毫秒数，包含当时的配额冷却时间）、
+`kind`（提供商错误类型）和 `reason`（脱敏后的错误信息，最多 200 个字符）。最终失败会保留截断后的错误信息，
+以及能够取得的 HTTP 状态码和请求 ID。
 重试成功后，`context.updated` 显示成功请求的输入 token 数。`usage.updated` 也会计入失败请求已报告的用量。
 
 ~~~bash

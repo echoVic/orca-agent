@@ -1298,7 +1298,7 @@ fn truncated_provider_attempt_is_discarded_and_retried_with_new_response_identit
             retry_states.push(retry.map(|retry| (retry.attempt, retry.max_attempts)));
         }
     }
-    assert_eq!(retry_states, [Some((1, 2)), None]);
+    assert_eq!(retry_states, [Some((1, 5)), None]);
     host.shutdown().unwrap();
 }
 

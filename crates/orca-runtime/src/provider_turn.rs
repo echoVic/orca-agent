@@ -626,6 +626,7 @@ impl RuntimeProviderTurnStep {
         let mut attempt_usage;
         let (mut response, response_identity) = loop {
             completed_attempts = completed_attempts.saturating_add(1);
+            let sends_before = retry_budget.attempts();
             let response_identity = ModelResponseIdentity::new(input.turn_context.turn_id.clone());
             let mut stream =
                 if crate::investigation_convergence::summary_prompt_present(&model_conversation) {
@@ -733,26 +734,20 @@ impl RuntimeProviderTurnStep {
             else {
                 break (response, response_identity);
             };
-            let delay = delay.max(retry_budget.retry_cooldown_delay());
-            if input.cancel.is_cancelled() || !retry_budget.can_wait(delay) {
+            if retry_budget.attempts() == sends_before {
                 break (response, response_identity);
             }
-            let attempt = retry_budget.attempts().max(completed_attempts);
-            let max_attempts = (attempt + retry_policy.max_attempts(error.kind)
-                - completed_attempts)
-                .min(retry_budget.max_attempts());
-            let retry =
-                orca_core::provider_types::ProviderRetry::new(attempt, max_attempts, delay, error);
             let ingress = input.turn_context.provider_response_ingress();
-            if let Some(ingress) = ingress {
-                ingress.commit_provider_attempt_failure(&response_identity, &retry)?;
-            }
-            if emit_deltas {
-                sink.emit(events.provider_retry(&retry))?;
-            }
-            if retry_budget.wait_blocking(delay, input.cancel).is_err()
-                || input.cancel.is_cancelled()
-            {
+            let waited = retry_budget.wait_before_retry(delay, input.cancel, error, |retry| {
+                if let Some(ingress) = ingress {
+                    ingress.commit_provider_attempt_failure(&response_identity, &retry)?;
+                }
+                if emit_deltas {
+                    sink.emit(events.provider_retry(&retry))?;
+                }
+                Ok(())
+            })?;
+            if !waited || input.cancel.is_cancelled() {
                 // Settle this response and earlier failed-attempt usage below
                 // before returning the cancellation terminal.
                 break (response, response_identity);
@@ -2218,6 +2213,24 @@ mod tests {
             assert!(message.contains("… [truncated]"));
             assert!(message.ends_with(&format!("(HTTP {status}, request id runtime-fixture)")));
         }
+    }
+
+    #[test]
+    fn nested_stream_recovery_reports_consistent_attempts() {
+        let (response, events, _) = run_retry_fixture(vec![retry_sse(RETRY_USAGE); 4], None);
+        assert!(response.response.error().is_some());
+        let counts: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "provider.retry")
+            .map(|event| {
+                let payload = &event["payload"];
+                (
+                    payload["attempt"].as_u64().unwrap(),
+                    payload["max_attempts"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(counts, [(1, 5), (2, 5), (3, 5)]);
     }
 
     #[test]
