@@ -9685,6 +9685,38 @@ mod jsonl_resume_generation_regression_tests {
         }
     }
 
+    /// Runs until it is released, then fails as a generation does whose
+    /// last send met the mailbox a shutdown closed.
+    struct GatedClosedMailboxExecutor {
+        entered: Sender<CancelToken>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl ThreadOperationExecutor for GatedClosedMailboxExecutor {
+        fn run_turn(
+            &self,
+            _thread: &mut RuntimeThread,
+            _request: &HostedTurnRequest,
+            _generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            self.entered
+                .send(cancel.clone())
+                .map_err(|_| io::Error::other("closed-mailbox entry receiver closed"))?;
+            self.release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(GATE_TIMEOUT)
+                .map_err(|_| io::Error::other("closed-mailbox generation was not released"))?;
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runtime semantic ingress actor is unavailable",
+            ))
+        }
+    }
+
     fn request_id() -> surface::SurfaceRequestId {
         surface::SurfaceRequestId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap()
     }
@@ -9734,6 +9766,167 @@ mod jsonl_resume_generation_regression_tests {
     #[test]
     fn jsonl_current_generation_interrupt_resume_is_not_replayed_from_predecessor() {
         run_gated_jsonl_resume(true);
+    }
+
+    /// A host shutdown that finds a turn's interrupt committed and its
+    /// generation still running ends the turn as the interrupt does. The
+    /// generation's error from the mailbox the shutdown closed is not a
+    /// failure of the turn.
+    #[test]
+    fn host_shutdown_after_a_committed_interrupt_ends_the_turn_cancelled() {
+        let _ = crate::history::claim_isolated_test_orca_home_if_unset();
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let host = RuntimeHost::start_with_executor(Arc::new(GatedClosedMailboxExecutor {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }))
+        .expect("start closed-mailbox host");
+        let gates = ReleaseGenerationGates(vec![release_tx]);
+        let thread = host
+            .start_thread(
+                RunConfig {
+                    cwd: Some(cwd.path().to_path_buf()),
+                    output_format: orca_core::config::OutputFormat::Jsonl,
+                    history_mode: HistoryMode::Record,
+                    tools: orca_core::config::ToolConfig {
+                        shell_enforcement_decision: Some(
+                            orca_core::capability::SandboxEnforcementDecision::new(
+                                orca_core::capability::EnforcementState::Enforced,
+                                "test-sandbox",
+                                Vec::new(),
+                            ),
+                        ),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                "shut down after a committed JSONL interrupt",
+            )
+            .expect("start recorded JSONL thread");
+        let connection_id =
+            surface::SurfaceConnectionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let handle = thread
+            .jsonl_surface_for_connection(connection_id)
+            .expect("bind JSONL connection");
+        let attachment = attach_jsonl(&handle);
+        let mut subscription = handle
+            .claim_subscription(&attachment.subscription)
+            .expect("claim JSONL subscription");
+        let snapshot = &attachment.baseline.snapshot;
+        let legacy_turn_id =
+            surface::LegacyTurnId(surface::DisplayText::new(TurnId::new().to_string()));
+        let reserved = committed(
+            attachment
+                .client
+                .reserve_operation(
+                    request_id(),
+                    surface::OperationRequestIntent {
+                        correlation: surface::OperationIngressCorrelation::JsonlThreadTurn {
+                            rpc_id_digest: surface::Sha256Digest::new(
+                                Sha256::digest(b"shutdown-after-interrupt").into(),
+                            ),
+                            legacy_turn_id: legacy_turn_id.clone(),
+                        },
+                        kind: surface::OperationKind::UserTurn,
+                        input: Some(surface::SurfaceInputRequest {
+                            blocks: surface::NonEmptyVec::try_new(vec![
+                                surface::SurfaceInputRequestBlock::Text {
+                                    text: surface::DisplayText::new("run until shut down"),
+                                },
+                            ])
+                            .unwrap(),
+                        }),
+                        replayability: surface::ReplayabilityRequest::CaptureReplayableCapsule,
+                        settings_preparation: surface::OperationSettingsPreparation::UseCurrent {
+                            expected_settings_revision: snapshot.settings.thread_revision,
+                            expected_policy_epoch: snapshot.settings.effective.policy_epoch,
+                        },
+                    },
+                )
+                .expect("reserve JSONL turn"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        assert!(matches!(
+            committed(
+                attachment
+                    .client
+                    .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+                    .expect("admit JSONL turn")
+            ),
+            surface::AdmissionOutput::Admitted { .. }
+        ));
+        let cancel = entered_rx
+            .recv_timeout(GATE_TIMEOUT)
+            .expect("generation entry");
+        let (_, interrupt) = resolved_control(
+            host.handle()
+                .control_jsonl_turn(
+                    attachment.client.clone(),
+                    request_id(),
+                    Some(attachment.client.thread_id().clone()),
+                    legacy_turn_id.clone(),
+                    surface::JsonlTurnControlAction::Interrupt,
+                )
+                .expect("interrupt the running generation"),
+        );
+        assert_eq!(
+            interrupt.echo.status,
+            surface::JsonlResolvedTurnControlStatus::Interrupted
+        );
+        assert!(cancel.is_cancelled());
+        assert!(matches!(
+            attach_jsonl(&handle)
+                .baseline
+                .snapshot
+                .foreground_operation
+                .as_ref()
+                .and_then(|operation| operation.pending_control.as_ref()),
+            Some(surface::PendingControlIntent::Interrupt { .. })
+        ));
+
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(host.shutdown());
+        });
+        // The generation is released only once the shutdown has closed the
+        // mailbox under it, so its error is the one the closed mailbox gives.
+        let deadline = std::time::Instant::now() + GATE_TIMEOUT;
+        while !thread.command_tx.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shutdown never closed the thread's mailbox"
+            );
+            std::thread::yield_now();
+        }
+        gates.0[0].send(()).expect("release the generation");
+        let _shutdown = shutdown_rx
+            .recv_timeout(GATE_TIMEOUT)
+            .expect("host shutdown hung");
+
+        let mut terminals = Vec::new();
+        while let Some(item) = subscription.try_recv() {
+            let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                continue;
+            };
+            for envelope in batch.events.as_slice() {
+                if let surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                    record,
+                }) = &envelope.event
+                    && record.operation_id == operation_id
+                {
+                    terminals.push(record.terminal.clone());
+                }
+            }
+        }
+        assert_eq!(
+            terminals,
+            vec![surface::OperationTerminal::Cancelled {
+                reason: surface::CancelReason::User,
+            }],
+            "the turn must end as its interrupt did"
+        );
     }
 
     fn run_gated_jsonl_resume(interrupt_successor: bool) {
