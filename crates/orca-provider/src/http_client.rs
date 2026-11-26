@@ -346,7 +346,6 @@ async fn admit_async(
         }
         let delay = cooldown_delay(key, previous_key, backoff);
         if delay.is_zero() {
-            budget.charge_send()?;
             if !cancel.is_cancelled() {
                 on_admission(None);
             }
@@ -400,6 +399,14 @@ impl HttpFailure {
             body: String::new(),
             exhausted: false,
         }
+    }
+
+    fn retry_refused(mut self, reason: String, cancel: &CancelToken) -> RequestFailure {
+        if cancel.is_cancelled() {
+            return "request cancelled".to_owned().into();
+        }
+        self.body = reason;
+        RequestFailure::Http(self)
     }
 }
 
@@ -534,11 +541,22 @@ pub(crate) fn execute_with_retry_details(
 ) -> Result<BlockingResponse, RequestFailure> {
     let client = client()?;
     let mut attempt: u32 = 0;
+    let mut previous_failure: Option<HttpFailure> = None;
     loop {
         let request = build_request(client)
             .build()
             .map_err(|e| format!("request build failed: {e}"))?;
-        let (result, key) = send_built_blocking_request(client, request, cancel, budget)?;
+        let sends_before = budget.attempts();
+        let previous = previous_failure.take();
+        let (result, key) =
+            send_built_blocking_request(client, request, cancel, budget).map_err(|reason| {
+                match previous {
+                    Some(failure) if budget.attempts() == sends_before => {
+                        failure.retry_refused(reason, cancel)
+                    }
+                    _ => reason.into(),
+                }
+            })?;
         match result {
             Ok(resp) => {
                 let status = resp.status();
@@ -549,8 +567,8 @@ pub(crate) fn execute_with_retry_details(
                 let retry_after = retryable
                     .then(|| extend_cooldown(key, resp.headers()))
                     .flatten();
+                let mut failure = HttpFailure::new(status, resp.headers());
                 if !retryable || attempt >= MAX_RETRIES || !budget.can_retry() {
-                    let mut failure = HttpFailure::new(status, resp.headers());
                     failure.exhausted = retryable;
                     let length = resp.content_length();
                     let mut body = Vec::new();
@@ -563,9 +581,12 @@ pub(crate) fn execute_with_retry_details(
                     return Err(RequestFailure::Http(failure));
                 }
                 // The next admission enforces Retry-After for this and peer calls.
-                if retry_after.is_none() {
-                    budget.wait_blocking(compute_backoff(attempt), cancel)?;
+                if retry_after.is_none()
+                    && let Err(reason) = budget.wait_blocking(compute_backoff(attempt), cancel)
+                {
+                    return Err(failure.retry_refused(reason, cancel));
                 }
+                previous_failure = Some(failure);
             }
             Err(err) => {
                 if attempt >= MAX_RETRIES || !budget.can_retry() || !is_retryable_error(&err) {
@@ -617,17 +638,21 @@ pub(crate) async fn execute_streaming_with_retry_details(
             .build()
             .map_err(|e| format!("request build failed: {e}"))?;
         let sends_before = budget.attempts();
-        let retrying = pending_report.is_some();
+        let mut reported_wait = false;
         let send = send_built_streaming_request(client, request, cancel, budget, backoff, |wait| {
-            if let Some(error) = pending_report.take() {
+            let Some(error) = pending_report.as_ref() else {
+                return;
+            };
+            if wait.is_some() || !reported_wait {
                 on_retry(Some(ProviderRetry::new(
                     sends_before,
                     budget.max_attempts(),
                     wait.unwrap_or_default(),
-                    &error,
+                    error,
                 )));
+                reported_wait = true;
             }
-            if retrying && wait.is_none() && !cancel.is_cancelled() {
+            if wait.is_none() && !cancel.is_cancelled() {
                 on_retry(None);
             }
         })
@@ -980,7 +1005,10 @@ async fn send_built_streaming_request(
         let result = tokio::select! {
             biased;
             _ = wait_for_cancel(cancel) => return Err("request cancelled".into()),
-            result = client.execute(request) => result,
+            result = async {
+                budget.charge_send()?;
+                Ok::<_, String>(client.execute(request).await)
+            } => result?,
         };
         match result {
             Ok(response) => {
@@ -1103,6 +1131,125 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Instant;
+
+    fn retry_response_server(responses: Vec<String>) -> (String, thread::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            use std::io::BufRead;
+            let deadline = Instant::now() + Duration::from_secs(4);
+            let mut sent = 0;
+            for response in responses {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return sent;
+                            }
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                assert!(reader.by_ref().lines().any(|line| line.unwrap().is_empty()));
+                stream.write_all(response.as_bytes()).unwrap();
+                sent += 1;
+            }
+            sent
+        });
+        (url, server)
+    }
+
+    fn retry_response(retry_after: u32) -> String {
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {retry_after}\r\nX-Request-Id: retry-429\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn retry_cancelled_by_immediate_report_is_not_charged() {
+        let (url, server) = retry_response_server(vec![retry_response(0)]);
+        let client = streaming_client().unwrap();
+        let cancel = CancelToken::new();
+        let budget = RetryBudget::default();
+        let result = execute_streaming_with_retry_details(
+            &client,
+            |c| c.get(&url),
+            &cancel,
+            &budget,
+            None,
+            |retry| {
+                assert_eq!(retry.unwrap().delay_ms, 0);
+                cancel.cancel();
+            },
+        )
+        .await;
+        assert_eq!(server.join().unwrap(), 1);
+        assert_eq!(result.unwrap_err().to_string(), "request cancelled");
+        assert_eq!(budget.attempts(), 1);
+    }
+
+    #[test]
+    fn blocking_retry_refused_by_deadline_keeps_http_failure() {
+        let (url, server) = retry_response_server(vec![retry_response(30)]);
+        let budget = RetryBudget::new(
+            5,
+            Duration::from_secs(120),
+            Some(Instant::now() + Duration::from_secs(5)),
+        );
+        let failure =
+            execute_with_retry_details(|c| c.get(&url), &budget, &CancelToken::new()).unwrap_err();
+        let error = crate::deepseek_http::provider_request_error(failure);
+        assert_eq!(server.join().unwrap(), 1);
+        assert_eq!(budget.attempts(), 1);
+        assert_eq!(error.http_status, Some(429));
+        assert_eq!(error.request_id.as_deref(), Some("retry-429"));
+        assert!(error.message.contains("exceeds retry deadline"));
+    }
+
+    #[tokio::test]
+    async fn retry_reports_each_wait_when_a_peer_extends_the_cooldown() {
+        let (url, server) = retry_response_server(vec![
+            retry_response(1),
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        ]);
+        let client = streaming_client().unwrap();
+        let request = client.get(&url).build().unwrap();
+        let key = quota_key(request.url(), request.headers());
+        let budget = RetryBudget::default();
+        let mut reports = Vec::new();
+        let result = execute_streaming_with_retry_details(
+            &client,
+            |c| c.get(&url),
+            &CancelToken::new(),
+            &budget,
+            None,
+            |report| {
+                if reports.is_empty() {
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    headers.insert("retry-after", "2".parse().unwrap());
+                    extend_cooldown(key, &headers);
+                }
+                reports.push(report);
+            },
+        )
+        .await;
+        assert_eq!(server.join().unwrap(), 2);
+        assert!(result.unwrap().status().is_success());
+        let [Some(initial), Some(extended), None] = reports.as_slice() else {
+            panic!("expected two waits and one clear, got {reports:?}");
+        };
+        assert_eq!(initial.attempt, 1);
+        assert_eq!(extended.attempt, 1);
+        assert!(initial.delay_ms > 0 && extended.delay_ms > 0);
+    }
 
     #[tokio::test]
     async fn retry_does_not_wait_for_a_stalled_error_body() {
