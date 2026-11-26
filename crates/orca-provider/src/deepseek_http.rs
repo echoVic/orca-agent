@@ -10,7 +10,8 @@ use orca_core::conversation::{
 };
 use orca_core::model::{FLASH_MODEL, canonical_model_name};
 use orca_core::provider_types::{
-    ProviderError, ProviderErrorKind, ProviderReplayState, ProviderResponse, ProviderStep, Usage,
+    PartialReply, ProviderError, ProviderErrorKind, ProviderReplayState, ProviderResponse,
+    ProviderStep, Usage,
 };
 use orca_core::tool_images::{MAX_REQUEST_TOOL_IMAGES, keep_newest_tool_images};
 use orca_core::tool_types::{ToolName, ToolRequest};
@@ -38,16 +39,12 @@ struct DeepSeekRequestError {
     kind: ProviderErrorKind,
     message: String,
     usage: Option<Usage>,
+    partial_reply: Option<PartialReply>,
 }
 
 impl DeepSeekRequestError {
     fn new(message: impl Into<String>) -> Self {
-        let message = message.into();
-        Self {
-            kind: classify_deepseek_error(&message),
-            message,
-            usage: None,
-        }
+        Self::with_usage(message, None)
     }
 
     fn with_usage(message: impl Into<String>, usage: Option<Usage>) -> Self {
@@ -56,17 +53,32 @@ impl DeepSeekRequestError {
             kind: classify_deepseek_error(&message),
             message,
             usage,
+            partial_reply: None,
         }
     }
 
+    fn at_output_limit(
+        content: Option<String>,
+        reasoning: Option<String>,
+        usage: Option<Usage>,
+    ) -> Self {
+        let mut error = Self::with_usage(length_finish_reason_error(), usage);
+        error.partial_reply = content
+            .filter(|text| !text.trim().is_empty())
+            .map(|content| PartialReply {
+                content,
+                reasoning: reasoning.filter(|text| !text.is_empty()),
+            });
+        error
+    }
+
     fn into_provider_error(self) -> (ProviderError, Option<Usage>) {
-        (
-            ProviderError::new(
-                self.kind,
-                format!("DeepSeek provider error: {}", self.message),
-            ),
-            self.usage,
-        )
+        let mut error = ProviderError::new(
+            self.kind,
+            format!("DeepSeek provider error: {}", self.message),
+        );
+        error.partial_reply = self.partial_reply;
+        (error, self.usage)
     }
 }
 
@@ -743,8 +755,9 @@ async fn request_chat_streaming_with_budget(
             && stream_result.finish_reason.as_deref() == Some("length");
         match stream_result.finish_reason.as_deref() {
             Some("length") if !bounded_summary_truncated => {
-                return Err(DeepSeekRequestError::with_usage(
-                    length_finish_reason_error(),
+                return Err(DeepSeekRequestError::at_output_limit(
+                    Some(stream_result.content),
+                    Some(stream_result.reasoning),
                     accumulated_usage,
                 ));
             }
@@ -921,8 +934,9 @@ fn request_chat(
 
         match finish_reason.as_str() {
             "length" => {
-                return Err(DeepSeekRequestError::with_usage(
-                    length_finish_reason_error(),
+                return Err(DeepSeekRequestError::at_output_limit(
+                    message.content,
+                    message.reasoning_content,
                     accumulated_usage,
                 ));
             }
@@ -2879,10 +2893,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn streaming_length_finish_reason_is_a_truncation_error() {
+    async fn a_length_finish_returns_the_partial_reply() {
         // A streamed finish_reason=length must terminate as the same truncation
         // error as the non-streaming path, carrying the streamed usage.
-        let truncated = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n\
+        let truncated = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"first thought\",\"content\":\"partial\"},\"finish_reason\":null}]}\n\n\
+                         data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\n\
                          data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
                          data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":8,\"prompt_cache_hit_tokens\":6}}\n\n\
                          data: [DONE]\n\n";
@@ -2901,13 +2916,20 @@ mod tests {
         };
         let cancel = CancelToken::new();
 
-        let error = request_chat_streaming(&conversation, &config, &cancel, &mut |_| {})
-            .await
-            .expect_err("length must be an error");
+        let response = call_streaming_async(&conversation, &config, &cancel, |_| {}).await;
+        let error = response.error().expect("length must be an error");
 
-        assert_eq!(error.message, length_finish_reason_error());
         assert_eq!(
-            error.usage,
+            error.message,
+            "DeepSeek provider error: Response truncated: model hit max_tokens limit (finish_reason=length); ask the model to continue in smaller chunks"
+        );
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            serde_json::to_value(error).unwrap()["partial_reply"],
+            serde_json::json!({"content": "partial", "reasoning": "first thought"})
+        );
+        assert_eq!(
+            response.usage,
             Some(Usage {
                 input_tokens: 10,
                 output_tokens: 8,

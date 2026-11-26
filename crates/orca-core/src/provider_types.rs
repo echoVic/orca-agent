@@ -60,9 +60,17 @@ pub enum ProviderErrorKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PartialReply {
+    pub content: String,
+    pub reasoning: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_reply: Option<PartialReply>,
 }
 
 impl ProviderError {
@@ -70,6 +78,7 @@ impl ProviderError {
         Self {
             kind,
             message: message.into(),
+            partial_reply: None,
         }
     }
 
