@@ -416,6 +416,9 @@ pub enum TuiEvent {
     SavedSessionActionFailed(String),
     StartupWarning(String),
     Notice(String),
+    /// The runtime would not move the running turn to the background: the
+    /// turn goes on in the foreground, and the text says why.
+    TurnKeptInForeground(String),
     /// A round of a turn the runtime started by itself (the next queued
     /// message, or a wake for background agents that finished); `turn_id`
     /// names the turn, the same for each of its rounds.

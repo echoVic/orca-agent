@@ -296,6 +296,11 @@ pub(crate) fn spawn_attached_event_sender_with_routing(
                         if let Some(status) = side_parent_status_for_event(&event) {
                             let _ = root_event_tx.send(TuiEvent::SideParentStatusChanged(status));
                         }
+                        // The background key acts on main's turn from any
+                        // view, so its answer goes to the view on screen.
+                        if let TuiEvent::TurnKeptInForeground(notice) = event {
+                            let _ = root_event_tx.send(TuiEvent::TurnKeptInForeground(notice));
+                        }
                     } else if send_attached_event(&root_event_tx, attachment, event).is_err() {
                         break;
                     }
@@ -416,6 +421,35 @@ mod tests {
         ));
         assert_eq!(approval_request_id(receive(&root_rx)), "older");
         assert_eq!(approval_request_id(receive(&root_rx)), "newer");
+    }
+
+    /// The background key acts on main's turn from an agent's view too, so
+    /// the answer that main's turn stays reaches the view on screen.
+    #[test]
+    fn a_turn_kept_in_the_foreground_is_shown_while_main_is_behind_another_view() {
+        const STAYS: &str =
+            "This turn cannot move to the background while its subagents are running.";
+        let (root_tx, root_rx) = mpsc::unbounded();
+        let parent = SessionAttachmentId::new(1);
+        let child = parent.next();
+        let routing = Arc::new(Mutex::new(AttachmentRouting::new(parent)));
+        let parent_tx = spawn_attached_event_sender_with_routing(
+            root_tx.clone(),
+            parent,
+            Some(routing.clone()),
+        );
+        AttachmentRouting::switch_attachment(&routing, &root_tx, child, Some(parent), false);
+        let _ = receive(&root_rx);
+
+        parent_tx
+            .send(TuiEvent::TurnKeptInForeground(STAYS.to_string()))
+            .unwrap();
+
+        assert!(matches!(
+            receive(&root_rx),
+            TuiEvent::TurnKeptInForeground(message) if message == STAYS
+        ));
+        assert!(root_rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 
     #[test]

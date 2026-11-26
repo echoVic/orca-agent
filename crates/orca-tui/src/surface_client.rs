@@ -12,8 +12,8 @@ use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
     AttachResult, BackgroundTarget, DisplayText, ExpectedGoal, FreshAttachRequest,
     GoalMutationAction, GoalRunInput, GoalTokenBudgetUpdate, MutationCommitAck, MutationReply,
-    NonEmptyText, NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationPatch,
-    OperationRequestIntent, OperationSettingsPreparation, OperationTerminal,
+    MutationTarget, NonEmptyText, NonEmptyVec, OperationIngressCorrelation, OperationKind,
+    OperationPatch, OperationRequestIntent, OperationSettingsPreparation, OperationTerminal,
     OptionalProcessLocalCancel, PinnedContextAction, PinnedContextSourceRevision,
     PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch, RuntimeSurfaceClientHandle,
     RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, SessionMetadataPatch,
@@ -22,12 +22,13 @@ use orca_runtime::surface::{
     SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceCursor, SurfaceEvent,
     SurfaceFactFamily, SurfaceGoal, SurfaceGoalFence, SurfaceImageDetail, SurfaceImageSource,
     SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
-    SurfaceMcpPromptExpansion, SurfaceMcpServerAction, SurfaceMcpServerStatus, SurfaceOperationId,
-    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
-    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceTaskId,
-    SurfaceUnavailableReason, SurfaceWorkflowRunId, TaskControlAction, TaskRevision,
-    TransferBackgroundOutput, UncommittedMutation, WaitOperationTerminalResult,
-    WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
+    SurfaceMcpPromptExpansion, SurfaceMcpServerAction, SurfaceMcpServerStatus,
+    SurfaceMutationErrorCode, SurfaceOperationId, SurfacePinnedContextEntry,
+    SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot, SurfaceSnapshot,
+    SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceTaskId, SurfaceUnavailableReason,
+    SurfaceWorkflowRunId, TaskControlAction, TaskRevision, TransferBackgroundOutput,
+    UncommittedMutation, WaitOperationTerminalResult, WorkflowCatalogRevision,
+    WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -2616,6 +2617,21 @@ fn drain_operation_with_boundary(
                         mutation.request_id, mutation.commit_id
                     )));
                     sealed = true;
+                }
+                // The runtime keeps the turn in the foreground while it
+                // runs subagents: the person reads why, and the turn goes on.
+                MutationReply::Uncommitted {
+                    mutation:
+                        UncommittedMutation::Invalid {
+                            target: Some(MutationTarget::Generation { .. }),
+                            error,
+                            ..
+                        },
+                } if error.error().code == SurfaceMutationErrorCode::IllegalState => {
+                    controller.rollback_surface_background_handoff(operation_id);
+                    let _ = event_tx.send(TuiEvent::TurnKeptInForeground(
+                        error.error().message.as_str().to_string(),
+                    ));
                 }
                 MutationReply::Uncommitted { mutation } => {
                     controller.rollback_surface_background_handoff(operation_id);

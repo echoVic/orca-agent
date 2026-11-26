@@ -4205,6 +4205,97 @@ fn hosted_tui_background_handoff_without_capacity_completes_successfully() {
     });
 }
 
+/// The background key on a turn whose subagent runs shows why the turn
+/// stays, once, and the turn is shown running on to its end in the
+/// foreground.
+#[test]
+fn hosted_tui_background_key_on_a_turn_with_a_running_subagent_shows_why_it_stays() {
+    const STAYS: &str = "This turn cannot move to the background while its subagents are running.";
+    with_orca_home(|_| {
+        let mut harness = HostedTuiHarness::start(test_config(HistoryMode::Record), None);
+        // The agent's own turn streams for 3 s; the main turn waits for it.
+        harness.send(UserAction::Submit(
+            "subagent async mock_stream_delay_ms 3000".to_string(),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let event = harness
+                .event_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("the agent is shown running");
+            // In suggest the person approves the call that starts the agent.
+            if let TuiEvent::ApprovalNeeded { key, .. } = event {
+                harness.send(UserAction::RespondToInteraction {
+                    key,
+                    response: TuiInteractionResponse::Approval(true),
+                });
+                continue;
+            }
+            let running = matching_task_update(event, |task| {
+                task.task_type == orca_core::task_types::TaskType::Subagent
+                    && task.status.is_active()
+                    && task.subagent_turn.is_some()
+            });
+            if running.is_some() {
+                break;
+            }
+        }
+
+        // The key is pressed as the renderer handles it, on the state it
+        // keeps of a running turn, and what follows is shown on that state.
+        let (mut state, _actions) = test_state();
+        state.set_status(AppStatus::Running);
+        crate::running_actions::handle_running_shortcut(
+            crate::shortcuts::RunningShortcut::BackgroundCurrentTurn,
+            &mut state,
+            &harness.action_tx,
+        );
+        let shown = |state: &AppState| {
+            state
+                .transcript
+                .messages
+                .iter()
+                .filter(
+                    |message| matches!(message, ChatMessage::System { text, .. } if text == STAYS),
+                )
+                .count()
+        };
+        let terminal = loop {
+            let event = harness
+                .event_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("the turn ends");
+            let terminal = match &event {
+                TuiEvent::SessionCompleted { status } => Some(status.clone()),
+                TuiEvent::Error(message) => panic!("the turn failed: {message}"),
+                _ => None,
+            };
+            let before = shown(&state);
+            state.update(event.clone());
+            if shown(&state) > before {
+                assert_eq!(
+                    state.status,
+                    AppStatus::Running,
+                    "the turn is shown running after the line"
+                );
+            }
+            if let Some(status) = terminal {
+                break status;
+            }
+            let backgrounded = matching_task_update(event, |task| {
+                task.task_type == orca_core::task_types::TaskType::MainSession
+                    && task.is_backgrounded
+            });
+            assert_eq!(backgrounded, None, "the turn moved to the background");
+        };
+        assert_eq!(shown(&state), 1, "the line is shown once");
+        assert_eq!(terminal, "success");
+        assert_eq!(state.status, AppStatus::Idle);
+        assert_eq!(harness.runtime.controller().current_id(), None);
+        harness.shutdown();
+    });
+}
+
 #[test]
 fn hosted_tui_backgrounded_canonical_provider_can_be_stopped_once() {
     with_orca_home(|home| {

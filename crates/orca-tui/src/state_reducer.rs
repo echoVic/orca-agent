@@ -942,6 +942,18 @@ impl AppState {
                     expanded: false,
                 });
             }
+            TuiEvent::TurnKeptInForeground(msg) => {
+                self.finish_assistant_stream();
+                self.push_message(ChatMessage::System {
+                    text: msg,
+                    expanded: false,
+                });
+                // The background key showed the turn idle before the runtime
+                // answered; it is still running here.
+                if self.status == AppStatus::Idle {
+                    self.enter_running();
+                }
+            }
             TuiEvent::McpActionFinished { server } => {
                 self.mcp_actions_in_flight.remove(&server);
             }
