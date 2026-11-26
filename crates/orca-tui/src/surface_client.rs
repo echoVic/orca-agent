@@ -1872,6 +1872,15 @@ pub(crate) fn launch_workflow(
                             break;
                         }
                     }
+                    SurfaceSubscriptionItem::ProviderRetry {
+                        operation_id,
+                        retry,
+                    } => {
+                        if let Some(event) = projection.project_provider_retry(&operation_id, retry)
+                        {
+                            let _ = monitor_events.send(event);
+                        }
+                    }
                     SurfaceSubscriptionItem::Gap { required } => {
                         let _ = monitor_events.send(TuiEvent::Error(format!(
                             "typed TUI workflow subscription gap requires {:?}",
@@ -2565,6 +2574,14 @@ fn drain_operation_with_boundary(
                         }
                     }
                 }
+                SurfaceSubscriptionItem::ProviderRetry {
+                    operation_id,
+                    retry,
+                } => {
+                    if let Some(event) = projection.project_provider_retry(&operation_id, retry) {
+                        let _ = event_tx.send(event);
+                    }
+                }
                 SurfaceSubscriptionItem::Gap { required } => {
                     failure = Some(io::Error::other(format!(
                         "typed TUI subscription gap requires {:?}",
@@ -2840,6 +2857,7 @@ fn monitor_background_presentation(
                         break false;
                     }
                 }
+                SurfaceSubscriptionItem::ProviderRetry { .. } => {}
                 SurfaceSubscriptionItem::Gap { .. } => break true,
                 SurfaceSubscriptionItem::Sealed { .. } => break false,
             }

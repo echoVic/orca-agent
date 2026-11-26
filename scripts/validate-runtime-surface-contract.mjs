@@ -1910,9 +1910,9 @@ function commandRow(manifest, table, name) {
 function invariantRegistry() {
   return new Map([
     [
-      "source_facts has exactly 60 unique variants matching EventType",
+      "source_facts has exactly 59 unique variants matching EventType source facts",
       (manifest) => {
-        assertCondition(manifest.source_facts.length === 60, "source_facts must contain 60 rows");
+        assertCondition(manifest.source_facts.length === 59, "source_facts must contain 59 rows");
         assertUnique(manifest.source_facts.map((row) => row[0]), "source_facts");
       },
     ],
@@ -4540,7 +4540,9 @@ export function validateCurrentInventories(manifest, { repoRoot, sourceOverrides
     relativeRepoPath(repoRoot, eventSchemaPath),
     sourceOverrides,
   );
-  const eventTypes = parseRustEnum(eventSchema, "pub enum EventType {");
+  // Retry reports go directly to live output and have no surface source fact.
+  const eventTypes = parseRustEnum(eventSchema, "pub enum EventType {")
+    .filter((variant) => variant !== "ProviderRetry");
   const sourceFacts = manifest.source_facts.map((row) => row[0]);
   assertExactArray(sourceFacts, eventTypes, "source_facts current EventType");
   manifest.source_facts.forEach((row) => {

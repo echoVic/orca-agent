@@ -11,12 +11,13 @@ use super::commands::{
 use super::identity::{
     CanonicalPath, CapabilityRevision, HostIncarnation, NonEmptySet, NonEmptyText, Sha256Digest,
     SurfaceAttachmentGrant, SurfaceAttachmentId, SurfaceAttachmentRole, SurfaceCapability,
-    SurfaceCapabilityCallId, SurfaceCursor, SurfaceRemoteTerminalId, SurfaceThreadId,
-    SurfaceUnavailableReason,
+    SurfaceCapabilityCallId, SurfaceCursor, SurfaceOperationId, SurfaceRemoteTerminalId,
+    SurfaceThreadId, SurfaceUnavailableReason,
 };
 use super::interaction::SurfaceInteractionKind;
 use super::projection::{SurfaceCapabilityCallKind, SurfaceTerminalExitStatus};
 use super::reducer::canonical_batch_encoded_bytes;
+use orca_core::provider_types::ProviderRetry;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::{
@@ -308,6 +309,7 @@ impl SharedSurfaceBatch {
 
 enum QueuedSubscriptionItem {
     Batch(Arc<SharedSurfaceBatch>),
+    ProviderRetry(SurfaceOperationId, Option<ProviderRetry>),
     Gap(SnapshotRequired),
     Sealed(SurfaceSubscriptionSealReason),
 }
@@ -1070,6 +1072,28 @@ impl SurfaceHub {
         self.notify_interaction_capability_change(!lost.is_empty());
     }
 
+    pub(crate) fn publish_provider_retry(
+        &self,
+        operation_id: &SurfaceOperationId,
+        retry: Option<ProviderRetry>,
+    ) {
+        let mut state = lock(&self.inner);
+        for subscriber in state.subscriptions.values_mut() {
+            if !subscriber.gapped
+                && (subscriber.queue.len() as u64) < self.config.subscriber_event_limit
+            {
+                subscriber
+                    .queue
+                    .push_back(QueuedSubscriptionItem::ProviderRetry(
+                        operation_id.clone(),
+                        retry.clone(),
+                    ));
+            }
+        }
+        drop(state);
+        self.notify.notify_all();
+    }
+
     pub(crate) fn repair_committed(
         &self,
         snapshot: Arc<SurfaceSnapshot>,
@@ -1669,6 +1693,12 @@ fn materialize_subscription_item(item: QueuedSubscriptionItem) -> SurfaceSubscri
         QueuedSubscriptionItem::Batch(batch) => SurfaceSubscriptionItem::Batch {
             batch: batch.batch.clone(),
         },
+        QueuedSubscriptionItem::ProviderRetry(operation_id, retry) => {
+            SurfaceSubscriptionItem::ProviderRetry {
+                operation_id,
+                retry,
+            }
+        }
         QueuedSubscriptionItem::Gap(required) => SurfaceSubscriptionItem::Gap { required },
         QueuedSubscriptionItem::Sealed(reason) => SurfaceSubscriptionItem::Sealed { reason },
     }
@@ -2003,7 +2033,7 @@ mod tests {
         let queued = dequeue_subscription_item(&mut subscriber).unwrap();
         let queued_batch = match &queued {
             QueuedSubscriptionItem::Batch(queued_batch) => queued_batch,
-            QueuedSubscriptionItem::Gap(_) => {
+            QueuedSubscriptionItem::ProviderRetry(..) | QueuedSubscriptionItem::Gap(_) => {
                 panic!("locked dequeue did not return the shared batch")
             }
             QueuedSubscriptionItem::Sealed(_) => {

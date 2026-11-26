@@ -1860,6 +1860,7 @@ fn attach_result_name(value: &AttachResult) -> &'static str {
 fn subscription_item_name(value: &SurfaceSubscriptionItem) -> &'static str {
     match value {
         SurfaceSubscriptionItem::Batch { .. } => "Batch",
+        SurfaceSubscriptionItem::ProviderRetry { .. } => "ProviderRetry",
         SurfaceSubscriptionItem::Gap { .. } => "Gap",
         SurfaceSubscriptionItem::Sealed { .. } => "Sealed",
     }
@@ -1925,7 +1926,6 @@ fn surface_event_name(value: &SurfaceEvent) -> &'static str {
         SurfaceEvent::Plan(_) => "Plan",
         SurfaceEvent::Usage(_) => "Usage",
         SurfaceEvent::Context(_) => "Context",
-        SurfaceEvent::ProviderRetry(_) => "ProviderRetry",
         SurfaceEvent::Interaction(_) => "Interaction",
         SurfaceEvent::Task(_) => "Task",
         SurfaceEvent::Workflow(_) => "Workflow",

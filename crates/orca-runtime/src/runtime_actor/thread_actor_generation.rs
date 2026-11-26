@@ -1153,13 +1153,21 @@ impl ThreadActor {
         else {
             return Ok(());
         };
-        let batch = self.surface_event_batch_with_commit_id(projection.events, None);
-        match projection.background_fence {
-            Some(background_fence) => {
-                self.commit_surface_background_batch_with_retry(background_fence, &batch)
+        if !projection.events.is_empty() {
+            let batch = self.surface_event_batch_with_commit_id(projection.events, None);
+            match projection.background_fence {
+                Some(background_fence) => {
+                    self.commit_surface_background_batch_with_retry(background_fence, &batch)?;
+                }
+                None => self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?,
             }
-            None => self.commit_surface_generation_batch_with_retry(fence, &batch),
         }
+        for retry in projection.retries {
+            self.resident_surface
+                .hub
+                .publish_provider_retry(&fence.operation_id, retry);
+        }
+        Ok(())
     }
 
     pub(super) fn commit_surface_subagent_activity(
@@ -2012,26 +2020,23 @@ impl ThreadActor {
             ));
         }
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-        let mut events = self
+        let events = self
             .generation_context_controller
             .provider_attempt_failure_events(&snapshot, &fence, identity)?;
+        if !events.is_empty() {
+            let batch = self.surface_event_batch_with_commit_id(events, None);
+            self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?;
+        }
         if let Some(mut retry) = retry {
             retry.reason = crate::thread_store::redact_sensitive_text(&retry.reason)
                 .chars()
                 .take(200)
                 .collect();
-            events.push((
-                surface::SurfaceScope::Generation {
-                    fence: fence.clone(),
-                },
-                surface::SurfaceEvent::ProviderRetry(Some(retry)),
-            ));
+            self.resident_surface
+                .hub
+                .publish_provider_retry(&fence.operation_id, Some(retry));
         }
-        if events.is_empty() {
-            return Ok(());
-        }
-        let batch = self.surface_event_batch_with_commit_id(events, None);
-        self.commit_surface_generation_batch_with_retry(fence, &batch)
+        Ok(())
     }
 
     pub(super) fn commit_surface_provider_response(

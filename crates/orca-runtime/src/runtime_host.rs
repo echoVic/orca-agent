@@ -37214,7 +37214,8 @@ mod tests {
         let interaction_event_count = std::iter::from_fn(|| subscription.try_recv())
             .filter_map(|item| match item {
                 surface::SurfaceSubscriptionItem::Batch { batch } => Some(batch),
-                surface::SurfaceSubscriptionItem::Gap { .. }
+                surface::SurfaceSubscriptionItem::ProviderRetry { .. }
+                | surface::SurfaceSubscriptionItem::Gap { .. }
                 | surface::SurfaceSubscriptionItem::Sealed { .. } => None,
             })
             .flat_map(|batch| batch.events.as_slice().to_vec())
@@ -39067,7 +39068,8 @@ mod tests {
         let duplicate_route_commits = std::iter::from_fn(|| fallback_subscription.try_recv())
             .filter_map(|item| match item {
                 surface::SurfaceSubscriptionItem::Batch { batch } => Some(batch),
-                surface::SurfaceSubscriptionItem::Gap { .. }
+                surface::SurfaceSubscriptionItem::ProviderRetry { .. }
+                | surface::SurfaceSubscriptionItem::Gap { .. }
                 | surface::SurfaceSubscriptionItem::Sealed { .. } => None,
             })
             .map(|batch| {
@@ -39449,7 +39451,8 @@ mod tests {
         let duplicate_events = std::iter::from_fn(|| observer_subscription.try_recv())
             .filter_map(|item| match item {
                 surface::SurfaceSubscriptionItem::Batch { batch } => Some(batch),
-                surface::SurfaceSubscriptionItem::Gap { .. }
+                surface::SurfaceSubscriptionItem::ProviderRetry { .. }
+                | surface::SurfaceSubscriptionItem::Gap { .. }
                 | surface::SurfaceSubscriptionItem::Sealed { .. } => None,
             })
             .flat_map(|batch| batch.events.as_slice().to_vec())

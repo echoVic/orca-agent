@@ -1293,19 +1293,92 @@ fn truncated_provider_attempt_is_discarded_and_retried_with_new_response_identit
     assert_eq!(snapshot.context.used_tokens, 103);
 
     let mut retry_states = Vec::new();
-    while let Some(SurfaceSubscriptionItem::Batch { batch }) = subscription.try_recv() {
-        for envelope in batch.events.as_slice() {
-            if let SurfaceEvent::ProviderRetry(retry) = &envelope.event {
-                retry_states.push(
-                    retry
-                        .as_ref()
-                        .map(|retry| (retry.attempt, retry.max_attempts)),
-                );
-            }
+    while let Some(item) = subscription.try_recv() {
+        if let SurfaceSubscriptionItem::ProviderRetry { retry, .. } = item {
+            retry_states.push(retry.map(|retry| (retry.attempt, retry.max_attempts)));
         }
     }
     assert_eq!(retry_states, [Some((1, 2)), None]);
     host.shutdown().unwrap();
+}
+
+#[test]
+fn a_session_with_retries_is_readable_by_the_previous_reader() {
+    let cwd = tempfile::tempdir().unwrap();
+    let host = RuntimeHost::start().unwrap();
+    let thread = host
+        .start_thread(
+            test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+            "record provider retry session",
+        )
+        .unwrap();
+    let session_id = thread.session_id().unwrap().to_string();
+    let attachment = fresh_interaction_attachment(&thread.surface());
+    let prompt = format!("mock_stream_closed_once {}", uuid::Uuid::new_v4());
+    let reserved = committed_value(
+        attachment
+            .client
+            .reserve_operation(
+                request_id(),
+                user_turn_intent(&attachment.baseline.snapshot, &prompt),
+            )
+            .unwrap(),
+    );
+    committed_value(
+        attachment
+            .client
+            .admit_reserved(
+                request_id(),
+                reserved.operation_id.clone(),
+                reserved.lease.lease_id,
+            )
+            .unwrap(),
+    );
+    assert!(matches!(
+        attachment
+            .client
+            .wait_operation_terminal(request_id(), reserved.operation_id)
+            .unwrap(),
+        WaitOperationTerminalResult::Terminal { .. }
+    ));
+    host.shutdown().unwrap();
+
+    // Closed enums from the 0.5.23 reader at 11d90cee.
+    let variants: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/session-0.5.23-variants.json")).unwrap();
+    let assert_known = |inventory: &str, variant: &str| {
+        assert!(
+            variants[inventory]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|known| known == variant),
+            "Orca 0.5.23 cannot read {inventory} variant {variant}"
+        );
+    };
+    let transcript = orca_runtime::history::load_session(&session_id).unwrap();
+    let raw = std::fs::read_to_string(transcript.path).unwrap();
+    let mut saw_surface_batch = false;
+    for line in raw.lines() {
+        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+        let record_type = record["type"].as_str().unwrap();
+        assert_known("record_types", record_type);
+        if record_type == "event.semantic" {
+            assert_known(
+                "semantic_event_types",
+                record["event"]["type"].as_str().unwrap(),
+            );
+        }
+        if let Some(events) = record["batch"]["events"].as_array() {
+            saw_surface_batch = true;
+            for envelope in events {
+                for variant in envelope["event"].as_object().unwrap().keys() {
+                    assert_known("surface_event_variants", variant);
+                }
+            }
+        }
+    }
+    assert!(saw_surface_batch);
 }
 
 #[test]
@@ -3863,7 +3936,9 @@ fn dropping_exclusive_responder_rotates_route_before_fallback_can_wake_waiter() 
     let resolved_count = std::iter::from_fn(|| fallback_subscription.try_recv())
         .filter_map(|item| match item {
             SurfaceSubscriptionItem::Batch { batch } => Some(batch),
-            SurfaceSubscriptionItem::Gap { .. } | SurfaceSubscriptionItem::Sealed { .. } => None,
+            SurfaceSubscriptionItem::ProviderRetry { .. }
+            | SurfaceSubscriptionItem::Gap { .. }
+            | SurfaceSubscriptionItem::Sealed { .. } => None,
         })
         .map(|batch| {
             batch

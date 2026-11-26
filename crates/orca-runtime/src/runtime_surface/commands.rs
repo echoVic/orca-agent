@@ -115,7 +115,6 @@ pub enum SurfaceEvent {
     Plan(SurfacePlanSnapshot),
     Usage(SurfaceUsageSnapshot),
     Context(SurfaceContextSnapshot),
-    ProviderRetry(Option<orca_core::provider_types::ProviderRetry>),
     Interaction(InteractionPatch),
     Task(TaskPatch),
     Workflow(WorkflowPatch),
@@ -1321,6 +1320,10 @@ pub enum SurfaceSubscriptionSealReason {
 pub enum SurfaceSubscriptionItem {
     Batch {
         batch: SurfaceCommitBatch,
+    },
+    ProviderRetry {
+        operation_id: SurfaceOperationId,
+        retry: Option<orca_core::provider_types::ProviderRetry>,
     },
     Gap {
         required: SnapshotRequired,

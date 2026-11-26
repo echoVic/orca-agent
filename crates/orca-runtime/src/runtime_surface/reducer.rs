@@ -502,7 +502,6 @@ enum CanonicalEventV1<'a> {
     Plan(&'a SurfacePlanSnapshot),
     Usage(&'a SurfaceUsageSnapshot),
     Context(&'a SurfaceContextSnapshot),
-    ProviderRetry(Option<&'a orca_core::provider_types::ProviderRetry>),
     Interaction(CanonicalInteractionPatchV1<'a>),
     Task(CanonicalTaskPatchV1<'a>),
     Workflow(&'a WorkflowPatch),
@@ -525,7 +524,6 @@ fn canonical_event_v1(event: &SurfaceEvent) -> CanonicalEventV1<'_> {
         SurfaceEvent::Plan(snapshot) => CanonicalEventV1::Plan(snapshot),
         SurfaceEvent::Usage(snapshot) => CanonicalEventV1::Usage(snapshot),
         SurfaceEvent::Context(snapshot) => CanonicalEventV1::Context(snapshot),
-        SurfaceEvent::ProviderRetry(retry) => CanonicalEventV1::ProviderRetry(retry.as_ref()),
         SurfaceEvent::Interaction(patch) => {
             CanonicalEventV1::Interaction(canonical_interaction_patch_v1(patch))
         }
@@ -1667,10 +1665,6 @@ fn scope_matches_event(
             scope,
             SurfaceScope::Thread | SurfaceScope::Generation { .. }
         ),
-        SurfaceEvent::ProviderRetry(_) => matches!(
-            scope,
-            SurfaceScope::Generation { .. } | SurfaceScope::Background { .. }
-        ),
         SurfaceEvent::Task(patch) => match (scope, patch) {
             (SurfaceScope::Thread, _) => true,
             (
@@ -2002,7 +1996,6 @@ fn apply_event(
             apply_assistant_patch(&mut state.snapshot, envelope, batch, patch)
         }
         SurfaceEvent::Tool(patch) => apply_tool_patch(state, envelope, batch, patch),
-        SurfaceEvent::ProviderRetry(_) => Ok(()),
         SurfaceEvent::Plan(plan) => {
             if state.snapshot.plan.revision.get().checked_add(1) != Some(plan.revision.get()) {
                 return Err(event_error(

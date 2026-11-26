@@ -22,6 +22,7 @@ struct PendingPlanSplit {
 }
 
 pub(crate) struct ProviderStepProjection {
+    pub(crate) retries: Vec<Option<orca_core::provider_types::ProviderRetry>>,
     pub(crate) events: Vec<(surface::SurfaceScope, surface::SurfaceEvent)>,
     pub(crate) background_fence: Option<surface::SurfaceBackgroundFence>,
 }
@@ -83,6 +84,7 @@ impl GenerationContextController {
             ),
         > = HashMap::new();
         let mut generation_validated = false;
+        let mut retries = Vec::new();
 
         for step in steps {
             let pieces = match step {
@@ -104,7 +106,7 @@ impl GenerationContextController {
                             .collect();
                         retry
                     });
-                    events.push((scope.clone(), surface::SurfaceEvent::ProviderRetry(retry)));
+                    retries.push(retry);
                     continue;
                 }
                 _ => continue,
@@ -220,11 +222,12 @@ impl GenerationContextController {
                 ));
             }
         }
-        if events.is_empty() {
+        if events.is_empty() && retries.is_empty() {
             return Ok(None);
         }
         Ok(Some(ProviderStepProjection {
             events,
+            retries,
             background_fence: foregrounded_background,
         }))
     }
