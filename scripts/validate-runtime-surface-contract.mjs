@@ -3586,6 +3586,13 @@ function cfgTestExternalModulePaths(repoRoot, sourcePaths, sourceOverrides) {
   return excluded;
 }
 
+// Masking keeps every line ending as it was, CR included: a CR blanked to a
+// space leaves " \n" where the source had "\r\n", and a hash taken over
+// masked text would then tell a CRLF checkout from an LF one.
+function lineEndingOrBlank(character) {
+  return character === "\n" || character === "\r" ? character : " ";
+}
+
 function maskRustNonCode(source) {
   const cached = rustNonCodeMaskCache.get(source);
   if (cached !== undefined) return cached;
@@ -3595,7 +3602,7 @@ function maskRustNonCode(source) {
   let blockDepth = 0;
   let escaped = false;
   let rawTerminator = "";
-  const masked = (text) => text.replace(/[^\n]/g, " ");
+  const masked = (text) => text.replace(/[^\r\n]/g, " ");
 
   while (index < source.length) {
     const character = source[index];
@@ -3642,7 +3649,7 @@ function maskRustNonCode(source) {
       continue;
     }
     if (state === "line-comment") {
-      output += character === "\n" ? "\n" : " ";
+      output += lineEndingOrBlank(character);
       index += 1;
       if (character === "\n") state = "code";
       continue;
@@ -3658,7 +3665,7 @@ function maskRustNonCode(source) {
         blockDepth -= 1;
         if (blockDepth === 0) state = "code";
       } else {
-        output += character === "\n" ? "\n" : " ";
+        output += lineEndingOrBlank(character);
         index += 1;
       }
       continue;
@@ -3669,12 +3676,12 @@ function maskRustNonCode(source) {
         index += rawTerminator.length;
         state = "code";
       } else {
-        output += character === "\n" ? "\n" : " ";
+        output += lineEndingOrBlank(character);
         index += 1;
       }
       continue;
     }
-    output += character === "\n" ? "\n" : " ";
+    output += lineEndingOrBlank(character);
     index += 1;
     if (escaped) escaped = false;
     else if (character === "\\") escaped = true;
@@ -3751,7 +3758,7 @@ function maskCfgTestItems(source) {
   const characters = code.split("");
   for (const [start, end] of ranges) {
     for (let index = start; index < end; index += 1) {
-      if (characters[index] !== "\n") characters[index] = " ";
+      characters[index] = lineEndingOrBlank(characters[index]);
     }
   }
   return characters.join("");
@@ -3786,7 +3793,7 @@ function maskRustUseDeclarations(source) {
   const characters = source.split("");
   for (const declaration of rustUseDeclarations(source)) {
     for (let index = declaration.start; index < declaration.end; index += 1) {
-      if (characters[index] !== "\n") characters[index] = " ";
+      characters[index] = lineEndingOrBlank(characters[index]);
     }
   }
   return characters.join("");
