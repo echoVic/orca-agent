@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.23";
+export const releaseVersion = "v0.5.24";
 
 export const releases = [
+  {
+    version: "v0.5.24",
+    date: "2026-11-27",
+    title: "grep handles patterns that start with a dash",
+    body: "grep now finds matches for patterns such as -> Result that previously failed. Your ripgrep config file no longer changes the results. A path outside the workspace or a symlink leading out of it is refused with path escapes workspace.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.24",
+  },
   {
     version: "v0.5.23",
     date: "2026-11-23",
