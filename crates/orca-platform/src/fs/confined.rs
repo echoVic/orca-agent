@@ -224,7 +224,8 @@ mod platform {
     use crate::fs::{PathPolicy, VerifiedPath, open_nofollow_nonblocking};
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileDispositionInfo, ReOpenFile, SetFileInformationByHandle,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfo, ReOpenFile,
+        SetFileInformationByHandle,
     };
 
     use super::*;
@@ -297,15 +298,14 @@ mod platform {
             contents: &[u8],
         ) -> io::Result<()> {
             use std::io::Write;
-            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Foundation::GENERIC_WRITE;
             let staged = self.path.join(staged);
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                .open(&staged)?;
+            let mut file = super::super::atomic::create_new_private(
+                &staged,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            )?;
             let result = (|| {
-                super::super::atomic::restrict_to_owner(&file)?;
                 file.write_all(contents)?;
                 file.sync_all()?;
                 fs::hard_link(&staged, self.path.join(name))
@@ -339,7 +339,8 @@ mod platform {
     }
 
     fn pin(policy: PathPolicy, path: &Path) -> io::Result<VerifiedPath> {
-        pin_with_access(policy, path, FILE_READ_ATTRIBUTES)
+        // Traversal access makes the handle participate in sharing checks.
+        pin_with_access(policy, path, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
     }
 
     fn pin_with_access(policy: PathPolicy, path: &Path, access: u32) -> io::Result<VerifiedPath> {
@@ -395,5 +396,23 @@ mod platform {
             _ => io::ErrorKind::InvalidInput,
         };
         io::Error::new(kind, error)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn an_open_directory_keeps_its_ancestors_in_place() {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join("parent");
+            let child = parent.join("child");
+            fs::create_dir_all(&child).unwrap();
+            let directory = Directory::open(&child, false).unwrap();
+            let renamed = root.path().join("renamed");
+            assert!(fs::rename(&parent, &renamed).is_err());
+            drop(directory);
+            fs::rename(&parent, &renamed).unwrap();
+        }
     }
 }
