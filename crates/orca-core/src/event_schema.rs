@@ -107,6 +107,7 @@ impl EventDraft {
         if state.next_seq == u64::MAX {
             return Err(io::Error::other("event sequence exhausted"));
         }
+        // Live envelopes share the sequence range used to recover this run.
         if let Some(store) = self.publication.store.as_deref()
             && state.next_seq >= state.reserved_until
         {
@@ -263,6 +264,8 @@ pub enum EventType {
     SessionCompleted,
     #[serde(rename = "session.rewind")]
     SessionRewind,
+    #[serde(rename = "provider.retry")]
+    ProviderRetry,
 }
 
 impl EventType {
@@ -319,6 +322,7 @@ impl EventType {
             Self::AssistantReasoningDelta
             | Self::AssistantMessageDelta
             | Self::ProviderReplayUpdated
+            | Self::ProviderRetry
             | Self::UsageUpdated
             | Self::ContextUpdated
             | Self::ToolCallProgress
@@ -533,6 +537,10 @@ impl EventFactory {
 
     pub fn usage_updated(&mut self, usage: UsageTotals) -> EventDraft {
         self.make(EventType::UsageUpdated, usage.event_payload())
+    }
+
+    pub fn provider_retry(&mut self, retry: &crate::provider_types::ProviderRetry) -> EventDraft {
+        self.make_serialized(EventType::ProviderRetry, retry)
     }
 
     pub fn context_updated(&mut self, used_tokens: usize, limit_tokens: usize) -> EventDraft {
