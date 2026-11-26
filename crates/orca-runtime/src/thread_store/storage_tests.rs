@@ -37,6 +37,61 @@ fn write_compat_session(directory: &Path, meta: &str, between: &str) -> PathBuf 
     path
 }
 
+fn write_session_with_later_schema_two_meta() -> PathBuf {
+    let newer = SESSION_META.replace(r#""schema_version":1"#, r#""schema_version":2"#);
+    write_compat_session(&sessions_dir(), SESSION_META, &format!("{newer}\n"))
+}
+
+#[test]
+fn resume_writer_refuses_a_later_schema_two_meta() {
+    let root = tempfile::tempdir().unwrap();
+    crate::history::with_test_orca_home(root.path(), |_| {
+        let path = write_session_with_later_schema_two_meta();
+        let compressed = path.with_extension("jsonl.zst");
+        let source = fs::read(&path).unwrap();
+        let original = zstd::stream::encode_all(source.as_slice(), 0).unwrap();
+        fs::write(&compressed, &original).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let error = SessionWriter::append_to_existing(compressed.clone())
+            .err()
+            .expect("resume must reject the newer transcript before restoring it");
+        assert!(error.to_string().contains("upgrade Orca"), "{error}");
+        assert!(!path.exists());
+        assert_eq!(fs::read(compressed).unwrap(), original);
+    });
+}
+
+#[test]
+fn rename_refuses_a_later_schema_two_meta() {
+    let root = tempfile::tempdir().unwrap();
+    crate::history::with_test_orca_home(root.path(), |_| {
+        let path = write_session_with_later_schema_two_meta();
+        let original = fs::read(&path).unwrap();
+        let error = JsonlThreadStore::new()
+            .rename_session("compat", "new title")
+            .unwrap_err();
+        assert!(error.to_string().contains("upgrade Orca"), "{error}");
+        assert_eq!(fs::read(path).unwrap(), original);
+    });
+}
+
+#[test]
+fn export_refuses_a_later_schema_two_meta() {
+    let root = tempfile::tempdir().unwrap();
+    crate::history::with_test_orca_home(root.path(), |_| {
+        let path = write_session_with_later_schema_two_meta();
+        let original = fs::read(&path).unwrap();
+        let target = root.path().join("export.jsonl");
+        let error = JsonlThreadStore::new()
+            .export_session("compat", &target)
+            .unwrap_err();
+        assert!(error.to_string().contains("upgrade Orca"), "{error}");
+        assert!(!target.exists());
+        assert_eq!(fs::read(path).unwrap(), original);
+    });
+}
+
 #[test]
 fn an_unknown_record_type_reports_newer_version() {
     let root = tempfile::tempdir().unwrap();

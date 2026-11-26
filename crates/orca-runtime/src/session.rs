@@ -1252,6 +1252,38 @@ mod tests {
     }
 
     #[test]
+    fn fork_refuses_a_later_schema_two_meta() {
+        use std::io::Write;
+
+        with_orca_home(|home| {
+            let parent = history::SessionWriter::start(home, "mock", None, "parent").unwrap();
+            let mut newer: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(parent.path()).unwrap()).unwrap();
+            let parent_id = newer["session_id"].as_str().unwrap().to_owned();
+            newer["schema_version"] = serde_json::json!(2);
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(parent.path())
+                    .unwrap(),
+                "{newer}"
+            )
+            .unwrap();
+            let original = std::fs::read(parent.path()).unwrap();
+            let cfg = config(home.to_path_buf(), HistoryMode::Fork(parent_id));
+
+            let error = InteractiveSession::new_with_preloaded(&cfg, "child", None)
+                .err()
+                .expect("fork must reject the newer parent before creating a child");
+            assert!(error.to_string().contains("upgrade Orca"), "{error}");
+            let sessions = history::list_sessions_with_archived(usize::MAX, true).unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].path, parent.path());
+            assert_eq!(std::fs::read(parent.path()).unwrap(), original);
+        });
+    }
+
+    #[test]
     fn a_fork_does_not_copy_skipped_records_and_the_parent_keeps_them() {
         use std::io::Write;
 
