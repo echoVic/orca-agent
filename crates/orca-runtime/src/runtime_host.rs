@@ -31699,7 +31699,7 @@ mod tests {
                 text: surface::DisplayText,
             },
             ResponseCompleted {
-                response: surface::SurfaceCompletedModelResponse,
+                response: PreviousSurfaceCompletedModelResponse,
             },
             StreamDiscarded {
                 stream_id: surface::SurfaceStreamId,
@@ -31707,7 +31707,7 @@ mod tests {
             },
         }
 
-        #[derive(serde::Deserialize, serde::Serialize)]
+        #[derive(Deserialize)]
         struct PreviousCompletedModelResponse {
             identity: orca_core::thread_item_projection::ModelResponseIdentity,
             assistant_content: Option<String>,
@@ -31715,67 +31715,166 @@ mod tests {
             tool_calls: Vec<orca_core::conversation::RawToolCall>,
         }
 
+        #[derive(Deserialize, Serialize)]
+        enum PreviousSurfaceEvent {
+            Assistant(PreviousAssistantPatch),
+            Context(surface::SurfaceContextSnapshot),
+        }
+
+        #[derive(Deserialize, Serialize)]
+        enum PreviousScope {
+            Generation {
+                fence: surface::SurfaceOperationFence,
+            },
+        }
+
+        #[derive(Deserialize)]
+        struct PreviousEnvelope {
+            scope: PreviousScope,
+            event: PreviousSurfaceEvent,
+        }
+
+        #[derive(Deserialize)]
+        struct PreviousBatch {
+            version: u8,
+            commit_class: surface::CommitClass,
+            event_count: u32,
+            batch_digest: Sha256Digest,
+            events: Vec<PreviousEnvelope>,
+        }
+
+        #[derive(Serialize)]
+        struct PreviousCanonicalEventDigest<'a> {
+            version: u8,
+            scope: &'a PreviousScope,
+            event: &'a PreviousSurfaceEvent,
+        }
+
+        #[derive(Serialize)]
+        struct PreviousCanonicalBatchDigest<'a> {
+            version: u8,
+            event_digests: &'a [Sha256Digest],
+            event_count: u32,
+            commit_class: &'a surface::CommitClass,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum PreviousSemanticEvent {
+            #[serde(rename = "model.response.completed")]
+            ModelResponseCompleted {
+                payload: PreviousCompletedModelResponse,
+            },
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum PreviousRecord {
+            #[serde(rename = "event.semantic")]
+            SemanticEvent {
+                event: PreviousSemanticEvent,
+            },
+            #[serde(rename = "runtime.surface_commit.prepared")]
+            SurfaceCommitPrepared {
+                event_count: u32,
+                batch_digest: Vec<u8>,
+                batch: PreviousBatch,
+            },
+        }
+
         let mut previous_completion = None;
-        let mut previous_batch = None;
+        let mut previous_response = None;
         for line in std::fs::read_to_string(path).unwrap().lines() {
-            let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
-            if record["event"]["type"] == "model.response.completed" {
-                let payload = &record["event"]["payload"];
-                let decoded: PreviousCompletedModelResponse =
-                    serde_json::from_value(payload.clone()).unwrap();
-                assert!(payload["cut_short"].is_string());
-                let decoded = serde_json::to_value(decoded).unwrap();
-                assert_eq!(decoded["identity"], payload["identity"]);
-                assert_eq!(decoded["assistant_content"], payload["assistant_content"]);
-                assert!(decoded.get("cut_short").is_none());
-                assert!(previous_completion.replace(decoded).is_none());
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            let is_completion_batch = record["batch"]["events"].as_array().is_some_and(|events| {
+                events.iter().any(|envelope| {
+                    let assistant = &envelope["event"]["Assistant"];
+                    envelope.get("cut_short").is_some()
+                        || assistant.get("ResponseCompleted").is_some()
+                        || assistant.get("ResponseKept").is_some()
+                })
+            });
+            if record["event"]["type"] != "model.response.completed" && !is_completion_batch {
+                continue;
             }
-            if let Some(events) = record
-                .get_mut("batch")
-                .and_then(|batch| batch.get_mut("events"))
-                .and_then(serde_json::Value::as_array_mut)
+
+            match serde_json::from_str::<PreviousRecord>(line)
+                .expect("v0.5.23 must decode the persisted completion record")
             {
-                for envelope in events {
-                    let envelope = envelope.as_object_mut().unwrap();
-                    envelope.retain(|key, _| {
-                        matches!(
-                            key.as_str(),
-                            "ordinal" | "event_id" | "commit_class" | "scope" | "event"
-                        )
-                    });
-                    if let Some(assistant) = envelope["event"].get_mut("Assistant") {
-                        let patch: PreviousAssistantPatch = serde_json::from_value(
-                            assistant.clone(),
-                        )
-                        .expect("Orca 0.5.23 must understand the persisted assistant patch");
-                        *assistant = serde_json::to_value(patch).unwrap();
-                    }
+                PreviousRecord::SemanticEvent {
+                    event: PreviousSemanticEvent::ModelResponseCompleted { payload },
+                } => {
+                    assert!(record["event"]["payload"]["cut_short"].is_string());
+                    assert_eq!(payload.assistant_content.as_deref(), Some(expected_text));
+                    assert_eq!(payload.assistant_reasoning.as_deref(), expected_reasoning);
+                    assert!(payload.tool_calls.is_empty());
+                    assert!(previous_completion.replace(payload.identity).is_none());
                 }
-            }
-            let record: crate::thread_store::SessionRecord =
-                serde_json::from_value(record).unwrap();
-            if let crate::thread_store::SessionRecord::SurfaceCommitPrepared {
-                batch: Some(batch),
-                batch_digest,
-                ..
-            } = record
-            {
-                let batch = batch.into_live().expect("the old event form must validate");
-                assert_eq!(batch.batch_digest.as_bytes().as_slice(), batch_digest);
-                if batch.events.as_slice().iter().any(|envelope| {
-                    matches!(
-                        envelope.event,
-                        surface::SurfaceEvent::Assistant(
-                            surface::AssistantPatch::ResponseCompleted { .. }
-                        )
-                    )
-                }) {
-                    assert!(previous_batch.replace(batch).is_none());
+                PreviousRecord::SurfaceCommitPrepared {
+                    event_count,
+                    batch_digest,
+                    batch,
+                } => {
+                    assert_eq!(batch.version, 1);
+                    assert_eq!(batch.events.len(), event_count as usize);
+                    assert_eq!(batch.event_count, event_count);
+                    assert_eq!(batch.batch_digest.as_bytes().as_slice(), batch_digest);
+
+                    let event_digests: Vec<_> = batch
+                        .events
+                        .iter()
+                        .map(|envelope| {
+                            let canonical = PreviousCanonicalEventDigest {
+                                version: 1,
+                                scope: &envelope.scope,
+                                event: &envelope.event,
+                            };
+                            Sha256Digest::digest(serde_json::to_vec(&canonical).unwrap())
+                        })
+                        .collect();
+                    let canonical = PreviousCanonicalBatchDigest {
+                        version: 1,
+                        event_digests: &event_digests,
+                        event_count,
+                        commit_class: &batch.commit_class,
+                    };
+                    assert_eq!(
+                        Sha256Digest::digest(serde_json::to_vec(&canonical).unwrap()),
+                        batch.batch_digest,
+                        "v0.5.23 must reproduce the persisted completion batch digest"
+                    );
+                    let mut responses = batch.events.into_iter().filter_map(|envelope| {
+                        match envelope.event {
+                            PreviousSurfaceEvent::Assistant(
+                                PreviousAssistantPatch::ResponseCompleted { response },
+                            ) => Some(response),
+                            _ => None,
+                        }
+                    });
+                    let response = responses.next().expect("v0.5.23 surface completion");
+                    assert!(responses.next().is_none());
+                    assert!(previous_response.replace(response).is_none());
                 }
             }
         }
-        assert!(previous_completion.is_some());
-        assert!(previous_batch.is_some());
+        let identity = previous_completion.expect("v0.5.23 semantic completion");
+        let response = previous_response.expect("v0.5.23 surface completion");
+        let item = response
+            .message_item
+            .expect("v0.5.23 assistant message item");
+        assert_eq!(item.text.as_str(), expected_text);
+        assert_eq!(
+            response
+                .reasoning_item
+                .as_ref()
+                .map(|item| item.content.as_str()),
+            expected_reasoning,
+        );
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            serde_json::to_value(item.id).unwrap(),
+            serde_json::to_value(identity.item_ids.conversation_item_id).unwrap(),
+        );
     }
 
     #[test]
