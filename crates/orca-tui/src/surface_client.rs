@@ -4913,7 +4913,16 @@ mod tests {
         let config = config.clone();
         let controller = controller.clone();
         let event_tx = event_tx.clone();
-        let prompt = prompt.to_string();
+        // The tests check what the command did once its turn has ended. A
+        // shell call waits for its command 10 s by default and then returns
+        // with the command still running, and the turn ends: a `git commit`
+        // slower than that on a loaded machine made no commit yet when the
+        // test counted (seen at about 11 s). So the call waits the longest a
+        // call can (30 s); `assert_git_turn_succeeded` waits longer still.
+        let prompt = match prompt.strip_prefix("bash ") {
+            Some(command) => format!("bash_wait 30000 :: {command}"),
+            None => prompt.to_string(),
+        };
         std::thread::spawn(move || {
             let result = run_through_dispatch(
                 &thread,
@@ -4945,8 +4954,9 @@ mod tests {
     fn assert_git_turn_succeeded(
         result_rx: &mpsc::Receiver<io::Result<TuiHostedOperationOutcome>>,
     ) {
+        // Longer than the 30 s its shell call may wait (see `spawn_git_turn`).
         let outcome = result_rx
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(Duration::from_secs(60))
             .expect("git turn finished without a second prompt")
             .expect("git turn");
         assert!(matches!(
