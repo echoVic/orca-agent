@@ -658,6 +658,9 @@ pub(crate) fn storage_identity_for_path(path: &Path) -> String {
 
 pub fn search_sessions(query: &str, include_archived: bool) -> io::Result<Vec<SearchHit>> {
     let mut hits = Vec::new();
+    // The in-process backend searches only the inspected prefix. Ripgrep can
+    // also match raw lines past that limit, with each hit checked against the
+    // bounded catalog health and its own skippable marker.
     let used_ripgrep = search_roots_with_ripgrep(query, include_archived, &mut hits)?;
     let mut seen: HashSet<(PathBuf, usize)> = hits
         .iter()
@@ -864,13 +867,16 @@ fn push_matching_lines(
     path: &Path,
     archived: bool,
     query: &str,
-    lines: &[String],
+    lines: &[Option<String>],
     hits: &mut Vec<SearchHit>,
     seen: &mut HashSet<(PathBuf, usize)>,
 ) {
     for (index, line) in lines.iter().enumerate() {
         let line_number = index + 1;
-        if line.contains(query) && seen.insert((path.to_path_buf(), line_number)) {
+        if let Some(line) = line
+            && line.contains(query)
+            && seen.insert((path.to_path_buf(), line_number))
+        {
             push_search_hit(path, archived, line_number, line.clone(), hits);
         }
     }
@@ -1575,6 +1581,52 @@ mod tests {
             }
         }))
         .expect("match json")
+    }
+
+    #[test]
+    fn an_empty_query_does_not_match_a_skipped_record() {
+        let home = tempfile::tempdir().unwrap();
+        crate::history::with_test_orca_home(home.path(), |_| {
+            let root = sessions_dir();
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("compat.jsonl");
+            let meta = serde_json::to_string(&SessionRecord::Meta(crate::history::create_meta(
+                home.path(),
+                "mock",
+                None,
+                "searchable session",
+            )))
+            .unwrap();
+            let skipped = r#"{"type":"future.note","ignorable":true}"#;
+            let message = r#"{"type":"conversation.message","message":{"role":"user","content":"after skipped record"}}"#;
+            let lines = [meta.as_str(), "", skipped, message];
+            fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+            let mut hits = Vec::new();
+            search_root_in_process(&root, false, "", &mut hits, &mut HashSet::new()).unwrap();
+            assert_eq!(
+                hits.iter().map(|hit| hit.line_number).collect::<Vec<_>>(),
+                [1, 2, 4]
+            );
+
+            let mut collector = RipgrepSearchCollector::new();
+            for (index, line) in lines.iter().enumerate() {
+                let frame = match_line(&path, line, index + 1);
+                collector.push(orca_tools::process::BoundedLine {
+                    bytes: &frame,
+                    observed_bytes: frame.len(),
+                    omitted_bytes: 0,
+                });
+            }
+            assert_eq!(
+                collector
+                    .matches
+                    .iter()
+                    .map(|hit| hit.line_number)
+                    .collect::<Vec<_>>(),
+                [1, 2, 4]
+            );
+        });
     }
 
     #[test]

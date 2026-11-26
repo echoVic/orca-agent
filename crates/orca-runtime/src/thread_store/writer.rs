@@ -45,8 +45,8 @@ pub(crate) const MAX_SESSION_LINE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) struct SessionScan {
     pub records: Vec<SessionRecord>,
     /// Decoded JSONL lines retained only up to the same record/line bounds.
-    /// Search uses these snippets instead of opening the source a second time.
-    pub lines: Vec<String>,
+    /// Skipped records have no snippet. Blank lines keep their own slots.
+    pub lines: Vec<Option<String>>,
     pub health: StoredSessionHealth,
     pub health_issue: Option<StoredSessionHealthIssue>,
     pub source_fingerprint: Option<String>,
@@ -446,21 +446,28 @@ fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionSca
         }
     };
     let mut scan = SessionScan::new(path);
+    let mut last_searchable_line = 0;
     while let Some(record) = reader.next() {
         let Ok(record) = record else {
             break;
         };
-        if matches!(record, SessionRecord::Ignorable(_)) {
-            continue;
-        }
-        scan.records.push(record);
+        let skipped = matches!(record, SessionRecord::Ignorable(_));
         if collect_lines {
-            // Preserve physical line numbers, including blank JSONL lines.
+            let line_number = reader.line_number as usize;
             scan.lines
-                .resize(reader.line_number as usize, String::new());
-            *scan.lines.last_mut().expect("current line") = reader.text().to_owned();
+                .resize_with(line_number - 1, || Some(String::new()));
+            scan.lines.push(if skipped {
+                None
+            } else {
+                last_searchable_line = line_number;
+                Some(reader.text().to_owned())
+            });
+        }
+        if !skipped {
+            scan.records.push(record);
         }
     }
+    scan.lines.truncate(last_searchable_line);
     if let Some(meta) = reader.newer_meta {
         scan.records.push(SessionRecord::Meta(meta));
     }
@@ -564,7 +571,7 @@ fn source_fingerprint(path: &Path) -> Option<String> {
     Some(orca_core::hex::lower(&hasher.finalize()))
 }
 
-pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<String>> {
+pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<Option<String>>> {
     let scan = scan_session_with_lines(path)?;
     match scan.health {
         StoredSessionHealth::Healthy
