@@ -256,9 +256,7 @@ impl McpClient {
             }
             let generation = transport.session_generation();
             let result = request(transport.as_ref());
-            if self.config.tool_loading == McpToolLoading::OnDemand
-                && transport.session_generation() != generation
-            {
+            if transport.session_generation() != generation {
                 let tools = list_transport_tools(
                     &self.config,
                     &self.server_name,
@@ -491,7 +489,9 @@ impl McpClient {
             transport::connect_with_credentials(config, self.credentials_path.clone())
         })?;
         let initialize_result = transport.initialize_or_cancel(should_cancel)?;
-        let tools = if config.tool_loading == McpToolLoading::OnDemand {
+        let tools = if config.tool_loading == McpToolLoading::OnDemand
+            || transport.session_generation() != 0
+        {
             Some(list_transport_tools(
                 config,
                 &self.server_name,

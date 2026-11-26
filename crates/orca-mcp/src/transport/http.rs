@@ -15,7 +15,7 @@ use reqwest::header::{ACCEPT, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use orca_core::capability::CapabilityReceipt;
-use orca_core::mcp_types::{McpServerConfig, McpToolLoading};
+use orca_core::mcp_types::McpServerConfig;
 
 use crate::auth::{AuthAttempt, RemoteAuth, is_auth_required};
 use crate::legacy_sse::LegacySseTransport;
@@ -69,7 +69,6 @@ pub(super) struct StreamableHttpTransport {
     auth: Arc<RemoteAuth>,
     session: Mutex<HttpSession>,
     session_generation: AtomicU64,
-    renew_tool_calls: bool,
     next_id: Mutex<u64>,
     client: reqwest::blocking::Client,
     startup_timeout: Duration,
@@ -178,7 +177,6 @@ impl StreamableHttpTransport {
             auth,
             session: Mutex::new(HttpSession::default()),
             session_generation: AtomicU64::new(0),
-            renew_tool_calls: config.tool_loading != McpToolLoading::OnDemand,
             next_id: Mutex::new(1),
             client: crate::http::blocking_client().map_err(|error| {
                 format!(
@@ -547,10 +545,7 @@ impl StreamableHttpTransport {
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, String> {
         let first = self.stream_request(method, params.clone(), timeout, handler, should_cancel);
-        if method == "tools/call"
-            && !self.renew_tool_calls
-            && first.as_ref().is_err_and(HttpRequestError::ended_session)
-        {
+        if method == "tools/call" && first.as_ref().is_err_and(HttpRequestError::ended_session) {
             self.renew_session()?;
             return Err(format!(
                 "MCP server '{}' renewed its session. Review its current tools and submit the tool call again.",
@@ -2960,13 +2955,13 @@ mod tests {
 
     #[test]
     fn an_expired_http_session_is_reinitialized_once() {
-        // The server ends session s1 as soon as it starts. Both request paths
-        // start session s2 and send the request once more.
+        // The server ends session s1 as soon as it starts. A tool call returns
+        // to the caller after renewal, while a tool listing retries once.
         let (server, transport) = expiring_http_session(vec!["s1"]);
-        let result = transport
+        let error = transport
             .call_tool("echo", json!({"text": "again"}))
-            .expect("tool call in the new session");
-        assert_eq!(result["content"][0]["text"], "again");
+            .unwrap_err();
+        assert!(error.contains("submit the tool call again"), "{error}");
         assert_eq!(
             server.session_trail(),
             [
@@ -2975,7 +2970,6 @@ mod tests {
                 "tools/call s1",
                 "initialize",
                 "notifications/initialized s2",
-                "tools/call s2"
             ]
         );
 
@@ -3007,14 +3001,41 @@ mod tests {
         // Ended again straight away: one retry, then an error naming the server.
         let (server, transport) = expiring_http_session(vec!["s1", "s2"]);
         let error = transport
-            .call_tool("echo", json!({"text": "again"}))
-            .expect_err("a second 404 must fail the call");
+            .list_tools(None)
+            .expect_err("a second 404 must fail the listing");
         assert!(
             error.contains("MCP server 'expiring'") && error.contains("404 Not Found"),
             "unexpected error: {error}"
         );
         assert_eq!(server.requests_for("initialize").len(), 2);
-        assert_eq!(server.requests_for("tools/call").len(), 2);
+        assert_eq!(server.requests_for("tools/list").len(), 2);
+    }
+
+    #[test]
+    fn eager_tools_refresh_when_http_renews_a_session() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            sessions: vec!["s1", "s2"],
+            renew_tools_on_call: true,
+            ..Default::default()
+        });
+        let registry = crate::initialize_registry(&[streamable_http_config("docs", &server)], None);
+        assert!(registry.wait_for_startup(&|| false));
+        let echo = registry.resolve_agent_tool("mcp__docs__echo").unwrap();
+        let error = registry.call_tool(&echo, json!({})).unwrap_err();
+        assert!(error.contains("submit the tool call again"), "{error}");
+        assert_eq!(server.requests_for("tools/call").len(), 1);
+        assert!(registry.resolve_agent_tool("mcp__docs__echo").is_none());
+        let search = registry.resolve_agent_tool("mcp__docs__search").unwrap();
+        assert!(
+            registry
+                .call_tool(&search, json!({"text":"new request"}))
+                .is_ok()
+        );
+        assert!(
+            server
+                .session_trail()
+                .ends_with(&["tools/list s2".into(), "tools/call s2".into()])
+        );
     }
 
     #[test]

@@ -261,7 +261,7 @@ impl ChildAgentLoopSetup {
         request: &ChildAgentRequest,
         cwd: &Path,
     ) {
-        if self.mcp_registry.has_on_demand_servers() {
+        if self.mcp_registry.agent_tools_can_change_during_turn() {
             let mut provider_config = child_provider_config(
                 config,
                 request,

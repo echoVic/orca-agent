@@ -155,6 +155,7 @@ struct McpRegistryInner {
     /// The tools of every server, in config order.
     tools: Vec<McpTool>,
     lookup: HashMap<String, McpToolRef>,
+    renewed_tool_list: bool,
     /// Problems with the config itself, such as a server without a name.
     errors: Vec<String>,
     /// Where a connection looks for a stored OAuth login.
@@ -684,12 +685,10 @@ pub(crate) fn list_transport_tools(
         page_generation = Some(current);
         Ok(page)
     })?;
-    if config.tool_loading == McpToolLoading::OnDemand {
-        if spans_sessions {
-            listing.tools.clear();
-        }
-        listing.session_generation = page_generation.filter(|generation| *generation != 0);
+    if spans_sessions {
+        listing.tools.clear();
     }
+    listing.session_generation = page_generation.filter(|generation| *generation != 0);
     Ok(listing)
 }
 
@@ -1310,8 +1309,9 @@ impl McpRegistry {
         }
     }
 
-    pub fn has_on_demand_servers(&self) -> bool {
-        self.read().servers.iter().any(McpServerEntry::is_on_demand)
+    pub fn agent_tools_can_change_during_turn(&self) -> bool {
+        let inner = self.read();
+        inner.renewed_tool_list || inner.servers.iter().any(McpServerEntry::is_on_demand)
     }
 
     /// Tool definitions paired with whether their schema is deferred for this agent.
@@ -1723,9 +1723,6 @@ impl McpRegistry {
     }
 
     fn refresh_reconnected_tools(&self, server: &str, client: &Arc<McpClient>) {
-        if client.config.tool_loading != McpToolLoading::OnDemand {
-            return;
-        }
         let mut inner = self.write();
         if !inner
             .clients
@@ -1737,6 +1734,7 @@ impl McpRegistry {
         if let Some(index) = inner.servers.iter().position(|entry| entry.name == server)
             && let Some(tools) = client.take_reconnected_tools()
         {
+            inner.renewed_tool_list = true;
             inner.replace_tools(index, tools);
             inner.index_tools();
             drop(inner);
