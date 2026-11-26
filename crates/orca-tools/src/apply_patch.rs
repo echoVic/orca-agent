@@ -12,6 +12,11 @@ use crate::file_admission::{
 };
 use crate::resolve_workspace_path;
 
+const MAX_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_OPERATIONS: usize = 100;
+const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MATCH_WORK: usize = 256 * 1024 * 1024;
+
 #[derive(Debug)]
 pub(crate) struct PatchError(String);
 
@@ -59,6 +64,9 @@ pub(crate) enum HunkLine {
 }
 
 pub(crate) fn parse_patch(input: &str) -> Result<Patch, PatchError> {
+    if input.len() > MAX_INPUT_BYTES {
+        return Err("patch input exceeds 1 MiB".into());
+    }
     let lines: Vec<_> = input.lines().collect();
     let start = lines.iter().position(|line| !line.trim().is_empty());
     let end = lines.iter().rposition(|line| !line.trim().is_empty());
@@ -72,6 +80,9 @@ pub(crate) fn parse_patch(input: &str) -> Result<Patch, PatchError> {
     let mut body = lines[start + 1..end].iter().copied().peekable();
     let mut ops = Vec::new();
     while let Some(line) = body.next() {
+        if ops.len() == MAX_OPERATIONS {
+            return Err("patch exceeds 100 operations".into());
+        }
         let op = (|| {
             if let Some(path) = line.strip_prefix("*** Add File: ") {
                 let path = parse_path(path)?;
@@ -151,6 +162,12 @@ fn parse_hunk<'a>(
     if lines.is_empty() {
         return Err("hunk has no lines");
     }
+    if lines
+        .iter()
+        .all(|line| matches!(line, HunkLine::Context(_)))
+    {
+        return Err("hunk has no additions or removals");
+    }
     let end_of_file = body.next_if_eq(&"*** End of File").is_some();
     Ok(Hunk {
         context_hint,
@@ -192,6 +209,11 @@ fn preflight_or_cancel(
     let root = cwd
         .canonicalize()
         .map_err(|error| PatchError(format!("cannot resolve workspace: {error}")))?;
+    let mut retained = 0;
+    let mut matching = MatchBudget {
+        remaining: MAX_MATCH_WORK,
+        should_cancel,
+    };
     let mut seen = HashSet::new();
     let mut ops = Vec::with_capacity(patch.ops.len());
     for (index, op) in patch.ops.iter().enumerate() {
@@ -228,7 +250,7 @@ fn preflight_or_cancel(
                 }
                 PatchOp::Update { hunks, .. } => {
                     let before = read_existing(&target, should_cancel)?;
-                    let after = apply_hunks(&before, hunks)?;
+                    let after = apply_hunks(&before, hunks, &mut matching)?;
                     let counts = hunks.iter().flat_map(|hunk| &hunk.lines).fold(
                         (0, 0),
                         |(added, removed), line| match line {
@@ -244,6 +266,11 @@ fn preflight_or_cancel(
                 && after.len() > MAX_EDIT_FILE_BYTES
             {
                 return Err(format!("result exceeds {MAX_EDIT_FILE_BYTES} bytes"));
+            }
+            retained +=
+                before.as_ref().map_or(0, String::len) + after.as_ref().map_or(0, String::len);
+            if retained > MAX_RETAINED_BYTES {
+                return Err("patch before-and-after text exceeds 64 MiB".into());
             }
             Ok(PlannedOp {
                 target,
@@ -379,18 +406,22 @@ fn read_existing(
     })
 }
 
-fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, String> {
+fn apply_hunks(
+    original: &str,
+    hunks: &[Hunk],
+    budget: &mut MatchBudget<'_>,
+) -> Result<String, String> {
     if hunks.is_empty() {
         return Ok(original.to_owned());
     }
     let source: Vec<_> = original.lines().collect();
     let mut result = Vec::new();
     let mut cursor = 0;
+    let mut trailing_blank_insertion = false;
     for (index, hunk) in hunks.iter().enumerate() {
         let start = if let Some(hint) = &hunk.context_hint {
-            find_match(&source[cursor..], &[hint.as_str()], false)
+            find_match(&source, cursor, &[hint.as_str()], false, budget)
                 .map_err(|reason| format!("hunk {} hint: {reason}", index + 1))?
-                + cursor
                 + 1
         } else {
             cursor
@@ -410,20 +441,26 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, String> {
                 start
             }
         } else {
-            find_match(&source[start..], &old, hunk.end_of_file)
+            find_match(&source, start, &old, hunk.end_of_file, budget)
                 .map_err(|reason| format!("hunk {}: {reason}", index + 1))?
-                + start
         };
-        result.extend_from_slice(&source[cursor..offset]);
+        if cursor < offset {
+            trailing_blank_insertion = false;
+            result.extend_from_slice(&source[cursor..offset]);
+        }
         cursor = offset;
         for line in &hunk.lines {
             match line {
                 HunkLine::Context(_) => {
+                    trailing_blank_insertion = false;
                     result.push(source[cursor]);
                     cursor += 1;
                 }
                 HunkLine::Remove(_) => cursor += 1,
-                HunkLine::Add(text) => result.push(text),
+                HunkLine::Add(text) => {
+                    trailing_blank_insertion = text.is_empty();
+                    result.push(text);
+                }
             }
         }
     }
@@ -435,34 +472,86 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, String> {
         "\n"
     };
     let mut updated = result.join(ending);
-    if !result.is_empty() && (original.is_empty() || original.ends_with('\n')) {
+    if !result.is_empty()
+        && (original.is_empty()
+            || original.ends_with('\n')
+            || (cursor == source.len() && trailing_blank_insertion))
+    {
         updated.push_str(ending);
     }
     Ok(updated)
 }
 
-fn find_match(source: &[&str], old: &[&str], end_of_file: bool) -> Result<usize, &'static str> {
+struct MatchBudget<'a> {
+    remaining: usize,
+    should_cancel: &'a dyn Fn() -> bool,
+}
+
+impl MatchBudget<'_> {
+    fn compare(&mut self, actual: &str, expected: &str) -> Result<(), &'static str> {
+        if (self.should_cancel)() {
+            return Err("patch cancelled");
+        }
+        // Trimming can scan both strings, so charge input bytes as well as comparisons.
+        let work = 16 + actual.len() + expected.len();
+        self.remaining = self
+            .remaining
+            .checked_sub(work)
+            .ok_or("patch matching work limit exceeded")?;
+        Ok(())
+    }
+}
+
+fn find_match(
+    source: &[&str],
+    start: usize,
+    old: &[&str],
+    end_of_file: bool,
+    budget: &mut MatchBudget<'_>,
+) -> Result<usize, &'static str> {
     let last = source
         .len()
         .checked_sub(old.len())
+        .filter(|last| *last >= start)
         .ok_or("context was not found")?;
-    let first = if end_of_file { last } else { 0 };
-    for normalize in [|line| line, str::trim_end, str::trim] as [fn(&str) -> &str; 3] {
-        let mut matches = (first..=last).filter(|&offset| {
-            source[offset..offset + old.len()]
-                .iter()
-                .zip(old)
-                .all(|(actual, expected)| normalize(actual) == normalize(expected))
-        });
-        if let Some(offset) = matches.next() {
-            return if matches.next().is_some() {
-                Err("context matched multiple locations")
-            } else {
-                Ok(offset)
-            };
+    let first = if end_of_file { last } else { start };
+    let normalizers: [fn(&str) -> &str; 3] = [|line| line, str::trim_end, str::trim];
+    for (level, normalize) in normalizers.into_iter().enumerate() {
+        let mut found = None;
+        for offset in first..=last {
+            if lines_match(&source[offset..], old, normalize, budget)?
+                && found.replace(offset).is_some()
+            {
+                return Err("context matched multiple locations");
+            }
+        }
+        if let Some(offset) = found {
+            if level > 0 {
+                for earlier in 0..start {
+                    if lines_match(&source[earlier..], old, normalizers[0], budget)? {
+                        return Err("ambiguous context: exact match before the current position");
+                    }
+                }
+            }
+            return Ok(offset);
         }
     }
     Err("context was not found")
+}
+
+fn lines_match(
+    source: &[&str],
+    old: &[&str],
+    normalize: fn(&str) -> &str,
+    budget: &mut MatchBudget<'_>,
+) -> Result<bool, &'static str> {
+    for (actual, expected) in source.iter().zip(old) {
+        budget.compare(actual, expected)?;
+        if normalize(actual) != normalize(expected) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[derive(serde::Deserialize)]
@@ -475,6 +564,10 @@ fn parse_request(request: &ToolRequest) -> Result<Patch, PatchError> {
         .raw_arguments
         .as_deref()
         .ok_or("missing patch arguments")?;
+    // A JSON escape can occupy six bytes per decoded byte.
+    if raw.len() > 6 * MAX_INPUT_BYTES + 1024 {
+        return Err("patch input exceeds 1 MiB".into());
+    }
     let args: PatchArgs = serde_json::from_str(raw)
         .map_err(|error| PatchError(format!("invalid patch arguments: {error}")))?;
     parse_patch(&args.input)
@@ -1043,6 +1136,103 @@ mod tests {
                 .to_string()
                 .contains("multiple locations")
         );
+    }
+
+    #[test]
+    fn patch_preserves_an_explicit_blank_line() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a"), "x").unwrap();
+        let result = execute(
+            &request("*** Update File: a\n@@\n-x\n+\n*** End of File"),
+            dir.path(),
+            || false,
+        );
+        assert_eq!(result.status, orca_core::tool_types::ToolStatus::Completed);
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"\n");
+    }
+
+    #[test]
+    fn patch_rejects_context_only_hunks() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a"), "context\r\nlast\n").unwrap();
+        let result = execute(
+            &request("*** Update File: a\n@@\n context"),
+            dir.path(),
+            || false,
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("no additions or removals")
+        );
+        assert_eq!(
+            fs::read(dir.path().join("a")).unwrap(),
+            b"context\r\nlast\n"
+        );
+    }
+
+    #[test]
+    fn patch_rejects_a_forward_whitespace_match_after_an_exact_match() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a"), "x\nmarker\n  x\n").unwrap();
+        let error = plan(
+            "*** Update File: a\n@@\n-marker\n+new\n@@\n-x\n+replacement",
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exact match before"));
+    }
+
+    #[test]
+    fn patch_limits_input_and_operation_count() {
+        let dir = TempDir::new().unwrap();
+        let oversized = request(&format!("*** Add File: a\n+{}", "a".repeat(1024 * 1024)));
+        let too_many = request(
+            &(0..101)
+                .map(|i| format!("*** Add File: a{i}\n+x"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        for (req, message) in [(oversized, "1 MiB"), (too_many, "100 operations")] {
+            let result = execute(&req, dir.path(), || false);
+            assert!(result.error.as_deref().unwrap().contains(message));
+            assert_eq!(dir.path().read_dir().unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn patch_limits_retained_text_before_writing() {
+        let dir = TempDir::new().unwrap();
+        let mut body = String::from("*** Add File: staged\n+x");
+        let text = format!("first\n{}", "x".repeat(12 * 1024 * 1024));
+        for file in ["a", "b", "c"] {
+            fs::write(dir.path().join(file), &text).unwrap();
+            body.push_str(&format!("\n*** Update File: {file}\n@@\n-first\n+new"));
+        }
+        let result = execute(&request(&body), dir.path(), || false);
+        assert!(result.error.as_deref().unwrap().contains("64 MiB"));
+        assert!(!dir.path().join("staged").exists());
+    }
+
+    #[test]
+    fn patch_limits_matching_work_before_writing() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a"), "abc\n".repeat(50_000)).unwrap();
+        let body = format!(
+            "*** Add File: staged\n+x\n*** Update File: a\n@@\n{}-never\n+new",
+            " abc\n".repeat(500)
+        );
+        let result = execute(&request(&body), dir.path(), || false);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("matching work limit")
+        );
+        assert!(!dir.path().join("staged").exists());
     }
 
     #[test]
