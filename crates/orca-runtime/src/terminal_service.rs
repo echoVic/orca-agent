@@ -852,6 +852,7 @@ fn run_terminal_supervisor(mut state: TerminalServiceState, receiver: Receiver<T
                     .retain(|completion| !task_ids.contains(&completion.task_id));
             }
             Ok(TerminalCommand::ReadCompletions { drain, response }) => {
+                let _ = state.enforce_deadlines();
                 let _ = state.reap();
                 let completions = if drain {
                     state.completions.drain(..).collect()
@@ -2550,6 +2551,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&handle.task_id]
         );
+    }
+
+    #[test]
+    fn reading_completions_reports_an_overdue_exit_as_a_deadline_stop() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (sink, inbox) = ShellTaskEndSink::channel();
+        let mut state =
+            TerminalServiceState::new(TaskRegistry::new("boundary-deadline".into()), Some(sink));
+        let handle = start_gated_command(&mut state, cwd.path());
+        state.sessions.get_mut(&handle.id).unwrap().deadline =
+            Some((Instant::now(), "caller timeout_ms"));
+        state.manager.write_stdin(&handle.id, "finish\n").unwrap();
+        wait_for_process_exits(&mut state, 1);
+
+        let (sender, receiver) = mpsc::channel();
+        let (response, snapshot) = mpsc::sync_channel(1);
+        sender
+            .send(TerminalCommand::ReadCompletions {
+                drain: false,
+                response,
+            })
+            .unwrap();
+        drop(sender);
+        run_terminal_supervisor(state, receiver);
+
+        let notices = snapshot.recv().unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].task_id, handle.task_id);
+        assert_eq!(notices[0].status, "failed", "{notices:?}");
+        let ends = inbox.take();
+        assert_eq!(ends.len(), 1, "{ends:?}");
+        assert_eq!(ends[0].task_id, handle.task_id);
+        assert!(ends[0].deadline_reached, "{ends:?}");
     }
 
     #[test]
