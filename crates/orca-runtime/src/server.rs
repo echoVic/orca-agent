@@ -2920,8 +2920,11 @@ mod tests {
 
     fn test_command_argv(script: &str) -> Vec<String> {
         if cfg!(windows) {
+            // `-NoProfile` for the reason the Unix branch is not a login
+            // shell; ssc's `platform_command` passes it too.
             vec![
                 "pwsh.exe".to_string(),
+                "-NoProfile".to_string(),
                 "-Command".to_string(),
                 script.to_string(),
             ]
@@ -3734,7 +3737,9 @@ enabled = true
                 test_command_exec_request(
                     "cmd-deny",
                     "curl --noproxy '' -sS -D - -o /dev/null http://blocked.orca.invalid/ || true",
-                    json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
+                    // Liveness guard only (see the allow test below): the asserted
+                    // behavior is the policy denial error, not the timeout.
+                    json!({"permissionProfile": "limited-network", "timeoutMs": 60000}),
                 )
                 .into_bytes(),
             );
@@ -3784,7 +3789,9 @@ enabled = true
                 test_command_exec_request(
                     "cmd-allowlist",
                     "curl --noproxy '' -sS -D - -o /dev/null http://other.orca.invalid/ || true",
-                    json!({"permissionProfile": "limited-network", "timeoutMs": 5000}),
+                    // Liveness guard only (see the allow test below): the asserted
+                    // behavior is the allowlist block header, not the timeout.
+                    json!({"permissionProfile": "limited-network", "timeoutMs": 60000}),
                 )
                 .into_bytes(),
             );
@@ -4875,9 +4882,12 @@ enabled = true
                 "cmd-allow",
                 &format!("curl --noproxy '' -sS http://127.0.0.1:{port}/"),
                 // The timeout is a liveness guard, not the behavior under test:
-                // under full-suite parallelism the in-process policy proxy can
-                // legitimately take longer than a few seconds to serve curl, and
-                // a 5s kill removes the completed event these tests assert.
+                // a kill removes the completed event these tests assert. The 5s
+                // kills once seen under full-suite load came from the fixture's
+                // login shell reading the host's profile (see
+                // `test_command_argv`), not from the policy proxy, which serves
+                // this curl in about 0.4s; a CPU-saturated machine can still
+                // push the whole command past 5s.
                 json!({"permissionProfile": "limited-network", "timeoutMs": 60000}),
             );
             let input = Cursor::new(request.into_bytes());
