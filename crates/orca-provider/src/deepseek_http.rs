@@ -18,7 +18,10 @@ use orca_core::tool_types::{ToolName, ToolRequest};
 use crate::ProviderConfig;
 use crate::context::render_internal_context;
 use crate::http_client::RetryBudget;
-use crate::tool_schema::{deepseek_strict_tools_schema_for_endpoint, deepseek_tools_schema};
+use crate::tool_schema::{
+    DEEPSEEK_MAX_TOOLS, deepseek_strict_tools_schema_for_endpoint, deepseek_tools_schema,
+    limit_tools_by_name,
+};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 // 免费/第三方兼容端点示例（通过 ORCA_BASE_URL 或 config.toml base_url 配置）：
@@ -27,7 +30,6 @@ pub(crate) const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 //   本地 Ollama:  "http://localhost:11434/v1"
 // 注意：第三方端点通常不支持 /beta strict 模式，请勿加 /beta 后缀
 pub(crate) const DEFAULT_MODEL: &str = FLASH_MODEL;
-const DEEPSEEK_MAX_TOOLS: usize = 128;
 const EMPTY_RESPONSE_RETRIES: usize = 1;
 const STREAM_INTEGRITY_RETRIES: usize = 1;
 const EMPTY_RESPONSE_ERROR: &str = "response did not contain content or tool calls";
@@ -1039,12 +1041,14 @@ pub(crate) fn deepseek_primary_request_tools(config: &ProviderConfig) -> Vec<Val
 }
 
 fn cap_tools_for_deepseek(mut tools: Vec<Value>) -> Vec<Value> {
-    if tools.len() > DEEPSEEK_MAX_TOOLS {
-        eprintln!(
-            "orca: warning: DeepSeek supports at most {DEEPSEEK_MAX_TOOLS} tools; truncating {} advertised tools",
-            tools.len()
+    let removed = limit_tools_by_name(&mut tools, DEEPSEEK_MAX_TOOLS, |tool| {
+        tool["function"]["name"].as_str().unwrap_or_default()
+    });
+    if !removed.is_empty() {
+        tracing::warn!(
+            left_out = removed.len(),
+            "DeepSeek supports at most {DEEPSEEK_MAX_TOOLS} tools; some tools were left out"
         );
-        tools.truncate(DEEPSEEK_MAX_TOOLS);
     }
     tools
 }
@@ -3652,13 +3656,55 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_tool_cap_keeps_orca_tools_before_mcp_tools() {
+        let builtins = [
+            "apply_patch",
+            "computer",
+            "edit",
+            "find",
+            "git_status",
+            "glob",
+            "grep",
+            "list_files",
+            "read_file",
+            "run_script",
+            "shell",
+            "skill",
+            "subagent",
+            "task_create",
+            "task_list",
+            "task_wait",
+            "update_plan",
+            "web_fetch",
+            "web_search",
+            "write_file",
+        ];
+        let mut names = builtins.map(str::to_owned).to_vec();
+        names.extend((0..120).map(|i| format!("mcp__x__t{i:03}")));
+        names.sort();
+        let tools = names
+            .iter()
+            .map(|name| serde_json::json!({"function": {"name": name}}))
+            .collect();
+        let capped = cap_tools_for_deepseek(tools);
+        let kept = capped
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(kept.len(), 128);
+        assert!(builtins.iter().all(|name| kept.contains(name)));
+        assert!(kept.is_sorted());
+    }
+
+    #[test]
     fn deepseek_tools_are_capped_at_api_limit() {
         let tools = (0..(DEEPSEEK_MAX_TOOLS + 5))
             .map(|index| {
                 serde_json::json!({
                     "type": "function",
                     "function": {
-                        "name": format!("tool_{index}"),
+                        "name": format!("tool_{index:03}"),
                         "description": "test",
                         "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
                     }

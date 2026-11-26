@@ -184,7 +184,13 @@ struct McpServerEntry {
     /// How it stood when its first connection ended, or the registry closed
     /// first ([`McpRegistryInner::note_startup_ends`]). `None` until then,
     /// and never changed after.
-    startup: Option<McpServerStatus>,
+    startup: Option<McpServerStartup>,
+}
+
+#[derive(Clone)]
+struct McpServerStartup {
+    status: McpServerStatus,
+    tool_names: Vec<String>,
 }
 
 impl McpServerEntry {
@@ -230,7 +236,14 @@ impl McpRegistryInner {
     fn note_startup_ends(&mut self) {
         for server in &mut self.servers {
             if server.startup.is_none() && server.state != McpServerState::Starting {
-                server.startup = Some(server.status());
+                server.startup = Some(McpServerStartup {
+                    status: server.status(),
+                    tool_names: server
+                        .tools
+                        .iter()
+                        .map(|tool| tool.schema_name.clone())
+                        .collect(),
+                });
             }
         }
     }
@@ -240,7 +253,12 @@ impl McpRegistryInner {
     fn startup_statuses(&self) -> Option<Vec<McpServerStatus>> {
         self.servers
             .iter()
-            .map(|server| server.startup.clone())
+            .map(|server| {
+                server
+                    .startup
+                    .as_ref()
+                    .map(|startup| startup.status.clone())
+            })
             .collect()
     }
 
@@ -836,6 +854,26 @@ impl McpRegistry {
     /// the hand-over.
     pub fn startup_statuses(&self) -> Option<Vec<McpServerStatus>> {
         self.read().startup_statuses()
+    }
+
+    /// The tool names from the servers' first connections, or the current names
+    /// while startup is still in progress.
+    pub fn startup_tool_names(&self) -> Vec<String> {
+        let inner = self.read();
+        if !inner.servers.is_empty() && inner.servers.iter().all(|server| server.startup.is_some())
+        {
+            return inner
+                .servers
+                .iter()
+                .filter_map(|server| server.startup.as_ref())
+                .flat_map(|startup| startup.tool_names.iter().cloned())
+                .collect();
+        }
+        inner
+            .tools
+            .iter()
+            .map(|tool| tool.schema_name.clone())
+            .collect()
     }
 
     /// Waits until no server is [`McpServerState::Starting`], each having

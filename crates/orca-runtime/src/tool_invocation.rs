@@ -9,7 +9,9 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
-use orca_provider::tool_schema::ProviderToolDefinition;
+use orca_provider::tool_schema::{
+    DEEPSEEK_MAX_TOOLS, ProviderToolDefinition, limit_tool_definitions,
+};
 use orca_tools::schema::{ToolPolicy, canonical_tool_definitions, normalize_tool_request};
 
 use crate::hooks::{HookOutcome, tool_request_with_hook_outcome};
@@ -209,6 +211,7 @@ pub(crate) fn provider_config_for_agent_loop(
         {
             tools.retain(|tool| tool.name != "computer");
         }
+        limit_tool_definitions(tools, DEEPSEEK_MAX_TOOLS);
     }
     let mut provider_config = ProviderConfig {
         api_key: config.api_key.clone(),

@@ -5,6 +5,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use orca_mcp::{McpChangeSubscription, McpRegistry, McpServerState};
+use orca_provider::tool_schema::DEEPSEEK_MAX_TOOLS;
 
 /// The warnings `registry` leaves once its servers' startup has ended, in
 /// its words: what is wrong with the config, and then, server by server in
@@ -17,7 +18,8 @@ use orca_mcp::{McpChangeSubscription, McpRegistry, McpServerState};
 /// ([`McpRegistry::startup_statuses`]), however long ago, not as they stand:
 /// a reconnect that failed since was told to whoever asked for it, in the
 /// words of `/mcp`, and is no failure of startup. Called before the startup
-/// has ended, it reads them as they stand.
+/// has ended, it reads them as they stand. Tools that exceed DeepSeek's
+/// limit are reported after the individual server warnings.
 pub fn mcp_startup_warnings(registry: &McpRegistry) -> Vec<String> {
     let mut warnings = registry.config_errors();
     let statuses = registry
@@ -36,6 +38,18 @@ pub fn mcp_startup_warnings(registry: &McpRegistry) -> Vec<String> {
             // The login it needs, or what it left out when it started.
             _ => warnings.extend(server.errors),
         }
+    }
+    let mut tool_names = registry.startup_tool_names();
+    let offered = tool_names.len();
+    let builtin = orca_tools::registry::default_tool_registry().iter().count();
+    let available = DEEPSEEK_MAX_TOOLS.saturating_sub(builtin);
+    if offered > available {
+        tool_names.sort_unstable();
+        let left_out = offered - available;
+        let first_three_names = tool_names[available..][..left_out.min(3)].join(", ");
+        warnings.push(format!(
+            "MCP servers offer {offered} tools, but only {available} fit beside Orca's own {builtin} tools within DeepSeek's limit of {DEEPSEEK_MAX_TOOLS}; {left_out} are left out of requests, starting with {first_three_names}. Use disabled_tools or enabled_tools in an MCP server's configuration to choose which are sent."
+        ));
     }
     warnings
 }
@@ -184,6 +198,44 @@ mod tests {
             startup_timeout_ms: Some(15_000),
             ..Default::default()
         }
+    }
+
+    fn offered_tools(count: usize) -> McpRegistry {
+        McpRegistry::from_tools_for_test(
+            (0..count)
+                .rev()
+                .map(|i| orca_core::mcp_types::McpTool {
+                    server: "docs".to_string(),
+                    name: format!("t{i:03}"),
+                    schema_name: format!("mcp__docs__t{i:03}"),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    read_only: true,
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn startup_warns_when_mcp_tools_do_not_fit() {
+        let available = 128 - orca_tools::registry::default_tool_registry().iter().count();
+        let warnings = mcp_startup_warnings(&offered_tools(available + 4));
+
+        assert!(
+            matches!(warnings.as_slice(), [warning]
+            if warning.starts_with("MCP servers offer ")
+                && warning.contains("4 are left out of requests")
+                && warning.contains("disabled_tools")
+                && warning.contains(&format!("mcp__docs__t{available:03}, mcp__docs__t{:03}, mcp__docs__t{:03}", available + 1, available + 2))),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn startup_does_not_warn_when_mcp_tools_fit() {
+        let available = 128 - orca_tools::registry::default_tool_registry().iter().count();
+
+        assert!(mcp_startup_warnings(&offered_tools(available)).is_empty());
     }
 
     /// A stdio server reconnected after its first connection ended is
