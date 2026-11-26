@@ -8256,6 +8256,7 @@ impl ThreadActor {
                         .map(|(interaction_id, _)| interaction_id)
                         .collect::<Vec<_>>(),
                 );
+                active.generation.user_interrupted = true;
                 Self::cancel_active_task_tree(active);
                 Ok(Self::committed_jsonl_turn_control(
                     request_id,

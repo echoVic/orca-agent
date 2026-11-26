@@ -1875,23 +1875,28 @@ fn project_surface_event<W: JsonlSurfaceOutput>(
                         item.content.as_str().to_string()
                     }
                 });
+                let mut payload = serde_json::json!({
+                    "identity": {
+                        "turn_id": projector.turn_id.to_string(),
+                        "item_ids": {
+                            "conversation_item_id": message_id.to_string(),
+                            "plan_item_id": plan_id.to_string(),
+                            "reasoning_item_id": reasoning_id.to_string(),
+                        },
+                    },
+                    "assistant_content": (!assistant_content.is_empty()).then_some(assistant_content),
+                    "assistant_reasoning": assistant_reasoning,
+                    "tool_calls": [],
+                });
+                if let SurfaceEvent::Assistant(AssistantPatch::ResponseKept { reason, .. }) = event
+                {
+                    payload["cut_short"] = serde_json::json!(reason);
+                }
                 write_runtime_event(
                     writer,
                     "model.response.completed",
                     &projector.thread_id,
-                    serde_json::json!({
-                        "identity": {
-                            "turn_id": projector.turn_id.to_string(),
-                            "item_ids": {
-                                "conversation_item_id": message_id.to_string(),
-                                "plan_item_id": plan_id.to_string(),
-                                "reasoning_item_id": reasoning_id.to_string(),
-                            },
-                        },
-                        "assistant_content": (!assistant_content.is_empty()).then_some(assistant_content),
-                        "assistant_reasoning": assistant_reasoning,
-                        "tool_calls": [],
-                    }),
+                    payload,
                 )?;
                 return Ok(false);
             }
@@ -2943,6 +2948,78 @@ mod tests {
                 "{approval}"
             );
             assert_eq!(approval["payload"]["action"], "computer", "{approval}");
+        });
+    }
+
+    #[test]
+    fn jsonl_response_completion_reports_the_cutoff_reason() {
+        crate::history::with_redirected_orca_home("jsonl-reply-cutoff", |_| {
+            use orca_core::conversation::CutShort;
+
+            let host = RuntimeHost::start().unwrap();
+            let cwd = tempdir().unwrap();
+            let mut config = test_run_config(cwd.path().to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let thread = host.start_thread(config, "reply cutoff").unwrap();
+            let surface = thread.surface();
+            let AttachResult::FreshAttached { attachment } =
+                surface.attach_fresh(FreshAttachRequest {
+                    request_id: SurfaceRequestId::new(),
+                    role: SurfaceAttachmentRole::Tui,
+                    requested_capabilities: BTreeSet::from([SurfaceCapability::ReadSnapshot]),
+                    interaction_capabilities: BTreeSet::new(),
+                })
+            else {
+                panic!("attach projection");
+            };
+            let turn_id = TurnId::new();
+            let response = crate::surface::SurfaceCompletedModelResponse {
+                response_id: crate::surface::UuidV7::try_from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                )
+                .unwrap(),
+                turn_id: turn_id.clone(),
+                message_item: None,
+                reasoning_item: None,
+                plan_item: None,
+                tool_calls: Vec::new(),
+            };
+            let mut projector = JsonlSurfaceProjector::new(
+                surface,
+                thread.thread_id().to_string(),
+                turn_id,
+                crate::runtime_host::test_support::computer_approval_view("fixture")
+                    .fence
+                    .operation_id,
+                attachment.client,
+                None,
+                Vec::new(),
+            );
+            for (reason, expected) in [
+                (Some(CutShort::Interrupted), Some("interrupted")),
+                (Some(CutShort::OutputLimit), Some("output_limit")),
+                (None, None),
+            ] {
+                let patch = match reason {
+                    Some(reason) => AssistantPatch::ResponseKept {
+                        response: response.clone(),
+                        reason,
+                    },
+                    None => AssistantPatch::ResponseCompleted {
+                        response: response.clone(),
+                    },
+                };
+                let mut output = SharedTurnOutput::default();
+                project_surface_event(&mut projector, &SurfaceEvent::Assistant(patch), &mut output)
+                    .unwrap();
+                let event: serde_json::Value = serde_json::from_slice(&output.bytes()).unwrap();
+                assert_eq!(event["type"], "model.response.completed");
+                assert_eq!(
+                    event["payload"].get("cut_short"),
+                    expected.map(serde_json::Value::from).as_ref()
+                );
+            }
+            host.shutdown().unwrap();
         });
     }
 
