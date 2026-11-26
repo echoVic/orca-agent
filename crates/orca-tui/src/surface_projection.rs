@@ -1383,6 +1383,15 @@ impl TuiSurfaceProjection {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn project_provider_retry(
+        &self,
+        operation_id: &SurfaceOperationId,
+        retry: Option<orca_core::provider_types::ProviderRetry>,
+    ) -> Option<TuiEvent> {
+        (self.focused_operation.as_ref() == Some(operation_id))
+            .then_some(TuiEvent::ProviderRetry(retry))
+    }
+
     pub(crate) fn focus_operation(&mut self, operation_id: SurfaceOperationId) {
         self.focused_operation = Some(operation_id);
     }

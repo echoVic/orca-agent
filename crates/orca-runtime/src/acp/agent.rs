@@ -2493,6 +2493,7 @@ fn drain_surface_prompt(
                     break terminal;
                 }
             }
+            SurfaceSubscriptionItem::ProviderRetry { .. } => continue,
             SurfaceSubscriptionItem::Gap { .. } => {
                 return reconcile_lost_subscription(&mut prepared, "gap");
             }

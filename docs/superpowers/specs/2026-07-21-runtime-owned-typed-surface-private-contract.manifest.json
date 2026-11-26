@@ -795,7 +795,7 @@
   "source_facts": [
     [
       "SessionStarted",
-      149,
+      150,
       "recorded",
       "Session",
       "Materialized",
@@ -811,7 +811,7 @@
     ],
     [
       "TurnStarted",
-      151,
+      152,
       "recorded",
       "Operation",
       "AgentLoopTurnStarted",
@@ -828,7 +828,7 @@
     ],
     [
       "AssistantReasoningDelta",
-      153,
+      154,
       "transient",
       "Assistant",
       "Delta",
@@ -844,7 +844,7 @@
     ],
     [
       "AssistantMessageDelta",
-      155,
+      156,
       "transient",
       "Assistant",
       "Delta",
@@ -860,7 +860,7 @@
     ],
     [
       "ModelResponseCompleted",
-      157,
+      158,
       "recorded",
       "Assistant",
       "ResponseCompleted",
@@ -878,7 +878,7 @@
     ],
     [
       "ProviderReplayUpdated",
-      159,
+      160,
       "transient",
       "Context",
       "ProviderReplayHealth",
@@ -894,7 +894,7 @@
     ],
     [
       "UsageUpdated",
-      161,
+      162,
       "transient",
       "Usage",
       "SurfaceUsageSnapshot",
@@ -910,7 +910,7 @@
     ],
     [
       "ContextUpdated",
-      163,
+      164,
       "transient",
       "Context",
       "SurfaceContextSnapshot",
@@ -926,7 +926,7 @@
     ],
     [
       "ContextCompactionStarted",
-      165,
+      166,
       "recorded",
       "Context",
       "CompactionRunning",
@@ -942,7 +942,7 @@
     ],
     [
       "ContextCompacted",
-      167,
+      168,
       "recorded",
       "Context",
       "CompactionCompleted",
@@ -959,7 +959,7 @@
     ],
     [
       "ModelRouted",
-      169,
+      170,
       "recorded",
       "Operation",
       "ModelRouteSelected",
@@ -975,7 +975,7 @@
     ],
     [
       "ApprovalRequested",
-      171,
+      172,
       "recorded",
       "Interaction",
       "Requested",
@@ -991,7 +991,7 @@
     ],
     [
       "ApprovalResolved",
-      173,
+      174,
       "recorded",
       "Interaction",
       "Resolved",
@@ -1007,7 +1007,7 @@
     ],
     [
       "ToolCallProgress",
-      175,
+      176,
       "transient",
       "Tool",
       "ArgumentsProgress",
@@ -1023,7 +1023,7 @@
     ],
     [
       "ToolOutputDelta",
-      177,
+      178,
       "transient",
       "Tool",
       "OutputDelta",
@@ -1039,7 +1039,7 @@
     ],
     [
       "ToolCallRequested",
-      179,
+      180,
       "recorded",
       "Tool",
       "Requested",
@@ -1055,7 +1055,7 @@
     ],
     [
       "ToolCallCompleted",
-      181,
+      182,
       "recorded",
       "Tool",
       "Completed",
@@ -1072,7 +1072,7 @@
     ],
     [
       "PlanUpdated",
-      183,
+      184,
       "recorded",
       "Plan",
       "SurfacePlanSnapshot",
@@ -1088,7 +1088,7 @@
     ],
     [
       "GoalCreated",
-      185,
+      186,
       "recorded",
       "Goal",
       "Created",
@@ -1104,7 +1104,7 @@
     ],
     [
       "GoalRunStarted",
-      187,
+      188,
       "recorded",
       "Goal",
       "RunStarted",
@@ -1120,7 +1120,7 @@
     ],
     [
       "GoalTurnStarted",
-      189,
+      190,
       "recorded",
       "Goal",
       "OuterTurnStarted",
@@ -1136,7 +1136,7 @@
     ],
     [
       "GoalIntentRequested",
-      191,
+      192,
       "recorded",
       "Goal",
       "IntentRequested",
@@ -1152,7 +1152,7 @@
     ],
     [
       "GoalIntentAcknowledged",
-      193,
+      194,
       "recorded",
       "Goal",
       "IntentAcknowledged",
@@ -1168,7 +1168,7 @@
     ],
     [
       "GoalTurnFinished",
-      195,
+      196,
       "recorded",
       "Goal",
       "OuterTurnFinished",
@@ -1185,7 +1185,7 @@
     ],
     [
       "GoalVerificationCompleted",
-      197,
+      198,
       "recorded",
       "Goal",
       "VerificationCompleted",
@@ -1201,7 +1201,7 @@
     ],
     [
       "GoalTransitioned",
-      199,
+      200,
       "recorded",
       "Goal",
       "Transitioned",
@@ -1217,7 +1217,7 @@
     ],
     [
       "GoalContinuationAdmitted",
-      201,
+      202,
       "recorded",
       "Goal",
       "ContinuationDecided",
@@ -1233,7 +1233,7 @@
     ],
     [
       "GoalContinuationRejected",
-      203,
+      204,
       "recorded",
       "Goal",
       "ContinuationDecided",
@@ -1249,7 +1249,7 @@
     ],
     [
       "GoalPaused",
-      205,
+      206,
       "recorded",
       "Goal",
       "Paused",
@@ -1265,7 +1265,7 @@
     ],
     [
       "GoalRecovered",
-      207,
+      208,
       "recorded",
       "Goal",
       "Recovered",
@@ -1281,7 +1281,7 @@
     ],
     [
       "GoalCompleted",
-      209,
+      210,
       "recorded",
       "Goal",
       "Completed",
@@ -1298,7 +1298,7 @@
     ],
     [
       "SubagentStarted",
-      211,
+      212,
       "recorded",
       "Subagent",
       "Started",
@@ -1314,7 +1314,7 @@
     ],
     [
       "SubagentProgress",
-      213,
+      214,
       "transient",
       "Subagent",
       "Progress",
@@ -1330,7 +1330,7 @@
     ],
     [
       "SubagentCompleted",
-      215,
+      216,
       "recorded",
       "Subagent",
       "Completed",
@@ -1346,7 +1346,7 @@
     ],
     [
       "AgentContinuationCheckpointed",
-      217,
+      218,
       "recorded",
       "Subagent",
       "ContinuationCheckpointed",
@@ -1363,7 +1363,7 @@
     ],
     [
       "AgentContinuationSuspended",
-      219,
+      220,
       "recorded",
       "Subagent",
       "ContinuationSuspended",
@@ -1380,7 +1380,7 @@
     ],
     [
       "AgentContinuationResumed",
-      221,
+      222,
       "recorded",
       "Subagent",
       "ContinuationResumed",
@@ -1397,7 +1397,7 @@
     ],
     [
       "AgentContinuationOrphanReconciled",
-      223,
+      224,
       "recorded",
       "Subagent",
       "ContinuationOrphanReconciled",
@@ -1414,7 +1414,7 @@
     ],
     [
       "AgentContinuationIndeterminate",
-      225,
+      226,
       "recorded",
       "Subagent",
       "ContinuationIndeterminate",
@@ -1431,7 +1431,7 @@
     ],
     [
       "WorkflowStarted",
-      227,
+      228,
       "recorded",
       "Workflow",
       "Started",
@@ -1447,7 +1447,7 @@
     ],
     [
       "WorkflowResumed",
-      229,
+      230,
       "recorded",
       "Workflow",
       "Resumed",
@@ -1463,7 +1463,7 @@
     ],
     [
       "WorkflowPhaseStarted",
-      231,
+      232,
       "recorded",
       "Workflow",
       "PhaseStarted",
@@ -1479,7 +1479,7 @@
     ],
     [
       "WorkflowPhaseCompleted",
-      233,
+      234,
       "recorded",
       "Workflow",
       "PhaseCompleted",
@@ -1495,7 +1495,7 @@
     ],
     [
       "WorkflowAgentStarted",
-      235,
+      236,
       "recorded",
       "Workflow",
       "AgentStarted",
@@ -1511,7 +1511,7 @@
     ],
     [
       "WorkflowAgentCached",
-      237,
+      238,
       "recorded",
       "Workflow",
       "AgentCached",
@@ -1527,7 +1527,7 @@
     ],
     [
       "WorkflowAgentCompleted",
-      239,
+      240,
       "recorded",
       "Workflow",
       "AgentCompleted",
@@ -1543,7 +1543,7 @@
     ],
     [
       "WorkflowAgentFailed",
-      241,
+      242,
       "recorded",
       "Workflow",
       "AgentFailed",
@@ -1559,7 +1559,7 @@
     ],
     [
       "WorkflowPaused",
-      243,
+      244,
       "recorded",
       "Workflow",
       "Paused",
@@ -1575,7 +1575,7 @@
     ],
     [
       "WorkflowStopped",
-      245,
+      246,
       "recorded",
       "Workflow",
       "Stopped",
@@ -1591,7 +1591,7 @@
     ],
     [
       "WorkflowCompleted",
-      247,
+      248,
       "recorded",
       "Workflow",
       "Completed",
@@ -1607,7 +1607,7 @@
     ],
     [
       "WorkflowFailed",
-      249,
+      250,
       "recorded",
       "Workflow",
       "Failed",
@@ -1623,7 +1623,7 @@
     ],
     [
       "WorkflowResultAvailable",
-      251,
+      252,
       "recorded",
       "Workflow",
       "ResultReady",
@@ -1639,7 +1639,7 @@
     ],
     [
       "WorkflowTasksUpdated",
-      253,
+      254,
       "transient",
       "Task",
       "Reconciled",
@@ -1655,7 +1655,7 @@
     ],
     [
       "TaskStatusUpdated",
-      255,
+      256,
       "transient",
       "Task",
       "Upserted",
@@ -1671,7 +1671,7 @@
     ],
     [
       "VerificationStarted",
-      257,
+      258,
       "recorded",
       "Operation",
       "VerificationStarted",
@@ -1687,7 +1687,7 @@
     ],
     [
       "VerificationCompleted",
-      259,
+      260,
       "recorded",
       "Operation",
       "VerificationCompleted",
@@ -1703,7 +1703,7 @@
     ],
     [
       "Error",
-      261,
+      262,
       "recorded",
       "None",
       "TypedSourceRequired",
@@ -1717,7 +1717,7 @@
     ],
     [
       "SessionCompleted",
-      263,
+      264,
       "recorded",
       "Operation",
       "Terminal",
@@ -1733,7 +1733,7 @@
     ],
     [
       "SessionRewind",
-      265,
+      266,
       "recorded",
       "None",
       "TypedSourceRequired",
@@ -7954,7 +7954,7 @@
     }
   ],
   "phase_0a_manifest_invariants": [
-    "source_facts has exactly 59 unique variants matching EventType at baseline",
+    "source_facts has exactly 59 unique variants matching EventType source facts",
     "closed_inventory.current_tui_user_actions has exactly 57 unique variants matching UserAction at baseline",
     "thread_commands has exactly 22 unique names matching closed_inventory.surface_commands",
     "host_commands has exactly 24 unique names matching closed_inventory.surface_host_commands including ControlJsonlTurn",
@@ -10581,7 +10581,7 @@
   },
   "artifact_bundle": {
     "private_contract_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-private-contract.md",
-    "private_contract_sha256": "13bec2ea091e5aae3be40d1a47dd05c7982a6fc3346f9e6244aae4a0d50502d4",
+    "private_contract_sha256": "37a8c709334e13ec13f93d0e0f8461a1fa8ae393b54ce0d0215d9c0483bd4acc",
     "parent_design_path": "docs/superpowers/specs/2026-07-21-runtime-owned-typed-surface-contract-design.md",
     "parent_design_commit": "89979d6062246ec4a9b98032ee62cc6d45c1e3ba",
     "parent_design_blob": "bf80af4ce1fde3607af3fd75874abddfaf79b450",
@@ -10836,6 +10836,7 @@
     ],
     "subscription_item_variants": [
       "Batch",
+      "ProviderRetry",
       "Gap",
       "Sealed"
     ],
@@ -10851,6 +10852,7 @@
     "cursor_boundary": "cursor.next_seq must equal a complete batch boundary; cursor inside a batch is InvalidCursor",
     "replay_unit": "Vec<SurfaceCommitBatch> only",
     "subscription_unit": "SurfaceSubscriptionItem.Batch(SurfaceCommitBatch)",
+    "live_only_subscription_items": ["ProviderRetry"],
     "replay_interval": "[from.next_seq, head.next_seq); complete contiguous batches only; empty replay requires from == head"
   },
   "jsonl_vector_sources": {

@@ -306,6 +306,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         )
         .with_runtime(child_cost_tracker, runtime.cancel, task_registry)
         .with_permission_handler(runtime.permission_handler.as_deref())
+        .with_provider_response_ingress(runtime.provider_response_ingress)
         .with_execution(
             &mut background_workflows,
             request.workflow_ipc.as_ref(),
