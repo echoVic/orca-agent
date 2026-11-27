@@ -1916,22 +1916,22 @@ impl AgentContinuationStore {
                     }
                 }
 
-                if let Some(digest) = record.fork_prefix_ref {
-                    let association =
-                        fork_child_path(root, &self.parent_session_id, &record.continuation_id);
-                    match read_fork_child(&association)? {
-                        Some(existing) if existing != digest => {
-                            return Err(corrupt_record(
-                                "fork prefix association conflicts with the new continuation",
-                            ));
-                        }
-                        Some(_) => {}
-                        None => write_json_pretty(
-                            &association,
-                            &digest,
-                            "write fork prefix association",
-                        )?,
+                // With neither an index entry nor a record, any association
+                // belongs to a creation that did not finish.
+                let association =
+                    fork_child_path(root, &self.parent_session_id, &record.continuation_id);
+                match fs::remove_file(&association) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(persistence_io_error(
+                            "remove orphan fork association",
+                            &error,
+                        ));
                     }
+                }
+                if let Some(digest) = record.fork_prefix_ref {
+                    write_json_pretty(&association, &digest, "write fork prefix association")?;
                 }
                 write_json_pretty(&record_path, &record, "write continuation record")?;
                 index.insert(
@@ -4802,30 +4802,34 @@ mod tests {
         }
     }
 
-    fn create_test_fork(registry: &TaskRegistry) -> PreparedContinuation {
+    fn test_continuation_input(registry: &TaskRegistry) -> CreateContinuationInput {
         let child = registry.create_subagent_with_parent(
             "inspect evidence".into(),
             Some("general".into()),
             None,
         );
+        CreateContinuationInput {
+            continuation_id: Some(AgentContinuationId::new()),
+            parent_task_id: None,
+            task_id: child.id,
+            prompt_id: AgentPromptId::new(),
+            compatibility: ContinuationCompatibility {
+                subagent_type: "general".into(),
+                frozen_agent: None,
+                model: Some(orca_core::model::PRO_MODEL.into()),
+                isolation: SubagentIsolation::None,
+                effective_cwd: std::env::temp_dir().display().to_string(),
+                worktree: None,
+                compatibility_hash: Sha256Digest::new([7; 32]),
+            },
+        }
+    }
+
+    fn create_test_fork(registry: &TaskRegistry) -> PreparedContinuation {
         ChildAgentCoordinator::new(registry.clone())
             .unwrap()
             .create_with_fork(
-                CreateContinuationInput {
-                    continuation_id: None,
-                    parent_task_id: None,
-                    task_id: child.id,
-                    prompt_id: AgentPromptId::new(),
-                    compatibility: ContinuationCompatibility {
-                        subagent_type: "general".into(),
-                        frozen_agent: None,
-                        model: Some(orca_core::model::PRO_MODEL.into()),
-                        isolation: SubagentIsolation::None,
-                        effective_cwd: std::env::temp_dir().display().to_string(),
-                        worktree: None,
-                        compatibility_hash: Sha256Digest::new([7; 32]),
-                    },
-                },
+                test_continuation_input(registry),
                 Some(
                     registry
                         .continuation_store()
@@ -4835,6 +4839,27 @@ mod tests {
                 ),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn a_failed_fork_creation_does_not_bind_a_later_fresh_child() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let input = test_continuation_input(&registry);
+        let id = input.continuation_id.clone().unwrap();
+        let coordinator = ChildAgentCoordinator::new(registry).unwrap();
+        let digest = coordinator
+            .store
+            .store_fork_prefix(test_fork_prefix())
+            .unwrap();
+        let association = fork_child_path(root.path(), "parent", &id);
+        // A failed creation can leave the association before the record is written.
+        write_json_pretty(&association, &digest, "write test association").unwrap();
+
+        coordinator.create(input).unwrap();
+        let restored = coordinator.prepared(id.as_str()).unwrap();
+        assert!(restored.fork_prefix.is_none());
+        assert!(!association.exists());
     }
 
     #[test]
