@@ -1546,6 +1546,95 @@ mod tests {
     }
 
     #[test]
+    fn revoked_trust_rebuilds_the_prompt_without_the_old_instructions() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust};
+
+        with_orca_home(|_| {
+            let cwd = tempdir().unwrap();
+            std::fs::create_dir(cwd.path().join(".git")).unwrap();
+            std::fs::write(cwd.path().join("AGENTS.md"), "Follow the deploy runbook.").unwrap();
+            set_trust(cwd.path(), TrustLevel::Trusted).unwrap();
+            let (_, prompt, transcript) = record_prompt_session(cwd.path());
+            assert!(prompt.contains("Follow the deploy runbook."));
+            set_trust(cwd.path(), TrustLevel::Untrusted).unwrap();
+
+            let id = transcript.meta.session_id.clone();
+            for mode in [
+                HistoryMode::Resume(id.clone()),
+                HistoryMode::Fork(id.clone()),
+            ] {
+                let session = reopen_prompt_session(cwd.path(), mode, transcript.clone());
+                assert!(prompt_section_notices(&session).is_empty());
+                assert!(session.conversation.messages.iter().all(|message| {
+                    !message
+                        .content_str()
+                        .unwrap_or_default()
+                        .contains("Follow the deploy runbook.")
+                }));
+            }
+        });
+    }
+
+    #[test]
+    fn revoked_nested_trust_rebuilds_the_prompt_without_the_delivered_instructions() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust};
+
+        with_orca_home(|home| {
+            let cwd = tempdir().unwrap();
+            let child = cwd.path().join("src");
+            std::fs::create_dir(&child).unwrap();
+            let touched = child.join("one.txt");
+            std::fs::write(&touched, "fixture").unwrap();
+            std::fs::write(child.join("AGENTS.md"), "Use the scoped runbook.").unwrap();
+            std::fs::write(home.join("AGENTS.md"), "Use the old global runbook.").unwrap();
+            set_trust(cwd.path(), TrustLevel::Trusted).unwrap();
+            let (path, _, transcript) = record_prompt_session(cwd.path());
+            let mut writer = SessionWriter::append_to_existing(path).unwrap();
+            let mut conversation = Conversation::new();
+            conversation
+                .nested_instructions
+                .pending_touches
+                .push((touched, false));
+            instructions::load_for_cwd(cwd.path())
+                .unwrap()
+                .append_nested_for_touches(&mut conversation, Some(&mut writer));
+            let batch = orca_provider::context::pending_context_message(&conversation).unwrap();
+            assert!(
+                batch
+                    .content_str()
+                    .unwrap()
+                    .contains("Use the scoped runbook.")
+            );
+            writer.append_message(&batch).unwrap();
+            drop(writer);
+
+            let id = transcript.meta.session_id;
+            let transcript = history::load_session(&id).unwrap();
+            set_trust(&child, TrustLevel::Untrusted).unwrap();
+            std::fs::write(home.join("AGENTS.md"), "Use the live global runbook.").unwrap();
+            for mode in [
+                HistoryMode::Resume(id.clone()),
+                HistoryMode::Fork(id.clone()),
+            ] {
+                let session = reopen_prompt_session(cwd.path(), mode, transcript.clone());
+                assert!(
+                    session.conversation.messages[0]
+                        .content_str()
+                        .unwrap()
+                        .contains("Use the live global runbook.")
+                );
+                assert!(prompt_section_notices(&session).is_empty());
+                assert!(session.conversation.messages.iter().all(|message| {
+                    !message
+                        .content_str()
+                        .unwrap_or_default()
+                        .contains("Use the scoped runbook.")
+                }));
+            }
+        });
+    }
+
+    #[test]
     fn a_removed_section_appends_the_no_longer_applies_note() {
         with_orca_home(|orca_home| {
             let cwd = tempdir().unwrap();

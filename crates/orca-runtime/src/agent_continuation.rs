@@ -970,6 +970,7 @@ impl StoredChildInternalContextFragment {
             origin,
             content: content.clone(),
             max_tokens,
+            instruction_scope: None,
         }
     }
 }

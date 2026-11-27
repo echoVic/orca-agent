@@ -4,8 +4,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use orca_core::conversation::{
-    Conversation, InternalContextKind, InternalContextOrigin, Message, NestedInstructionSource,
-    NestedInstructionVersion,
+    Conversation, InstructionScope, InternalContextKind, InternalContextOrigin, Message,
+    NestedInstructionSource, NestedInstructionVersion,
 };
 use sha2::{Digest, Sha256};
 
@@ -17,7 +17,7 @@ const CHAIN_BYTES: usize = 65_536;
 const BUDGET_NOTE: &str = "\n\n[Instruction budget: ";
 const ADDITIONAL: &str = "Additional instructions for ";
 const UPDATED: &str = "Updated instructions for ";
-const NESTED_CONTEXT: &str = "nested-project-instructions";
+pub(crate) const NESTED_CONTEXT: &str = "nested-project-instructions";
 const PROJECT_OPEN: &str = "<project-instructions>\n";
 const PROJECT_CLOSE: &str = "</project-instructions>";
 
@@ -32,11 +32,26 @@ pub struct ProjectInstructions {
 struct InstructionSection {
     source: PathBuf,
     content: String,
+    trusted_sources: Vec<PathBuf>,
 }
 
 impl ProjectInstructions {
     pub fn is_empty(&self) -> bool {
         self.sections.is_empty()
+    }
+
+    pub(crate) fn scope(&self, cwd: &Path) -> InstructionScope {
+        let mut sources = self
+            .sections
+            .iter()
+            .flat_map(|section| section.trusted_sources.iter().cloned())
+            .collect::<Vec<_>>();
+        sources.sort();
+        sources.dedup();
+        InstructionScope {
+            cwd: cwd.to_owned(),
+            sources,
+        }
     }
 
     pub fn to_system_prompt_block(&self) -> Option<String> {
@@ -87,7 +102,14 @@ fn load_for_cwd_with_home(
     {
         sections.push(InstructionSection {
             source: user_agents.clone(),
-            content: read_with_includes(&user_agents, &mut visited, orca_home_path)?,
+            content: read_with_includes(
+                &user_agents,
+                &mut visited,
+                orca_home_path,
+                None,
+                &mut Vec::new(),
+            )?,
+            trusted_sources: Vec::new(),
         });
     }
 
@@ -100,19 +122,25 @@ fn load_for_cwd_with_home(
     };
     let project_root = find_project_root(cwd).filter(|root| is_trusted(root));
     if let Some(project_root) = &project_root {
+        let home = orca_home_path.expect("trusted project has a configuration directory");
         let root_agents = project_root.join(INSTRUCTIONS_FILE);
-        if root_agents.is_file() {
+        let rules = sorted_markdown_files(&project_root.join(RULES_DIR))?;
+        for path in std::iter::once(root_agents).chain(rules) {
+            if !path.is_file() || !trusted_project_file(project_root, &path, home) {
+                continue;
+            }
+            let mut trusted_sources = Vec::new();
+            let content = read_with_includes(
+                &path,
+                &mut visited,
+                Some(project_root),
+                Some(home),
+                &mut trusted_sources,
+            )?;
             project_sections.push(InstructionSection {
-                source: root_agents.clone(),
-                content: read_with_includes(&root_agents, &mut visited, Some(project_root))?,
-            });
-        }
-
-        let rules_dir = project_root.join(RULES_DIR);
-        for rule in sorted_markdown_files(&rules_dir)? {
-            project_sections.push(InstructionSection {
-                source: rule.clone(),
-                content: read_with_includes(&rule, &mut visited, Some(project_root))?,
+                source: path,
+                content,
+                trusted_sources,
             });
         }
     }
@@ -138,7 +166,11 @@ fn load_for_cwd_with_home(
             }
             let source = scope.join(INSTRUCTIONS_FILE);
             if let Ok((content, _, _)) = read_nested_source(&source) {
-                project_sections.push(InstructionSection { source, content });
+                project_sections.push(InstructionSection {
+                    trusted_sources: vec![source.clone()],
+                    source,
+                    content,
+                });
             }
         }
     }
@@ -252,6 +284,27 @@ pub(crate) fn render_nested_record(identity: &NestedInstructionSource, content: 
     )
 }
 
+fn trusted_project_file(root: &Path, source: &Path, home: &Path) -> bool {
+    root.canonicalize()
+        .ok()
+        .zip(source.canonicalize().ok())
+        .is_some_and(|(root, source)| {
+            source.parent().is_some_and(|parent| {
+                orca_core::config::folder_trust::is_trusted_project_scope(&root, parent, home)
+            })
+        })
+}
+
+pub(crate) fn nested_scope_is_loaded(scope: &InstructionScope, cwd: &Path) -> bool {
+    cwd.canonicalize().is_ok_and(|cwd| cwd == scope.cwd)
+        && orca_core::home::orca_home().is_some_and(|home| {
+            scope.sources.iter().all(|source| {
+                trusted_source(&scope.cwd, source, &home)
+                    && read_nested_source(&scope.cwd.join(source)).is_ok()
+            })
+        })
+}
+
 fn trusted_source(workspace: &Path, source: &Path, home: &Path) -> bool {
     use std::path::Component;
     source
@@ -292,6 +345,13 @@ fn render_effective_chain(conversation: &mut Conversation, workspace: &Path, hom
     } else {
         Some(fit_nested_chain(&versions))
     };
+    let scope = InstructionScope {
+        cwd: workspace.to_owned(),
+        sources: versions
+            .iter()
+            .map(|version| version.identity.source.clone())
+            .collect(),
+    };
     conversation.replace_internal_context(
         NESTED_CONTEXT,
         InternalContextKind::ProjectInstructions,
@@ -299,6 +359,9 @@ fn render_effective_chain(conversation: &mut Conversation, workspace: &Path, hom
         block,
         CHAIN_BYTES,
     );
+    conversation
+        .internal_context
+        .set_instruction_scope(NESTED_CONTEXT, scope);
 }
 
 fn fit_nested_chain(versions: &[&NestedInstructionVersion]) -> String {
@@ -463,10 +526,14 @@ pub(crate) fn restore_nested_state(
         .nested_instructions
         .written_sources
         .extend(written_sources.iter().cloned());
-    for version in versions
-        .iter()
-        .filter(|version| version.identity.workspace == cwd)
-    {
+    let home = orca_core::home::orca_home();
+    for version in versions.iter().filter(|version| {
+        version.identity.workspace == cwd
+            && home.as_deref().is_some_and(|home| {
+                trusted_source(&cwd, &version.identity.source, home)
+                    && read_nested_source(&cwd.join(&version.identity.source)).is_ok()
+            })
+    }) {
         conversation
             .nested_instructions
             .written_sources
@@ -643,9 +710,11 @@ fn read_with_includes(
     path: &Path,
     visited: &mut HashSet<PathBuf>,
     allowed_root: Option<&Path>,
+    trust_home: Option<&Path>,
+    trusted_sources: &mut Vec<PathBuf>,
 ) -> io::Result<String> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if !visited.insert(canonical) {
+    if !visited.insert(canonical.clone()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("cyclic @include in {}", path.display()),
@@ -653,6 +722,9 @@ fn read_with_includes(
     }
 
     let content = fs::read_to_string(path)?;
+    if trust_home.is_some() {
+        trusted_sources.push(canonical);
+    }
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut output = String::new();
     let mut seen_includes = HashSet::new();
@@ -677,8 +749,20 @@ fn read_with_includes(
                     ));
                 }
             }
+            if let Some((root, home)) = allowed_root.zip(trust_home)
+                && resolved.exists()
+                && !trusted_project_file(root, &resolved, home)
+            {
+                continue;
+            }
             if seen_includes.insert(resolved.clone()) {
-                let included = read_with_includes(&resolved, visited, allowed_root)?;
+                let included = read_with_includes(
+                    &resolved,
+                    visited,
+                    allowed_root,
+                    trust_home,
+                    trusted_sources,
+                )?;
                 output.push_str(included.trim());
                 output.push('\n');
             }

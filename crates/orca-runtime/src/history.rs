@@ -291,10 +291,50 @@ pub(crate) fn resume_conversation_in_cwd(
     system_prompt: String,
     active_cwd: &Path,
 ) -> Conversation {
-    let recorded_prompt = transcript.messages.first().filter(|message| {
-        message
-            .system_prompt_record()
-            .is_some_and(|record| !record.update && !record.sections.is_empty())
+    let restored = replay_compactions_for_resume(
+        &transcript.messages,
+        &transcript.compactions,
+        &transcript.summaries,
+    );
+    let mut loaded_sources = HashMap::new();
+    let prompt_sources_are_loaded = |message: &Message| {
+        message.system_prompt_record().is_none_or(|record| {
+            record.sections.iter().all(|section| {
+                if section.name != "project instructions" || section.text.is_none() {
+                    return true;
+                }
+                let Some(scope) = &section.instruction_scope else {
+                    return false;
+                };
+                scope.sources.is_empty()
+                    || ((scope.cwd == active_cwd
+                        || orca_core::config::folder_trust::is_trusted(active_cwd))
+                        && {
+                            let loaded =
+                                loaded_sources.entry(scope.cwd.clone()).or_insert_with(|| {
+                                    crate::instructions::load_for_cwd_or_default(&scope.cwd)
+                                        .scope(&scope.cwd)
+                                        .sources
+                                });
+                            scope
+                                .sources
+                                .iter()
+                                .all(|source| loaded.binary_search(source).is_ok())
+                        })
+            })
+        })
+    };
+    let instruction_messages_can_replay = restored.iter().all(|message| {
+        instruction_fragments_can_replay(message, active_cwd)
+            && crate::skill_context::should_replay_mention(message, active_cwd) != Some(false)
+    });
+    let prompt_can_replay =
+        instruction_messages_can_replay && restored.iter().all(prompt_sources_are_loaded);
+    let recorded_prompt = restored.first().filter(|message| {
+        prompt_can_replay
+            && message
+                .system_prompt_record()
+                .is_some_and(|record| !record.update && !record.sections.is_empty())
     });
     let mut conversation = Conversation::new();
     conversation.repeat_tool_streak = transcript
@@ -313,34 +353,32 @@ pub(crate) fn resume_conversation_in_cwd(
         &transcript.nested_instructions,
         &transcript.written_instruction_sources,
     );
-    let mut restored_messages = replay_compactions_for_resume(
-        &transcript.messages,
-        &transcript.compactions,
-        &transcript.summaries,
-    )
-    .into_iter()
-    // The leading prompt is already installed. Keep delivered context,
-    // instruction updates, truncation markers, notices and mentioned skills
-    // in their original places until compaction.
-    .filter(|message| {
-        if message.is_context_fragment_batch() || message.is_system_prompt_update() {
-            return true;
-        }
-        if let Some(replay) = crate::skill_context::should_replay_mention(message, active_cwd) {
-            return replay;
-        }
-        !matches!(
-            message,
-            Message::System {
-                content,
-                pinned: false,
-            ..
-            } if !content.starts_with(
-                "[Earlier conversation history was truncated to fit context window]"
-            ) && !is_delivered_notice(content)
-        )
-    })
-    .collect::<Vec<_>>();
+    let replay_prompt_updates = recorded_prompt.is_some();
+    let mut restored_messages = restored
+        .into_iter()
+        // Keep delivered context in its original position when its sources still apply.
+        .filter(|message| {
+            if message.is_context_fragment_batch() {
+                return instruction_fragments_can_replay(message, active_cwd);
+            }
+            if message.is_system_prompt_update() {
+                return replay_prompt_updates;
+            }
+            if let Some(replay) = crate::skill_context::should_replay_mention(message, active_cwd) {
+                return replay;
+            }
+            !matches!(
+                message,
+                Message::System {
+                    content,
+                    pinned: false,
+                ..
+                } if !content.starts_with(
+                    "[Earlier conversation history was truncated to fit context window]"
+                ) && !is_delivered_notice(content)
+            )
+        })
+        .collect::<Vec<_>>();
     normalize_tool_boundaries(&mut restored_messages);
     for message in restored_messages.iter() {
         conversation.messages.push(message.clone());
@@ -376,6 +414,30 @@ pub(crate) fn resume_conversation_in_cwd(
             .map(|record| record.summary.clone());
     }
     conversation
+}
+
+fn instruction_fragments_can_replay(message: &Message, cwd: &Path) -> bool {
+    let Message::System {
+        context_fragments, ..
+    } = message
+    else {
+        return true;
+    };
+    context_fragments
+        .iter()
+        .all(|change| match change.id.as_str() {
+            crate::instructions::NESTED_CONTEXT if change.digest.is_some() => change
+                .instruction_scope
+                .as_ref()
+                .is_some_and(|scope| crate::instructions::nested_scope_is_loaded(scope, cwd)),
+            orca_core::conversation::SKILLS_CONTEXT_FRAGMENT_ID if change.digest.is_some() => {
+                change
+                    .instruction_scope
+                    .as_ref()
+                    .is_some_and(|scope| crate::skill_context::catalog_scope_is_loaded(scope, cwd))
+            }
+            _ => true,
+        })
 }
 
 fn replay_compactions_for_resume(

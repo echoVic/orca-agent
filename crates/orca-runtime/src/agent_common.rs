@@ -181,8 +181,10 @@ fn build_agent_system_prompt_with_goal_and_tools(
     if let Some(block) = memory.and_then(MemoryBlock::to_system_prompt_block) {
         prompt.push("memory", format!("\n\n{block}"));
     }
-    if let Some(block) = instructions.and_then(ProjectInstructions::to_system_prompt_block) {
-        prompt.push("project instructions", format!("\n\n{block}"));
+    if let Some(instructions) = instructions
+        && let Some(block) = instructions.to_system_prompt_block()
+    {
+        prompt.push_instructions(format!("\n\n{block}"), instructions.scope(cwd));
     }
     if subagent_depth == 0 {
         prompt.push("delegation", format_subagent_guidance(delegation));

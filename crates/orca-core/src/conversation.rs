@@ -223,12 +223,22 @@ pub enum CutShort {
 pub struct ContextFragmentChange {
     pub id: String,
     pub digest: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_scope: Option<InstructionScope>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InstructionScope {
+    pub cwd: PathBuf,
+    pub sources: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SystemPromptSection {
     pub name: String,
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_scope: Option<InstructionScope>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -459,6 +469,8 @@ pub struct InternalContextFragment {
     pub origin: InternalContextOrigin,
     pub content: String,
     pub max_tokens: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_scope: Option<InstructionScope>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -500,6 +512,12 @@ impl InternalContext {
             *existing = fragment;
         } else {
             self.fragments.push(fragment);
+        }
+    }
+
+    pub fn set_instruction_scope(&mut self, id: &str, scope: InstructionScope) {
+        if let Some(fragment) = self.fragments.iter_mut().find(|fragment| fragment.id == id) {
+            fragment.instruction_scope = Some(scope);
         }
     }
 
@@ -804,6 +822,7 @@ impl Conversation {
             origin: InternalContextOrigin::Model,
             content,
             max_tokens: PLAN_CONTEXT_MAX_TOKENS,
+            instruction_scope: None,
         });
         self.internal_context.plan_age_turns = 0;
     }
@@ -906,6 +925,7 @@ impl Conversation {
                 origin,
                 content,
                 max_tokens: max_tokens.max(1),
+                instruction_scope: None,
             }),
             None => self.internal_context.remove(id),
         }

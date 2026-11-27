@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use orca_core::conversation::{Message, SystemPromptRecord, SystemPromptSection};
+use orca_core::conversation::{InstructionScope, Message, SystemPromptRecord, SystemPromptSection};
 use orca_core::history_redaction::redact_sensitive_text;
 use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
 
@@ -14,6 +14,15 @@ impl SystemPrompt {
         self.sections.push(SystemPromptSection {
             name: name.into(),
             text: Some(text.into()),
+            instruction_scope: None,
+        });
+    }
+
+    pub(crate) fn push_instructions(&mut self, text: String, scope: InstructionScope) {
+        self.sections.push(SystemPromptSection {
+            name: "project instructions".into(),
+            text: Some(text),
+            instruction_scope: Some(scope),
         });
     }
 
@@ -76,6 +85,7 @@ pub(crate) fn section_updates(history: &[Message], current: &Message) -> Vec<Mes
         .chain(previous.into_keys().map(|name| SystemPromptSection {
             name: name.to_owned(),
             text: None,
+            instruction_scope: None,
         }))
         .map(|section| {
             let name = &section.name;

@@ -659,16 +659,16 @@ fn pending_context_message_with_counter(
         .filter_map(|fragment| {
             let text =
                 truncate_text_to_token_limit(fragment.content.trim(), fragment.max_tokens, counter);
-            (!text.is_empty()).then_some((fragment.id, text))
+            (!text.is_empty()).then_some((fragment.id, text, fragment.instruction_scope))
         })
         .collect::<Vec<_>>();
     if let Some(catalog) = render_mcp_catalogs_with_counter(conversation, counter) {
-        current.push(("mcp".to_owned(), catalog));
+        current.push(("mcp".to_owned(), catalog, None));
     }
 
     let mut content = String::new();
     let mut changes = Vec::new();
-    for (id, text) in current {
+    for (id, text, instruction_scope) in current {
         let text = orca_core::history_redaction::redact_sensitive_text(&text);
         let digest = Sha256::digest(text.as_bytes()).into();
         if previous.remove(id.as_str()) == Some(digest) {
@@ -686,6 +686,7 @@ fn pending_context_message_with_counter(
         changes.push(ContextFragmentChange {
             id,
             digest: Some(digest),
+            instruction_scope,
         });
     }
     for id in previous.into_keys() {
@@ -696,6 +697,7 @@ fn pending_context_message_with_counter(
         changes.push(ContextFragmentChange {
             id: id.to_string(),
             digest: None,
+            instruction_scope: None,
         });
     }
     (!changes.is_empty()).then(|| Message::context_fragment_batch(content, changes))
