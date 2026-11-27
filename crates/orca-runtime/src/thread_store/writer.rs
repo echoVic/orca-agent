@@ -179,11 +179,31 @@ fn open_completion_history_file(path: &Path) -> io::Result<File> {
 }
 
 pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
+    append_record(path, record).map(|_| ())
+}
+
+fn append_record(path: &Path, record: &SessionRecord) -> io::Result<bool> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
     let _lock = acquire_file_lock(path)?;
+    if let Some(update) = boundary_section_update(record) {
+        let stored = redact_session_record(record);
+        let mut last = None;
+        for candidate in iter_records(path, HydrateImages::NotToolMessages)? {
+            let candidate = candidate?;
+            if let Some(previous) = boundary_section_update(&candidate)
+                && previous.resume_boundary == update.resume_boundary
+                && previous.sections[0].name == update.sections[0].name
+            {
+                last = Some(candidate);
+            }
+        }
+        if last.as_ref().and_then(boundary_section_update) == boundary_section_update(&stored) {
+            return Ok(false);
+        }
+    }
     let line = encode_record_line(path, record)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(&line)?;
@@ -202,7 +222,7 @@ pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn write_durable_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
@@ -738,8 +758,38 @@ pub(crate) fn read_transcript_until(
     })?;
     transcript_from_records(
         path,
-        iter_records(path, HydrateImages::NotToolMessages)?.take(count),
+        iter_records(path, HydrateImages::NotToolMessages)?
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                Ok(record)
+                    if index >= count
+                        && !boundary_section_update(&record).is_some_and(|update| {
+                            update.resume_boundary.as_deref() == Some(boundary_message_id)
+                        }) =>
+                {
+                    None
+                }
+                item => Some(item),
+            }),
     )
+}
+
+fn boundary_section_update(
+    record: &SessionRecord,
+) -> Option<&orca_core::conversation::SystemPromptRecord> {
+    match record {
+        SessionRecord::Message {
+            message:
+                StoredMessage::System {
+                    system_prompt: Some(update),
+                    ..
+                },
+            ..
+        } if update.update && update.resume_boundary.is_some() && update.sections.len() == 1 => {
+            Some(update)
+        }
+        _ => None,
+    }
 }
 
 /// A user message that a `/rewind` can target, in effective-history order.
@@ -2168,8 +2218,9 @@ impl SessionWriter {
             .conversation_records
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        write_record(&self.path, &record.as_session_record())?;
-        records.push(record);
+        if append_record(&self.path, &record.as_session_record())? {
+            records.push(record);
+        }
         Ok(())
     }
 

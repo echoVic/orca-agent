@@ -567,8 +567,15 @@ impl InteractiveSession {
         {
             conversation.compaction_system_prompt = Some(current_prompt.clone());
         }
-        let prompt_updates =
-            crate::system_prompt::section_updates(&conversation.messages, &current_prompt);
+        let resume_boundary = match &config.history_mode {
+            HistoryMode::ResumeAt { resume_at, .. } => Some(resume_at.as_str()),
+            _ => None,
+        };
+        let prompt_updates = crate::system_prompt::section_updates(
+            &conversation.messages,
+            &current_prompt,
+            resume_boundary,
+        );
         conversation.messages.extend(prompt_updates.iter().cloned());
         let usage_baseline = if matches!(
             config.history_mode,
@@ -1731,6 +1738,51 @@ mod tests {
                     .contains("Token: optional")
             );
             assert!(prompt_section_notices(&session).is_empty());
+        });
+    }
+
+    #[test]
+    fn resuming_twice_at_the_same_boundary_writes_one_notice() {
+        with_orca_home(|home| {
+            let cwd = tempdir().unwrap();
+            let agents = home.join("AGENTS.md");
+            std::fs::write(&agents, "Use the original runbook.").unwrap();
+            let (path, _, transcript) = record_prompt_session(cwd.path());
+            let boundary = std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                    (record["message"]["role"] == "user")
+                        .then(|| record["id"].as_str().unwrap().to_owned())
+                })
+                .unwrap();
+            let id = transcript.meta.session_id;
+            std::fs::write(&agents, "Use the replacement runbook.").unwrap();
+            for _ in 0..2 {
+                let resumed = reopen_prompt_session(
+                    cwd.path(),
+                    HistoryMode::ResumeAt {
+                        selector: id.clone(),
+                        resume_at: boundary.clone(),
+                    },
+                    history::load_session(&id).unwrap(),
+                );
+                assert_eq!(prompt_section_notices(&resumed).len(), 1);
+            }
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                raw.lines()
+                    .filter(|line| line.contains("Use the replacement runbook."))
+                    .count(),
+                1
+            );
+            let resumed = reopen_prompt_session(
+                cwd.path(),
+                HistoryMode::Resume(id.clone()),
+                history::load_session(&id).unwrap(),
+            );
+            assert_eq!(prompt_section_notices(&resumed).len(), 1);
         });
     }
 

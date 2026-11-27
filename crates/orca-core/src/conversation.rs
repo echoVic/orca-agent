@@ -249,6 +249,8 @@ pub struct SystemPromptSection {
 pub struct SystemPromptRecord {
     pub sections: Vec<SystemPromptSection>,
     pub update: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_boundary: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub redacted: bool,
 }

@@ -38,13 +38,18 @@ impl SystemPrompt {
             SystemPromptRecord {
                 sections: self.sections,
                 update: false,
+                resume_boundary: None,
                 redacted: false,
             },
         )
     }
 }
 
-pub(crate) fn section_updates(history: &[Message], current: &Message) -> Vec<Message> {
+pub(crate) fn section_updates(
+    history: &[Message],
+    current: &Message,
+    resume_boundary: Option<&str>,
+) -> Vec<Message> {
     let Some(record) = history.first().and_then(Message::system_prompt_record) else {
         return Vec::new();
     };
@@ -94,6 +99,7 @@ pub(crate) fn section_updates(history: &[Message], current: &Message) -> Vec<Mes
                 SystemPromptRecord {
                     sections: vec![section],
                     update: true,
+                    resume_boundary: resume_boundary.map(str::to_owned),
                     redacted: false,
                 },
             )
