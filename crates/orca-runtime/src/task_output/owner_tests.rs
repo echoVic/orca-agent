@@ -202,3 +202,20 @@ fn registry_archives_are_lazy_isolated_and_recovered_after_owner_death() {
     assert_eq!(third_store.tail(&live.id, 3).unwrap().combined, "ved");
     assert!(!home.path().join("shared/output/owner.lock").exists());
 }
+
+#[test]
+fn reading_dead_archive_does_not_require_sweep_metadata() {
+    let home = tempfile::tempdir().unwrap();
+    let open = || TaskRegistry::new_persistent("read".into(), home.path().into()).unwrap();
+    let first = open();
+    let task = first.create_shell("first".into(), "echo".into());
+    let store = TaskOutputStore::for_tasks(&first);
+    store
+        .register_shell("first", &task.id, false, false)
+        .unwrap();
+    store.append_stdout(&task.id, "saved").unwrap();
+    drop((store, first));
+    let reader = TaskOutputStore::for_tasks(&open());
+    std::fs::write(home.path().join("read/tasks.json"), b"{").unwrap();
+    assert_eq!(reader.tail(&task.id, 5).unwrap().combined, "saved");
+}

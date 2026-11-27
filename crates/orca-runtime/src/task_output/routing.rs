@@ -92,11 +92,7 @@ impl ArchiveRoute {
         Ok(archive)
     }
 
-    fn dead_archives(
-        &self,
-        entries: &[(String, PathBuf)],
-        remove_empty: bool,
-    ) -> io::Result<Vec<DeadArchive>> {
+    fn dead_archives(&self, entries: &[(String, PathBuf)]) -> io::Result<Vec<DeadArchive>> {
         let mut dead = Vec::new();
         if entries.is_empty() {
             return Ok(dead);
@@ -106,7 +102,7 @@ impl ArchiveRoute {
             if self.tasks.output_owner_alive(id) {
                 continue;
             }
-            if remove_empty && OutputArchive::remove_empty_directory(path).unwrap_or(false) {
+            if OutputArchive::remove_empty_directory(path).unwrap_or(false) {
                 continue;
             }
             let Ok(archive) = OutputArchive::existing(path, self.tasks.session_id(), false) else {
@@ -133,7 +129,7 @@ impl ArchiveRoute {
     pub(super) fn sweep(&self, limits: ArchiveLimits) -> io::Result<()> {
         let mut shells = 0usize;
         let mut bytes = 0usize;
-        for archive in self.dead_archives(&self.entries()?, true)? {
+        for archive in self.dead_archives(&self.entries()?)? {
             if archive.newest.is_some() {
                 shells = shells.saturating_add(archive.shells);
                 bytes = bytes.saturating_add(archive.bytes);
@@ -167,7 +163,7 @@ impl ArchiveRoute {
             }
         }
         let _lock = self.tasks.output_session_lock()?;
-        let entries = self.entries()?;
+        let mut entries = self.entries()?;
         for (_, path) in &entries {
             if let Ok(Some(archive)) = OutputArchive::cached(path) {
                 let result = read(&archive.lock().expect("output archive poisoned"), false);
@@ -176,9 +172,16 @@ impl ArchiveRoute {
                 }
             }
         }
-        for dead in self.dead_archives(&entries, false)? {
-            if let Ok(archive) = OutputArchive::existing(&dead.path, self.tasks.session_id(), false)
-            {
+        entries.retain(|(id, _)| !self.tasks.output_owner_alive(id));
+        entries.sort_by_cached_key(|(_, path)| {
+            std::cmp::Reverse(
+                fs::symlink_metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .ok(),
+            )
+        });
+        for (_, path) in entries {
+            if let Ok(archive) = OutputArchive::existing(&path, self.tasks.session_id(), false) {
                 let result = read(&archive, false);
                 if !matches!(&result, Err(error) if error.kind() == io::ErrorKind::NotFound) {
                     return result;
