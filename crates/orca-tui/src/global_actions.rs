@@ -118,21 +118,23 @@ pub(crate) fn quit_on_termination_signal(
 }
 
 fn turn_running(state: &AppState) -> bool {
-    matches!(
-        state.status,
-        AppStatus::Running
-            | AppStatus::Compacting
-            | AppStatus::WaitingApproval
-            | AppStatus::WaitingUserInput
-    ) || (state.conversation_target().task_id().is_some()
-        && matches!(
+    if state.conversation_target().task_id().is_some() {
+        return matches!(
             state.main_behind_child,
             Some(
                 SideParentStatus::Running
                     | SideParentStatus::NeedsApproval
                     | SideParentStatus::NeedsInput
             )
-        ))
+        );
+    }
+    matches!(
+        state.status,
+        AppStatus::Running
+            | AppStatus::Compacting
+            | AppStatus::WaitingApproval
+            | AppStatus::WaitingUserInput
+    )
 }
 
 #[cfg(test)]
@@ -300,6 +302,46 @@ mod tests {
             Some(ChatMessage::System { text, .. })
                 if text == "2 agents are still running. Press Ctrl+C again to quit and stop them."
         ));
+    }
+
+    #[test]
+    fn ctrl_c_on_a_running_agent_uses_idle_mains_quit_path() {
+        let (send, actions) = mpsc::unbounded();
+        let mut state = AppState::new(send.clone(), "test".into(), "mock".into(), "/tmp".into());
+        state.update(TuiEvent::ChildFocusChanged {
+            task_id: Some("kept".into()),
+        });
+        state.update(TuiEvent::BackgroundTasksUpdated(vec![agent_task(
+            "kept",
+            TaskStatus::Running,
+            Some("child"),
+        )]));
+        state.update(TuiEvent::SideParentStatusChanged(SideParentStatus::Idle));
+        state.set_status(AppStatus::Running);
+        let first =
+            handle_global_shortcut(GlobalShortcut::Cancel, &mut state, &send, || Ok(())).unwrap();
+        assert!(matches!(first, super::GlobalShortcutFlow::Continue));
+        assert!(actions.is_empty(), "idle main has no turn to interrupt");
+        assert!(
+            matches!(state.transcript.messages.last(),Some(ChatMessage::System{text,..}) if text=="1 agent is still running. Press Ctrl+C again to quit and stop it.")
+        );
+        let (screen, _display) = mpsc::unbounded();
+        let (mut dispatcher, commands) = crate::action_dispatcher::TuiActionDispatcher::spawn(
+            actions,
+            screen,
+            crate::operation_controller::TuiSurfaceTaskControl::isolated_for_test(),
+            4,
+            4,
+        )
+        .unwrap();
+        let second =
+            handle_global_shortcut(GlobalShortcut::Cancel, &mut state, &send, || Ok(())).unwrap();
+        assert!(matches!(second, super::GlobalShortcutFlow::Exit(130)));
+        assert!(matches!(
+            commands.recv_timeout(std::time::Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        dispatcher.shutdown().unwrap();
     }
 
     #[test]
