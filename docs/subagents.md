@@ -110,21 +110,43 @@ those started with `"isolation": "worktree"`, custom agent types, those under
 a finite parent budget, and those continued with `resume_from`. The rest of
 this section is about the others.
 
-A main turn waits for the subagents it started before it ends, so main is
-running while they run. In the TUI:
+Main normally waits for the subagents it starts before ending its turn.
+In the TUI:
 
-- A subagent's conversation can be opened while it runs: select its row under
-  the conversation with Shift+↑↓ and press Enter, or select it in the Agents
-  panel (`/agents`) and press Enter. The view shows the task it was given as
-  the first message, then its text, tool calls and results as they happen.
-  Esc returns to the main conversation and interrupts nothing.
-- A message cannot be sent to a subagent yet. Text submitted in its
-  conversation is handed back to the composer with `this is an agent's
-  conversation: return to the main conversation to send a message`.
+- Open a subagent while it runs or after it ends. Mark its row under the
+  conversation with Shift+↑↓ and press Enter, or open `/agents`, select its
+  row and press Enter. The hint reads `Enter open conversation`. The first
+  message is the task it was given. Its text, tool calls and results follow.
+  Esc returns to main and interrupts nothing. If the Agents panel, an expanded
+  list of agents, search, shortcuts help or a selection is open, Esc closes
+  that first. Press Esc again when the conversation is clear to return.
+- Under the subagent's conversation, `Main is running · Esc return` means
+  main is still working. If main needs approval or an answer, the line says
+  so. Under a finished agent it reads `Main is idle · Esc return` when main
+  is idle. The agent you open is marked. Shift+↑↓ moves the mark; Enter
+  opens the marked agent without going back to main. A nested agent's row
+  in this view opens the Agents panel instead.
+- Text sent to a running subagent goes back to the composer with
+  `this is an agent's conversation: return to the main conversation to send a message`.
+- A finished subagent's view ends with `This agent has finished. Its conversation is read-only.`
+  This also holds if it finished on screen or you opened it after a resume.
+  Text goes back to the composer with
+  `this agent has finished: return to the main conversation to send a message`.
+  If the conversation cannot be read, or another task continued it, you see
+  `This agent's conversation could not be loaded. Showing its last checkpoint.`
+  Only this task's checkpoint is shown. If there is none, you see just the
+  checkpoint and read-only notices.
+- Where main started its agents, it shows one launch line per batch: `Delegating to 1 agent` or
+  `Delegating to N agents in parallel`. Each agent gets one end line:
+  `Agent completed: <name>`, `Agent stopped: <name>`, `Agent cancelled: <name>`,
+  `Agent failed: <error>` or `Agent blocked: <error>` (the name if there is no
+  error). These lines belong to main wherever you were looking. They are
+  there when you return or resume. Main's running row and timer continue
+  across the visit.
 - Esc or Ctrl+C on the running main turn stops its subagents with it. Their
   rows leave the dock and read `cancelled` in the Agents panel.
 - `s` on a subagent's row in the Agents panel stops that subagent only. A
-  `Stopping …` notice is shown at once, and the row reads `stopped` once the
+  `Stopping "<name>".` notice appears, and the row reads `stopped` once the
   subagent has settled. Main's turn and the other subagents go on. Main is
   told who stopped it, in these words: `the person using Orca stopped this
   subagent from the Agents panel; it was not stopped by you and it did not
@@ -133,10 +155,16 @@ running while they run. In the TUI:
   the background reads `stopped` in main's `task_wait`, with it as the
   result. Its completion notice gives the same line, without the caveat that
   follows a subagent's own report.
-- Quitting stops the subagents that are still running and records them as
-  stopped. While they run, main's turn is running too, so the first Ctrl+C
-  stops that turn and its subagents with it; the next Ctrl+C says `Press
-  Ctrl+C again to quit.`, and the one after that quits.
+- Ctrl+C works the same in main and in a subagent's view. While main runs,
+  the first Ctrl+C stops main's turn and its subagents with it. Once none
+  are running, the next says `Press Ctrl+C again to quit.` Press it again
+  within two seconds to quit. If main is idle but one agent still runs, the
+  first says `1 agent is still running. Press Ctrl+C again to quit and stop it.`
+  With several it says `N agents are still running. Press Ctrl+C again to quit and stop them.`
+  Quitting stops those agents and records them as stopped.
+- If Orca was killed while a subagent ran, after `--resume` its row reads
+  `failed`. Main shows `Agent failed: …` once. The quit line does not count
+  that agent as running.
 - A main turn whose subagents are running is not moved to the background.
   Ctrl+B on it, in main's conversation or in a subagent's, shows
   `This turn cannot move to the background while its subagents are running.`,

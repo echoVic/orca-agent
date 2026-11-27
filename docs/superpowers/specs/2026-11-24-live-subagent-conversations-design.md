@@ -419,6 +419,53 @@ it reads `the person using Orca stopped this subagent from the Agents panel;
 it was not stopped by you and it did not fail. Do not start it again unless
 they ask.`, and the notice gives it without that caveat.
 
+Run on 2026-11-28 at the end of stage 2 (`deepseek-flash` with a real key in
+auto-edit, a 150x50 pty read with `pyte`; runs 1–4 at `ff2c0361`, run 5 at
+`a00a4893`, frames under `/tmp/orca-stage2/run-*/`), items 1 to 8 hold. The
+task for each of two agents was to write a file, run a command and write an
+essay of about 3000 words; main was to write about 400–1500 words while they
+ran. 1: main's timer went from 24s to 35s across a visit; on returning in
+mid-reply the text followed its prompt once, with both launch lines still
+there. 2: Shift+↓ and Enter took the view from Lighthouses to Bridges; the
+mark followed and Bridges' timer already read 54s. 3: Lighthouses finished
+on screen with one read-only notice, not its own completion line; text sent
+there came back to the composer and main had one completion per agent.
+4: stopping Bridges in Lighthouses' Agents panel stopped only Bridges. In
+run 2 Esc closed the panel but also left the view, so the next Esc interrupted
+main. After `a00a4893`, run 5's first Esc showed `Stopping "Bridges".` in
+Lighthouses and the second showed main still running at 49s; it did not
+restart Bridges. 5: opening the completed Bridges from `/agents` showed
+its task through the end of its essay, read-only. 6: from Lighthouses,
+Ctrl+C left main idle and no agents active within 0.5s; the next Ctrl+C
+gave the quit hint and the third exited 130 with no process left. 7: after
+resume, main had both launches and ends, but Lighthouses opened with its
+own instructions shown as a person's message. `8c1c8528` made the saved
+view skip the same delegated instructions as the live view. In run 5 it
+opened at its task; stopped Bridges opened read-only without a checkpoint
+notice. 8: after `kill -9` at 24s and a resume, both the agent and main's
+task were recorded as failed; the panel counted zero active and Ctrl+C
+gave the ordinary quit hint. The workspace suite ran once at `1d5f1b73`:
+four runtime tests pinned the old activity word (`99ac0af0`), one contract
+pinned the projection's visibility (`522c5bd0`), and another caught the
+missing check for a running child (`ff2c0361`). The known intermittent
+`auto_edit_git_write_asks_once_and_opens_git_for_that_command_only` passed
+three times alone. Seen and left to stage 3: the hand-back is an
+`Input was not accepted [input.invalid]` card whose `next` reads
+`Correct the input and submit it again.`; a cancelled agent's card says
+`Submit the request again to retry.` in a read-only view; after a return,
+Bridges' end line sat after main's final reply although Bridges ended
+earlier; `Agent failed:` showed the runtime error
+(`subagent owner exited after execution began without a terminal receipt; execution remains indeterminate`)
+instead of the agent's name; the list's activity line joined a heredoc's
+lines without a space; a write replayed from the saved conversation showed
+neither `+1 −0` nor its diff. Left to later stages: a turn brought back to
+the foreground must accept an interrupt from the controller supervising it
+and show its running state from that reader. The runtime should publish a
+continuation task's own row in main. Each task needs an immutable end
+boundary on its thread so opening it cannot show a later task's work.
+A saved-snapshot reader should show the child's committed facts after a
+resume without leasing, repairing or restarting its thread.
+
 ## Not in this change
 
 - Asking the person, or the main agent, on a subagent's behalf.
