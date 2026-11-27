@@ -1479,21 +1479,6 @@ enum AgentContinuationStoreBackend {
     },
 }
 
-pub(crate) struct ContinuationReconciliation {
-    projections: Vec<ContinuationProjection>,
-    _session_lock: Option<ExclusiveFileLock>,
-}
-
-impl ContinuationReconciliation {
-    pub(crate) fn projections(&self) -> &[ContinuationProjection] {
-        &self.projections
-    }
-
-    fn into_projections(self) -> Vec<ContinuationProjection> {
-        self.projections
-    }
-}
-
 #[derive(Default)]
 struct ProcessLocalContinuationState {
     index: HashMap<AgentContinuationId, String>,
@@ -1788,16 +1773,21 @@ impl AgentContinuationStore {
     pub(crate) fn reconcile_expired_owners(
         &self,
     ) -> Result<Vec<ContinuationProjection>, AgentContinuationError> {
-        self.reconcile_expired_owners_locked()
-            .map(ContinuationReconciliation::into_projections)
+        let _lock = match &self.backend {
+            AgentContinuationStoreBackend::Persistent { root, .. } => Some(acquire_lock(
+                &session_lock_path(root, &self.parent_session_id),
+                "acquire continuation session lock",
+            )?),
+            AgentContinuationStoreBackend::ProcessLocal { .. } => None,
+        };
+        self.reconcile_expired_owners_under_session_lock(|_| true)
     }
 
-    /// Reconciles expired owners while retaining the persistent session lock.
-    /// Callers may apply the returned projections to task records before this
-    /// guard is dropped, keeping recovery on one authoritative snapshot.
-    pub(crate) fn reconcile_expired_owners_locked(
+    /// The caller holds the persistent session lock through task projection.
+    pub(crate) fn reconcile_expired_owners_under_session_lock(
         &self,
-    ) -> Result<ContinuationReconciliation, AgentContinuationError> {
+        recover: impl Fn(&str) -> bool,
+    ) -> Result<Vec<ContinuationProjection>, AgentContinuationError> {
         let now_ms = continuation_now_ms();
         match &self.backend {
             AgentContinuationStoreBackend::ProcessLocal { state } => {
@@ -1817,7 +1807,10 @@ impl AgentContinuationStore {
                     .collect::<Result<Vec<_>, AgentContinuationError>>()?;
                 sort_records(&mut records);
                 let mut projections = Vec::with_capacity(records.len());
-                for record in records {
+                for record in records
+                    .into_iter()
+                    .filter(|record| recover(&record.latest_task_id))
+                {
                     let (record, changed) = reconcile_expired_record(record, now_ms)?;
                     if changed {
                         state
@@ -1826,19 +1819,15 @@ impl AgentContinuationStore {
                     }
                     projections.push(ContinuationProjection::from(&record));
                 }
-                Ok(ContinuationReconciliation {
-                    projections,
-                    _session_lock: None,
-                })
+                Ok(projections)
             }
             AgentContinuationStoreBackend::Persistent { root, cache } => {
-                let session_lock = acquire_lock(
-                    &session_lock_path(root, &self.parent_session_id),
-                    "acquire continuation session lock",
-                )?;
                 let records = load_parent_records_unlocked(root, &self.parent_session_id)?;
                 let mut reconciled_records = Vec::with_capacity(records.len());
-                for record in records {
+                for record in records
+                    .into_iter()
+                    .filter(|record| recover(&record.latest_task_id))
+                {
                     let (record, changed) = reconcile_expired_record(record, now_ms)?;
                     if changed {
                         write_json_pretty(
@@ -1858,10 +1847,7 @@ impl AgentContinuationStore {
                     .iter()
                     .map(ContinuationProjection::from)
                     .collect();
-                Ok(ContinuationReconciliation {
-                    projections,
-                    _session_lock: Some(session_lock),
-                })
+                Ok(projections)
             }
         }
     }

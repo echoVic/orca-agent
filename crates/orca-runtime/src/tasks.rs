@@ -1748,23 +1748,8 @@ impl TaskRegistry {
             AgentContinuationStore::new_persistent(session_id.clone(), root.clone())
                 .map_err(io::Error::other)?;
         let mut persistence = TaskPersistence::new(root, session_id.clone());
-        let continuation_reconciliation = if recover_interrupted {
-            Some(
-                continuation_store
-                    .reconcile_expired_owners_locked()
-                    .map_err(io::Error::other)?,
-            )
-        } else {
-            None
-        };
-        let _session_lock = if continuation_reconciliation.is_none() {
-            Some(
-                ExclusiveFileLock::acquire(&persistence.session_lock_path(&session_id))
-                    .map_err(io::Error::other)?,
-            )
-        } else {
-            None
-        };
+        let _session_lock = ExclusiveFileLock::acquire(&persistence.session_lock_path(&session_id))
+            .map_err(io::Error::other)?;
         match crate::task_owner::RegistryOwner::acquire(&persistence.root, &session_id) {
             Ok(owner) => persistence.owner = Some(Arc::new(owner)),
             Err(error) => {
@@ -1782,16 +1767,30 @@ impl TaskRegistry {
             .map_err(io::Error::other)?;
         let mut records = persistence.load_session_records_unlocked(&session_id)?;
         let mut changed = false;
-        if recover_interrupted {
-            let continuation_projections = continuation_reconciliation
-                .as_ref()
-                .map(|reconciliation| reconciliation.projections())
-                .unwrap_or_default();
+        let now = now_ms();
+        let interrupted: HashSet<_> = records
+            .values()
+            .filter(|record| {
+                !is_terminal(record.status)
+                    && (recover_interrupted || record.registry_owner.is_some())
+                    && !(record.lease_owner.is_some()
+                        && record.lease_expires_at_ms.is_some_and(|end| end > now))
+                    && !typed_provider_outcomes.contains_key(&record.id)
+                    && !persistence.has_live_owner(record)
+            })
+            .map(|record| record.id.clone())
+            .collect();
+        if recover_interrupted || !interrupted.is_empty() {
+            let continuation_projections = continuation_store
+                .reconcile_expired_owners_under_session_lock(|id| {
+                    recover_interrupted || interrupted.contains(id)
+                })
+                .map_err(io::Error::other)?;
             let reconciled_task_ids = continuation_projections
                 .iter()
                 .map(|projection| projection.latest_task_id.clone())
                 .collect::<HashSet<_>>();
-            for projection in continuation_projections {
+            for projection in &continuation_projections {
                 let Some(record) = records.get_mut(&projection.latest_task_id) else {
                     continue;
                 };
@@ -1823,11 +1822,8 @@ impl TaskRegistry {
                     changed = true;
                 }
             }
-            for (task_id, record) in &mut records {
-                if !reconciled_task_ids.contains(task_id)
-                    && !typed_provider_outcomes.contains_key(task_id)
-                    && !persistence.has_live_owner(record)
-                {
+            for task_id in interrupted.difference(&reconciled_task_ids) {
+                if let Some(record) = records.get_mut(task_id) {
                     changed |= mark_interrupted_if_active(record);
                 }
             }
@@ -9163,6 +9159,37 @@ mod tests {
             response.identity.item_ids.agent_message_item_id(),
             &response.identity.item_ids.reasoning_item_id
         );
+    }
+
+    #[test]
+    fn registry_attach_recovers_only_stamped_orphans_without_a_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tasks");
+        let live = TaskRegistry::new_persistent("session".into(), root.clone()).unwrap();
+        let gone = TaskRegistry::new_persistent_attached("session".into(), root.clone()).unwrap();
+        let running = |registry: &TaskRegistry, description: &str| {
+            let task = registry.create_subagent(description.into(), None);
+            registry.mark_running(&task.id).unwrap();
+            task.id
+        };
+        let hosted = running(&live, "live");
+        let orphan = running(&gone, "orphan");
+        let leased = running(&gone, "leased");
+        let lease = live.acquire_task_lease(&leased).unwrap();
+        let legacy = running(&gone, "legacy");
+        gone.with_tasks(|records| {
+            records.get_mut(&legacy).unwrap().registry_owner = None;
+            gone.persist_current_task(records, &legacy).unwrap();
+        })
+        .unwrap();
+        drop(gone);
+
+        let attached = TaskRegistry::new_persistent_attached("session".into(), root).unwrap();
+        assert_eq!(attached.get(&orphan).unwrap().status, TaskStatus::Failed);
+        for task_id in [hosted, legacy, leased.clone()] {
+            assert_eq!(attached.get(&task_id).unwrap().status, TaskStatus::Running);
+        }
+        live.renew_task_lease(&lease, &leased).unwrap();
     }
 
     #[test]

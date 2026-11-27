@@ -146,9 +146,11 @@ or stdin is presumed to survive a host restart.
 The older `output/archive.sqlite3` is a read-only fallback. A newer reader
 never creates, probes or holds `output/owner.lock`, changes an old row, or
 writes an automatic cursor there. Its cursor stays in memory; a running row
-whose task is terminal is presented as interrupted. After an older process
-crashes, resuming with `attach_for_cwd` runs no recovery: its nonterminal
-task can still make a dead shell read as `running`. A read-only connection
+whose task is terminal is presented as interrupted. Resuming a session now
+recovers active tasks stamped by a dead registry using the same owner probe
+as a fresh open. Live owners and held execution leases are left alone. An
+older process leaves no stamp: attach leaves its task untouched, so a dead
+shell in its archive can still read as `running`. A read-only connection
 cannot roll back a hot journal left by that process; in that case all shells
 in the top-level archive read as “missing or expired”, as for other read
 failures. Older readers cannot see new sub-archive output. Two record-store
