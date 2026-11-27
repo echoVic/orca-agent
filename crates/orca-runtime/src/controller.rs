@@ -4595,6 +4595,41 @@ while IFS= read -r line; do
     }
 
     #[test]
+    fn a_redacted_prompt_is_sent_without_a_saved_cache_digest() {
+        let cwd = tempfile::tempdir().unwrap();
+        let home = crate::history::isolated_test_orca_home_subdir("redacted-cache-digest");
+        let _home = crate::history::redirect_test_orca_home(&home);
+        std::fs::write(home.join("AGENTS.md"), "Token: required").unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.history_mode = HistoryMode::Record;
+        config.pricing_refresh = false;
+        let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+        let mut thread = RuntimeThread::start(&config, "read the policy").unwrap();
+        assert_eq!(
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("read the policy"),
+                    io::sink()
+                )
+                .unwrap(),
+            RunStatus::Success
+        );
+        let requests = provider.join().unwrap();
+        assert!(
+            requests[0]["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Token: required")
+        );
+        let raw =
+            std::fs::read_to_string(thread.session_mut().writer_mut().unwrap().path()).unwrap();
+        assert!(raw.contains("Token: <redacted>"));
+        assert!(!raw.contains("provider.prompt_cache_checkpoint"));
+    }
+
+    #[test]
     fn runtime_capture_preserves_tool_groups_and_restores_current_fragments() {
         use orca_core::config::folder_trust::{TrustLevel, set_trust};
         use orca_core::conversation::REPEAT_TOOL_REMINDER_PREFIX;

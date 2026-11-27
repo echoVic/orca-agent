@@ -101,18 +101,45 @@ impl PromptCacheCheckpoint {
     }
 }
 
+/// Transcript audit records omit digests when saved context text would differ
+/// from the request sent to DeepSeek.
+pub fn checkpoint_for_deepseek_transcript(
+    conversation: &Conversation,
+    config: &ProviderConfig,
+) -> serde_json::Result<Option<PromptCacheCheckpoint>> {
+    let messages = conversation_to_api_messages(conversation);
+    if messages
+        .iter()
+        .filter(|message| message.role == "system")
+        .any(|message| {
+            message.content.as_deref().is_some_and(|text| {
+                orca_core::history_redaction::redact_sensitive_text(text) != text
+            })
+        })
+    {
+        return Ok(None);
+    }
+    checkpoint_for_messages(&messages, config).map(Some)
+}
+
 /// Creates a content-free cache checkpoint from the exact conversation lowering
 /// and primary preflight tool payload sent to DeepSeek.
 pub fn checkpoint_for_deepseek_request(
     conversation: &Conversation,
     config: &ProviderConfig,
 ) -> serde_json::Result<PromptCacheCheckpoint> {
-    let messages = conversation_to_api_messages(conversation);
+    checkpoint_for_messages(&conversation_to_api_messages(conversation), config)
+}
+
+fn checkpoint_for_messages(
+    messages: &[crate::deepseek_http::ApiMessage],
+    config: &ProviderConfig,
+) -> serde_json::Result<PromptCacheCheckpoint> {
     let tools = deepseek_primary_request_tools(config);
     Ok(PromptCacheCheckpoint {
         version: PROMPT_CACHE_CHECKPOINT_VERSION,
         scope_sha256: scope_sha256(config)?,
-        message_prefix_sha256: hash_json(MESSAGES_DOMAIN, &messages)?,
+        message_prefix_sha256: hash_json(MESSAGES_DOMAIN, messages)?,
         message_count: messages.len() as u32,
         tool_schema_sha256: hash_json(TOOLS_DOMAIN, &tools)?,
         tool_count: tools.len() as u32,
