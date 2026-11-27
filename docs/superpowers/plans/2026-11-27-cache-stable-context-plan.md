@@ -43,7 +43,7 @@
 - **Thinking mode.** A fragment message mid-history keeps the request valid. Assistant messages after the last user message keep `reasoning_content`. Test `fragment_messages_keep_thinking_mode_requests_valid`.
 - **Compaction removing the last appended version.** The current version is re-appended after the summary, exactly once. Test `compaction_reappends_current_fragments_once`.
 - **Resume after an Orca upgrade that changed one prompt section.** The recorded prompt is sent, plus one change notice. The cached prefix up to the history is byte-identical to the recorded request. Test `resume_after_a_prompt_change_appends_one_notice`.
-- **Fork into a worktree with a different cwd.** The cwd section is reported as changed, and nothing else changes. Test `fork_reports_only_the_changed_cwd_section`.
+- **Fork into a worktree with a different cwd.** The fork reports every section whose text differs. Identical `AGENTS.md` files in two trusted worktrees produce a cwd notice and a project-instructions notice with the new paths. Test `fork_reports_the_cwd_and_project_instruction_paths`.
 
 ---
 
@@ -70,7 +70,7 @@
   - `resume_with_an_unchanged_prompt_sends_the_recorded_prompt`
   - `resume_after_a_prompt_change_appends_one_notice`
   - `a_removed_section_appends_the_no_longer_applies_note`
-  - `fork_reports_only_the_changed_cwd_section`
+  - `fork_reports_the_cwd_and_project_instruction_paths`
   - `a_session_without_recorded_sections_resumes_as_before`
   - `the_recorded_sections_are_readable_by_the_previous_release`: open with the v0.5.25 types.
 - [ ] **Step 2:** Run each test and confirm it fails.

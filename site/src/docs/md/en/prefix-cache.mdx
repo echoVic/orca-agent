@@ -27,9 +27,11 @@ part of the history on later DeepSeek requests. The current plan stays at the
 end of each request.
 
 Resuming or forking a recorded session reuses its original system prompt.
-Orca appends a notice for each section that changed or was removed. A session
-recorded without prompt sections still rebuilds its prompt on resume.
-Compaction can fold the updated sections into a new leading prompt.
+Orca appends a notice for every section whose text differs or was removed. A
+worktree fork can report both the working directory and the paths named in the
+project instructions. Orca rebuilds the prompt when instruction sources stop
+applying or the recorded prompt cannot be replayed. Compaction can fold the
+updated sections into a new leading prompt.
 
 ## Observe provider-reported usage
 

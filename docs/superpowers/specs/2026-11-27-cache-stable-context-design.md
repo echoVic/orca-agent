@@ -21,13 +21,14 @@ dsh fixes both the same way:
    - A fragment that disappeared is written as `The <kind> context no longer applies.`
    - Unchanged fragments add nothing.
 2. **`plan` stays at the tail** as today, because it changes often and its value is in being current.
-3. **After compaction**, the current versions of all appended fragments are appended again after the summary, because the summary may have dropped them.
+3. **After compaction that replaces the prefix**, Orca appends the current fragments again. Micro-compaction preserves deliveries in the retained prefix.
 4. **Resume rebuilds the "last appended" state from the transcript**, so a resumed session sends nothing new for unchanged fragments.
 5. **The system prompt is recorded in sections, and resume reuses it.**
    - The session's system prompt is recorded with its named sections when the session starts.
    - On resume or fork, Orca builds the prompt it would build today, section by section, and compares it with the recorded sections.
    - The recorded prompt is sent unchanged. Each changed section is appended as one system message after the history: `The "<section>" instructions changed; they now read:` followed by the new text. A removed section is appended as `The "<section>" instructions no longer apply.`
-   - A rebuild of the leading prompt happens only at compaction.
+   - A fork reports every section whose text differs, including project instructions that name files in the new worktree.
+   - Resume and fork rebuild when prior instruction sources stop applying or the recorded prompt cannot be replayed. Compaction that replaces the prefix can also install the current prompt.
 6. **Measure it.** Report, on a terminal_bench subset or a recorded long session, the uncached prompt tokens per request before and after.
 
 ## Non-goals

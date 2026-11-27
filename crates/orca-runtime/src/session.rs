@@ -1804,30 +1804,77 @@ mod tests {
     }
 
     #[test]
-    fn fork_reports_only_the_changed_cwd_section() {
+    fn fork_reports_the_cwd_and_project_instruction_paths() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust};
+
         with_orca_home(|_| {
-            let parent = tempdir().unwrap();
-            let child = tempdir().unwrap();
-            let (_, prompt, transcript) = record_prompt_session(parent.path());
+            let fixture = tempdir().unwrap();
+            let parent = fixture.path().join("source");
+            let child = fixture.path().join("worktree");
+            std::fs::create_dir(&parent).unwrap();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .current_dir(&parent)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&["init"]);
+            std::fs::write(parent.join("AGENTS.md"), "Use the repository runbook.").unwrap();
+            git(&["add", "AGENTS.md"]);
+            git(&[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "Add fixture instructions",
+            ]);
+            git(&[
+                "worktree",
+                "add",
+                "--detach",
+                child.to_str().unwrap(),
+                "HEAD",
+            ]);
+            assert_eq!(
+                std::fs::read(parent.join("AGENTS.md")).unwrap(),
+                std::fs::read(child.join("AGENTS.md")).unwrap()
+            );
+            set_trust(&parent, TrustLevel::Trusted).unwrap();
+            set_trust(&child, TrustLevel::Trusted).unwrap();
+            let (_, prompt, transcript) = record_prompt_session(&parent);
             let parent_id = transcript.meta.session_id.clone();
-            let fork =
-                reopen_prompt_session(child.path(), HistoryMode::Fork(parent_id), transcript);
+            let fork = reopen_prompt_session(&child, HistoryMode::Fork(parent_id), transcript);
             assert_eq!(
                 fork.conversation.messages[0].content_str(),
                 Some(prompt.as_str())
             );
             assert_eq!(
                 prompt_section_notices(&fork),
-                [format!(
-                    "The \"cwd\" instructions changed; they now read:\n- Working directory: {}",
-                    child.path().display()
-                )]
+                [
+                    format!(
+                        "The \"cwd\" instructions changed; they now read:\n- Working directory: {}",
+                        child.display()
+                    ),
+                    format!(
+                        "The \"project instructions\" instructions changed; they now read:\n<project-instructions>\n# {}\nUse the repository runbook.\n</project-instructions>",
+                        child.join("AGENTS.md").display()
+                    )
+                ]
             );
             let fork_id = fork.session_id().unwrap().to_owned();
             let persisted = history::load_session(&fork_id).unwrap();
-            let resumed =
-                reopen_prompt_session(child.path(), HistoryMode::Resume(fork_id), persisted);
-            assert_eq!(prompt_section_notices(&resumed).len(), 1);
+            let resumed = reopen_prompt_session(&child, HistoryMode::Resume(fork_id), persisted);
+            assert_eq!(prompt_section_notices(&resumed).len(), 2);
         });
     }
 
