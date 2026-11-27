@@ -163,6 +163,10 @@ and `plan_item_id`. Concatenating their `payload.text` preserves the exact text,
 including whitespace. A merged event keeps the first event's envelope, so `seq`
 values remain monotonic but may skip values. `model.response.completed` carries
 the full response text in `assistant_reasoning` and `assistant_content`.
+When Orca keeps a cut-short reply, the same payload records `cut_short` as
+`interrupted` or `output_limit` alongside the response identity. The kept
+reply carries an empty tool-call list, and the turn retains its cancel or
+provider failure status.
 
 Its optional `payload.observation` reports logical provider `elapsed_ms`,
 `first_delta_ms`, and `first_delta_kind` (`reasoning`, `text`, or `tool`). The

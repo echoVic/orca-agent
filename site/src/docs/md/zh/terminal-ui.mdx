@@ -78,7 +78,7 @@
  ↳ then run the whole test suite
 ~~~
 
-- `Esc`（或 `Ctrl+G`）中断当前轮次。
+- `Esc`（或 `Ctrl+G`）中断当前轮次。如果回复已经显示了文字，Orca 会保留收到的内容，并标记 `(interrupted)`。回复达到模型的输出上限时，Orca 也会保留内容，并标记 `(stopped at the output limit)`。重新打开会话后，你仍可以让 Orca 接着写。
 - 一轮第一次请求模型之前，会等待还在连接的 MCP 服务器，好让模型拿到它们的工具；等待期间活动行显示 `connecting MCP servers`，这时按 `Esc` 会中断这一轮，等待也一并中断。
 - `Enter` 把消息加入队列。当前轮次结束后，排队的消息按顺序发出，并作为你的下一条消息显示在对话里。中断会暂停队列；再发一条消息会恢复队列，也可以用 `/queue` 查看、暂停或启动队列。
 - `Ctrl+Enter` 立即发送：正在运行的轮次会在当前这一步结束后读到这条消息。如果当前轮次接不了，这条消息会排到队列最前面。这个功能需要终端支持 kitty 键盘协议，例如 Ghostty、kitty、WezTerm。

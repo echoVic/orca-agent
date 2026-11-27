@@ -1953,6 +1953,21 @@ impl SessionWriter {
             .clone()
     }
 
+    pub(crate) fn has_conversation_item(&self, item_id: &ConversationItemId) -> bool {
+        self.conversation_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|record| record.item_id.as_ref() == Some(item_id))
+    }
+
+    pub(crate) fn next_event_seq(&self) -> u64 {
+        *self
+            .event_sequence_cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn append_message(&mut self, message: &Message) -> io::Result<()> {
         let message = StoredMessage::from(message);
         let record = match &self.turn_id {
@@ -2952,6 +2967,7 @@ mod tests {
             .expect("append prefix");
         writer
             .append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some("discarded answer".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -2983,6 +2999,7 @@ mod tests {
             .expect("post-write ambiguity is reprobed and durably acknowledged");
         writer
             .append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some("post-compaction answer".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),

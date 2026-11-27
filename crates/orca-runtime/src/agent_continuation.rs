@@ -567,6 +567,8 @@ pub(crate) enum StoredChildMessage {
         reasoning_content: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<RawToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cut_short: Option<orca_core::conversation::CutShort>,
         #[serde(default)]
         pinned: bool,
     },
@@ -597,11 +599,13 @@ impl StoredChildMessage {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             } => Self::Assistant {
                 content: content.clone(),
                 reasoning_content: reasoning_content.clone(),
                 tool_calls: tool_calls.clone(),
+                cut_short: *cut_short,
                 pinned: *pinned,
             },
             Message::Tool {
@@ -647,11 +651,13 @@ impl StoredChildMessage {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             } => Message::Assistant {
                 content: content.clone(),
                 reasoning_content: reasoning_content.clone(),
                 tool_calls: tool_calls.clone(),
+                cut_short: *cut_short,
                 pinned: *pinned,
             },
             Self::Tool {

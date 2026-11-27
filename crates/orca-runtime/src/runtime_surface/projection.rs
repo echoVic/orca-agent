@@ -423,6 +423,8 @@ pub enum SurfaceItem {
         id: SurfaceItemId,
         turn_id: SurfaceTurnId,
         text: DisplayText,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cut_short: Option<orca_core::conversation::CutShort>,
         pinned: bool,
     },
     AssistantReasoning {
@@ -440,6 +442,8 @@ pub enum SurfaceItem {
         /// before it. A plan recorded without it is shown after the message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_offset: Option<ByteOffset>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cut_short: Option<orca_core::conversation::CutShort>,
         pinned: bool,
     },
     ToolResultMessage {
@@ -546,10 +550,27 @@ pub enum AssistantPatch {
     ResponseCompleted {
         response: SurfaceCompletedModelResponse,
     },
+    ResponseKept {
+        response: SurfaceCompletedModelResponse,
+        reason: orca_core::conversation::CutShort,
+    },
     StreamDiscarded {
         stream_id: SurfaceStreamId,
         reason: AssistantDiscardReason,
     },
+}
+
+impl AssistantPatch {
+    pub(super) fn for_v1_event(&self) -> std::borrow::Cow<'_, Self> {
+        match self {
+            Self::ResponseKept { response, .. } => {
+                std::borrow::Cow::Owned(Self::ResponseCompleted {
+                    response: response.clone(),
+                })
+            }
+            patch => std::borrow::Cow::Borrowed(patch),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

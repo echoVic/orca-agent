@@ -197,6 +197,7 @@ fn project_conversation_records(
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             } if !tool_calls.is_empty() => {
                 let mut seen_call_ids = HashSet::new();
@@ -209,6 +210,7 @@ fn project_conversation_records(
                     content: content.clone(),
                     reasoning_content: reasoning_content.clone(),
                     tool_calls: unique_tool_calls.clone(),
+                    cut_short: *cut_short,
                     pinned: *pinned,
                 };
                 let mut items = projected_record_items(record, &assistant)?;

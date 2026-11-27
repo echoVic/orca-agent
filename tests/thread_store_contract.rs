@@ -39,6 +39,7 @@ fn session_store_thread_store_appends_live_thread_items() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: Some("thread store response".to_string()),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
@@ -595,6 +596,7 @@ fn session_store_projects_thread_turns_and_items() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: Some("turn projection assistant".to_string()),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
@@ -674,6 +676,7 @@ fn session_store_projects_mcp_tool_calls_as_thread_items() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -731,6 +734,7 @@ fn session_store_preserves_failed_mcp_tool_metadata_in_thread_items() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -786,6 +790,7 @@ fn session_store_projects_error_prefixed_mcp_tool_content_as_failed_item() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -841,6 +846,7 @@ fn session_store_projects_external_tool_calls_as_dynamic_thread_items() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -901,6 +907,7 @@ fn session_store_preserves_failed_external_tool_metadata_in_dynamic_thread_items
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -956,6 +963,7 @@ fn session_store_preserves_denied_external_tool_metadata_in_dynamic_thread_items
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -1018,6 +1026,7 @@ fn session_store_preserves_truncated_tool_metadata_in_thread_items() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -1080,6 +1089,7 @@ fn session_store_preserves_failed_command_projection_without_aggregated_output()
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -1155,6 +1165,7 @@ fn session_store_round_trips_tool_terminal_metadata() {
             .append_items(&[
                 Message::user("run tools".to_string()),
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![
@@ -1272,6 +1283,7 @@ fn session_store_repairs_missing_tool_terminal_for_recovered_projections() {
             .append_items(&[
                 Message::user("run legacy command".to_string()),
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: Some("legacy incomplete invocation".to_string()),
                     tool_calls: vec![RawToolCall {
@@ -1345,6 +1357,7 @@ fn session_store_projects_file_edit_calls_as_file_change_thread_items() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -1410,6 +1423,7 @@ fn session_store_projects_write_file_calls_as_file_change_thread_items() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -1480,6 +1494,7 @@ fn session_store_projects_builtin_read_tool_as_dynamic_thread_item() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -1536,6 +1551,7 @@ fn session_store_projects_multiple_user_turns_with_stable_item_ids() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: Some("first assistant".to_string()),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
@@ -1552,6 +1568,7 @@ fn session_store_projects_multiple_user_turns_with_stable_item_ids() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: Some("second assistant".to_string()),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
@@ -1635,6 +1652,7 @@ fn session_store_paginates_thread_turns_and_items_with_cursors() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: Some("first assistant".to_string()),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
@@ -1651,6 +1669,7 @@ fn session_store_paginates_thread_turns_and_items_with_cursors() {
                     pinned: false,
                 },
                 Message::Assistant {
+                    cut_short: None,
                     content: Some("second assistant".to_string()),
                     reasoning_content: None,
                     tool_calls: Vec::new(),

@@ -2438,6 +2438,7 @@ mod tests {
             let mut conversation = Conversation::new();
             conversation.add_user("capture the screen".to_string());
             conversation.messages.push(Message::Assistant {
+                cut_short: None,
                 content: None,
                 reasoning_content: None,
                 tool_calls: vec![orca_core::conversation::RawToolCall {

@@ -656,6 +656,7 @@ mod tests {
                 "please run ORCA_API_KEY={env_secret} and password={password_secret}"
             )))?;
             writer.append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some(format!(
                     "configured with {{\"DEEPSEEK_API_KEY\":\"{json_secret}\"}}"
                 )),
@@ -924,6 +925,7 @@ mod tests {
             writer.enter_turn(TurnId::new());
             writer.append_message(&Message::user("start".to_string()))?;
             writer.append_message(&Message::Assistant {
+                cut_short: None,
                 content: None,
                 reasoning_content: None,
                 tool_calls: vec![RawToolCall {
@@ -1054,6 +1056,7 @@ mod tests {
             messages: vec![
                 Message::user("first".to_string()),
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: Some("private thinking".to_string()),
                     tool_calls: vec![],
@@ -1176,12 +1179,14 @@ mod tests {
             writer.enter_turn(TurnId::new());
             writer.append_message(&Message::user("collapsed old user".repeat(100)))?;
             writer.append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some("collapsed old assistant".repeat(100)),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 pinned: false,
             })?;
             writer.append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some("kept tail before compaction".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -1232,6 +1237,7 @@ mod tests {
             Message::system("system".to_string()),
             Message::user("old-a".to_string()),
             Message::Assistant {
+                cut_short: None,
                 content: Some("old-b".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -1239,6 +1245,7 @@ mod tests {
             },
             Message::user("old-c".to_string()),
             Message::Assistant {
+                cut_short: None,
                 content: Some("old-d".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
