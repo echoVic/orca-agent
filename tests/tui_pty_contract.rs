@@ -1548,17 +1548,15 @@ fn tui_side_close_restores_running_main_and_stream_once() {
         "side visible while main runs",
     );
     process.write(&[0x03]).unwrap();
-    assert_screen_has_text(&process, &mut output, prefix, "close restored main's reply");
-    assert_screen_has_text(
+    let frame = wait_for_screen(
         &process,
         &mut output,
-        "Esc interrupt",
-        "close restored running status",
-    );
-    let frame = reconstruct_screen(&output);
-    assert!(
-        frame.contains("Running ") && !frame.contains("Ctrl+/ back"),
-        "{frame}"
+        |screen| {
+            screen.contains("Running ")
+                && screen.contains("Esc interrupt")
+                && !screen.contains("Ctrl+/ back")
+        },
+        "side close did not restore running main",
     );
     assert_eq!(frame.matches(prefix).count(), 1, "{frame}");
     std::fs::write(second, "").unwrap();
@@ -2909,6 +2907,29 @@ fn assert_screen_shows(process: &PtyProcess, output: &mut Vec<u8>, expected: &st
 /// Like `assert_screen_shows`, but `expected` has to be on the screen as it
 /// is, not in pieces somewhere in it: where text comes in an order is what is
 /// checked.
+fn wait_for_screen(
+    process: &PtyProcess,
+    output: &mut Vec<u8>,
+    matches: impl Fn(&str) -> bool,
+    failure: &str,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let screen = reconstruct_screen(output);
+        if matches(&screen) {
+            return screen;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{failure}; reconstructed screen=\n{screen}"
+        );
+        if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+}
+
 fn assert_screen_has_text(
     process: &PtyProcess,
     output: &mut Vec<u8>,
