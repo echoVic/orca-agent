@@ -331,6 +331,7 @@ mod tests {
                 additional_fields: Default::default(),
             },
             messages: Vec::new(),
+            repeat_tool_streak: None,
             compactions: Vec::new(),
             summaries: Vec::new(),
             usage: None,
