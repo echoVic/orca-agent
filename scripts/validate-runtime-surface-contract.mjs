@@ -1273,7 +1273,7 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     "crates/orca-tui/src/types.rs:reset_session_projection:self.announced_startup_warnings.clear",
     1,
   ],
-  ["crates/orca-tui/src/hosted_child.rs:return_to_parent:child_focus.event_bridge.stop", 1],
+  ["crates/orca-tui/src/hosted_child.rs:return_to_parent:bridge.stop", 1],
   // Each deferral starts with an empty local Vec; clearing it is not a runtime mutation.
   ["crates/orca-tui/src/attachment_routing.rs:defer_parent:self.deferred_parent_events.clear", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:pending_terminal_session.activate", 1],

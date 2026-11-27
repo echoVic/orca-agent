@@ -365,6 +365,7 @@ pub(crate) fn hosted_tui_controller_loop(
     let mut on_child = false;
     control.bind_hosted_settings_config(config.clone());
     let mut last_idle_projection_cursor = None;
+    let mut last_parent_projection_cursor = None;
     let mut next_recap_request_id = 1_u64;
     let mut active_recap_request_id = None;
     let (recap_completion_tx, recap_completion_rx) = mpsc::unbounded();
@@ -408,6 +409,7 @@ pub(crate) fn hosted_tui_controller_loop(
             &mut on_child,
         ) {
             last_idle_projection_cursor = None;
+            last_parent_projection_cursor = None;
         }
         control.restrict_hosted_settings(side_parent.is_some() || on_child || view.has_focus());
         let action: Result<UserAction, ()> = if control.is_shutdown() {
@@ -416,6 +418,13 @@ pub(crate) fn hosted_tui_controller_loop(
             match action_rx.recv_timeout(IDLE_SURFACE_PROJECTION_POLL_INTERVAL) {
                 Ok(action) => Ok(action),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if on_child {
+                        poll_idle_surface_projection(
+                            view.main_runtime(&control).as_ref(),
+                            &view.main_sender(),
+                            &mut last_parent_projection_cursor,
+                        );
+                    }
                     poll_idle_surface_projection(
                         thread.as_ref(),
                         &event_tx,
@@ -444,7 +453,11 @@ pub(crate) fn hosted_tui_controller_loop(
         if let Some(reason) = action.as_ref().ok().and_then(|action| {
             restricted_command(action, side_parent.is_some(), on_child || view.has_focus())
         }) {
-            let _ = event_tx.send(TuiEvent::CommandRefused(reason.to_string()));
+            let _ = view
+                .focused_sender()
+                .as_ref()
+                .unwrap_or(&event_tx)
+                .send(TuiEvent::CommandRefused(reason.to_string()));
             control.cancel_surface_activation_if_idle();
             continue;
         }
@@ -472,7 +485,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     | UserAction::CloseSideConversation)
             )
         {
-            let _ = event_tx.send(TuiEvent::OperationRejected(
+            let _ = view.focused_sender().as_ref().unwrap_or(&event_tx).send(TuiEvent::OperationRejected(
                 "side conversations are unavailable while a child is focused; return to parent first"
                     .to_string(),
             ));

@@ -32409,6 +32409,51 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_agents_session_is_read_without_taking_its_thread() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let host = RuntimeHost::start().unwrap();
+        host.handle().keep_subagents_in_process();
+        let parent = host.start_thread(config, "parent").unwrap();
+        let surface = parent.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        run_surface_turn_to_success(&surface, &attachment, "subagent sync mock_usage");
+        let marker = cwd.path().join("release-main");
+        let (operation, _) = admit_surface_turn(
+            &surface,
+            &attachment,
+            &format!("mock_stream_release_marker {}", marker.display()),
+        );
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let child = &snapshot.subagents[0];
+        let id =
+            uuid::Uuid::from_bytes(*child.child_thread_id.as_ref().unwrap().as_bytes()).to_string();
+        assert_eq!(
+            snapshot.foreground_operation.as_ref().unwrap().operation_id,
+            operation
+        );
+        let transcript = surface::RuntimeSurfaceHostHandle::load_saved_session(&id).unwrap();
+        assert_eq!(transcript.meta.session_id, id);
+        assert_eq!(
+            transcript.meta.parent_id.as_deref(),
+            Some(parent.thread_id())
+        );
+        assert!(transcript.messages.iter().any(|message| matches!(message, orca_core::conversation::Message::Assistant {content:Some(text),..} if text.contains("usage accounting"))));
+        std::fs::write(marker, "done").unwrap();
+        assert!(
+            matches!(attachment.client.wait_operation_terminal(surface_request_id(), operation).unwrap(), surface::WaitOperationTerminalResult::Terminal {value} if matches!(value.terminal, surface::OperationTerminal::Succeeded {..}))
+        );
+        run_surface_turn_to_success(&surface, &attachment, "mock_usage");
+        host.shutdown().unwrap();
+    }
+
+    #[test]
     fn a_finished_sync_agents_transcript_is_read_from_its_child_session() {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);

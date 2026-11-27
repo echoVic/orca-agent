@@ -2515,7 +2515,7 @@ fn agent_workspace_action_hint<'a>(
     match row {
         AgentWorkspaceRow::Subagent { task, .. } => {
             if task.publication_revision.is_some() {
-                if crate::agent_workspace_actions::opens_live_conversation(task) {
+                if crate::agent_workspace_actions::opens_conversation(task) {
                     text.push_str(" · Enter open conversation");
                 } else {
                     text.push_str(" · Enter transcript");
@@ -5607,6 +5607,7 @@ fn main_behind_child_line(state: &AppState, theme: &Theme) -> Option<Line<'stati
         crate::types::SideParentStatus::NeedsInput => {
             ("Main needs your answer · Esc return", theme.approval)
         }
+        _ if state.finished_child => ("Main is idle · Esc return", theme.muted),
         _ => return None,
     };
     Some(Line::from(Span::styled(
@@ -14861,6 +14862,9 @@ mod tests {
         assert!(hint(&child, false).contains("Enter open conversation"));
         let mut finished = child.clone();
         finished.status = TaskStatus::Completed;
+        assert!(hint(&finished, true).contains("Enter open conversation"));
+        assert!(hint(&finished, false).contains("Enter open conversation"));
+        finished.subagent_child_thread_id = None;
         assert!(hint(&finished, true).contains("Enter transcript"));
     }
 

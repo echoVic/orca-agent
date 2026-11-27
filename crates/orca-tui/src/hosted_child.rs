@@ -63,10 +63,11 @@ pub(crate) struct HostedChildFocus {
     pub(crate) parent_thread: RuntimeThreadHandle,
     pub(crate) parent_event_tx: mpsc::Sender<TuiEvent>,
     pub(crate) parent_attachment: SessionAttachmentId,
-    pub(crate) child_thread: RuntimeThreadHandle,
+    pub(crate) interactive: Option<(RuntimeThreadHandle, HostedChildEventBridge)>,
+    task_id: String,
+    bound_thread_id: String,
     pub(crate) child_event_tx: mpsc::Sender<TuiEvent>,
     pub(crate) child_attachment: SessionAttachmentId,
-    pub(crate) event_bridge: HostedChildEventBridge,
 }
 
 /// Passive typed-surface subscription for a focused child's conversation. The
@@ -618,7 +619,39 @@ fn main_status_for_child(snapshot: &SurfaceSnapshot) -> SideParentStatus {
     status
 }
 
+pub(crate) struct FinishedTask {
+    attachment: SessionAttachmentId,
+    task_id: String,
+    bound_thread_id: String,
+}
+
+fn ended(status: orca_core::task_types::TaskStatus) -> bool {
+    use orca_core::task_types::TaskStatus::*;
+    matches!(status, Completed | Failed | Cancelled | Stopped | Blocked)
+}
+
+impl FinishedTask {
+    pub(crate) fn for_view(
+        state: &crate::types::AppState,
+        rows: &[orca_core::task_types::BackgroundTaskSummary],
+    ) -> Option<Self> {
+        if state.finished_child {
+            return None;
+        }
+        let task_id = state.conversation_target().task_id()?;
+        let row = rows
+            .iter()
+            .find(|row| row.id == task_id && ended(row.status))?;
+        Some(Self {
+            attachment: state.active_session_attachment?,
+            task_id: row.id.clone(),
+            bound_thread_id: row.subagent_child_thread_id.clone()?,
+        })
+    }
+}
+
 pub(crate) enum HostedChildAction {
+    Finished(FinishedTask),
     Focus {
         task_id: String,
         expected_revision: u64,
@@ -643,6 +676,43 @@ pub(crate) fn handle_hosted_child_action(
     control: &TuiSurfaceTaskControl,
 ) {
     match action {
+        HostedChildAction::Finished(FinishedTask {
+            attachment,
+            task_id,
+            bound_thread_id,
+        }) => {
+            let Some(current) = focus.as_mut().filter(|current| {
+                current.child_attachment == attachment
+                    && current.task_id == task_id
+                    && current.bound_thread_id == bound_thread_id
+                    && current.interactive.is_some()
+            }) else {
+                return;
+            };
+            let Ok(parent) = read_parent_snapshot(&current.parent_thread) else {
+                return;
+            };
+            let Ok(binding) = child_binding(&parent, &task_id, 0) else {
+                return;
+            };
+            let Some(revision) = finished_revision(&parent, &task_id) else {
+                return;
+            };
+            if binding.child_thread_id != bound_thread_id {
+                return;
+            }
+            let (child, bridge) = current.interactive.take().unwrap();
+            drop(bridge);
+            show_finished_child(
+                current,
+                &parent,
+                revision,
+                Some(&child),
+                attachment_routing,
+                root_event_tx,
+                control,
+            );
+        }
         HostedChildAction::Focus {
             task_id,
             expected_revision,
@@ -719,20 +789,13 @@ fn focus_child(
         }
     };
 
-    // Resolve only a runtime-hosted live thread. A saved-session resume here
-    // would let an old row redirect the user to a different conversation and
-    // would violate the parent/child ownership fence.
-    let child_thread = match host.resolve_live_thread(&binding.child_thread_id) {
-        Ok(child) => child,
-        Err(_) => {
-            reject(
-                event_tx,
-                "the selected child no longer has a live conversation",
-            );
-            return;
-        }
-    };
-    if child_thread.parent_thread_id() != Some(parent_thread.thread_id()) {
+    // Never resume a child to focus it. A finished child may be read from
+    // disk after its binding has been checked again.
+    let child_thread = host.resolve_live_thread(&binding.child_thread_id).ok();
+    if child_thread
+        .as_ref()
+        .is_some_and(|child| child.parent_thread_id() != Some(parent_thread.thread_id()))
+    {
         reject(
             event_tx,
             "the selected child is not owned by this conversation",
@@ -770,8 +833,38 @@ fn focus_child(
     }
 
     let parent_attachment = *session_attachment;
-    let child_attachment = AttachmentRouting::allocate_next(attachment_routing);
     let parent_event_tx = event_tx.clone();
+    if let Some(revision) = finished_revision(&current_snapshot, &task_id) {
+        let mut finished = HostedChildFocus {
+            parent_thread,
+            parent_event_tx,
+            parent_attachment,
+            interactive: None,
+            task_id,
+            bound_thread_id: binding.child_thread_id,
+            child_event_tx: event_tx.clone(),
+            child_attachment: parent_attachment,
+        };
+        show_finished_child(
+            &mut finished,
+            &current_snapshot,
+            revision,
+            child_thread.as_ref(),
+            attachment_routing,
+            root_event_tx,
+            control,
+        );
+        *focus = Some(finished);
+        return;
+    }
+    let Some(child_thread) = child_thread else {
+        reject(
+            event_tx,
+            "the selected child no longer has a live conversation",
+        );
+        return;
+    };
+    let child_attachment = AttachmentRouting::allocate_next(attachment_routing);
     let child_event_tx = spawn_attached_event_sender_with_routing(
         root_event_tx.clone(),
         child_attachment,
@@ -846,10 +939,11 @@ fn focus_child(
         parent_thread,
         parent_event_tx,
         parent_attachment,
-        child_thread: child_thread.clone(),
+        task_id,
+        bound_thread_id: binding.child_thread_id,
         child_event_tx,
         child_attachment,
-        event_bridge: child_bridge,
+        interactive: Some((child_thread, child_bridge)),
     });
     // Start the relay only after the child reset is queued so hydration and
     // live child events cannot race ahead of the visible focus transition.
@@ -858,8 +952,202 @@ fn focus_child(
     for interaction in child_interactions {
         let _ = send_attached_event(root_event_tx, child_attachment, interaction);
     }
-    if let Some(focus) = focus.as_ref() {
-        focus.event_bridge.start();
+    if let Some((_, bridge)) = focus.as_ref().and_then(|focus| focus.interactive.as_ref()) {
+        bridge.start();
+    }
+}
+
+const READ_ONLY: &str = "This agent has finished. Its conversation is read-only.";
+const CHECKPOINT: &str =
+    "This agent's conversation could not be loaded. Showing its last checkpoint.";
+
+fn finished_revision(parent: &SurfaceSnapshot, task_id: &str) -> Option<u64> {
+    parent
+        .tasks
+        .iter()
+        .find(|task| {
+            task.task_id.as_str() == task_id
+                && ended(crate::surface_projection::task_status(task.status))
+        })
+        .map(|task| task.revision.get())
+}
+
+fn show_finished_child(
+    focus: &mut HostedChildFocus,
+    parent: &SurfaceSnapshot,
+    revision: u64,
+    live: Option<&RuntimeThreadHandle>,
+    routing: &Arc<Mutex<AttachmentRouting>>,
+    root: &mpsc::Sender<TuiEvent>,
+    control: &TuiSurfaceTaskControl,
+) {
+    let (projection, mut conversation) = live
+        .and_then(|child| {
+            let snapshot = read_parent_snapshot(child).ok()?;
+            let (projection, conversation) = hosted_projection_batch_from_snapshot(
+                child,
+                &snapshot,
+                HistoryTarget::Conversation,
+            );
+            Some((Some(Box::new(projection)), conversation))
+        })
+        .unwrap_or_else(|| {
+            (
+                None,
+                saved_or_checkpoint(
+                    &focus.parent_thread,
+                    &focus.task_id,
+                    revision,
+                    &focus.bound_thread_id,
+                ),
+            )
+        });
+    conversation
+        .messages
+        .push(crate::transcript_state::ChatMessage::System {
+            text: READ_ONLY.to_string(),
+            expanded: false,
+        });
+    let attachment = AttachmentRouting::allocate_next(routing);
+    focus.child_attachment = attachment;
+    focus.child_event_tx =
+        spawn_attached_event_sender_with_routing(root.clone(), attachment, Some(routing.clone()));
+    AttachmentRouting::switch_attachment(
+        routing,
+        root,
+        attachment,
+        Some(focus.parent_attachment),
+        false,
+    );
+    let main_status = control
+        .pending_queue_interactions(focus.parent_thread.thread_id())
+        .iter()
+        .find_map(crate::attachment_routing::side_parent_status_for_event)
+        .unwrap_or_else(|| main_status_for_child(parent));
+    let _ = send_attached_event(
+        root,
+        attachment,
+        TuiEvent::FinishedChildProjection {
+            task_id: focus.task_id.clone(),
+            main_status,
+            projection,
+        },
+    );
+    let _ = send_attached_event(root, attachment, conversation.into_event(None));
+    let _ = send_attached_event(
+        root,
+        attachment,
+        TuiEvent::MainMcpCatalogWhileVisiting(
+            crate::surface_projection::McpCatalogView::from_surface(&parent.mcp_catalog),
+        ),
+    );
+}
+
+fn saved_or_checkpoint(
+    parent: &RuntimeThreadHandle,
+    task_id: &str,
+    revision: u64,
+    child_id: &str,
+) -> HostedConversation {
+    let saved = crate::hosted_session::load_saved_history_fallback(child_id).ok();
+    cold_conversation(parent.thread_id(), child_id, saved, || {
+        let request = crate::protocol::TaskTranscriptRequest {
+            task_id: task_id.to_string(),
+            expected_revision: revision,
+        };
+        match crate::surface_client::read_task_transcript(&parent.typed_surface(), &request) {
+            crate::protocol::TaskTranscriptResult::Found(record)
+                if record.task_id.as_str() == task_id && record.checkpoint_revision != 0 =>
+            {
+                record.items
+            }
+            _ => Vec::new(),
+        }
+    })
+}
+
+fn cold_conversation(
+    parent_id: &str,
+    child_id: &str,
+    transcript: Option<orca_runtime::history::SessionTranscript>,
+    checkpoint: impl FnOnce() -> Vec<orca_runtime::surface::TaskTranscriptItem>,
+) -> HostedConversation {
+    if let Some(saved) = transcript.filter(|saved| {
+        saved.meta.session_id == child_id && saved.meta.parent_id.as_deref() == Some(parent_id)
+    }) {
+        let mut replay = crate::hosted_session::HistoryReplay::default();
+        return HostedConversation {
+            messages: saved
+                .messages
+                .into_iter()
+                .flat_map(|message| replay.convert(message))
+                .collect(),
+            plan: saved.plan,
+            agent_lines: Default::default(),
+        };
+    }
+    use crate::transcript_state::ChatMessage;
+    use orca_runtime::surface::TaskTranscriptItem;
+    let mut messages = vec![ChatMessage::System {
+        text: CHECKPOINT.to_owned(),
+        expanded: false,
+    }];
+    for item in checkpoint() {
+        let row = match item {
+            TaskTranscriptItem::User { content } => ChatMessage::User(content.as_str().to_owned()),
+            TaskTranscriptItem::Assistant { content } => {
+                ChatMessage::Assistant(content.as_str().to_owned())
+            }
+            TaskTranscriptItem::ToolCall { id, name } => {
+                checkpoint_tool(id.as_str(), name.as_str(), "checkpoint".into(), None)
+            }
+            TaskTranscriptItem::ToolResult {
+                id,
+                content,
+                status,
+            } => {
+                let status = format!("{status:?}").to_ascii_lowercase();
+                let output = Some(content.as_str().to_owned());
+                let call = messages.iter_mut().rev().find(|message| {
+                    matches!(message, ChatMessage::ToolCall { id: call, .. } if call == id.as_str())
+                });
+                if let Some(ChatMessage::ToolCall {
+                    status: old,
+                    output: text,
+                    ..
+                }) = call
+                {
+                    *old = status;
+                    *text = output;
+                    continue;
+                }
+                checkpoint_tool(id.as_str(), "tool", status, output)
+            }
+        };
+        messages.push(row);
+    }
+    HostedConversation {
+        messages,
+        plan: None,
+        agent_lines: Default::default(),
+    }
+}
+
+fn checkpoint_tool(
+    id: &str,
+    name: &str,
+    status: String,
+    output: Option<String>,
+) -> crate::transcript_state::ChatMessage {
+    crate::transcript_state::ChatMessage::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        target: None,
+        status,
+        output,
+        diff: None,
+        kind: None,
+        expanded: false,
     }
 }
 
@@ -915,7 +1203,9 @@ fn return_to_parent(
     *thread = Some(child_focus.parent_thread.clone());
     *event_tx = child_focus.parent_event_tx.clone();
     *session_attachment = child_focus.parent_attachment;
-    child_focus.event_bridge.stop();
+    if let Some((_, bridge)) = child_focus.interactive.as_mut() {
+        bridge.stop();
+    }
     AttachmentRouting::release_deferred_parent_events(attachment_routing, root_event_tx);
     let _ = send_attached_event(
         root_event_tx,
@@ -1119,11 +1409,8 @@ fn child_binding(
     let subagent = snapshot
         .subagents
         .iter()
-        .find(|subagent| &subagent.subagent_id == subagent_id)
+        .find(|subagent| &subagent.subagent_id == subagent_id && subagent.task_id == task_id)
         .ok_or_else(|| "the selected child has no surface binding".to_string())?;
-    if subagent.status != orca_runtime::surface::SurfaceSubagentStatus::Running {
-        return Err("the selected child is no longer running".to_string());
-    }
     let child_thread_id = subagent
         .child_thread_id
         .as_ref()
@@ -1137,9 +1424,9 @@ fn child_binding(
 /// handle. Shutdown still settles the active child before the parent when the
 /// TUI itself exits, matching the side-conversation lifecycle contract.
 pub(crate) fn shutdown_attached_child_on_controller_exit(focus: HostedChildFocus) {
-    let _ = focus
-        .child_thread
-        .shutdown_with_timeout(Duration::from_secs(5));
+    if let Some((child, _)) = focus.interactive {
+        let _ = child.shutdown_with_timeout(Duration::from_secs(5));
+    }
     let _ = focus
         .parent_thread
         .shutdown_with_timeout(Duration::from_secs(5));
@@ -1226,10 +1513,11 @@ pub(crate) mod live_child_for_test {
                 parent_thread: parent.clone(),
                 parent_event_tx: event_tx.clone(),
                 parent_attachment: main_attachment,
-                child_thread: child.clone(),
+                task_id: "child".into(),
+                bound_thread_id: child.thread_id().to_owned(),
                 child_event_tx: event_tx,
                 child_attachment,
-                event_bridge,
+                interactive: Some((child.clone(), event_bridge)),
             });
             control.bind_view(view.clone());
             Self {
@@ -3898,6 +4186,466 @@ pub(crate) mod tests {
         turn.join().unwrap();
         main.shutdown();
         result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    struct AgentVisit {
+        view: crate::hosted_view::HostedView,
+        control: super::TuiSurfaceTaskControl,
+        events: crossbeam_channel::Receiver<super::TuiEvent>,
+        state: AppState,
+    }
+
+    impl AgentVisit {
+        fn new(parent: &ChildThread) -> Self {
+            let (root, events) = crossbeam_channel::unbounded();
+            let attachment = SessionAttachmentId::new(1);
+            let view = crate::hosted_view::HostedView::new(
+                parent.host.handle(),
+                root.clone(),
+                super::Arc::new(super::Mutex::new(super::AttachmentRouting::new(attachment))),
+                root,
+                attachment,
+            );
+            view.note_main_thread(&parent.thread);
+            let control = super::TuiSurfaceTaskControl::isolated_for_test();
+            control.bind_view(view.clone());
+            let mut state = AppState::new(
+                crossbeam_channel::unbounded().0,
+                "test".into(),
+                "mock".into(),
+                "/tmp".into(),
+            );
+            state.active_session_attachment = Some(attachment);
+            Self {
+                view,
+                control,
+                events,
+                state,
+            }
+        }
+
+        fn apply(&mut self) {
+            for event in self.events.try_iter() {
+                if let Ok(Some(payload)) = accept_attached_tui_event(&mut self.state, event) {
+                    self.state.update(payload);
+                }
+            }
+        }
+
+        fn open(&mut self, row: &BackgroundTaskSummary) {
+            self.view.handle(
+                super::HostedChildAction::Focus {
+                    task_id: row.id.clone(),
+                    expected_revision: row.publication_revision.unwrap(),
+                },
+                &self.control,
+            );
+            self.apply();
+            assert_eq!(
+                self.state.conversation_target().task_id(),
+                Some(row.id.as_str())
+            );
+        }
+
+        fn assert_finished(&mut self, main: &str) {
+            use crate::transcript_state::ChatMessage;
+            assert!(self.state.finished_child);
+            assert!(
+                matches!(self.state.transcript.messages.last(),Some(ChatMessage::System{text,..}) if text==super::READ_ONLY)
+            );
+            let frame = crate::test_support::frame_string(&mut self.state, 120, 40);
+            assert_eq!(frame.matches(super::READ_ONLY).count(), 1, "{frame}");
+            assert!(
+                frame.contains(main) && !frame.contains("Esc interrupt"),
+                "{frame}"
+            );
+        }
+    }
+
+    fn parent_with_kept_agents() -> ChildThread {
+        let parent = ChildThread::configured(|config| {
+            config.approval_mode = orca_core::approval_types::ApprovalMode::FullAuto;
+            config.subagents.max_depth = 3;
+        });
+        parent.host.handle().keep_subagents_in_process();
+        parent
+    }
+
+    fn agent_row(parent: &ChildThread) -> BackgroundTaskSummary {
+        let snapshot = super::read_parent_snapshot(&parent.thread).unwrap();
+        SurfaceProjectionState::from_surface_snapshot(&snapshot)
+            .workflow_tasks
+            .into_iter()
+            .find(|row| {
+                row.task_type == TaskType::Subagent && row.subagent_child_thread_id.is_some()
+            })
+            .unwrap()
+    }
+
+    fn finished_nested() -> (ChildThread, BackgroundTaskSummary) {
+        let parent = parent_with_kept_agents();
+        let (sender, _events) = crossbeam_channel::unbounded();
+        run_child_turn(
+            &parent.thread,
+            parent.config.clone(),
+            "subagent sync subagent sync mock_usage",
+            &sender,
+        );
+        let row = agent_row(&parent);
+        assert_eq!(row.status, TaskStatus::Completed);
+        (parent, row)
+    }
+
+    #[test]
+    fn a_finished_agent_is_bound_read_only_from_its_snapshot() {
+        use crate::transcript_state::ChatMessage;
+        let (parent, row) = finished_nested();
+        let mut visit = AgentVisit::new(&parent);
+        let child_id = row.subagent_child_thread_id.as_deref().unwrap();
+        let child = parent.host.handle().resolve_live_thread(child_id).unwrap();
+        let reads = crate::surface_client::trace_snapshot_reads(|| visit.open(&row));
+        visit.assert_finished("Main is idle · Esc return");
+        let reads: Vec<_> = reads
+            .iter()
+            .filter(|read| {
+                uuid::Uuid::from_bytes(*read.baseline.cursor.thread_id.as_bytes()).to_string()
+                    == child_id
+            })
+            .collect();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(
+            reads[0].capabilities.grant.capabilities.as_set(),
+            &super::BTreeSet::from([super::SurfaceCapability::ReadSnapshot])
+        );
+        assert!(reads[0].capabilities.interaction_kinds.is_empty());
+        assert!(
+            child
+                .typed_surface()
+                .surface()
+                .claim_subscription(&reads[0].subscription)
+                .is_none()
+        );
+        let notes: Vec<_> = visit
+            .state
+            .transcript
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::System { text, .. }
+                    if text.starts_with("Delegating") || text.starts_with("Agent completed:") =>
+                {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            ["Delegating to 1 agent", "Agent completed: mock_usage"]
+        );
+        let mut operating = Some(parent.thread.clone());
+        let mut attachment = SessionAttachmentId::new(1);
+        assert_eq!(
+            visit.view.adopt(
+                &mut operating,
+                &mut visit.view.main_sender(),
+                &mut attachment,
+                false
+            ),
+            crate::hosted_view::Adoption::Unchanged
+        );
+        assert_eq!(operating.unwrap().thread_id(), parent.thread.thread_id());
+        assert!(visit.view.close().unwrap().interactive.is_none());
+        parent.shutdown();
+    }
+
+    #[test]
+    fn a_finished_agent_after_a_resume_is_read_from_its_saved_session() {
+        use crate::transcript_state::ChatMessage;
+        let (parent, original) = finished_nested();
+        let ChildThread {
+            thread,
+            host,
+            mut config,
+            home,
+        } = parent;
+        config.history_mode = orca_core::config::HistoryMode::Resume(thread.thread_id().to_owned());
+        thread.shutdown().unwrap();
+        host.shutdown().unwrap();
+        let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let thread = host.start_thread(config.clone(), "resumed parent").unwrap();
+        let parent = ChildThread {
+            thread,
+            host,
+            config,
+            home,
+        };
+        let row = agent_row(&parent);
+        assert_eq!(
+            row.subagent_child_thread_id,
+            original.subagent_child_thread_id
+        );
+        assert!(
+            parent
+                .host
+                .handle()
+                .resolve_live_thread(row.subagent_child_thread_id.as_ref().unwrap())
+                .is_err()
+        );
+        let mut visit = AgentVisit::new(&parent);
+        visit.open(&row);
+        visit.assert_finished("Main is idle · Esc return");
+        let messages = &visit.state.transcript.messages;
+        assert!(
+            messages.iter().any(
+                |message| matches!(message, ChatMessage::ToolCall{name,..} if name=="subagent")
+            ),
+            "{messages:?}"
+        );
+        assert!(messages.iter().any(|message| matches!(message, ChatMessage::Assistant(text) | ChatMessage::AssistantChunk{text,..} if text.contains("Mock completed after tool execution."))));
+        assert!(!messages.iter().any(|message| matches!(message, ChatMessage::System{text,..} if text.starts_with("Delegating") || text.starts_with("Agent completed:") || text==super::CHECKPOINT)));
+        parent.shutdown();
+    }
+
+    #[test]
+    fn a_finished_agent_whose_session_cannot_be_loaded_shows_its_checkpoint() {
+        use crate::transcript_state::ChatMessage;
+        use orca_runtime::surface::{
+            SurfaceHistoryId, TaskTranscriptItem, TaskTranscriptToolStatus,
+        };
+        let (parent, row) = finished_nested();
+        let id = row.subagent_child_thread_id.as_deref().unwrap();
+        let load = || crate::hosted_session::load_saved_history_fallback(id).unwrap();
+        for (parent_id, child_id, saved) in [
+            (parent.thread.thread_id(), id, None),
+            ("wrong-parent", id, Some(load())),
+            (parent.thread.thread_id(), "wrong-child", Some(load())),
+        ] {
+            let messages = super::cold_conversation(parent_id, child_id, saved, || {
+                vec![
+                    TaskTranscriptItem::User {
+                        content: DisplayText::new("task"),
+                    },
+                    TaskTranscriptItem::Assistant {
+                        content: DisplayText::new("reply"),
+                    },
+                    TaskTranscriptItem::ToolCall {
+                        id: SurfaceHistoryId::try_new("one").unwrap(),
+                        name: NonEmptyText::try_new("read").unwrap(),
+                    },
+                    TaskTranscriptItem::ToolResult {
+                        id: SurfaceHistoryId::try_new("one").unwrap(),
+                        content: DisplayText::new("bytes"),
+                        status: TaskTranscriptToolStatus::Completed,
+                    },
+                ]
+            })
+            .messages;
+            assert!(
+                matches!(&messages[..], [ChatMessage::System{text,..},ChatMessage::User(task),ChatMessage::Assistant(reply),ChatMessage::ToolCall{id,name,status,output:Some(output),..}] if text==super::CHECKPOINT && task=="task" && reply=="reply" && id=="one" && name=="read" && status=="completed" && output=="bytes")
+            );
+        }
+        parent.shutdown();
+    }
+
+    pub(crate) fn check_finished_submit() {
+        let (parent, row) = finished_nested();
+        let mut visit = AgentVisit::new(&parent);
+        visit.open(&row);
+        visit.assert_finished("Main is idle · Esc return");
+        let (actions, source) = crossbeam_channel::unbounded();
+        let (sender, events) = crossbeam_channel::unbounded();
+        let (mut dispatcher, commands) = crate::action_dispatcher::TuiActionDispatcher::spawn(
+            source,
+            sender,
+            visit.control.clone(),
+            4,
+            4,
+        )
+        .unwrap();
+        let before = visit.state.transcript.messages.len();
+        crate::idle_submit_actions::submit_command_line_prompt(
+            &mut visit.state,
+            &actions,
+            "kept draft".into(),
+        );
+        let rejection = events.recv_timeout(super::Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(&rejection,super::TuiEvent::SubmissionRejected {prompt,message,..} if prompt=="kept draft" && message=="this agent has finished: return to the main conversation to send a message")
+        );
+        visit.state.update(rejection);
+        assert_eq!(visit.state.transcript.messages.len(), before + 1);
+        assert!(
+            matches!(&visit.state.transcript.messages[before - 1], crate::transcript_state::ChatMessage::System {text,..} if text == super::READ_ONLY)
+        );
+        assert_eq!(
+            crate::test_support::frame_string(&mut visit.state, 120, 40)
+                .matches(
+                    "this agent has finished: return to the main conversation to send a message"
+                )
+                .count(),
+            1
+        );
+        assert!(commands.is_empty());
+        dispatcher.shutdown().unwrap();
+        parent.shutdown();
+    }
+
+    pub(crate) fn check_finished_edge() {
+        let parent = parent_with_kept_agents();
+        let marker = parent.home.path().join("finish-child");
+        let prompt = format!(
+            "subagent async mock_stream_release_marker {}",
+            marker.display()
+        );
+        let (sender, events) = crossbeam_channel::unbounded();
+        let worker = {
+            let thread = parent.thread.clone();
+            let config = parent.config.clone();
+            std::thread::spawn(move || run_child_turn(&thread, config, &prompt, &sender))
+        };
+        let row = loop {
+            let event = events
+                .recv_timeout(super::Duration::from_secs(10))
+                .unwrap()
+                .into_test_payload();
+            if let super::TuiEvent::SurfaceProjectionSynced(projection) = event
+                && let Some(row) = projection.workflow_tasks.iter().find(|row| {
+                    row.status == TaskStatus::Running && row.subagent_child_thread_id.is_some()
+                })
+            {
+                break row.clone();
+            }
+        };
+        let mut visit = AgentVisit::new(&parent);
+        visit.open(&row);
+        let mut operating = Some(parent.thread.clone());
+        let mut sender = visit.view.main_sender();
+        let mut attachment = SessionAttachmentId::new(1);
+        assert_eq!(
+            visit
+                .view
+                .adopt(&mut operating, &mut sender, &mut attachment, false),
+            crate::hosted_view::Adoption::Child
+        );
+        let old = attachment;
+        std::fs::write(&marker, b"").unwrap();
+        worker.join().unwrap();
+        let deadline = std::time::Instant::now() + super::Duration::from_secs(10);
+        let ended = loop {
+            let row = agent_row(&parent);
+            if row.status == TaskStatus::Completed {
+                break row;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "main did not publish the agent's end: {:?}",
+                row.status
+            );
+            std::thread::sleep(super::Duration::from_millis(10));
+        };
+        let notice = || super::FinishedTask {
+            attachment: old,
+            task_id: row.id.clone(),
+            bound_thread_id: row.subagent_child_thread_id.clone().unwrap(),
+        };
+        for wrong in [
+            super::FinishedTask {
+                task_id: "other".into(),
+                ..notice()
+            },
+            super::FinishedTask {
+                bound_thread_id: "other".into(),
+                ..notice()
+            },
+        ] {
+            visit
+                .view
+                .handle(super::HostedChildAction::Finished(wrong), &visit.control);
+            assert_eq!(
+                visit.view.out_of_step(),
+                Some(crate::hosted_view::OutOfStep::AgentOnScreen)
+            );
+        }
+        let end =
+            super::FinishedTask::for_view(&visit.state, std::slice::from_ref(&ended)).unwrap();
+        visit
+            .view
+            .handle(super::HostedChildAction::Finished(end), &visit.control);
+        visit.apply();
+        visit.assert_finished("Main is idle · Esc return");
+        visit
+            .view
+            .handle(super::HostedChildAction::Finished(notice()), &visit.control);
+        assert!(super::FinishedTask::for_view(&visit.state, &[ended]).is_none());
+        assert!(visit.events.is_empty());
+        assert_eq!(
+            visit
+                .view
+                .adopt(&mut operating, &mut sender, &mut attachment, false),
+            crate::hosted_view::Adoption::Main
+        );
+        assert_eq!(operating.unwrap().thread_id(), parent.thread.thread_id());
+        assert_ne!(visit.state.active_session_attachment, Some(old));
+        parent.shutdown();
+    }
+
+    pub(crate) fn check_finished_return() {
+        let (parent, row) = finished_nested();
+        for has_reader in [false, true] {
+            let mut visit = AgentVisit::new(&parent);
+            let marker = parent
+                .home
+                .path()
+                .join(format!("release-main-{has_reader}"));
+            let prompt = format!("mock_stream_release_marker {}", marker.display());
+            let (sender, events) = crossbeam_channel::unbounded();
+            let control = if has_reader {
+                visit.control.clone()
+            } else {
+                super::TuiSurfaceTaskControl::isolated_for_test()
+            };
+            let runtime = parent.thread.typed_surface();
+            let config = parent.config.clone();
+            let worker = std::thread::spawn(move || {
+                crate::surface_actions::TuiSurfaceActions::new(runtime)
+                    .run_turn(
+                        orca_runtime::runtime_host::HostedTurnRequest::new(prompt),
+                        config,
+                        &control,
+                        &sender,
+                    )
+                    .unwrap()
+            });
+            while !matches!(
+                events
+                    .recv_timeout(super::Duration::from_secs(5))
+                    .unwrap()
+                    .into_test_payload(),
+                super::TuiEvent::MessageDelta(_)
+            ) {}
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                visit.open(&row);
+                visit.assert_finished("Main is running · Esc return");
+                visit
+                    .view
+                    .handle(super::HostedChildAction::Return, &visit.control);
+                visit.apply();
+                assert!(!visit.state.finished_child);
+                assert!(visit.state.conversation_target().task_id().is_none());
+                assert_eq!(visit.state.status, crate::types::AppStatus::Running);
+                assert_eq!(
+                    visit.state.lifecycle_cursor.as_ref().unwrap().live,
+                    has_reader
+                );
+            }));
+            std::fs::write(marker, b"").unwrap();
+            worker.join().unwrap();
+            if let Err(panic) = checked {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        parent.shutdown();
     }
 
     #[test]

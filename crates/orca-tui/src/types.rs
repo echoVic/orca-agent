@@ -788,6 +788,7 @@ pub struct AppState {
     /// What the main conversation is doing while a child's is on screen;
     /// `None` when main itself is on screen.
     pub(crate) main_behind_child: Option<SideParentStatus>,
+    pub(crate) finished_child: bool,
     /// Whether `/tasks` has expanded the background-task dock in the
     /// activity area above the composer. Distinct from `panel_mode`: the
     /// dock stays layered above the transcript instead of replacing it.
@@ -860,6 +861,7 @@ impl AppState {
     }
 
     pub(crate) fn set_conversation_target(&mut self, target: ConversationTarget) {
+        self.finished_child = false;
         self.conversation_target = target;
     }
 
@@ -1202,6 +1204,7 @@ impl AppState {
             agent_workspace: AgentWorkspaceState::default(),
             agent_dock_selected_task_id: None,
             main_behind_child: None,
+            finished_child: false,
             tasks_dock_expanded: false,
             announced_startup_warnings: std::collections::HashSet::new(),
             announced_subagent_batches: std::collections::HashSet::new(),

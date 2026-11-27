@@ -117,6 +117,14 @@ impl TuiAgentRuntime {
         &self.controller
     }
 
+    pub(crate) fn finished_sender(
+        &self,
+    ) -> Option<crossbeam_channel::Sender<crate::hosted_child::FinishedTask>> {
+        self.dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.finished_tx.clone())
+    }
+
     pub(crate) fn interaction_ack_receiver(&self) -> Receiver<InteractionResponseAck> {
         if let Some(receiver) = &self.remote_ack_rx {
             receiver.clone()

@@ -22,7 +22,8 @@ use crate::surface_projection::{
 use crate::transcript_state::ChatMessage;
 use crate::types::{
     AppState, AppStatus, ApprovalDialog, PanelMode, PlanApprovalDialog, RecapState, RewindPhase,
-    RewindState, SessionPickerPhase, SideConversationUiState, TaskTranscriptViewState,
+    RewindState, SessionPickerPhase, SideConversationUiState, SideParentStatus,
+    TaskTranscriptViewState,
 };
 use crate::user_input_dialog::UserInputDialog;
 
@@ -351,17 +352,21 @@ impl AppState {
                 {
                     return;
                 }
-                if let Some(status) = main_status {
-                    self.main_behind_child = Some(status);
-                }
-                let background_tasks = self.background_workflow_tasks.clone();
-                self.reset_session_projection();
-                self.invalidate_recap();
-                self.background_workflow_tasks = background_tasks;
-                self.set_conversation_target(ConversationTarget::subagent(task_id));
-                self.task_transcript = None;
-                self.panel_mode = PanelMode::Conversation;
+                self.reset_child_view(task_id, main_status);
                 self.apply_surface_projection_state(*projection);
+            }
+            TuiEvent::FinishedChildProjection {
+                task_id,
+                main_status,
+                projection,
+            } => {
+                self.reset_child_view(task_id, Some(main_status));
+                if let Some(projection) = projection {
+                    self.apply_surface_projection_state(*projection);
+                } else {
+                    self.update_workflow_panel(self.background_workflow_tasks.clone());
+                }
+                self.finished_child = true;
             }
             TuiEvent::SavedSessionsUpdated {
                 sessions,
@@ -1581,6 +1586,19 @@ impl AppState {
                 });
             }
         }
+    }
+
+    fn reset_child_view(&mut self, task_id: String, main_status: Option<SideParentStatus>) {
+        let background_tasks = std::mem::take(&mut self.background_workflow_tasks);
+        self.reset_session_projection();
+        if let Some(status) = main_status {
+            self.main_behind_child = Some(status);
+        }
+        self.invalidate_recap();
+        self.background_workflow_tasks = background_tasks;
+        self.set_conversation_target(ConversationTarget::subagent(task_id));
+        self.task_transcript = None;
+        self.panel_mode = PanelMode::Conversation;
     }
 
     fn reset_main_projection(

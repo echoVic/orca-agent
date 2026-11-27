@@ -440,14 +440,9 @@ impl TuiSurfaceTaskControl {
                 hosted.surface_active.is_some() || hosted.surface_activation_armed,
             )
         };
-        let view = view?;
-        if view.has_focus() {
-            return Some(crate::hosted_view::OutOfStep::AgentOnScreen);
-        }
-        if !turn_active {
-            return None;
-        }
-        view.out_of_step()
+        view?
+            .out_of_step()
+            .filter(|reason| *reason != crate::hosted_view::OutOfStep::AgentRuns || turn_active)
     }
 
     pub(crate) fn bind_hosted_settings_config(

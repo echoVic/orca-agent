@@ -9044,3 +9044,17 @@ fn disconnected_job_sender_drops_runtime_without_noise_or_extra_revision() {
     assert_eq!(state.successful_edit_highlight_submit_count(), 0);
     assert!(!state.edit_highlight_runtime_started());
 }
+#[test]
+fn a_finished_agents_view_says_it_is_read_only_and_hands_a_message_back() {
+    crate::hosted_child::tests::check_finished_submit();
+}
+
+#[test]
+fn an_agent_that_finishes_on_screen_becomes_read_only() {
+    crate::hosted_child::tests::check_finished_edge();
+}
+
+#[test]
+fn a_finished_agent_returns_to_running_main_with_only_its_own_reader() {
+    crate::hosted_child::tests::check_finished_return();
+}

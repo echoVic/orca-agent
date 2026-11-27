@@ -46,6 +46,7 @@ pub(crate) fn adoption(
 pub(crate) enum OutOfStep {
     /// A child is on screen; a message typed there has nowhere to go.
     AgentOnScreen,
+    FinishedAgentOnScreen,
     /// The controller still operates on a child that is not on screen.
     AgentRuns,
 }
@@ -137,7 +138,7 @@ impl HostedView {
         // conversation the controller recorded.
         let (mut thread, mut event_tx, mut attachment) = match inner.focus.as_ref() {
             Some(focus) => (
-                Some(focus.child_thread.clone()),
+                focus.interactive.as_ref().map(|(child, _)| child.clone()),
                 focus.child_event_tx.clone(),
                 focus.child_attachment,
             ),
@@ -210,7 +211,11 @@ impl HostedView {
         // operating thread moves: what was said ahead of a check
         // ([`Self::set_side_active`]) lasts only until the next pass.
         inner.side_active = side_active;
-        let on_screen = inner.focus.as_ref().map(|focus| focus.child_attachment);
+        let on_screen = inner
+            .focus
+            .as_ref()
+            .filter(|focus| focus.interactive.is_some())
+            .map(|focus| focus.child_attachment);
         let change = adoption(on_screen, inner.adopted);
         match change {
             Adoption::Child => {
@@ -223,7 +228,7 @@ impl HostedView {
                     };
                 }
                 let focus = inner.focus.as_ref().expect("a child is on screen");
-                *thread = Some(focus.child_thread.clone());
+                *thread = focus.interactive.as_ref().map(|(child, _)| child.clone());
                 *event_tx = focus.child_event_tx.clone();
                 *attachment = focus.child_attachment;
                 inner.adopted = on_screen;
@@ -278,6 +283,13 @@ impl HostedView {
         )
     }
 
+    pub(crate) fn focused_sender(&self) -> Option<mpsc::Sender<TuiEvent>> {
+        self.lock()
+            .focus
+            .as_ref()
+            .map(|focus| focus.child_event_tx.clone())
+    }
+
     pub(crate) fn command_refusal(
         &self,
         action: &crate::protocol::UserAction,
@@ -300,6 +312,13 @@ impl HostedView {
     /// controller is sent now still goes to the conversation it operates on.
     pub(crate) fn out_of_step(&self) -> Option<OutOfStep> {
         let inner = self.lock();
+        if inner
+            .focus
+            .as_ref()
+            .is_some_and(|focus| focus.interactive.is_none())
+        {
+            return Some(OutOfStep::FinishedAgentOnScreen);
+        }
         out_of_step(
             inner.focus.as_ref().map(|focus| focus.child_attachment),
             inner.adopted,

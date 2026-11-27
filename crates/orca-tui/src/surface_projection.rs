@@ -2150,7 +2150,7 @@ fn task_type(task_type: orca_runtime::surface::SurfaceTaskType) -> TaskType {
     }
 }
 
-fn task_status(status: SurfaceTaskStatus) -> TaskStatus {
+pub(crate) fn task_status(status: SurfaceTaskStatus) -> TaskStatus {
     match status {
         SurfaceTaskStatus::Queued => TaskStatus::Queued,
         SurfaceTaskStatus::Running => TaskStatus::Running,

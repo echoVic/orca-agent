@@ -345,6 +345,7 @@ fn run_tui_inner(
     let mut renderer_runtime =
         RendererRuntimeEventOwner::new(mention_search, pending_initial_prompt)
             .with_local_shell_readiness(local_runtime);
+    renderer_runtime.finished_tx = agent_runtime.finished_sender();
 
     let renderer_result = match pending_terminal_session.activate() {
         Ok(terminal_session) => terminal_session.run(

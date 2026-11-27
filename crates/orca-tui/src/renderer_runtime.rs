@@ -32,6 +32,7 @@ pub(crate) struct RendererRuntimeEventOwner {
     mention_search: MentionSearchManager,
     pending_initial_prompt: Option<String>,
     local_shell_readiness: bool,
+    pub(crate) finished_tx: Option<mpsc::Sender<crate::hosted_child::FinishedTask>>,
     /// The MCP servers in view when the mention catalog last looked at
     /// them.
     mcp_servers_seen: Vec<McpServerView>,
@@ -46,6 +47,7 @@ impl RendererRuntimeEventOwner {
             mention_search,
             pending_initial_prompt,
             local_shell_readiness: true,
+            finished_tx: None,
             mcp_servers_seen: Vec::new(),
         }
     }
@@ -78,6 +80,12 @@ impl RendererRuntimeEventOwner {
             Ok(Some(tui_event)) => tui_event,
             Ok(None) | Err(()) => return,
         };
+        if let TuiEvent::BackgroundTasksUpdated(rows) = &tui_event
+            && let Some(sender) = &self.finished_tx
+            && let Some(notice) = crate::hosted_child::FinishedTask::for_view(state, rows)
+        {
+            let _ = sender.send(notice);
+        }
         match tui_event {
             // The wait for the history of the conversation resumed at launch
             // ends when it loads, and when a new conversation takes its place

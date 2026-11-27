@@ -979,16 +979,22 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
     if queue_next_turn {
         std::fs::write(&marker, b"").unwrap();
     }
+    if queued_approval {
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "This agent has finished. Its conversation is read-only.",
+            "the agent did not settle before the queued approval",
+        );
+        process.write(b"/side\r").unwrap();
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "side conversations are unavailable while a child is focused",
+            "controller did not answer in the finished agent's view",
+        );
+    }
     if approval || queued_approval {
-        if queued_approval {
-            process.write(b"/side\r").unwrap();
-            assert_screen_has_text(
-                &process,
-                &mut output,
-                "side conversations are unavailable while a child is focused",
-                "controller did not answer on the adopted child",
-            );
-        }
         std::fs::write(&ask, b"").unwrap();
         assert_screen_has_text(
             &process,
@@ -1413,6 +1419,99 @@ fn tui_bracketed_image_path_paste_materializes_an_atomic_attachment() {
     let status = process.wait_for_exit(Duration::from_secs(5));
     process.close_io_and_join();
     assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
+fn tui_a_finished_agent_opens_its_conversation_now_and_after_a_resume() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n").unwrap();
+    for resumed in [false, true] {
+        let mut output = Vec::new();
+        let mut process = if resumed {
+            let process =
+                PtyProcess::spawn_resumed_without_prompt(home.path(), cwd.path(), "latest")
+                    .unwrap();
+            assert_screen_has_text(
+                &process,
+                &mut output,
+                "Resumed saved conversation.",
+                "main did not resume",
+            );
+            process
+        } else {
+            let mut process =
+                PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "subagent sync mock_usage")
+                    .unwrap();
+            accept_new_workspace(&mut process, &mut output);
+            wait_for_screen(
+                &process,
+                &mut output,
+                |frame| {
+                    frame.contains("Agent completed:")
+                        && frame.contains("Mock completed after tool execution.")
+                        && !frame.contains("Esc interrupt")
+                },
+                "main did not finish the delegation",
+            );
+            process
+        };
+        process.write(b"/agents\r").unwrap();
+        wait_for_screen(
+            &process,
+            &mut output,
+            |frame| frame.contains("Tasks Workspace") && frame.contains("mock_usage"),
+            "agent row not ready",
+        );
+        process.write(b"\r").unwrap();
+        let frame = wait_for_screen(
+            &process,
+            &mut output,
+            |frame| {
+                frame.contains("This agent has finished. Its conversation is read-only.")
+                    && frame.contains("Main is idle · Esc return")
+            },
+            "ended agent did not open",
+        );
+        assert!(
+            frame.contains("Mock runtime completed with usage accounting."),
+            "{frame}"
+        );
+        assert!(frame.contains("Main is idle · Esc return"), "{frame}");
+        assert!(
+            !frame.contains("Showing its last checkpoint") && !frame.contains("Esc interrupt"),
+            "{frame}"
+        );
+        process.write(b"keep this draft\r").unwrap();
+        let frame = wait_for_screen(
+            &process,
+            &mut output,
+            |frame| {
+                frame.contains(
+                    "this agent has finished: return to the main conversation to send a message",
+                )
+            },
+            "finished message not handed back",
+        );
+        assert!(frame.contains("keep this draft"), "{frame}");
+        process.write(&[0x1b]).unwrap();
+        wait_for_screen(
+            &process,
+            &mut output,
+            |frame| {
+                frame.contains("Delegating to 1 agent")
+                    && !frame.contains("Its conversation is read-only.")
+            },
+            "Esc did not return to main",
+        );
+        process.write(&[0x15]).unwrap();
+        arm_idle_exit(&mut process, &mut output);
+        assert_eq!(
+            process.wait_for_exit(Duration::from_secs(5)).code(),
+            Some(130)
+        );
+        process.close_io_and_join();
+    }
 }
 
 #[test]
@@ -2904,9 +3003,6 @@ fn assert_screen_shows(process: &PtyProcess, output: &mut Vec<u8>, expected: &st
     }
 }
 
-/// Like `assert_screen_shows`, but `expected` has to be on the screen as it
-/// is, not in pieces somewhere in it: where text comes in an order is what is
-/// checked.
 fn wait_for_screen(
     process: &PtyProcess,
     output: &mut Vec<u8>,
@@ -2930,6 +3026,9 @@ fn wait_for_screen(
     }
 }
 
+/// Like `assert_screen_shows`, but `expected` has to be on the screen as it
+/// is, not in pieces somewhere in it: where text comes in an order is what is
+/// checked.
 fn assert_screen_has_text(
     process: &PtyProcess,
     output: &mut Vec<u8>,

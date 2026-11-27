@@ -382,8 +382,28 @@ pub(crate) fn update_settings(
 
 pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<SurfaceSnapshot> {
     with_snapshot_attachment(thread, |attachment| {
+        #[cfg(test)]
+        SNAPSHOT_READS.with_borrow_mut(|reads| {
+            if let Some(reads) = reads {
+                reads.push(attachment.clone());
+            }
+        });
         Ok((*attachment.baseline.snapshot).clone())
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_READS: std::cell::RefCell<Option<Vec<orca_runtime::surface::FreshSurfaceAttachment>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn trace_snapshot_reads(
+    read: impl FnOnce(),
+) -> Vec<orca_runtime::surface::FreshSurfaceAttachment> {
+    SNAPSHOT_READS.replace(Some(Vec::new()));
+    read();
+    SNAPSHOT_READS.take().unwrap()
 }
 
 fn with_snapshot_attachment<T>(

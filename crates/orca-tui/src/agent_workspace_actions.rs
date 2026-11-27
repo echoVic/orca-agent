@@ -6,9 +6,8 @@ use crate::agent_workspace::AgentWorkspaceRow;
 use crate::protocol::{TaskTranscriptRequest, UserAction};
 use crate::types::{AppState, PanelMode};
 
-/// Opens a subagent the way Enter on it does: a child on a thread of this
-/// process takes over the conversation view, any other one opens its
-/// transcript in the Agents panel. `false` when there is nothing to open yet,
+/// Opens a bound child's conversation, or an unbound task's transcript
+/// in the Agents panel. `false` when there is nothing to open yet,
 /// because the surface has not published the task.
 pub(crate) fn open_agent_task(
     state: &mut AppState,
@@ -25,7 +24,7 @@ pub(crate) fn open_agent_task(
     let Some(expected_revision) = task.publication_revision else {
         return false;
     };
-    if opens_live_conversation(task) {
+    if opens_conversation(task) {
         let _ = action_tx.send(UserAction::FocusChildThread {
             task_id: task_id.to_string(),
             expected_revision,
@@ -43,11 +42,8 @@ pub(crate) fn open_agent_task(
     true
 }
 
-/// Whether opening this agent switches the view to its live conversation:
-/// a child still running on a thread of this process. Any other agent opens
-/// its panel.
-pub(crate) fn opens_live_conversation(task: &BackgroundTaskSummary) -> bool {
-    task.subagent_child_thread_id.is_some() && task.status.is_active()
+pub(crate) fn opens_conversation(task: &BackgroundTaskSummary) -> bool {
+    task.subagent_child_thread_id.is_some()
 }
 
 /// Leaves whatever agent is open for the main conversation: a focused child
@@ -769,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_child_opens_its_panel_not_a_conversation_that_is_gone() {
+    fn a_finished_agent_with_a_thread_opens_its_conversation() {
         let mut child = task("child", 1_000);
         child.subagent_child_thread_id = Some("child-thread".to_string());
         child.status = TaskStatus::Completed;
@@ -778,6 +774,19 @@ mod tests {
 
         assert!(open_agent_task(&mut state, &tx, "child"));
 
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+        assert!(
+            matches!(rx.try_recv(), Ok(UserAction::FocusChildThread { task_id, expected_revision: 7 }) if task_id == "child")
+        );
+    }
+
+    #[test]
+    fn a_finished_agent_without_a_thread_opens_the_panel() {
+        let mut child = task("child", 1_000);
+        child.status = TaskStatus::Completed;
+        let (mut state, rx) = conversation_with(vec![child]);
+        let tx = state.event_tx.clone();
+        assert!(open_agent_task(&mut state, &tx, "child"));
         assert_eq!(state.panel_mode, PanelMode::Agents);
         assert!(matches!(
             rx.try_recv(),

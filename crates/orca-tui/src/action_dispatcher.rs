@@ -42,6 +42,7 @@ pub(crate) struct TuiActionDispatcher {
     shutdown_tx: Sender<()>,
     handle: Option<JoinHandle<()>>,
     interaction_ack_rx: Receiver<InteractionResponseAck>,
+    pub(crate) finished_tx: Sender<crate::hosted_child::FinishedTask>,
 }
 
 struct DispatcherPending {
@@ -65,6 +66,7 @@ impl TuiActionDispatcher {
         }
         let (command_tx, command_rx) = crossbeam_channel::bounded(command_capacity);
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+        let (finished_tx, finished_rx) = crossbeam_channel::unbounded();
         let (interaction_ack_tx, interaction_ack_rx) =
             crossbeam_channel::bounded(INTERACTION_ACK_CAPACITY);
         let handle = thread::Builder::new()
@@ -75,7 +77,7 @@ impl TuiActionDispatcher {
                     event_tx,
                     command_tx,
                     interaction_ack_tx,
-                    shutdown_rx,
+                    (shutdown_rx, finished_rx),
                     controller,
                     backlog_capacity,
                 )
@@ -85,6 +87,7 @@ impl TuiActionDispatcher {
                 shutdown_tx,
                 handle: Some(handle),
                 interaction_ack_rx,
+                finished_tx,
             },
             command_rx,
         ))
@@ -116,13 +119,22 @@ fn run_dispatcher(
     event_tx: Sender<TuiEvent>,
     command_tx: Sender<UserAction>,
     interaction_ack_tx: Sender<InteractionResponseAck>,
-    shutdown_rx: Receiver<()>,
+    notifications: (Receiver<()>, Receiver<crate::hosted_child::FinishedTask>),
     surface_control: TuiSurfaceTaskControl,
     backlog_capacity: usize,
 ) {
     // Keep the frozen mutation inventory's historical receiver name while the
     // concrete value is the runtime-surface-only control.
     let controller = surface_control;
+    let (shutdown_rx, finished_rx) = notifications;
+    let finish = |notice: crate::hosted_child::FinishedTask| {
+        if let Some(view) = controller.view() {
+            view.handle(
+                crate::hosted_child::HostedChildAction::Finished(notice),
+                &controller,
+            );
+        }
+    };
     let mut pending = DispatcherPending {
         commands: VecDeque::with_capacity(backlog_capacity),
         event: None,
@@ -156,6 +168,7 @@ fn run_dispatcher(
 
         if pending.commands.is_empty() {
             crossbeam_channel::select! {
+                recv(finished_rx) -> notice => { if let Ok(notice) = notice { finish(notice); } },
                 recv(shutdown_rx) -> _ => break,
                 recv(action_rx) -> action => {
                     let Ok(action) = action else { break };
@@ -174,6 +187,7 @@ fn run_dispatcher(
             }
         } else {
             crossbeam_channel::select! {
+                recv(finished_rx) -> notice => { if let Ok(notice) = notice { finish(notice); } },
                 recv(shutdown_rx) -> _ => break,
                 recv(action_rx) -> action => {
                     let Ok(action) = action else { break };
@@ -223,6 +237,9 @@ fn route_action(
     {
         let message = match out_of_step {
             crate::hosted_view::OutOfStep::AgentOnScreen => AGENT_ON_SCREEN,
+            crate::hosted_view::OutOfStep::FinishedAgentOnScreen => {
+                "this agent has finished: return to the main conversation to send a message"
+            }
             crate::hosted_view::OutOfStep::AgentRuns => AGENT_STILL_RUNNING,
         }
         .to_string();
