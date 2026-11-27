@@ -1,3 +1,4 @@
+pub use crate::agent_continuation::is_delegated_child_context;
 pub(crate) use crate::child_agent_entrypoints::run_child_agent;
 pub use crate::child_agent_entrypoints::{
     ChildAgentPromptContext, run_child_agent_prompt_with_tool_executor,

@@ -1473,6 +1473,21 @@ fn tui_a_finished_agent_opens_its_conversation_now_and_after_a_resume() {
             },
             "ended agent did not open",
         );
+        if resumed {
+            assert!(
+                !frame.contains("You are a delegated child agent"),
+                "{frame}"
+            );
+            assert_eq!(
+                frame
+                    .lines()
+                    .filter_map(|line| line.trim_start().strip_prefix('›'))
+                    .map(str::trim)
+                    .find(|text| !text.is_empty()),
+                Some("mock_usage"),
+                "{frame}"
+            );
+        }
         assert!(
             frame.contains("Mock runtime completed with usage accounting."),
             "{frame}"

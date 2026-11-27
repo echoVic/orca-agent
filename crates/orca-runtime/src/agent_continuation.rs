@@ -787,6 +787,10 @@ pub(crate) fn project_checkpoint_transcript(
     Ok(items)
 }
 
+pub fn is_delegated_child_context(content: &str) -> bool {
+    content.starts_with(crate::agent_controller::DELEGATED_CHILD_CONTEXT)
+}
+
 /// Projects the recorded conversation of an agent that ran on its own child
 /// thread without a continuation (a sync agent) into bounded display items.
 /// Its session is the only record of what it did.
@@ -795,8 +799,7 @@ pub(crate) fn project_conversation_transcript(messages: &[Message]) -> Vec<Child
     for message in messages {
         match message {
             Message::System { .. } => {}
-            Message::User { content, .. }
-                if content.starts_with(crate::agent_controller::DELEGATED_CHILD_CONTEXT) => {}
+            Message::User { content, .. } if is_delegated_child_context(content) => {}
             Message::User { content, .. } => items.push(ChildTranscriptItem::User {
                 content: bound_transcript_text(content),
             }),
@@ -3951,6 +3954,18 @@ fn default_child_conversation_snapshot_schema_version() -> u32 {
 mod tests {
     use super::*;
     use orca_core::conversation::Conversation;
+
+    #[test]
+    fn delegated_child_context_matches_the_role_prefix_but_not_the_task() {
+        let prefix = crate::agent_controller::DELEGATED_CHILD_CONTEXT;
+        assert!(is_delegated_child_context(&format!(
+            "{prefix}## General Role"
+        )));
+        assert!(!is_delegated_child_context("subagent sync mock_usage"));
+        assert!(!is_delegated_child_context(&format!(
+            "Summarize this: {prefix}"
+        )));
+    }
 
     #[test]
     fn custom_agent_snapshot_does_not_change_legacy_builtin_hash_or_record_shape() {

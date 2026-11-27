@@ -11,6 +11,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel as mpsc;
+use orca_core::conversation::Message;
+use orca_runtime::agent_child::is_delegated_child_context;
 use orca_runtime::runtime_host::{RuntimeHostHandle, RuntimeThreadHandle};
 use orca_runtime::surface::{
     AttachResult, FreshAttachRequest, RuntimeSurfaceClientHandle, RuntimeSurfaceHandle,
@@ -1142,6 +1144,7 @@ fn cold_conversation(
             messages: saved
                 .messages
                 .into_iter()
+                .filter(|message| !matches!(message, Message::User { content, .. } if is_delegated_child_context(content)))
                 .flat_map(|message| replay.convert(message))
                 .collect(),
             plan: saved.plan,
@@ -4853,6 +4856,14 @@ pub(crate) mod tests {
         visit.open(&row);
         visit.assert_finished("Main is idle · Esc return");
         let messages = &visit.state.transcript.messages;
+        let user_messages: Vec<_> = messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::User(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(user_messages, ["subagent sync mock_usage"]);
         assert!(
             messages.iter().any(
                 |message| matches!(message, ChatMessage::ToolCall{name,..} if name=="subagent")
@@ -4861,6 +4872,11 @@ pub(crate) mod tests {
         );
         assert!(messages.iter().any(|message| matches!(message, ChatMessage::Assistant(text) | ChatMessage::AssistantChunk{text,..} if text.contains("Mock completed after tool execution."))));
         assert!(!messages.iter().any(|message| matches!(message, ChatMessage::System{text,..} if text.starts_with("Delegating") || text.starts_with("Agent completed:") || text==super::CHECKPOINT)));
+        let frame = crate::test_support::frame_string(&mut visit.state, 120, 60);
+        assert!(
+            !frame.contains("You are a delegated child agent"),
+            "{frame}"
+        );
         parent.shutdown();
     }
 
