@@ -4693,8 +4693,13 @@ impl RuntimeHostHandle {
                 // The registry's stop for a child in this process marks the
                 // task and cancels its turn without waiting for it.
                 if asked.insert(task_id.clone()) && registry.local_subagent_end_pending(&task_id) {
-                    if task.status.is_active() {
-                        let _ = registry.request_stop(&task_id);
+                    if task.status.is_active()
+                        && registry.request_stop(&task_id).is_err()
+                        && registry
+                            .get(&task_id)
+                            .is_some_and(|current| current.status.is_active())
+                    {
+                        continue;
                     }
                     stopping.push((registry.clone(), task_id));
                 }
@@ -4925,6 +4930,11 @@ impl RuntimeHostHandle {
 }
 
 impl RuntimeHost {
+    #[cfg(feature = "test-utils")]
+    pub fn default_executor_for_test() -> Arc<dyn ThreadOperationExecutor> {
+        Arc::new(LegacyThreadOperationExecutor)
+    }
+
     pub fn start() -> Result<Self, RuntimeHostError> {
         Self::start_with_background_capacity(HOST_BACKGROUND_TASK_CAPACITY)
     }

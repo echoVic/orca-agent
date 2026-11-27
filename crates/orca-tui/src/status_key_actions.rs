@@ -242,7 +242,7 @@ fn compacting_shortcut_allowed(shortcut: RunningShortcut) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
     use orca_core::approval_types::ApprovalMode;
@@ -862,13 +862,18 @@ mod tests {
                 status: "cancelled".into(),
             },
         );
+        assert_idle_takes_typing(&mut state);
+    }
+
+    pub(crate) fn assert_idle_takes_typing(state: &mut AppState) {
+        let (action_tx, _actions) = mpsc::unbounded();
         let mut config = config();
         let shared = Arc::new(Mutex::new(config.clone()));
         let mut textarea = TextArea::default();
         press_status_key(
             KeyCode::Char('x'),
             KeyModifiers::NONE,
-            &mut state,
+            state,
             &mut config,
             &shared,
             &action_tx,

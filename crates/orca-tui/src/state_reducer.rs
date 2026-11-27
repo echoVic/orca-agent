@@ -98,6 +98,31 @@ impl AppState {
                 self.turn_diagnostic_seen = current_turn_seen;
                 return None;
             }
+            if let TuiEvent::Compacted {
+                before_messages,
+                after_messages,
+                ref reason,
+                ref strategy,
+                collapsed_messages,
+                ref status_text,
+            } = event
+            {
+                if accepted {
+                    return Some(event);
+                }
+                self.push_message(ChatMessage::System {
+                    text: format_compaction_notice(
+                        reason,
+                        strategy,
+                        before_messages,
+                        after_messages,
+                        collapsed_messages,
+                        status_text,
+                    ),
+                    expanded: false,
+                });
+                return None;
+            }
             if !accepted
                 || matches!(event, TuiEvent::TerminalRecoveryNeeded(_))
                     && self.status == AppStatus::Idle
@@ -108,6 +133,9 @@ impl AppState {
                 return None;
             }
             self.lifecycle_cursor = Some(event.lifecycle_delivery(owner, cursor));
+            if matches!(event, TuiEvent::OperationReleased) {
+                return None;
+            }
         }
         Some(event)
     }
@@ -227,7 +255,9 @@ impl AppState {
             TuiEvent::Attached(_) => {
                 eprintln!("orca: ignored an attached TUI event that bypassed attachment fencing");
             }
-            TuiEvent::SessionAttachmentActivated | TuiEvent::SurfaceRequestSettled(_) => {}
+            TuiEvent::SessionAttachmentActivated
+            | TuiEvent::SurfaceRequestSettled(_)
+            | TuiEvent::OperationReleased => {}
             TuiEvent::SideConversationChanged {
                 active,
                 available,

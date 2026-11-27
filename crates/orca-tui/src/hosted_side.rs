@@ -381,10 +381,18 @@ pub(crate) fn handle_hosted_side_action(
                 let side_active = thread
                     .as_ref()
                     .is_some_and(|current| current.thread_id() == side.side_thread.thread_id());
-                let parent_batch = if side_active {
-                    match read_hosted_projection_batch(&side.thread, HistoryTarget::Main) {
-                        Ok(batch) => Some(batch),
+                let parent_snapshot = if side_active {
+                    attachment_routing
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .defer_parent(side.attachment);
+                    match TuiSurfaceActions::new(side.thread.typed_surface()).read_snapshot() {
+                        Ok(snapshot) => Some(snapshot),
                         Err(error) => {
+                            AttachmentRouting::cancel_deferred_parent_events(
+                                attachment_routing,
+                                root_event_tx,
+                            );
                             let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                                 "failed to return to the main conversation: {error}"
                             )));
@@ -397,6 +405,12 @@ pub(crate) fn handle_hosted_side_action(
                 };
                 let side_thread = side.side_thread;
                 if let Err(error) = side_thread.shutdown_with_timeout(Duration::from_secs(5)) {
+                    if side_active {
+                        AttachmentRouting::cancel_deferred_parent_events(
+                            attachment_routing,
+                            root_event_tx,
+                        );
+                    }
                     let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                         "failed to close side conversation: {error}"
                     )));
@@ -416,13 +430,14 @@ pub(crate) fn handle_hosted_side_action(
                         *session_attachment,
                         Some(side.attachment),
                     );
-                    let (parent_projection, conversation) = parent_batch.expect("parent batch");
-                    if let Err(error) = project_hosted_thread_attached(
-                        parent_projection,
-                        conversation,
-                        Some("Inherited conversation context."),
+                    if let Err(error) = crate::hosted_child::project_returned_main_with_label(
+                        &side.thread,
+                        &parent_snapshot.expect("parent snapshot"),
                         *session_attachment,
                         root_event_tx,
+                        control,
+                        attachment_routing,
+                        Some("Inherited conversation context."),
                     ) {
                         let _ = event_tx.send(TuiEvent::Error(format!(
                             "failed to project main conversation: {error}"
@@ -459,6 +474,80 @@ pub(crate) fn handle_hosted_side_action(
 mod tests {
     use super::*;
     use orca_core::config::HistoryMode;
+
+    #[test]
+    fn fix5_closing_side_reseeds_mains_stale_owner() {
+        let home = crate::test_support::isolate_orca_home();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_owned());
+        config.history_mode = HistoryMode::Record;
+        let runtime = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let parent = runtime
+            .start_thread(config.clone(), "side-close parent")
+            .unwrap();
+        let config = Arc::new(Mutex::new(config));
+        let mut thread = Some(parent.clone());
+        let (root, events) = mpsc::unbounded();
+        let mut sender = root.clone();
+        let main = SessionAttachmentId::new(1);
+        let mut attachment = main;
+        let routing = Arc::new(Mutex::new(AttachmentRouting::new(main)));
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let mut side = None;
+        let mut action = |action| {
+            handle_hosted_side_action(
+                action,
+                &mut thread,
+                &mut side,
+                &runtime.handle(),
+                &config,
+                &Arc::new(Mutex::new(None)),
+                &root,
+                &mut sender,
+                &mut attachment,
+                &routing,
+                &control,
+                &Default::default(),
+            )
+        };
+        action(HostedSideAction::Start { prompt: None });
+        let mut cursor = crate::surface_client::read_snapshot(&parent.typed_surface())
+            .unwrap()
+            .cursor;
+        let op = || {
+            orca_runtime::surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap()
+        };
+        routing.lock().unwrap().route(
+            &root,
+            main,
+            TuiEvent::RuntimeTurnStarted {
+                turn_id: "stale".into(),
+            }
+            .at_operation_cursor(true, &cursor, &op()),
+        );
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            TuiEvent::SideParentStatusChanged(SideParentStatus::Running)
+        )));
+        action(HostedSideAction::Close);
+        assert!(side.is_none());
+        cursor.next_seq = orca_runtime::surface::SequenceNumber::new(cursor.next_seq.get() + 1);
+        routing.lock().unwrap().route(
+            &root,
+            main,
+            TuiEvent::SessionCompleted {
+                status: "cancelled".into(),
+            }
+            .at_operation_cursor(true, &cursor, &op()),
+        );
+        let accepted = events.try_iter().any(|event| matches!(event.into_test_payload(),TuiEvent::SessionCompleted {status} if status=="cancelled"));
+        control.shutdown();
+        runtime.shutdown().unwrap();
+        assert!(accepted, "stale owner survived the side close");
+    }
 
     #[test]
     fn start_without_parent_uses_focused_side_action_owner() {

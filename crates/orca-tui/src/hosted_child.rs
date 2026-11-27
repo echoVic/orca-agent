@@ -954,9 +954,21 @@ pub(crate) fn project_returned_main(
     control: &TuiSurfaceTaskControl,
     routing: &Arc<Mutex<AttachmentRouting>>,
 ) -> Result<(), String> {
+    project_returned_main_with_label(thread, snapshot, attachment, sender, control, routing, None)
+}
+
+pub(crate) fn project_returned_main_with_label(
+    thread: &RuntimeThreadHandle,
+    snapshot: &SurfaceSnapshot,
+    attachment: SessionAttachmentId,
+    sender: &mpsc::Sender<TuiEvent>,
+    control: &TuiSurfaceTaskControl,
+    routing: &Arc<Mutex<AttachmentRouting>>,
+    label: Option<&str>,
+) -> Result<(), String> {
     let (projection, conversation) =
         hosted_projection_batch_from_snapshot(thread, snapshot, HistoryTarget::Main);
-    project_hosted_thread_attached(projection, conversation, None, attachment, sender)?;
+    project_hosted_thread_attached(projection, conversation, label, attachment, sender)?;
     if let Some(generation) = snapshot
         .foreground_operation
         .as_ref()
@@ -1152,11 +1164,21 @@ pub(crate) mod live_child_for_test {
         }
 
         fn configured(configure: impl FnOnce(&mut orca_core::config::RunConfig)) -> Self {
+            Self::with_host(
+                || orca_runtime::runtime_host::RuntimeHost::start().unwrap(),
+                configure,
+            )
+        }
+
+        fn with_host(
+            start_host: impl FnOnce() -> orca_runtime::runtime_host::RuntimeHost,
+            configure: impl FnOnce(&mut orca_core::config::RunConfig),
+        ) -> Self {
             let home = crate::test_support::isolate_orca_home();
+            let host = start_host();
             let mut config = crate::test_support::test_run_config();
             config.cwd = Some(home.path().to_path_buf());
             config.history_mode = orca_core::config::HistoryMode::Record;
-            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
             host.handle().keep_subagents_in_process();
             let child_config = config.clone();
             configure(&mut config);
@@ -1862,6 +1884,15 @@ pub(crate) mod live_child_for_test {
 
     #[test]
     fn fix4_refused_gap_interrupt_reports_one_error_and_ends_the_row() {
+        refused_gap_interrupt(false);
+    }
+
+    #[test]
+    fn fix5_refused_gap_delivers_one_owned_diagnostic_and_failed_close() {
+        refused_gap_interrupt(true);
+    }
+
+    fn refused_gap_interrupt(routed: bool) {
         use orca_runtime::{
             history::SessionStore,
             prompt_queue::{PromptQueueAction, PromptQueueInput},
@@ -1894,12 +1925,25 @@ pub(crate) mod live_child_for_test {
             .load_session(thread.thread_id())
             .unwrap()
             .path;
+        let baseline = follow.baseline.cursor.clone();
         overflow_delayed_reader(&thread, 32);
         let held = path.with_extension("held");
         std::fs::rename(&path, &held).unwrap();
         std::fs::create_dir(&path).unwrap();
         let control = TuiSurfaceTaskControl::isolated_for_test();
         let (display, events) = crossbeam_channel::unbounded();
+        let main = SessionAttachmentId::new(1);
+        if routed {
+            control.bind_view(HostedView::new(
+                host.handle(),
+                display.clone(),
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::attachment_routing::AttachmentRouting::new(main),
+                )),
+                display.clone(),
+                main,
+            ));
+        }
         let result =
             crate::surface_client::follow_queue_operation(follow, &thread, &control, &display);
         std::fs::remove_dir(&path).unwrap();
@@ -1933,6 +1977,66 @@ pub(crate) mod live_child_for_test {
         host.shutdown().unwrap();
         result.expect("the reader must not report a second error to its dispatcher");
         let shown: Vec<_> = events.try_iter().collect();
+        if routed {
+            let mut gate = MainDisplay::new();
+            let limit = baseline.next_seq.get() + 32;
+            let overflow_head =
+                orca_runtime::surface::JsonlSurfaceCommitLedger::new(path, baseline)
+                    .recover_batches()
+                    .unwrap()
+                    .committed
+                    .into_iter()
+                    .find(|batch| batch.cursor_after.next_seq.get() > limit)
+                    .unwrap()
+                    .cursor_after
+                    .clone();
+            let mut diagnostic_cursor = None;
+            let mut ended = false;
+            for event in shown {
+                let mut must_pass = false;
+                if let TuiEvent::SurfaceDelivery(delivery) = &event {
+                    match &delivery.1 {
+                        TuiEvent::Diagnostic(diagnostic) => {
+                            must_pass = true;
+                            assert!(
+                                diagnostic
+                                    .detail()
+                                    .contains("typed TUI subscription gap requires SlowSubscriber")
+                            );
+                            assert_eq!(delivery.2.as_ref(), Some(&operation));
+                            assert_eq!(delivery.0, overflow_head);
+                            assert!(diagnostic_cursor.replace(delivery.0.clone()).is_none());
+                        }
+                        TuiEvent::SessionCompleted { status } => {
+                            must_pass = true;
+                            assert_eq!(delivery.2.as_ref(), Some(&operation));
+                            assert_eq!(Some(&delivery.0), diagnostic_cursor.as_ref());
+                            assert_eq!(status, "failed");
+                            assert!(!ended);
+                            ended = true;
+                        }
+                        _ => {}
+                    }
+                }
+                let accepted = gate.send(event);
+                assert!(!must_pass || accepted);
+            }
+            assert!(ended);
+            assert_eq!(gate.state.status, crate::types::AppStatus::Idle);
+            assert_eq!(
+                gate.state
+                    .transcript
+                    .messages
+                    .iter()
+                    .filter(|row| matches!(
+                        row,
+                        crate::transcript_state::ChatMessage::Diagnostic(_)
+                    ))
+                    .count(),
+                1
+            );
+            return;
+        }
         assert_eq!(
             shown
                 .iter()
@@ -1982,6 +2086,314 @@ pub(crate) mod live_child_for_test {
             .unwrap()
             .metadata_revision;
         }
+    }
+
+    #[test]
+    fn fix5_foregrounded_p_finalizes_once_after_backgrounding_p_then_q() {
+        let fixture = ViewOnChild::start();
+        let mut shown = MainDisplay::new();
+        let (first, release_p) = background_turn(&fixture, &mut shown, "p");
+        let (_, release_q) = background_turn(&fixture, &mut shown, "q");
+        assert_eq!(shown.state.status, crate::types::AppStatus::Idle);
+        let owner = fixture.parent.typed_surface();
+        let control = fixture.control.clone();
+        let (sender, events) = crossbeam_channel::unbounded();
+        let task = first.task_id.unwrap();
+        let worker = std::thread::spawn(move || {
+            crate::surface_client::foreground_task(&owner, task.as_str(), &control, &sender)
+        });
+        assert!(
+            fixture
+                .control
+                .wait_for_surface_active(std::time::Duration::from_secs(10))
+        );
+        std::fs::write(release_p, "").unwrap();
+        worker.join().unwrap().unwrap();
+        let mut finalized = 0;
+        for event in events.try_iter() {
+            let payload = event.clone().into_test_payload();
+            assert!(!matches!(
+                payload,
+                TuiEvent::TurnStarted { .. } | TuiEvent::RuntimeTurnStarted { .. }
+            ));
+            let terminal = matches!(&event,TuiEvent::SurfaceDelivery(item) if item.2.as_ref()==Some(&first.operation_id) && matches!(&item.1,TuiEvent::SessionCompleted {status} if status=="success"));
+            let previous = shown.state.last_completed_at;
+            let accepted = shown.send(event);
+            if terminal && accepted {
+                assert_ne!(shown.state.last_completed_at, previous);
+                assert!(shown.state.transcript.assistant_stream_tail.is_none());
+                finalized += 1;
+            }
+        }
+        std::fs::write(release_q, "").unwrap();
+        fixture.shutdown();
+        assert_eq!(finalized, 1, "P must pass both lifecycle gates");
+        assert_eq!(shown.state.status, crate::types::AppStatus::Idle);
+    }
+
+    struct MainDisplay {
+        route: crate::attachment_routing::AttachmentRouting,
+        state: crate::types::AppState,
+    }
+
+    impl MainDisplay {
+        fn new() -> Self {
+            let main = SessionAttachmentId::new(1);
+            let mut state = fresh_state();
+            state.active_session_attachment = Some(main);
+            Self {
+                route: crate::attachment_routing::AttachmentRouting::new(main),
+                state,
+            }
+        }
+
+        fn send(&mut self, event: TuiEvent) -> bool {
+            let (sender, events) = crossbeam_channel::unbounded();
+            self.route
+                .route(&sender, SessionAttachmentId::new(1), event);
+            let mut accepted = false;
+            for event in events.try_iter() {
+                if let Some(event) =
+                    crate::attachment_routing::accept_attached_tui_event(&mut self.state, event)
+                        .unwrap()
+                {
+                    self.state.update(event);
+                    accepted = true;
+                }
+            }
+            accepted
+        }
+    }
+
+    fn background_turn(
+        fixture: &ViewOnChild,
+        shown: &mut MainDisplay,
+        label: &str,
+    ) -> (
+        orca_runtime::surface::SurfaceBackgroundOperation,
+        std::path::PathBuf,
+    ) {
+        let release = fixture._home.path().join(label);
+        let prompt = format!("mock_stream_release_marker {}", release.display());
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(fixture._home.path().to_owned());
+        let owner = fixture.parent.typed_surface();
+        let control = fixture.control.clone();
+        let (sender, events) = crossbeam_channel::unbounded();
+        let worker = std::thread::spawn(move || {
+            crate::surface_client::run(
+                &owner,
+                orca_runtime::runtime_host::HostedTurnRequest::new(prompt),
+                config,
+                &control,
+                &sender,
+            )
+        });
+        let mut started_owner = None;
+        let id = loop {
+            let event = events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            if let TuiEvent::SurfaceDelivery(delivery) = &event
+                && matches!(delivery.1, TuiEvent::TurnStarted { .. })
+            {
+                started_owner = delivery.2.clone();
+            }
+            let streamed = matches!(event.clone().into_test_payload(), TuiEvent::MessageDelta(_));
+            shown.send(event);
+            if streamed && let Some(owner) = started_owner.take() {
+                break owner;
+            }
+        };
+        let (actions, received) = crossbeam_channel::unbounded();
+        crate::running_actions::handle_running_shortcut(
+            crate::shortcuts::RunningShortcut::BackgroundCurrentTurn,
+            &mut shown.state,
+            &actions,
+        );
+        assert!(matches!(
+            received.recv().unwrap(),
+            crate::protocol::UserAction::BackgroundCurrentTurn
+        ));
+        assert!(fixture.control.request_background_current());
+        assert!(
+            matches!(worker.join().unwrap().unwrap(),crate::hosted_runtime::TuiHostedOperationOutcome::Turn{status} if status=="backgrounded")
+        );
+        for event in events.try_iter() {
+            shown.send(event);
+        }
+        let background = super::read_parent_snapshot(&fixture.parent)
+            .unwrap()
+            .background_operations
+            .into_iter()
+            .find(|op| op.operation_id == id)
+            .unwrap();
+        (background, release)
+    }
+
+    #[test]
+    fn fix5_typed_transferred_settles_the_foreground_request() {
+        use orca_runtime::surface::*;
+        let fixture = ViewOnChild::start();
+        let (background, marker) =
+            background_turn(&fixture, &mut MainDisplay::new(), "transfer-fence");
+        let interaction_id =
+            SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let key = format!("{interaction_id:?}");
+        let patch = InteractionPatch::Transferred {
+            interaction_id,
+            expected_revision: InteractionRevision::try_new(1).unwrap(),
+            next_revision: InteractionRevision::try_new(2).unwrap(),
+            background_fence: background.fence,
+            route: SurfaceInteractionRoute::Unassigned {
+                epoch: ResponseRouteEpoch::try_new(2).unwrap(),
+            },
+        };
+        std::fs::write(marker, "").unwrap();
+        fixture.shutdown();
+        let settlement = crate::surface_client::settlement_event(&patch)
+            .expect("typed transfer is a foreground settlement");
+        crate::attachment_routing::tests::assert_settlement_releases(&key, settlement);
+    }
+
+    #[test]
+    fn fix5_cancelled_compact_after_background_p_takes_typing() {
+        use orca_runtime::runtime_host::{RuntimeHost, ThreadOperationExecutor};
+        struct HoldCompact;
+        impl ThreadOperationExecutor for HoldCompact {
+            fn run_turn(
+                &self,
+                thread: &mut orca_runtime::thread::RuntimeThread,
+                request: &orca_runtime::runtime_host::HostedTurnRequest,
+                generation: &orca_runtime::runtime_host::GenerationContext,
+                events: &mut orca_core::event_schema::EventFactory,
+                writer: &mut (dyn std::io::Write + Send),
+                cancel: &orca_core::cancel::CancelToken,
+            ) -> std::io::Result<orca_runtime::runtime_host::ThreadOperationOutcome> {
+                if request.operation_kind()
+                    == &orca_runtime::runtime_host::HostedOperationKind::ManualCompaction
+                {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while !cancel.is_cancelled() {
+                        assert!(std::time::Instant::now() < deadline);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+                RuntimeHost::default_executor_for_test()
+                    .run_turn(thread, request, generation, events, writer, cancel)
+            }
+        }
+        let fixture = ViewOnChild::with_host(
+            || RuntimeHost::start_with_executor(std::sync::Arc::new(HoldCompact)).unwrap(),
+            |_| {},
+        );
+        let mut shown = MainDisplay::new();
+        let (first, release) = background_turn(&fixture, &mut shown, "finish-p");
+        std::fs::write(release, "").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !crate::surface_client::snapshot_operation_is_terminal(
+            &super::read_parent_snapshot(&fixture.parent).unwrap(),
+            &first.operation_id,
+        ) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let thread = fixture.parent.typed_surface();
+        let control = fixture.control.clone();
+        let (sender, events) = crossbeam_channel::unbounded();
+        let worker = std::thread::spawn(move || {
+            crate::surface_client::manual_compact(&thread, &control, &sender)
+        });
+        loop {
+            let event = events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            shown.send(event);
+            if shown.state.status == crate::types::AppStatus::Compacting {
+                break;
+            }
+        }
+        assert!(fixture.control.interrupt_current().unwrap());
+        worker.join().unwrap().unwrap();
+        let mut accepted = false;
+        for event in events.try_iter() {
+            let cancelled = matches!(&event,TuiEvent::SurfaceDelivery(item) if item.2.is_some() && matches!(&item.1,TuiEvent::SessionCompleted{status} if status=="cancelled"));
+            accepted |= shown.send(event) && cancelled;
+        }
+        fixture.shutdown();
+        assert!(accepted, "cancelled /compact must pass both gates");
+        crate::status_key_actions::tests::assert_idle_takes_typing(&mut shown.state);
+    }
+
+    #[test]
+    fn fix5_drain_error_releases_its_owner_for_a_startless_terminal() {
+        let fixture = ViewOnChild::start();
+        let marker = fixture._home.path().join("fail-drain");
+        let path = orca_runtime::history::SessionStore::new()
+            .load_session(fixture.parent.thread_id())
+            .unwrap()
+            .path;
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(fixture._home.path().to_owned());
+        let owner = fixture.parent.typed_surface();
+        let control = fixture.control.clone();
+        let (sender, events) = crossbeam_channel::unbounded();
+        let prompt = format!("mock_stream_release_marker {}", marker.display());
+        let worker = std::thread::spawn(move || {
+            crate::surface_client::run(
+                &owner,
+                orca_runtime::runtime_host::HostedTurnRequest::new(prompt),
+                config,
+                &control,
+                &sender,
+            )
+        });
+        let mut shown = MainDisplay::new();
+        loop {
+            let event = events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let prefix = matches!(event.clone().into_test_payload(), TuiEvent::MessageDelta(_));
+            shown.send(event);
+            if prefix {
+                break;
+            }
+        }
+        assert_eq!(shown.state.status, crate::types::AppStatus::Running);
+        orca_runtime::surface::JsonlSurfaceCommitLedger::inject_terminal_append_failure_once(path);
+        std::fs::write(marker, "").unwrap();
+        assert!(
+            worker
+                .join()
+                .unwrap()
+                .err()
+                .expect("failed drain")
+                .to_string()
+                .contains("requires recovery")
+        );
+        for event in events.try_iter() {
+            shown.send(event);
+        }
+        assert!(shown.state.last_completed_at.is_none());
+        let cursor = super::read_parent_snapshot(&fixture.parent).unwrap().cursor;
+        let other = orca_runtime::surface::SurfaceOperationId::try_from_bytes(
+            *uuid::Uuid::now_v7().as_bytes(),
+        )
+        .unwrap();
+        fixture.control.unbind_view();
+        drop(fixture.view.close());
+        fixture.child.shutdown().unwrap();
+        assert!(fixture.parent.shutdown().is_err());
+        assert!(fixture.host.shutdown().is_err());
+        assert!(
+            shown.send(
+                TuiEvent::SessionCompleted {
+                    status: "success".into()
+                }
+                .at_operation_cursor(true, &cursor, &other)
+            )
+        );
+        assert!(shown.state.last_completed_at.is_some());
     }
 
     #[test]
@@ -2068,15 +2480,20 @@ pub(crate) mod live_child_for_test {
 
     #[test]
     fn a_delayed_gapped_queue_reader_does_not_block_the_next_follow() {
-        delayed_reader_does_not_block_the_next_follow(true);
+        delayed_reader_does_not_block_the_next_follow(true, false);
     }
 
     #[test]
     fn fix4_delayed_healthy_reader_delivers_everything_after_the_second_finishes() {
-        delayed_reader_does_not_block_the_next_follow(false);
+        delayed_reader_does_not_block_the_next_follow(false, false);
     }
 
-    fn delayed_reader_does_not_block_the_next_follow(gap: bool) {
+    #[test]
+    fn fix5_gap_read_failure_keeps_the_successful_receipt() {
+        delayed_reader_does_not_block_the_next_follow(true, true);
+    }
+
+    fn delayed_reader_does_not_block_the_next_follow(gap: bool, fail_read: bool) {
         use orca_runtime::{
             prompt_queue::{PromptQueueAction, PromptQueueInput},
             runtime_host::RuntimeHost,
@@ -2113,8 +2530,18 @@ pub(crate) mod live_child_for_test {
                         start.send(follow.operation.clone()).unwrap();
                         gate.recv_timeout(timeout).expect("release first reader");
                     }
-                    crate::surface_client::follow_queue_operation(
-                        follow, &owner, &control, &display,
+                    crate::surface_client::follow_queue_operation_with_read(
+                        follow,
+                        &owner,
+                        &control,
+                        &display,
+                        |thread| {
+                            if fail_read && index == 0 {
+                                Err(std::io::Error::other("final snapshot unavailable"))
+                            } else {
+                                crate::surface_client::read_snapshot(thread)
+                            }
+                        },
                     )
                     .unwrap();
                     finish.send(index).unwrap();
@@ -2164,6 +2591,12 @@ pub(crate) mod live_child_for_test {
                 })
                 .collect();
             let gaps = batch.iter().filter(|event| matches!(event, TuiEvent::Error(message) if message == "typed TUI subscription gap requires SlowSubscriber")).count();
+            if fail_read && gaps == 1 {
+                assert_eq!(batch.iter().filter(|event|matches!(event,TuiEvent::Error(message) if message.contains("final snapshot unavailable"))).count(),1);
+                assert!(!batch.iter().any(
+                    |event| matches!(event,TuiEvent::SessionCompleted {status} if status=="failed")
+                ));
+            }
             (terminals, text, gaps)
         };
         let index = finished
@@ -2190,7 +2623,7 @@ pub(crate) mod live_child_for_test {
         assert_eq!(
             text.matches("Mock release-marker stream completed.")
                 .count(),
-            1,
+            usize::from(!fail_read),
             "{text}"
         );
         host.shutdown().unwrap();

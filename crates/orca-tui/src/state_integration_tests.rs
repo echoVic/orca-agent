@@ -3309,6 +3309,44 @@ fn recovery_projection_is_not_overwritten_by_lifecycle_events() {
 }
 
 #[test]
+fn fix5_late_compacted_keeps_only_its_notice() {
+    let mut state = state();
+    let op = || SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+    let compact = op();
+    let next = op();
+    state.update(
+        TuiEvent::RuntimeTurnStarted {
+            turn_id: "next".into(),
+        }
+        .at_operation_cursor(
+            true,
+            &crate::surface_projection::test_surface_cursor(4),
+            &next,
+        ),
+    );
+    state.update(TuiEvent::OpenMessageRestored("still streaming".into()));
+    let tail = state.transcript.assistant_stream_tail.unwrap();
+    state.update(
+        TuiEvent::Compacted {
+            reason: "manual".into(),
+            strategy: "none".into(),
+            before_messages: 3,
+            after_messages: 3,
+            collapsed_messages: 0,
+            status_text: String::new(),
+        }
+        .at_operation_cursor(
+            true,
+            &crate::surface_projection::test_surface_cursor(3),
+            &compact,
+        ),
+    );
+    assert_eq!(state.status, AppStatus::Running);
+    assert_eq!(state.transcript.assistant_stream_tail, Some(tail));
+    assert_eq!(state.transcript.messages.iter().filter(|row| matches!(row, ChatMessage::System {text,..} if text.contains("3 messages unchanged"))).count(),1);
+}
+
+#[test]
 fn fix4_late_failure_keeps_its_line_without_finishing_the_new_stream() {
     let mut state = state();
     let op = || SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();

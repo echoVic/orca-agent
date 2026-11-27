@@ -268,6 +268,8 @@ impl TuiEvent {
         match self {
             Self::SessionCompleted { .. }
             | Self::TerminalRecoveryNeeded(_)
+            | Self::OperationReleased
+            | Self::Compacted { .. }
             | Self::Diagnostic(_) => !previous.live || previous.owner == *owner,
             Self::TurnStarted { .. } | Self::RuntimeTurnStarted { .. }
                 if previous.owner == *owner =>
@@ -288,7 +290,9 @@ impl TuiEvent {
             cursor,
             live: !matches!(
                 self,
-                Self::SessionCompleted { .. } | Self::TerminalRecoveryNeeded(_)
+                Self::SessionCompleted { .. }
+                    | Self::TerminalRecoveryNeeded(_)
+                    | Self::OperationReleased
             ),
         }
     }
@@ -299,7 +303,10 @@ impl TuiEvent {
         cursor: &orca_runtime::surface::SurfaceCursor,
         operation: &orca_runtime::surface::SurfaceOperationId,
     ) -> Self {
-        if routed && (self.owns_operation_status() || matches!(self, Self::Diagnostic(_))) {
+        if routed
+            && (self.owns_operation_status()
+                || matches!(self, Self::Diagnostic(_) | Self::Compacted { .. }))
+        {
             Self::SurfaceDelivery(Box::new((cursor.clone(), self, Some(operation.clone()))))
         } else {
             self.at_surface_cursor(routed, cursor)
@@ -317,6 +324,7 @@ impl TuiEvent {
                 | Self::McpElicitationRequested { .. }
                 | Self::UserInputRequested { .. }
                 | Self::TerminalRecoveryNeeded(_)
+                | Self::OperationReleased
         )
     }
 
@@ -483,6 +491,7 @@ pub enum TuiEvent {
         preview: Option<String>,
     },
     SurfaceRequestSettled(String),
+    OperationReleased,
     PermissionApprovalNeeded {
         key: TuiInteractionKey,
         tool: String,

@@ -1244,6 +1244,9 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
 const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
+  // The route tracks pending display request IDs locally; none of these settles a runtime request.
+  ["crates/orca-tui/src/attachment_routing.rs:accept_parent_delivery:self.parent_waiting.insert", 1],
+  ["crates/orca-tui/src/attachment_routing.rs:accept_parent_delivery:self.parent_waiting.clear", 1],
   // Function-local collections in a pure read of a &SurfaceSnapshot, not runtime mutations.
   ["crates/orca-tui/src/subagent_lines.rs:positioned_lines:tool_results.insert", 1],
   ["crates/orca-tui/src/subagent_lines.rs:positioned_lines:last_item.insert", 1],
