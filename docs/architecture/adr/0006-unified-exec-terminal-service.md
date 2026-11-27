@@ -73,8 +73,10 @@ immediately. Unread output is preserved until the terminal result is polled.
 
 ## Durable Output
 
-Recorded task registries own an `output/` directory inside their existing
-`tasks/<session>/` storage directory. The SQLite archive stores a shell-session
+Each persistent task registry owns one OS lock in
+`task-sessions/<session>/owners/<id>.lock` for the lifetime of its clones.
+Only its first shell registration creates `output/owners/<id>/` under that
+session. Its v1 SQLite archive stores a shell-session
 to task mapping, terminal mode, terminal outcome, automatic cursor, absolute
 byte counts, per-stream prefix counts, and ordered UTF-8 output chunks. It is
 primary output storage, not a derived index that can be silently rebuilt.
@@ -88,7 +90,7 @@ existing bounded snapshot wire behavior. A persistence failure is latched and
 reported as an error rather than a successful empty output. This guarantee
 starts at the reader's committed chunk, not at bytes still in an OS pipe.
 
-Limits are 32 MiB retained per task, 128 MiB per session, 256 task metadata
+Each sub-archive is limited to 32 MiB retained per task, 128 MiB total, 256 task metadata
 rows, and 32,768 chunk rows. Appends and reads operate on at most 8 KiB chunks
 (plus up to three UTF-8 boundary bytes). Per-task trimming rounds the retained
 start up to a UTF-8 boundary; session pressure removes oldest chunks. Older
@@ -115,12 +117,35 @@ The fixed macOS `/tmp` and `/var` system aliases are resolved before SQLite's
 no-follow open. Explicit reads use the registered `write_stdin` transport
 through the existing tool authorization path.
 
-A process-exclusive file lock prevents a second host from taking over an
-active archive. Managers within one host share that owner. After the owner
-exits, a new instance reopens the mapping without scanning all output into
-memory; any remaining `running` archive metadata becomes `interrupted`, with
-no exit code. Completed status and the automatic cursor survive reopening.
-This does not claim that OS processes or stdin survive a runtime host restart.
+Tasks carry the runner's `{session, id}` when created or marked running. On
+reopen or foreign by-ID lookup, recovery skips live owners. A handoff can
+leave the record in A while its runner holds the lock in B. The probe holds
+only A's task-store lock and tries B's existing owner file without blocking or
+creating it. Stamps are published after lock acquisition, only B's sweep can
+unlink a dead lock under B's store lock, and IDs are never reused. Thus a
+foreign probe cannot see create-before-lock, obstruct the owner, or deadlock
+with the other session. Missing or lockable means dead; other errors leave
+the record alone. This uses flock on Unix and LockFileEx on Windows. If an
+open Windows handle prevents removal, a later sweep tries again.
+
+Managers in one process can read each other's live sub-archives. A new host
+can read a dead owner's output: remaining running rows become interrupted
+with no exit code, and completed status and automatic cursors survive. The
+first writer open sweeps dead sub-archives under the session lock. It removes
+those without a shell whose task ID occurs in `tasks.json`, then retains the
+newest referenced archives (highest referring task sequence first) within
+256 shells and 128 MiB combined. Neither live owners nor the old top-level
+archive participate. Evicted output reads as missing or expired. No process
+or stdin is presumed to survive a host restart.
+
+The older `output/archive.sqlite3` is a read-only fallback. A newer reader
+never creates, probes or holds `output/owner.lock`, changes an old row, or
+writes an automatic cursor there. Its cursor stays in memory; a running row
+whose task is terminal is presented as interrupted. Read failure is missing
+or expired. Older readers cannot see new sub-archive output. Two record-store
+limitations remain across versions: an older opener can fail a newer live
+record, and its next whole-map write drops unknown owner stamps; a newer
+opener still recovers ownerless running records from an older live host.
 
 ## Result Contract
 
