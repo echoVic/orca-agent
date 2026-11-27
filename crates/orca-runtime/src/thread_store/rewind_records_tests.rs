@@ -134,6 +134,7 @@ fn rewind_record(session_id: &str, at_message_id: &str, kept_messages: u32) -> S
 
 fn snapshot_record(session_id: &str, at_message_id: &str) -> FileSnapshotRecord {
     FileSnapshotRecord {
+        created_directories: Vec::new(),
         schema_version: 1,
         snapshot_id: "snap_contract_1".to_string(),
         session_id: session_id.to_string(),

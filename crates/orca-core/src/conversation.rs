@@ -1,11 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
 use crate::approval_types::ActionKind;
+use crate::mcp_types::McpToolCatalog;
 use crate::tool_images::{MAX_REQUEST_TOOL_IMAGES, RetainedToolImages, keep_newest_tool_images};
-use crate::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminal, ToolTerminalSource};
+use crate::tool_types::{
+    ToolName, ToolRequest, ToolResult, ToolStatus, ToolTerminal, ToolTerminalSource,
+};
 
 /// The single conversation attachment target used by interactive surfaces.
 /// Keeping the target typed prevents parent, child and sibling navigation from
@@ -84,10 +89,10 @@ pub fn is_internal_image_analysis(content: &str) -> bool {
             .get("description")
             .is_some_and(|value| value.is_string())
         || !record.get("query").is_some_and(|value| value.is_string())
-        || !record
+        || record
             .get("image_count")
             .and_then(|value| value.as_u64())
-            .is_some_and(|count| count > 0)
+            .is_none_or(|count| count == 0)
     {
         return false;
     }
@@ -136,13 +141,21 @@ const DELIVERED_NOTICE_PREFIXES: [&str; 4] = [
     "[Budget soft landing]",
 ];
 
+pub const REPEAT_TOOL_REMINDER_PREFIX: &str = "You have called ";
+
+fn is_repeat_tool_reminder(content: &str) -> bool {
+    content.starts_with(REPEAT_TOOL_REMINDER_PREFIX)
+        && content.contains(" with the same arguments ")
+}
+
 /// Whether a system message is a delivered notice. Notices are ordinary
 /// conversation content: the model keeps seeing each one until compaction
 /// summarizes it, including across a resume.
 pub fn is_delivered_notice(content: &str) -> bool {
-    DELIVERED_NOTICE_PREFIXES
-        .iter()
-        .any(|prefix| content.starts_with(prefix))
+    is_repeat_tool_reminder(content)
+        || DELIVERED_NOTICE_PREFIXES
+            .iter()
+            .any(|prefix| content.starts_with(prefix))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -282,8 +295,16 @@ impl Message {
         match self {
             Self::System { pinned, .. }
             | Self::User { pinned, .. }
-            | Self::Assistant { pinned, .. }
-            | Self::Tool { pinned, .. } => *pinned,
+            | Self::Assistant { pinned, .. } => *pinned,
+            // Keep the matching call and receipt so the next session can restore its tools.
+            Self::Tool {
+                pinned, terminal, ..
+            } => {
+                *pinned
+                    || terminal.as_ref().is_some_and(|terminal| {
+                        terminal.status == ToolStatus::Completed && terminal.mcp_tool_load.is_some()
+                    })
+            }
         }
     }
 
@@ -311,6 +332,7 @@ pub const MODE_CONTEXT_FRAGMENT_ID: &str = "mode";
 pub const GOAL_CONTEXT_FRAGMENT_ID: &str = "goal";
 pub const PLAN_CONTEXT_FRAGMENT_ID: &str = "plan";
 pub const SKILL_CONTEXT_FRAGMENT_ID: &str = "skill";
+pub const SKILLS_CONTEXT_FRAGMENT_ID: &str = "skills";
 pub const MEMORY_CONTEXT_FRAGMENT_ID: &str = "memory";
 /// Today's date. It rides in the internal context rather than the system
 /// prompt, so the system prompt and the history stay the same across days.
@@ -322,6 +344,25 @@ pub const MODE_CONTEXT_MAX_TOKENS: usize = 2_048;
 pub const GOAL_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const PLAN_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const SKILL_CONTEXT_MAX_TOKENS: usize = 4_096;
+pub const SKILL_INVOCATION_PREFIX: &str = "[Mentioned skill invocation ";
+
+/// Distinguishes submitted prompts from internal user-role messages in history.
+pub fn is_rewindable_user_prompt(content: &str, images: &[ImageInput], pinned: bool) -> bool {
+    if !images.is_empty() {
+        return true;
+    }
+    let skill_invocation = pinned
+        && content
+            .strip_prefix(SKILL_INVOCATION_PREFIX)
+            .and_then(|rest| rest.split_once("]\n"))
+            .and_then(|(header, _)| header.split_once(' '))
+            .is_some_and(|(version, root)| {
+                version.len() == 64
+                    && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && serde_json::from_str::<Option<String>>(root).is_ok()
+            });
+    !is_internal_image_analysis(content) && !skill_invocation
+}
 pub const MEMORY_CONTEXT_MAX_TOKENS: usize = 3_072;
 pub const MCP_CONTEXT_MAX_TOKENS: usize = 4_096;
 
@@ -333,6 +374,7 @@ pub enum InternalContextKind {
     Goal,
     Plan,
     Skill,
+    ProjectInstructions,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -435,15 +477,31 @@ impl InternalContext {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SummaryState {
     pub baseline: Option<String>,
     pub deltas: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_output_spills: Vec<crate::tool_types::ToolOutputSpill>,
 }
 
 impl SummaryState {
     pub fn is_empty(&self) -> bool {
-        self.baseline.is_none() && self.deltas.is_empty()
+        self.baseline.is_none() && self.deltas.is_empty() && self.tool_output_spills.is_empty()
+    }
+
+    pub fn spill_notices(&self) -> Option<String> {
+        if self.tool_output_spills.is_empty() {
+            return None;
+        }
+        let mut notices = String::from(
+            "[Saved results from earlier tool calls. Read a path with read_file or search it with grep.]",
+        );
+        for spill in &self.tool_output_spills {
+            notices.push('\n');
+            notices.push_str(&spill.path().to_string_lossy());
+        }
+        Some(notices)
     }
 
     pub fn latest_rolling(&self) -> Option<&str> {
@@ -461,6 +519,9 @@ impl SummaryState {
         }
         for delta in &self.deltas {
             total += counter.count(delta);
+        }
+        if let Some(notices) = self.spill_notices() {
+            total += counter.count(&notices);
         }
         total
     }
@@ -482,12 +543,70 @@ pub struct UsageAnchor {
     boundary: u64,
 }
 
-#[derive(Debug)]
+/// In-memory DeepSeek request data used only for compaction replay.
+pub struct CapturedProviderRequest {
+    pub source_messages: Vec<[u8; 32]>,
+    pub summary: SummaryState,
+    pub endpoint: String,
+    pub model: String,
+    pub reasoning_effort: crate::config::ReasoningEffort,
+    pub messages: Vec<CapturedProviderMessage>,
+    pub tools: Vec<serde_json::Value>,
+}
+
+pub struct CapturedProviderMessage {
+    pub json: Box<serde_json::value::RawValue>,
+    pub estimated_tokens: usize,
+    pub has_images: bool,
+    pub has_tool_images: bool,
+}
+
+#[derive(Clone, Default)]
+struct ProviderRequestCapture {
+    latest: Arc<Mutex<Option<Arc<CapturedProviderRequest>>>>,
+    prepared_source: Option<Arc<[[u8; 32]]>>,
+}
+
+impl fmt::Debug for ProviderRequestCapture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderRequestCapture")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NestedInstructionSource {
+    pub workspace: PathBuf,
+    pub source: PathBuf,
+    pub digest: String,
+    pub updated: bool,
+    pub shortened: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NestedInstructionVersion {
+    pub identity: NestedInstructionSource,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NestedInstructionState {
+    pub pending_touches: Vec<(PathBuf, bool)>,
+    pub written_sources: HashSet<PathBuf>,
+    pub versions: std::collections::BTreeMap<PathBuf, NestedInstructionVersion>,
+}
+
+#[derive(Debug, Default)]
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub internal_context: InternalContext,
+    /// Repeated tool calls since the latest user prompt, retained across
+    /// compaction so reminders do not restart with the visible history tail.
+    pub repeat_tool_streak: Option<RepeatToolStreak>,
     /// Per-server guidance for the current tool set, sent in its own request message.
     pub mcp_instructions: Vec<(String, String)>,
+    pub mcp_catalogs: Vec<McpToolCatalog>,
     pub rolling_summary: Option<String>,
     pub summary: SummaryState,
     /// Not persisted: a resumed conversation measures from a full estimate
@@ -498,6 +617,15 @@ pub struct Conversation {
     /// not try again until the prompt has grown well past it (#175).
     pub compaction_hold: Option<usize>,
     retained_tool_images: Option<RetainedToolImages>,
+    provider_request_capture: ProviderRequestCapture,
+    pub nested_instructions: NestedInstructionState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepeatToolStreak {
+    pub tool_name: String,
+    pub arguments: String,
+    pub count: u32,
 }
 
 // Prompt snapshots and inherited conversations must not publish into the
@@ -507,28 +635,51 @@ impl Clone for Conversation {
         Self {
             messages: self.messages.clone(),
             internal_context: self.internal_context.clone(),
+            repeat_tool_streak: self.repeat_tool_streak.clone(),
             mcp_instructions: self.mcp_instructions.clone(),
+            mcp_catalogs: self.mcp_catalogs.clone(),
             rolling_summary: self.rolling_summary.clone(),
             summary: self.summary.clone(),
             usage_anchor: self.usage_anchor,
             compaction_hold: self.compaction_hold,
             retained_tool_images: None,
+            provider_request_capture: ProviderRequestCapture {
+                latest: Arc::new(Mutex::new(self.last_provider_request())),
+                prepared_source: None,
+            },
+            nested_instructions: self.nested_instructions.clone(),
         }
     }
 }
 
 impl Conversation {
     pub fn new() -> Self {
-        Self {
-            messages: Vec::new(),
-            internal_context: InternalContext::default(),
-            mcp_instructions: Vec::new(),
-            rolling_summary: None,
-            summary: SummaryState::default(),
-            usage_anchor: None,
-            compaction_hold: None,
-            retained_tool_images: None,
-        }
+        Self::default()
+    }
+
+    pub fn last_provider_request(&self) -> Option<Arc<CapturedProviderRequest>> {
+        self.provider_request_capture.latest.lock().unwrap().clone()
+    }
+
+    pub fn record_provider_request(&self, request: CapturedProviderRequest) {
+        *self.provider_request_capture.latest.lock().unwrap() = Some(Arc::new(request));
+    }
+
+    pub fn bind_provider_request_source(&mut self, source: &Self, messages: Vec<[u8; 32]>) {
+        self.provider_request_capture = ProviderRequestCapture {
+            latest: Arc::clone(&source.provider_request_capture.latest),
+            prepared_source: Some(messages.into()),
+        };
+    }
+
+    pub fn provider_request_source(&self) -> Option<&[[u8; 32]]> {
+        self.provider_request_capture.prepared_source.as_deref()
+    }
+
+    pub fn clone_for_provider_request(&self) -> Self {
+        let mut request = self.clone();
+        request.provider_request_capture = self.provider_request_capture.clone();
+        request
     }
 
     /// Enable a bounded read view before lending this conversation to a worker.
@@ -543,6 +694,8 @@ impl Conversation {
     /// Adopt a compacted conversation while preserving its running read view.
     pub fn adopt(&mut self, mut replacement: Self) {
         replacement.retained_tool_images = self.retained_tool_images.take();
+        replacement.nested_instructions = std::mem::take(&mut self.nested_instructions);
+        replacement.repeat_tool_streak = self.repeat_tool_streak.take();
         *self = replacement;
         self.refresh_retained_tool_images();
     }
@@ -634,6 +787,16 @@ impl Conversation {
         );
     }
 
+    pub fn replace_skill_catalog(&mut self, content: Option<String>) {
+        self.replace_internal_context(
+            SKILLS_CONTEXT_FRAGMENT_ID,
+            InternalContextKind::Skill,
+            InternalContextOrigin::System,
+            content,
+            SKILL_CONTEXT_MAX_TOKENS,
+        );
+    }
+
     pub fn replace_memory_context(&mut self, content: Option<String>) {
         self.replace_internal_context(
             MEMORY_CONTEXT_FRAGMENT_ID,
@@ -708,15 +871,18 @@ impl Conversation {
     }
 
     pub fn add_user(&mut self, content: String) {
+        self.repeat_tool_streak = None;
         self.messages.push(Message::user(content));
     }
 
     pub fn add_user_with_images(&mut self, content: String, images: Vec<ImageInput>) {
+        self.repeat_tool_streak = None;
         self.messages
             .push(Message::user_with_images(content, images));
     }
 
     pub fn add_user_pinned(&mut self, content: String) {
+        self.repeat_tool_streak = None;
         self.messages.push(Message::pinned_user(content));
     }
 
@@ -799,8 +965,8 @@ impl Conversation {
         let mut index = None;
         for (position, message) in self.messages.iter().enumerate() {
             if matches!(message,
-                Message::User { content, images, .. }
-                    if !images.is_empty() || !is_internal_image_analysis(content))
+                Message::User { content, images, pinned }
+                    if is_rewindable_user_prompt(content, images, *pinned))
             {
                 if seen == ordinal {
                     index = Some(position);
@@ -924,16 +1090,25 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
                     .map(|tool_call| tool_call.id.as_str())
                     .collect::<HashSet<_>>();
                 let mut collected_tools = HashMap::new();
+                let mut reminders = Vec::new();
                 let mut next = index + 1;
 
                 while next < messages.len() {
-                    let Message::Tool { tool_call_id, .. } = &messages[next] else {
-                        break;
-                    };
-                    if expected.contains(tool_call_id.as_str()) {
-                        collected_tools
-                            .entry(tool_call_id.clone())
-                            .or_insert_with(|| messages[next].clone());
+                    match &messages[next] {
+                        Message::Tool { tool_call_id, .. } => {
+                            if expected.contains(tool_call_id.as_str()) {
+                                collected_tools
+                                    .entry(tool_call_id.clone())
+                                    .or_insert_with(|| messages[next].clone());
+                            }
+                        }
+                        Message::System {
+                            content,
+                            pinned: false,
+                        } if is_repeat_tool_reminder(content) => {
+                            reminders.push(messages[next].clone());
+                        }
+                        _ => break,
                     }
                     next += 1;
                 }
@@ -952,6 +1127,8 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
                             .unwrap_or_else(|| repaired_missing_tool_result(tool_call)),
                     );
                 }
+                // Providers expect all results in a tool group to be adjacent.
+                normalized.extend(reminders);
                 index = next.max(index + 1);
             }
             message => {
@@ -1260,6 +1437,27 @@ mod tests {
             Message::Tool { terminal: Some(terminal), .. }
                 if terminal == result.terminal()
         ));
+    }
+
+    #[test]
+    fn mcp_tool_load_receipt_is_pinned_for_compaction_and_resume() {
+        let request = ToolRequest {
+            id: "load_1".to_string(),
+            name: ToolName::Mcp("mcp__catalog__load_tools".to_string()),
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"names":["lookup"]}"#.to_string()),
+        };
+        let result = ToolResult::completed(&request, "loaded".to_string(), false)
+            .with_mcp_tool_load(Some(crate::tool_types::McpToolLoad {
+                server: "catalog".to_string(),
+                names: ["lookup".to_string()].into_iter().collect(),
+            }));
+        let mut conversation = Conversation::new();
+
+        conversation.add_tool_result_with_terminal(&result, "loaded".to_string());
+
+        assert!(conversation.messages[0].is_pinned());
     }
 
     #[test]
@@ -2176,5 +2374,21 @@ mod tests {
         // An anchor over no messages measures nothing.
         conv.record_usage_anchor(1_000, 900, 0);
         assert!(conv.valid_usage_anchor().is_none());
+    }
+
+    #[test]
+    fn rewind_skips_generated_skill_invocations_but_keeps_pinned_prompts() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("$review:permissions".to_string());
+        conversation.messages.push(Message::pinned_user(format!(
+            "{SKILL_INVOCATION_PREFIX}{} null]\nexpanded skill",
+            "a".repeat(64),
+        )));
+        conversation.add_user_pinned("Continue".to_string());
+
+        assert_eq!(
+            conversation.truncate_before_user_ordinal(1).as_deref(),
+            Some("Continue")
+        );
     }
 }

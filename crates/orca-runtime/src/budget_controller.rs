@@ -615,8 +615,8 @@ impl BudgetLease {
     }
 
     pub fn admit_turn(&mut self) -> Result<(), BudgetStop> {
-        self.sync_wall_time()?;
-        if let Some(stop) = self.stop_if_exhausted() {
+        self.sync_wall_time_inner();
+        if let Some(stop) = self.stop_if_exhausted(false) {
             return Err(stop);
         }
         self.usage.add_turn();
@@ -625,9 +625,6 @@ impl BudgetLease {
 
     pub fn admit_tool_call(&mut self) -> Result<(), BudgetStop> {
         self.sync_wall_time()?;
-        if let Some(stop) = self.stop_if_exhausted() {
-            return Err(stop);
-        }
         self.usage.add_tool_call();
         Ok(())
     }
@@ -635,14 +632,21 @@ impl BudgetLease {
     pub fn record_cost_usd_micros(&mut self, cost_usd_micros: u64) -> Result<(), BudgetStop> {
         self.sync_wall_time_inner();
         self.usage.add_cost_usd_micros(cost_usd_micros);
-        self.stop_if_exhausted().map_or(Ok(()), Err)
+        self.stop_if_exhausted(true).map_or(Ok(()), Err)
     }
 
     /// Enforces the shared wall deadline even when a provider response has no
     /// billable usage and no tool follows it.
     pub(crate) fn sync_wall_time(&mut self) -> Result<(), BudgetStop> {
         self.sync_wall_time_inner();
-        self.stop_if_exhausted().map_or(Ok(()), Err)
+        self.stop_if_exhausted(true).map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn wall_time_deadline(&self) -> Option<Instant> {
+        let limit = self.effective_spec.max_wall_time_ms?;
+        // The lease stops on the first elapsed millisecond above the limit.
+        self.started_at
+            .checked_add(Duration::from_millis(limit.checked_add(1)?))
     }
 
     /// Consumed usage receipt for the parent to merge. Settles the
@@ -682,9 +686,10 @@ impl BudgetLease {
         }
     }
 
-    fn stop_if_exhausted(&self) -> Option<BudgetStop> {
+    fn stop_if_exhausted(&self, in_turn: bool) -> Option<BudgetStop> {
         let usage = self.usage;
-        if let Some(max_turns) = self.effective_spec.max_turns
+        if !in_turn
+            && let Some(max_turns) = self.effective_spec.max_turns
             && usage.turns >= max_turns
         {
             return Some(BudgetStop {

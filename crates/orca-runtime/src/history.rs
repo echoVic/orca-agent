@@ -283,8 +283,27 @@ impl JsonlThreadStore {
 }
 
 pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String) -> Conversation {
+    resume_conversation_in_cwd(transcript, system_prompt, Path::new(&transcript.meta.cwd))
+}
+
+pub(crate) fn resume_conversation_in_cwd(
+    transcript: &SessionTranscript,
+    system_prompt: String,
+    active_cwd: &Path,
+) -> Conversation {
     let mut conversation = Conversation::new();
+    conversation.repeat_tool_streak = transcript
+        .repeat_tool_streak
+        .clone()
+        .or_else(|| crate::session::repeat_tool_streak_from_history(&transcript.messages));
     conversation.add_system(system_prompt);
+    crate::instructions::restore_nested_state(
+        &mut conversation,
+        Path::new(&transcript.meta.cwd),
+        &transcript.messages,
+        &transcript.nested_instructions,
+        &transcript.written_instruction_sources,
+    );
     let mut restored_messages = replay_compactions_for_resume(
         &transcript.messages,
         &transcript.compactions,
@@ -292,9 +311,12 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
     )
     .into_iter()
     // The old system prompt and ephemeral system context are rebuilt rather
-    // than restored. The truncation marker and delivered notices are
-    // conversation content; a notice stays until compaction summarizes it.
+    // than restored. The truncation marker, delivered notices and mentioned
+    // skills are conversation content and stay until compaction.
     .filter(|message| {
+        if let Some(replay) = crate::skill_context::should_replay_mention(message, active_cwd) {
+            return replay;
+        }
         !matches!(
             message,
             Message::System {
@@ -317,6 +339,12 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
         .find_map(|record| record.summary_state.clone())
     {
         conversation.summary = summary_state;
+        let spill_dir = crate::thread_store::spill::directory(&transcript.meta.session_id);
+        conversation.summary.tool_output_spills.retain(|spill| {
+            spill_dir
+                .as_deref()
+                .is_some_and(|dir| spill.belongs_to_directory(dir))
+        });
         conversation.rolling_summary = transcript
             .summaries
             .last()
@@ -875,6 +903,11 @@ mod tests {
             );
             compacted.add_system_pinned("[Hook context]\nretained".to_string());
             compacted.add_user("tail".to_string());
+            compacted.repeat_tool_streak = Some(orca_core::conversation::RepeatToolStreak {
+                tool_name: "read_file".to_string(),
+                arguments: r#"{"path":"a"}"#.to_string(),
+                count: 4,
+            });
             writer.append_manual_compaction_snapshot(
                 &identity,
                 5,
@@ -883,7 +916,21 @@ mod tests {
             )?;
 
             let transcript = load_session("latest")?;
+            assert_eq!(
+                transcript
+                    .repeat_tool_streak
+                    .as_ref()
+                    .map(|streak| streak.count),
+                Some(4)
+            );
             let resumed = resume_conversation(&transcript, "fresh system".to_string());
+            assert_eq!(
+                resumed
+                    .repeat_tool_streak
+                    .as_ref()
+                    .map(|streak| streak.count),
+                Some(4)
+            );
             assert!(matches!(
                 resumed.messages.as_slice(),
                 [
@@ -1051,6 +1098,7 @@ mod tests {
                 },
                 Message::user("second".to_string()),
             ],
+            repeat_tool_streak: None,
             compactions: Vec::new(),
             summaries: Vec::new(),
             usage: None,
@@ -1059,6 +1107,8 @@ mod tests {
             completion_error: None,
             next_event_seq: 0,
             semantic_events: Vec::new(),
+            nested_instructions: Vec::new(),
+            written_instruction_sources: Vec::new(),
             path: cwd.join("reasoning-only.jsonl"),
         };
 
@@ -1137,6 +1187,7 @@ mod tests {
                 &SummaryState {
                     baseline: Some("rebuilt baseline".to_string()),
                     deltas: vec!["fresh delta".to_string()],
+                    ..Default::default()
                 },
             )?;
             let transcript = load_session("latest")?;
@@ -1184,6 +1235,7 @@ mod tests {
                 &SummaryState {
                     baseline: Some("summary baseline".to_string()),
                     deltas: Vec::new(),
+                    ..Default::default()
                 },
             )?;
             writer.enter_turn(TurnId::new());

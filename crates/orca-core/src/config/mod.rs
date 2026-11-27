@@ -302,6 +302,9 @@ pub struct ToolConfig {
     /// `read_document` explains that it needs the setting.
     #[serde(default = "default_deepseek_web")]
     pub deepseek_web: bool,
+    /// Whether the multi-file `apply_patch` tool is available.
+    #[serde(default)]
+    pub apply_patch: bool,
     /// The experimental `run_script` tool.
     #[serde(default)]
     pub script: ScriptToolConfig,
@@ -363,6 +366,7 @@ impl Default for ToolConfig {
             output_truncation: ToolOutputTruncation::default(),
             shell_timeout_secs: default_shell_timeout_secs(),
             deepseek_web: default_deepseek_web(),
+            apply_patch: false,
             script: ScriptToolConfig::default(),
             shell_enforcement_decision: None,
             headless_exec: false,

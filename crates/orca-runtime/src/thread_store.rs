@@ -9,12 +9,13 @@ mod retention;
 mod rewind_records_tests;
 #[cfg_attr(test, allow(dead_code))]
 mod session_index;
+pub(crate) mod spill;
 #[cfg(test)]
 mod storage_tests;
 mod types;
 mod writer;
 
-use orca_core::conversation::Conversation;
+pub(crate) use orca_core::history_redaction::redact_sensitive_text;
 
 pub(crate) use assets::HydrateImages;
 pub use live_thread::LiveThread;
@@ -63,13 +64,6 @@ pub(crate) use writer::{
     stored_session_health_error_details, truncate_transcript_at_boundary,
     write_prompt_queue_snapshot,
 };
-
-pub(crate) fn resume_conversation(
-    transcript: &SessionTranscript,
-    system_prompt: String,
-) -> Conversation {
-    crate::history::resume_conversation(transcript, system_prompt)
-}
 
 #[cfg(test)]
 mod tests {
@@ -648,5 +642,3 @@ mod tests {
         assert!(serde_json::from_value::<types::StoredMessage>(conflicting).is_err());
     }
 }
-
-pub(crate) use orca_core::redaction::redact_sensitive_text;

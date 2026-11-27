@@ -1,10 +1,95 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::approval_types::ActionKind;
 use crate::conversation::ImageInput;
+
+const SPILL_NOTICE_PREFIX: &str = " bytes omitted. The full result is saved at ";
+const SPILL_NOTICE_SUFFIX: &str =
+    "; read it with read_file using unit=bytes, offset and limit, or search it with grep.]";
+
+pub fn tool_output_spill_notice(omitted: usize, path: &str) -> String {
+    format!("[{omitted}{SPILL_NOTICE_PREFIX}{path}{SPILL_NOTICE_SUFFIX}")
+}
+
+/// A saved result belongs to one session directory and one invocation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolOutputSpill {
+    directory: PathBuf,
+    tool_call_id: String,
+    omitted_bytes: usize,
+}
+
+impl ToolOutputSpill {
+    pub fn new(directory: PathBuf, tool_call_id: String, omitted_bytes: usize) -> Option<Self> {
+        directory.is_absolute().then_some(Self {
+            directory,
+            tool_call_id,
+            omitted_bytes,
+        })
+    }
+
+    pub fn belongs_to(&self, directory: &std::path::Path, tool_call_id: &str) -> bool {
+        self.belongs_to_directory(directory) && self.matches_call(tool_call_id)
+    }
+
+    pub fn belongs_to_directory(&self, directory: &std::path::Path) -> bool {
+        self.directory == directory
+    }
+
+    pub fn matches_call(&self, tool_call_id: &str) -> bool {
+        self.tool_call_id == tool_call_id
+    }
+
+    pub fn path(&self) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let id = &self.tool_call_id;
+        let name = if !id.is_empty()
+            && id.len() <= 120
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            && orca_platform::fs::PathIdentity::windows(&format!("C:\\{id}.txt")).is_ok()
+        {
+            id.clone()
+        } else {
+            crate::hex::lower(&Sha256::digest(id.as_bytes()))
+        };
+        self.directory.join(format!("{name}.txt"))
+    }
+
+    pub fn notice(&self) -> String {
+        tool_output_spill_notice(self.omitted_bytes, &self.path().display().to_string())
+    }
+
+    /// Remove only the exact notice rendered from this structured reference.
+    pub fn preview<'a>(&self, content: &'a str) -> &'a str {
+        content
+            .strip_suffix(&format!("\n\n{}", self.notice()))
+            .unwrap_or(content)
+    }
+
+    pub fn render(&self, preview: &str) -> String {
+        format!("{preview}\n\n{}", self.notice())
+    }
+
+    pub fn unavailable(&self, preview: &str, reason: &str) -> String {
+        format!(
+            "{preview}\n\n[{} bytes omitted. {reason}]",
+            self.omitted_bytes
+        )
+    }
+
+    pub fn in_directory(&self, directory: PathBuf) -> Self {
+        Self {
+            directory,
+            ..self.clone()
+        }
+    }
+}
 
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
@@ -21,6 +106,7 @@ pub enum ToolName {
     TaskSendInput,
     TaskWait,
     Edit,
+    ApplyPatch,
     WriteFile,
     GitStatus,
     RunScript,
@@ -145,6 +231,7 @@ impl ToolName {
             Self::TaskSendInput => "task_send_input",
             Self::TaskWait => "task_wait",
             Self::Edit => "edit",
+            Self::ApplyPatch => "apply_patch",
             Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
             Self::RunScript => "run_script",
@@ -199,6 +286,7 @@ impl ToolName {
             Self::TaskSendInput => "task_send_input",
             Self::TaskWait => "task_wait",
             Self::Edit => "edit",
+            Self::ApplyPatch => "apply_patch",
             Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
             Self::RunScript => "run_script",
@@ -236,6 +324,10 @@ impl ToolName {
         }
     }
 
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "Preserve the optional tool-name parser API"
+    )]
     pub fn from_str(value: &str) -> Option<Self> {
         if value.starts_with("mcp__") {
             return Some(Self::Mcp(value.to_string()));
@@ -405,21 +497,30 @@ impl CapabilitySet {
     }
 
     pub fn is_read_only(&self) -> bool {
+        self.is_read_only_with_network(false)
+    }
+
+    pub fn is_read_only_or_network_search(&self) -> bool {
+        self.is_read_only_with_network(true)
+    }
+
+    fn is_read_only_with_network(&self, allow_network: bool) -> bool {
         !self.capabilities.is_empty()
             && self.capabilities.iter().all(|capability| {
-                matches!(
-                    capability,
-                    ToolCapability::FsRead
-                        | ToolCapability::FsList
-                        | ToolCapability::FsSearch
-                        | ToolCapability::GitInspect
-                        | ToolCapability::TaskRead
-                        | ToolCapability::PlanUpdate
-                        | ToolCapability::GoalUpdate
-                        | ToolCapability::UserInputRequest
-                        | ToolCapability::McpResourceRead
-                        | ToolCapability::SkillRead
-                )
+                (allow_network && *capability == ToolCapability::NetworkSearch)
+                    || matches!(
+                        capability,
+                        ToolCapability::FsRead
+                            | ToolCapability::FsList
+                            | ToolCapability::FsSearch
+                            | ToolCapability::GitInspect
+                            | ToolCapability::TaskRead
+                            | ToolCapability::PlanUpdate
+                            | ToolCapability::GoalUpdate
+                            | ToolCapability::UserInputRequest
+                            | ToolCapability::McpResourceRead
+                            | ToolCapability::SkillRead
+                    )
             })
     }
 
@@ -428,11 +529,10 @@ impl CapabilitySet {
             ActionKind::Computer
         } else if self.contains(ToolCapability::ShellExecute) {
             ActionKind::Shell
-        } else if self.contains(ToolCapability::FsWrite) {
-            ActionKind::Write
-        } else if self.contains(ToolCapability::TaskControl) {
-            ActionKind::Write
-        } else if self.contains(ToolCapability::PermissionRequest) {
+        } else if self.contains(ToolCapability::FsWrite)
+            || self.contains(ToolCapability::TaskControl)
+            || self.contains(ToolCapability::PermissionRequest)
+        {
             ActionKind::Write
         } else if self.contains(ToolCapability::NetworkSearch) {
             ActionKind::Network
@@ -501,9 +601,10 @@ pub struct ToolControlSemantics {
     pub replay: ReplaySemantics,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultKind {
+    #[default]
     Success,
     /// Started but not terminated; distinct from both success and failure.
     Running,
@@ -537,12 +638,6 @@ impl ToolResultKind {
             Self::Cancelled => ToolStatus::Cancelled,
             Self::Indeterminate => ToolStatus::Indeterminate,
         }
-    }
-}
-
-impl Default for ToolResultKind {
-    fn default() -> Self {
-        Self::Success
     }
 }
 
@@ -604,6 +699,9 @@ impl ToolStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileChangePreview {
+    Patch {
+        text: String,
+    },
     UnifiedDiff {
         text: String,
         truncated: bool,
@@ -614,9 +712,31 @@ pub enum FileChangePreview {
     },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+impl FileChangePreview {
+    pub fn patch_diff(&self) -> Option<&str> {
+        match self {
+            Self::Patch { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    pub fn display_text(&self) -> String {
+        match self {
+            Self::UnifiedDiff { text, .. } | Self::Patch { text } => text.clone(),
+            Self::Omitted {
+                path,
+                max_input_bytes,
+            } => {
+                format!("[Diff preview omitted for {path}: input exceeds {max_input_bytes} bytes]")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolTerminalSource {
+    #[default]
     Observed,
     CompatibilityRepair,
 }
@@ -627,17 +747,12 @@ impl ToolTerminalSource {
     }
 }
 
-impl Default for ToolTerminalSource {
-    fn default() -> Self {
-        Self::Observed
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolInvocationStarted {
     Yes,
     No,
+    #[default]
     Unknown,
 }
 
@@ -647,10 +762,10 @@ impl ToolInvocationStarted {
     }
 }
 
-impl Default for ToolInvocationStarted {
-    fn default() -> Self {
-        Self::Unknown
-    }
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpToolLoad {
+    pub server: String,
+    pub names: std::collections::BTreeSet<String>,
 }
 
 #[non_exhaustive]
@@ -677,6 +792,10 @@ pub struct ToolTerminal {
         skip_serializing_if = "ToolInvocationStarted::is_unknown"
     )]
     pub started: ToolInvocationStarted,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spill: Option<Box<ToolOutputSpill>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_load: Option<McpToolLoad>,
 }
 
 impl ToolTerminal {
@@ -704,6 +823,8 @@ impl ToolTerminal {
             kind,
             source,
             started,
+            spill: None,
+            mcp_tool_load: None,
         })
     }
 
@@ -741,6 +862,9 @@ struct ToolTerminalWire {
     source: ToolTerminalSource,
     #[serde(default, rename = "invocation_started")]
     started: ToolInvocationStarted,
+    #[serde(default)]
+    spill: Option<Box<ToolOutputSpill>>,
+    mcp_tool_load: Option<McpToolLoad>,
 }
 
 impl<'de> Deserialize<'de> for ToolTerminal {
@@ -758,6 +882,11 @@ impl<'de> Deserialize<'de> for ToolTerminal {
             wire.source,
             wire.started,
         )
+        .map(|mut terminal| {
+            terminal.spill = wire.spill;
+            terminal.mcp_tool_load = wire.mcp_tool_load;
+            terminal
+        })
         .map_err(serde::de::Error::custom)
     }
 }
@@ -800,6 +929,22 @@ impl ToolServiceUsage {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "path", rename_all = "snake_case")]
+pub enum FileEffect {
+    Written(String),
+    Deleted(String),
+    CreatedDirectory(String),
+}
+
+impl FileEffect {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Written(path) | Self::Deleted(path) | Self::CreatedDirectory(path) => path,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolResult {
     pub id: String,
@@ -811,6 +956,10 @@ pub struct ToolResult {
     pub images: Vec<ImageInput>,
     #[serde(skip)]
     pub file_change_preview: Option<Arc<FileChangePreview>>,
+    #[serde(skip)]
+    pub touched_files: Vec<PathBuf>,
+    #[serde(skip)]
+    pub file_effects: Vec<FileEffect>,
     /// What the tool wrote for the person watching while it ran, when that
     /// is to be kept with the conversation. It is never sent to the model.
     /// Only `run_script` sets it, to the lines that say what its calls did.
@@ -861,6 +1010,23 @@ impl ToolResult {
         self.terminal.truncated = truncated;
     }
 
+    /// A preview for event and display records. Saved-result locations are
+    /// rendered from the reference on the model-facing conversation item.
+    pub fn output_preview(&self) -> Option<&str> {
+        self.output.as_deref().map(|output| {
+            self.spill
+                .as_ref()
+                .filter(|spill| spill.matches_call(&self.id))
+                .map_or(output, |spill| spill.preview(output))
+        })
+    }
+
+    pub fn set_spill(&mut self, spill: ToolOutputSpill) {
+        debug_assert!(spill.matches_call(&self.id));
+        self.terminal.spill = Some(Box::new(spill));
+        self.set_truncated(true);
+    }
+
     /// A tool call that started work which is still running.
     ///
     /// This is deliberately not `completed`: the side effect has not
@@ -882,6 +1048,8 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_files: Vec::new(),
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -904,6 +1072,8 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_files: Vec::new(),
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -941,6 +1111,8 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_files: Vec::new(),
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -996,6 +1168,8 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_files: Vec::new(),
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1018,6 +1192,8 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_files: Vec::new(),
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1040,6 +1216,8 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_files: Vec::new(),
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1075,6 +1253,8 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_files: Vec::new(),
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1121,10 +1301,17 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_files: Vec::new(),
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
         }
+    }
+
+    pub fn with_touched_file(mut self, path: PathBuf) -> Self {
+        self.touched_files.push(path);
+        self
     }
 
     pub fn with_file_change_preview(mut self, preview: FileChangePreview) -> Self {
@@ -1139,6 +1326,11 @@ impl ToolResult {
 
     pub fn with_images(mut self, images: Vec<ImageInput>) -> Self {
         self.images = images;
+        self
+    }
+
+    pub fn with_mcp_tool_load(mut self, load: Option<McpToolLoad>) -> Self {
+        self.terminal.mcp_tool_load = load;
         self
     }
 
@@ -1267,7 +1459,7 @@ fn truncate_output_tokens(output: String, max_tokens: usize) -> (String, bool) {
 }
 
 fn approx_tool_tokens(text: &str) -> usize {
-    text.split_whitespace().count().max((text.len() + 3) / 4)
+    text.split_whitespace().count().max(text.len().div_ceil(4))
 }
 
 fn approx_bytes_for_tokens(tokens: usize) -> usize {
@@ -1515,6 +1707,8 @@ mod tests {
             kind: ToolResultKind::Indeterminate,
             source: ToolTerminalSource::CompatibilityRepair,
             started: ToolInvocationStarted::Unknown,
+            spill: None,
+            mcp_tool_load: None,
         };
 
         let value = serde_json::to_value(terminal).unwrap();
@@ -1522,6 +1716,7 @@ mod tests {
         assert_eq!(value["kind"], "indeterminate");
         assert_eq!(value["terminal_source"], "compatibility_repair");
         assert!(value.get("started").is_none());
+        assert!(value.get("mcp_tool_load").is_none());
         assert_eq!(
             serde_json::to_value(InterruptSemantics::CooperativeCancel).unwrap(),
             "cooperative_cancel"
@@ -1549,6 +1744,8 @@ mod tests {
                 kind: ToolResultKind::Cancelled,
                 source: ToolTerminalSource::Observed,
                 started: ToolInvocationStarted::Yes,
+                spill: None,
+                mcp_tool_load: None,
             }
         );
 

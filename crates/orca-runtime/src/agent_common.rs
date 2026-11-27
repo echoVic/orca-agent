@@ -231,12 +231,13 @@ pub fn format_subagent_guidance(delegation: DelegationPolicy) -> String {
 
 {permission}
 - {exploration_rule}
-- Scope children to one subsystem or call chain and a few entry files, not repo-wide audits. Give each user-named independent branch its own child when capacity allows; do not bundle unrelated branches to reduce count.
+- Limit children to one subsystem or call chain and a few entry files, and do not bundle unrelated branches. Give each user-named independent branch its own child as capacity allows.
 - {context_rule}
-- Keep single-file work, small lookups, coupled changes, and live user input local.
+- Keep single-file work, small lookups, coupled edits, and user input local.
 - Continue non-overlapping work. Integrate exact evidence, including missing-file errors; do not repeat searches/reread cited files unless verifying a concrete inconsistency.
-- One launch per named branch: integrate complete/partial/failed/uncertain results and questions. Replace only for explicit exhaustive completion or a new independently bounded blocking question.
-- Stay in scope; stop when briefing costs exceed remaining work. Capacity is a ceiling, not a target/quota.
+- If only child results remain, end your reply. Orca resumes the turn as results arrive.
+- One launch per named branch. Integrate all results and questions. Replace only for explicit exhaustive completion or a new independently bounded blocking question.
+- Stop when briefing costs exceed remaining work. Capacity is a ceiling, not a target/quota.
 Roles, tool ceilings, reports: see `subagent`."#
     )
 }
@@ -453,7 +454,13 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 pub fn format_tool_result_for_model(result: &ToolResult) -> String {
     match (&result.output, &result.error) {
         (Some(output), _) => {
-            if result.truncated {
+            if let Some(spill) = result
+                .spill
+                .as_ref()
+                .filter(|spill| spill.matches_call(&result.id))
+            {
+                spill.render(spill.preview(output))
+            } else if result.truncated {
                 format!("{output}\n[output truncated]")
             } else {
                 output.clone()
@@ -479,6 +486,52 @@ pub fn requires_approval(action: ActionKind) -> bool {
 mod tests {
     use super::*;
     use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus};
+    use orca_core::tool_types::{ToolName, ToolRequest};
+
+    #[test]
+    fn spill_like_tool_text_keeps_the_truncation_notice() {
+        let request = ToolRequest {
+            id: "ordinary".into(),
+            name: ToolName::WebFetch,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let path = std::env::current_dir().unwrap().join("spill/ordinary.txt");
+        let notice =
+            orca_core::tool_types::tool_output_spill_notice(10, &path.display().to_string());
+        let output = format!("head\n\n{notice}");
+        let result = ToolResult::completed(&request, output.clone(), true);
+        assert_eq!(
+            format_tool_result_for_model(&result),
+            format!("{output}\n[output truncated]")
+        );
+    }
+
+    #[test]
+    fn a_spilled_result_ends_with_the_file_notice() {
+        let request = ToolRequest {
+            id: "spill".into(),
+            name: ToolName::WebFetch,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let path = std::env::temp_dir().join("spill").join("spill.txt");
+        let notice =
+            orca_core::tool_types::tool_output_spill_notice(10, &path.display().to_string());
+        let output = format!("head\n\ntail\n\n{notice}");
+        let mut result = ToolResult::completed(&request, "head\n\ntail".into(), true);
+        result.set_spill(
+            orca_core::tool_types::ToolOutputSpill::new(
+                path.parent().unwrap().to_owned(),
+                request.id.clone(),
+                10,
+            )
+            .unwrap(),
+        );
+        assert_eq!(format_tool_result_for_model(&result), output);
+    }
 
     #[test]
     fn computer_actions_require_approval() {
@@ -537,7 +590,7 @@ mod tests {
             "verifying a concrete inconsistency",
             "including missing-file errors",
             "One launch per named branch",
-            "complete/partial/failed/uncertain",
+            "Integrate all results and questions",
             "explicit exhaustive completion",
             "new independently bounded blocking question",
         ] {
@@ -550,6 +603,15 @@ mod tests {
             .unwrap();
         assert!(schema.contains("Only for a downstream machine"));
         assert!(schema.contains("omit for ordinary human-readable evidence reports"));
+    }
+
+    #[test]
+    fn delegation_guidance_allows_ending_a_reply_while_subagents_run() {
+        for policy in [DelegationPolicy::Adaptive, DelegationPolicy::Explicit] {
+            let guidance = format_subagent_guidance(policy);
+            assert!(guidance.contains("If only child results remain, end your reply"));
+            assert!(guidance.contains("Orca resumes the turn as results arrive"));
+        }
     }
 
     #[test]

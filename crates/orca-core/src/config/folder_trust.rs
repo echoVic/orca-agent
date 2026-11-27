@@ -174,6 +174,26 @@ pub fn is_trusted_with_config_dir(path: &Path, config_dir: &Path) -> bool {
     )
 }
 
+/// A discovered project file inherits trust from its workspace. An explicit
+/// untrusted directory anywhere in that workspace's chain excludes its files.
+pub fn is_trusted_project_scope(workspace: &Path, scope: &Path, config_dir: &Path) -> bool {
+    if !scope.starts_with(workspace) {
+        return false;
+    }
+    let resolved = canonicalize_as_far_as_possible(scope);
+    if resolved != scope {
+        return false;
+    }
+    let store = load_path(&trust_file_path_in(config_dir));
+    trust_level_in(&store, workspace) == Some(TrustLevel::Trusted)
+        && scope.ancestors().all(|dir| {
+            store
+                .folders
+                .get(dir.to_string_lossy().as_ref())
+                .is_none_or(|entry| entry.level != TrustLevel::Untrusted)
+        })
+}
+
 /// Record a trust decision for `path`.
 pub fn set_trust(path: &Path, level: TrustLevel) -> Result<(), String> {
     let Some(config_dir) = config_dir() else {

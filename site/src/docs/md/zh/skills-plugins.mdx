@@ -2,12 +2,17 @@
 
 一个 skill 是包含 SKILL.md 指令文件的目录。Orca 从以下位置发现 skills：
 
-1. 设置 ORCA_HOME 时读取 $ORCA_HOME/skills，否则读取 ~/.orca/skills；
-2. ~/.agents/skills；
-3. 已受信任项目中的 .orca/skills；
-4. 已受信任项目中的 .agents/skills。
+1. 已受信任项目中的 `.orca/skills`。
+2. 已受信任项目中的 `.agents/skills`。
+3. `$ORCA_HOME/skills`，未设置 `ORCA_HOME` 时使用 `~/.orca/skills`。
+4. `~/.agents/skills`。
 
-项目 skill 在工作区受信任前不会加载，避免刚打开的仓库静默注入指令。
+同一个 ID 出现在多个位置时，以上面最靠前的位置为准。Orca 向上查找最近的 `.git`，
+以它所在的目录作为项目根目录。工作区不在 Git 仓库中时，使用工作区根目录。
+信任该目录后，Orca 才会加载项目 skill。
+
+每轮开始时，Orca 会把 skill 的 ID 和描述发给模型。任务匹配时，模型可以用 `read_skill`
+读取正文。目录最多占用 4,096 个 token，`list_skills` 可以查看完整列表。
 
 ## 最小 skill
 
@@ -35,6 +40,8 @@ $rust-review 审查当前分支。
 $rust-review:permissions 审查权限改动。
 ~~~
 
-冒号后的可选文本会替换 skill 正文中的 `{{arg}}`。TUI 的 mention 搜索也会展示已发现的 skills。
+冒号后的可选文本会替换 skill 正文中的 `{{arg}}`。同一版本的正文只加入对话一次，
+后续轮次仍可使用，直到上下文压缩。正文超过 4,096 个 token 时，Orca 会提示用
+`read_skill` 读取剩余部分。TUI 的提及搜索也会展示已发现的 skill。
 
 公开 CLI 没有加载或卸载 skill 的命令。新增、编辑或删除 SKILL.md 后，启动引用它的任务即可。

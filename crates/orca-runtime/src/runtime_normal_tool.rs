@@ -90,6 +90,18 @@ pub(crate) fn execute_runtime_normal_tool(
     context: &mut RuntimeNormalToolWorkerContext<'_>,
 ) -> ToolResult {
     match invocation.request.name {
+        ToolName::ApplyPatch => {
+            return match &invocation.prepared_patch {
+                Some(prepared) => {
+                    prepared.commit(&invocation.request, || context.cancel.is_cancelled())
+                }
+                None => ToolResult::failed_before_start(
+                    &invocation.request,
+                    "patch requires prepared approval targets",
+                    None,
+                ),
+            };
+        }
         ToolName::Bash => return execute_bash(invocation, context),
         ToolName::TaskReadOutput => return read_task_output(invocation),
         ToolName::TaskSendInput => return send_task_input(invocation, context),
@@ -97,18 +109,31 @@ pub(crate) fn execute_runtime_normal_tool(
         _ => {}
     }
 
-    orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_profile(
+    let cancelled = || context.cancel.is_cancelled();
+    let ctx = orca_tools::ToolContext::new(&invocation.cwd)
+        .with_output_truncation(invocation.output_truncation)
+        .with_shell_timeout(Some(Duration::from_secs(
+            invocation.effective_shell_timeout_secs(),
+        )))
+        .with_additional_working_directories(invocation.additional_roots.iter().cloned())
+        .with_execution_profile(invocation.config.execution_profile)
+        .with_deepseek_web(deepseek_web_access(&invocation.config))
+        .with_spill_directory(
+            invocation
+                .task_registry
+                .as_ref()
+                .and_then(crate::tasks::TaskRegistry::spill_directory),
+        )
+        .with_cancel(&cancelled);
+    let ctx = match context.mcp_elicitation_handler {
+        Some(handler) => ctx.with_mcp_elicitation_handler(handler),
+        None => ctx,
+    };
+    orca_tools::execute_in_context(
         &invocation.request,
-        &invocation.cwd,
-        &invocation.additional_roots,
         &invocation.mcp_registry,
         &invocation.external_tools,
-        invocation.output_truncation,
-        invocation.effective_shell_timeout_secs(),
-        context.mcp_elicitation_handler,
-        invocation.config.execution_profile,
-        deepseek_web_access(&invocation.config),
-        || context.cancel.is_cancelled(),
+        ctx,
     )
 }
 
@@ -717,7 +742,19 @@ fn wait_for_tasks(
         terminal_only,
         any,
         max_output_bytes,
-        || context.cancel.is_cancelled(),
+        || {
+            if context.cancel.is_cancelled() {
+                Some("wait_cancelled")
+            } else if invocation
+                .steer_handle
+                .as_ref()
+                .is_some_and(crate::lifecycle::ThreadSteerHandle::has_pending)
+            {
+                Some("steer_pending")
+            } else {
+                None
+            }
+        },
     ) {
         Ok(result) => result,
         Err(error) => return ToolResult::invalid_input(&invocation.request, error),
@@ -833,7 +870,7 @@ fn observe_until(
     terminal_only: bool,
     any: bool,
     max_output_bytes: usize,
-    should_cancel: impl Fn() -> bool,
+    interruption: impl Fn() -> Option<&'static str>,
 ) -> Result<(Vec<TaskObservation>, &'static str), String> {
     let deadline = Instant::now() + wait;
     let mut observations = observe_once(invocation, task_ids, max_output_bytes)?;
@@ -855,12 +892,8 @@ fn observe_until(
             Some("target_reached_terminal")
         } else if !terminal_only && changed {
             Some("state_changed")
-        } else if should_cancel() {
-            Some("wait_cancelled")
-        } else if Instant::now() >= deadline {
-            Some("wait_elapsed")
         } else {
-            None
+            interruption().or_else(|| (Instant::now() >= deadline).then_some("wait_elapsed"))
         };
         if let Some(reason) = reason {
             return Ok((observations, reason));
@@ -1345,7 +1378,7 @@ mod tests {
             true,
             false,
             2048,
-            || false,
+            || None,
         )
         .unwrap();
         assert_eq!(reason, "target_reached_terminal");
@@ -1367,7 +1400,7 @@ mod tests {
             false,
             false,
             2048,
-            || false,
+            || None,
         )
         .unwrap();
         assert_eq!(reason, "wait_elapsed");

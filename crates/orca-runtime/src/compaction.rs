@@ -8,10 +8,13 @@ use orca_core::config::OutputFormat;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::{EventObserver, EventSink};
 use orca_core::hook_types::HookEvent;
-use orca_core::provider_types::{ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep};
+use orca_core::provider_types::{
+    ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, Usage,
+};
 use orca_core::subagent_types::SubagentType;
 use orca_provider::{ProviderConfig, context};
 
+use crate::cost::CostTracker;
 use crate::hooks::{HookContext, HookRunner, conversation_with_hook_context};
 use crate::lifecycle::RuntimeTurnContext;
 use crate::session::InteractiveSession;
@@ -186,10 +189,9 @@ pub(crate) struct RuntimeCompactionOutcome {
 
 // Pricing stays in runtime, beside the existing price book; provider keeps the
 // actual response usage even when the summary is not adopted.
-fn compaction_observation_payload(
+pub(crate) fn compaction_observation_payload(
     observation: &context::CompactionObservation,
 ) -> serde_json::Value {
-    use orca_core::provider_types::Usage;
     let mut payload =
         serde_json::to_value(observation).expect("serializable compaction observation");
     let mut known = None::<Usage>;
@@ -346,22 +348,6 @@ pub(crate) fn child_unrecoverable_overflow_message(provider_message: &str) -> St
     )
 }
 
-// The compacted history carries no usage anchor. Scale its estimate by the
-// ratio the provider's count showed for the history it replaces, never down.
-fn calibrated_prompt_tokens(estimated: usize, reference: context::PromptMeasurement) -> usize {
-    if reference.tokens <= reference.estimated {
-        return estimated;
-    }
-    let scaled = estimated as u128 * reference.tokens as u128 / reference.estimated.max(1) as u128;
-    usize::try_from(scaled).unwrap_or(usize::MAX)
-}
-
-/// A pressure compaction is kept only when it brings the prompt under the soft
-/// line or cuts it by at least this share. Under a pinned prompt that alone is
-/// past the line, folding one small tool exchange saves a few percent and only
-/// discards the agent's recent results (#175). Emergencies keep any reduction.
-const PRESSURE_COMPACTION_MIN_GAIN_PERCENT: usize = 10;
-
 /// After a pressure compaction found nothing worth keeping, the next one waits
 /// until the prompt has grown by this share past where it was tried.
 const PRESSURE_COMPACTION_RETRY_GROWTH_PERCENT: usize = 10;
@@ -455,7 +441,8 @@ pub fn run_tui_agent_turn_compaction<W: io::Write>(
         &mut sink,
         runtime_parts.writer,
     )
-    .with_cancel(input.cancel);
+    .with_cancel(input.cancel)
+    .with_cost_tracker(runtime_parts.cost_tracker);
     let compacted = compaction.compact_if_needed(runtime_parts.conversation)?;
     let pressure = context::context_pressure(
         runtime_parts.conversation,
@@ -505,7 +492,8 @@ pub fn handle_tui_agent_provider_error<W: io::Write>(
                 &mut sink,
                 runtime_parts.writer,
             )
-            .with_cancel(input.cancel);
+            .with_cancel(input.cancel)
+            .with_cost_tracker(runtime_parts.cost_tracker);
             let shrunk = compaction
                 .compact_after_provider_error_retry(runtime_parts.conversation, trigger)?;
             if shrunk {
@@ -630,6 +618,9 @@ pub(crate) struct RuntimeCompactionStep<'a, W: io::Write> {
     events: &'a mut EventFactory,
     sink: &'a mut EventSink<W>,
     history_writer: Option<&'a mut SessionWriter>,
+    cost_tracker: Option<&'a mut CostTracker>,
+    operation: Option<&'a mut crate::operation_context::OperationContext>,
+    max_cost_usd_micros: Option<u64>,
     cancel: Option<&'a CancelToken>,
     deadline: Option<Instant>,
     deadline_cancel: Option<CompactionDeadlineCancellation>,
@@ -655,6 +646,9 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             events,
             sink,
             history_writer,
+            cost_tracker: None,
+            operation: None,
+            max_cost_usd_micros: None,
             cancel: None,
             deadline: None,
             deadline_cancel: None,
@@ -670,6 +664,24 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
     pub(crate) fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
         self.deadline = deadline;
         self.deadline_cancel = None;
+        self
+    }
+
+    pub(crate) fn with_cost_tracker(mut self, tracker: &'a mut CostTracker) -> Self {
+        self.cost_tracker = Some(tracker);
+        self
+    }
+
+    pub(crate) fn with_operation(
+        mut self,
+        operation: &'a mut crate::operation_context::OperationContext,
+    ) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
+    pub(crate) fn with_max_cost(mut self, limit: Option<u64>) -> Self {
+        self.max_cost_usd_micros = limit;
         self
     }
 
@@ -877,27 +889,81 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         } else {
             self.context_config
         };
-        let mut compaction = if let Some(cancel) = self.cancel_token() {
-            context::compact_with_summary_cancellable(
-                self.provider,
-                conversation,
-                context_config,
-                self.provider_config,
-                cancel,
-            )
-        } else {
-            context::compact_with_summary(
-                self.provider,
-                conversation,
-                context_config,
-                self.provider_config,
-            )
+        let cancel = self.cancel_token().cloned();
+        let mut recorded = false;
+        let mut settlement_error = None;
+        let mut budget_stopped = false;
+        let mut settle = |model: &str, usage: Option<Usage>| {
+            let before = self
+                .cost_tracker
+                .as_deref()
+                .map(|tracker| crate::cost::usd_to_micros(tracker.totals().estimated_cost_usd))
+                .unwrap_or(0);
+            if let Some(tracker) = self.cost_tracker.as_deref_mut()
+                && let Some(usage) = usage.filter(|usage| !usage.is_empty())
+            {
+                tracker.add_model_usage(model, usage);
+                recorded = true;
+            }
+            let settled = (|| -> io::Result<bool> {
+                if let Some(operation) = self.operation.as_deref_mut() {
+                    if let Some(tracker) = self.cost_tracker.as_deref()
+                        && operation.record_compaction_cost(before, tracker)?.is_err()
+                    {
+                        return Ok(false);
+                    }
+                    if operation.sync_wall_time()?.is_err() {
+                        return Ok(false);
+                    }
+                }
+                let spent = self
+                    .cost_tracker
+                    .as_deref()
+                    .map(|tracker| crate::cost::usd_to_micros(tracker.totals().estimated_cost_usd))
+                    .unwrap_or(0);
+                Ok(self
+                    .deadline
+                    .is_none_or(|deadline| Instant::now() < deadline)
+                    && self.max_cost_usd_micros.is_none_or(|limit| spent <= limit))
+            })();
+            match settled {
+                Ok(proceed) => {
+                    budget_stopped = !proceed;
+                    proceed
+                }
+                Err(error) => {
+                    settlement_error = Some(error);
+                    false
+                }
+            }
         };
+        let mut compaction = context::compact_with_summary_settled(
+            self.provider,
+            conversation,
+            context_config,
+            self.provider_config,
+            cancel.as_ref(),
+            trigger.is_emergency(),
+            &mut settle,
+        );
+        if recorded
+            && self.turn_context.emit_deltas
+            && let Some(tracker) = self.cost_tracker.as_deref()
+        {
+            let totals = tracker.totals();
+            self.sink.emit(self.events.usage_updated(totals))?;
+            if let Some(writer) = self.history_writer.as_deref_mut() {
+                writer.append_usage(totals)?;
+            }
+        }
+        if let Some(error) = settlement_error {
+            return Err(error);
+        }
         let after = context::measure_prompt(&compaction.conversation, self.provider_config);
-        if !self.worth_adopting(trigger, before, after) {
+        if budget_stopped || !self.worth_adopting(trigger, before, after) {
             // Nothing worth keeping: keep the history as it was, persist
             // nothing, and hold pressure compaction until the prompt grows.
-            if !trigger.is_emergency() {
+            if !budget_stopped && !trigger.is_emergency() {
                 conversation.compaction_hold = Some(before.tokens);
             }
             compaction.observation.measure_retained_history(
@@ -947,7 +1013,7 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
             outcome,
             RuntimeCompactionAdoption {
                 adopted: true,
-                prompt_tokens: calibrated_prompt_tokens(after.estimated, before),
+                prompt_tokens: before.calibrate_compacted_estimate(after.estimated),
             },
         ))
     }
@@ -960,18 +1026,12 @@ impl<'a, W: io::Write> RuntimeCompactionStep<'a, W> {
         before: context::PromptMeasurement,
         after: context::PromptMeasurement,
     ) -> bool {
-        if after.estimated >= before.estimated {
-            return false;
-        }
-        if trigger.is_emergency() {
-            return true;
-        }
-        let saved = before.estimated - after.estimated;
-        calibrated_prompt_tokens(after.estimated, before) <= self.context_config.soft_limit()
-            || saved.saturating_mul(100)
-                >= before
-                    .estimated
-                    .saturating_mul(PRESSURE_COMPACTION_MIN_GAIN_PERCENT)
+        context::worth_adopting_compaction(
+            before,
+            after.estimated,
+            self.context_config.soft_limit(),
+            trigger.is_emergency(),
+        )
     }
 
     fn emit_compaction_completed(&mut self, outcome: &RuntimeCompactionOutcome) -> io::Result<()> {

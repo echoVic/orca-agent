@@ -34,7 +34,8 @@ pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
             ),
             false,
         )
-        .with_file_change_preview(plan.preview),
+        .with_file_change_preview(plan.preview)
+        .with_touched_file(plan.path),
         Err(e) => ToolResult::failed(request, format!("failed to write file: {e}"), None),
     }
 }

@@ -514,6 +514,12 @@ impl WorkflowStateStore {
             return None;
         }
 
+        if !super::ipc::WorkflowIpcContext::cached_agent_can_be_reused(
+            &self.task_lists_path(run_id),
+            call_path,
+        ) {
+            return None;
+        }
         let cache = read_agent_cache(&path).ok()?;
         cache
             .get(&cache_key(call_path, input_hash))

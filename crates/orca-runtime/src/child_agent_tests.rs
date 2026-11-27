@@ -1052,6 +1052,7 @@ fn child_agent_provider_error_records_usage_before_failure() {
         &response,
         &mut tracker,
         None,
+        None,
     )
     .expect("provider-error handling should not fail")
     .expect("provider error should produce a decision");
@@ -1067,71 +1068,6 @@ fn child_agent_provider_error_records_usage_before_failure() {
     assert_eq!(totals.input_tokens, 120);
     assert_eq!(totals.output_tokens, 30);
     assert_eq!(totals.cache_tokens, 10);
-}
-
-#[test]
-fn observed_child_agent_provider_error_emits_cumulative_usage() {
-    let request = ChildAgentRequest::new(
-        "inspect repo".to_string(),
-        SubagentType::General,
-        None,
-        2,
-        false,
-    );
-    let instructions = ProjectInstructions::default();
-    let memory = MemoryBlock::default();
-    let runtime_config = config(None);
-    let mut setup = prepare_child_agent_loop(
-        &runtime_config,
-        &request,
-        std::env::temp_dir().as_path(),
-        &instructions,
-        &memory,
-    );
-    let response = ProviderResponse {
-        steps: vec![ProviderStep::Error(ProviderError::other("quota exhausted"))],
-        assistant_content: None,
-        assistant_reasoning: None,
-        tool_calls: vec![],
-        usage: Some(Usage {
-            input_tokens: 120,
-            output_tokens: 30,
-            cache_tokens: 10,
-        }),
-    };
-    let mut tracker = CostTracker::new(None);
-    tracker.add_usage(Usage {
-        input_tokens: 5,
-        output_tokens: 2,
-        cache_tokens: 1,
-    });
-    let activities = RefCell::new(Vec::new());
-    let observer = ChildAgentActivityObserver::new(|activity| {
-        activities.borrow_mut().push(activity.clone());
-    });
-
-    let decision = crate::child_agent_loop_runner::handle_child_agent_provider_error_with_usage(
-        &runtime_config,
-        &mut setup,
-        std::env::temp_dir().as_path(),
-        &HookRunner::default(),
-        &response,
-        &mut tracker,
-        Some(&observer),
-    )
-    .expect("provider-error handling should not fail")
-    .expect("provider error should produce a decision");
-
-    assert!(matches!(decision, ChildAgentProviderErrorDecision::Fail(_)));
-    drop(observer);
-    assert_eq!(
-        activities.into_inner(),
-        vec![ChildAgentActivity::Usage(tracker.totals())]
-    );
-    let totals = tracker.totals();
-    assert_eq!(totals.input_tokens, 125);
-    assert_eq!(totals.output_tokens, 32);
-    assert_eq!(totals.cache_tokens, 11);
 }
 
 #[test]
@@ -1173,6 +1109,7 @@ fn fold_child_agent_provider_response_records_usage_and_terminal_assistant() {
         &HookRunner::default(),
         &response,
         &mut tracker,
+        None,
         None,
     )
     .expect("provider-error handling should not fail");
@@ -1337,6 +1274,236 @@ fn run_child_agent_loop_with_tool_executor_runs_tools_until_provider_completes()
         .expect("child loop returns an exact budget receipt");
     assert_eq!(budget_usage.turns, 2);
     assert_eq!(budget_usage.tool_calls, 1);
+}
+
+#[test]
+fn child_compaction_allows_the_last_admitted_turn_in_both_loops() {
+    use crate::budget_controller::BudgetController;
+    use orca_core::budget::BudgetSpec;
+
+    for observed in [false, true] {
+        let config = config(None);
+        let request =
+            ChildAgentRequest::new("mock_usage".into(), SubagentType::General, None, 2, false);
+        let mut lease = BudgetController::new(BudgetSpec::default())
+            .child_lease(BudgetSpec {
+                max_turns: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut tracker = CostTracker::new(None);
+        let cwd = std::env::temp_dir();
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let hooks = HookRunner::default();
+        let context = ChildAgentLoopContext {
+            request: &request,
+            cwd: &cwd,
+            instructions: &instructions,
+            memory: &memory,
+            hooks: &hooks,
+            child_cost_tracker: &mut tracker,
+            lease: Some(&mut lease),
+        };
+        let result = if observed {
+            run_child_agent_loop_with_tool_executor_observed(
+                &config,
+                context,
+                None,
+                |_, _, _| unreachable!(),
+            )
+        } else {
+            run_child_agent_loop_with_tool_executor(&config, context, |_, _, _| unreachable!())
+        }
+        .unwrap();
+        assert_eq!(result.status, RunStatus::Success, "{:?}", result.error);
+        assert_eq!(tracker.totals().input_tokens, 120);
+        assert!(lease.admit_turn().is_err());
+    }
+}
+
+fn run_child_compaction_fixture(
+    retry: bool,
+    expire: bool,
+) -> (io::Result<ChildAgentResult>, usize, u64, u64) {
+    use crate::budget_controller::BudgetController;
+    use orca_core::budget::BudgetSpec;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let done = Arc::new(AtomicBool::new(false));
+    let done_for_server = Arc::clone(&done);
+    let server = std::thread::spawn(move || {
+        let mut calls = 0;
+        'accept: while !done_for_server.load(Ordering::Relaxed) {
+            let (mut socket, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => panic!("accept child request: {error}"),
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                match reader.read_line(&mut header) {
+                    Ok(0) => continue 'accept,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        continue 'accept;
+                    }
+                    Err(error) => panic!("read child request: {error}"),
+                }
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut request_body = vec![0; length];
+            reader.read_exact(&mut request_body).unwrap();
+            calls += 1;
+            let request: serde_json::Value = serde_json::from_slice(&request_body).unwrap();
+            let last_message = request["messages"].as_array().unwrap().last().unwrap();
+            let content = last_message["content"].as_str().unwrap();
+            let replay_call = if retry { 4 } else { 3 };
+            if calls == replay_call {
+                assert!(content.starts_with("Write a checkpoint"));
+            } else if calls > replay_call {
+                assert!(content.starts_with("Summarize this collapsed conversation segment"));
+            }
+            let (status, content_type, body) = if calls <= 2 {
+                let chunk = serde_json::json!({"choices":[{"delta":{
+                    "content": if calls == 1 { "older evidence ".repeat(2_000) } else { "recent evidence ".repeat(900) },
+                    "reasoning_content":"check evidence",
+                    "tool_calls":[{"index":0,"id":format!("call-{calls}"),"function":{"name":"bash","arguments":"{\"command\":\"echo evidence\"}"}}]
+                },"finish_reason":"tool_calls"}]});
+                (
+                    "200 OK",
+                    "text/event-stream",
+                    format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                )
+            } else if retry && calls == 3 {
+                (
+                    "400 Bad Request",
+                    "application/json",
+                    r#"{"error":{"message":"prompt_too_long"}}"#.to_string(),
+                )
+            } else {
+                if expire && calls == if retry { 4 } else { 3 } {
+                    std::thread::sleep(Duration::from_millis(1_400));
+                }
+                ("200 OK", "text/event-stream", "data: {\"choices\":[{\"delta\":{\"content\":\"short facts\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":20}}\n\ndata: [DONE]\n\n".to_string())
+            };
+            let _ = write!(
+                socket,
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+        calls
+    });
+    let mut config = config(Some(PRO_MODEL));
+    config.provider = ProviderKind::DeepSeek;
+    config.api_key = Some("local-fixture".into());
+    config.base_url = Some(base_url);
+    if !retry {
+        config.model_runtime.soft_compact_token_limit = Some(1);
+    }
+    let request =
+        ChildAgentRequest::new("inspect repo".into(), SubagentType::General, None, 4, false);
+    let mut lease = BudgetController::new(BudgetSpec::default())
+        .child_lease(BudgetSpec {
+            max_wall_time_ms: expire.then_some(1_000),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut tracker = CostTracker::new(None);
+    let observer = ChildAgentActivityObserver::new_fallible(|activity| {
+        if !expire && matches!(activity, ChildAgentActivity::Usage(_)) {
+            return Err(io::Error::other("usage observer failed"));
+        }
+        Ok(())
+    });
+    let result = run_child_agent_loop_with_tool_executor_observed(
+        &config,
+        ChildAgentLoopContext {
+            request: &request,
+            cwd: std::env::temp_dir().as_path(),
+            instructions: &ProjectInstructions::default(),
+            memory: &MemoryBlock::default(),
+            hooks: &HookRunner::default(),
+            child_cost_tracker: &mut tracker,
+            lease: Some(&mut lease),
+        },
+        Some(&observer),
+        |_, _, request| ChildAgentToolExecution {
+            should_stop: false,
+            result: ToolResult::completed(request, "done".into(), false),
+            child_cost: None,
+        },
+    );
+    done.store(true, Ordering::Relaxed);
+    (
+        result,
+        server.join().unwrap(),
+        lease.usage().cost_usd_micros,
+        crate::cost::usd_to_micros(tracker.totals().estimated_cost_usd),
+    )
+}
+
+#[test]
+fn child_compaction_settles_lease_before_publishing_usage() {
+    for retry in [false, true] {
+        let (result, calls, receipt, spent) = run_child_compaction_fixture(retry, false);
+        assert_eq!(
+            calls,
+            if retry { 5 } else { 4 },
+            "Flash fallback before expiry"
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "usage observer failed",
+            "retry={retry}"
+        );
+        assert!(spent > 0, "retry={retry}");
+        assert_eq!(receipt, spent, "retry={retry}");
+    }
+}
+
+#[test]
+fn child_compaction_stops_remote_requests_at_lease_deadline() {
+    for retry in [true, false] {
+        let (result, calls, _, spent) = run_child_compaction_fixture(retry, true);
+        let result = result.unwrap();
+        assert_eq!(
+            calls,
+            if retry { 4 } else { 3 },
+            "no Flash fallback after replay expires, retry={retry}"
+        );
+        assert_eq!(
+            spent, 0,
+            "the delayed response arrived after the lease expired"
+        );
+        assert!(result.error.unwrap().contains("wall_time_budget"));
+    }
 }
 
 /// What a `bash echo child` child costs when its one tool call was billed

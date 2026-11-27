@@ -15,9 +15,9 @@ use crate::child_agent_loop_setup::{
     try_prepare_child_agent_loop,
 };
 use crate::child_agent_provider_turn::{
-    ChildAgentProviderErrorDecision, ChildAgentProviderTurn, handle_child_agent_provider_error,
-    prepare_child_agent_request, route_child_agent_model, run_child_agent_provider_turn,
-    run_child_agent_provider_turn_observed,
+    ChildAgentProviderErrorDecision, ChildAgentProviderTurn,
+    handle_child_agent_provider_error_with_cost, prepare_child_agent_request_with_cost,
+    route_child_agent_model, run_child_agent_provider_turn, run_child_agent_provider_turn_observed,
 };
 use crate::child_agent_response_folding::{
     ChildAgentProviderResponseFold, ChildAgentToolContext, ChildAgentToolExecution,
@@ -248,9 +248,29 @@ where
             }
         }
 
-        if let Err(message) =
-            prepare_child_agent_request(config, &mut setup, context.cwd, context.hooks)?
-        {
+        setup.refresh_mcp(config, context.request, context.cwd);
+        let compaction_config = child_compaction_config(config, lease, context.child_cost_tracker);
+        let prepared = prepare_child_agent_request_with_cost(
+            &compaction_config,
+            &mut setup,
+            context.cwd,
+            context.hooks,
+            Some(context.child_cost_tracker),
+            lease.wall_time_deadline(),
+        )?;
+        if let Err(stop) = sync_child_cost_to_lease(
+            lease,
+            context.child_cost_tracker,
+            &mut recorded_cost_usd_micros,
+        ) {
+            return finish_lightweight_child_result(
+                &setup,
+                lease,
+                checkpoint_observer,
+                child_lease_stop_result(stop),
+            );
+        }
+        if let Err(message) = prepared {
             let result = ChildAgentResult {
                 status: RunStatus::Failed,
                 final_message: None,
@@ -324,14 +344,16 @@ where
             );
         }
 
+        let compaction_config = child_compaction_config(config, lease, context.child_cost_tracker);
         let provider_error_decision = handle_child_agent_provider_error_with_usage(
-            config,
+            &compaction_config,
             &mut setup,
             context.cwd,
             context.hooks,
             &response,
             context.child_cost_tracker,
             None,
+            lease.wall_time_deadline(),
         )?;
         if let Err(stop) = sync_child_cost_to_lease(
             lease,
@@ -529,9 +551,31 @@ where
             }
         }
 
-        if let Err(message) =
-            prepare_child_agent_request(config, &mut setup, context.cwd, context.hooks)?
-        {
+        setup.refresh_mcp(config, context.request, context.cwd);
+        let before = context.child_cost_tracker.totals();
+        let compaction_config = child_compaction_config(config, lease, context.child_cost_tracker);
+        let prepared = prepare_child_agent_request_with_cost(
+            &compaction_config,
+            &mut setup,
+            context.cwd,
+            context.hooks,
+            Some(context.child_cost_tracker),
+            lease.wall_time_deadline(),
+        )?;
+        if let Err(stop) = sync_child_cost_to_lease(
+            lease,
+            context.child_cost_tracker,
+            &mut recorded_cost_usd_micros,
+        ) {
+            return finish_lightweight_child_result(
+                &setup,
+                lease,
+                checkpoint_observer,
+                child_lease_stop_result(stop),
+            );
+        }
+        publish_changed_child_usage(context.child_cost_tracker, before, observer)?;
+        if let Err(message) = prepared {
             let result = ChildAgentResult {
                 status: RunStatus::Failed,
                 final_message: None,
@@ -606,14 +650,17 @@ where
             );
         }
 
+        let before = context.child_cost_tracker.totals();
+        let compaction_config = child_compaction_config(config, lease, context.child_cost_tracker);
         let provider_error_decision = handle_child_agent_provider_error_with_usage(
-            config,
+            &compaction_config,
             &mut setup,
             context.cwd,
             context.hooks,
             &response,
             context.child_cost_tracker,
             observer,
+            lease.wall_time_deadline(),
         )?;
         if let Err(stop) = sync_child_cost_to_lease(
             lease,
@@ -627,6 +674,7 @@ where
                 child_lease_stop_result(stop),
             );
         }
+        publish_changed_child_usage(context.child_cost_tracker, before, observer)?;
         if let Some(result) =
             child_agent_budget_exhausted_result(config, context.child_cost_tracker)
         {
@@ -793,6 +841,7 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
     response: &ProviderResponse,
     child_cost_tracker: &mut CostTracker,
     observer: Option<&dyn ChildAgentActivityPublisher>,
+    deadline: Option<std::time::Instant>,
 ) -> io::Result<Option<ChildAgentProviderErrorDecision>> {
     let has_provider_error = response
         .steps
@@ -802,7 +851,15 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
         record_child_provider_usage(response.usage, child_cost_tracker, observer)?;
     }
 
-    let decision = handle_child_agent_provider_error(config, setup, cwd, hooks, response)?;
+    let decision = handle_child_agent_provider_error_with_cost(
+        config,
+        setup,
+        cwd,
+        hooks,
+        response,
+        Some(child_cost_tracker),
+        deadline,
+    )?;
     if matches!(decision, Some(ChildAgentProviderErrorDecision::Fail(_)))
         && let Some(partial) = response
             .error()
@@ -822,6 +879,43 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
             });
     }
     Ok(decision)
+}
+
+fn publish_changed_child_usage(
+    tracker: &CostTracker,
+    before: orca_core::cost_types::UsageTotals,
+    observer: Option<&dyn ChildAgentActivityPublisher>,
+) -> io::Result<()> {
+    let totals = tracker.totals();
+    if totals != before
+        && let Some(observer) = observer
+    {
+        observer.publish_activity(ChildAgentActivity::Usage(totals))?;
+    }
+    Ok(())
+}
+
+/// The child may hold a smaller operation lease than its session limit. Use
+/// the remaining lease cost on the tracker's scale for each replay boundary.
+fn child_compaction_config(
+    config: &RunConfig,
+    lease: &crate::budget_controller::BudgetLease,
+    tracker: &CostTracker,
+) -> RunConfig {
+    let mut config = config.clone();
+    if let Some(limit) = lease.spec().max_cost_usd_micros {
+        let remaining = limit.saturating_sub(lease.usage().cost_usd_micros);
+        let total_limit = crate::cost::usd_to_micros(tracker.totals().estimated_cost_usd)
+            .saturating_add(remaining);
+        config.budget.max_cost_usd_micros = Some(
+            config
+                .budget
+                .max_cost_usd_micros
+                .unwrap_or(u64::MAX)
+                .min(total_limit),
+        );
+    }
+    config
 }
 
 fn record_child_provider_usage(
@@ -863,6 +957,25 @@ mod tests {
     use crate::lifecycle::run_status_from_tool_status;
     use orca_core::event_schema::RunStatus;
     use orca_core::tool_types::ToolStatus;
+
+    #[test]
+    fn child_compaction_uses_the_remaining_lease_cost() {
+        use crate::budget_controller::BudgetController;
+        use crate::cost::CostTracker;
+        use orca_core::budget::BudgetSpec;
+        let config = orca_core::config::RunConfig::default();
+        let mut parent = BudgetController::new(BudgetSpec::default());
+        let mut lease = parent
+            .child_lease(BudgetSpec {
+                max_cost_usd_micros: Some(100),
+                ..Default::default()
+            })
+            .unwrap();
+        lease.record_cost_usd_micros(75).unwrap();
+        let tracker = CostTracker::new(None);
+        let compact = super::child_compaction_config(&config, &lease, &tracker);
+        assert_eq!(compact.budget.max_cost_usd_micros, Some(25));
+    }
 
     #[test]
     fn child_agent_tool_terminal_status_preserves_cancelled_and_unknown_outcomes() {

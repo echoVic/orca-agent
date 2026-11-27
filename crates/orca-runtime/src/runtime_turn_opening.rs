@@ -5,7 +5,7 @@ use orca_core::config::ProviderKind;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
-use orca_core::model::{ImageRouteDecision, ModelSelection};
+use orca_core::model::{ImageRouteDecision, ModelRouteContext, ModelSelection};
 use orca_provider::{ProviderConfig, context};
 
 use crate::compaction::RuntimeCompactionStep;
@@ -99,10 +99,17 @@ impl RuntimeTurnOpeningStep {
         // Compute once before compaction/hooks; every summary shares this
         // fixed operation deadline instead of renewing a per-request timeout.
         let deadline = input.operation.remaining_deadline()?;
+        let compaction_model = input.model.route(ModelRouteContext {
+            subagent_type: turn_context.subagent_type,
+            subagent_model: input.model_override,
+            has_images: false,
+        });
+        let mut compaction_provider = input.provider_config.clone();
+        compaction_provider.model = Some(compaction_model.actual_model);
         let prepared = RuntimeCompactionStep::new(
             input.provider,
             input.context_config,
-            input.provider_config,
+            &compaction_provider,
             turn_context.clone(),
             input.hooks,
             input.events,
@@ -111,7 +118,10 @@ impl RuntimeTurnOpeningStep {
         )
         .with_cancel(input.cancel)
         .with_deadline(deadline)
+        .with_cost_tracker(input.cost_tracker)
+        .with_operation(input.operation)
         .prepare_request(input.conversation)?;
+        let budget = input.operation.sync_wall_time()?;
         // Local fallback can make the prompt fit after cancellation/expiry.
         // Stop before turn hooks, image routing or the main model request.
         if input.cancel.is_cancelled() {
@@ -122,7 +132,11 @@ impl RuntimeTurnOpeningStep {
                 None,
             )));
         }
-        if let Err(stop) = input.operation.sync_wall_time()? {
+        let budget = match budget {
+            Ok(()) => input.operation.sync_wall_time()?,
+            Err(stop) => Err(stop),
+        };
+        if let Err(stop) = budget {
             let terminal = input.operation.commit_budget_stop_with_boundary(
                 turn_context.turn_id.as_str(),
                 input.events.run_id(),
@@ -231,43 +245,62 @@ mod tests {
     fn opening_summary_case(
         wall_time_ms: Option<u64>,
         cancel_on_accept: bool,
-    ) -> (RuntimeTurnOpeningResult, Duration) {
+        max_cost_usd_micros: Option<u64>,
+    ) -> (
+        RuntimeTurnOpeningResult,
+        Duration,
+        orca_core::cost_types::UsageTotals,
+        usize,
+    ) {
         let cancel = CancelToken::new();
         let server_cancel = cancel.clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = request_count.clone();
         let server = std::thread::spawn(move || {
-            let started = Instant::now();
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        if started.elapsed() > Duration::from_secs(3) {
-                            return;
+            for index in 0..8 {
+                let warming = index == 0;
+                let started = Instant::now();
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if started.elapsed()
+                                > if index < 2 {
+                                    Duration::from_secs(3)
+                                } else {
+                                    Duration::from_millis(250)
+                                }
+                            {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
                         }
-                        std::thread::sleep(Duration::from_millis(5));
+                        Err(error) => panic!("accept summary: {error}"),
                     }
-                    Err(error) => panic!("accept summary: {error}"),
+                };
+                captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0_u8; 16 * 1024];
+                let _ = stream.read(&mut request);
+                if !warming && cancel_on_accept {
+                    server_cancel.cancel();
                 }
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = [0_u8; 16 * 1024];
-            let _ = stream.read(&mut request);
-            if cancel_on_accept {
-                server_cancel.cancel();
+                if !warming && max_cost_usd_micros.is_none() {
+                    std::thread::sleep(Duration::from_millis(1_200));
+                }
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"retained facts\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4000,\"completion_tokens\":90,\"prompt_cache_hit_tokens\":1000}}\n\ndata: [DONE]\n\n";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
             }
-            // The endpoint waits beyond the entire operation budget.
-            std::thread::sleep(Duration::from_millis(1_200));
-            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"retained facts\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
         });
         let mut conversation = Conversation::new();
         conversation.add_system("system".to_string());
@@ -290,11 +323,20 @@ mod tests {
             external_tools: vec![],
             max_output_tokens: None,
         };
+        let warm = orca_provider::call_streaming(
+            ProviderKind::DeepSeek,
+            &conversation,
+            &provider_config,
+            &cancel,
+            &mut |_| {},
+        );
+        assert!(warm.error().is_none(), "{:?}", warm.error());
         let mut lifecycle = crate::lifecycle::RuntimeSessionLifecycle::new("opening-deadline");
         let mut actor = RuntimeTaskActor::new(&mut lifecycle);
         let mut operation = OperationContext::for_tests(
             orca_core::budget::BudgetSpec {
                 max_wall_time_ms: wall_time_ms,
+                max_cost_usd_micros,
                 ..Default::default()
             },
             "opening-summary-deadline",
@@ -333,12 +375,19 @@ mod tests {
             .unwrap();
         let elapsed = started.elapsed();
         server.join().unwrap();
-        (result, elapsed)
+        (
+            result,
+            elapsed,
+            cost.totals(),
+            request_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_sub(1),
+        )
     }
 
     #[test]
     fn automatic_opening_summary_obeys_remaining_operation_wall_time() {
-        let (result, elapsed) = opening_summary_case(Some(500), false);
+        let (result, elapsed, _, _) = opening_summary_case(Some(500), false, None);
         assert!(
             elapsed < Duration::from_millis(900),
             "automatic summary exceeded remaining operation wall time: {elapsed:?}"
@@ -360,7 +409,7 @@ mod tests {
 
     #[test]
     fn automatic_opening_summary_cancellation_stops_before_main_model() {
-        let (result, elapsed) = opening_summary_case(None, true);
+        let (result, elapsed, _, _) = opening_summary_case(None, true, None);
         assert!(
             elapsed < Duration::from_millis(900),
             "automatic summary ignored cancellation: {elapsed:?}"
@@ -375,5 +424,43 @@ mod tests {
             ),
             "cancelled summary must stop before the main model, even after local fallback"
         );
+    }
+
+    #[test]
+    fn a_billed_rejected_replay_that_exhausts_the_budget_starts_no_fallback() {
+        let (result, _, totals, requests) = opening_summary_case(None, false, Some(1));
+        assert!(matches!(
+            result,
+            RuntimeTurnOpeningResult::Return(AgentLoopResult {
+                terminal: orca_core::budget::OperationTerminal::Stopped {
+                    reason: orca_core::budget::StopReason::CostBudget { .. },
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(totals.input_tokens, 4_000);
+        assert_eq!(totals.output_tokens, 90);
+        assert_eq!(
+            requests, 1,
+            "a billed rejected checkpoint exhausted the operation budget"
+        );
+    }
+
+    #[test]
+    fn compaction_checkpoint_usage_can_exhaust_the_operation_budget() {
+        let (result, _, totals, _) = opening_summary_case(None, false, Some(1));
+        assert_eq!(totals.input_tokens, 4_000);
+        assert_eq!(totals.cache_tokens, 1_000);
+        assert!(matches!(
+            result,
+            RuntimeTurnOpeningResult::Return(AgentLoopResult {
+                terminal: orca_core::budget::OperationTerminal::Stopped {
+                    reason: orca_core::budget::StopReason::CostBudget { .. },
+                    ..
+                },
+                ..
+            })
+        ));
     }
 }

@@ -1163,6 +1163,7 @@ impl WorkflowRunner {
         {
             return Ok(());
         }
+        WorkflowIpcContext::reconcile_dead_claims(&self.state.task_lists_path(run_id))?;
         state.status = WorkflowRunStatus::Failed;
         state.final_summary = None;
         state.error = Some("Workflow interrupted by runtime restart".to_string());
@@ -1317,6 +1318,9 @@ impl WorkflowRunner {
         let args = request.input.args.clone().unwrap_or(Value::Null);
         let resume_from = request.input.resume_from_run_id.clone();
         let restart_phase = request.input.restart_phase.clone();
+        if let Some(source) = &resume_from {
+            WorkflowIpcContext::reconcile_dead_claims(&self.state.task_lists_path(source))?;
+        }
         let cached_agents = Arc::new(AtomicU32::new(0));
         let mut failed_error = None;
         let mut completed_result = None;
@@ -1358,7 +1362,7 @@ impl WorkflowRunner {
         match WorkflowHost::run_with_agent_event_control_and_ipc_paths(
             &resolved.persisted_path,
             args,
-            &ipc_paths,
+            (&ipc_paths, &workflow_ipc),
             workflow_limits.max_concurrent_agents,
             |call| {
                 self.answer_agent_call(
@@ -1688,6 +1692,7 @@ impl WorkflowRunner {
 
         let execution_policy = workflow_agent_execution_policy(&call, workflow_limits);
         let max_attempts = execution_policy.max_agent_retries.saturating_add(1).max(1);
+        let mut child_ipc = workflow_ipc.for_sender(call.call_path.clone());
         let mut previous_errors = Vec::new();
         for attempt in 1..=max_attempts {
             if self.workflow_stop_requested(run_id, task_id, workflow_cancel)? {
@@ -1784,18 +1789,20 @@ impl WorkflowRunner {
             if let Some(budget_cap) = permit.budget_cap() {
                 child_execution_policy.max_agent_tokens = Some(budget_cap);
             }
-            match self.run_child_agent_call(
+            let child_result = self.run_child_agent_call(
                 task_id,
                 &call,
-                workflow_ipc,
+                &child_ipc,
                 &child_execution_policy,
                 workflow_cancel,
                 continuation_selector
                     .as_ref()
                     .map(|continuation| continuation.continuation_id.as_str()),
                 permit.budget_spec(),
-            ) {
+            );
+            match child_result {
                 Ok(child_output) => {
+                    let release_error = child_ipc.release_child_claims().err();
                     permit.settle_usage(
                         child_output.usage.total_tokens(),
                         child_output.budget_usage,
@@ -1810,7 +1817,10 @@ impl WorkflowRunner {
                     let transcript_path =
                         write_agent_transcript(transcript_dir, &call, &output, false)?;
                     let result = workflow_agent_result(&call, Value::String(output.clone()), false);
-                    if let Err(error_message) = validate_workflow_agent_schema(&call, &result) {
+                    let failed_release = release_error.is_some();
+                    if let Err(error_message) = release_error
+                        .map_or_else(|| validate_workflow_agent_schema(&call, &result), Err)
+                    {
                         self.state.record_agent_completed(
                             run_id,
                             WorkflowAgentRecord {
@@ -1838,6 +1848,9 @@ impl WorkflowRunner {
                         )?;
                         if let Ok(state) = self.state.load_run(run_id) {
                             let _ = self.refresh_task_progress(task_id, &state);
+                        }
+                        if failed_release {
+                            return Err(io::Error::other(error_message));
                         }
 
                         return Ok(HostCommand::AgentError {
@@ -1882,7 +1895,7 @@ impl WorkflowRunner {
                 Err(error) => {
                     let completed_at_ms = now_ms();
                     let WorkflowChildAgentCallError {
-                        message: error_message,
+                        message: mut error_message,
                         usage,
                         retryable,
                         cancelled,
@@ -1899,6 +1912,14 @@ impl WorkflowRunner {
                         workflow_cancel.cancel();
                     }
                     drop(permit);
+                    let will_retry = attempt < max_attempts && retryable && !cancelled;
+                    let keep_claims =
+                        will_retry && continuation.as_ref().is_some_and(|state| state.resumable);
+                    let mut failed_release = false;
+                    if !keep_claims && let Err(error) = child_ipc.release_child_claims() {
+                        error_message.push_str(&format!("\n{error}"));
+                        failed_release = true;
+                    }
                     let transcript_path =
                         write_agent_transcript(transcript_dir, &call, &error_message, false)?;
                     self.state.record_agent_completed(
@@ -1934,7 +1955,13 @@ impl WorkflowRunner {
                         let _ = self.refresh_task_progress(task_id, &state);
                     }
 
-                    if attempt < max_attempts && retryable && !cancelled {
+                    if failed_release {
+                        return Err(io::Error::other(error_message));
+                    }
+                    if will_retry {
+                        if !keep_claims {
+                            child_ipc = workflow_ipc.for_sender(call.call_path.clone());
+                        }
                         previous_errors.push(error_message);
                         continuation_selector =
                             continuation.filter(|continuation| continuation.resumable);
@@ -2310,7 +2337,7 @@ impl WorkflowRunner {
             headless_root: false,
             allowed_tools: execution_policy.allowed_tools.clone(),
             tool_policy_label: execution_policy.tool_policy_label.clone(),
-            workflow_ipc: Some(workflow_ipc.for_sender(call.call_path.clone())),
+            workflow_ipc: Some(workflow_ipc.clone()),
             continuation: continuation_start,
         };
         let mut lifecycle =
@@ -2861,6 +2888,10 @@ fn parse_child_tool_events(bytes: &[u8]) -> Vec<WorkflowEvidenceToolEvent> {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             is_mcp: name.starts_with("mcp__"),
+            file_effect_count: payload
+                .get("file_effects")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
         };
         if let Some(id) = id {
             events_by_id
@@ -2885,6 +2916,7 @@ fn merge_tool_event(existing: &mut WorkflowEvidenceToolEvent, update: &WorkflowE
         existing.error = update.error.clone();
     }
     existing.is_mcp |= update.is_mcp;
+    existing.file_effect_count = existing.file_effect_count.max(update.file_effect_count);
 }
 
 fn workflow_phase_summaries(state: &WorkflowRunState) -> Vec<WorkflowPhaseTaskSummary> {
@@ -3852,6 +3884,221 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn updates_from_the_host_and_the_runner_are_both_kept() {
+        let result = run_task_list_workflow(
+            "createTaskList('host', ['from host']);
+             await agent('create runner list');
+             export default [listTasks('host'), listTasks('runner')];",
+        );
+        assert_eq!(result[0][0]["value"], "from host");
+        assert_eq!(result[1][0]["value"], "from runner");
+        assert_ne!(result[0][0]["id"], result[1][0]["id"]);
+    }
+
+    #[test]
+    fn a_crashed_claimant_releases_its_task() {
+        let result = run_task_list_workflow(
+            "await agent('create runner list');
+             let failed = false;
+             try { await agent('claim and fail'); } catch { failed = true; }
+             const released = listTasks('runner')[0];
+             await agent('claim and complete');
+             export default { failed, released, completed: listTasks('runner')[0] };",
+        );
+        assert_eq!(result["failed"], true);
+        assert_eq!(result["released"]["status"], "pending");
+        assert!(result["released"]["claimedBy"].is_null());
+        assert_eq!(result["released"]["id"], "workflow-task-1");
+        assert_eq!(result["completed"]["id"], "workflow-task-1");
+        assert_eq!(result["completed"]["status"], "completed");
+        assert_eq!(result["completed"]["result"], "finished");
+    }
+
+    #[test]
+    fn workflow_checkpointed_retry_keeps_its_claim() {
+        let result = run_task_list_workflow(
+            "createTaskList('runner', ['keep']);
+             await agent('claim and retry');
+             export default listTasks('runner');",
+        );
+        assert_eq!(result[0]["status"], "completed");
+        assert_eq!(result[0]["result"], "retried");
+    }
+
+    #[test]
+    fn workflow_resume_releases_dead_claims_and_reruns_mutating_calls() {
+        const ENTRY: &str = "workflow::runner::tests::workflow_abandon_task_list_claim";
+        let temp = tempdir().unwrap();
+        let script = temp.path().join("workflow.js");
+        fs::write(
+            &script,
+            "export const meta = { name: 'restart', description: 'Task list restart', phases: [] };
+            await agent('create runner list');
+            await agent('read runner list');
+            export default listTasks('runner');",
+        )
+        .unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().into());
+        let session = temp.path().join("session");
+        let request = WorkflowLaunchRequest::from_script_path(script.display().to_string());
+        let runner = WorkflowRunner::new(
+            config.clone(),
+            TaskRegistry::new("restart".into()),
+            session.clone(),
+        )
+        .with_child_executor(task_list_child_executor);
+        let original = runner.launch(request.clone()).unwrap();
+        let run_id = original.output.run_id.unwrap();
+        let path = runner.state.task_lists_path(&run_id);
+        drop(runner);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", ENTRY])
+            .env("ORCA_TEST_ABANDON_TASK_LIST", &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let persisted = || serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted()["lists"]["runner"][0]["status"], "running");
+
+        let reopened = WorkflowRunner::new(config, TaskRegistry::new("restart".into()), session)
+            .with_child_executor(task_list_child_executor);
+        let resumed = reopened.resume(request.with_resume_from(run_id)).unwrap();
+        assert_eq!(persisted()["lists"]["runner"][0]["status"], "pending");
+        assert!(persisted()["lists"]["runner"][0]["claimedBy"].is_null());
+        let result = resumed
+            .summary
+            .strip_suffix(" (cached 1 agent)")
+            .expect(&resumed.summary);
+        assert_eq!(
+            serde_json::from_str::<Value>(result).unwrap()[0]["value"],
+            "from runner"
+        );
+    }
+
+    #[test]
+    fn workflow_abandon_task_list_claim() {
+        let Some(path) = std::env::var_os("ORCA_TEST_ABANDON_TASK_LIST") else {
+            return;
+        };
+        let ipc = WorkflowIpcContext::new_durable_task_lists(path.into()).unwrap();
+        let child = ipc.for_sender("abandoned");
+        assert_eq!(
+            child.claim_task("runner", None).unwrap()["status"],
+            "running"
+        );
+        std::process::exit(0);
+    }
+
+    fn run_task_list_workflow(script_body: &str) -> Value {
+        let temp = tempdir().unwrap();
+        let script = temp.path().join("workflow.js");
+        fs::write(
+            &script,
+            format!(
+                "export const meta = {{ name: 'task-list-test', description: 'Shared task list', phases: [] }};\n{script_body}"
+            ),
+        )
+        .unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().into());
+        config.workflows.max_agent_retries = 1;
+        let runner = WorkflowRunner::new(
+            config,
+            TaskRegistry::new("task-list-test".into()),
+            temp.path().join("session"),
+        )
+        .with_child_executor(task_list_child_executor);
+        let launched = runner
+            .launch(WorkflowLaunchRequest::from_script_path(
+                script.display().to_string(),
+            ))
+            .unwrap();
+        serde_json::from_str(&launched.summary).unwrap()
+    }
+
+    fn task_list_child_executor(
+        _config: &RunConfig,
+        request: &ChildAgentRequest,
+        runtime: &mut ChildAgentRuntime<'_, SharedEventBuffer>,
+        _cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        let ipc = request.workflow_ipc.as_ref().unwrap();
+        match request.prompt.as_str() {
+            "create runner list" => {
+                ipc.create_task_list("runner", vec![serde_json::json!("from runner")])
+                    .map_err(io::Error::other)?;
+            }
+            "read runner list" => {
+                ipc.list_tasks("runner").map_err(io::Error::other)?;
+            }
+            "claim and retry" if request.continuation.is_none() => {
+                assert_eq!(ipc.claim_task("runner", None).unwrap()["status"], "running");
+                let mut conversation = orca_core::conversation::Conversation::new();
+                conversation.add_user("claim and retry".into());
+                runtime
+                    .checkpoint_observer
+                    .unwrap()
+                    .checkpoint(crate::child_agent_types::ChildAgentCheckpointObservation {
+                        conversation: &conversation,
+                        turn: 1,
+                        usage: orca_core::budget::BudgetUsage {
+                            turns: 1,
+                            ..Default::default()
+                        },
+                        last_tool_boundary: None,
+                    })
+                    .map_err(io::Error::other)?;
+                return Ok(ChildAgentResult {
+                    status: RunStatus::Failed,
+                    final_message: None,
+                    error: Some("provider disconnected".into()),
+                    budget_usage: None,
+                });
+            }
+            "claim and retry" => {
+                assert!(
+                    ipc.for_sender("competing child")
+                        .claim_task("runner", None)
+                        .unwrap()
+                        .is_null()
+                );
+                ipc.complete_task(
+                    "runner",
+                    "workflow-task-1",
+                    serde_json::json!("retried"),
+                    None,
+                )
+                .map_err(io::Error::other)?;
+            }
+            "claim and fail" => {
+                let task = ipc.claim_task("runner", None).map_err(io::Error::other)?;
+                assert_eq!(task["status"], "running");
+                panic!("claimant stopped unexpectedly");
+            }
+            "claim and complete" => {
+                let task = ipc.claim_task("runner", None).map_err(io::Error::other)?;
+                if let Some(id) = task["id"].as_str() {
+                    ipc.complete_task("runner", id, serde_json::json!("finished"), None)
+                        .map_err(io::Error::other)?;
+                }
+            }
+            prompt => panic!("unexpected child prompt: {prompt}"),
+        }
+        Ok(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("done".into()),
+            error: None,
+            budget_usage: None,
+        })
     }
 
     #[test]

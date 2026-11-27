@@ -101,7 +101,6 @@ impl RuntimeTurnIterationStep {
                 image_route,
                 runtime_system_messages: input.loop_state.runtime_system_messages,
                 context_config: input.provider_context.context_config,
-                base_provider_config: input.provider_context.provider_config,
                 capabilities: RuntimeStepCapabilitySnapshot::new(
                     input.deps.instructions,
                     input.deps.memory,

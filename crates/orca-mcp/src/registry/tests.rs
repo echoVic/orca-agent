@@ -219,6 +219,7 @@ fn filtered_tools_are_not_registered() {
         Arc::default(),
     )
     .expect("connect with fixed tools transport");
+    let tools = tools.tools;
     let lookup = tools
         .iter()
         .map(|tool| {
@@ -228,6 +229,7 @@ fn filtered_tools_are_not_registered() {
                     server: tool.server.clone(),
                     tool: tool.name.clone(),
                     schema_name: tool.schema_name.clone(),
+                    session_generation: None,
                 },
             )
         })
@@ -352,6 +354,7 @@ fn call_tool_or_cancel_waits_for_transport_cleanup() {
                 credentials_path: None,
                 capabilities: McpServerCapabilities::resource_capable_for_test(),
                 instructions: Mutex::default(),
+                reconnected_tools: Mutex::default(),
                 reconnect_failure: Mutex::default(),
                 stop: Arc::default(),
                 transport: Mutex::new(Arc::new(CleanupAwareTransport {
@@ -367,6 +370,7 @@ fn call_tool_or_cancel_waits_for_transport_cleanup() {
                 server: tool.server,
                 tool: tool.name,
                 schema_name: tool.schema_name,
+                session_generation: None,
             },
         )]),
         ..Default::default()
@@ -455,6 +459,7 @@ fn registry_with_call_tool_result(content: Value) -> (McpRegistry, McpToolRef) {
                 credentials_path: None,
                 capabilities: McpServerCapabilities::default(),
                 instructions: Mutex::default(),
+                reconnected_tools: Mutex::default(),
                 reconnect_failure: Mutex::default(),
                 stop: Arc::default(),
                 transport: Mutex::new(Arc::new(StaticCallToolTransport { content })),
@@ -467,6 +472,7 @@ fn registry_with_call_tool_result(content: Value) -> (McpRegistry, McpToolRef) {
                 server: tool.server,
                 tool: tool.name,
                 schema_name: tool.schema_name,
+                session_generation: None,
             },
         )]),
         ..Default::default()
@@ -1210,9 +1216,14 @@ fn cancelled_while_the_transport_is_held<T: Send>(
 /// with no content.
 struct CallCountingTransport {
     calls: Arc<AtomicUsize>,
+    generation: u64,
 }
 
 impl McpTransport for CallCountingTransport {
+    fn session_generation(&self) -> u64 {
+        self.generation
+    }
+
     fn initialize(&self) -> Result<Value, String> {
         Ok(serde_json::json!({}))
     }
@@ -1275,13 +1286,24 @@ fn a_cancellable_call_to_a_remote_server_waiting_for_the_transport_returns_when_
         },
         CallCountingTransport {
             calls: Arc::clone(&calls),
+            generation: 0,
         },
     );
 
     // A remote server's transport is never restarted before a request, so
     // its call waits for the transport only to send itself.
     let answer = cancelled_while_the_transport_is_held(&client, |should_cancel| {
-        client.call_tool("echo", serde_json::json!({}), None, Some(should_cancel))
+        client.call_tool(
+            &McpToolRef {
+                server: client.server_name.clone(),
+                tool: "echo".into(),
+                schema_name: "echo".into(),
+                session_generation: None,
+            },
+            serde_json::json!({}),
+            None,
+            Some(should_cancel),
+        )
     });
 
     assert_eq!(answer.unwrap_err(), "MCP tool call cancelled");
@@ -1290,6 +1312,35 @@ fn a_cancellable_call_to_a_remote_server_waiting_for_the_transport_returns_when_
         0,
         "the cancelled call reached the server"
     );
+}
+
+#[test]
+fn eager_calls_use_the_current_http_tool_listing() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let client = client_with(
+        McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransportKind::Http,
+            ..Default::default()
+        },
+        CallCountingTransport {
+            calls: calls.clone(),
+            generation: 2,
+        },
+    );
+    let mut tool = McpToolRef {
+        server: "remote".into(),
+        tool: "echo".into(),
+        schema_name: "mcp__remote__echo".into(),
+        session_generation: Some(1),
+    };
+    let call = |tool: &McpToolRef| client.call_tool(tool, serde_json::json!({}), None, None);
+    assert!(call(&tool).unwrap_err().contains("changed its tools"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    tool.session_generation = Some(2);
+    call(&tool).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -1303,6 +1354,7 @@ fn a_reconnect_waiting_for_the_transport_returns_when_cancelled() {
         },
         CallCountingTransport {
             calls: Arc::default(),
+            generation: 0,
         },
     );
     let failed = client.lock_transport().expect("its transport").clone();
@@ -1537,6 +1589,7 @@ fn registry_call_tool_routes_elicitation_handler_to_transport() {
                 credentials_path: None,
                 capabilities: McpServerCapabilities::default(),
                 instructions: Mutex::default(),
+                reconnected_tools: Mutex::default(),
                 reconnect_failure: Mutex::default(),
                 stop: Arc::default(),
                 transport: Mutex::new(Arc::new(ElicitingTransport)),
@@ -1549,6 +1602,7 @@ fn registry_call_tool_routes_elicitation_handler_to_transport() {
                 server: tool.server,
                 tool: tool.name,
                 schema_name: tool.schema_name,
+                session_generation: None,
             },
         )]),
         ..Default::default()
@@ -2603,6 +2657,30 @@ fn missing_server_config(name: &str, dir: &std::path::Path) -> McpServerConfig {
 
 #[cfg(unix)]
 #[test]
+fn a_server_tool_named_load_tools_is_skipped_with_a_warning() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = listing_server_config(
+        "docs",
+        temp_dir.path(),
+        r#"[{"name":"load_tools","inputSchema":{"type":"object"}},{"name":"search","inputSchema":{"type":"object"}}]"#,
+    );
+    let mut raw = serde_json::to_value(config).unwrap();
+    raw["tool_loading"] = serde_json::json!("on-demand");
+    let config = serde_json::from_value(raw).unwrap();
+    let registry = connected_registry(&[config], None);
+    assert_eq!(schema_names(&registry), ["mcp__docs__search"]);
+    assert!(
+        registry
+            .errors()
+            .iter()
+            .any(|error| error.contains("load_tools") && error.contains("skipping")),
+        "{:?}",
+        registry.errors()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn reconnecting_a_server_replaces_only_its_tools() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let first = listing_server_config(
@@ -2852,6 +2930,7 @@ fn client_with(config: McpServerConfig, transport: impl McpTransport + 'static) 
         credentials_path: None,
         capabilities: McpServerCapabilities::default(),
         instructions: Mutex::default(),
+        reconnected_tools: Mutex::default(),
         reconnect_failure: Mutex::default(),
         stop: Arc::default(),
         transport: Mutex::new(Arc::new(transport)),
@@ -2948,9 +3027,12 @@ fn a_failure_on_a_replaced_connection_does_not_mark_the_new_one() {
         let registry = Arc::downgrade(&registry.shared);
         move || {
             let shared = registry.upgrade().expect("the registry");
-            McpRegistry { shared }
-                .reconnect_server("docs")
-                .expect("reconnect the server");
+            McpRegistry {
+                shared,
+                tool_scope: Default::default(),
+            }
+            .reconnect_server("docs")
+            .expect("reconnect the server");
         }
     };
     let old = client_with(
@@ -2975,6 +3057,9 @@ fn a_failure_on_a_replaced_connection_does_not_mark_the_new_one() {
         [status("docs", McpServerState::Ready)],
         "the new connection's login works"
     );
+    let echo = registry
+        .resolve_tool("mcp__docs__echo")
+        .expect("the echo tool from the new connection");
     registry
         .call_tool(&echo, serde_json::json!({}))
         .expect("the new connection serves the next call");
@@ -3040,9 +3125,12 @@ fn a_list_cut_short_on_a_replaced_connection_is_not_noted_on_the_new_one() {
         let registry = Arc::downgrade(&registry.shared);
         move || {
             let shared = registry.upgrade().expect("the registry");
-            McpRegistry { shared }
-                .reconnect_server("docs")
-                .expect("reconnect the server");
+            McpRegistry {
+                shared,
+                tool_scope: Default::default(),
+            }
+            .reconnect_server("docs")
+            .expect("reconnect the server");
         }
     };
     let old = client_with(
@@ -4500,7 +4588,11 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"breaks","version":"1"}}}\n' "$id"
       ;;
     *'"method":"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id"
+      if [ -f "$state_dir/reconnected-tools.json" ] && [ -f "$state_dir/broke" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":%s}}\n' "$id" "$(cat "$state_dir/reconnected-tools.json")"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id"
+      fi
       ;;
     *'"method":"tools/call"'*)
       if [ -f "$state_dir/broke" ]; then
@@ -4519,6 +4611,29 @@ done
     config.args.push(dir.to_string_lossy().into_owned());
     config.tool_timeout_ms = Some(STDIO_TEST_STARTUP_TIMEOUT_MS);
     config
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restarted_on_demand_server_refreshes_its_tools_before_the_next_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = tool_server_that_breaks_once(dir.path());
+    config.tool_loading = McpToolLoading::OnDemand;
+    let registry = connected_registry(&[config], None);
+    registry
+        .load_tools("breaks", &["echo".to_string()])
+        .unwrap();
+    let echo = registry.resolve_agent_tool("mcp__breaks__echo").unwrap();
+    std::fs::write(
+        dir.path().join("reconnected-tools.json"),
+        r#"[{"name":"find","inputSchema":{"type":"object"}}]"#,
+    )
+    .unwrap();
+
+    assert!(registry.call_tool(&echo, serde_json::json!({})).is_err());
+    assert_eq!(schema_names(&registry), ["mcp__breaks__find"]);
+    assert!(registry.resolve_agent_tool("mcp__breaks__echo").is_none());
+    assert!(registry.resolve_agent_tool("mcp__breaks__find").is_none());
 }
 
 #[cfg(unix)]
@@ -4804,6 +4919,8 @@ fn a_snapshot_never_mixes_two_states_of_a_server() {
             generation: FIRST_CONNECTION,
             stop: Arc::default(),
             tools: Vec::new(),
+            tool_session_generation: None,
+            tool_warnings: Vec::new(),
             prompts: Vec::new(),
             prompts_error: None,
             errors: Vec::new(),

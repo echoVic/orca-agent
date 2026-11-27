@@ -21,6 +21,13 @@ pub struct RuntimeModelResponse {
     pub observation: Option<ProviderResponseObservation>,
     pub cut_short: Option<orca_core::conversation::CutShort>,
     pub(crate) delivered: Option<PartialReply>,
+    pub(crate) background_patch: Option<BackgroundPatchContext>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct BackgroundPatchContext {
+    pub enabled: bool,
+    pub fingerprint: Option<[u8; 32]>,
 }
 
 impl RuntimeModelResponse {
@@ -36,6 +43,7 @@ impl RuntimeModelResponse {
             observation: None,
             cut_short: None,
             delivered: None,
+            background_patch: None,
         }
     }
 

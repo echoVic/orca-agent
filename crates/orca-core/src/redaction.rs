@@ -16,7 +16,10 @@ fn redact_keyed_secret_values(value: &str) -> String {
         }
 
         let key_end = bytes[..index].trim_ascii_end().len();
-        let key_start = key_start_before_delimiter(bytes, key_end);
+        let Some(key_start) = key_start_before_delimiter(bytes, key_end) else {
+            index += 1;
+            continue;
+        };
         let key = trim_key_candidate(&value[key_start..key_end]);
         if !is_sensitive_key(key) {
             index += 1;
@@ -78,7 +81,7 @@ fn redact_keyed_secret_values(value: &str) -> String {
     output
 }
 
-fn key_start_before_delimiter(bytes: &[u8], delimiter_index: usize) -> usize {
+fn key_start_before_delimiter(bytes: &[u8], delimiter_index: usize) -> Option<usize> {
     let mut start = delimiter_index;
     while start > 0 {
         let previous = bytes[start - 1];
@@ -87,16 +90,19 @@ fn key_start_before_delimiter(bytes: &[u8], delimiter_index: usize) -> usize {
         {
             break;
         }
+        if matches!(previous, b':' | b'=') {
+            return None;
+        }
         start -= 1;
     }
-    start
+    Some(start)
 }
 
 fn trim_key_candidate(key: &str) -> &str {
     key.trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '{' | '[' | ','))
 }
 
-fn is_sensitive_key(key: &str) -> bool {
+pub(super) fn is_sensitive_key(key: &str) -> bool {
     // A key is a config, env, or JSON name. A path or a code span before a
     // colon (`auth/token.py`: …) is prose naming a file, not a credential.
     if key.is_empty()
@@ -149,11 +155,13 @@ fn key_is_in_url_query(prefix: &str) -> bool {
 }
 
 fn unquoted_value_end(bytes: &[u8], mut index: usize, url_query: bool) -> usize {
-    while index < bytes.len()
-        && !bytes[index].is_ascii_whitespace()
-        && !matches!(bytes[index], b',' | b'}' | b']' | b';')
-        && !(url_query && matches!(bytes[index], b'&' | b'#'))
-    {
+    while let Some(&byte) = bytes.get(index) {
+        if byte.is_ascii_whitespace()
+            || matches!(byte, b',' | b'}' | b']' | b';')
+            || (url_query && matches!(byte, b'&' | b'#'))
+        {
+            break;
+        }
         index += 1;
     }
     index
@@ -210,6 +218,14 @@ fn looks_like_standalone_secret(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::redact_sensitive_text;
+
+    #[test]
+    fn redaction_handles_long_punctuation_without_rescanning_it() {
+        let input = ":".repeat(65_536);
+        let started = std::time::Instant::now();
+        assert_eq!(redact_sensitive_text(&input), input);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
 
     #[test]
     fn diagnostic_redaction_covers_unquoted_authorization_values() {

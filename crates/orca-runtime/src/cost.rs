@@ -71,10 +71,20 @@ impl CostTracker {
     }
 
     pub fn add_usage(&mut self, usage: Usage) -> UsageTotals {
+        let cost = self.estimate(self.model.as_deref().unwrap_or(""), usage);
+        self.accumulate_usage(usage, cost)
+    }
+
+    pub(crate) fn add_model_usage(&mut self, model: &str, usage: Usage) -> UsageTotals {
+        let cost = self.estimate(canonical_model_name(model), usage);
+        self.accumulate_usage(usage, cost)
+    }
+
+    fn accumulate_usage(&mut self, usage: Usage, cost: f64) -> UsageTotals {
         self.totals.input_tokens += usage.input_tokens;
         self.totals.output_tokens += usage.output_tokens;
         self.totals.cache_tokens += usage.cache_tokens;
-        self.totals.estimated_cost_usd += self.estimate(usage);
+        self.totals.estimated_cost_usd += cost;
         self.totals
     }
 
@@ -90,8 +100,7 @@ impl CostTracker {
 
     /// DeepSeek bills cache-miss input, cache-hit input, and output tokens
     /// separately; peak hours double its prices, never an override's.
-    fn estimate(&self, usage: Usage) -> f64 {
-        let model = self.model.as_deref().unwrap_or("");
+    fn estimate(&self, model: &str, usage: Usage) -> f64 {
         if let Some(rates) = self.overrides.get(model) {
             return rates::cost_usd(*rates, 1.0, usage);
         }

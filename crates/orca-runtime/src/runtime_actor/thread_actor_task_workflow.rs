@@ -273,6 +273,12 @@ impl ThreadActor {
             task_id: task_id.clone(),
             usage_ledger: self.usage_ledger.clone(),
             response_identity: suspension.identity().clone(),
+            cwd: active
+                .config
+                .cwd
+                .clone()
+                .unwrap_or(std::env::current_dir()?),
+            apply_patch: active.config.tools.apply_patch,
             surface_outcome,
             surface_provider_ingress,
         };
@@ -619,9 +625,10 @@ impl ThreadActor {
                         self.resident_surface.coordinator.state().snapshot(),
                         &typed.fence,
                         response,
-                        &orca_tools::registry::tool_registry_with_mcp_and_external(
+                        &orca_tools::registry::tool_registry_for_session(
                             Some(&self.handle.mcp_registry),
                             &typed.external_tools,
+                            typed.apply_patch,
                         ),
                     )
             })

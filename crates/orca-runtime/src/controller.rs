@@ -518,10 +518,9 @@ impl<'a> ThreadTurnContext<'a> {
             config.auto_memory && !matches!(config.history_mode, HistoryMode::Disabled),
             request.prompt_placement() == ThreadTurnPromptPlacement::ExistingTurn,
         );
+        crate::skill_context::refresh_catalog(parts.conversation, &cwd);
         if request.prompt_placement() != ThreadTurnPromptPlacement::ExistingTurn {
-            parts
-                .conversation
-                .replace_skill_context(agent_common::explicit_skill_context(&cwd, &prompt));
+            parts.conversation.replace_skill_context(None);
             if let Some(note) =
                 agent_common::plan_mode_switch_note(parts.conversation, config.approval_mode)
             {
@@ -545,6 +544,12 @@ impl<'a> ThreadTurnContext<'a> {
                 writer.append_message(&message)?;
             }
             parts.conversation.messages.push(message);
+            crate::skill_context::append_mentions(
+                parts.conversation,
+                parts.writer.as_deref_mut(),
+                &cwd,
+                &prompt,
+            )?;
         }
 
         Ok(Self {
@@ -979,10 +984,8 @@ impl<'a, 'session, W: io::Write> PreparedThreadTurn<'a, 'session, W> {
     }
 }
 
-/// A turn applied writes when its transcript records a successful `edit` or
-/// `write_file` tool result. Those tools are the ones that carry a
-/// `file_change_preview`; the preview itself is not retained on the tool
-/// message, so the completed result is the durable signal.
+/// A successful file-writing tool result is the transcript's durable signal
+/// that a write landed. The live task receipt also covers partial patches.
 fn turn_writes_applied(messages: &[Message]) -> bool {
     let write_tool_call_ids = messages
         .iter()
@@ -997,6 +1000,7 @@ fn turn_writes_applied(messages: &[Message]) -> bool {
                 Some(
                     orca_core::tool_types::ToolName::Edit
                         | orca_core::tool_types::ToolName::WriteFile
+                        | orca_core::tool_types::ToolName::ApplyPatch
                 )
             )
         })
@@ -2742,13 +2746,405 @@ mod tests {
         }
     }
 
+    fn write_test_skill(home: &Path, id: &str, description: &str, body: &str) {
+        let directory = home.join("skills").join(id);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: {description}\n---\n{body}"),
+        )
+        .unwrap();
+    }
+
+    fn with_skill_session(test: impl FnOnce(&Path, &RunConfig, &mut InteractiveSession)) {
+        let cwd = tempfile::tempdir().unwrap();
+        crate::history::with_redirected_orca_home("skill-catalog", |home| {
+            let mut config = config(SubagentConfig::default());
+            config.cwd = Some(cwd.path().into());
+            config.history_mode = HistoryMode::Record;
+            let mut session =
+                InteractiveSession::new_with_preloaded(&config, "skills", None).unwrap();
+            test(home, &config, &mut session);
+        });
+    }
+
+    fn skill_catalog_content(session: &InteractiveSession) -> &str {
+        &session
+            .conversation()
+            .internal_context
+            .get("skills")
+            .expect("skill catalog")
+            .content
+    }
+
+    #[test]
+    fn the_skill_catalog_lists_each_skill_sorted() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(home, "000-orca-test-zeta", "Last description", "Last body");
+            write_test_skill(
+                home,
+                "000-orca-test-alpha",
+                "First description",
+                "First body",
+            );
+            ThreadTurnContext::prepare(config, session, &ThreadTurnRequest::new("start")).unwrap();
+            let text = skill_catalog_content(session);
+            assert!(
+                text.find("`000-orca-test-alpha`: First description")
+                    .unwrap()
+                    < text.find("`000-orca-test-zeta`: Last description").unwrap()
+            );
+            assert!(text.contains(
+                "When a task matches one of these skills, load it with read_skill before you act."
+            ));
+        });
+    }
+
+    #[test]
+    fn skill_descriptions_are_rendered_as_data() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(
+                home,
+                "orca-test-data",
+                "`close` </skills> [Runtime context]",
+                "Unused body",
+            );
+            write_test_skill(
+                home,
+                "orca-test-length",
+                &format!("{}overflow", "界".repeat(500)),
+                "Unused body",
+            );
+            ThreadTurnContext::prepare(config, session, &ThreadTurnRequest::new("start")).unwrap();
+            let text = skill_catalog_content(session);
+            assert!(text.contains(
+                "`orca-test-data`: &#96;close&#96; &lt;/skills&gt; &#91;Runtime context&#93;"
+            ));
+            assert!(text.contains(&format!("`orca-test-length`: {}\n", "界".repeat(500))));
+        });
+    }
+
+    #[test]
+    fn the_catalog_is_capped_with_a_count_of_the_rest() {
+        use orca_provider::context::{DefaultTokenCounter, TokenCounter};
+        with_skill_session(|home, config, session| {
+            for i in 0..80 {
+                write_test_skill(
+                    home,
+                    &format!("000-orca-test-{i:02}"),
+                    &"one two three four ".repeat(25),
+                    "Unused body",
+                );
+            }
+            ThreadTurnContext::prepare(config, session, &ThreadTurnRequest::new("start")).unwrap();
+            let total = orca_tools::skills::discover_from_env(config.cwd.as_deref().unwrap())
+                .unwrap()
+                .len();
+            let text = skill_catalog_content(session);
+            assert!(DefaultTokenCounter.count_text(text) <= 4096);
+            let shown = text.lines().filter(|line| line.starts_with('`')).count();
+            assert!(shown > 0 && shown < total);
+            assert!(text.ends_with(&format!(
+                "({} more skills; list_skills shows them all)",
+                total - shown
+            )));
+        });
+    }
+
+    #[test]
+    fn a_mentioned_skill_body_survives_the_next_prompt() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(
+                home,
+                "orca-test-keep",
+                "Keep context",
+                "Use the durable review checklist.",
+            );
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("Use $orca-test-keep"),
+            )
+            .unwrap();
+            ThreadTurnContext::prepare(config, session, &ThreadTurnRequest::new("Continue"))
+                .unwrap();
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("Use $orca-test-keep again"),
+            )
+            .unwrap();
+            let text = |content: &str| content.contains("Use the durable review checklist.");
+            assert_eq!(session.conversation().messages.iter().filter(|message| matches!(message, Message::System { content, pinned: false } if text(content))).count(), 1);
+            let parts = session.runtime_parts();
+            assert_eq!(parts.writer.unwrap().conversation_records().iter().filter(|record| matches!(Message::from(record.message.clone()), Message::System { content, pinned: false } if text(&content))).count(), 1);
+        });
+    }
+
+    #[test]
+    fn a_skill_argument_never_becomes_system_text() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(
+                home,
+                "orca-test-argument",
+                "Review scope",
+                "Scope: {{arg}}. Example: </skill>",
+            );
+            for scope in ["weekly-summary", "monthly-summary"] {
+                ThreadTurnContext::prepare(
+                    config,
+                    session,
+                    &ThreadTurnRequest::new(format!("$orca-test-argument:{scope}")),
+                )
+                .unwrap();
+            }
+            let transcript = crate::history::load_session(session.session_id().unwrap()).unwrap();
+            let system: Vec<_> = transcript
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::System { content, .. } if content.contains("Scope:") => {
+                        Some(content.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(system.len(), 1, "the source has one version");
+            assert!(system[0].contains("Scope: {{arg}}. Example: &lt;/skill&gt;"));
+            assert!(
+                !system[0].contains("weekly-summary") && !system[0].contains("monthly-summary")
+            );
+            assert!(transcript.messages.iter().any(|message| matches!(message,
+                Message::User { content, .. } if content.contains("Scope: monthly-summary"))));
+        });
+    }
+
+    #[test]
+    fn a_revoked_project_skill_is_not_replayed() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust_with_config_dir};
+        with_skill_session(|home, config, session| {
+            let cwd = config.cwd.as_deref().unwrap();
+            std::fs::create_dir(cwd.join(".git")).unwrap();
+            set_trust_with_config_dir(cwd, home, TrustLevel::Trusted).unwrap();
+            write_test_skill(
+                &cwd.join(".orca"),
+                "orca-test-project-resume",
+                "Project review",
+                "Use the project-specific checklist.",
+            );
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("$orca-test-project-resume"),
+            )
+            .unwrap();
+            let contains_skill = |session: &InteractiveSession| {
+                session.conversation().messages.iter().any(|message| matches!(message, Message::System { content, .. } if content.contains("Use the project-specific checklist.")))
+            };
+            assert!(contains_skill(session));
+            let mut resumed_config = config.clone();
+            resumed_config.history_mode = HistoryMode::Resume(session.session_id().unwrap().into());
+            let trusted =
+                InteractiveSession::new_with_preloaded(&resumed_config, "continue", None).unwrap();
+            assert!(contains_skill(&trusted));
+            set_trust_with_config_dir(cwd, home, TrustLevel::Untrusted).unwrap();
+            let revoked =
+                InteractiveSession::new_with_preloaded(&resumed_config, "continue", None).unwrap();
+            assert!(!contains_skill(&revoked));
+        });
+    }
+
+    #[test]
+    fn resuming_from_an_untrusted_subfolder_omits_project_skill_mentions() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust_with_config_dir};
+        with_skill_session(|home, config, session| {
+            let cwd = config.cwd.as_deref().unwrap();
+            std::fs::create_dir(cwd.join(".git")).unwrap();
+            let nested = cwd.join("nested");
+            std::fs::create_dir(&nested).unwrap();
+            set_trust_with_config_dir(cwd, home, TrustLevel::Trusted).unwrap();
+            set_trust_with_config_dir(&nested, home, TrustLevel::Untrusted).unwrap();
+            let skill_body = "Check the project-specific scope: {{arg}}.";
+            write_test_skill(
+                &cwd.join(".orca"),
+                "project-review",
+                "Project review",
+                skill_body,
+            );
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("$project-review:weekly"),
+            )
+            .unwrap();
+            let has_skill = |conversation: &Conversation| {
+                conversation.messages.iter().any(|message| {
+                    message
+                        .content_str()
+                        .is_some_and(|text| text.contains("Check the project-specific scope"))
+                })
+            };
+            assert!(has_skill(session.conversation()));
+            let id = session.session_id().unwrap();
+            let transcript = crate::history::load_session(id).unwrap();
+            let boundary = session
+                .conversation_records()
+                .unwrap()
+                .last()
+                .unwrap()
+                .item_id
+                .as_ref()
+                .unwrap()
+                .to_string();
+            let mut resumed_config = config.clone();
+            resumed_config.cwd = Some(nested.clone());
+            for mode in [
+                HistoryMode::Resume(id.into()),
+                HistoryMode::ResumeAt {
+                    selector: id.into(),
+                    resume_at: boundary.clone(),
+                },
+                HistoryMode::Fork(id.into()),
+            ] {
+                resumed_config.history_mode = mode;
+                let resumed = InteractiveSession::new_with_preloaded(
+                    &resumed_config,
+                    "continue",
+                    Some(transcript.clone()),
+                )
+                .unwrap();
+                assert!(!has_skill(resumed.conversation()));
+            }
+            let one_shot = crate::session::bootstrap_agent_conversation(
+                Some(&transcript),
+                "System".into(),
+                &nested,
+                "Continue",
+            );
+            assert!(!has_skill(&one_shot));
+        });
+    }
+
+    #[test]
+    fn a_skill_body_is_restored_with_the_session() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(
+                home,
+                "orca-test-resume",
+                "Resume context",
+                "Follow the saved checklist.",
+            );
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("Use $orca-test-resume"),
+            )
+            .unwrap();
+            let mut resumed_config = config.clone();
+            resumed_config.history_mode =
+                HistoryMode::Resume(session.session_id().unwrap().to_string());
+            let resumed =
+                InteractiveSession::new_with_preloaded(&resumed_config, "continue", None).unwrap();
+            assert!(resumed.conversation().messages.iter().any(|message| matches!(message, Message::System { content, .. } if content.contains("Follow the saved checklist."))));
+        });
+    }
+
+    #[test]
+    fn a_skill_body_is_rewound_with_its_prompt() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(
+                home,
+                "orca-test-rewind",
+                "Rewind context",
+                "Follow the rewind checklist.",
+            );
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("Use $orca-test-rewind"),
+            )
+            .unwrap();
+            let mut conversation = session.conversation().clone();
+            assert!(conversation.messages.iter().any(|message| matches!(message, Message::System { content, .. } if content.contains("Follow the rewind checklist."))));
+            assert_eq!(
+                conversation.backtrack_last_user().as_deref(),
+                Some("Use $orca-test-rewind")
+            );
+            assert_eq!(conversation.messages.len(), 1);
+        });
+    }
+
+    #[test]
+    fn saved_rewind_ordinals_count_only_submitted_prompts() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(home, "review", "Review context", "Review {{arg}}.");
+            for prompt in ["$review:permissions", "Continue"] {
+                ThreadTurnContext::prepare(config, session, &ThreadTurnRequest::new(prompt))
+                    .unwrap();
+            }
+            let path = session.runtime_parts().writer.unwrap().path().to_path_buf();
+            let entries = crate::thread_store::read_effective_user_messages(&path).unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.prompt.as_str())
+                    .collect::<Vec<_>>(),
+                ["$review:permissions", "Continue"]
+            );
+            let cut =
+                crate::thread_store::read_transcript_before_message(&path, &entries[1].message_id)
+                    .unwrap();
+            assert_eq!(cut.ordinal, 1);
+            let transcript = crate::history::load_session(session.session_id().unwrap()).unwrap();
+            let mut resumed = crate::history::resume_conversation(&transcript, "System".into());
+            assert_eq!(
+                resumed.truncate_before_user_ordinal(1).as_deref(),
+                Some("Continue")
+            );
+        });
+    }
+
+    #[test]
+    fn a_long_skill_body_says_where_the_rest_is() {
+        use orca_provider::context::{DefaultTokenCounter, TokenCounter};
+        with_skill_session(|home, config, session| {
+            write_test_skill(
+                home,
+                "orca-test-long",
+                "Long guide",
+                &format!("{}Final paragraph", "step by step ".repeat(3_000)),
+            );
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("Use $orca-test-long"),
+            )
+            .unwrap();
+            let body = session
+                .conversation()
+                .messages
+                .iter()
+                .find_map(|message| match message {
+                    Message::System { content, .. } if content.contains("step by step") => {
+                        Some(content)
+                    }
+                    _ => None,
+                })
+                .expect("mentioned body in history");
+            assert!(DefaultTokenCounter.count_text(body) <= 4096);
+            assert!(body.ends_with(
+                "[skill text cut at 4096 tokens; read_skill orca-test-long shows the rest]"
+            ));
+            assert!(!body.contains("Final paragraph"));
+        });
+    }
+
     #[cfg(unix)]
     fn delayed_mcp_server(
         dir: &std::path::Path,
         delay: u32,
         tool_count: usize,
     ) -> orca_core::mcp_types::McpServerConfig {
-        let path = dir.join("catalog.sh");
         let tools = (0..tool_count)
             .map(|i| {
                 serde_json::json!({
@@ -2756,6 +3152,16 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+        delayed_mcp_server_with_tools(dir, delay, tools)
+    }
+
+    #[cfg(unix)]
+    fn delayed_mcp_server_with_tools(
+        dir: &Path,
+        delay: u32,
+        tools: Vec<serde_json::Value>,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let path = dir.join("catalog.sh");
         std::fs::write(&path, format!(r#"
 while IFS= read -r line; do
   case "$line" in
@@ -2974,6 +3380,649 @@ while IFS= read -r line; do
             }
             assert!(sent.contains("mcp__zz_external__lookup"));
         }
+    }
+
+    #[cfg(unix)]
+    fn mcp_loading_mode(
+        server: orca_core::mcp_types::McpServerConfig,
+        mode: &str,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let mut raw = serde_json::to_value(server).unwrap();
+        raw["tool_loading"] = serde_json::json!(mode);
+        serde_json::from_value(raw).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn mcp_only_names(request: &serde_json::Value) -> Vec<&str> {
+        request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .filter(|name| name.starts_with("mcp__catalog__"))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn run_mcp_test_prompt(config: &RunConfig, session: &mut InteractiveSession) {
+        assert_eq!(
+            run_thread_turn_to_writer(
+                config,
+                session,
+                &mut RuntimeSessionLifecycle::new("mcp-catalog-test"),
+                "Find a record",
+                io::sink(),
+                ControllerRunOptions::default(),
+            )
+            .unwrap(),
+            RunStatus::Success
+        );
+    }
+
+    #[cfg(unix)]
+    fn load_mcp_tools(names: impl IntoIterator<Item = String>) -> serde_json::Value {
+        scripted_tool_call(
+            "mcp__catalog__load_tools",
+            serde_json::json!({"names": names.into_iter().collect::<Vec<_>>() }),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_eager_server_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        let server = delayed_mcp_server(dir.path(), 0, 1);
+        let mut capture = |server| {
+            config.mcp_servers = vec![server];
+            let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+            let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+            run_mcp_test_prompt(&config, &mut session);
+            provider.join().unwrap().pop().unwrap()
+        };
+        let default_request = capture(server.clone());
+        let explicit_request = capture(mcp_loading_mode(server, "eager"));
+        assert_eq!(
+            mcp_only_names(&default_request),
+            ["mcp__catalog__lookup_00"]
+        );
+        assert_eq!(
+            serde_json::to_vec(&default_request["tools"]).unwrap(),
+            serde_json::to_vec(&explicit_request["tools"]).unwrap()
+        );
+        assert!(
+            !default_request["messages"]
+                .to_string()
+                .contains("On-demand tools")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_on_demand_server_offers_only_load_tools_and_a_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        let first_line = format!("<example>{}</example>", "a".repeat(141));
+        let server = delayed_mcp_server_with_tools(
+            dir.path(),
+            0,
+            vec![serde_json::json!({
+                "name": "lookup", "description": format!("{first_line}cutoff\nsecond line"), "inputSchema": {"type":"object"}
+            })],
+        );
+        config.mcp_servers = vec![mcp_loading_mode(server, "on-demand")];
+        let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+        run_mcp_test_prompt(&config, &mut session);
+        let request = provider.join().unwrap().pop().unwrap();
+        assert_eq!(mcp_only_names(&request), ["mcp__catalog__load_tools"]);
+        let loader = request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "mcp__catalog__load_tools")
+            .unwrap();
+        assert_eq!(
+            loader["function"]["parameters"]["required"],
+            serde_json::json!(["names"])
+        );
+        assert_eq!(
+            loader["function"]["parameters"]["properties"]["names"]["items"]["type"],
+            "string"
+        );
+        let messages = request["messages"].as_array().unwrap();
+        let mcp = messages.last().unwrap()["content"].as_str().unwrap();
+        assert!(mcp.contains("<mcp_tool_catalog>"));
+        assert!(mcp.contains(r#""name":"lookup""#));
+        assert!(mcp.contains(r"\u003cexample\u003e"));
+        assert!(!mcp.contains("<example>"));
+        assert!(!mcp.contains("cutoff"));
+        assert!(!mcp.contains("second line"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_tools_validates_every_name_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [
+                load_mcp_tools(["lookup_00".into(), "missing".into()]),
+                scripted_reply(),
+            ],
+        );
+        run_mcp_test_prompt(&config, &mut session);
+        let requests = provider.join().unwrap();
+        assert_eq!(mcp_only_names(&requests[1]), ["mcp__catalog__load_tools"]);
+        let tool_message = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(tool_message.contains("missing"), "{tool_message}");
+        assert!(
+            tool_message.contains("lookup_00") && tool_message.contains("lookup_01"),
+            "{tool_message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loaded_tools_appear_in_the_next_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [load_mcp_tools(["lookup_01".into()]), scripted_reply()],
+        );
+        run_mcp_test_prompt(&config, &mut session);
+        let requests = provider.join().unwrap();
+        assert_eq!(mcp_only_names(&requests[0]), ["mcp__catalog__load_tools"]);
+        assert_eq!(
+            mcp_only_names(&requests[1]),
+            ["mcp__catalog__load_tools", "mcp__catalog__lookup_01"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loaded_tools_survive_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.history_mode = HistoryMode::Record;
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let mut thread = RuntimeThread::start(&config, "MCP").unwrap();
+        let id = thread.session().session_id().unwrap().to_string();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [load_mcp_tools(["lookup_01".into()]), scripted_reply()],
+        );
+        assert_eq!(
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("Find a record"),
+                    io::sink()
+                )
+                .unwrap(),
+            RunStatus::Success
+        );
+        provider.join().unwrap();
+        let transcript = crate::history::load_session(&id).unwrap();
+        assert!(
+            !transcript
+                .meta
+                .additional_fields
+                .contains_key("loaded_mcp_tools")
+        );
+        drop(thread);
+        config.history_mode = HistoryMode::Resume(id);
+        let mut resumed = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+        run_mcp_test_prompt(&config, &mut resumed);
+        let requests = provider.join().unwrap();
+        assert_eq!(
+            mcp_only_names(&requests[0]),
+            ["mcp__catalog__load_tools", "mcp__catalog__lookup_01"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_at_an_earlier_message_drops_later_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.history_mode = HistoryMode::Record;
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let mut thread = RuntimeThread::start(&config, "MCP").unwrap();
+        let id = thread.session().session_id().unwrap().to_string();
+        let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+        assert_eq!(
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("Find a record"),
+                    io::sink()
+                )
+                .unwrap(),
+            RunStatus::Success
+        );
+        provider.join().unwrap();
+        let boundary = thread
+            .session()
+            .conversation_records()
+            .unwrap()
+            .last()
+            .unwrap()
+            .item_id
+            .clone()
+            .unwrap();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [load_mcp_tools(["lookup_01".into()]), scripted_reply()],
+        );
+        assert_eq!(
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("Find a record"),
+                    io::sink()
+                )
+                .unwrap(),
+            RunStatus::Success
+        );
+        provider.join().unwrap();
+        drop(thread);
+        config.history_mode = HistoryMode::ResumeAt {
+            selector: id,
+            resume_at: boundary.to_string(),
+        };
+        let mut resumed = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+        run_mcp_test_prompt(&config, &mut resumed);
+        let requests = provider.join().unwrap();
+        assert_eq!(mcp_only_names(&requests[0]), ["mcp__catalog__load_tools"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_custom_agent_can_use_an_explicit_mcp_tool_without_its_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let mut request = crate::child_agent_types::ChildAgentRequest::new(
+            "Find a record".into(),
+            SubagentType::Custom("lookup".into()),
+            None,
+            1,
+            false,
+        );
+        let tool = "mcp__catalog__lookup_01";
+        request.allowed_tools = Some(vec![tool.into()]);
+        let setup = crate::child_agent_loop_setup::prepare_child_agent_loop(
+            &config,
+            &request,
+            dir.path(),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+        );
+        let names: Vec<_> = setup
+            .provider_config
+            .tools_override
+            .unwrap()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(names, [tool]);
+        assert!(setup.mcp_registry.resolve_agent_tool(tool).is_some());
+        assert!(
+            setup
+                .mcp_registry
+                .resolve_agent_tool("mcp__catalog__lookup_00")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subagents_start_with_nothing_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let mut parent = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [load_mcp_tools(["lookup_01".into()]), scripted_reply()],
+        );
+        run_mcp_test_prompt(&config, &mut parent);
+        let requests = provider.join().unwrap();
+        assert!(mcp_only_names(&requests[1]).contains(&"mcp__catalog__lookup_01"));
+        let mut request = crate::child_agent_types::ChildAgentRequest::new(
+            "Find a record".into(),
+            SubagentType::General,
+            None,
+            1,
+            false,
+        );
+        request.allowed_tools = Some(vec![
+            "mcp__catalog__load_tools".into(),
+            "mcp__catalog__lookup_01".into(),
+        ]);
+        let setup = crate::child_agent_loop_setup::prepare_child_agent_loop(
+            &config,
+            &request,
+            dir.path(),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+        );
+        let names: Vec<_> = setup
+            .provider_config
+            .tools_override
+            .unwrap()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(names.iter().any(|name| name == "mcp__catalog__load_tools"));
+        assert!(!names.iter().any(|name| name == "mcp__catalog__lookup_01"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnect_keeps_only_offered_loaded_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let registry = orca_mcp::initialize_registry(&config.mcp_servers, None);
+        let mut session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+            &config,
+            "MCP",
+            None,
+            registry.clone(),
+        )
+        .unwrap();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [
+                load_mcp_tools(["lookup_00".into(), "lookup_01".into()]),
+                scripted_reply(),
+            ],
+        );
+        run_mcp_test_prompt(&config, &mut session);
+        let requests = provider.join().unwrap();
+        assert!(mcp_only_names(&requests[1]).contains(&"mcp__catalog__lookup_01"));
+        for offered in [
+            vec!["lookup_00", "new_tool"],
+            vec!["lookup_00", "lookup_01"],
+        ] {
+            delayed_mcp_server_with_tools(
+                dir.path(),
+                0,
+                offered
+                    .iter()
+                    .map(|name| serde_json::json!({"name": name,"inputSchema":{"type":"object"}}))
+                    .collect(),
+            );
+            registry.reconnect_server("catalog").unwrap();
+            let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+            run_mcp_test_prompt(&config, &mut session);
+            let requests = provider.join().unwrap();
+            assert_eq!(
+                mcp_only_names(&requests[0]),
+                ["mcp__catalog__load_tools", "mcp__catalog__lookup_00"]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_mcp_request_refreshes_after_loading_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let provider = serve_scripted_provider(
+            &mut config,
+            [load_mcp_tools(["lookup_01".into()]), scripted_reply()],
+        );
+        let mut child = crate::child_agent_types::ChildAgentRequest::new(
+            "Find a record".into(),
+            SubagentType::General,
+            None,
+            1,
+            false,
+        );
+        child.allowed_tools = Some(vec![
+            "mcp__catalog__load_tools".into(),
+            "mcp__catalog__lookup_01".into(),
+        ]);
+        use crate::agent_child::{ChildAgentLoopContext, run_child_agent_loop_with_tool_executor};
+        let result = run_child_agent_loop_with_tool_executor(
+            &config,
+            ChildAgentLoopContext {
+                request: &child,
+                cwd: dir.path(),
+                instructions: &ProjectInstructions::default(),
+                memory: &MemoryBlock::default(),
+                hooks: &HookRunner::new(Vec::new()),
+                child_cost_tracker: &mut CostTracker::new(None),
+                lease: None,
+            },
+            |context, _, request| {
+                let result =
+                    orca_tools::execute_with_mcp(request, dir.path(), context.mcp_registry);
+                assert_eq!(
+                    result.status,
+                    tool_types::ToolStatus::Completed,
+                    "{result:?}"
+                );
+                crate::agent_child::ChildAgentToolExecution {
+                    should_stop: false,
+                    result,
+                    child_cost: None,
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(result.status, RunStatus::Success);
+        let requests = provider.join().unwrap();
+        assert_eq!(mcp_only_names(&requests[0]), ["mcp__catalog__load_tools"]);
+        assert_eq!(
+            mcp_only_names(&requests[1]),
+            ["mcp__catalog__load_tools", "mcp__catalog__lookup_01"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_large_mcp_catalog_explains_how_to_list_omitted_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        let tools = (0..120).map(|i| serde_json::json!({
+            "name": format!("lookup_{i:03}"), "description": "one two three four ".repeat(15), "inputSchema": {"type":"object"}
+        })).collect();
+        let big = delayed_mcp_server_with_tools(dir.path(), 0, tools);
+        let other_dir = tempfile::tempdir().unwrap();
+        let mut other = delayed_mcp_server(other_dir.path(), 0, 2);
+        other.name = "other".into();
+        config.mcp_servers = vec![
+            mcp_loading_mode(big, "on-demand"),
+            mcp_loading_mode(other, "on-demand"),
+        ];
+        let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let provider = serve_scripted_provider(
+            &mut config,
+            [
+                scripted_tool_call("mcp__other__load_tools", serde_json::json!({"names": []})),
+                scripted_reply(),
+            ],
+        );
+        run_mcp_test_prompt(&config, &mut session);
+        let requests = provider.join().unwrap();
+        let catalog = requests[0]["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(catalog.contains("MCP catalog shortened"));
+        assert!(catalog.contains("mcp__catalog__load_tools"));
+        assert!(catalog.contains("mcp__other__load_tools"));
+        use orca_provider::context::{DefaultTokenCounter, TokenCounter};
+        assert!(
+            DefaultTokenCounter.count_text(catalog)
+                <= orca_core::conversation::MCP_CONTEXT_MAX_TOKENS
+        );
+        let reply = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            reply.contains("lookup_00") && reply.contains("lookup_01"),
+            "{reply}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loaded_tools_respect_the_tool_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        let tools = (0..135)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("aaa_{i:03}"), "inputSchema": {"type":"object"}
+                })
+            })
+            .collect();
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server_with_tools(dir.path(), 0, tools),
+            "on-demand",
+        )];
+        let mut session = InteractiveSession::new_with_preloaded(&config, "MCP", None).unwrap();
+        let warnings = crate::mcp_startup::McpStartupWarnings::watch(session.mcp_registry(), 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        warnings.on_tool_limit(move |warnings| send.send(warnings).unwrap());
+        session
+            .runtime_extensions("mcp-catalog-test")
+            .insert(warnings);
+        let provider = serve_scripted_provider(
+            &mut config,
+            [
+                load_mcp_tools((0..135).map(|i| format!("aaa_{i:03}"))),
+                scripted_reply(),
+            ],
+        );
+        run_mcp_test_prompt(&config, &mut session);
+        let requests = provider.join().unwrap();
+        assert_eq!(mcp_only_names(&requests[0]), ["mcp__catalog__load_tools"]);
+        assert_eq!(requests[1]["tools"].as_array().unwrap().len(), 128);
+        let sent = mcp_only_names(&requests[1]);
+        assert!(sent.contains(&"mcp__catalog__load_tools"));
+        let reply = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        let (available, unavailable) = reply
+            .split_once('\n')
+            .expect("loader reports both outcomes");
+        let available = available
+            .split_once(": ")
+            .unwrap()
+            .1
+            .split(", ")
+            .collect::<Vec<_>>();
+        let unavailable = unavailable
+            .split_once(": ")
+            .unwrap()
+            .1
+            .split(", ")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            available,
+            sent.iter()
+                .filter_map(|name| name.strip_prefix("mcp__catalog__"))
+                .filter(|name| *name != "load_tools")
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(available.len() + unavailable.len(), 135);
+        let mut dropped = session
+            .mcp_registry()
+            .tools()
+            .into_iter()
+            .map(|tool| tool.schema_name)
+            .filter(|name| !sent.contains(&name.as_str()))
+            .collect::<Vec<_>>();
+        dropped.sort_unstable();
+        let detail = format!(
+            "left out {} tools: {}",
+            dropped.len(),
+            dropped[..3].join(", ")
+        );
+        let reports = receive.try_iter().flatten().collect::<Vec<_>>();
+        assert!(
+            reports.iter().any(|warning| warning.contains(&detail)),
+            "{reports:?}"
+        );
     }
 
     #[test]
@@ -3522,9 +4571,9 @@ while IFS= read -r line; do
         serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})
     }
 
-    fn serve_scripted_provider<const N: usize>(
+    fn serve_scripted_provider(
         config: &mut RunConfig,
-        responses: [serde_json::Value; N],
+        responses: impl IntoIterator<Item = serde_json::Value>,
     ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
@@ -3532,6 +4581,7 @@ while IFS= read -r line; do
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
+        let responses = responses.into_iter().collect::<Vec<_>>();
         let provider = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let mut received = Vec::new();
@@ -3579,6 +4629,225 @@ while IFS= read -r line; do
         config.api_key = Some("test-only".into());
         config.base_url = Some(format!("http://{address}"));
         provider
+    }
+
+    fn assert_steer_reaches_waiting_parent(use_task_wait: bool, inputs: &[&'static str]) {
+        use orca_core::event_schema::{EventEnvelope, EventType};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut thread = RuntimeThread::start(&config, "wait for a child").unwrap();
+        let registry = thread.session().task_registry().clone();
+        let root = registry.create_main_session("root".into());
+        let child = registry.create_subagent_with_parent(
+            "long-running child".into(),
+            None,
+            Some(root.id.clone()),
+        );
+        registry.mark_running(&child.id).unwrap();
+        let first_response = if use_task_wait {
+            scripted_tool_call("task_wait", serde_json::json!({"task_ids": [&child.id]}))
+        } else {
+            scripted_reply()
+        };
+        let provider = serve_scripted_provider(&mut config, [first_response, scripted_reply()]);
+        let steer = ThreadSteerHandle::default();
+        let (entered, wait_entered) = std::sync::mpsc::sync_channel(1);
+        let (resume, wait_resume) = std::sync::mpsc::channel();
+        steer.probe_next_wait(entered, wait_resume);
+        let (responses, observed) = std::sync::mpsc::channel();
+        let child_finished_before_answer = std::thread::scope(|scope| {
+            let worker_steer = steer.clone();
+            let worker_registry = registry.clone();
+            let child_id = child.id.clone();
+            let worker = scope.spawn(move || {
+                wait_entered.recv_timeout(Duration::from_secs(5)).unwrap();
+                for &text in inputs {
+                    assert!(worker_steer.push(text));
+                }
+                resume.send(()).unwrap();
+                let timed_out = observed.recv_timeout(Duration::from_secs(3)).is_err();
+                worker_registry
+                    .complete(&child_id, "child done".into())
+                    .unwrap();
+                timed_out
+            });
+            let response_count = AtomicUsize::new(0);
+            let request = ThreadTurnRequest::new("wait for a child")
+                .with_root_task_id(root.id)
+                .with_steer_handle(steer.clone())
+                .with_event_observer(Arc::new(move |event: &EventEnvelope| {
+                    if event.event_type == EventType::ModelResponseCompleted
+                        && response_count.fetch_add(1, Ordering::Relaxed) == 1
+                    {
+                        let _ = responses.send(());
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        while registry.get(&child.id).unwrap().status.is_active() {
+                            assert!(std::time::Instant::now() < deadline);
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    Ok(())
+                }));
+            let result = thread.run_request(&config, &request, io::sink());
+            let timed_out = worker.join().unwrap();
+            assert_eq!(result.unwrap(), RunStatus::Success);
+            timed_out
+        });
+        let received = provider.join().unwrap();
+        let messages = received[1]["messages"].as_array().unwrap();
+        let user_inputs = messages
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(user_inputs, [&["wait for a child"][..], inputs].concat());
+        if use_task_wait {
+            let result = messages
+                .iter()
+                .position(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"] == "shell-test"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("steer_pending"))
+                })
+                .expect("wait result must settle before steering");
+            let first_steer = messages
+                .iter()
+                .position(|message| message["role"] == "user" && message["content"] == inputs[0])
+                .unwrap();
+            assert!(result < first_steer);
+        }
+        assert!(
+            !child_finished_before_answer,
+            "the parent answered only after the child finished"
+        );
+    }
+
+    #[test]
+    fn a_steer_during_task_wait_is_answered_before_the_child_finishes() {
+        assert_steer_reaches_waiting_parent(true, &["answer this while the child runs"]);
+    }
+
+    #[test]
+    fn a_steer_during_the_end_of_turn_child_wait_is_answered() {
+        assert_steer_reaches_waiting_parent(false, &["answer this while the child runs"]);
+    }
+
+    #[test]
+    fn two_steers_during_a_wait_are_answered_in_order() {
+        assert_steer_reaches_waiting_parent(true, &["first steer", "second steer"]);
+    }
+
+    #[test]
+    fn a_steer_outside_a_wait_is_unchanged() {
+        use orca_core::event_schema::{EventEnvelope, EventType};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        let provider = serve_scripted_provider(&mut config, [scripted_reply(), scripted_reply()]);
+        let mut thread = RuntimeThread::start(&config, "reply without waiting").unwrap();
+        let steer = ThreadSteerHandle::default();
+        let replies = AtomicUsize::new(0);
+        let request = ThreadTurnRequest::new("reply without waiting")
+            .with_steer_handle(steer.clone())
+            .with_event_observer(Arc::new(move |event: &EventEnvelope| {
+                if event.event_type == EventType::ModelResponseCompleted
+                    && replies.fetch_add(1, Ordering::Relaxed) == 0
+                {
+                    assert!(steer.push("one more thing"));
+                }
+                Ok(())
+            }));
+        assert_eq!(
+            thread.run_request(&config, &request, io::sink()).unwrap(),
+            RunStatus::Success
+        );
+        let received = provider.join().unwrap();
+        assert!(
+            received[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "user" && message["content"] == "one more thing"
+                })
+        );
+    }
+
+    #[test]
+    fn an_ended_reply_receives_each_child_result_as_it_arrives() {
+        use orca_core::event_schema::{EventEnvelope, EventType};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        let mut thread = RuntimeThread::start(&config, "collect child results").unwrap();
+        let registry = thread.session().task_registry().clone();
+        let root = registry.create_main_session("root".into());
+        let [first, second] = ["first result", "second result"].map(|label| {
+            let child =
+                registry.create_subagent_with_parent(label.into(), None, Some(root.id.clone()));
+            registry.mark_running(&child.id).unwrap();
+            registry.mark_subagent_result_pending(&child.id);
+            child.id
+        });
+        let provider = serve_scripted_provider(
+            &mut config,
+            std::array::from_fn::<_, 3, _>(|_| scripted_reply()),
+        );
+        let (responses, observed) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                observed.recv_timeout(Duration::from_secs(5)).unwrap();
+                registry
+                    .complete(&first, "first child done".into())
+                    .unwrap();
+                let resumed = observed.recv_timeout(Duration::from_secs(2)).is_ok();
+                registry
+                    .complete(&second, "second child done".into())
+                    .unwrap();
+                resumed
+            });
+            let request = ThreadTurnRequest::new("collect child results")
+                .with_root_task_id(root.id)
+                .with_event_observer(Arc::new(move |event: &EventEnvelope| {
+                    if event.event_type == EventType::ModelResponseCompleted {
+                        let _ = responses.send(());
+                    }
+                    Ok(())
+                }));
+            assert_eq!(
+                thread.run_request(&config, &request, io::sink()).unwrap(),
+                RunStatus::Success
+            );
+            assert!(
+                worker.join().unwrap(),
+                "the first result waited for the second child"
+            );
+        });
+        let received = provider.join().unwrap();
+        let notice_count = |request: &serde_json::Value, text: &str| {
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message["role"] == "system"
+                        && message["content"].as_str().is_some_and(|content| {
+                            content.starts_with("<task-notification>") && content.contains(text)
+                        })
+                })
+                .count()
+        };
+        assert_eq!(notice_count(&received[1], "first child done"), 1);
+        assert_eq!(notice_count(&received[1], "second child done"), 0);
+        assert_eq!(notice_count(&received[2], "first child done"), 1);
+        assert_eq!(notice_count(&received[2], "second child done"), 1);
     }
 
     #[test]
@@ -5513,6 +6782,7 @@ while IFS= read -r line; do
         let cancel = CancelToken::new();
         let results = crate::runtime_readonly_tool_turn::execute_readonly_batch(
             crate::runtime_readonly_tool_turn::RuntimeReadonlyBatchContext {
+                spill_directory: None,
                 cwd: dir.path(),
                 events: &mut events,
                 sink: &mut sink,
@@ -5523,6 +6793,7 @@ while IFS= read -r line; do
                 cancel: &cancel,
                 output_truncation: tool_types::ToolOutputTruncation::default(),
                 max_parallel: 2,
+                network: None,
                 provider_response_ingress: None,
             },
         )
@@ -5709,6 +6980,7 @@ while IFS= read -r line; do
             sink: &mut sink,
             tool_request: &request,
             invocation: &invocation,
+            prepared_patch: None,
             turn_store: None,
             policy: &policy,
             permission_overlay: &mut permission_overlay,
@@ -5755,6 +7027,7 @@ while IFS= read -r line; do
                 events: &mut events,
                 sink: &mut sink,
                 execution_request: &request,
+                prepared_patch: None,
                 goal_mode: false,
                 headless: false,
                 subagent_depth: 0,
@@ -5765,6 +7038,7 @@ while IFS= read -r line; do
                 emit_deltas: true,
                 cost_tracker: &mut cost_tracker,
                 cancel: &cancel,
+                steer_handle: None,
                 task_registry: &task_registry,
                 background_workflows: &mut background_workflows,
                 workflow_ipc: None,
@@ -5830,6 +7104,7 @@ while IFS= read -r line; do
                     events: &mut events,
                     sink: &mut sink,
                     execution_request: request,
+                    prepared_patch: None,
                     goal_mode: false,
                     headless: false,
                     subagent_depth: 0,
@@ -5840,6 +7115,7 @@ while IFS= read -r line; do
                     emit_deltas: false,
                     cost_tracker: &mut cost_tracker,
                     cancel: &cancel,
+                    steer_handle: None,
                     task_registry: &task_registry,
                     background_workflows: &mut background_workflows,
                     workflow_ipc: None,

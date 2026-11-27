@@ -1264,6 +1264,7 @@ fn map_acp_mcp_server(server: McpServer) -> Result<McpServerConfig, String> {
                 oauth_callback_port: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                tool_loading: Default::default(),
             })
         }
         McpServer::Sse(server) => {
@@ -1318,6 +1319,7 @@ fn map_acp_mcp_server(server: McpServer) -> Result<McpServerConfig, String> {
                 oauth_callback_port: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                tool_loading: Default::default(),
             })
         }
         McpServer::Http(server) => Err(format!(

@@ -19,7 +19,10 @@ use serde_json::Value;
 use orca_core::capability::CapabilitySet;
 use orca_core::execution_broker::{ExecutionBroker, LaunchError};
 use orca_core::retained_output::{RetainedOutput, RetainedOutputSnapshot};
+use orca_platform::fs::{AtomicWritePolicy, atomic_write};
 use orca_platform::process::ProcessJob;
+
+use super::ipc::WorkflowIpcContext;
 
 const MAX_WORKFLOW_HOST_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKFLOW_HOST_EVENTS: usize = 8_192;
@@ -78,23 +81,29 @@ pub struct WorkflowHostIpcPaths {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct WorkflowHostRunPolicy {
+struct WorkflowHostRunPolicy<'a> {
     collect_events: bool,
     max_agent_workers: usize,
+    workflow_ipc: Option<&'a WorkflowIpcContext>,
 }
 
-impl WorkflowHostRunPolicy {
+impl<'a> WorkflowHostRunPolicy<'a> {
     fn collecting() -> Self {
         Self {
             collect_events: true,
             max_agent_workers: DEFAULT_WORKFLOW_HOST_AGENT_WORKERS,
+            workflow_ipc: None,
         }
     }
 
-    fn callback_only(max_agent_workers: usize) -> Self {
+    fn callback_only(
+        max_agent_workers: usize,
+        workflow_ipc: Option<&'a WorkflowIpcContext>,
+    ) -> Self {
         Self {
             collect_events: false,
             max_agent_workers: max_agent_workers.max(1),
+            workflow_ipc,
         }
     }
 }
@@ -239,7 +248,7 @@ impl WorkflowHost {
     pub(crate) fn run_with_agent_event_control_and_ipc_paths<F, E, C, A>(
         script_path: &Path,
         args: Value,
-        ipc_paths: &WorkflowHostIpcPaths,
+        (ipc_paths, workflow_ipc): (&WorkflowHostIpcPaths, &WorkflowIpcContext),
         max_agent_workers: usize,
         on_agent_call: F,
         on_event: E,
@@ -257,7 +266,7 @@ impl WorkflowHost {
             script_path,
             args,
             Some(ipc_paths),
-            WorkflowHostRunPolicy::callback_only(max_agent_workers),
+            WorkflowHostRunPolicy::callback_only(max_agent_workers, Some(workflow_ipc)),
             on_agent_call,
             on_event,
             should_cancel,
@@ -271,7 +280,7 @@ impl WorkflowHost {
         script_path: &Path,
         args: Value,
         ipc_paths: Option<&WorkflowHostIpcPaths>,
-        policy: WorkflowHostRunPolicy,
+        policy: WorkflowHostRunPolicy<'_>,
         on_agent_call: F,
         mut on_event: E,
         should_cancel: C,
@@ -285,6 +294,19 @@ impl WorkflowHost {
     {
         let host_path = ensure_host_file()?;
         let _host_file = WorkflowHostFileGuard::new(host_path.clone());
+        let replies = tempfile::Builder::new()
+            .prefix("orca-workflow-replies-")
+            .tempdir()?;
+        let task_list_reply = node_entry_path(replies.path().to_path_buf()).join("task-list.json");
+        let workflow_ipc = match policy.workflow_ipc {
+            Some(ipc) => ipc.clone(),
+            None => match ipc_paths {
+                Some(paths) => {
+                    WorkflowIpcContext::new_durable_task_lists(paths.task_lists_path.clone())?
+                }
+                None => WorkflowIpcContext::new(),
+            },
+        };
         let args_json = serialize_bounded_json(
             &args,
             MAX_WORKFLOW_HOST_FRAME_BYTES,
@@ -299,21 +321,20 @@ impl WorkflowHost {
             &host_path,
             script_path,
             ipc_paths,
+            Some(&task_list_reply),
         ));
         orca_platform::process::remove_credential_env(&mut command);
         command.arg(&host_path).arg(script_path).arg(args_json);
-        if let Some(ipc_paths) = ipc_paths {
-            // The host may write these two files and nothing beside them, so
-            // the directory they go in has to be there already.
-            for path in [&ipc_paths.mailbox_path, &ipc_paths.task_lists_path] {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
+        let mailbox_path = ipc_paths.map(|paths| paths.mailbox_path.as_path());
+        if let Some(path) = mailbox_path {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
             }
-            command
-                .arg(&ipc_paths.mailbox_path)
-                .arg(&ipc_paths.task_lists_path);
         }
+        command
+            .arg(mailbox_path.unwrap_or_else(|| Path::new("")))
+            .arg(&task_list_reply)
+            .arg(MAX_WORKFLOW_HOST_FRAME_BYTES.to_string());
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -366,8 +387,11 @@ impl WorkflowHost {
         let on_agent_call = &on_agent_call;
         let execution_result = thread::scope(|scope| -> io::Result<()> {
             let worker_count = policy.max_agent_workers.max(1);
-            let call_queue_capacity = worker_count.saturating_mul(2).max(1);
-            let (call_tx, call_rx) = crossbeam_channel::bounded::<AgentCall>(call_queue_capacity);
+            // The frame count and byte limits bound queued calls. Keep reading
+            // frames while workers wait for the script to receive their results,
+            // since a synchronous task list call may be blocking the script.
+            let (call_tx, call_rx) =
+                crossbeam_channel::bounded::<AgentCall>(MAX_WORKFLOW_HOST_EVENTS);
             let mut worker_handles = Vec::with_capacity(worker_count);
             for _ in 0..worker_count {
                 let receiver = call_rx.clone();
@@ -441,8 +465,15 @@ impl WorkflowHost {
                         ));
                     }
 
-                    let event: HostEvent = serde_json::from_slice(&frame)
+                    let message: WorkflowHostMessage = serde_json::from_slice(&frame)
                         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    let event = match message {
+                        WorkflowHostMessage::Event(event) => event,
+                        WorkflowHostMessage::TaskList { task_list_call } => {
+                            task_list_call.reply(&workflow_ipc, &task_list_reply)?;
+                            continue;
+                        }
+                    };
                     if let HostEvent::WorkflowFailed { error } = &event {
                         workflow_failed = Some(error.clone());
                     }
@@ -459,17 +490,19 @@ impl WorkflowHost {
                         opts,
                     } = &event
                     {
-                        send_workflow_agent_call(
-                            &call_tx,
-                            AgentCall {
+                        call_tx
+                            .try_send(AgentCall {
                                 call_id: call_id.clone(),
                                 call_path: call_path.clone(),
                                 phase: phase.clone(),
                                 prompt: prompt.clone(),
                                 opts: opts.clone(),
-                            },
-                            &should_cancel,
-                        )?;
+                            })
+                            .map_err(|error| {
+                                io::Error::other(format!(
+                                    "workflow host agent worker queue: {error}"
+                                ))
+                            })?;
                     }
                     if policy.collect_events {
                         events.push(event);
@@ -556,6 +589,71 @@ impl WorkflowHost {
         }
 
         Ok(events)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WorkflowHostMessage {
+    Event(HostEvent),
+    TaskList {
+        task_list_call: WorkflowHostTaskListCall,
+    },
+}
+
+#[derive(Deserialize)]
+struct WorkflowHostTaskListCall {
+    id: u64,
+    request: WorkflowHostTaskListRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum WorkflowHostTaskListRequest {
+    Create {
+        name: String,
+        items: Vec<Value>,
+    },
+    Claim {
+        name: String,
+        by: String,
+    },
+    Complete {
+        name: String,
+        task_id: String,
+        result: Value,
+        by: String,
+    },
+    List {
+        name: String,
+    },
+}
+
+impl WorkflowHostTaskListCall {
+    fn reply(self, ipc: &WorkflowIpcContext, reply_path: &Path) -> io::Result<()> {
+        use WorkflowHostTaskListRequest::*;
+
+        let result = match self.request {
+            Create { name, items } => ipc.create_task_list(&name, items),
+            Claim { name, by } => ipc.claim_task(&name, Some(&by)),
+            Complete {
+                name,
+                task_id,
+                result,
+                by,
+            } => ipc.complete_task(&name, &task_id, result, Some(&by)),
+            List { name } => ipc.list_tasks(&name),
+        };
+        let reply = match result {
+            Ok(value) => serde_json::json!({ "id": self.id, "value": value }),
+            Err(error) => serde_json::json!({ "id": self.id, "error": error }),
+        };
+        atomic_write(
+            reply_path,
+            &serde_json::to_vec(&reply)?,
+            AtomicWritePolicy::NoFollow,
+        )
+        .map_err(io::Error::other)
     }
 }
 
@@ -796,36 +894,6 @@ fn join_host_thread<T>(handle: thread::JoinHandle<io::Result<T>>, label: &str) -
         .map_err(|_| io::Error::other(format!("workflow host {label} panicked")))?
 }
 
-fn send_workflow_agent_call<C>(
-    sender: &crossbeam_channel::Sender<AgentCall>,
-    mut call: AgentCall,
-    should_cancel: &C,
-) -> io::Result<()>
-where
-    C: Fn() -> io::Result<bool>,
-{
-    loop {
-        match sender.try_send(call) {
-            Ok(()) => return Ok(()),
-            Err(crossbeam_channel::TrySendError::Full(returned)) => {
-                call = returned;
-                if should_cancel()? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "workflow host cancelled",
-                    ));
-                }
-                thread::sleep(WORKFLOW_HOST_CONTROL_POLL_INTERVAL);
-            }
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                return Err(io::Error::other(
-                    "workflow host agent worker queue disconnected",
-                ));
-            }
-        }
-    }
-}
-
 fn run_workflow_agent_worker<F>(
     receiver: crossbeam_channel::Receiver<AgentCall>,
     writer: Arc<Mutex<impl Write>>,
@@ -841,6 +909,9 @@ fn run_workflow_agent_worker<F>(
         let Ok(call) = received else {
             return;
         };
+        if abort.load(Ordering::Acquire) {
+            return;
+        }
 
         let call_id = call.call_id.clone();
         let command =
@@ -995,7 +1066,7 @@ fn node_entry_path(path: PathBuf) -> PathBuf {
 /// - The host's own realm cannot compile code from text, so an object of that
 ///   realm in a script's hands does not become code running there.
 /// - Where Node has a permission model, the process reads the host module, the
-///   script and its two IPC files, writes the IPC files, and starts nothing.
+///   script, its mailbox and task list replies. It can only write the mailbox.
 ///
 /// A Node without a permission model is given the first flag only.
 fn node_confinement_args(
@@ -1003,20 +1074,27 @@ fn node_confinement_args(
     host_path: &Path,
     script_path: &Path,
     ipc_paths: Option<&WorkflowHostIpcPaths>,
+    task_list_reply: Option<&Path>,
 ) -> Vec<OsString> {
     let mut args = vec![OsString::from("--disallow-code-generation-from-strings")];
     if node_has_permission_model(node) {
-        args.extend(permission_model_args(host_path, script_path, ipc_paths));
+        args.extend(permission_model_args(
+            host_path,
+            script_path,
+            ipc_paths,
+            task_list_reply,
+        ));
     }
     args
 }
 
 /// The flags that let a Node with a permission model read `host_path` and
-/// `script_path`, read and replace the IPC files, and do nothing else.
+/// `script_path`, read and replace the mailbox, and read task list replies.
 fn permission_model_args(
     host_path: &Path,
     script_path: &Path,
     ipc_paths: Option<&WorkflowHostIpcPaths>,
+    task_list_reply: Option<&Path>,
 ) -> Vec<OsString> {
     let allow = |access: &str, path: &Path| {
         let mut flag = OsString::from(format!("--allow-fs-{access}="));
@@ -1029,13 +1107,17 @@ fn permission_model_args(
         allow("read", script_path),
     ];
     if let Some(ipc_paths) = ipc_paths {
-        for path in [&ipc_paths.mailbox_path, &ipc_paths.task_lists_path] {
-            // Node asks for read access to a file it renames.
-            for path in [path.clone(), host_replacement_path(path)] {
-                args.push(allow("read", &path));
-                args.push(allow("write", &path));
-            }
+        // Node asks for read access to a file it renames.
+        for path in [
+            ipc_paths.mailbox_path.clone(),
+            host_replacement_path(&ipc_paths.mailbox_path),
+        ] {
+            args.push(allow("read", &path));
+            args.push(allow("write", &path));
         }
+    }
+    if let Some(path) = task_list_reply {
+        args.push(allow("read", path));
     }
     args
 }
@@ -1100,7 +1182,12 @@ process.stdout.write(String(process.permission.has("child")));
 
     let mut command = Command::new(node);
     command
-        .args(permission_model_args(&module, &module, Some(&ipc_paths)))
+        .args(permission_model_args(
+            &module,
+            &module,
+            Some(&ipc_paths),
+            None,
+        ))
         .arg(&module)
         .arg(&ipc_paths.mailbox_path)
         .stdin(Stdio::null())
@@ -1519,7 +1606,7 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
             &script,
             serde_json::Value::Null,
             None,
-            WorkflowHostRunPolicy::callback_only(1),
+            WorkflowHostRunPolicy::callback_only(1, None),
             |call| {
                 Ok(HostCommand::AgentResult {
                     call_id: call.call_id,
@@ -1751,6 +1838,7 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
             Path::new("/host.mjs"),
             Path::new("/workflow.js"),
             None,
+            None,
         );
 
         assert_eq!(args, ["--disallow-code-generation-from-strings"]);
@@ -1799,7 +1887,7 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
         let entry = node_entry_path(entry);
         let node = WorkflowHost::node_executable();
         let output = Command::new(&node)
-            .args(node_confinement_args(&node, &entry, readable, ipc))
+            .args(node_confinement_args(&node, &entry, readable, ipc, None))
             .arg(&entry)
             .arg(readable)
             .output()
@@ -1853,7 +1941,111 @@ console.log(JSON.stringify({
     }
 
     #[test]
-    fn the_workflow_host_process_writes_only_its_mailbox_and_task_lists() {
+    fn workflow_task_list_call_waits_for_the_reply_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("workflow.js");
+        fs::write(
+            &script,
+            "export const meta = { name: 'retry', description: 'Wait for task list reply', phases: [] };
+             export default createTaskList('audit', ['check'])[0].status;",
+        )
+        .unwrap();
+        let preload = temp.path().join("reply-reads.cjs");
+        fs::write(
+            &preload,
+            r#"const fs = require('node:fs');
+const { syncBuiltinESMExports } = require('node:module');
+const readFileSync = fs.readFileSync;
+const codes = ['EBUSY', 'EBUSY', 'EPERM', 'EPERM', 'EACCES', 'EACCES'];
+fs.readFileSync = (path, ...options) => {
+  if (path === process.argv[5] && codes.length > 0) {
+    const code = codes.shift();
+    throw Object.assign(new Error(`Reply read failed with ${code}`), { code });
+  }
+  return readFileSync(path, ...options);
+};
+syncBuiltinESMExports();
+"#,
+        )
+        .unwrap();
+
+        let mut command = Command::new(WorkflowHost::node_executable());
+        command.arg("--require").arg(node_entry_path(preload));
+        let events = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
+            command,
+            &script,
+            Value::Null,
+            None,
+            WorkflowHostRunPolicy::collecting(),
+            |_| unreachable!("script makes no agent calls"),
+            |_| Ok(()),
+            || Ok(false),
+            || {},
+        )
+        .unwrap();
+        assert!(
+            matches!(events.last(), Some(HostEvent::WorkflowCompleted { result }) if result == "pending"),
+            "last host event: {:?}",
+            events.last()
+        );
+    }
+
+    #[test]
+    fn workflow_task_list_reports_oversized_requests_to_the_script() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("workflow.js");
+        fs::write(
+            &script,
+            "export const meta = { name: 'limit', description: 'Task list limit', phases: [] };
+             let error;
+             try { createTaskList('oversized', ['界'.repeat(350_000)]); }
+             catch (e) { error = e.message; }
+             export default [error, listTasks('oversized').length, createTaskList('small', ['ok']).length];",
+        )
+        .unwrap();
+        let events = WorkflowHost::run_collecting_events_with_agent(&script, Value::Null, |_| {
+            unreachable!("script makes no agent calls")
+        })
+        .unwrap();
+        assert!(
+            matches!(events.last(), Some(HostEvent::WorkflowCompleted { result })
+            if *result == serde_json::json!(["Workflow task list request exceeds 1048576 bytes", 0, 1]))
+        );
+    }
+
+    #[test]
+    fn workflow_task_list_call_completes_with_an_agent_backlog() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("workflow.js");
+        fs::write(
+            &script,
+            "export const meta = { name: 'backlog', description: 'Task list with agents', phases: [] };
+             const agents = Array.from({ length: 64 }, () => agent('work'));
+             const tasks = createTaskList('audit', ['check']);
+             await Promise.all(agents);
+             export default tasks[0].status;",
+        )
+        .unwrap();
+
+        let output = WorkflowHost::run_collecting_events_with_agent(&script, Value::Null, |call| {
+            Ok(HostCommand::AgentResult {
+                call_id: call.call_id,
+                result: Value::String("x".repeat(256 * 1024)),
+            })
+        })
+        .unwrap();
+        assert!(
+            matches!(
+                output.last(),
+                Some(HostEvent::WorkflowCompleted { result }) if result == "pending"
+            ),
+            "last host event: {:?}",
+            output.last()
+        );
+    }
+
+    #[test]
+    fn the_workflow_host_process_writes_only_its_mailbox() {
         let node = WorkflowHost::node_executable();
         if !WorkflowHost::node_available() || !node_has_permission_model(&node) {
             return;
@@ -1886,7 +2078,7 @@ console.log(JSON.stringify({
 
         let seen: Value = serde_json::from_str(seen.trim()).expect("json report");
         assert_eq!(seen["mailbox"], "allowed");
-        assert_eq!(seen["tasks"], "allowed");
+        assert_eq!(seen["tasks"], "ERR_ACCESS_DENIED");
         assert_eq!(seen["readBack"], "allowed");
         assert_eq!(seen["state"], "ERR_ACCESS_DENIED");
         assert_eq!(

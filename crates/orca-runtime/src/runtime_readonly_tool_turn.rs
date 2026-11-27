@@ -1,17 +1,26 @@
 use std::io;
 use std::path::Path;
 
+use orca_core::approval_types::ApprovalDecision;
 use orca_core::cancel::CancelToken;
+use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::hook_types::HookEvent;
-use orca_core::tool_types::{ToolOutputTruncation, ToolRequest, ToolResult, ToolStatus};
+use orca_core::tool_types::{
+    ToolOutputTruncation, ToolRequest, ToolResult, ToolServiceUsage, ToolStatus,
+};
 use orca_mcp::McpRegistry;
 
+use crate::agent_common;
 use crate::hooks::{HookContext, HookRunError, HookRunner};
+use crate::runtime_permission::TurnPermissionOverlay;
 use crate::runtime_surface::RuntimeProviderResponseIngress;
-use crate::runtime_tool_call::{RuntimeReadonlyToolInvocation, RuntimeToolCallRuntime};
+use crate::runtime_tool_call::{
+    RuntimeNormalToolInvocation, RuntimeReadonlyToolInvocation, RuntimeToolCallRuntime,
+};
+use crate::runtime_tool_scheduler::is_network_read;
 use crate::session::record_tool_result_for_agent;
 use crate::tasks::TaskRegistry;
 use crate::thread_store::SessionWriter;
@@ -22,6 +31,7 @@ use crate::tool_invocation::{
 use crate::tool_turn::{ToolTurnOutcome, record_root_task_output_truncation};
 
 pub(crate) struct RuntimeReadonlyBatchContext<'a, W: io::Write> {
+    pub(crate) spill_directory: Option<&'a Path>,
     pub(crate) cwd: &'a Path,
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
@@ -33,6 +43,15 @@ pub(crate) struct RuntimeReadonlyBatchContext<'a, W: io::Write> {
     pub(crate) output_truncation: ToolOutputTruncation,
     pub(crate) max_parallel: usize,
     pub(crate) provider_response_ingress: Option<&'a dyn RuntimeProviderResponseIngress>,
+    pub(crate) network: Option<RuntimeNetworkBatchContext<'a>>,
+}
+
+pub(crate) struct RuntimeNetworkBatchContext<'a> {
+    pub(crate) config: &'a RunConfig,
+    pub(crate) policy: &'a orca_approval::ApprovalPolicy,
+    pub(crate) permission_overlay: &'a TurnPermissionOverlay,
+    pub(crate) service_usage: &'a mut Vec<(String, ToolServiceUsage)>,
+    pub(crate) task_registry: Option<&'a TaskRegistry>,
 }
 
 pub(crate) struct RuntimeReadonlyToolTurnContext<'a, W: io::Write> {
@@ -48,6 +67,7 @@ pub(crate) struct RuntimeReadonlyToolTurnRequest<'a> {
     pub(crate) cancel: &'a CancelToken,
     pub(crate) output_truncation: ToolOutputTruncation,
     pub(crate) max_parallel: usize,
+    pub(crate) network: Option<RuntimeNetworkBatchContext<'a>>,
 }
 
 pub(crate) struct RuntimeReadonlyToolTurnIo<'a, W: io::Write> {
@@ -82,6 +102,7 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
     context: RuntimeReadonlyBatchContext<'_, W>,
 ) -> io::Result<RuntimeReadonlyBatchExecution> {
     let RuntimeReadonlyBatchContext {
+        spill_directory,
         cwd,
         events,
         sink,
@@ -93,14 +114,111 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
         output_truncation,
         max_parallel,
         provider_response_ingress,
+        mut network,
     } = context;
     let mut early_results: Vec<Option<ToolResult>> = vec![None; tool_requests.len()];
     let mut runnable = Vec::new();
     let mut event_error = None;
 
-    let event_registry =
-        orca_tools::registry::tool_registry_with_mcp_and_external(Some(mcp_registry), &[]);
+    let external_tools = network
+        .as_ref()
+        .map_or(&[][..], |network| network.config.external_tools.as_slice());
+    let event_registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        Some(mcp_registry),
+        external_tools,
+    );
     for (idx, tool_request) in tool_requests.iter().enumerate() {
+        if event_error.is_some() {
+            early_results[idx] = Some(ToolResult::cancelled_before_start(
+                tool_request,
+                "an earlier read-only admission could not be delivered",
+            ));
+            continue;
+        }
+        if cancel.is_cancelled() {
+            early_results[idx] = Some(ToolResult::cancelled_before_start(
+                tool_request,
+                "the read-only batch was cancelled before dispatch",
+            ));
+            continue;
+        }
+        let invocation = prepare_tool_invocation_with_external(
+            tool_request,
+            0,
+            u32::MAX,
+            mcp_registry,
+            external_tools,
+        );
+        if network.is_some()
+            && let Err(error) = crate::tool_invocation::validate_tool_invocation_with_external(
+                &invocation,
+                mcp_registry,
+                external_tools,
+            )
+        {
+            if emit_deltas {
+                retain_first_event_error(
+                    &mut event_error,
+                    sink.emit(
+                        crate::lifecycle::RuntimeTaskActor::tool_call_requested_event_with_registry_for(
+                            events,
+                            tool_request,
+                            &event_registry,
+                        ),
+                    ),
+                );
+            }
+            early_results[idx] = Some(error.into_result());
+            continue;
+        }
+        if let Some(network_context) = network.as_ref()
+            && let Some(approval) =
+                crate::tool_invocation::approval_request_for_invocation(&invocation)
+            && agent_common::requires_approval(approval.action)
+        {
+            let resolution = network_context.policy.resolve_for_tool(
+                &approval,
+                invocation.effective.name.as_str(),
+                approval
+                    .target
+                    .as_deref()
+                    .or(tool_request.target.as_deref()),
+            );
+            if emit_deltas {
+                retain_first_event_error(
+                    &mut event_error,
+                    sink.emit(events.approval_requested(&approval)),
+                );
+                retain_first_event_error(
+                    &mut event_error,
+                    sink.emit(events.approval_resolved(&resolution)),
+                );
+            }
+            if event_error.is_some() {
+                early_results[idx] = Some(ToolResult::failed_before_start(
+                    tool_request,
+                    "tool dispatch stopped because approval events could not be delivered",
+                    None,
+                ));
+                continue;
+            }
+            if resolution.decision != ApprovalDecision::Allow {
+                early_results[idx] = Some(ToolResult::denied(tool_request, resolution.reason));
+                if emit_deltas {
+                    retain_first_event_error(
+                        &mut event_error,
+                        sink.emit(
+                            crate::lifecycle::RuntimeTaskActor::tool_call_requested_event_with_registry_for(
+                                events,
+                                tool_request,
+                                &event_registry,
+                            ),
+                        ),
+                    );
+                }
+                continue;
+            }
+        }
         if emit_deltas {
             retain_first_event_error(
                 &mut event_error,
@@ -113,15 +231,14 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
                 ),
             );
         }
-        if cancel.is_cancelled() {
-            early_results[idx] = Some(ToolResult::cancelled_before_start(
+        if event_error.is_some() {
+            early_results[idx] = Some(ToolResult::failed_before_start(
                 tool_request,
-                "the read-only batch was cancelled before dispatch",
+                "tool dispatch stopped because its requested event could not be delivered",
+                None,
             ));
             continue;
         }
-        let invocation =
-            prepare_tool_invocation_with_external(tool_request, 0, u32::MAX, mcp_registry, &[]);
         match hooks.run_with_cancel_result(
             HookEvent::PreToolUse,
             HookContext {
@@ -136,8 +253,25 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
             cancel,
         ) {
             Ok(outcome) => {
-                match apply_pre_tool_outcome_with_external(invocation, &outcome, mcp_registry, &[])
-                {
+                let changes_approved_target = network.is_some()
+                    && is_network_read(tool_request)
+                    && outcome
+                        .modified_target
+                        .as_ref()
+                        .is_some_and(|target| invocation.effective.target.as_ref() != Some(target));
+                match apply_pre_tool_outcome_with_external(
+                    invocation,
+                    &outcome,
+                    mcp_registry,
+                    external_tools,
+                ) {
+                    Ok(_) if changes_approved_target => {
+                        early_results[idx] = Some(ToolResult::failed_before_start(
+                            tool_request,
+                            "pre-tool hook changed an approval-relevant request after its authority was evaluated",
+                            None,
+                        ));
+                    }
                     Ok(invocation) => runnable.push((idx, invocation.effective)),
                     Err(error) => early_results[idx] = Some(error.into_result()),
                 }
@@ -158,19 +292,37 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
         }
     }
 
-    let runnable_requests = runnable
-        .iter()
-        .map(|(_, request)| request.clone())
-        .collect::<Vec<_>>();
-    let runnable_results = if runnable_requests.is_empty() {
+    let runnable_results = if runnable.is_empty() {
         Vec::new()
     } else {
+        let additional_roots = network.as_ref().map(|network| {
+            crate::runtime_permission::tool_working_directories(
+                network.config,
+                network.permission_overlay,
+            )
+        });
         RuntimeToolCallRuntime::for_current_execution()?.execute_readonly_batch(
-            runnable_requests
+            runnable
                 .iter()
-                .cloned()
-                .map(|request| RuntimeReadonlyToolInvocation {
-                    request,
+                .map(|(_, request)| RuntimeReadonlyToolInvocation {
+                    spill_directory: spill_directory.map(Path::to_path_buf),
+                    network_read: network.as_ref().filter(|_| is_network_read(request)).map(
+                        |network| {
+                            Box::new(RuntimeNormalToolInvocation::snapshot(
+                                network.config,
+                                request,
+                                cwd,
+                                additional_roots.as_deref().unwrap_or_default(),
+                                mcp_registry,
+                                external_tools,
+                                output_truncation,
+                                network.config.tools.shell_timeout_secs,
+                                network.task_registry,
+                                network.permission_overlay.clone(),
+                            ))
+                        },
+                    ),
+                    request: request.clone(),
                     cwd: cwd.to_path_buf(),
                     mcp_registry: mcp_registry.clone(),
                     output_truncation,
@@ -190,6 +342,14 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
         .map(|result| result.expect("each read-only batch item has a result"))
         .collect::<Vec<_>>();
 
+    if let Some(network) = network.as_mut() {
+        network.service_usage.extend(
+            results
+                .iter()
+                .filter(|result| !result.service_usage.is_empty())
+                .map(|result| (result.id.clone(), result.service_usage)),
+        );
+    }
     if let Some(ingress) = provider_response_ingress {
         ingress
             .commit_tool_results(&results)
@@ -202,7 +362,7 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
                 &mut event_error,
                 sink.emit(events.tool_call_completed(result)),
             );
-            if let Err(error) = hooks.run(
+            if let Err(error) = hooks.run_with_cancel_result(
                 HookEvent::PostToolUse,
                 HookContext {
                     cwd: &cwd.display().to_string(),
@@ -213,10 +373,16 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
                     after_messages: None,
                     usage: None,
                 },
+                cancel,
             ) {
                 retain_first_event_error(
                     &mut event_error,
-                    sink.emit(events.error(&format!("post_tool_use hook failed: {error}"))),
+                    match error {
+                        HookRunError::Cancelled(_) => Ok(()),
+                        HookRunError::Failed(error) => {
+                            sink.emit(events.error(&format!("post_tool_use hook failed: {error}")))
+                        }
+                    },
                 );
             }
         }
@@ -297,6 +463,7 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
         cancel,
         output_truncation,
         max_parallel,
+        network,
     } = request;
     let RuntimeReadonlyToolTurnIo {
         events,
@@ -311,7 +478,9 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
         task_registry,
         root_task_id,
     } = services;
+    let has_network_reads = network.is_some();
     let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+        spill_directory: task_registry.and_then(TaskRegistry::spill_directory),
         cwd,
         events,
         sink,
@@ -323,6 +492,7 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
         output_truncation,
         max_parallel,
         provider_response_ingress,
+        network,
     })?;
     let cancelled_result = execution
         .results
@@ -331,6 +501,11 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
     let cancelled_error = cancelled_result.and_then(|result| result.error.clone());
     let turn_cancelled = cancel.is_cancelled() || cancelled_result.is_some();
     let output_truncated = execution.results.iter().any(|result| result.truncated);
+    let indeterminate = execution
+        .results
+        .iter()
+        .find(|result| has_network_reads && result.status == ToolStatus::Indeterminate)
+        .map(|result| result.error.clone());
 
     record_readonly_batch_results(conversation, history_writer, execution.results, emit_deltas)?;
     if let Some(task_registry) = task_registry {
@@ -349,6 +524,13 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
         return Ok(ToolTurnOutcome::Return {
             status: RunStatus::Cancelled,
             error: cancelled_error.or_else(|| Some("read-only tool turn cancelled".to_string())),
+            terminal: None,
+        });
+    }
+    if let Some(error) = indeterminate {
+        return Ok(ToolTurnOutcome::Return {
+            status: RunStatus::Failed,
+            error,
             terminal: None,
         });
     }
@@ -402,6 +584,7 @@ mod tests {
         let mut events = EventFactory::new("readonly-target".to_string());
         let mut bytes = Vec::new();
         let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+            spill_directory: None,
             cwd: cwd.path(),
             events: &mut events,
             sink: &mut EventSink::new(&mut bytes, OutputFormat::Jsonl),
@@ -412,6 +595,7 @@ mod tests {
             cancel: &CancelToken::new(),
             output_truncation: ToolOutputTruncation::default(),
             max_parallel: 2,
+            network: None,
             provider_response_ingress: None,
         })
         .unwrap();
@@ -493,6 +677,7 @@ mod tests {
         let hooks = HookRunner::default();
 
         let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+            spill_directory: None,
             cwd: Path::new("."),
             events: &mut events,
             sink: &mut sink,
@@ -503,6 +688,7 @@ mod tests {
             cancel: &cancel,
             output_truncation: ToolOutputTruncation::default(),
             max_parallel: 2,
+            network: None,
             provider_response_ingress: Some(&ingress),
         })
         .unwrap();
@@ -774,6 +960,7 @@ mod tests {
             }
             let mut sink = EventSink::new(writer, generation.config().output_format);
             let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+                spill_directory: None,
                 cwd: generation
                     .config()
                     .cwd
@@ -788,6 +975,7 @@ mod tests {
                 cancel,
                 output_truncation: ToolOutputTruncation::default(),
                 max_parallel: 2,
+                network: None,
                 provider_response_ingress: None,
             })?;
             let status = if execution
@@ -922,6 +1110,7 @@ mod tests {
             let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
             let hooks = HookRunner::default();
             let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+                spill_directory: None,
                 cwd: Path::new("."),
                 events: &mut events,
                 sink: &mut sink,
@@ -932,6 +1121,7 @@ mod tests {
                 cancel: &worker_cancel,
                 output_truncation: ToolOutputTruncation::default(),
                 max_parallel: 1,
+                network: None,
                 provider_response_ingress: None,
             })
             .expect("execute read-only batch");
@@ -965,6 +1155,80 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, ToolStatus::Cancelled);
         assert_eq!(results[0].terminal().started, ToolInvocationStarted::Yes);
+    }
+
+    #[test]
+    fn network_batch_validates_and_resolves_approval_before_pre_hooks() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = host_test_config(cwd.path().to_path_buf());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let requests = [
+            ToolRequest {
+                id: "invalid-fetch".to_string(),
+                name: ToolName::WebFetch,
+                action: ActionKind::Network,
+                target: None,
+                raw_arguments: Some("{}".to_string()),
+            },
+            ToolRequest {
+                id: "valid-fetch".to_string(),
+                name: ToolName::WebFetch,
+                action: ActionKind::Network,
+                target: Some("https://example.com/".to_string()),
+                raw_arguments: Some(json!({"url": "https://example.com/"}).to_string()),
+            },
+        ];
+        let hooks = HookRunner::new(vec![orca_core::hook_types::HookConfig {
+            event: HookEvent::PreToolUse,
+            command: "exit 1".to_string(),
+            tool: Some("web_fetch".to_string()),
+        }]);
+        let cancel = CancelToken::new();
+        let mut events = EventFactory::new("network-admission-order".to_string());
+        let mut bytes = Vec::new();
+        let mut sink = EventSink::new(&mut bytes, OutputFormat::Jsonl);
+        let permission_overlay = TurnPermissionOverlay::default();
+        let mut service_usage = Vec::new();
+        let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+            cwd: cwd.path(),
+            spill_directory: None,
+            events: &mut events,
+            sink: &mut sink,
+            tool_requests: &requests,
+            emit_deltas: true,
+            mcp_registry: &McpRegistry::default(),
+            hooks: &hooks,
+            cancel: &cancel,
+            output_truncation: ToolOutputTruncation::default(),
+            max_parallel: 2,
+            network: Some(RuntimeNetworkBatchContext {
+                task_registry: None,
+                config: &config,
+                policy: &policy,
+                permission_overlay: &permission_overlay,
+                service_usage: &mut service_usage,
+            }),
+            provider_response_ingress: None,
+        })
+        .expect("execute network batch");
+
+        assert!(
+            execution.results[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("schema validation"))
+        );
+        assert!(
+            execution.results[1]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("pre_tool_use hook blocked"))
+        );
+        drop(sink);
+        let events = String::from_utf8(bytes).expect("event output");
+        assert!(events.contains("approval.requested"));
+        assert!(events.contains("approval.resolved"));
     }
 
     #[test]

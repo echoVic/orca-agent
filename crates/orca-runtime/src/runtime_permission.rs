@@ -13,6 +13,19 @@ use crate::protocol::{
     RequestPermissionProfile,
 };
 
+pub(crate) fn tool_working_directories(
+    config: &orca_core::config::RunConfig,
+    overlay: &TurnPermissionOverlay,
+) -> Vec<PathBuf> {
+    config
+        .additional_working_directories
+        .iter()
+        .filter(|directory| directory.source != SESSION_METADATA_DIRECTORY_SOURCE)
+        .map(|directory| directory.path.clone())
+        .chain(overlay.additional_working_directories().iter().cloned())
+        .collect()
+}
+
 /// Caller-proven provenance for a permission prompt. The actor binds a
 /// foreground request to the committed tool identity. Child requests must
 /// carry the complete activity owner, so they cannot be recovered from an
@@ -254,6 +267,7 @@ pub struct TurnPermissionOverlay {
         std::collections::HashMap<String, orca_core::config::PermissionProfileNetworkAccess>,
     strict_auto_review: bool,
     preapproved_tool_call_id: Option<String>,
+    pub(crate) preapproved_patch_fingerprint: Option<[u8; 32]>,
     /// Tool calls whose interactive approval named the `.git` they write, so
     /// bash does not ask a second time.
     git_metadata_write_approvals: Vec<String>,
@@ -568,6 +582,7 @@ mod tests {
             )]),
             strict_auto_review: false,
             preapproved_tool_call_id: Some("approval-only".to_string()),
+            preapproved_patch_fingerprint: None,
             git_metadata_write_approvals: Vec::new(),
         };
         let current = TurnPermissionOverlay {
@@ -588,6 +603,7 @@ mod tests {
             ]),
             strict_auto_review: true,
             preapproved_tool_call_id: None,
+            preapproved_patch_fingerprint: None,
             git_metadata_write_approvals: Vec::new(),
         };
 

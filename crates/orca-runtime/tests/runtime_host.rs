@@ -1775,6 +1775,7 @@ fn actor_owned_start_preserves_preloaded_session_usage_and_injected_mcp_registry
             Message::system("original system".to_string()),
             Message::user("resumed prompt".to_string()),
         ],
+        repeat_tool_streak: None,
         compactions: Vec::new(),
         summaries: Vec::new(),
         usage: Some(baseline),
@@ -1783,6 +1784,8 @@ fn actor_owned_start_preserves_preloaded_session_usage_and_injected_mcp_registry
         completion_error: None,
         next_event_seq: 0,
         semantic_events: Vec::new(),
+        nested_instructions: Vec::new(),
+        written_instruction_sources: Vec::new(),
         path: transcript_path,
     };
     let mut config = test_config(cwd.path().to_path_buf());

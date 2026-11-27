@@ -51,8 +51,9 @@ mean the task should be replayed.
 
 ## Compaction
 
-Context compaction changes the material sent on later turns and can therefore
-change cache behavior. Observe context.compaction.started and
-context.compacted in a JSONL stream when diagnosing a shift. Those events
-describe prompt management; the recorded conversation and terminal tool events
-remain the source of truth for recovery.
+Deep compaction's checkpoint request replays the existing prefix on the same
+model. Most of the replayed input can be billed at cache-hit rates when the
+prefix is still cached. Look for `purpose: "replay"` under
+`context.compacted.payload.observation.summary_requests` to see the provider's
+reported cache tokens for that request. Once Orca installs the checkpoint, the
+next ordinary turn starts from a changed prefix. See [Context and Compaction](#context-window).

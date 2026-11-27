@@ -1,6 +1,7 @@
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
@@ -34,6 +35,7 @@ use crate::provider_stream::RuntimeProviderSuspensionControl;
 use crate::runtime_directive::{RuntimeDirective, RuntimeDirectiveState};
 use crate::runtime_execution_policy::RuntimeExecutionPolicyHandle;
 use crate::runtime_state::RuntimeTurnReducer;
+use crate::runtime_surface::SurfaceItemId;
 use crate::runtime_surface::{RuntimeProviderResponseIngress, RuntimeWorkflowLifecycleIngress};
 use crate::runtime_tool_call::{
     RuntimeNormalToolInteractions, RuntimeNormalToolInvocation, RuntimeToolCallRuntime,
@@ -248,15 +250,37 @@ impl From<RuntimeTurnStartError> for AgentLoopResult {
 
 #[derive(Clone, Debug, Default)]
 pub struct ThreadSteerHandle {
-    state: Arc<Mutex<SteerState>>,
+    state: Arc<(Mutex<SteerState>, Condvar)>,
 }
 
 #[derive(Debug, Default)]
 struct SteerState {
-    pending: Vec<String>,
+    pending: VecDeque<String>,
+    reserved: HashSet<SurfaceItemId>,
+    #[cfg(test)]
+    wait_probe: Option<SteerWaitProbe>,
     /// Set once the turn has decided to end: later input is refused rather
     /// than accepted and never shown to the model.
     closed: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SteerWaitProbe {
+    entered: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+struct SteerAdmission<'a> {
+    handle: &'a ThreadSteerHandle,
+    input_id: SurfaceItemId,
+}
+
+impl Drop for SteerAdmission<'_> {
+    fn drop(&mut self) {
+        self.handle.state().reserved.remove(&self.input_id);
+        self.handle.state.1.notify_all();
+    }
 }
 
 pub(crate) struct AgentLoopContext<'a> {
@@ -769,8 +793,13 @@ impl<'a> RuntimeTaskActor<'a> {
         let Some(approval) = approval else {
             return RuntimeApprovalDecision::NotRequired;
         };
-        let resolution =
-            policy.resolve_for_tool(&approval, request.name.as_str(), request.target.as_deref());
+        let resolution = crate::runtime_approval::resolve_for_request(
+            policy,
+            &approval,
+            &[],
+            request.name.as_str(),
+            request.target.as_deref(),
+        );
         match resolution.decision {
             ApprovalDecision::Allow => RuntimeApprovalDecision::Allowed(resolution),
             ApprovalDecision::Ask => RuntimeApprovalDecision::Ask(approval),
@@ -945,7 +974,7 @@ impl<'a> RuntimeTaskActor<'a> {
 
 impl ThreadSteerHandle {
     fn state(&self) -> std::sync::MutexGuard<'_, SteerState> {
-        self.state.lock().expect("thread steer handle lock")
+        self.state.0.lock().expect("thread steer handle lock")
     }
 
     /// Hands `input` to the running turn: `false` when the turn has already
@@ -955,15 +984,69 @@ impl ThreadSteerHandle {
         if state.closed {
             return false;
         }
-        state.pending.push(input.into());
+        state.pending.push_back(input.into());
         true
+    }
+
+    pub(crate) fn commit_steer(
+        &self,
+        input_id: SurfaceItemId,
+        text: String,
+        commit: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<bool> {
+        {
+            let mut state = self.state();
+            if state.closed || !state.reserved.insert(input_id.clone()) {
+                return Ok(false);
+            }
+        }
+        let _admission = SteerAdmission {
+            handle: self,
+            input_id,
+        };
+        commit()?;
+        self.state().pending.push_back(text);
+        Ok(true)
+    }
+
+    pub(crate) fn consume_next(
+        &self,
+        append: impl FnOnce(&str) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        let mut state = self.state();
+        let Some(text) = state.pending.front() else {
+            return Ok(false);
+        };
+        append(text)?;
+        state.pending.pop_front();
+        Ok(true)
     }
 
     pub fn drain(&self) -> Vec<String> {
         self.state().pending.drain(..).collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn probe_next_wait(
+        &self,
+        entered: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.state().wait_probe = Some(SteerWaitProbe { entered, resume });
+    }
+
     pub fn has_pending(&self) -> bool {
+        #[cfg(test)]
+        {
+            let probe = self.state().wait_probe.take();
+            if let Some(probe) = probe {
+                probe.entered.send(()).unwrap();
+                probe
+                    .resume
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+        }
         !self.state().pending.is_empty()
     }
 
@@ -971,7 +1054,13 @@ impl ThreadSteerHandle {
     /// which the turn answers first; otherwise refuses any later input. Both
     /// happen under one lock, so no input slips in between.
     pub(crate) fn close_unless_pending(&self) -> bool {
-        let mut state = self.state();
+        let mut state = self
+            .state
+            .1
+            .wait_while(self.state(), |state| {
+                state.pending.is_empty() && !state.reserved.is_empty()
+            })
+            .expect("thread steer handle lock");
         if state.pending.is_empty() {
             state.closed = true;
             false
@@ -988,14 +1077,6 @@ impl ThreadSteerHandle {
     /// Accepts input again, for the operation's next generation.
     pub(crate) fn reopen(&self) {
         self.state().closed = false;
-    }
-
-    /// Takes back `input` if the turn has not drained it yet.
-    pub(crate) fn retract(&self, input: &str) {
-        let mut state = self.state();
-        if let Some(index) = state.pending.iter().rposition(|pending| pending == input) {
-            state.pending.remove(index);
-        }
     }
 }
 

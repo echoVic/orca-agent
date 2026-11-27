@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::MAX_DIFF_INPUT_BYTES;
 use crate::error::RewindError;
 use crate::path::{
-    BoundedFile, excluded_directory, file_sha256, read_regular_file, resolve_inside,
+    BoundedFile, excluded_directory, file_sha256, read_regular_file, resolve_directory,
+    resolve_inside,
 };
 use crate::store::{BlobRef, PreImage, RewindStore};
 
@@ -22,6 +23,8 @@ pub struct SnapshotView {
     pub at_message_id: String,
     /// Workspace-relative paths (`/` separated) touched during that turn.
     pub files: BTreeMap<String, SnapshotFileView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_directories: Vec<String>,
 }
 
 /// One path's entry inside a [`SnapshotView`].
@@ -89,6 +92,8 @@ pub struct PlanOptions {
 pub struct RestorePlan {
     pub writes: Vec<PlannedWrite>,
     pub deletes: Vec<PlannedDelete>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove_directories: Vec<String>,
     pub skipped: Vec<PlanSkip>,
     /// Paths already at their target state (no action needed).
     pub unchanged: u64,
@@ -171,6 +176,24 @@ pub fn build_plan(
     }
 
     let mut plan = RestorePlan::default();
+    let directories: std::collections::BTreeSet<_> = ordered
+        .iter()
+        .flat_map(|snapshot| snapshot.created_directories.iter())
+        .collect();
+    plan.remove_directories = directories
+        .into_iter()
+        .rev()
+        .filter_map(|path| {
+            if excluded_directory(path).is_some() {
+                return None;
+            }
+            let absolute = resolve_directory(root, path).ok()?;
+            absolute
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_dir())
+                .then(|| path.clone())
+        })
+        .collect();
     let mut untracked_paths = Vec::new();
     let mut escape_paths = Vec::new();
     let mut not_regular_paths = Vec::new();
@@ -407,6 +430,7 @@ mod tests {
         }
         SnapshotView {
             ordinal,
+            created_directories: Vec::new(),
             at_message_id: format!("item_{ordinal}"),
             files: map,
         }

@@ -712,7 +712,7 @@ fn workflow_child_agents_can_exchange_messages_with_mailbox_tools() {
 }
 
 #[test]
-fn workflow_child_agents_can_claim_and_complete_shared_tasks() {
+fn workflow_child_task_tools_release_unfinished_claims_and_refuse_completion() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {
         return;
     }
@@ -734,7 +734,7 @@ fn workflow_child_agents_can_claim_and_complete_shared_tasks() {
     config.approval_mode = ApprovalMode::AutoEdit;
     let tasks = TaskRegistry::new("session-1".to_string());
     let session_dir = temp.path().join("session");
-    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir);
+    let runner = WorkflowRunner::new(config, tasks.clone(), session_dir.clone());
 
     let launched = runner
         .launch(WorkflowLaunchRequest::from_script_path(
@@ -743,10 +743,22 @@ fn workflow_child_agents_can_claim_and_complete_shared_tasks() {
         .expect("workflow completes with child task-list tools");
 
     assert!(launched.summary.contains("workflow-task-1"));
-    assert!(launched.summary.contains("completed"));
-    assert!(launched.summary.contains("worker-a"));
+    assert!(launched.summary.contains("pending"));
     assert!(launched.summary.contains("api"));
-    assert!(launched.summary.contains("ok"));
+    let run_id = launched.output.run_id.as_deref().unwrap();
+    let store = WorkflowStateStore::new(session_dir.join("workflow-runs"));
+    let evidence = store.load_evidence_bundle(run_id).unwrap();
+    let tool_events = || evidence.agents.iter().flat_map(|agent| &agent.tool_events);
+    assert!(tool_events().any(|event| {
+        event.name == "workflow_claim_task" && event.status.as_deref() == Some("completed")
+    }));
+    assert!(tool_events().any(|event| {
+        event.name == "workflow_complete_task"
+            && event
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("must be running"))
+    }));
     let record = tasks.get(&launched.task_id).expect("task record");
     assert_eq!(record.status, TaskStatus::Completed);
     assert_eq!(record.workflow_agents.len(), 4);

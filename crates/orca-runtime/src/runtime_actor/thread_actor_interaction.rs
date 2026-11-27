@@ -1266,12 +1266,8 @@ impl ThreadActor {
                             | surface::OperationOrigin::JsonlThreadTurn { .. }
                     )
                 });
-            let tool = self.surface_tool_for_runtime_request(
-                snapshot,
-                &fence,
-                &request,
-                &active.config.external_tools,
-            )?;
+            let tool =
+                self.surface_tool_for_runtime_request(snapshot, &fence, &request, &active.config)?;
             let authority = Self::surface_authority_for_tool(&snapshot, &fence, &tool)?;
             let intent = surface::ToolInvocationIntent::before_invocation(tool, authority.clone())
                 .with_computer_approval(approval.clone());
@@ -1293,7 +1289,9 @@ impl ThreadActor {
             // Cold external dispatch uses the actor config's first definition;
             // it must exist and match the executing turn's first definition.
             let name = request.name.as_str();
-            let can_restore_tool_definition = self.handle.mcp_registry.resolve_tool(name).is_none()
+            let can_restore_tool_definition = !(name == "apply_patch"
+                && (active.config.tools.apply_patch || self.config.tools.apply_patch))
+                && self.handle.mcp_registry.resolve_tool(name).is_none()
                 && (orca_tools::registry::default_tool_registry()
                     .resolve(name)
                     .is_some()

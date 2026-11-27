@@ -136,6 +136,7 @@ impl std::error::Error for TaskLeaseError {}
 #[derive(Clone)]
 pub struct TaskRegistry {
     session_id: String,
+    spill_directory: Option<PathBuf>,
     owner_id: String,
     inner: Arc<Mutex<HashMap<String, TaskRecord>>>,
     cancelled_roots: Arc<Mutex<HashSet<String>>>,
@@ -1571,6 +1572,7 @@ struct PersistedProviderResponse {
     identity: Option<ModelResponseIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cut_short: Option<orca_core::conversation::CutShort>,
+    background_patch: Option<crate::model_response::BackgroundPatchContext>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1612,6 +1614,7 @@ impl TaskRegistry {
         let continuation_store = AgentContinuationStore::new(session_id.clone());
         Self {
             session_id,
+            spill_directory: None,
             owner_id: new_task_lease_owner_id(std::process::id()),
             inner: Arc::new(Mutex::new(HashMap::new())),
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
@@ -1732,6 +1735,7 @@ impl TaskRegistry {
         drop(_session_lock);
         Ok(Self {
             session_id,
+            spill_directory: None,
             owner_id: new_task_lease_owner_id(std::process::id()),
             inner: Arc::new(Mutex::new(records)),
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
@@ -1781,6 +1785,15 @@ impl TaskRegistry {
             registry.artifact_storage = Arc::new(TaskArtifactStorage::Recorded);
             registry
         })
+    }
+
+    pub(crate) fn with_spill_directory(mut self, directory: Option<PathBuf>) -> Self {
+        self.spill_directory = directory;
+        self
+    }
+
+    pub(crate) fn spill_directory(&self) -> Option<&Path> {
+        self.spill_directory.as_deref()
     }
 
     pub(crate) fn is_process_local(&self) -> bool {
@@ -6664,6 +6677,7 @@ impl PersistedProviderResponse {
             runtime_response.attempt_usage = attempt.usage;
         }
         runtime_response.cut_short = self.cut_short;
+        runtime_response.background_patch = self.background_patch;
         runtime_response
     }
 }
@@ -6688,6 +6702,7 @@ impl From<&RuntimeModelResponse> for PersistedProviderResponse {
             ),
             identity: Some(response.identity.clone()),
             cut_short: response.cut_short,
+            background_patch: response.background_patch,
         }
     }
 }
@@ -7181,7 +7196,7 @@ fn active_main_session_adoption_eligible(record: &TaskRecord) -> bool {
         && record.error.is_none()
 }
 
-fn pending_tool_call_from_provider_response(
+pub(crate) fn pending_tool_call_from_provider_response(
     response: &ProviderResponse,
 ) -> Option<PendingToolCallSummary> {
     response
@@ -8793,6 +8808,7 @@ mod tests {
             attempt_usage: None,
             identity: None,
             cut_short: None,
+            background_patch: None,
         }
         .into_runtime_response_with_migration_identity();
 

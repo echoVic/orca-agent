@@ -200,7 +200,6 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) image_route: ImageRouteDecision,
     pub(crate) runtime_system_messages: &'a [String],
     pub(crate) context_config: &'a context::ContextConfig,
-    pub(crate) base_provider_config: &'a ProviderConfig,
     pub(crate) capabilities: RuntimeStepCapabilitySnapshot<'a>,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) events: &'a mut EventFactory,
@@ -464,6 +463,7 @@ impl RuntimeProviderTurnStep {
             sink,
             mut history_writer,
         } = input.io;
+        crate::instructions::refresh_nested_instructions(conversation, input.turn_context.cwd);
         let cwd_display = input.turn_context.cwd.display().to_string();
         let emit_deltas = input.turn_context.emit_deltas;
         let pre_model_outcome = match input.actor.run_pre_model_hook_with_cancel(
@@ -604,10 +604,13 @@ impl RuntimeProviderTurnStep {
 
         let model_conversation =
             conversation_with_hook_context(&prepared_images.conversation, &pre_model_outcome);
-        let model_conversation = conversation_with_runtime_system_messages(
+        let mut model_conversation = conversation_with_runtime_system_messages(
             &model_conversation,
             input.runtime_system_messages,
         );
+        if input.provider == ProviderKind::DeepSeek {
+            orca_provider::deepseek_http::bind_replay_source(&mut model_conversation, conversation);
+        }
         let measurement = context::measure_prompt(&model_conversation, input.provider_config);
         let request_config = context::with_request_reply_budget(
             input.provider_config,
@@ -1107,6 +1110,11 @@ impl RuntimeProviderResponseStep {
             ));
         }
         if step_snapshot.turn_context.emit_deltas {
+            if !events.has_publication_store()
+                && let Some(writer) = history_writer.as_deref_mut()
+            {
+                writer.append_message(&completed_response.assistant_message())?;
+            }
             sink.emit(completion_event)?;
         }
         record_assistant_response_for_agent(
@@ -1122,7 +1130,8 @@ impl RuntimeProviderResponseStep {
         }
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
-        match run_tool_turns(RuntimeToolTurnsContext {
+        let instructions = step_snapshot.capabilities().instructions;
+        let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state,
             operation: Some(operation),
@@ -1140,7 +1149,9 @@ impl RuntimeProviderResponseStep {
                 workflow_child_executor,
                 batch_child_executor,
             },
-        })? {
+        });
+        instructions.append_nested_for_touches(conversation, history_writer);
+        match outcome? {
             ToolTurnOutcome::Continue => Ok(RuntimeProviderResponseOutcome::Continue),
             ToolTurnOutcome::Return {
                 status,
@@ -1210,6 +1221,10 @@ impl RuntimeTurnProviderCycleStep {
             .as_ref()
             .and_then(RuntimeTurnContinuation::preapproved_tool_call_id)
             .map(str::to_string);
+        let preapproved_patch = continuation
+            .as_ref()
+            .and_then(|continuation| continuation.response.background_patch)
+            .and_then(|patch| patch.fingerprint);
         let response = if let Some(continuation) = continuation {
             continuation.response
         } else {
@@ -1260,7 +1275,7 @@ impl RuntimeTurnProviderCycleStep {
                 &mut RuntimeCompactionStep::new(
                     input.provider,
                     input.context_config,
-                    input.base_provider_config,
+                    input.turn_provider_config,
                     turn_context.clone(),
                     capabilities.hooks,
                     input.events,
@@ -1268,10 +1283,26 @@ impl RuntimeTurnProviderCycleStep {
                     history_writer,
                 )
                 .with_cancel(capabilities.cancel)
-                .with_deadline(input.operation.remaining_deadline()?),
+                .with_deadline(input.operation.remaining_deadline()?)
+                .with_cost_tracker(input.cost_tracker)
+                .with_operation(input.operation),
                 conversation,
             )?
         };
+        if let Err(stop) = input.operation.sync_wall_time()? {
+            let (_, history_writer) = input.conversation.parts_mut();
+            let terminal = input.operation.commit_budget_stop_with_boundary(
+                turn_context.turn_id.as_str(),
+                input.events.run_id(),
+                history_writer,
+                &input.cost_tracker.totals(),
+                None,
+                stop,
+            )?;
+            return Ok(RuntimeTurnProviderCycleResult::Return(
+                AgentLoopResult::budget_stop(terminal, stop),
+            ));
+        }
         if let RuntimeProviderErrorStepOutcome::Failed(error) = &provider_error_outcome
             && let Some(ingress) = turn_context.provider_response_ingress()
         {
@@ -1301,7 +1332,7 @@ impl RuntimeTurnProviderCycleStep {
         let (conversation, history_writer, checkpoint_observer) =
             input.conversation.parts_mut_with_checkpoint_observer();
         let mut kernel = RuntimeTurnKernel::from_extension_stores(input.extensions.stores());
-        kernel.set_preapproved_tool_call_id(preapproved_tool_call_id);
+        kernel.set_preapproved_tool_call_id(preapproved_tool_call_id, preapproved_patch);
         let step_context =
             RuntimeStepContext::from_snapshot(RuntimeStepSnapshot::new_with_capabilities(
                 input.config,
@@ -3321,6 +3352,15 @@ mod tests {
 
     #[test]
     fn provider_response_step_records_final_assistant_message() {
+        check_provider_response_publication(false);
+    }
+
+    #[test]
+    fn provider_response_waits_for_history_before_publishing_completion() {
+        check_provider_response_publication(true);
+    }
+
+    fn check_provider_response_publication(fail_append: bool) {
         let config = config();
         let response = ProviderResponse {
             steps: vec![ProviderStep::MessageDelta("done".to_string())],
@@ -3330,6 +3370,15 @@ mod tests {
             usage: None,
         };
         let cwd = tempfile::tempdir().expect("cwd");
+        let mut history_writer = fail_append.then(|| {
+            let home = tempfile::tempdir().unwrap();
+            let _home = crate::history::redirect_test_orca_home(home.path());
+            let mut writer = SessionWriter::start(cwd.path(), "mock", None, "completion").unwrap();
+            writer.enter_turn(orca_core::thread_identity::TurnId::new());
+            std::fs::remove_file(writer.path()).unwrap();
+            std::fs::create_dir(writer.path()).unwrap();
+            (home, writer)
+        });
         let mut events = EventFactory::new("provider-response-final".to_string());
         let mut output = Vec::new();
         let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
@@ -3370,36 +3419,44 @@ mod tests {
             first_delta_ms: Some(275),
             first_delta_kind: Some("text"),
         });
-        let outcome = RuntimeProviderResponseStep::new()
-            .handle(
-                response,
-                RuntimeProviderResponseInput {
-                    step_context,
-                    sampling_state: &mut sampling_state,
-                    operation: &mut crate::operation_context::OperationContext::for_tests(
-                        orca_core::budget::BudgetSpec::default(),
-                        "provider-response-test",
-                    ),
-                    io: RuntimeProviderResponseIo {
-                        events: &mut events,
-                        sink: &mut sink,
-                        conversation: &mut conversation,
-                        history_writer: None,
-                        cost_tracker: &mut cost_tracker,
-                        background_workflows: &mut background_workflows,
-                        checkpoint_observer: None,
-                    },
+        let outcome = RuntimeProviderResponseStep::new().handle(
+            response,
+            RuntimeProviderResponseInput {
+                step_context,
+                sampling_state: &mut sampling_state,
+                operation: &mut crate::operation_context::OperationContext::for_tests(
+                    orca_core::budget::BudgetSpec::default(),
+                    "provider-response-test",
+                ),
+                io: RuntimeProviderResponseIo {
+                    events: &mut events,
+                    sink: &mut sink,
+                    conversation: &mut conversation,
+                    history_writer: history_writer.as_mut().map(|(_, writer)| writer),
+                    cost_tracker: &mut cost_tracker,
+                    background_workflows: &mut background_workflows,
+                    checkpoint_observer: None,
                 },
-                RuntimeProviderResponseExecutors {
-                    workflow_child_executor: unused_child_executor::<
-                        crate::workflow::runner::SharedEventBuffer,
-                    >,
-                    batch_child_executor: unused_child_executor::<io::Sink>,
-                },
-            )
-            .expect("handle provider response");
+            },
+            RuntimeProviderResponseExecutors {
+                workflow_child_executor: unused_child_executor::<
+                    crate::workflow::runner::SharedEventBuffer,
+                >,
+                batch_child_executor: unused_child_executor::<io::Sink>,
+            },
+        );
 
-        match outcome {
+        if fail_append {
+            assert!(outcome.is_err());
+            assert!(conversation.messages.is_empty());
+            drop(sink);
+            assert!(
+                output.is_empty(),
+                "completion was published before the history write"
+            );
+            return;
+        }
+        match outcome.expect("handle provider response") {
             RuntimeProviderResponseOutcome::Success { final_message } => {
                 assert_eq!(final_message.as_deref(), Some("done"));
             }
@@ -3621,7 +3678,6 @@ mod tests {
                     image_route: ImageRouteDecision::None,
                     runtime_system_messages: &[],
                     context_config: &context_config,
-                    base_provider_config: &provider_config,
                     capabilities: RuntimeStepCapabilitySnapshot::new(
                         &instructions,
                         &memory,
