@@ -409,6 +409,8 @@ pub struct FileSnapshotRecord {
     pub end_digest: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub files: std::collections::BTreeMap<String, SnapshotFileEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_directories: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_stats: Option<SnapshotChangeStats>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

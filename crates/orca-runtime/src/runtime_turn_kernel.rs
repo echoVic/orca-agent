@@ -43,10 +43,14 @@ impl<'a> RuntimeTurnKernel<'a> {
         )
     }
 
-    pub(crate) fn set_preapproved_tool_call_id(&mut self, id: Option<String>) {
-        self.sampling_state
-            .permission_overlay_mut()
-            .set_preapproved_tool_call_id(id);
+    pub(crate) fn set_preapproved_tool_call_id(
+        &mut self,
+        id: Option<String>,
+        patch: Option<[u8; 32]>,
+    ) {
+        let overlay = self.sampling_state.permission_overlay_mut();
+        overlay.set_preapproved_tool_call_id(id);
+        overlay.preapproved_patch_fingerprint = patch;
     }
 
     #[cfg(test)]

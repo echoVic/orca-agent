@@ -90,6 +90,18 @@ pub(crate) fn execute_runtime_normal_tool(
     context: &mut RuntimeNormalToolWorkerContext<'_>,
 ) -> ToolResult {
     match invocation.request.name {
+        ToolName::ApplyPatch => {
+            return match &invocation.prepared_patch {
+                Some(prepared) => {
+                    prepared.commit(&invocation.request, || context.cancel.is_cancelled())
+                }
+                None => ToolResult::failed_before_start(
+                    &invocation.request,
+                    "patch requires prepared approval targets",
+                    None,
+                ),
+            };
+        }
         ToolName::Bash => return execute_bash(invocation, context),
         ToolName::TaskReadOutput => return read_task_output(invocation),
         ToolName::TaskSendInput => return send_task_input(invocation, context),

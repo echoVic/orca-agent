@@ -3702,7 +3702,8 @@ fn append_message_lines(
         } => {
             let neutral_completed =
                 status == "completed" && matches!(kind.as_deref(), Some("empty" | "no_matches"));
-            let is_edit = diff.is_some() || matches!(name.as_str(), "edit" | "write_file");
+            let is_edit =
+                diff.is_some() || matches!(name.as_str(), "edit" | "write_file" | "apply_patch");
             let icon = match status.as_str() {
                 "completed" if is_edit => "✎",
                 "completed" => "✓",
@@ -10317,6 +10318,41 @@ mod tests {
             text[1..].iter().all(|line| line.starts_with("    │ ")),
             "{text:?}"
         );
+    }
+
+    #[test]
+    fn apply_patch_renders_the_diff_and_status_of_a_partial_result() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::{ToolName, ToolRequest};
+        let workspace = tempfile::tempdir().unwrap();
+        let request = ToolRequest {
+            id: "patch".into(),
+            name: ToolName::ApplyPatch,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(serde_json::json!({"input": "*** Begin Patch\n*** Add File: first.txt\n+hello\n*** Add File: second.txt\n+world\n*** Add File: last.txt\n+later\n*** End Patch"}).to_string()),
+        };
+        let patch = orca_tools::apply_patch::prepare(&request, workspace.path(), || false).unwrap();
+        std::fs::write(workspace.path().join("second.txt"), "existing\n").unwrap();
+        let result = patch.commit(&request, || false);
+        let message = ChatMessage::ToolCall {
+            id: result.id.clone(),
+            name: result.name.as_str().into(),
+            target: None,
+            status: "failed".into(),
+            output: result.output.clone(),
+            diff: result
+                .file_change_preview
+                .as_ref()
+                .map(|preview| preview.display_text()),
+            kind: None,
+            expanded: true,
+        };
+        let text = message_text(None, &message).join("\n");
+        assert!(text.contains("Failed: second.txt"), "{text}");
+        assert!(text.contains("Not attempted: last.txt"), "{text}");
+        assert!(text.contains("+++ b/first.txt"), "{text}");
+        assert!(!text.contains("+++ b/second.txt"), "{text}");
     }
 
     #[test]

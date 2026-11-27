@@ -1572,6 +1572,7 @@ struct PersistedProviderResponse {
     identity: Option<ModelResponseIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cut_short: Option<orca_core::conversation::CutShort>,
+    background_patch: Option<crate::model_response::BackgroundPatchContext>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -6676,6 +6677,7 @@ impl PersistedProviderResponse {
             runtime_response.attempt_usage = attempt.usage;
         }
         runtime_response.cut_short = self.cut_short;
+        runtime_response.background_patch = self.background_patch;
         runtime_response
     }
 }
@@ -6700,6 +6702,7 @@ impl From<&RuntimeModelResponse> for PersistedProviderResponse {
             ),
             identity: Some(response.identity.clone()),
             cut_short: response.cut_short,
+            background_patch: response.background_patch,
         }
     }
 }
@@ -7193,7 +7196,7 @@ fn active_main_session_adoption_eligible(record: &TaskRecord) -> bool {
         && record.error.is_none()
 }
 
-fn pending_tool_call_from_provider_response(
+pub(crate) fn pending_tool_call_from_provider_response(
     response: &ProviderResponse,
 ) -> Option<PendingToolCallSummary> {
     response
@@ -8805,6 +8808,7 @@ mod tests {
             attempt_usage: None,
             identity: None,
             cut_short: None,
+            background_patch: None,
         }
         .into_runtime_response_with_migration_identity();
 

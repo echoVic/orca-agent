@@ -187,6 +187,19 @@ Each execution produces a **result object** containing:
 - `artifacts`: list of changed files, created files, etc.
 - `duration_ms`: execution time
 
+#### Multi-file patches
+
+`apply_patch` can add, update, delete, and move workspace files in one tool call. Enable it in your Orca configuration.
+
+```toml
+[tools]
+apply_patch = true
+```
+
+The tool takes a single `input` string containing the patch, from `*** Begin Patch` to `*** End Patch`. Orca checks every path and hunk before writing. If any check fails, the workspace stays untouched. If a write fails, Orca stops and reports which operations finished, which failed, and which it skipped. Expand the tool row to see the per-file diffs.
+
+`apply_patch` follows the same approval policy as `edit`. With file history enabled, `/rewind` can restore the files the patch changed.
+
 ### Phase 6: Result Integration
 
 Results are fed back into the context window for the next model call:

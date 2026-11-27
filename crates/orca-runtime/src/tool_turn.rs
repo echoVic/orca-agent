@@ -276,9 +276,10 @@ pub(crate) fn tool_start_boundary(
 ) -> crate::agent_continuation::ToolBoundary {
     use orca_core::tool_types::ReplaySemantics;
 
-    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+    let registry = orca_tools::registry::tool_registry_for_session(
         Some(mcp_registry),
         &config.external_tools,
+        config.tools.apply_patch,
     );
     let replay = registry
         .control_semantics(&request.name)
@@ -418,9 +419,10 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             .as_ref()
             .map(|_| crate::tool_execution::policy_for_tool_execution(config));
         let policy = current_policy.as_ref().unwrap_or(initial_policy);
-        let event_registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        let event_registry = orca_tools::registry::tool_registry_for_session(
             Some(mcp_registry),
             &config.external_tools,
+            config.tools.apply_patch,
         );
 
         if cancel.is_cancelled() {
@@ -480,7 +482,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             tool_policy,
             subagent_type,
             mcp_registry,
-            &config.external_tools,
+            config,
         ) {
             let error = result.error.clone();
             let event_error = emit_tool_terminal_events(
@@ -1516,9 +1518,10 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         provider_response_ingress,
     } = interactions;
     if let Some(error) = subagent_budget_exhaustion_error(config, tool_request, cost_tracker) {
-        let event_registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        let event_registry = orca_tools::registry::tool_registry_for_session(
             Some(mcp_registry),
             &config.external_tools,
+            config.tools.apply_patch,
         );
         let result = ToolResult::failed_before_start(tool_request, error.clone(), None);
         let event_error = emit_tool_terminal_events(

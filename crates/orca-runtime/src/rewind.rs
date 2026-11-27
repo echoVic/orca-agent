@@ -177,6 +177,7 @@ struct RewindTurnState {
     max_checkpoints: usize,
     start: Option<workspace_observation::Snapshot>,
     files: BTreeMap<String, CapturedFile>,
+    created_directories: BTreeSet<String>,
     limitations: BTreeSet<String>,
 }
 
@@ -237,9 +238,25 @@ pub(crate) fn begin_turn(
             max_checkpoints: settings.max_checkpoints,
             start,
             files: BTreeMap::new(),
+            created_directories: BTreeSet::new(),
             limitations: BTreeSet::new(),
         })),
     })
+}
+
+pub(crate) fn validate_patch_paths(
+    patch: &orca_tools::apply_patch::PreparedPatch,
+) -> Result<(), String> {
+    for (path, _) in patch.pre_images() {
+        if let Some(directory) = orca_rewind::excluded_directory(path) {
+            return Err(format!(
+                "rewind cannot restore {path}: directory {directory} is excluded"
+            ));
+        }
+        orca_rewind::resolve_inside(patch.root(), path)
+            .map_err(|error| format!("rewind cannot restore {path}: {error}"))?;
+    }
+    Ok(())
 }
 
 impl RewindTurn {
@@ -262,7 +279,55 @@ impl RewindTurn {
             return;
         };
         let mut state = lock_state(&self.inner);
-        let resolved = match resolve_request_path(&state.root, cwd, path) {
+        let resolved = resolve_request_path(&state.root, cwd, path);
+        Self::capture_path(&mut state, resolved);
+    }
+
+    pub(crate) fn prepare_patch_capture(
+        &self,
+        patch: &orca_tools::apply_patch::PreparedPatch,
+    ) -> io::Result<BTreeMap<String, PreImage>> {
+        let state = lock_state(&self.inner);
+        if patch.root() != state.root {
+            return Err(io::Error::other(
+                "patch workspace differs from the checkpoint workspace",
+            ));
+        }
+        let store = RewindStore::open(&state.store_dir)?;
+        patch
+            .pre_images()
+            .map(|(path, before)| {
+                let pre = match before {
+                    Some((text, mode)) => PreImage::Blob(store.put_bytes(text.as_bytes(), mode)?),
+                    None => PreImage::Missing,
+                };
+                Ok((path.to_owned(), pre))
+            })
+            .collect()
+    }
+
+    pub(crate) fn record_patch_effects(
+        &self,
+        mut capture: BTreeMap<String, PreImage>,
+        effects: &[orca_core::tool_types::FileEffect],
+    ) {
+        use orca_core::tool_types::FileEffect;
+        let mut state = lock_state(&self.inner);
+        for effect in effects {
+            let path = effect.path();
+            if matches!(effect, FileEffect::CreatedDirectory(_)) {
+                state.created_directories.insert(path.to_owned());
+            } else if let Some(pre) = capture.remove(path) {
+                state.files.entry(path.to_owned()).or_insert(CapturedFile {
+                    pre,
+                    post_sha256: None,
+                });
+            }
+        }
+    }
+
+    fn capture_path(state: &mut RewindTurnState, resolved: Result<(String, PathBuf), String>) {
+        let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(limitation) => {
                 state.limitations.insert(limitation);
@@ -377,7 +442,7 @@ impl RewindTurn {
                     }
                 }
             }
-            if state.files.is_empty() {
+            if state.files.is_empty() && state.created_directories.is_empty() {
                 None
             } else {
                 let change_stats = change_stats_for(&state.files, &root, &state.store_dir);
@@ -407,6 +472,7 @@ impl RewindTurn {
                     start_digest: None,
                     end_digest: None,
                     files,
+                    created_directories: state.created_directories.iter().cloned().collect(),
                     change_stats: Some(change_stats),
                     untracked,
                     limitations: limitations.into_iter().collect(),
@@ -1285,6 +1351,7 @@ fn snapshot_views(snapshots: &[FileSnapshotRecord]) -> Vec<SnapshotView> {
         .map(|snapshot| SnapshotView {
             ordinal: snapshot.ordinal,
             at_message_id: snapshot.at_message_id.clone(),
+            created_directories: snapshot.created_directories.clone(),
             files: snapshot
                 .files
                 .iter()
@@ -1305,7 +1372,7 @@ fn snapshot_views(snapshots: &[FileSnapshotRecord]) -> Vec<SnapshotView> {
 fn files_report_from_plan(plan: &RestorePlan) -> RewindFilesReport {
     RewindFilesReport {
         changed: plan.writes.len() as u64,
-        deleted: plan.deletes.len() as u64,
+        deleted: (plan.deletes.len() + plan.remove_directories.len()) as u64,
         unchanged: plan.unchanged,
         skipped: plan.skipped.iter().map(stored_skip).collect(),
     }
@@ -1536,6 +1603,7 @@ mod tests {
             );
             writer
                 .append_file_snapshot(FileSnapshotRecord {
+                    created_directories: Vec::new(),
                     schema_version: REWIND_SCHEMA_VERSION,
                     snapshot_id: format!("snap_{ordinal}"),
                     session_id: session_id.clone(),
@@ -1606,6 +1674,7 @@ mod tests {
             .into_owned();
         writer
             .append_file_snapshot(FileSnapshotRecord {
+                created_directories: Vec::new(),
                 schema_version: REWIND_SCHEMA_VERSION,
                 snapshot_id: "snap_drift".to_string(),
                 session_id: writer.session_id().expect("session id").to_string(),

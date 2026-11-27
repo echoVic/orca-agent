@@ -1221,6 +1221,10 @@ impl RuntimeTurnProviderCycleStep {
             .as_ref()
             .and_then(RuntimeTurnContinuation::preapproved_tool_call_id)
             .map(str::to_string);
+        let preapproved_patch = continuation
+            .as_ref()
+            .and_then(|continuation| continuation.response.background_patch)
+            .and_then(|patch| patch.fingerprint);
         let response = if let Some(continuation) = continuation {
             continuation.response
         } else {
@@ -1328,7 +1332,7 @@ impl RuntimeTurnProviderCycleStep {
         let (conversation, history_writer, checkpoint_observer) =
             input.conversation.parts_mut_with_checkpoint_observer();
         let mut kernel = RuntimeTurnKernel::from_extension_stores(input.extensions.stores());
-        kernel.set_preapproved_tool_call_id(preapproved_tool_call_id);
+        kernel.set_preapproved_tool_call_id(preapproved_tool_call_id, preapproved_patch);
         let step_context =
             RuntimeStepContext::from_snapshot(RuntimeStepSnapshot::new_with_capabilities(
                 input.config,

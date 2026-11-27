@@ -178,6 +178,16 @@ impl PathPolicy {
     ) -> Result<VerifiedPath, PlatformError> {
         windows::open_no_follow(path, self, access_mode, share_mode)
     }
+
+    /// Holds the opened path in place by excluding delete sharing.
+    #[cfg(windows)]
+    pub(crate) fn open_no_follow_pinned(
+        self,
+        path: &Path,
+        access_mode: u32,
+    ) -> Result<VerifiedPath, PlatformError> {
+        self.open_no_follow_shared(path, access_mode, windows::PINNED_SHARE_MODE)
+    }
 }
 
 pub struct VerifiedPath {
@@ -199,6 +209,11 @@ impl std::fmt::Debug for VerifiedPath {
 impl VerifiedPath {
     pub fn file(&self) -> &File {
         &self.file
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn into_file(self) -> File {
+        self.file
     }
 
     pub fn identity(&self) -> &PathIdentity {
@@ -459,6 +474,7 @@ mod windows {
     use super::*;
 
     pub(super) const DEFAULT_ACCESS_MODE: u32 = FILE_READ_ATTRIBUTES;
+    pub(super) const PINNED_SHARE_MODE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
     pub(super) const DEFAULT_SHARE_MODE: u32 =
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
@@ -474,7 +490,7 @@ mod windows {
                 path: path.to_string_lossy().into_owned(),
                 reason: "path is not valid UTF-8".to_string(),
             })?;
-        policy.identity(text)?;
+        let expected = policy.identity(text)?;
 
         let file = std::fs::OpenOptions::new()
             .access_mode(access_mode)
@@ -497,6 +513,12 @@ mod windows {
 
         let final_path = final_path_from_handle(&file)?;
         let identity = policy.identity(&final_path)?;
+        if pinned && identity != expected {
+            return Err(PlatformError::InvalidPathIdentity {
+                path: text.to_string(),
+                reason: "opened path differs from the verified path".to_string(),
+            });
+        }
         Ok(VerifiedPath {
             file,
             identity,

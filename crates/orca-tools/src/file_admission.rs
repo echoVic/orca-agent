@@ -138,7 +138,7 @@ pub(crate) fn open_regular_file(path: &Path) -> Result<(File, u64), FileAdmissio
     Ok((file, metadata.len()))
 }
 
-fn read_utf8_reader_with_limit(
+pub(crate) fn read_utf8_reader_with_limit(
     mut reader: impl Read,
     declared_bytes: u64,
     max_bytes: u64,
@@ -360,6 +360,22 @@ pub fn build_file_change_preview(
     before: Option<&str>,
     after: Option<&str>,
 ) -> FileChangePreview {
+    build_file_change_preview_with_headers(
+        path,
+        &format!("a/{path}"),
+        &format!("b/{path}"),
+        before,
+        after,
+    )
+}
+
+pub(crate) fn build_file_change_preview_with_headers(
+    path: &str,
+    old_header: &str,
+    new_header: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> FileChangePreview {
     if before.is_some_and(|text| text.len() > MAX_DIFF_INPUT_BYTES)
         || after.is_some_and(|text| text.len() > MAX_DIFF_INPUT_BYTES)
     {
@@ -374,7 +390,7 @@ pub fn build_file_change_preview(
     let diff = config.diff_lines(before.unwrap_or(""), after.unwrap_or(""));
     let full = diff
         .unified_diff()
-        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .header(old_header, new_header)
         .to_string();
     let (text, truncated) = truncate_output(full, MAX_DIFF_OUTPUT_BYTES);
     FileChangePreview::UnifiedDiff { text, truncated }

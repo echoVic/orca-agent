@@ -44,6 +44,7 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) execution_request: &'a tool_types::ToolRequest,
+    pub(crate) prepared_patch: Option<Arc<orca_tools::apply_patch::PreparedPatch>>,
     pub(crate) goal_mode: bool,
     pub(crate) headless: bool,
     pub(crate) subagent_depth: u32,
@@ -152,6 +153,7 @@ impl<'a> RuntimeToolRouter<'a> {
             events,
             sink,
             execution_request,
+            prepared_patch,
             goal_mode,
             headless,
             subagent_depth,
@@ -470,7 +472,7 @@ impl<'a> RuntimeToolRouter<'a> {
                             .unwrap_or(&self.runtime.thread_extensions)
                             .get_or_init(crate::git_write_command::GitMetadataWriteSession::default)
                     });
-                let invocation = RuntimeNormalToolInvocation::snapshot(
+                let mut invocation = RuntimeNormalToolInvocation::snapshot(
                     config,
                     execution_request,
                     cwd,
@@ -485,6 +487,7 @@ impl<'a> RuntimeToolRouter<'a> {
                 .with_terminal_service(terminal_service)
                 .with_git_metadata_write_session(git_metadata_write_session)
                 .with_owner(root_task_id);
+                invocation.prepared_patch = prepared_patch;
                 let output = {
                     // A piece that could not be recorded is dropped: the tool
                     // goes on, and its result is recorded as always.
@@ -743,6 +746,7 @@ mod tests {
                     events: &mut events,
                     sink: &mut sink,
                     execution_request: &request,
+                    prepared_patch: None,
                     goal_mode: false,
                     headless: false,
                     subagent_depth: depth,
@@ -873,6 +877,7 @@ mod tests {
                     events: &mut events,
                     sink: &mut sink,
                     execution_request: &request,
+                    prepared_patch: None,
                     goal_mode: false,
                     headless: false,
                     subagent_depth: 0,
@@ -1002,6 +1007,7 @@ mod tests {
                 events: &mut events,
                 sink: &mut sink,
                 execution_request: request,
+                prepared_patch: None,
                 goal_mode,
                 headless,
                 subagent_depth,

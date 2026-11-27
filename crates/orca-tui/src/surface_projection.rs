@@ -2321,7 +2321,9 @@ fn surface_thread_id_text(thread_id: &orca_runtime::surface::SurfaceThreadId) ->
 /// A tool row's diff and kind from the file change its result recorded.
 fn file_change_diff(file_change: Option<&SurfaceFileChange>) -> (Option<String>, Option<String>) {
     match file_change {
-        Some(SurfaceFileChange::UnifiedDiff { text, .. }) => (
+        Some(
+            SurfaceFileChange::UnifiedDiff { text, .. } | SurfaceFileChange::Patch { text, .. },
+        ) => (
             Some(text.as_str().to_string()),
             Some("file_change".to_string()),
         ),

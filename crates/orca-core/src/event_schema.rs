@@ -20,7 +20,7 @@ use crate::provider_types::{ProviderReplayState, ToolCallProgress};
 use crate::task_types::BackgroundTaskSummary;
 use crate::thread_identity::TurnId;
 use crate::thread_item_projection::{CompletedModelResponse, ModelResponseIdentity};
-use crate::tool_types::{FileChangePreview, ToolRequest, ToolResult, ToolTerminalSource};
+use crate::tool_types::{ToolRequest, ToolResult, ToolTerminalSource};
 use crate::verification::VerificationResult;
 
 pub const EVENT_SCHEMA_VERSION: &str = "1";
@@ -674,16 +674,11 @@ impl EventFactory {
         if result.terminal().source != ToolTerminalSource::Observed {
             payload["terminal_source"] = json!(result.terminal().source);
         }
+        if !result.file_effects.is_empty() {
+            payload["file_effects"] = json!(result.file_effects);
+        }
         if let Some(preview) = result.file_change_preview.as_deref() {
-            payload["diff"] = json!(match preview {
-                FileChangePreview::UnifiedDiff { text, .. } => text.clone(),
-                FileChangePreview::Omitted {
-                    path,
-                    max_input_bytes,
-                } => format!(
-                    "[Diff preview omitted for {path}: input exceeds {max_input_bytes} bytes]"
-                ),
-            });
+            payload["diff"] = json!(preview.display_text());
         }
         self.make(EventType::ToolCallCompleted, payload)
     }

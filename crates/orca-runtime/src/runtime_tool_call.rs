@@ -51,6 +51,7 @@ pub(crate) struct RuntimeReadonlyToolInvocation {
 
 pub(crate) struct RuntimeNormalToolInvocation {
     pub(crate) request: ToolRequest,
+    pub(crate) prepared_patch: Option<Arc<orca_tools::apply_patch::PreparedPatch>>,
     pub(crate) config: RunConfig,
     pub(crate) cwd: PathBuf,
     pub(crate) additional_roots: Vec<PathBuf>,
@@ -84,9 +85,10 @@ impl RuntimeNormalToolInvocation {
         task_registry: Option<&TaskRegistry>,
         permission_overlay: TurnPermissionOverlay,
     ) -> Self {
-        let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        let registry = orca_tools::registry::tool_registry_for_session(
             Some(mcp_registry),
             external_tools,
+            config.tools.apply_patch,
         );
         let control = registry
             .control_semantics(&request.name)
@@ -96,6 +98,7 @@ impl RuntimeNormalToolInvocation {
             });
         Self {
             request: request.clone(),
+            prepared_patch: None,
             config: config.clone(),
             cwd: cwd.to_path_buf(),
             additional_roots: additional_roots.to_vec(),
@@ -117,6 +120,7 @@ impl RuntimeNormalToolInvocation {
     pub(crate) fn clone_for_request(&self, request: &ToolRequest) -> RuntimeNormalToolInvocation {
         let mut clone = RuntimeNormalToolInvocation {
             request: request.clone(),
+            prepared_patch: None,
             config: self.config.clone(),
             cwd: self.cwd.clone(),
             additional_roots: self.additional_roots.clone(),
@@ -1252,6 +1256,7 @@ pub(crate) mod tests {
                 target: Some("printf test".to_string()),
                 raw_arguments: None,
             },
+            prepared_patch: None,
             config: test_config(),
             cwd: PathBuf::from("."),
             additional_roots: Vec::new(),

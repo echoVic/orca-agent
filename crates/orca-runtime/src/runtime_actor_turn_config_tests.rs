@@ -149,9 +149,10 @@ async fn foreground_response_classifies_external_tools_with_turn_override() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tool_approval_validates_external_tools_with_turn_override() {
-    for (action, expected) in [
-        (ActionKind::Write, surface::SurfaceToolAction::Write),
-        (ActionKind::Shell, surface::SurfaceToolAction::Shell),
+    for (action, expected, name) in [
+        (ActionKind::Write, surface::SurfaceToolAction::Write, "turn_tool"),
+        (ActionKind::Shell, surface::SurfaceToolAction::Shell, "turn_tool"),
+        (ActionKind::Write, surface::SurfaceToolAction::Write, "apply_patch"),
     ] {
         let cwd = tempfile::tempdir().unwrap();
         let mut actor = turn_config_actor(cwd.path());
@@ -164,6 +165,11 @@ async fn tool_approval_validates_external_tools_with_turn_override() {
         let intent = surface_user_turn_intent(&attachment.baseline.snapshot, "approve override");
         let mut active =
             admit_turn_config_operation_with_attachment(&mut actor, action, &attachment, intent);
+        if name == "apply_patch" {
+            active.config.external_tools[0].name = name.into();
+            actor.config.external_tools.clone_from(&active.config.external_tools);
+            actor.config.tools.apply_patch = true;
+        }
         let response = turn_config_response(&active);
         let fence = active.surface_operation.clone().unwrap();
         let response = actor
@@ -180,7 +186,7 @@ async fn tool_approval_validates_external_tools_with_turn_override() {
                 id: "turn-tool-approval".into(),
                 action,
                 description: "Approve turn-only external tool".into(),
-                tool: Some("turn_tool".into()),
+                tool: Some(name.into()),
                 target: None,
                 preview: None,
             },
@@ -205,6 +211,9 @@ async fn tool_approval_validates_external_tools_with_turn_override() {
             panic!("expected tool approval");
         };
         assert_eq!(tool.action, expected);
+        if name == "apply_patch" {
+            assert_eq!(interaction.recovery_disposition, surface::InteractionUnavailableDisposition::FailOperation);
+        }
         committed_surface_value(
             actor
                 .respond_surface_interaction_by_id(
@@ -238,7 +247,7 @@ fn record_legacy_turn_tool_approval(
 ) {
     let snapshot = actor.resident_surface.coordinator.state().snapshot();
     let tool = actor
-        .surface_tool_for_runtime_request(snapshot, &fence, request, &active.config.external_tools)
+        .surface_tool_for_runtime_request(snapshot, &fence, request, &active.config)
         .unwrap();
     let authority = ThreadActor::surface_authority_for_tool(snapshot, &fence, &tool).unwrap();
     let intent = surface::ToolInvocationIntent::before_invocation(tool.clone(), authority.clone());
@@ -696,6 +705,7 @@ async fn background_response_classifies_external_tools_with_turn_override() {
             task_registry: active.task_registry.clone(),
             external_tools: active.config.external_tools.clone(),
             reply_journal: None,
+            apply_patch: active.config.tools.apply_patch,
             outcome: Arc::new(Mutex::new(Some(TypedProviderBackgroundOutcome {
                 response: Some(response),
                 status: RunStatus::Success,

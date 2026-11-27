@@ -769,8 +769,13 @@ impl<'a> RuntimeTaskActor<'a> {
         let Some(approval) = approval else {
             return RuntimeApprovalDecision::NotRequired;
         };
-        let resolution =
-            policy.resolve_for_tool(&approval, request.name.as_str(), request.target.as_deref());
+        let resolution = crate::runtime_approval::resolve_for_request(
+            policy,
+            &approval,
+            &[],
+            request.name.as_str(),
+            request.target.as_deref(),
+        );
         match resolution.decision {
             ApprovalDecision::Allow => RuntimeApprovalDecision::Allowed(resolution),
             ApprovalDecision::Ask => RuntimeApprovalDecision::Ask(approval),

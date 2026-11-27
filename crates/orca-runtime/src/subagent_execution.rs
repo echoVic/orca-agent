@@ -346,9 +346,10 @@ fn execute_subagent_batch(
     );
     let batch_id = uuid::Uuid::now_v7().to_string();
 
-    let event_registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+    let event_registry = orca_tools::registry::tool_registry_for_session(
         Some(mcp_registry),
         &config.external_tools,
+        config.tools.apply_patch,
     );
     for (idx, tool_request) in tool_requests.iter().enumerate() {
         if event_error.is_some() {

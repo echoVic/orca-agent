@@ -106,6 +106,7 @@ pub enum ToolName {
     TaskSendInput,
     TaskWait,
     Edit,
+    ApplyPatch,
     WriteFile,
     GitStatus,
     RunScript,
@@ -230,6 +231,7 @@ impl ToolName {
             Self::TaskSendInput => "task_send_input",
             Self::TaskWait => "task_wait",
             Self::Edit => "edit",
+            Self::ApplyPatch => "apply_patch",
             Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
             Self::RunScript => "run_script",
@@ -284,6 +286,7 @@ impl ToolName {
             Self::TaskSendInput => "task_send_input",
             Self::TaskWait => "task_wait",
             Self::Edit => "edit",
+            Self::ApplyPatch => "apply_patch",
             Self::WriteFile => "write_file",
             Self::GitStatus => "git_status",
             Self::RunScript => "run_script",
@@ -689,6 +692,9 @@ impl ToolStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileChangePreview {
+    Patch {
+        text: String,
+    },
     UnifiedDiff {
         text: String,
         truncated: bool,
@@ -697,6 +703,27 @@ pub enum FileChangePreview {
         path: String,
         max_input_bytes: usize,
     },
+}
+
+impl FileChangePreview {
+    pub fn patch_diff(&self) -> Option<&str> {
+        match self {
+            Self::Patch { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    pub fn display_text(&self) -> String {
+        match self {
+            Self::UnifiedDiff { text, .. } | Self::Patch { text } => text.clone(),
+            Self::Omitted {
+                path,
+                max_input_bytes,
+            } => {
+                format!("[Diff preview omitted for {path}: input exceeds {max_input_bytes} bytes]")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -905,6 +932,22 @@ impl ToolServiceUsage {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "path", rename_all = "snake_case")]
+pub enum FileEffect {
+    Written(String),
+    Deleted(String),
+    CreatedDirectory(String),
+}
+
+impl FileEffect {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Written(path) | Self::Deleted(path) | Self::CreatedDirectory(path) => path,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolResult {
     pub id: String,
@@ -918,6 +961,8 @@ pub struct ToolResult {
     pub file_change_preview: Option<Arc<FileChangePreview>>,
     #[serde(skip)]
     pub touched_file: Option<PathBuf>,
+    #[serde(skip)]
+    pub file_effects: Vec<FileEffect>,
     /// What the tool wrote for the person watching while it ran, when that
     /// is to be kept with the conversation. It is never sent to the model.
     /// Only `run_script` sets it, to the lines that say what its calls did.
@@ -1007,6 +1052,7 @@ impl ToolResult {
             images: Vec::new(),
             file_change_preview: None,
             touched_file: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1030,6 +1076,7 @@ impl ToolResult {
             images: Vec::new(),
             file_change_preview: None,
             touched_file: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1068,6 +1115,7 @@ impl ToolResult {
             images: Vec::new(),
             file_change_preview: None,
             touched_file: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1124,6 +1172,7 @@ impl ToolResult {
             images: Vec::new(),
             file_change_preview: None,
             touched_file: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1147,6 +1196,7 @@ impl ToolResult {
             images: Vec::new(),
             file_change_preview: None,
             touched_file: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1170,6 +1220,7 @@ impl ToolResult {
             images: Vec::new(),
             file_change_preview: None,
             touched_file: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1206,6 +1257,7 @@ impl ToolResult {
             images: Vec::new(),
             file_change_preview: None,
             touched_file: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1253,6 +1305,7 @@ impl ToolResult {
             images: Vec::new(),
             file_change_preview: None,
             touched_file: None,
+            file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),

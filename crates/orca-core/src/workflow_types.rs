@@ -230,6 +230,12 @@ pub struct WorkflowEvidenceToolEvent {
     pub error: Option<String>,
     #[serde(default)]
     pub is_mcp: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub file_effect_count: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
