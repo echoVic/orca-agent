@@ -1020,12 +1020,12 @@ impl RuntimeProviderResponseStep {
             ));
         }
         if step_snapshot.turn_context.emit_deltas {
-            sink.emit(completion_event)?;
             if !events.has_publication_store()
                 && let Some(writer) = history_writer.as_deref_mut()
             {
                 writer.append_message(&completed_response.assistant_message())?;
             }
+            sink.emit(completion_event)?;
         }
         record_assistant_response_for_agent(
             conversation,
@@ -3082,6 +3082,15 @@ mod tests {
 
     #[test]
     fn provider_response_step_records_final_assistant_message() {
+        check_provider_response_publication(false);
+    }
+
+    #[test]
+    fn provider_response_waits_for_history_before_publishing_completion() {
+        check_provider_response_publication(true);
+    }
+
+    fn check_provider_response_publication(fail_append: bool) {
         let config = config();
         let response = ProviderResponse {
             steps: vec![ProviderStep::MessageDelta("done".to_string())],
@@ -3091,6 +3100,15 @@ mod tests {
             usage: None,
         };
         let cwd = tempfile::tempdir().expect("cwd");
+        let mut history_writer = fail_append.then(|| {
+            let home = tempfile::tempdir().unwrap();
+            let _home = crate::history::redirect_test_orca_home(home.path());
+            let mut writer = SessionWriter::start(cwd.path(), "mock", None, "completion").unwrap();
+            writer.enter_turn(orca_core::thread_identity::TurnId::new());
+            std::fs::remove_file(writer.path()).unwrap();
+            std::fs::create_dir(writer.path()).unwrap();
+            (home, writer)
+        });
         let mut events = EventFactory::new("provider-response-final".to_string());
         let mut output = Vec::new();
         let mut sink = EventSink::new(&mut output, OutputFormat::Jsonl);
@@ -3131,36 +3149,44 @@ mod tests {
             first_delta_ms: Some(275),
             first_delta_kind: Some("text"),
         });
-        let outcome = RuntimeProviderResponseStep::new()
-            .handle(
-                response,
-                RuntimeProviderResponseInput {
-                    step_context,
-                    sampling_state: &mut sampling_state,
-                    operation: &mut crate::operation_context::OperationContext::for_tests(
-                        orca_core::budget::BudgetSpec::default(),
-                        "provider-response-test",
-                    ),
-                    io: RuntimeProviderResponseIo {
-                        events: &mut events,
-                        sink: &mut sink,
-                        conversation: &mut conversation,
-                        history_writer: None,
-                        cost_tracker: &mut cost_tracker,
-                        background_workflows: &mut background_workflows,
-                        checkpoint_observer: None,
-                    },
+        let outcome = RuntimeProviderResponseStep::new().handle(
+            response,
+            RuntimeProviderResponseInput {
+                step_context,
+                sampling_state: &mut sampling_state,
+                operation: &mut crate::operation_context::OperationContext::for_tests(
+                    orca_core::budget::BudgetSpec::default(),
+                    "provider-response-test",
+                ),
+                io: RuntimeProviderResponseIo {
+                    events: &mut events,
+                    sink: &mut sink,
+                    conversation: &mut conversation,
+                    history_writer: history_writer.as_mut().map(|(_, writer)| writer),
+                    cost_tracker: &mut cost_tracker,
+                    background_workflows: &mut background_workflows,
+                    checkpoint_observer: None,
                 },
-                RuntimeProviderResponseExecutors {
-                    workflow_child_executor: unused_child_executor::<
-                        crate::workflow::runner::SharedEventBuffer,
-                    >,
-                    batch_child_executor: unused_child_executor::<io::Sink>,
-                },
-            )
-            .expect("handle provider response");
+            },
+            RuntimeProviderResponseExecutors {
+                workflow_child_executor: unused_child_executor::<
+                    crate::workflow::runner::SharedEventBuffer,
+                >,
+                batch_child_executor: unused_child_executor::<io::Sink>,
+            },
+        );
 
-        match outcome {
+        if fail_append {
+            assert!(outcome.is_err());
+            assert!(conversation.messages.is_empty());
+            drop(sink);
+            assert!(
+                output.is_empty(),
+                "completion was published before the history write"
+            );
+            return;
+        }
+        match outcome.expect("handle provider response") {
             RuntimeProviderResponseOutcome::Success { final_message } => {
                 assert_eq!(final_message.as_deref(), Some("done"));
             }

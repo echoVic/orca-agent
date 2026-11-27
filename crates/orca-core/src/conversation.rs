@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::approval_types::ActionKind;
 use crate::mcp_types::McpToolCatalog;
 use crate::tool_images::{MAX_REQUEST_TOOL_IMAGES, RetainedToolImages, keep_newest_tool_images};
-use crate::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminal, ToolTerminalSource};
+use crate::tool_types::{
+    ToolName, ToolRequest, ToolResult, ToolStatus, ToolTerminal, ToolTerminalSource,
+};
 
 /// The single conversation attachment target used by interactive surfaces.
 /// Keeping the target typed prevents parent, child and sibling navigation from
@@ -275,8 +277,16 @@ impl Message {
         match self {
             Self::System { pinned, .. }
             | Self::User { pinned, .. }
-            | Self::Assistant { pinned, .. }
-            | Self::Tool { pinned, .. } => *pinned,
+            | Self::Assistant { pinned, .. } => *pinned,
+            // Keep the matching call and receipt so the next session can restore its tools.
+            Self::Tool {
+                pinned, terminal, ..
+            } => {
+                *pinned
+                    || terminal.as_ref().is_some_and(|terminal| {
+                        terminal.status == ToolStatus::Completed && terminal.mcp_tool_load.is_some()
+                    })
+            }
         }
     }
 
@@ -1283,6 +1293,27 @@ mod tests {
             Message::Tool { terminal: Some(terminal), .. }
                 if terminal == result.terminal()
         ));
+    }
+
+    #[test]
+    fn mcp_tool_load_receipt_is_pinned_for_compaction_and_resume() {
+        let request = ToolRequest {
+            id: "load_1".to_string(),
+            name: ToolName::Mcp("mcp__catalog__load_tools".to_string()),
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"names":["lookup"]}"#.to_string()),
+        };
+        let result = ToolResult::completed(&request, "loaded".to_string(), false)
+            .with_mcp_tool_load(Some(crate::tool_types::McpToolLoad {
+                server: "catalog".to_string(),
+                names: ["lookup".to_string()].into_iter().collect(),
+            }));
+        let mut conversation = Conversation::new();
+
+        conversation.add_tool_result_with_terminal(&result, "loaded".to_string());
+
+        assert!(conversation.messages[0].is_pinned());
     }
 
     #[test]

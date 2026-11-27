@@ -4,6 +4,8 @@ use orca_approval::ApprovalPolicy;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
 use orca_core::event_schema::RunStatus;
+use orca_core::subagent_types::SubagentType;
+
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 use orca_provider::context::ContextConfig;
@@ -148,6 +150,28 @@ fn build_child_agent_loop_setup(
         orca_mcp::initialize_registry(&config.mcp_servers, config.mcp_credentials_path.clone());
     mcp_registry.wait_for_startup(&|| false);
     let mcp_registry = crate::mcp_startup::restore_tool_scope(mcp_registry, &conversation);
+    if let SubagentType::Custom(_) = request.subagent_type
+        && let Some(allowed) = &request.allowed_tools
+    {
+        // An explicit tool grant can stand alone when the agent cannot call its loader.
+        let tools = mcp_registry.agent_tools();
+        for (server, loader) in mcp_registry.on_demand_loaders() {
+            if allowed.contains(&loader) {
+                continue;
+            }
+            let names: Vec<_> = tools
+                .iter()
+                .filter(|(tool, deferred)| {
+                    *deferred && tool.server == server && allowed.contains(&tool.schema_name)
+                })
+                .map(|(tool, _)| tool.name.clone())
+                .collect();
+            if !names.is_empty() {
+                // These names came from this server's current listing.
+                let _ = mcp_registry.load_tools(&server, &names);
+            }
+        }
+    }
     let provider_tools = crate::extension::ExtensionData::new("child-session");
     let mut provider_config =
         child_provider_config(config, request, cwd, &mcp_registry, &provider_tools);

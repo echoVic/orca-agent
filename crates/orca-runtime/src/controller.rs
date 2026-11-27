@@ -3679,6 +3679,50 @@ while IFS= read -r line; do
 
     #[cfg(unix)]
     #[test]
+    fn a_custom_agent_can_use_an_explicit_mcp_tool_without_its_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(dir.path().into());
+        config.mcp_servers = vec![mcp_loading_mode(
+            delayed_mcp_server(dir.path(), 0, 2),
+            "on-demand",
+        )];
+        let mut request = crate::child_agent_types::ChildAgentRequest::new(
+            "Find a record".into(),
+            SubagentType::Custom("lookup".into()),
+            None,
+            1,
+            false,
+        );
+        let tool = "mcp__catalog__lookup_01";
+        request.allowed_tools = Some(vec![tool.into()]);
+        let setup = crate::child_agent_loop_setup::prepare_child_agent_loop(
+            &config,
+            &request,
+            dir.path(),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+        );
+        let names: Vec<_> = setup
+            .provider_config
+            .tools_override
+            .unwrap()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(names, [tool]);
+        assert!(setup.mcp_registry.resolve_agent_tool(tool).is_some());
+        assert!(
+            setup
+                .mcp_registry
+                .resolve_agent_tool("mcp__catalog__lookup_00")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn subagents_start_with_nothing_loaded() {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::history::redirect_test_orca_home(dir.path());
