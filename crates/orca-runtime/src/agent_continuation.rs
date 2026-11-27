@@ -3116,15 +3116,17 @@ impl ChildAgentCoordinator {
         validate_resume_request(&record, &validation_input)?;
 
         if record.current_attempt.prompt_id == input.prompt_id {
+            let prepared = self.prepare_record(&record)?;
             self.install_projection(&record)?;
-            return self.prepare_record(&record);
+            return Ok(prepared);
         }
 
         let now_ms = continuation_now_ms();
         reject_live_owner(&record, now_ms)?;
         ensure_record_resumable(&record)?;
         let expected_revision = record.revision;
-        let previous = PreparedContinuation::from(&record);
+        let previous = self.prepare_record(&record)?;
+        let fork_prefix = previous.fork_prefix.clone();
         let prompt_id = input.prompt_id;
         let task_id = input.task_id;
         let parent_task_id = input.parent_task_id;
@@ -3167,7 +3169,10 @@ impl ChildAgentCoordinator {
                     Ok(())
                 })?;
         self.install_projection(&committed)?;
-        self.prepare_record(&committed)
+        Ok(PreparedContinuation {
+            fork_prefix,
+            ..PreparedContinuation::from(&committed)
+        })
     }
 
     fn validate_recorded_parent_recovery(
@@ -4965,6 +4970,72 @@ mod tests {
                 corrupt_record(problem)
             );
         }
+    }
+
+    #[test]
+    fn a_missing_fork_prefix_leaves_the_continuation_resumable() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let child = create_test_fork(&registry);
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let lease = coordinator.acquire(&child).unwrap();
+        let saved = coordinator
+            .commit_checkpoint(
+                &lease,
+                lease.revision,
+                checkpoint(lease.attempt_id.clone(), 0, 0),
+            )
+            .unwrap();
+        coordinator
+            .commit_terminal(
+                &lease,
+                saved.revision,
+                AgentTerminal::Completed { result: None },
+            )
+            .unwrap();
+        let before = coordinator
+            .store
+            .load_record(&child.continuation_id)
+            .unwrap()
+            .unwrap();
+        let digest = before.fork_prefix_ref.unwrap();
+        fs::remove_file(fork_prefix_path(root.path(), "parent", digest)).unwrap();
+        let task = test_continuation_input(&registry);
+        let input = ResumeContinuationInput {
+            selector: child.continuation_id.to_string(),
+            parent_task_id: task.parent_task_id,
+            task_id: task.task_id,
+            prompt_id: task.prompt_id,
+            compatibility: child.compatibility,
+        };
+
+        assert_eq!(
+            coordinator.prepare_resume(input.clone()).unwrap_err(),
+            corrupt_record("referenced fork prefix is missing")
+        );
+        assert_eq!(
+            coordinator
+                .store
+                .load_record(&child.continuation_id)
+                .unwrap(),
+            Some(before)
+        );
+
+        assert_eq!(
+            coordinator
+                .store
+                .store_fork_prefix(test_fork_prefix())
+                .unwrap(),
+            digest
+        );
+        let resumed = coordinator
+            .prepare_resume(ResumeContinuationInput {
+                prompt_id: AgentPromptId::new(),
+                ..input
+            })
+            .unwrap();
+        assert_eq!(resumed.fork_prefix, child.fork_prefix);
+        assert_ne!(resumed.attempt_id, child.attempt_id);
     }
 
     #[test]
