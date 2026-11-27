@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Mutex, OnceLock};
@@ -1783,17 +1783,37 @@ fn partition_for_compaction(
     let newest = units.len().checked_sub(1)?;
     let current_opener = units.iter().rposition(|unit| unit.opens_turn);
     let tokens = |message: &Message| message_tokens_with_counter(message, counter);
+    // Forks keep the inherited prompt. Retain the latest notice for each
+    // section, including removals, even when its surrounding turn is cut.
+    let mut latest_prompt_updates = HashSet::new();
+    if conversation.fork_prefix.is_some() && conversation.compaction_system_prompt.is_none() {
+        let mut seen_sections = HashSet::new();
+        for (index, message) in messages.iter().enumerate().rev() {
+            if let Some(record) = message
+                .system_prompt_record()
+                .filter(|record| record.update)
+            {
+                for section in &record.sections {
+                    if seen_sections.insert(section.name.as_str()) {
+                        latest_prompt_updates.insert(index);
+                    }
+                }
+            }
+        }
+    }
+    let keep_message =
+        |index: usize| messages[index].is_pinned() || latest_prompt_updates.contains(&index);
     let cost = |unit: &CompactionUnit| {
         messages[unit.range.clone()]
             .iter()
             .map(tokens)
             .sum::<usize>()
     };
-    let pinned_cost = |unit: &CompactionUnit| {
-        messages[unit.range.clone()]
-            .iter()
-            .filter(|message| message.is_pinned())
-            .map(tokens)
+    let retained_cost = |unit: &CompactionUnit| {
+        unit.range
+            .clone()
+            .filter(|&index| keep_message(index))
+            .map(|index| tokens(&messages[index]))
             .sum::<usize>()
     };
     let image_cost = |unit: &CompactionUnit| {
@@ -1828,7 +1848,13 @@ fn partition_for_compaction(
         + units
             .iter()
             .zip(&retain)
-            .map(|(unit, keep)| if *keep { cost(unit) } else { pinned_cost(unit) })
+            .map(|(unit, keep)| {
+                if *keep {
+                    cost(unit)
+                } else {
+                    retained_cost(unit)
+                }
+            })
             .sum::<usize>();
 
     let image_allowance = MAX_HISTORY_IMAGE_TOKENS.min(target_tokens / 4);
@@ -1838,7 +1864,7 @@ fn partition_for_compaction(
             continue;
         }
         let unit = &units[index];
-        let unit_cost = cost(unit).saturating_sub(pinned_cost(unit));
+        let unit_cost = cost(unit).saturating_sub(retained_cost(unit));
         if budget.saturating_add(unit_cost) > target_tokens
             || retained_history_images + image_cost(unit) > image_allowance
         {
@@ -1854,11 +1880,11 @@ fn partition_for_compaction(
     let mut collapsed = vec![];
     let mut cut = prefix.len();
     for (unit, keep) in units.iter().zip(retain) {
-        for message in &messages[unit.range.clone()] {
-            if keep || message.is_pinned() {
-                kept.push(message.clone());
+        for index in unit.range.clone() {
+            if keep || keep_message(index) {
+                kept.push(messages[index].clone());
             } else {
-                collapsed.push(message.clone());
+                collapsed.push(messages[index].clone());
                 cut = unit.range.end;
             }
         }
