@@ -943,6 +943,7 @@ fn legacy_terminal_reconciliation_digest(
 #[derive(Clone, Debug)]
 pub struct TaskRecord {
     pub id: String,
+    registry_owner: Option<crate::task_owner::OwnerStamp>,
     pub parent_task_id: Option<String>,
     pub task_type: TaskType,
     pub status: TaskStatus,
@@ -1508,11 +1509,14 @@ pub(crate) fn async_worker_job_name(agent_id: &str) -> String {
 struct TaskPersistence {
     root: PathBuf,
     session_id: String,
+    owner: Option<Arc<crate::task_owner::RegistryOwner>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedTaskRecord {
     id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registry_owner: Option<crate::task_owner::OwnerStamp>,
     #[serde(default)]
     parent_task_id: Option<String>,
     task_type: TaskType,
@@ -1742,7 +1746,7 @@ impl TaskRegistry {
         let continuation_store =
             AgentContinuationStore::new_persistent(session_id.clone(), root.clone())
                 .map_err(io::Error::other)?;
-        let persistence = Arc::new(TaskPersistence::new(root, session_id.clone()));
+        let mut persistence = TaskPersistence::new(root, session_id.clone());
         let continuation_reconciliation = if recover_interrupted {
             Some(
                 continuation_store
@@ -1760,6 +1764,12 @@ impl TaskRegistry {
         } else {
             None
         };
+        let owner = Arc::new(crate::task_owner::RegistryOwner::acquire(
+            &persistence.root,
+            &session_id,
+        )?);
+        persistence.owner = Some(owner.clone());
+        let persistence = Arc::new(persistence);
         let typed_provider_outcomes =
             persistence.load_typed_provider_outcomes_unlocked(&session_id)?;
         let detached_bindings = persistence.load_detached_bindings_unlocked(&session_id)?;
@@ -1814,6 +1824,7 @@ impl TaskRegistry {
             for (task_id, record) in &mut records {
                 if !reconciled_task_ids.contains(task_id)
                     && !typed_provider_outcomes.contains_key(task_id)
+                    && !persistence.has_live_owner(record)
                 {
                     changed |= mark_interrupted_if_active(record);
                 }
@@ -1822,6 +1833,7 @@ impl TaskRegistry {
         if changed {
             persistence.write_session_records_unlocked(&session_id, &records)?;
         }
+        owner.sweep_locks(&persistence.root);
         drop(_session_lock);
         Ok(Self {
             session_id,
@@ -1927,6 +1939,14 @@ impl TaskRegistry {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    fn owner_stamp(&self) -> Option<crate::task_owner::OwnerStamp> {
+        self.persistence
+            .as_ref()?
+            .owner
+            .as_ref()
+            .map(|owner| owner.stamp.clone())
     }
 
     /// Output is owned by this task session, never by a caller-supplied task path.
@@ -3070,6 +3090,7 @@ impl TaskRegistry {
             if record.stop_requested {
                 return Err(TaskLeaseError::Fenced);
             }
+            record.registry_owner = self.owner_stamp();
             record.blocker = None;
             record.status = TaskStatus::Running;
             if record.started_at_ms.is_none() {
@@ -3417,6 +3438,7 @@ impl TaskRegistry {
             .expect("submission sequence persistence failed");
         let record = TaskRecord {
             id: id.clone(),
+            registry_owner: self.owner_stamp(),
             sequence,
             parent_task_id: None,
             task_type: TaskType::Workflow,
@@ -3564,6 +3586,7 @@ impl TaskRegistry {
             .expect("submission sequence persistence failed");
         let record = TaskRecord {
             id: id.clone(),
+            registry_owner: self.owner_stamp(),
             sequence,
             parent_task_id,
             task_type: TaskType::Subagent,
@@ -3705,6 +3728,7 @@ impl TaskRegistry {
             .expect("submission sequence persistence failed");
         let record = TaskRecord {
             id: id.clone(),
+            registry_owner: self.owner_stamp(),
             sequence,
             parent_task_id: None,
             task_type: TaskType::MainSession,
@@ -3800,6 +3824,7 @@ impl TaskRegistry {
             .expect("submission sequence persistence failed");
         let record = TaskRecord {
             id: id.clone(),
+            registry_owner: self.owner_stamp(),
             sequence,
             parent_task_id: None,
             task_type: TaskType::Shell,
@@ -4865,6 +4890,7 @@ impl TaskRegistry {
                 return Err(task_state_error("mark_running", record.status));
             }
 
+            record.registry_owner = self.owner_stamp();
             record.blocker = None;
             record.status = TaskStatus::Running;
             if record.started_at_ms.is_none() {
@@ -6183,7 +6209,20 @@ fn map_task_transcript_continuation_error(
 
 impl TaskPersistence {
     fn new(root: PathBuf, session_id: String) -> Self {
-        Self { root, session_id }
+        Self {
+            root,
+            session_id,
+            owner: None,
+        }
+    }
+
+    fn has_live_owner(&self, record: &TaskRecord) -> bool {
+        !is_terminal(record.status)
+            && self
+                .owner
+                .as_ref()
+                .zip(record.registry_owner.as_ref())
+                .is_some_and(|(owner, stamp)| owner.alive(&self.root, stamp))
     }
 
     fn write_current_task(&self, record: &TaskRecord) -> io::Result<()> {
@@ -6280,6 +6319,7 @@ impl TaskPersistence {
         };
         if recover_interrupted
             && session_id != requesting_session_id
+            && !self.has_live_owner(record)
             && mark_interrupted_if_active(record)
         {
             self.write_session_records_unlocked(&session_id, &records)?;
@@ -6581,6 +6621,7 @@ impl PersistedTaskRecord {
             .transpose();
         let mut record = TaskRecord {
             id: self.id,
+            registry_owner: self.registry_owner,
             parent_task_id: self.parent_task_id,
             task_type: self.task_type,
             status: self.status,
@@ -6693,6 +6734,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
     fn from(record: &TaskRecord) -> Self {
         Self {
             id: record.id.clone(),
+            registry_owner: record.registry_owner.clone(),
             parent_task_id: record.parent_task_id.clone(),
             task_type: record.task_type,
             status: record.status,
@@ -9050,6 +9092,7 @@ mod tests {
         let task =
             registry.create_subagent("inspect auth".to_string(), Some("general".to_string()));
         registry.mark_running(&task.id).unwrap();
+        drop(registry);
 
         let reloaded =
             TaskRegistry::new_persistent("session-2".to_string(), temp.path().join("tasks"))

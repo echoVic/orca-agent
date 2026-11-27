@@ -664,7 +664,7 @@ fn validate_id(value: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn prepare_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
     check_components(path)?;
     if !path.exists() {
         let mut builder = fs::DirBuilder::new();
@@ -680,7 +680,7 @@ fn prepare_directory(path: &Path) -> io::Result<()> {
     check_private(&fs::symlink_metadata(path)?, true)
 }
 
-fn check_components(path: &Path) -> io::Result<()> {
+pub(crate) fn check_components(path: &Path) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(invalid("task output root must be absolute"));
     }

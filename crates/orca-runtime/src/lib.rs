@@ -375,6 +375,7 @@ pub mod subagent_async_worker;
 pub mod subagent_execution;
 mod system_prompt;
 pub mod task_output;
+mod task_owner;
 pub mod tasks;
 pub mod termination_signals;
 pub mod thread;

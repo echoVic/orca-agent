@@ -6,6 +6,7 @@ mod persistence;
 pub(crate) use persistence::ArchivedShell;
 use persistence::OutputArchive;
 
+pub(crate) use persistence::{check_components, prepare_directory};
 pub const DEFAULT_TASK_OUTPUT_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RETAINED_CHUNKS: usize = 32 * 1024;
 
