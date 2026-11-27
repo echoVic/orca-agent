@@ -104,10 +104,10 @@ own system prompt and a standalone brief. Use `"context": "fork"` when the
 child needs evidence from earlier turns of the parent conversation.
 
 A fork starts with the parent's DeepSeek system prompt, ordered tools, and
-completed history as sent to DeepSeek. Orca excludes the current turn and
-appends the task and role instructions as a user message. The parent's goal
-and plan overlays, MCP instructions and catalogs, and request-only hook and
-directive fragments after the cut stay with the parent. The child uses the
+completed history. Orca excludes the current turn and appends the task and
+role instructions as a user message. The child sends only changes to context
+fragments that the inherited history already contains. The parent's plan,
+MCP instructions, and request-only context after the cut stay with the parent. The child uses the
 parent's model and reasoning effort, so omit `model`. The inherited catalog
 can show tools outside the child's role. Orca returns the role's refusal to
 the child so it can continue. The child's transcript and result begin with
@@ -117,8 +117,10 @@ If Orca has no completed parent turn or cannot recover its request prefix, it
 starts a fresh child and includes a note. A fork requires a compatible parent
 DeepSeek model and endpoint. Use `resume_from` by itself to continue an existing
 child. Sibling forks in the same session share one saved copy of the prefix.
-Orca keeps that copy for the lifetime of the parent session because queued
-launches and resumable children can still need it after a restart. In Orca
+Orca keeps a private, redacted copy for queued launches and resumption. A
+child started in the parent's process uses the original captured request. If
+an inherited instruction source loses trust, the child continues from its own
+history with a rebuilt prompt. In Orca
 0.5.25, a fork child resumes from its own transcript without the inherited
 history. A newer build can restore the saved prefix again after upgrading.
 

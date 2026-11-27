@@ -22,6 +22,8 @@ pub struct SubagentRequest {
     pub(crate) context: RoleContextPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) fork_prefix_ref: Option<crate::runtime_surface::Sha256Digest>,
+    #[serde(skip)]
+    pub(crate) captured_fork_prefix: Option<std::sync::Arc<ProviderForkPrefix>>,
     pub mode: SubagentMode,
     pub isolation: SubagentIsolation,
     pub schema: Option<Value>,
@@ -113,6 +115,7 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         model,
         context,
         fork_prefix_ref: None,
+        captured_fork_prefix: None,
         mode,
         isolation,
         schema,
@@ -158,9 +161,10 @@ pub(crate) fn prepare_fork_request(
     request.fork_prefix_ref = Some(
         task_registry
             .continuation_store()?
-            .store_fork_prefix(prefix)
+            .store_fork_prefix(prefix.clone())
             .map_err(|error| error.to_string())?,
     );
+    request.captured_fork_prefix = Some(std::sync::Arc::new(prefix));
     Ok(None)
 }
 

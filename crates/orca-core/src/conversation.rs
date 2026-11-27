@@ -681,6 +681,9 @@ pub struct ProviderForkPrefix {
     pub estimated_tokens: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_messages: Vec<ForkSystemMessage>,
+    /// The saved copy may differ from the original request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted: bool,
 }
 
 impl fmt::Debug for ProviderForkPrefix {
@@ -689,6 +692,7 @@ impl fmt::Debug for ProviderForkPrefix {
             .debug_struct("ProviderForkPrefix")
             .field("model", &self.model)
             .field("message_count", &self.messages.len())
+            .field("redacted", &self.redacted)
             .field("tool_count", &self.tools.len())
             .finish_non_exhaustive()
     }

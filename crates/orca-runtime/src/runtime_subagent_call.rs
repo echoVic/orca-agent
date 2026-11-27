@@ -1627,6 +1627,7 @@ fn run_subagent_worker(
         model: requested_model,
         context: _,
         fork_prefix_ref,
+        captured_fork_prefix,
         mode: _,
         isolation: requested_isolation,
         schema,
@@ -1855,7 +1856,7 @@ fn run_subagent_worker(
                 .or_else(|_| coordinator.create_with_fork(input, fork_prefix_ref))
         }
     };
-    let prepared = match prepared {
+    let mut prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             let worktree = worktree_execution.finish();
@@ -1872,6 +1873,9 @@ fn run_subagent_worker(
             );
         }
     };
+    if let Some(prefix) = captured_fork_prefix {
+        prepared.fork_prefix = Some(prefix);
+    }
     let lease = match coordinator
         .acquire(&prepared)
         .or_else(|_| coordinator.acquire(&prepared))

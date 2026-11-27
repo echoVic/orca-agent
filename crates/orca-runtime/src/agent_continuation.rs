@@ -37,7 +37,7 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_images::RESUMED_TOOL_IMAGE_NOTE;
 use orca_core::tool_types::{ToolResultKind, ToolStatus, ToolTerminal, ToolTerminalSource};
 use orca_mcp::McpRegistry;
-use orca_platform::fs::{AtomicWritePolicy, ExclusiveFileLock, atomic_write};
+use orca_platform::fs::{AtomicWritePolicy, ExclusiveFileLock, atomic_write, atomic_write_private};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::runtime_surface::Sha256Digest;
@@ -1703,6 +1703,14 @@ impl AgentContinuationStore {
         &self,
         prefix: ProviderForkPrefix,
     ) -> Result<Sha256Digest, AgentContinuationError> {
+        let mut prefix = prefix;
+        if matches!(
+            self.backend,
+            AgentContinuationStoreBackend::Persistent { .. }
+        ) {
+            crate::fork_context::redact_for_storage(&mut prefix)
+                .map_err(|_| persistence_error("redact fork prefix"))?;
+        }
         let bytes =
             serde_json::to_vec(&prefix).map_err(|_| persistence_error("serialize fork prefix"))?;
         let digest = Sha256Digest::digest(&bytes);
@@ -1723,7 +1731,7 @@ impl AgentContinuationStore {
                     fs::create_dir_all(path.parent().expect("fork prefix directory")).map_err(
                         |error| persistence_io_error("create fork prefix directory", &error),
                     )?;
-                    atomic_write(&path, &bytes, AtomicWritePolicy::NoFollow)
+                    atomic_write_private(&path, &bytes, AtomicWritePolicy::NoFollow)
                         .map_err(|_| persistence_error("write fork prefix"))?;
                 }
             }
@@ -1745,9 +1753,11 @@ impl AgentContinuationStore {
                 let path = fork_prefix_path(root, &self.parent_session_id, digest);
                 let bytes = read_fork_prefix_bytes(&path, digest)?
                     .ok_or_else(|| corrupt_record("referenced fork prefix is missing"))?;
-                serde_json::from_slice(&bytes)
-                    .map(Arc::new)
-                    .map_err(|_| corrupt_record("fork prefix does not match its schema"))
+                let mut prefix = serde_json::from_slice(&bytes)
+                    .map_err(|_| corrupt_record("fork prefix does not match its schema"))?;
+                crate::fork_context::redact_for_storage(&mut prefix)
+                    .map_err(|_| corrupt_record("fork prefix contains an invalid message"))?;
+                Ok(Arc::new(prefix))
             }
         }
     }
@@ -4640,6 +4650,92 @@ mod tests {
             tools: vec![],
             estimated_tokens: 15,
             system_messages: vec![],
+            redacted: false,
+        }
+    }
+
+    #[test]
+    fn fork_history_on_disk_is_redacted() {
+        use orca_core::conversation::{ContextFragmentChange, ForkSystemMessage};
+        let root = tempfile::tempdir().unwrap();
+        let store = AgentContinuationStore::new_persistent("parent".into(), root.path().to_owned())
+            .unwrap();
+        let marker = "fictional-fork-value";
+        let text = format!("token={marker}");
+        let content =
+            format!("Current memory context (this replaces any earlier version):\n{text}");
+        let mut prefix = test_fork_prefix();
+        let mut prompt = crate::system_prompt::SystemPrompt::default();
+        prompt.push("identity", &text);
+        let prompt = prompt.into_message();
+        prefix.messages = vec![
+            serde_json::json!({"role":"system", "content": prompt.content_str().unwrap()}).to_string(),
+            serde_json::json!({"role":"system", "content": content}).to_string(),
+            serde_json::json!({"role":"assistant", "reasoning_content":text, "tool_calls":[{
+                "id":"read", "type":"function", "function":{"name":"read_file", "arguments":serde_json::json!({"token":marker}).to_string()}
+            }]}).to_string(),
+        ];
+        prefix.system_messages = vec![
+            ForkSystemMessage {
+                index: 0,
+                context_fragments: vec![],
+                system_prompt: prompt.system_prompt_record().cloned().map(Box::new),
+            },
+            ForkSystemMessage {
+                index: 1,
+                context_fragments: vec![ContextFragmentChange {
+                    id: "memory".into(),
+                    digest: Some([42; 32]),
+                    span: Some(0..content.len()),
+                    redacted: false,
+                    instruction_scope: None,
+                }],
+                system_prompt: None,
+            },
+        ];
+        let unredacted = serde_json::to_vec(&prefix).unwrap();
+        let reference = store.store_fork_prefix(prefix.clone()).unwrap();
+        let file = fork_prefix_path(root.path(), "parent", reference);
+        let saved = fs::read_to_string(&file).unwrap();
+        assert!(!saved.contains(marker));
+        assert_ne!(reference, Sha256Digest::digest(&unredacted));
+        assert_eq!(reference, Sha256Digest::digest(saved.as_bytes()));
+        assert!(prefix.messages[1].contains(marker));
+        assert!(
+            !fork_prefix_path(root.path(), "parent", Sha256Digest::digest(unredacted)).exists()
+        );
+        let reopened =
+            AgentContinuationStore::new_persistent("parent".into(), root.path().to_owned())
+                .unwrap();
+        let loaded = reopened.load_fork_prefix(reference).unwrap();
+        assert_ne!(loaded.messages, prefix.messages);
+        assert!(loaded.redacted);
+        assert!(
+            loaded
+                .messages
+                .iter()
+                .all(|message| message.contains("<redacted>"))
+        );
+        assert!(
+            loaded.system_messages[0]
+                .system_prompt
+                .as_ref()
+                .unwrap()
+                .redacted
+        );
+        assert!(loaded.system_messages[1].context_fragments[0].redacted);
+        assert!(
+            loaded.system_messages[1].context_fragments[0]
+                .digest
+                .is_none()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 

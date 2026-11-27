@@ -1741,6 +1741,7 @@ done
             tools: captured.clone(),
             estimated_tokens: 0,
             system_messages: vec![],
+            redacted: false,
         }));
         let mut config = ProviderConfig {
             api_key: None,

@@ -1774,12 +1774,7 @@ fn redact_stored_message(message: &mut StoredMessage) {
                 }
             }
             if let Some(record) = system_prompt {
-                record.redacted |= changed;
-                for section in &mut record.sections {
-                    if let Some(text) = &mut section.text {
-                        record.redacted |= redact_string_in_place(text);
-                    }
-                }
+                redact_prompt_record(record, changed);
             }
         }
         StoredMessage::User { content, .. } => {
@@ -1819,7 +1814,19 @@ fn redact_stored_message(message: &mut StoredMessage) {
     }
 }
 
-fn redact_fragment_metadata(
+pub(crate) fn redact_prompt_record(
+    record: &mut orca_core::conversation::SystemPromptRecord,
+    content_changed: bool,
+) {
+    record.redacted |= content_changed;
+    for section in &mut record.sections {
+        if let Some(text) = &mut section.text {
+            record.redacted |= redact_string_in_place(text);
+        }
+    }
+}
+
+pub(crate) fn redact_fragment_metadata(
     original: &str,
     redacted: &str,
     changes: &mut [orca_core::conversation::ContextFragmentChange],
@@ -1857,7 +1864,7 @@ fn redact_fragment_metadata(
     }
 }
 
-fn redact_json_value(value: &mut serde_json::Value) {
+pub(crate) fn redact_json_value(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) => {
             redact_string_in_place(text);

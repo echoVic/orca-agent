@@ -64,6 +64,7 @@ pub(crate) use writer::{
     stored_session_health_error_details, truncate_transcript_at_boundary,
     write_prompt_queue_snapshot,
 };
+pub(crate) use writer::{redact_fragment_metadata, redact_json_value, redact_prompt_record};
 
 #[cfg(test)]
 mod tests {

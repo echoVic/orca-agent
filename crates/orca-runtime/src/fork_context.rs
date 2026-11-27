@@ -125,3 +125,39 @@ pub(crate) fn refresh_prompt_sections(conversation: &mut Conversation) {
             },
         ));
 }
+
+pub(crate) fn redact_for_storage(prefix: &mut ProviderForkPrefix) -> serde_json::Result<()> {
+    use crate::thread_store::{
+        redact_fragment_metadata, redact_json_value, redact_prompt_record, redact_sensitive_text,
+    };
+
+    let mut metadata = prefix.system_messages.iter_mut().peekable();
+    for (index, wire) in prefix.messages.iter_mut().enumerate() {
+        let original: serde_json::Value = serde_json::from_str(wire)?;
+        let mut saved = original.clone();
+        redact_json_value(&mut saved);
+        if let Some(system) = metadata.next_if(|system| system.index == index) {
+            let before = original["content"].as_str().unwrap_or_default();
+            let after = saved["content"].as_str().unwrap_or_default();
+            if before != after {
+                redact_fragment_metadata(before, after, &mut system.context_fragments);
+            }
+            if let Some(record) = system.system_prompt.as_mut() {
+                redact_prompt_record(record, before != after);
+            }
+        }
+        if original != saved {
+            *wire = saved.to_string();
+            prefix.redacted = true;
+        }
+    }
+    let endpoint = redact_sensitive_text(&prefix.endpoint);
+    prefix.redacted |= endpoint != prefix.endpoint;
+    prefix.endpoint = endpoint;
+    for tool in &mut prefix.tools {
+        let original = tool.clone();
+        redact_json_value(tool);
+        prefix.redacted |= *tool != original;
+    }
+    Ok(())
+}

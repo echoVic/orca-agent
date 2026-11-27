@@ -314,6 +314,10 @@ pub(crate) fn fork(conversation: &Conversation) -> Result<ProviderForkPrefix, &'
         messages,
         tools: request.tools.clone(),
         system_messages,
+        redacted: conversation
+            .fork_prefix
+            .as_ref()
+            .is_some_and(|prefix| prefix.redacted),
         estimated_tokens: inherited_tokens
             + captured
                 .iter()
