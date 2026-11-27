@@ -907,14 +907,14 @@ mod tests {
 
     #[test]
     fn apply_patch_flag_off_preserves_the_serialized_provider_prefix() {
-        // Based on 4d273a1d, with the shell prompt updated for background command notices.
+        // Includes byte paging for saved read_file results and background command notices.
         assert_eq!(
             patch_prefix_digests(),
             [
-                "0ec8ac37238f427f1445fdd17a28d0af9823a1c0051301926c7304a17d926575",
-                "67153d849b28d61ed7ecaeb0689006469f8a44f33950fb60c27f01cd15c8e59f",
-                "68749227d4876f14951bf6ee157821e43d1a4948e61881c1d243a2521f7d4f88",
-                "4e0dff83a26d4d174e1eea88677e76d50725a18924c1757bfdb411d011191384",
+                "54a976f10fd789046229c077c469b93e9f7ff2fe21d00bce61ab3128951671f2",
+                "50d7d340fccf8e68e3cc9424a5e5fbb74c3778135f3a87a7d02dfd46e34f3df4",
+                "0febb051947a213e39de3d5ae3088de50c3ecaaf592c0859451adbff38aa0567",
+                "39bce068e74a7974e956e0f523da308eda7a0ad5747d104848cd8fde9f155352",
             ]
         );
     }
