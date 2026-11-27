@@ -5523,6 +5523,7 @@ while IFS= read -r line; do
                 cancel: &cancel,
                 output_truncation: tool_types::ToolOutputTruncation::default(),
                 max_parallel: 2,
+                network: None,
                 provider_response_ingress: None,
             },
         )

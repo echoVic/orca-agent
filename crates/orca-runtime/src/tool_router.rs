@@ -420,21 +420,8 @@ impl<'a> RuntimeToolRouter<'a> {
                 workflow_ipc.map(|ipc| ipc as &dyn RuntimeWorkflowIpc),
             )),
             RuntimeSpecialToolDispatch::Normal => {
-                let additional_roots = config
-                    .additional_working_directories
-                    .iter()
-                    .filter(|directory| {
-                        directory.source
-                            != crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
-                    })
-                    .map(|directory| directory.path.clone())
-                    .chain(
-                        permission_overlay
-                            .additional_working_directories()
-                            .iter()
-                            .cloned(),
-                    )
-                    .collect::<Vec<_>>();
+                let additional_roots =
+                    crate::runtime_permission::tool_working_directories(config, permission_overlay);
                 // `bash` is the single command entry point, so it is the tool
                 // that needs the runtime-owned terminal service.
                 // Every command tool shares one runtime-owned terminal service:

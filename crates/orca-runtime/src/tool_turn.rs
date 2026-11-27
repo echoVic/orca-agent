@@ -27,11 +27,13 @@ use crate::operation_context::OperationContext;
 #[cfg(test)]
 use crate::runtime_readonly_tool_turn::record_readonly_batch_results;
 use crate::runtime_readonly_tool_turn::{
-    RuntimeReadonlyToolTurnContext, RuntimeReadonlyToolTurnIo, RuntimeReadonlyToolTurnRequest,
-    RuntimeReadonlyToolTurnServices, run_readonly_tool_turn,
+    RuntimeNetworkBatchContext, RuntimeReadonlyToolTurnContext, RuntimeReadonlyToolTurnIo,
+    RuntimeReadonlyToolTurnRequest, RuntimeReadonlyToolTurnServices, run_readonly_tool_turn,
 };
 use crate::runtime_surface::{RuntimeProviderResponseIngress, RuntimeWorkflowLifecycleIngress};
-use crate::runtime_tool_scheduler::{RuntimeToolDispatch, RuntimeToolDispatchScheduler};
+use crate::runtime_tool_scheduler::{
+    NetworkReadScheduling, RuntimeToolDispatch, RuntimeToolDispatchScheduler,
+};
 use crate::session::record_tool_result_for_agent;
 use crate::step_context::{
     RuntimeSamplingRequestState, RuntimeStepContext, RuntimeToolResultRecordOutcome,
@@ -386,6 +388,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     let permission_handler_owned = step_snapshot.turn_context.permission_handler_owned();
     let user_input_handler = capabilities.user_input_handler;
     let mcp_elicitation_handler = capabilities.mcp_elicitation_handler;
+    let mut sequential_read_window_end = 0;
     while let Some(tool_request) = sampling_state.current_tool_request(tool_requests) {
         // Capture one immutable execution-policy revision per dispatch. A user
         // confirmed policy change therefore affects the next tool admission,
@@ -528,7 +531,25 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         }
 
         let Some(dispatch) = RuntimeToolDispatchScheduler::new(config, subagent_depth)
-            .next_dispatch(sampling_state, tool_requests)
+            .next_dispatch(
+                sampling_state,
+                tool_requests,
+                Some(NetworkReadScheduling {
+                    policy,
+                    mcp_registry,
+                    sequential_until: &mut sequential_read_window_end,
+                    tool_allowed: &|request| {
+                        reject_disallowed_child_tool(
+                            request,
+                            tool_policy,
+                            subagent_type,
+                            mcp_registry,
+                            &config.external_tools,
+                        )
+                        .is_none()
+                    },
+                }),
+            )
         else {
             break;
         };
@@ -536,6 +557,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
         let dispatch_len = match &dispatch {
             RuntimeToolDispatch::Normal(_) => 1,
             RuntimeToolDispatch::SubagentBatch(window)
+            | RuntimeToolDispatch::NetworkReadBatch(window)
             | RuntimeToolDispatch::ReadonlyBatch(window) => window.tool_requests().len(),
         };
         if crate::investigation_convergence::summary_prompt_present(conversation) {
@@ -594,6 +616,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             let window_requests: Vec<&ToolRequest> = match &dispatch {
                 RuntimeToolDispatch::Normal(request) => vec![*request],
                 RuntimeToolDispatch::SubagentBatch(window)
+                | RuntimeToolDispatch::NetworkReadBatch(window)
                 | RuntimeToolDispatch::ReadonlyBatch(window) => {
                     window.tool_requests().iter().collect()
                 }
@@ -659,6 +682,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             let window_requests: Vec<&ToolRequest> = match &dispatch {
                 RuntimeToolDispatch::Normal(request) => vec![*request],
                 RuntimeToolDispatch::SubagentBatch(window)
+                | RuntimeToolDispatch::NetworkReadBatch(window)
                 | RuntimeToolDispatch::ReadonlyBatch(window) => {
                     window.tool_requests().iter().collect()
                 }
@@ -868,7 +892,11 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             continue;
         }
 
-        if let RuntimeToolDispatch::ReadonlyBatch(dispatch_window) = dispatch {
+        let has_network_reads = matches!(dispatch, RuntimeToolDispatch::NetworkReadBatch(_));
+        if let RuntimeToolDispatch::ReadonlyBatch(dispatch_window)
+        | RuntimeToolDispatch::NetworkReadBatch(dispatch_window) = dispatch
+        {
+            let mut service_usage = Vec::new();
             let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
                 request: RuntimeReadonlyToolTurnRequest {
                     cwd,
@@ -877,6 +905,11 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     cancel,
                     output_truncation: config.tools.output_truncation,
                     max_parallel: config.tools.max_read_parallel,
+                    network: has_network_reads.then_some(RuntimeNetworkBatchContext {
+                        config,
+                        permission_overlay: &sampling_state.permission_overlay,
+                        service_usage: &mut service_usage,
+                    }),
                 },
                 io: RuntimeReadonlyToolTurnIo {
                     events,
@@ -892,6 +925,23 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     root_task_id,
                 },
             });
+            let mut usage_error = None;
+            for (call_id, usage) in service_usage {
+                let report_usage = emit_deltas && outcome.is_ok() && usage_error.is_none();
+                if let Err(error) = charge_tool_service_usage(
+                    usage,
+                    &call_id,
+                    cost_tracker,
+                    operation.as_deref_mut(),
+                    events,
+                    sink,
+                    history_writer.as_deref_mut(),
+                    report_usage,
+                ) && usage_error.is_none()
+                {
+                    usage_error = Some(error);
+                }
+            }
             let outcome = match outcome {
                 Ok(outcome) => {
                     sampling_state.advance_tool_cursor_to_window_end(&dispatch_window);
@@ -924,6 +974,21 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                         conversation_tool_settlement(conversation, &request.id).1,
                     )?;
                 }
+            }
+            if let Some(error) = usage_error {
+                close_unstarted_tool_requests(
+                    sampling_state,
+                    tool_requests,
+                    &event_registry,
+                    events,
+                    sink,
+                    conversation,
+                    history_writer.as_deref_mut(),
+                    emit_deltas,
+                    provider_response_ingress,
+                    "an earlier tool batch completed before its fees could be reported",
+                )?;
+                return Err(error);
             }
             if matches!(outcome, ToolTurnOutcome::Return { .. }) {
                 close_unstarted_tool_requests(
@@ -2181,6 +2246,381 @@ mod tests {
                 },
             })
         })
+    }
+
+    mod scheduler_network {
+        use super::*;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        use crate::runtime_tool_call::{
+            RuntimeNormalToolHandler, RuntimeNormalToolInvocation, RuntimeNormalToolWorkerContext,
+            with_test_normal_handler,
+        };
+        use orca_core::approval_types::{ApprovalDecision, ApprovalRequest, ApprovalResolution};
+
+        const DELAY: Duration = Duration::from_millis(300);
+
+        struct LocalFetch {
+            address: std::net::SocketAddr,
+        }
+
+        impl RuntimeNormalToolHandler for LocalFetch {
+            fn execute(
+                &self,
+                invocation: &RuntimeNormalToolInvocation,
+                context: &mut RuntimeNormalToolWorkerContext<'_>,
+            ) -> ToolResult {
+                if invocation.request.name != ToolName::WebFetch {
+                    return crate::runtime_normal_tool::execute_runtime_normal_tool(
+                        invocation, context,
+                    );
+                }
+                let request = &invocation.request;
+                let mut stream = TcpStream::connect(self.address).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                write!(
+                    stream,
+                    "GET /{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                    request.id, self.address
+                )
+                .unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+                if request.id == "indeterminate" {
+                    ToolResult::indeterminate(request, "fixture outcome unknown")
+                } else if headers.starts_with("HTTP/1.1 200") {
+                    ToolResult::completed(request, body.to_string(), false).with_service_usage(
+                        ToolServiceUsage {
+                            deepseek_fetches: 1,
+                            ..Default::default()
+                        },
+                    )
+                } else {
+                    ToolResult::failed(request, body, None)
+                }
+            }
+        }
+
+        #[derive(Default)]
+        struct Approvals(Mutex<Vec<String>>);
+
+        impl RuntimeApprovalHandler for Approvals {
+            fn resolve_interactive(
+                &self,
+                approval: &ApprovalRequest,
+                request: &ToolRequest,
+            ) -> io::Result<ApprovalResolution> {
+                self.0.lock().unwrap().push(request.id.clone());
+                Ok(ApprovalResolution {
+                    id: approval.id.clone(),
+                    decision: ApprovalDecision::Allow,
+                    reason: "test approval".to_string(),
+                })
+            }
+        }
+
+        fn run_fetches(
+            config: RunConfig,
+            requests: &[ToolRequest],
+            failed_id: Option<&'static str>,
+        ) -> (Conversation, Duration, usize, Vec<String>) {
+            let cwd = tempfile::tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let count = requests
+                .iter()
+                .filter(|request| request.name == ToolName::WebFetch)
+                .count();
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let server_peak = Arc::clone(&peak);
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                thread::scope(|scope| {
+                    let mut accepted = 0;
+                    while accepted < count {
+                        let mut stream = match listener.accept() {
+                            Ok((stream, _)) => stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "fetch did not reach the fixture"
+                                );
+                                thread::sleep(Duration::from_millis(2));
+                                continue;
+                            }
+                            Err(error) => panic!("fixture accept: {error}"),
+                        };
+                        accepted += 1;
+                        let active = &active;
+                        let peak = &server_peak;
+                        scope.spawn(move || {
+                            let mut reader = BufReader::new(&stream);
+                            let mut line = String::new();
+                            reader.read_line(&mut line).unwrap();
+                            let id = line.split_whitespace().nth(1).unwrap().trim_start_matches('/').to_string();
+                            loop {
+                                line.clear();
+                                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                                    break;
+                                }
+                            }
+                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            thread::sleep(if id == "a" { DELAY } else { DELAY - Duration::from_millis(50) });
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            let status = if failed_id == Some(id.as_str()) { "404 Not Found" } else { "200 OK" };
+                            write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{id}", id.len()).unwrap();
+                        });
+                    }
+                });
+            });
+
+            let mut events = EventFactory::new("network-batch".to_string());
+            let mut conversation = Conversation::new();
+            let mut cost_tracker = CostTracker::new(None);
+            let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+            let policy = policy_for_tool_execution(&config);
+            let approvals = Approvals::default();
+            let instructions = ProjectInstructions::default();
+            let memory = MemoryBlock::default();
+            let registry = McpRegistry::default();
+            let hooks = HookRunner::default();
+            let cancel = CancelToken::new();
+            let tasks = TaskRegistry::new("network-batch".to_string());
+            let step = RuntimeStepContext::new(
+                &config,
+                cwd.path(),
+                AgentToolPolicyContext::unrestricted(),
+                0,
+                true,
+                &policy,
+                &instructions,
+                &memory,
+                &registry,
+                &hooks,
+                &cancel,
+                &tasks,
+                None,
+                Some(&approvals),
+                None,
+                None,
+                None,
+            );
+            let start = Instant::now();
+            let outcome = with_test_normal_handler(Arc::new(LocalFetch { address }), || {
+                run_tool_turns(RuntimeToolTurnsContext {
+                    step_context: step,
+                    sampling_state: &mut RuntimeSamplingRequestState::new(),
+                    operation: None,
+                    io: RuntimeToolTurnsIo {
+                        events: &mut events,
+                        sink: &mut sink,
+                        conversation: &mut conversation,
+                        history_writer: None,
+                        cost_tracker: &mut cost_tracker,
+                        background_workflows: &mut Vec::new(),
+                    },
+                    tool_requests: requests,
+                    checkpoint_observer: None,
+                    executors: RuntimeToolTurnsExecutors {
+                        workflow_child_executor: unused_child_executor::<SharedEventBuffer>,
+                        batch_child_executor: unused_child_executor::<io::Sink>,
+                    },
+                })
+            })
+            .unwrap();
+            let elapsed = start.elapsed();
+            server.join().unwrap();
+            if failed_id == Some("indeterminate") {
+                assert!(matches!(
+                    outcome,
+                    ToolTurnOutcome::Return {
+                        status: RunStatus::Failed,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(outcome, ToolTurnOutcome::Continue));
+            }
+            assert_eq!(
+                cost_tracker.totals().service.deepseek_fetches as usize,
+                count - usize::from(failed_id.is_some())
+            );
+            (
+                conversation,
+                elapsed,
+                peak.load(Ordering::SeqCst),
+                approvals.0.into_inner().unwrap(),
+            )
+        }
+
+        fn fetch(id: &str) -> ToolRequest {
+            ToolRequest {
+                id: id.to_string(),
+                name: ToolName::WebFetch,
+                action: ActionKind::Network,
+                target: None,
+                raw_arguments: Some(
+                    json!({"url": format!("https://example.com/{id}")}).to_string(),
+                ),
+            }
+        }
+
+        fn network_config(mode: ApprovalMode, limit: usize) -> RunConfig {
+            let mut config = config_with_external(Vec::new());
+            config.approval_mode = mode;
+            config.tools.max_read_parallel = limit;
+            config
+        }
+
+        fn tool_results(conversation: &Conversation) -> Vec<(&str, ToolStatus)> {
+            conversation
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Tool {
+                        tool_call_id,
+                        terminal: Some(terminal),
+                        ..
+                    } => Some((tool_call_id.as_str(), terminal.status)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn consecutive_web_fetches_run_in_parallel_when_allowed() {
+            let (conversation, elapsed, peak, approvals) = run_fetches(
+                network_config(ApprovalMode::AutoEdit, 3),
+                &[fetch("a"), fetch("b"), fetch("c")],
+                None,
+            );
+            assert!(elapsed < DELAY * 2, "fetches took {elapsed:?}");
+            assert_eq!(peak, 3);
+            assert!(approvals.is_empty());
+            assert_eq!(
+                tool_results(&conversation),
+                [
+                    ("a", ToolStatus::Completed),
+                    ("b", ToolStatus::Completed),
+                    ("c", ToolStatus::Completed)
+                ]
+            );
+        }
+
+        #[test]
+        fn network_reads_that_need_approval_run_one_by_one() {
+            let requests = [fetch("a"), fetch("b"), fetch("c")];
+            let (conversation, _, peak, approvals) =
+                run_fetches(network_config(ApprovalMode::Suggest, 3), &requests, None);
+            assert_eq!(peak, 1);
+            assert_eq!(approvals, ["a", "b", "c"]);
+            assert_eq!(
+                tool_results(&conversation),
+                [
+                    ("a", ToolStatus::Completed),
+                    ("b", ToolStatus::Completed),
+                    ("c", ToolStatus::Completed)
+                ]
+            );
+        }
+
+        #[test]
+        fn a_failing_fetch_does_not_disturb_the_others_order() {
+            let (conversation, _, peak, _) = run_fetches(
+                network_config(ApprovalMode::FullAuto, 3),
+                &[fetch("a"), fetch("b"), fetch("c")],
+                Some("b"),
+            );
+            assert_eq!(peak, 3);
+            assert_eq!(
+                tool_results(&conversation),
+                [
+                    ("a", ToolStatus::Completed),
+                    ("b", ToolStatus::Failed),
+                    ("c", ToolStatus::Completed)
+                ]
+            );
+        }
+
+        #[test]
+        fn an_indeterminate_fetch_settles_the_batch_before_stopping_later_tools() {
+            let requests = [
+                fetch("a"),
+                fetch("indeterminate"),
+                fetch("c"),
+                ToolRequest {
+                    id: "write".to_string(),
+                    name: ToolName::WriteFile,
+                    action: ActionKind::Write,
+                    target: None,
+                    raw_arguments: Some(json!({"path": "a.txt", "content": "hello"}).to_string()),
+                },
+            ];
+            let (conversation, _, peak, _) = run_fetches(
+                network_config(ApprovalMode::FullAuto, 3),
+                &requests,
+                Some("indeterminate"),
+            );
+            assert_eq!(peak, 3);
+            assert_eq!(
+                tool_results(&conversation),
+                [
+                    ("a", ToolStatus::Completed),
+                    ("indeterminate", ToolStatus::Indeterminate),
+                    ("c", ToolStatus::Completed),
+                    ("write", ToolStatus::Cancelled),
+                ]
+            );
+        }
+
+        #[test]
+        fn a_write_ends_the_network_batch() {
+            let requests = [
+                fetch("a"),
+                fetch("b"),
+                ToolRequest {
+                    id: "write".to_string(),
+                    name: ToolName::WriteFile,
+                    action: ActionKind::Write,
+                    target: None,
+                    raw_arguments: Some(json!({"path": "a.txt", "content": "hello"}).to_string()),
+                },
+                fetch("c"),
+            ];
+            let (conversation, _, peak, _) =
+                run_fetches(network_config(ApprovalMode::FullAuto, 4), &requests, None);
+            assert_eq!(peak, 2);
+            assert_eq!(
+                tool_results(&conversation),
+                [
+                    ("a", ToolStatus::Completed),
+                    ("b", ToolStatus::Completed),
+                    ("write", ToolStatus::Completed),
+                    ("c", ToolStatus::Completed)
+                ]
+            );
+        }
+
+        #[test]
+        fn the_batch_respects_max_read_parallel() {
+            let (conversation, _, peak, _) = run_fetches(
+                network_config(ApprovalMode::FullAuto, 2),
+                &[fetch("a"), fetch("b"), fetch("c")],
+                None,
+            );
+            assert_eq!(peak, 2);
+            assert_eq!(tool_results(&conversation).len(), 3);
+        }
     }
 
     #[test]
@@ -3478,6 +3918,7 @@ mod tests {
                 cancel: &CancelToken::new(),
                 output_truncation: ToolConfig::default().output_truncation,
                 max_parallel: 2,
+                network: None,
             },
             io: RuntimeReadonlyToolTurnIo {
                 events: &mut events,
@@ -3549,6 +3990,7 @@ mod tests {
                 cancel: &cancel,
                 output_truncation: ToolConfig::default().output_truncation,
                 max_parallel: 2,
+                network: None,
             },
             io: RuntimeReadonlyToolTurnIo {
                 events: &mut events,
@@ -3619,6 +4061,7 @@ mod tests {
                 cancel: &cancel,
                 output_truncation: ToolConfig::default().output_truncation,
                 max_parallel: 2,
+                network: None,
             },
             io: RuntimeReadonlyToolTurnIo {
                 events: &mut events,
@@ -3684,6 +4127,7 @@ mod tests {
                 cancel: &cancel,
                 output_truncation: ToolConfig::default().output_truncation,
                 max_parallel: 2,
+                network: None,
             },
             io: RuntimeReadonlyToolTurnIo {
                 events: &mut events,

@@ -405,21 +405,30 @@ impl CapabilitySet {
     }
 
     pub fn is_read_only(&self) -> bool {
+        self.is_read_only_with_network(false)
+    }
+
+    pub fn is_read_only_or_network_search(&self) -> bool {
+        self.is_read_only_with_network(true)
+    }
+
+    fn is_read_only_with_network(&self, allow_network: bool) -> bool {
         !self.capabilities.is_empty()
             && self.capabilities.iter().all(|capability| {
-                matches!(
-                    capability,
-                    ToolCapability::FsRead
-                        | ToolCapability::FsList
-                        | ToolCapability::FsSearch
-                        | ToolCapability::GitInspect
-                        | ToolCapability::TaskRead
-                        | ToolCapability::PlanUpdate
-                        | ToolCapability::GoalUpdate
-                        | ToolCapability::UserInputRequest
-                        | ToolCapability::McpResourceRead
-                        | ToolCapability::SkillRead
-                )
+                (allow_network && *capability == ToolCapability::NetworkSearch)
+                    || matches!(
+                        capability,
+                        ToolCapability::FsRead
+                            | ToolCapability::FsList
+                            | ToolCapability::FsSearch
+                            | ToolCapability::GitInspect
+                            | ToolCapability::TaskRead
+                            | ToolCapability::PlanUpdate
+                            | ToolCapability::GoalUpdate
+                            | ToolCapability::UserInputRequest
+                            | ToolCapability::McpResourceRead
+                            | ToolCapability::SkillRead
+                    )
             })
     }
 
