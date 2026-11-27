@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use orca_core::conversation::{InstructionScope, Message, SystemPromptRecord, SystemPromptSection};
+use orca_core::conversation::{
+    InstructionScope, Message, SYSTEM_PROMPT_RECORD_VERSION, SystemPromptRecord,
+    SystemPromptSection,
+};
 use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
 
 #[derive(Default)]
@@ -36,6 +39,7 @@ impl SystemPrompt {
         Message::system_with_prompt_record(
             self.render(),
             SystemPromptRecord {
+                version: SYSTEM_PROMPT_RECORD_VERSION,
                 sections: self.sections,
                 update: false,
                 resume_boundary: None,
@@ -97,6 +101,7 @@ pub(crate) fn section_updates(
             Message::system_with_prompt_record(
                 content,
                 SystemPromptRecord {
+                    version: SYSTEM_PROMPT_RECORD_VERSION,
                     sections: vec![section],
                     update: true,
                     resume_boundary: resume_boundary.map(str::to_owned),

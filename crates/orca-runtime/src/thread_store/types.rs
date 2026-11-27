@@ -732,6 +732,16 @@ impl Serialize for StoredToolTerminal {
     }
 }
 
+fn deserialize_prompt_metadata<'de, D>(
+    deserializer: D,
+) -> Result<Option<Box<orca_core::conversation::SystemPromptRecord>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).ok())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", tag = "role")]
 enum StoredMessageWire {
@@ -743,7 +753,7 @@ enum StoredMessageWire {
         nested_instruction: Option<Box<NestedInstructionSource>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         context_fragments: Vec<orca_core::conversation::ContextFragmentChange>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, deserialize_with = "deserialize_prompt_metadata")]
         system_prompt: Option<Box<orca_core::conversation::SystemPromptRecord>>,
     },
     User {

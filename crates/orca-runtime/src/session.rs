@@ -1878,6 +1878,61 @@ mod tests {
         });
     }
 
+    fn resumes_with_a_rebuilt_prompt(edit: impl FnOnce(&mut serde_json::Value)) {
+        with_orca_home(|home| {
+            let cwd = tempdir().unwrap();
+            let agents = home.join("AGENTS.md");
+            std::fs::write(&agents, "Use yesterday's runbook.").unwrap();
+            let (path, _, transcript) = record_prompt_session(cwd.path());
+            let original = prompt_wire_record(&path);
+            let mut record: serde_json::Value = serde_json::from_str(&original).unwrap();
+            edit(&mut record["message"]);
+            let raw =
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .replacen(&original, &record.to_string(), 1);
+            std::fs::write(&path, raw).unwrap();
+            std::fs::write(&agents, "Use today's runbook.").unwrap();
+            let id = transcript.meta.session_id;
+            let loaded =
+                history::load_session(&id).expect("optional metadata must leave history readable");
+            let session = reopen_prompt_session(cwd.path(), HistoryMode::Resume(id), loaded);
+            let prompt = session.conversation.messages[0].content_str().unwrap();
+            assert!(prompt.contains("Use today's runbook."));
+            assert!(prompt_section_notices(&session).is_empty());
+        });
+    }
+
+    #[test]
+    fn duplicate_prompt_section_names_rebuild_the_prompt() {
+        resumes_with_a_rebuilt_prompt(|message| {
+            message["system_prompt"]["sections"][1]["name"] =
+                message["system_prompt"]["sections"][0]["name"].clone();
+        });
+    }
+
+    #[test]
+    fn prompt_sections_must_reconstruct_the_stored_content() {
+        resumes_with_a_rebuilt_prompt(|message| {
+            message["content"] = "A different prompt".into();
+        });
+    }
+
+    #[test]
+    fn malformed_prompt_sections_leave_the_transcript_readable() {
+        resumes_with_a_rebuilt_prompt(|message| {
+            message["system_prompt"]["sections"] = serde_json::json!({});
+        });
+    }
+
+    #[test]
+    fn an_unknown_prompt_metadata_version_rebuilds_without_notices() {
+        resumes_with_a_rebuilt_prompt(|message| {
+            message["system_prompt"]["version"] = 999.into();
+            message["system_prompt"]["sections"][0]["name"] = "future section".into();
+        });
+    }
+
     #[test]
     fn a_session_without_recorded_sections_resumes_as_before() {
         with_orca_home(|_| {

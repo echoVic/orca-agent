@@ -299,7 +299,8 @@ pub(crate) fn resume_conversation_in_cwd(
     let mut loaded_sources = HashMap::new();
     let prompt_sources_are_loaded = |message: &Message| {
         message.system_prompt_record().is_none_or(|record| {
-            !record.redacted
+            record.version == orca_core::conversation::SYSTEM_PROMPT_RECORD_VERSION
+                && !record.redacted
                 && record.sections.iter().all(|section| {
                     if section.name != "project instructions" || section.text.is_none() {
                         return true;
@@ -335,7 +336,7 @@ pub(crate) fn resume_conversation_in_cwd(
         prompt_can_replay
             && message
                 .system_prompt_record()
-                .is_some_and(|record| !record.update && !record.sections.is_empty())
+                .is_some_and(|record| leading_prompt_matches_sections(message, record))
     });
     let mut conversation = Conversation::new();
     conversation.repeat_tool_streak = transcript
@@ -433,6 +434,29 @@ pub(crate) fn resume_conversation_in_cwd(
             .map(|record| record.summary.clone());
     }
     conversation
+}
+
+fn leading_prompt_matches_sections(
+    message: &Message,
+    record: &orca_core::conversation::SystemPromptRecord,
+) -> bool {
+    if record.update || record.sections.is_empty() {
+        return false;
+    }
+    let mut names = std::collections::HashSet::new();
+    if !record
+        .sections
+        .iter()
+        .all(|section| section.text.is_some() && names.insert(&section.name))
+    {
+        return false;
+    }
+    let reconstructed = record
+        .sections
+        .iter()
+        .filter_map(|section| section.text.as_deref())
+        .collect::<String>();
+    message.content_str() == Some(reconstructed.as_str())
 }
 
 fn restore_fragment_batch(

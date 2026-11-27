@@ -245,8 +245,11 @@ pub struct SystemPromptSection {
     pub instruction_scope: Option<InstructionScope>,
 }
 
+pub const SYSTEM_PROMPT_RECORD_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SystemPromptRecord {
+    pub version: u32,
     pub sections: Vec<SystemPromptSection>,
     pub update: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
