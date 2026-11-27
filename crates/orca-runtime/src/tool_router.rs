@@ -44,6 +44,7 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) execution_request: &'a tool_types::ToolRequest,
+    pub(crate) parent_conversation: Option<&'a orca_core::conversation::Conversation>,
     pub(crate) prepared_patch: Option<Arc<orca_tools::apply_patch::PreparedPatch>>,
     pub(crate) goal_mode: bool,
     pub(crate) headless: bool,
@@ -154,6 +155,7 @@ impl<'a> RuntimeToolRouter<'a> {
             events,
             sink,
             execution_request,
+            parent_conversation,
             prepared_patch,
             goal_mode,
             headless,
@@ -346,6 +348,7 @@ impl<'a> RuntimeToolRouter<'a> {
                     }),
                     event_error,
                     child_budget.as_ref(),
+                    parent_conversation,
                 )?;
                 dispatch_child_budget_usage = child_budget_usage;
                 Ok(result)
@@ -731,6 +734,7 @@ mod tests {
             let mut event_error = None;
             let result = RuntimeToolRouter::new(&mut runtime)
                 .dispatch(RuntimeToolInvocationContext {
+                    parent_conversation: None,
                     config: &config,
                     cwd: cwd.path(),
                     events: &mut events,
@@ -863,6 +867,7 @@ mod tests {
             let mut event_error = None;
             let result = RuntimeToolRouter::new(&mut runtime)
                 .dispatch(RuntimeToolInvocationContext {
+                    parent_conversation: None,
                     config: &config,
                     cwd: cwd.path(),
                     events: &mut events,
@@ -994,6 +999,7 @@ mod tests {
         let mut event_error = None;
         RuntimeToolRouter::new(&mut runtime)
             .dispatch(RuntimeToolInvocationContext {
+                parent_conversation: None,
                 config: &config,
                 cwd: cwd.path(),
                 events: &mut events,

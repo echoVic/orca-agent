@@ -138,6 +138,23 @@ where
     child_config.model = child_config
         .model
         .with_subagent_override(request.model.clone());
+    if let Some(prefix) = &request.fork_prefix {
+        if let Err(error) = crate::subagent::validate_fork_prefix(&child_config, prefix) {
+            return (
+                ChildAgentResult {
+                    status: RunStatus::Failed,
+                    final_message: None,
+                    error: Some(error),
+                    budget_usage: None,
+                },
+                CostTracker::new(child_config.model.as_deref()),
+            );
+        }
+        child_config.model = child_config
+            .model
+            .with_subagent_override(Some(prefix.model.clone()));
+        child_config.reasoning_effort = prefix.reasoning_effort;
+    }
     let mut child_cost_tracker = CostTracker::new(child_config.model.as_deref());
     let result =
         executor(&child_config, &request, &mut child_cost_tracker).unwrap_or_else(|error| {

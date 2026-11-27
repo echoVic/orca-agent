@@ -79,6 +79,7 @@ pub(crate) fn is_semantic_commit_failure(error: &io::Error) -> bool {
 
 pub(crate) struct ToolExecutionContext<'a> {
     cwd: &'a Path,
+    parent_conversation: Option<&'a orca_core::conversation::Conversation>,
     subagent_depth: u32,
     emit_deltas: bool,
     goal_mode: bool,
@@ -351,6 +352,7 @@ impl<'a> ToolExecutionContext<'a> {
             goal_turn: None,
             root_task_id: None,
             child_budget: None,
+            parent_conversation: None,
         }
     }
 
@@ -359,6 +361,14 @@ impl<'a> ToolExecutionContext<'a> {
         child_budget: Option<orca_core::budget::BudgetSpec>,
     ) -> Self {
         self.child_budget = child_budget;
+        self
+    }
+
+    pub(crate) fn with_parent_conversation(
+        mut self,
+        conversation: &'a orca_core::conversation::Conversation,
+    ) -> Self {
+        self.parent_conversation = Some(conversation);
         self
     }
 
@@ -1063,6 +1073,7 @@ impl ToolExecutionActor {
             goal_turn,
             root_task_id,
             child_budget,
+            parent_conversation,
         } = context;
         let instructions = instructions.expect("tool execution instructions");
         let memory = memory.expect("tool execution memory");
@@ -1430,6 +1441,7 @@ impl ToolExecutionActor {
                 events,
                 sink,
                 execution_request,
+                parent_conversation,
                 prepared_patch,
                 goal_mode,
                 headless,

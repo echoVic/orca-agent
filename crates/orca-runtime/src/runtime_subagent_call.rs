@@ -1625,6 +1625,8 @@ fn run_subagent_worker(
         prompt,
         subagent_type: requested_subagent_type,
         model: requested_model,
+        context: _,
+        fork_prefix_ref,
         mode: _,
         isolation: requested_isolation,
         schema,
@@ -1849,8 +1851,8 @@ fn run_subagent_worker(
                 compatibility,
             };
             coordinator
-                .create(input.clone())
-                .or_else(|_| coordinator.create(input))
+                .create_with_fork(input.clone(), fork_prefix_ref)
+                .or_else(|_| coordinator.create_with_fork(input, fork_prefix_ref))
         }
     };
     let prepared = match prepared {
@@ -2060,6 +2062,7 @@ fn execute_acquired_sync_subagent(
             .as_ref()
             .map(WorkflowIpcContext::for_nested_attempt),
         continuation: continuation_start,
+        fork_prefix: prepared.fork_prefix.clone(),
     };
     let surface_task_id = match SurfaceTaskId::try_new(registry_task_id.clone()) {
         Ok(task_id) => task_id,
@@ -2524,8 +2527,9 @@ pub(crate) fn build_checkpoint_observer(
                     last_tool_boundary: captured_boundary,
                     created_at_ms: unix_time_ms(),
                     digest: crate::runtime_surface::Sha256Digest::new([0; 32]),
+                    full_digest: None,
                 };
-                checkpoint.digest = checkpoint.computed_digest()?;
+                checkpoint.seal()?;
                 pending_checkpoint = Some(checkpoint.clone());
                 checkpoint
             };

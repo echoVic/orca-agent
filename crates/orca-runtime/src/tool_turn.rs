@@ -514,6 +514,10 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             if let Some(error) = event_error {
                 return Err(error);
             }
+            // A fork may show the parent's tools even under a narrower child role.
+            if conversation.fork_prefix.is_some() {
+                continue;
+            }
             close_unstarted_tool_requests(
                 sampling_state,
                 tool_requests,
@@ -1641,6 +1645,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         });
     }
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
+        .with_parent_conversation(conversation)
         .with_goal_mode(goal_mode)
         .with_headless(headless)
         .with_root_task_id(root_task_id)

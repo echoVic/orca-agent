@@ -2339,6 +2339,7 @@ impl WorkflowRunner {
             tool_policy_label: execution_policy.tool_policy_label.clone(),
             workflow_ipc: Some(workflow_ipc.clone()),
             continuation: continuation_start,
+            fork_prefix: None,
         };
         let mut lifecycle =
             RuntimeSessionLifecycle::new(format!("workflow-child-{}", call.call_id));
