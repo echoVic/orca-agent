@@ -5523,7 +5523,7 @@ fn activity_rows(
             state.workflow_tasks(),
             theme,
             state.tick,
-            state.agent_dock_selected_task_id.as_deref(),
+            state.agent_dock_focus(),
             state.tasks_dock_visible(),
             state.status == AppStatus::Idle,
             width,
@@ -5667,30 +5667,43 @@ fn background_task_activity_lines(
     expanded: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
-    background_task_activity_rows(tasks, theme, tick, selected_task_id, expanded, true, width)
-        .into_iter()
-        .map(|(line, _)| line)
-        .collect()
+    background_task_activity_rows(
+        tasks,
+        theme,
+        tick,
+        crate::workflow_panel::AgentDockFocus {
+            selected: selected_task_id,
+            viewed: None,
+        },
+        expanded,
+        true,
+        width,
+    )
+    .into_iter()
+    .map(|(line, _)| line)
+    .collect()
 }
 
 /// The subagent rows the dock draws when there are more than it has room for:
-/// agents that need attention first, then the selected one, then the rest in
-/// list order. The rows come back in list (start) order, never priority order.
+/// In a visit the mark stays visible; otherwise attention takes priority.
+/// The rows come back in list (start) order, never priority order.
 fn dock_rows<'a>(
     visible: &[&'a BackgroundTaskSummary],
-    selected: Option<&str>,
+    focus: crate::workflow_panel::AgentDockFocus<'_>,
     cap: usize,
 ) -> Vec<&'a BackgroundTaskSummary> {
     if visible.len() <= cap {
         return visible.to_vec();
     }
     let priority = |task: &BackgroundTaskSummary| -> u8 {
-        if task.status.requires_attention() {
+        if focus.viewed.is_some() && focus.selected == Some(task.id.as_str()) {
             0
-        } else if selected == Some(task.id.as_str()) {
+        } else if task.status.requires_attention() {
             1
-        } else {
+        } else if focus.selected == Some(task.id.as_str()) {
             2
+        } else {
+            3
         }
     };
     let mut picked = (0..visible.len()).collect::<Vec<_>>();
@@ -5707,7 +5720,7 @@ fn background_task_activity_rows(
     tasks: &[BackgroundTaskSummary],
     theme: &Theme,
     tick: u64,
-    selected_task_id: Option<&str>,
+    focus: crate::workflow_panel::AgentDockFocus<'_>,
     expanded: bool,
     idle: bool,
     width: u16,
@@ -5743,10 +5756,7 @@ fn background_task_activity_rows(
 
     let visible_subagents = tasks
         .iter()
-        .filter(|task| {
-            task.task_type == TaskType::Subagent
-                && (task.status.is_active() || task.status.requires_attention())
-        })
+        .filter(|task| focus.includes(task))
         .collect::<Vec<_>>();
     if !visible_subagents.is_empty() {
         let subagent_cap = if expanded {
@@ -5785,8 +5795,8 @@ fn background_task_activity_rows(
             Some(AgentHitTarget::Main),
         ));
 
-        for task in dock_rows(&visible_subagents, selected_task_id, subagent_cap) {
-            let selected = selected_task_id == Some(task.id.as_str());
+        for task in dock_rows(&visible_subagents, focus, subagent_cap) {
+            let selected = focus.selected == Some(task.id.as_str());
             let selection = if selected { "›" } else { "○" };
             let status = task_status_label(task.status);
             let name = task.name.as_deref().unwrap_or(task.description.as_str());
@@ -5883,7 +5893,8 @@ fn background_task_activity_rows(
     // keys that do something now: Shift+Up/Down picks an agent, and Enter
     // opens the picked agent, or else the first background approval.
     if expanded {
-        let agent_selected = selected_task_id
+        let agent_selected = focus
+            .selected
             .is_some_and(|selected| visible_subagents.iter().any(|task| task.id == selected));
         let mut keys = Vec::with_capacity(3);
         if !visible_subagents.is_empty() {
@@ -14170,10 +14181,18 @@ mod tests {
             " Shift+↑↓ select · Enter approve · Esc close"
         );
         // During a running turn Enter leaves the approval for later.
-        let running = background_task_activity_rows(&[approval], &theme, 0, None, true, false, 100)
-            .into_iter()
-            .map(|(line, _)| line)
-            .collect::<Vec<_>>();
+        let running = background_task_activity_rows(
+            &[approval],
+            &theme,
+            0,
+            Default::default(),
+            true,
+            false,
+            100,
+        )
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect::<Vec<_>>();
         assert_eq!(lines_text(&running).pop().unwrap(), " Esc close");
     }
 
@@ -15539,7 +15558,7 @@ mod tests {
             .collect();
         tasks[cap + 1].status = TaskStatus::ApprovalRequired;
         let visible: Vec<_> = tasks.iter().collect();
-        let rows = super::dock_rows(&visible, None, cap);
+        let rows = super::dock_rows(&visible, Default::default(), cap);
         assert_eq!(rows.len(), cap);
         assert_eq!(dock_ids(&rows), ["a0", "a1", "a2", "a5"]);
     }
@@ -15551,7 +15570,14 @@ mod tests {
             .map(|i| dock_agent(&format!("a{i}"), TaskStatus::Running))
             .collect();
         let visible: Vec<_> = tasks.iter().collect();
-        let rows = super::dock_rows(&visible, Some("a5"), cap);
+        let rows = super::dock_rows(
+            &visible,
+            crate::workflow_panel::AgentDockFocus {
+                selected: Some("a5"),
+                ..Default::default()
+            },
+            cap,
+        );
         assert_eq!(rows.len(), cap);
         assert_eq!(dock_ids(&rows), ["a0", "a1", "a2", "a5"]);
     }
@@ -15564,7 +15590,14 @@ mod tests {
             .collect();
         tasks[cap - 1].status = TaskStatus::ApprovalRequired;
         let visible: Vec<_> = tasks.iter().collect();
-        let rows = super::dock_rows(&visible, Some("a1"), cap);
+        let rows = super::dock_rows(
+            &visible,
+            crate::workflow_panel::AgentDockFocus {
+                selected: Some("a1"),
+                ..Default::default()
+            },
+            cap,
+        );
         assert_eq!(dock_ids(&rows), ["a0", "a1", "a2", "a3"]);
     }
 

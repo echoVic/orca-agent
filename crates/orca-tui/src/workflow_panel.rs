@@ -12,6 +12,21 @@ use crate::protocol::{PendingWorkflowNotification, TaskTranscriptRequest, UserAc
 use crate::transcript_state::ChatMessage;
 use crate::types::{AppState, AppStatus, ApprovalDialog, PanelMode};
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AgentDockFocus<'a> {
+    pub selected: Option<&'a str>,
+    pub viewed: Option<&'a str>,
+}
+
+impl AgentDockFocus<'_> {
+    pub(crate) fn includes(self, task: &BackgroundTaskSummary) -> bool {
+        task.task_type == TaskType::Subagent
+            && (task.status.is_active()
+                || task.status.requires_attention()
+                || self.viewed == Some(task.id.as_str()))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkflowPanelState {
     selected: usize,
@@ -373,26 +388,35 @@ impl AppState {
             .as_deref()
             .and_then(|selected| visible.iter().position(|task_id| task_id == selected))
             .and_then(|index| index.checked_sub(1))
-            .and_then(|index| visible.get(index).cloned());
+            .and_then(|index| visible.get(index).cloned())
+            .or_else(|| {
+                self.conversation_target()
+                    .task_id()
+                    .and_then(|_| visible.first().cloned())
+            });
+    }
+
+    pub(crate) fn agent_dock_focus(&self) -> AgentDockFocus<'_> {
+        AgentDockFocus {
+            selected: self.agent_dock_selected_task_id.as_deref(),
+            viewed: self.conversation_target().task_id(),
+        }
     }
 
     pub(crate) fn selected_agent_dock_task(&self) -> Option<&BackgroundTaskSummary> {
-        let selected = self.agent_dock_selected_task_id.as_deref()?;
-        self.workflow_panel.tasks().iter().find(|task| {
-            task.id == selected
-                && task.task_type == TaskType::Subagent
-                && (task.status.is_active() || task.status.requires_attention())
-        })
+        let focus = self.agent_dock_focus();
+        let selected = focus.selected?;
+        self.workflow_panel
+            .tasks()
+            .iter()
+            .find(|task| task.id == selected && focus.includes(task))
     }
 
     fn agent_dock_ids(&self) -> Vec<String> {
         self.workflow_panel
             .tasks()
             .iter()
-            .filter(|task| {
-                task.task_type == TaskType::Subagent
-                    && (task.status.is_active() || task.status.requires_attention())
-            })
+            .filter(|task| self.agent_dock_focus().includes(task))
             .map(|task| task.id.clone())
             .collect()
     }
@@ -571,8 +595,7 @@ impl AppState {
             .selected_workflow_task()
             .is_some_and(is_backgrounded_running_main_session);
         let selected_task_id = self.selected_workflow_task().map(|task| task.id.clone());
-        self.workflow_panel.replace_tasks(tasks);
-        self.agent_workspace.reconcile(self.workflow_panel.tasks());
+        self.replace_dock_tasks(tasks);
         self.refresh_open_task_transcript();
         if should_reveal_background_approval {
             // A background approval must surface without stealing the
@@ -659,9 +682,16 @@ impl AppState {
             return;
         }
         self.background_workflow_tasks = tasks.clone();
+        self.replace_dock_tasks(tasks);
+        self.learn_command_ends_from_tasks();
+    }
+
+    fn replace_dock_tasks(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         self.workflow_panel.replace_tasks(tasks);
         self.agent_workspace.reconcile(self.workflow_panel.tasks());
-        self.learn_command_ends_from_tasks();
+        if self.selected_agent_dock_task().is_none() {
+            self.agent_dock_selected_task_id = None;
+        }
     }
 
     #[cfg(test)]

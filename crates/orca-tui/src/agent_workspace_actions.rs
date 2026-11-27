@@ -516,6 +516,156 @@ mod tests {
         (state, rx)
     }
 
+    fn dock_visit() -> (
+        AppState,
+        mpsc::Receiver<UserAction>,
+        Vec<BackgroundTaskSummary>,
+    ) {
+        let tasks: Vec<_> = ["first", "second", "third"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut agent = task(id, index as i64 + 1);
+                agent.subagent_child_thread_id = Some(format!("thread-{id}"));
+                agent
+            })
+            .collect();
+        let (mut state, events) = conversation_with(Vec::new());
+        state.update(crate::protocol::TuiEvent::BackgroundTasksUpdated(
+            tasks.clone(),
+        ));
+        project_agent(&mut state, "first");
+        (state, events, tasks)
+    }
+
+    fn project_agent(state: &mut AppState, id: &str) {
+        let mut snapshot = crate::hosted_child::tests::snapshot_with_child(1, 5);
+        snapshot.tasks.clear();
+        snapshot.subagents.clear();
+        state.update(crate::protocol::TuiEvent::ChildProjectionReset {
+            task_id: id.into(),
+            main_status: Some(crate::types::SideParentStatus::Running),
+            projection: Box::new(
+                crate::surface_projection::SurfaceProjectionState::from_surface_snapshot(&snapshot),
+            ),
+        });
+    }
+
+    fn dock_key(
+        state: &mut AppState,
+        key: crossterm::event::KeyEvent,
+        draft: bool,
+    ) -> crate::key_event_actions::KeyEventFlow {
+        let actions = state.event_tx.clone();
+        crate::key_event_actions::handle_key_event_preflight(
+            key,
+            state,
+            &crate::test_support::test_run_config(),
+            &actions,
+            &mut crate::vim::VimState::new(false),
+            draft,
+            || Ok(()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn shift_down_in_an_agents_view_moves_the_mark() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+        for (panel, by_click) in [(false, true), (false, false), (true, true), (true, false)] {
+            let (mut state, events, _) = dock_visit();
+            let actions = state.event_tx.clone();
+            if panel {
+                state.show_agents();
+                handle_agent_workspace_key(KeyCode::Down, &mut state, &actions);
+            }
+            if by_click {
+                render_once(&mut state);
+                let target = if panel {
+                    AgentHitTarget::WorkspaceRow(1)
+                } else {
+                    AgentHitTarget::DockAgent("second".into())
+                };
+                let row = clicks_on(&state, &target)[0];
+                let MouseFlow::OpenAgent(id) = click(&mut state, row) else {
+                    panic!("click must open the sibling")
+                };
+                assert!(open_agent_task(&mut state, &actions, &id));
+            } else if panel {
+                assert!(handle_agent_workspace_key(
+                    KeyCode::Enter,
+                    &mut state,
+                    &actions
+                ));
+            } else {
+                dock_key(&mut state, down, false);
+                dock_key(
+                    &mut state,
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    false,
+                );
+            }
+            assert!(
+                matches!(events.try_recv(), Ok(UserAction::FocusChildThread { task_id, .. }) if task_id == "second")
+            );
+            project_agent(&mut state, "second");
+            assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("second"));
+            dock_key(&mut state, down, false);
+            let frame = crate::test_support::frame_string(&mut state, 100, 40);
+            assert!(frame.contains("› third · running"), "{frame}");
+            assert_eq!(state.conversation_target().task_id(), Some("second"));
+        }
+    }
+
+    #[test]
+    fn a_reorder_keeps_the_mark_but_removing_its_row_clears_it() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let (mut state, _, mut tasks) = dock_visit();
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
+        dock_key(&mut state, up, false);
+        assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("first"));
+        tasks[0].created_at_ms = 4;
+        state.update(crate::protocol::TuiEvent::BackgroundTasksUpdated(
+            tasks.clone(),
+        ));
+        assert_eq!(state.workflow_tasks().last().unwrap().id, "first");
+        assert!(
+            crate::test_support::frame_string(&mut state, 100, 40).contains("› first · running")
+        );
+        state.update(crate::protocol::TuiEvent::BackgroundTasksUpdated(
+            tasks[1..].to_vec(),
+        ));
+        assert!(state.agent_dock_selected_task_id.is_none());
+        state.update(crate::protocol::TuiEvent::BackgroundTasksUpdated(tasks));
+        assert!(state.agent_dock_selected_task_id.is_none());
+        dock_key(&mut state, up, false);
+        assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("second"));
+        project_agent(&mut state, "first");
+        assert_eq!(
+            state.agent_dock_selected_task_id.as_deref(),
+            Some("second"),
+            "a same-agent refresh is not a new open"
+        );
+    }
+
+    #[test]
+    fn a_draft_leaves_the_dock_alone_and_selects_composer_text() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let (mut state, _, _) = dock_visit();
+        state.agent_dock_selected_task_id = Some("second".into());
+        let key = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+        let mut textarea = ratatui_textarea::TextArea::from(["top", "bottom"]);
+        assert!(matches!(
+            dock_key(&mut state, key, !textarea.is_empty()),
+            crate::key_event_actions::KeyEventFlow::Unhandled
+        ));
+        crate::composer_textarea::composer_input(&mut textarea, key.into());
+        assert_eq!(textarea.cursor().0, 1);
+        assert!(textarea.is_selecting());
+        assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("second"));
+    }
+
     fn with_ready_recap(state: &mut AppState, text: &str) {
         let attachment = crate::protocol::SessionAttachmentId::new(1);
         state.active_session_attachment = Some(attachment);

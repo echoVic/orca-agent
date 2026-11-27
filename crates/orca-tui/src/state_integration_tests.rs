@@ -900,6 +900,84 @@ mod agent_visit {
     }
 
     #[test]
+    fn the_agent_on_screen_is_marked_in_the_dock() {
+        with_streaming_main(|thread, mut main| {
+            let mut state = state();
+            let fixture = parent_of_child();
+            main.tasks.extend(fixture.tasks);
+            main.subagents.extend(fixture.subagents);
+            snapshot_update(&mut state, &main);
+            let mut child = snapshot_with_child(1, 5);
+            child.tasks.clear();
+            child.subagents.clear();
+            focus(&mut state, "child", &main, &child);
+            assert!(
+                crate::test_support::frame_string(&mut state, 100, 40)
+                    .contains("› child · running")
+            );
+            return_to_main(&mut state, thread, &main);
+            assert!(state.agent_dock_selected_task_id.is_none());
+            let frame = crate::test_support::frame_string(&mut state, 100, 40);
+            assert!(
+                frame.contains("child · running") && !frame.contains("› child"),
+                "{frame}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_read_only_view_marks_its_agent() {
+        let mut main = parent_of_child();
+        main.tasks[0].status = orca_runtime::surface::SurfaceTaskStatus::Completed;
+        main.subagents[0].status = orca_runtime::surface::SurfaceSubagentStatus::Completed;
+        let mut child = main.clone();
+        child.tasks.clear();
+        child.subagents.clear();
+        for projection in [
+            None,
+            Some(Box::new(SurfaceProjectionState::from_surface_snapshot(
+                &child,
+            ))),
+        ] {
+            let mut state = state();
+            snapshot_update(&mut state, &main);
+            assert!(
+                !crate::test_support::frame_string(&mut state, 100, 40)
+                    .contains("child · completed")
+            );
+            state.update(TuiEvent::FinishedChildProjection {
+                task_id: "child".into(),
+                main_status: crate::types::SideParentStatus::Idle,
+                projection,
+            });
+            let frame = crate::test_support::frame_string(&mut state, 100, 40);
+            assert!(
+                frame.contains("› child · completed") && frame.contains("Agents 0 active"),
+                "{frame}"
+            );
+            let mut tasks = crate::surface_projection::workflow_task_summaries(&main);
+            let mut approval = tasks[0].clone();
+            approval.status = orca_core::task_types::TaskStatus::ApprovalRequired;
+            for index in 0..5 {
+                approval.id = format!("approval-{index}");
+                tasks.push(approval.clone());
+            }
+            state.update(TuiEvent::BackgroundTasksUpdated(tasks));
+            let frame = crate::test_support::frame_string(&mut state, 100, 40);
+            assert!(
+                frame.contains("› child · completed"),
+                "attention rows filled the dock: {frame}"
+            );
+            state.update(TuiEvent::ChildFocusChanged { task_id: None });
+            assert!(state.agent_dock_selected_task_id.is_none());
+            assert!(
+                !crate::test_support::frame_string(&mut state, 100, 40)
+                    .contains("child · completed")
+            );
+        }
+    }
+
+    #[test]
     fn an_agent_that_ends_on_screen_adds_nothing_to_its_own_conversation() {
         let mut state = state();
         let mut main = parent_of_child();

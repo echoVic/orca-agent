@@ -37073,6 +37073,66 @@ mod tests {
         (thread, attachment, reserved.operation_id, first_generation)
     }
 
+    #[test]
+    fn main_waits_for_its_kept_agent_after_its_natural_reply() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().unwrap();
+        let marker = cwd.path().join("release-child");
+        let description = format!("mock_stream_release_marker {}", marker.display());
+        let (thread, attachment, operation, _stop) =
+            start_keeping_parent_turn(&host, cwd.path(), &format!("subagent async {description}"));
+        let release = ReleaseMarker(marker);
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &thread.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let agent = kept_agents_under_way(read_snapshot, &[&description]).remove(0);
+        let reply = "Mock completed after tool execution.";
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let snapshot = read_snapshot();
+            if snapshot.items.iter().any(|item| matches!(item, surface::SurfaceItem::AssistantMessage { text, .. } if text.as_str() == reply))
+                || snapshot.assistant_streams.iter().any(|stream| stream.text.as_str() == reply) { break; }
+            assert!(
+                Instant::now() < deadline,
+                "main never produced its post-tool reply"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let client = attachment.client.clone();
+        let (send, terminal) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _ = send.send(client.wait_operation_terminal(surface_request_id(), operation));
+        });
+        assert!(
+            matches!(
+                terminal.recv_timeout(Duration::from_millis(250)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "main ended with its child still held"
+        );
+        let registry = thread.task_registry();
+        let running = registry.get(agent.task_id.as_str()).unwrap();
+        assert_eq!(running.status, TaskStatus::Running);
+        let parent = running.parent_task_id.unwrap();
+        assert_eq!(registry.get(&parent).unwrap().status, TaskStatus::Running);
+        release.release();
+        assert!(
+            matches!(terminal.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap().unwrap(), surface::WaitOperationTerminalResult::Terminal { value } if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. }))
+        );
+        waiter.join().unwrap();
+        let child = registry.get(agent.task_id.as_str()).unwrap();
+        assert_eq!(child.status, TaskStatus::Completed);
+        assert!(
+            child.completed_at_ms.unwrap()
+                <= registry.get(&parent).unwrap().completed_at_ms.unwrap()
+        );
+    }
+
     /// The background key while the turn keeps an async agent running: the
     /// person is told at once that the turn stays, the turn and its agent
     /// go on, and once the agent has ended the turn ends where it ran, not

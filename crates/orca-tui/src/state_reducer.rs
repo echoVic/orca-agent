@@ -303,10 +303,14 @@ impl AppState {
                     self.background_workflow_tasks = self.workflow_panel.task_list();
                 }
                 self.focused_workflow_tasks.clear();
+                self.agent_dock_selected_task_id.clone_from(&task_id);
                 self.set_conversation_target(match task_id {
                     Some(task_id) => ConversationTarget::subagent(task_id),
                     None => ConversationTarget::Main,
                 });
+                if self.selected_agent_dock_task().is_none() {
+                    self.agent_dock_selected_task_id = None;
+                }
                 self.task_transcript = None;
                 self.panel_mode = PanelMode::Conversation;
                 self.scroll_to_bottom();
@@ -352,7 +356,7 @@ impl AppState {
                 {
                     return;
                 }
-                self.reset_child_view(task_id, main_status);
+                self.reset_child_view(task_id, main_status, false);
                 self.apply_surface_projection_state(*projection);
             }
             TuiEvent::FinishedChildProjection {
@@ -360,13 +364,12 @@ impl AppState {
                 main_status,
                 projection,
             } => {
-                self.reset_child_view(task_id, Some(main_status));
+                self.reset_child_view(task_id, Some(main_status), true);
                 if let Some(projection) = projection {
                     self.apply_surface_projection_state(*projection);
                 } else {
                     self.update_workflow_panel(self.background_workflow_tasks.clone());
                 }
-                self.finished_child = true;
             }
             TuiEvent::SavedSessionsUpdated {
                 sessions,
@@ -1588,7 +1591,17 @@ impl AppState {
         }
     }
 
-    fn reset_child_view(&mut self, task_id: String, main_status: Option<SideParentStatus>) {
+    fn reset_child_view(
+        &mut self,
+        task_id: String,
+        main_status: Option<SideParentStatus>,
+        finished: bool,
+    ) {
+        let selected = if !finished && self.conversation_target().task_id() == Some(&task_id) {
+            self.agent_dock_selected_task_id.take()
+        } else {
+            Some(task_id.clone())
+        };
         let background_tasks = std::mem::take(&mut self.background_workflow_tasks);
         self.reset_session_projection();
         if let Some(status) = main_status {
@@ -1597,6 +1610,8 @@ impl AppState {
         self.invalidate_recap();
         self.background_workflow_tasks = background_tasks;
         self.set_conversation_target(ConversationTarget::subagent(task_id));
+        self.agent_dock_selected_task_id = selected;
+        self.finished_child = finished;
         self.task_transcript = None;
         self.panel_mode = PanelMode::Conversation;
     }
