@@ -176,7 +176,7 @@ impl PathPolicy {
         access_mode: u32,
         share_mode: u32,
     ) -> Result<VerifiedPath, PlatformError> {
-        windows::open_no_follow(path, self, access_mode, share_mode)
+        windows::open_no_follow(path, self, access_mode, share_mode, false)
     }
 
     /// Holds the opened path in place by excluding delete sharing.
@@ -186,7 +186,7 @@ impl PathPolicy {
         path: &Path,
         access_mode: u32,
     ) -> Result<VerifiedPath, PlatformError> {
-        self.open_no_follow_shared(path, access_mode, windows::PINNED_SHARE_MODE)
+        windows::open_no_follow(path, self, access_mode, windows::PINNED_SHARE_MODE, true)
     }
 }
 
@@ -483,6 +483,7 @@ mod windows {
         policy: PathPolicy,
         access_mode: u32,
         share_mode: u32,
+        verify_identity: bool,
     ) -> Result<VerifiedPath, PlatformError> {
         let text = path
             .to_str()
@@ -513,7 +514,7 @@ mod windows {
 
         let final_path = final_path_from_handle(&file)?;
         let identity = policy.identity(&final_path)?;
-        if pinned && identity != expected {
+        if verify_identity && identity != expected {
             return Err(PlatformError::InvalidPathIdentity {
                 path: text.to_string(),
                 reason: "opened path differs from the verified path".to_string(),
