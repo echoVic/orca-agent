@@ -136,13 +136,21 @@ const DELIVERED_NOTICE_PREFIXES: [&str; 4] = [
     "[Budget soft landing]",
 ];
 
+pub const REPEAT_TOOL_REMINDER_PREFIX: &str = "You have called ";
+
+fn is_repeat_tool_reminder(content: &str) -> bool {
+    content.starts_with(REPEAT_TOOL_REMINDER_PREFIX)
+        && content.contains(" with the same arguments ")
+}
+
 /// Whether a system message is a delivered notice. Notices are ordinary
 /// conversation content: the model keeps seeing each one until compaction
 /// summarizes it, including across a resume.
 pub fn is_delivered_notice(content: &str) -> bool {
-    DELIVERED_NOTICE_PREFIXES
-        .iter()
-        .any(|prefix| content.starts_with(prefix))
+    is_repeat_tool_reminder(content)
+        || DELIVERED_NOTICE_PREFIXES
+            .iter()
+            .any(|prefix| content.starts_with(prefix))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -924,16 +932,25 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
                     .map(|tool_call| tool_call.id.as_str())
                     .collect::<HashSet<_>>();
                 let mut collected_tools = HashMap::new();
+                let mut reminders = Vec::new();
                 let mut next = index + 1;
 
                 while next < messages.len() {
-                    let Message::Tool { tool_call_id, .. } = &messages[next] else {
-                        break;
-                    };
-                    if expected.contains(tool_call_id.as_str()) {
-                        collected_tools
-                            .entry(tool_call_id.clone())
-                            .or_insert_with(|| messages[next].clone());
+                    match &messages[next] {
+                        Message::Tool { tool_call_id, .. } => {
+                            if expected.contains(tool_call_id.as_str()) {
+                                collected_tools
+                                    .entry(tool_call_id.clone())
+                                    .or_insert_with(|| messages[next].clone());
+                            }
+                        }
+                        Message::System {
+                            content,
+                            pinned: false,
+                        } if is_repeat_tool_reminder(content) => {
+                            reminders.push(messages[next].clone());
+                        }
+                        _ => break,
                     }
                     next += 1;
                 }
@@ -952,6 +969,8 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
                             .unwrap_or_else(|| repaired_missing_tool_result(tool_call)),
                     );
                 }
+                // Providers expect all results in a tool group to be adjacent.
+                normalized.extend(reminders);
                 index = next.max(index + 1);
             }
             message => {
