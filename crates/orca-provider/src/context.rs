@@ -1438,6 +1438,9 @@ fn summarize_collapsed_messages(
     result.internal_context = conversation.internal_context.clone();
     result.nested_instructions = conversation.nested_instructions.clone();
     result
+        .repeat_tool_streak
+        .clone_from(&conversation.repeat_tool_streak);
+    result
         .mcp_instructions
         .clone_from(&conversation.mcp_instructions);
     result.mcp_catalogs.clone_from(&conversation.mcp_catalogs);

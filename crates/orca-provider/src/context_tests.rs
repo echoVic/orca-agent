@@ -1447,13 +1447,23 @@ mod replay_compaction {
     #[test]
     fn deep_compaction_uses_the_replay_checkpoint() {
         let server = server(json!({"content": CHECKPOINT}), "stop");
-        let result = compact(&server, &conversation(), 100_000);
+        let mut conversation = conversation();
+        conversation.repeat_tool_streak = Some(orca_core::conversation::RepeatToolStreak {
+            tool_name: "read_file".into(),
+            arguments: "{}".into(),
+            count: 2,
+        });
+        let result = compact(&server, &conversation, 100_000);
         assert!(
             matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == CHECKPOINT)
         );
         assert_eq!(
             result.conversation.summary.baseline.as_deref(),
             Some(CHECKPOINT)
+        );
+        assert_eq!(
+            result.conversation.repeat_tool_streak,
+            conversation.repeat_tool_streak
         );
         let requests = server.requests.lock().unwrap();
         let [request] = requests.as_slice() else {
