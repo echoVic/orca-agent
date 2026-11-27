@@ -320,7 +320,7 @@ fn micro_compaction_shortens_output_beside_a_pinned_notice() {
     assert!(matches!(&messages[4],
         Message::Tool { content, .. } if content.starts_with("[tool output micro-compact]")));
     assert!(matches!(&messages[5],
-        Message::System { content, pinned: true } if content.contains("done")));
+        Message::System { content, pinned: true, .. } if content.contains("done")));
 }
 
 #[test]

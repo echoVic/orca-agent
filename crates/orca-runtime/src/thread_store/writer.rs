@@ -1999,6 +1999,7 @@ impl SessionWriter {
             content: version.content.clone(),
             pinned: false,
             nested_instruction: Some(Box::new(version.identity.clone())),
+            context_fragments: Vec::new(),
         };
         let record = match &self.turn_id {
             Some(turn) => StoredConversationRecord::identified(

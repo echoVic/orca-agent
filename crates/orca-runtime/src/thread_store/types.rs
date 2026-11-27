@@ -544,6 +544,8 @@ pub(crate) enum StoredMessage {
         pinned: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nested_instruction: Option<Box<NestedInstructionSource>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        context_fragments: Vec<orca_core::conversation::ContextFragmentChange>,
     },
     User {
         content: String,
@@ -737,6 +739,8 @@ enum StoredMessageWire {
         pinned: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nested_instruction: Option<Box<NestedInstructionSource>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        context_fragments: Vec<orca_core::conversation::ContextFragmentChange>,
     },
     User {
         content: String,
@@ -776,10 +780,12 @@ impl<'de> Deserialize<'de> for StoredMessage {
                 content,
                 pinned,
                 nested_instruction,
+                context_fragments,
             } => Ok(Self::System {
                 content,
                 pinned,
                 nested_instruction,
+                context_fragments,
             }),
             StoredMessageWire::User {
                 content,
@@ -826,10 +832,15 @@ impl<'de> Deserialize<'de> for StoredMessage {
 impl From<&Message> for StoredMessage {
     fn from(message: &Message) -> Self {
         match message {
-            Message::System { content, pinned } => Self::System {
+            Message::System {
+                content,
+                pinned,
+                context_fragments,
+            } => Self::System {
                 content: content.clone(),
                 pinned: *pinned,
                 nested_instruction: None,
+                context_fragments: context_fragments.clone(),
             },
             Message::User {
                 content,
@@ -877,6 +888,7 @@ impl From<StoredMessage> for Message {
                 content,
                 pinned,
                 nested_instruction,
+                context_fragments,
             } => Self::System {
                 content: match nested_instruction {
                     Some(identity) => {
@@ -885,6 +897,7 @@ impl From<StoredMessage> for Message {
                     None => content,
                 },
                 pinned,
+                context_fragments,
             },
             StoredMessage::User {
                 content,

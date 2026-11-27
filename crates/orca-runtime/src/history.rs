@@ -310,10 +310,13 @@ pub(crate) fn resume_conversation_in_cwd(
         &transcript.summaries,
     )
     .into_iter()
-    // The old system prompt and ephemeral system context are rebuilt rather
-    // than restored. The truncation marker, delivered notices and mentioned
-    // skills are conversation content and stay until compaction.
+    // The old system prompt and ephemeral system context are rebuilt. Context
+    // batches, truncation markers, delivered notices and mentioned skills
+    // stay in their original places until compaction.
     .filter(|message| {
+        if message.is_context_fragment_batch() {
+            return true;
+        }
         if let Some(replay) = crate::skill_context::should_replay_mention(message, active_cwd) {
             return replay;
         }
@@ -322,6 +325,7 @@ pub(crate) fn resume_conversation_in_cwd(
             Message::System {
                 content,
                 pinned: false,
+            ..
             } if !content.starts_with(
                 "[Earlier conversation history was truncated to fit context window]"
             ) && !is_delivered_notice(content)
@@ -935,8 +939,8 @@ mod tests {
                 resumed.messages.as_slice(),
                 [
                     Message::System { content: system, .. },
-                    Message::System { content: marker, pinned: false },
-                    Message::System { content: hook, pinned: true },
+                    Message::System { content: marker, pinned: false, .. },
+                    Message::System { content: hook, pinned: true, .. },
                     Message::User { content: tail, .. },
                 ] if system == "fresh system"
                     && marker

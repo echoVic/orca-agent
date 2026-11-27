@@ -18,7 +18,7 @@ use orca_core::tool_images::{MAX_REQUEST_TOOL_IMAGES, keep_newest_tool_images};
 use orca_core::tool_types::{ToolName, ToolRequest};
 
 use crate::ProviderConfig;
-use crate::context::{render_internal_context, render_mcp_catalogs, render_mcp_instructions};
+use crate::context::{pending_context_message, render_internal_context, render_mcp_instructions};
 use crate::http_client::{RequestFailure, RetryBudget};
 use crate::replay_prefix;
 use crate::tool_schema::{
@@ -1410,7 +1410,7 @@ fn serialize_conversation_messages(
     // ahead of it as part of the prefix.
     let prefix_len = source_messages
         .iter()
-        .take_while(|message| matches!(message, Message::System { pinned: false, .. }))
+        .take_while(|message| message.is_leading_system())
         .count();
     let went_on = turn_went_on_after(source_messages);
     let last_user = source_messages
@@ -1505,11 +1505,16 @@ fn serialize_conversation_messages(
     messages.splice(summary_position..summary_position, injected);
 
     if cut.is_none() {
-        // Volatile steering and server guidance stay after the cached history.
+        // Direct provider callers can render changes without mutating the
+        // conversation. The runtime normally appends them before this point.
+        let pending_context = pending_context_message(conversation);
         for overlay in [
+            pending_context
+                .as_ref()
+                .and_then(Message::content_str)
+                .map(str::to_owned),
             render_internal_context(conversation),
             render_mcp_instructions(conversation),
-            render_mcp_catalogs(conversation),
         ]
         .into_iter()
         .flatten()
@@ -2729,8 +2734,207 @@ mod tests {
         );
     }
 
+    fn prepare_context(conv: &mut Conversation) {
+        conv.messages.extend(pending_context_message(conv));
+    }
+
+    fn context_conversation() -> Conversation {
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".into());
+        conv.add_user("read the records".into());
+        conv.replace_memory_context(Some("first fact".into()));
+        conv
+    }
+
     #[test]
-    fn internal_context_is_a_separate_system_message_after_the_history() {
+    fn an_unchanged_fragment_appends_nothing() {
+        let mut conv = context_conversation();
+        prepare_context(&mut conv);
+        assert_eq!(conv.messages.len(), 3);
+        prepare_context(&mut conv);
+        assert_eq!(conv.messages.len(), 3);
+    }
+
+    #[test]
+    fn a_changed_fragment_appends_one_replacement() {
+        let mut conv = context_conversation();
+        prepare_context(&mut conv);
+        conv.add_assistant(Some("continuing".into()), None, vec![]);
+        conv.replace_memory_context(Some("second fact".into()));
+        conv.replace_goal_state(Some("finish the report".into()));
+        prepare_context(&mut conv);
+        assert_eq!(conv.messages.len(), 5);
+        assert_eq!(
+            conv.messages[4].content_str(),
+            Some(concat!(
+                "Current memory context (this replaces any earlier version):\n[Relevant memory]\nsecond fact",
+                "\n\nCurrent goal context (this replaces any earlier version):\n[Goal state]\nfinish the report",
+            ))
+        );
+        prepare_context(&mut conv);
+        assert_eq!(conv.messages.len(), 5);
+    }
+
+    #[test]
+    fn a_removed_fragment_appends_the_no_longer_applies_note() {
+        let mut conv = context_conversation();
+        prepare_context(&mut conv);
+        conv.replace_memory_context(None);
+        prepare_context(&mut conv);
+        assert_eq!(
+            conv.messages.last().unwrap().content_str(),
+            Some("The memory context no longer applies.")
+        );
+        prepare_context(&mut conv);
+        assert_eq!(conv.messages.len(), 4);
+    }
+
+    #[test]
+    fn plan_stays_at_the_tail() {
+        let mut conv = context_conversation();
+        conv.replace_plan_state("[Plan] Find the next record".into());
+        prepare_context(&mut conv);
+        assert_eq!(conv.messages.len(), 3);
+        assert!(
+            conv.messages[2]
+                .content_str()
+                .unwrap()
+                .contains("first fact")
+        );
+        let messages = conversation_to_api_messages(&conv);
+        assert_eq!(
+            messages.last().unwrap().content.as_deref(),
+            Some("[Plan] Find the next record")
+        );
+    }
+
+    #[test]
+    fn compaction_reappends_current_fragments_once() {
+        let mut conv = context_conversation();
+        prepare_context(&mut conv);
+        conv.add_assistant(Some("old answer ".repeat(2000)), None, vec![]);
+        conv.add_user("continue".into());
+        conv.replace_memory_context(Some("latest fact".into()));
+        prepare_context(&mut conv);
+        let config = crate::context::ContextConfig {
+            max_tokens: 128,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
+        };
+        let mut compacted = crate::context::compact(&conv, &config);
+        assert!(!compacted.summary.is_empty());
+        let before = compacted.messages.len();
+        prepare_context(&mut compacted);
+        let messages = conversation_to_api_messages(&compacted);
+        assert_eq!(compacted.messages.len(), before + 1);
+        let summary = messages
+            .iter()
+            .position(|message| {
+                message
+                    .content
+                    .as_deref()
+                    .is_some_and(|text| text.contains("[Summary baseline]"))
+            })
+            .unwrap();
+        let contexts = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                let content = message.content.as_deref()?;
+                content
+                    .starts_with("Current memory context")
+                    .then_some((index, content))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contexts.len(), 1);
+        assert!(contexts[0].0 > summary);
+        assert!(contexts[0].1.ends_with("latest fact"));
+        prepare_context(&mut compacted);
+        assert_eq!(compacted.messages.len(), before + 1);
+    }
+
+    #[test]
+    fn fragment_messages_keep_thinking_mode_requests_valid() {
+        let mut conv = context_conversation();
+        prepare_context(&mut conv);
+        conv.add_assistant(
+            None,
+            Some("I should read the file".into()),
+            vec![RawToolCall {
+                id: "read-record".into(),
+                function_name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        let tool_call_id = match conv.messages.last().unwrap() {
+            Message::Assistant { tool_calls, .. } => tool_calls[0].id.clone(),
+            _ => unreachable!(),
+        };
+        conv.add_tool_result(tool_call_id, "file contents".into());
+        conv.replace_memory_context(Some("another fact".into()));
+        prepare_context(&mut conv);
+        let messages = conversation_to_api_messages(&conv);
+        assert_eq!(messages[2].role, "system");
+        assert_eq!(messages[3].role, "assistant");
+        assert_eq!(
+            messages[3].reasoning_content.as_deref(),
+            Some("I should read the file")
+        );
+        assert_eq!(messages[4].role, "tool");
+        assert!(
+            messages[5]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("another fact")
+        );
+    }
+
+    #[test]
+    fn uncached_tail_tokens_drop_on_a_scripted_session() {
+        use crate::context::{DefaultTokenCounter, TokenCounter};
+
+        let mut conv = context_conversation();
+        let stable = "Read the surrounding code before editing. ".repeat(40);
+        conv.replace_memory_context(Some(stable.clone()));
+        let memory = format!("[Relevant memory]\n{}", stable.trim());
+        let plan = "[Plan] Inspect the next file";
+        conv.replace_plan_state(plan.into());
+        let before = format!("{memory}\n\n{plan}");
+        let mut measurements = Vec::new();
+        for step in 0..5 {
+            let prior_count = conv.messages.len();
+            prepare_context(&mut conv);
+            let messages = conversation_to_api_messages(&conv);
+            let after = &messages[prior_count..];
+            let after_bytes = after
+                .iter()
+                .map(|msg| msg.content.as_deref().unwrap().len())
+                .sum::<usize>();
+            let after_tokens = after
+                .iter()
+                .map(|msg| DefaultTokenCounter.count_text(msg.content.as_deref().unwrap()))
+                .sum::<usize>();
+            measurements.push((
+                before.len(),
+                after_bytes,
+                DefaultTokenCounter.count_text(&before),
+                after_tokens,
+            ));
+            conv.add_assistant(Some(format!("Read file {step}")), None, vec![]);
+            conv.add_user(format!("Read file {} next", step + 1));
+        }
+        eprintln!("context bytes before/after and estimated tokens before/after: {measurements:?}");
+        assert!(measurements[1..].iter().all(
+            |&(before_bytes, after_bytes, before_tokens, after_tokens)| after_bytes < before_bytes
+                && after_tokens < before_tokens
+        ));
+    }
+
+    #[test]
+    fn direct_requests_render_context_changes_before_the_plan() {
         let mut conv = Conversation::new();
         conv.add_system("system prompt".to_string());
         conv.add_user("do something".to_string());
@@ -2738,13 +2942,18 @@ mod tests {
         conv.replace_goal_state(Some("build a widget".to_string()));
 
         let messages = conversation_to_api_messages(&conv);
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].content.as_deref(), Some("system prompt"));
         assert_eq!(messages[1].content.as_deref(), Some("do something"));
         assert_eq!(messages[2].role, "system");
-        let overlay = messages[2].content.as_deref().unwrap();
-        assert!(overlay.contains("[Goal state]"));
-        assert!(overlay.contains("[Plan]"));
+        assert!(
+            messages[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("[Goal state]")
+        );
+        assert_eq!(messages[3].content.as_deref(), Some("[Plan]\n1. step one"));
     }
 
     #[test]
@@ -2771,17 +2980,26 @@ mod tests {
         let after = serde_json::to_value(conversation_to_api_messages(&conv)).unwrap();
 
         let (before, after) = (before.as_array().unwrap(), after.as_array().unwrap());
-        assert_eq!(before.len(), after.len());
-        let overlay = after.len() - 1;
-        assert_eq!(before[..overlay], after[..overlay]);
+        assert_eq!(after.len(), before.len() + 1);
+        let end_of_history = before.len() - 1;
+        assert_eq!(before[..end_of_history], after[..end_of_history]);
         assert_eq!(
             after[1]["content"],
             format!("{SUMMARY_PREAMBLE}[Summary baseline]\nearlier work")
         );
-        assert_eq!(after[overlay]["role"], "system");
-        let overlay = after[overlay]["content"].as_str().unwrap();
-        assert!(overlay.contains("[in_progress] patch it"));
-        assert!(overlay.contains("a recalled fact"));
+        assert_eq!(after[end_of_history]["role"], "system");
+        assert!(
+            after[end_of_history]["content"]
+                .as_str()
+                .unwrap()
+                .contains("a recalled fact")
+        );
+        assert!(
+            after.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("[in_progress] patch it")
+        );
     }
 
     #[test]
@@ -2798,10 +3016,14 @@ mod tests {
         );
 
         let messages = conversation_to_api_messages(&conv);
-        let overlay = messages.last().unwrap().content.as_deref().unwrap();
-
-        assert!(crate::context::DefaultTokenCounter.count_text(overlay) <= 2);
-        assert_ne!(overlay, "one two three four five six");
+        let rendered = messages.last().unwrap().content.as_deref().unwrap();
+        let (heading, text) = rendered.split_once('\n').unwrap();
+        assert_eq!(
+            heading,
+            "Current bounded-runtime context (this replaces any earlier version):"
+        );
+        assert!(crate::context::DefaultTokenCounter.count_text(text) <= 2);
+        assert_ne!(text, "one two three four five six");
     }
 
     #[test]

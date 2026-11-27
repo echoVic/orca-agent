@@ -576,7 +576,7 @@ impl RuntimeProviderTurnStep {
         if let Some(error) = image_usage_error {
             return Ok(RuntimeProviderTurnOutput::terminal(error));
         }
-        let prepared_images = match prepared_images {
+        let mut prepared_images = match prepared_images {
             Ok(prepared) => prepared,
             Err(error) => {
                 return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
@@ -597,6 +597,15 @@ impl RuntimeProviderTurnStep {
                 writer.append_message(&analysis)?;
             }
             conversation.messages.push(analysis);
+        }
+        if input.provider == ProviderKind::DeepSeek
+            && let Some(context) = context::pending_context_message(conversation)
+        {
+            if let Some(writer) = history_writer.as_deref_mut() {
+                writer.append_message(&context)?;
+            }
+            prepared_images.conversation.messages.push(context.clone());
+            conversation.messages.push(context);
         }
         // The persisted messages this request is built from; the usage
         // anchor measures against them.

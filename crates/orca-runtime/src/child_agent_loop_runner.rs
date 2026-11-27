@@ -291,6 +291,12 @@ where
             );
         }
 
+        if config.provider == orca_core::config::ProviderKind::DeepSeek {
+            let conversation = &mut setup.conversation;
+            conversation
+                .messages
+                .extend(context::pending_context_message(conversation));
+        }
         let measurement = context::measure_prompt(&setup.conversation, &model_turn.provider_config);
         model_turn.provider_config = context::with_request_reply_budget(
             &model_turn.provider_config,
@@ -596,6 +602,12 @@ where
             );
         }
 
+        if config.provider == orca_core::config::ProviderKind::DeepSeek {
+            let conversation = &mut setup.conversation;
+            conversation
+                .messages
+                .extend(context::pending_context_message(conversation));
+        }
         let measurement = context::measure_prompt(&setup.conversation, &model_turn.provider_config);
         model_turn.provider_config = context::with_request_reply_budget(
             &model_turn.provider_config,

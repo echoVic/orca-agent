@@ -56,9 +56,9 @@ fn fingerprint(message: &Message, include_images: bool) -> Option<[u8; 32]> {
         &[]
     };
     match message {
-        Message::System { content, pinned } => {
-            serde_json::to_writer(&mut hash, &("system", content, pinned))
-        }
+        Message::System {
+            content, pinned, ..
+        } => serde_json::to_writer(&mut hash, &("system", content, pinned)),
         Message::User {
             content, pinned, ..
         } => serde_json::to_writer(&mut hash, &("user", content, pinned, images)),

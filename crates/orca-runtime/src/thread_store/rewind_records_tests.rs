@@ -650,7 +650,9 @@ fn summarize_from_fold_truncates_and_appends_a_pinned_summary() {
             ["first prompt".to_string(), "reply one".to_string()]
         );
         match &transcript.messages[2] {
-            Message::System { content, pinned } => {
+            Message::System {
+                content, pinned, ..
+            } => {
                 assert!(pinned, "folded summary must be pinned");
                 assert_eq!(content, "summary of the removed tail");
             }
@@ -696,7 +698,9 @@ fn summarize_up_to_fold_drains_the_front_and_keeps_the_system_position() {
         // after it.
         assert_eq!(texts(&transcript)[0], "persisted system prompt");
         match &transcript.messages[1] {
-            Message::System { content, pinned } => {
+            Message::System {
+                content, pinned, ..
+            } => {
                 assert!(pinned, "folded summary must be pinned");
                 assert_eq!(content, "summary of the prefix");
             }
@@ -740,7 +744,9 @@ fn summarize_up_to_fold_drains_leading_messages_before_the_target() {
         let transcript = fixture.transcript();
         assert_eq!(transcript.messages.len(), 3);
         match &transcript.messages[0] {
-            Message::System { content, pinned } => {
+            Message::System {
+                content, pinned, ..
+            } => {
                 assert!(pinned, "folded summary must be pinned");
                 assert_eq!(content, "summary of the first turn");
             }

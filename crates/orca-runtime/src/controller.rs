@@ -2875,9 +2875,9 @@ mod tests {
             )
             .unwrap();
             let text = |content: &str| content.contains("Use the durable review checklist.");
-            assert_eq!(session.conversation().messages.iter().filter(|message| matches!(message, Message::System { content, pinned: false } if text(content))).count(), 1);
+            assert_eq!(session.conversation().messages.iter().filter(|message| matches!(message, Message::System { content, pinned: false, .. } if text(content))).count(), 1);
             let parts = session.runtime_parts();
-            assert_eq!(parts.writer.unwrap().conversation_records().iter().filter(|record| matches!(Message::from(record.message.clone()), Message::System { content, pinned: false } if text(&content))).count(), 1);
+            assert_eq!(parts.writer.unwrap().conversation_records().iter().filter(|record| matches!(Message::from(record.message.clone()), Message::System { content, pinned: false, .. } if text(&content))).count(), 1);
         });
     }
 
@@ -3393,6 +3393,20 @@ while IFS= read -r line; do
     }
 
     #[cfg(unix)]
+    fn requested_mcp_catalog(request: &serde_json::Value) -> &str {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .find_map(|message| {
+                message.split_once("Current mcp context (this replaces any earlier version):\n")
+            })
+            .unwrap()
+            .1
+    }
+
+    #[cfg(unix)]
     fn mcp_only_names(request: &serde_json::Value) -> Vec<&str> {
         request["tools"]
             .as_array()
@@ -3494,8 +3508,7 @@ while IFS= read -r line; do
             loader["function"]["parameters"]["properties"]["names"]["items"]["type"],
             "string"
         );
-        let messages = request["messages"].as_array().unwrap();
-        let mcp = messages.last().unwrap()["content"].as_str().unwrap();
+        let mcp = requested_mcp_catalog(&request);
         assert!(mcp.contains("<mcp_tool_catalog>"));
         assert!(mcp.contains(r#""name":"lookup""#));
         assert!(mcp.contains(r"\u003cexample\u003e"));
@@ -3911,9 +3924,19 @@ while IFS= read -r line; do
         );
         run_mcp_test_prompt(&config, &mut session);
         let requests = provider.join().unwrap();
-        let catalog = requests[0]["messages"].as_array().unwrap().last().unwrap()["content"]
-            .as_str()
-            .unwrap();
+        let catalog = requested_mcp_catalog(&requests[0]);
+        assert_eq!(requested_mcp_catalog(&requests[1]), catalog);
+        assert_eq!(
+            requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("<mcp_tool_catalog>")))
+                .count(),
+            1
+        );
         assert!(catalog.contains("MCP catalog shortened"));
         assert!(catalog.contains("mcp__catalog__load_tools"));
         assert!(catalog.contains("mcp__other__load_tools"));
@@ -4275,7 +4298,7 @@ while IFS= read -r line; do
         let message_count = thread.session().conversation().messages.len();
         assert!(matches!(
             thread.session().conversation().messages.last(),
-            Some(Message::System { content, pinned: false })
+            Some(Message::System { content, pinned: false, .. })
                 if content.contains("<task-notification>")
                     && content.contains("notified")
                     && content.contains(&task_id)
@@ -6827,7 +6850,7 @@ while IFS= read -r line; do
         assert_eq!(model_conversation.messages.len(), 3);
         assert!(matches!(
             model_conversation.messages.last(),
-            Some(orca_core::conversation::Message::System { content, pinned: true })
+            Some(orca_core::conversation::Message::System { content, pinned: true, .. })
                 if content.contains("policy hint") && content.contains("repo hint")
         ));
     }

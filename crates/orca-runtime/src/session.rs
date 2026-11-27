@@ -1333,6 +1333,33 @@ mod tests {
     }
 
     #[test]
+    fn resume_rebuilds_the_last_appended_state_without_new_messages() {
+        with_orca_home(|_| {
+            let cwd = tempdir().unwrap();
+            let mut writer =
+                SessionWriter::start(cwd.path(), "deepseek", None, "read records").unwrap();
+            writer
+                .append_message(&Message::system("system prompt".into()))
+                .unwrap();
+            writer.enter_turn(TurnId::new());
+            writer
+                .append_message(&Message::user("read records".into()))
+                .unwrap();
+            let content = "Current memory context (this replaces any earlier version):\n[Relevant memory]\nfirst fact";
+            let mut original = Conversation::new();
+            original.replace_memory_context(Some("first fact".into()));
+            let batch = orca_provider::context::pending_context_message(&original).unwrap();
+            writer.append_message(&batch).unwrap();
+            let transcript = history::load_session("latest").unwrap();
+            let mut resumed = history::resume_conversation(&transcript, "system prompt".into());
+            assert_eq!(resumed.messages.len(), 3);
+            assert_eq!(resumed.messages[2].content_str(), Some(content));
+            resumed.replace_memory_context(Some("first fact".into()));
+            assert!(orca_provider::context::pending_context_message(&resumed).is_none());
+        });
+    }
+
+    #[test]
     fn session_from_handmade_run_config_installs_user_price_overrides() {
         crate::pricing::tests::with_isolated_user_overrides(|| {
             use orca_core::model::{ModelDefinition, ModelPriceOverride, UsdPerMillion};
@@ -1826,6 +1853,7 @@ mod tests {
                     Message::System {
                         content,
                         pinned: false,
+                        ..
                     } if content.starts_with("You have called ") => Some(content.as_str()),
                     _ => None,
                 })
@@ -1841,7 +1869,7 @@ mod tests {
             }
             assert_eq!(reminders(&conversation), [THIRD]);
             assert!(matches!(conversation.messages.as_slice(),
-                [.., Message::Tool { content: output, .. }, Message::System { content, pinned: false }]
+                [.., Message::Tool { content: output, .. }, Message::System { content, pinned: false, .. }]
                     if output == "tool output" && content == THIRD));
         }
 
@@ -2009,7 +2037,7 @@ mod tests {
                     crate::history::resume_conversation(&transcript, "system prompt".to_string());
                 assert_eq!(reminders(&resumed), [THIRD]);
                 assert!(matches!(resumed.messages.as_slice(),
-                    [.., Message::Tool { content: output, .. }, Message::System { content, pinned: false }]
+                    [.., Message::Tool { content: output, .. }, Message::System { content, pinned: false, .. }]
                         if output == "tool output" && content == THIRD));
             });
         }

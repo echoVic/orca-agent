@@ -46,7 +46,9 @@ fn manual_compaction_conversation_keys(
     let mut keys = Vec::new();
     for message in &conversation.messages {
         match message {
-            orca_core::conversation::Message::System { content, pinned } => {
+            orca_core::conversation::Message::System {
+                content, pinned, ..
+            } => {
                 keys.push(ManualCompactionItemKey::System {
                     content: content.clone(),
                     pinned: *pinned,

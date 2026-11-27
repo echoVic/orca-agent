@@ -217,11 +217,20 @@ pub enum CutShort {
     OutputLimit,
 }
 
+/// Identity of a rendered fragment in a system message. A missing digest
+/// records a removal. The digest survives transcript text redaction.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextFragmentChange {
+    pub id: String,
+    pub digest: Option<[u8; 32]>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Message {
     System {
         content: String,
         pinned: bool,
+        context_fragments: Vec<ContextFragmentChange>,
     },
     User {
         content: String,
@@ -249,13 +258,31 @@ impl Message {
         Self::System {
             content,
             pinned: false,
+            context_fragments: Vec::new(),
         }
+    }
+
+    pub fn context_fragment_batch(content: String, changes: Vec<ContextFragmentChange>) -> Self {
+        Self::System {
+            content,
+            pinned: false,
+            context_fragments: changes,
+        }
+    }
+
+    pub fn is_context_fragment_batch(&self) -> bool {
+        matches!(self, Self::System { context_fragments, .. } if !context_fragments.is_empty())
+    }
+
+    pub fn is_leading_system(&self) -> bool {
+        matches!(self, Self::System { pinned: false, .. }) && !self.is_context_fragment_batch()
     }
 
     pub fn pinned_system(content: String) -> Self {
         Self::System {
             content,
             pinned: true,
+            context_fragments: Vec::new(),
         }
     }
 
@@ -762,10 +789,8 @@ impl Conversation {
         );
     }
 
-    /// Tells the model today's date. Call it when a turn opens: the fragment
-    /// is rendered after the history on every request, so a session that
-    /// crosses midnight, or is resumed on a later day, sees the new date
-    /// without its cached prefix changing.
+    /// Updates the date fragment when a turn opens. A new date can be
+    /// appended to history without changing the system prompt.
     pub fn set_today(&mut self, today: chrono::NaiveDate) {
         self.replace_internal_context(
             DATE_CONTEXT_FRAGMENT_ID,
@@ -848,6 +873,7 @@ impl Conversation {
             if let Message::System {
                 content,
                 pinned: true,
+                ..
             } = msg
             {
                 !content.starts_with("[Pinned plan state]")
@@ -863,7 +889,7 @@ impl Conversation {
         self.messages.retain(|msg| {
             !matches!(
                 msg,
-                Message::System { content, pinned: false }
+                Message::System { content, pinned: false, .. }
                 if content.starts_with("[Summary of earlier conversation]")
                 || content.starts_with("[Earlier conversation history was truncated")
             )
@@ -874,7 +900,9 @@ impl Conversation {
     /// ordinary messages.
     pub fn unpin_delivered_notices(&mut self) {
         for message in &mut self.messages {
-            if let Message::System { content, pinned } = message
+            if let Message::System {
+                content, pinned, ..
+            } = message
                 && *pinned
                 && is_delivered_notice(content)
             {
@@ -1118,6 +1146,7 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
                         Message::System {
                             content,
                             pinned: false,
+                            ..
                         } if is_repeat_tool_reminder(content) => {
                             reminders.push(messages[next].clone());
                         }
@@ -1900,7 +1929,9 @@ mod tests {
         conv.messages
             .iter()
             .map(|message| match message {
-                Message::System { content, pinned } => format!("sys|{pinned}|{content}"),
+                Message::System {
+                    content, pinned, ..
+                } => format!("sys|{pinned}|{content}"),
                 Message::User {
                     content, pinned, ..
                 } => format!("usr|{pinned}|{content}"),
@@ -2083,6 +2114,7 @@ mod tests {
                 Message::System {
                     content,
                     pinned: false,
+                    ..
                 } if is_delivered_notice(content) => Some(content.as_str()),
                 _ => None,
             })
@@ -2118,7 +2150,7 @@ mod tests {
         conv.strip_legacy_pinned_volatile();
         assert_eq!(conv.messages.len(), 3);
         assert!(
-            matches!(&conv.messages[0], Message::System { content, pinned: false } if content == "sys")
+            matches!(&conv.messages[0], Message::System { content, pinned: false, .. } if content == "sys")
         );
         assert!(matches!(&conv.messages[1], Message::User { content, .. } if content == "hello"));
         assert!(matches!(&conv.messages[2], Message::Assistant { .. }));
@@ -2140,7 +2172,7 @@ mod tests {
         assert_eq!(conv.messages.len(), 3);
         assert!(conv.messages[1].is_pinned());
         assert!(
-            matches!(&conv.messages[2], Message::System { content, pinned: true } if content.contains("Hook context"))
+            matches!(&conv.messages[2], Message::System { content, pinned: true, .. } if content.contains("Hook context"))
         );
     }
 

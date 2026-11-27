@@ -162,10 +162,7 @@ mod tests {
     #[test]
     fn thread_store_projects_conversation_turns() {
         let messages = vec![
-            Message::System {
-                content: "system".to_string(),
-                pinned: false,
-            },
+            Message::system("system".to_string()),
             Message::User {
                 content: "hello".to_string(),
                 images: Vec::new(),

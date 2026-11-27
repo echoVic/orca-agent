@@ -1741,7 +1741,7 @@ mod tests {
             .unwrap();
             assert!(adopted, "the compaction must write a snapshot");
             assert!(conversation.messages.iter().any(|message| matches!(message,
-                Message::System { content, pinned: false } if content == &notice)));
+                Message::System { content, pinned: false, .. } if content == &notice)));
 
             let transcript = crate::thread_store::JsonlThreadStore::new()
                 .load_session("notice-resume")
@@ -1751,7 +1751,9 @@ mod tests {
                 .messages
                 .iter()
                 .filter_map(|message| match message {
-                    Message::System { content, pinned } => Some((content.as_str(), *pinned)),
+                    Message::System {
+                        content, pinned, ..
+                    } => Some((content.as_str(), *pinned)),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
