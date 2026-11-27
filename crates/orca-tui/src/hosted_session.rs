@@ -291,6 +291,7 @@ fn runtime_event_to_tui(event: &EventEnvelope) -> Option<TuiEvent> {
                 turn_id: turn_id.to_string(),
             },
             None => TuiEvent::TurnStarted {
+                started_at_ms: None,
                 turn: event
                     .payload
                     .get("turn")
@@ -525,7 +526,7 @@ pub(crate) fn announce_runtime_ready(
 
 pub(crate) fn read_hosted_projection_batch(
     thread: &RuntimeThreadHandle,
-) -> Result<(SurfaceProjectionState, Vec<ChatMessage>), String> {
+) -> Result<(SurfaceProjectionState, HostedConversation), String> {
     TuiSurfaceActions::new(thread.typed_surface())
         .read_snapshot()
         .map(|snapshot| hosted_projection_batch_from_snapshot(thread, &snapshot))
@@ -535,7 +536,7 @@ pub(crate) fn read_hosted_projection_batch(
 pub(crate) fn hosted_projection_batch_from_snapshot(
     thread: &RuntimeThreadHandle,
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
-) -> (SurfaceProjectionState, Vec<ChatMessage>) {
+) -> (SurfaceProjectionState, HostedConversation) {
     let projection = SurfaceProjectionState::from_surface_snapshot(snapshot);
     let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(snapshot);
     if let Some(session_id) = thread.session_id()
@@ -546,12 +547,45 @@ pub(crate) fn hosted_projection_batch_from_snapshot(
     if let Some(message) = crate::surface_projection::latest_terminal_message(snapshot) {
         messages.push(message);
     }
-    (projection, messages)
+    (
+        projection,
+        HostedConversation::from_snapshot(snapshot, messages),
+    )
+}
+
+pub(crate) struct HostedConversation {
+    pub(crate) messages: Vec<ChatMessage>,
+    pub(crate) plan: Option<(Option<String>, Vec<PlanItem>)>,
+}
+
+impl HostedConversation {
+    pub(crate) fn from_snapshot(
+        snapshot: &orca_runtime::surface::SurfaceSnapshot,
+        messages: Vec<ChatMessage>,
+    ) -> Self {
+        Self {
+            messages,
+            plan: snapshot_plan(snapshot),
+        }
+    }
+
+    pub(crate) fn into_event(self, label: Option<&str>) -> TuiEvent {
+        let Self { messages, plan } = self;
+        match label {
+            Some(label) => TuiEvent::HistoryLoaded {
+                messages,
+                plan: None,
+                label: label.to_owned(),
+            },
+            None => TuiEvent::ConversationReprojected { messages, plan },
+        }
+    }
 }
 
 pub(crate) fn project_hosted_thread_attached(
     projection: SurfaceProjectionState,
-    messages: Vec<ChatMessage>,
+    conversation: HostedConversation,
+    label: Option<&str>,
     attachment: SessionAttachmentId,
     root_event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<(), String> {
@@ -561,28 +595,14 @@ pub(crate) fn project_hosted_thread_attached(
         TuiEvent::SessionProjectionReset(Box::new(projection)),
     )
     .map_err(|error| error.to_string())?;
-    send_attached_event(
-        root_event_tx,
-        attachment,
-        TuiEvent::HistoryLoaded {
-            messages,
-            plan: None,
-            label: "Inherited conversation context.".to_string(),
-        },
-    )
-    .map_err(|error| error.to_string())
+    send_attached_event(root_event_tx, attachment, conversation.into_event(label))
+        .map_err(|error| error.to_string())
 }
 
-pub(crate) fn emit_typed_history_snapshot(
-    thread: &RuntimeThreadHandle,
-    mode: &HistoryMode,
-    session_presentation: Option<SessionProjectionPresentation>,
-    event_tx: &mpsc::Sender<TuiEvent>,
-) -> Result<(), String> {
-    let actions = TuiSurfaceActions::new(thread.typed_surface());
-    let snapshot = actions.read_snapshot().map_err(|error| error.to_string())?;
-    let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
-    let mut plan = if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
+fn snapshot_plan(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+) -> Option<(Option<String>, Vec<PlanItem>)> {
+    if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
         None
     } else {
         Some((
@@ -609,7 +629,19 @@ pub(crate) fn emit_typed_history_snapshot(
                 })
                 .collect(),
         ))
-    };
+    }
+}
+
+pub(crate) fn emit_typed_history_snapshot(
+    thread: &RuntimeThreadHandle,
+    mode: &HistoryMode,
+    session_presentation: Option<SessionProjectionPresentation>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), String> {
+    let actions = TuiSurfaceActions::new(thread.typed_surface());
+    let snapshot = actions.read_snapshot().map_err(|error| error.to_string())?;
+    let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
+    let mut plan = snapshot_plan(&snapshot);
     if messages.is_empty()
         && let HistoryMode::Resume(selector) | HistoryMode::Fork(selector) = mode
     {
@@ -1189,7 +1221,11 @@ mod tests {
 
         project_hosted_thread_attached(
             projection,
-            vec![ChatMessage::User("hello".to_string())],
+            HostedConversation {
+                messages: vec![ChatMessage::User("hello".to_string())],
+                plan: None,
+            },
+            None,
             attachment,
             &event_tx,
         )
@@ -1207,7 +1243,7 @@ mod tests {
             second,
             TuiEvent::Attached(attached)
                 if attached.attachment == Some(attachment)
-                    && matches!(attached.event, TuiEvent::HistoryLoaded { .. })
+                    && matches!(attached.event, TuiEvent::ConversationReprojected { .. })
         ));
     }
 

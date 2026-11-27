@@ -153,8 +153,8 @@ pub(crate) fn handle_hosted_side_action(
                         return;
                     }
                 };
-            let side_messages = match read_hosted_projection_batch(&started) {
-                Ok((_, messages)) => messages,
+            let conversation = match read_hosted_projection_batch(&started) {
+                Ok((_, conversation)) => conversation,
                 Err(error) => {
                     reap_hosted_thread(started);
                     *thread = Some(parent);
@@ -208,7 +208,8 @@ pub(crate) fn handle_hosted_side_action(
             );
             if let Err(error) = project_hosted_thread_attached(
                 side_projection,
-                side_messages,
+                conversation,
+                Some("Inherited conversation context."),
                 *session_attachment,
                 root_event_tx,
             ) {
@@ -313,6 +314,7 @@ pub(crate) fn handle_hosted_side_action(
                 if let Err(error) = project_hosted_thread_attached(
                     target_batch.0,
                     target_batch.1,
+                    Some("Inherited conversation context."),
                     *session_attachment,
                     root_event_tx,
                 ) {
@@ -406,10 +408,11 @@ pub(crate) fn handle_hosted_side_action(
                         *session_attachment,
                         Some(side.attachment),
                     );
-                    let (parent_projection, parent_messages) = parent_batch.expect("parent batch");
+                    let (parent_projection, conversation) = parent_batch.expect("parent batch");
                     if let Err(error) = project_hosted_thread_attached(
                         parent_projection,
-                        parent_messages,
+                        conversation,
+                        Some("Inherited conversation context."),
                         *session_attachment,
                         root_event_tx,
                     ) {

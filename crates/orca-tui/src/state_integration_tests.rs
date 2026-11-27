@@ -723,6 +723,383 @@ fn workflow_task_summary(id: &str, name: &str) -> BackgroundTaskSummary {
     }
 }
 
+mod agent_visit {
+    use super::*;
+    use crate::hosted_child::tests::{snapshot_with_child, with_streaming_main};
+    use orca_runtime::runtime_host::RuntimeThreadHandle;
+    use orca_runtime::surface::{SurfaceSnapshot, SurfaceTaskType, UnixMillis};
+
+    fn parent_of_child() -> SurfaceSnapshot {
+        let mut snapshot = snapshot_with_child(1, 5);
+        snapshot.tasks[0].started_at = Some(UnixMillis::new(
+            chrono::Utc::now().timestamp_millis() - 30_000,
+        ));
+        snapshot
+    }
+
+    fn apply_attached(state: &mut AppState, events: mpsc::Receiver<TuiEvent>) -> Option<u64> {
+        let mut start = None;
+        for event in events.try_iter() {
+            let TuiEvent::Attached(attached) = event else {
+                panic!("unfenced event")
+            };
+            if let TuiEvent::TurnStarted { started_at_ms, .. } = &attached.event {
+                start = *started_at_ms;
+            }
+            state.update(attached.event);
+        }
+        start
+    }
+
+    fn focus(state: &mut AppState, id: &str, main: &SurfaceSnapshot, child: &SurfaceSnapshot) {
+        let (sender, events) = mpsc::unbounded();
+        crate::hosted_child::project_hosted_child_attached(
+            id.into(),
+            main,
+            SurfaceProjectionState::from_surface_snapshot(child),
+            crate::hosted_session::HostedConversation::from_snapshot(
+                child,
+                crate::surface_projection::history_messages_from_surface_snapshot(child),
+            ),
+            crate::protocol::SessionAttachmentId::new(2),
+            &sender,
+        )
+        .unwrap();
+        apply_attached(state, events);
+        for event in crate::hosted_child::FocusedAgent::from_parent(id, main)
+            .projection(child)
+            .hydrate_open_streams()
+        {
+            state.update(event);
+        }
+    }
+
+    fn return_to_main(
+        state: &mut AppState,
+        thread: &RuntimeThreadHandle,
+        snapshot: &SurfaceSnapshot,
+    ) -> Option<u64> {
+        let (sender, events) = mpsc::unbounded();
+        crate::hosted_child::project_returned_main(
+            thread,
+            snapshot,
+            crate::protocol::SessionAttachmentId::new(1),
+            &sender,
+        )
+        .unwrap();
+        let start = apply_attached(state, events);
+        state.update(TuiEvent::ChildFocusChanged { task_id: None });
+        start
+    }
+
+    fn assert_running_seconds(frame: &str, minimum: u64) {
+        let seconds = frame
+            .split_once("Running ")
+            .and_then(|(_, tail)| tail.split_once('s'))
+            .and_then(|(seconds, _)| seconds.parse::<u64>().ok());
+        assert!(seconds.is_some_and(|value| value >= minimum), "{frame}");
+    }
+
+    fn assert_no_label(state: &AppState) {
+        assert!(!state.transcript.messages.iter().any(|message| matches!(message, ChatMessage::System { text, .. } if text == "Inherited conversation context.")));
+    }
+
+    #[test]
+    fn returning_from_an_agent_keeps_a_running_main_running() {
+        with_streaming_main(|thread, mut snapshot| {
+            let mut state = state();
+            let mut main = parent_of_child();
+            main.foreground_operation = snapshot.foreground_operation.clone();
+            state.update(TuiEvent::TurnStarted {
+                turn: 0,
+                task: None,
+                started_at_ms: None,
+            });
+            state.update(TuiEvent::MessageDelta("before".into()));
+            state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+                SurfaceProjectionState::from_surface_snapshot(&main),
+            )));
+            focus(&mut state, "child", &main, &snapshot);
+            let admitted = snapshot
+                .foreground_operation
+                .as_ref()
+                .unwrap()
+                .agent_loop_turns[0]
+                .admitted_main_task_id
+                .clone()
+                .unwrap();
+            let mut timed_task = snapshot_with_child(1, 2).tasks.remove(0);
+            timed_task.task_id = admitted;
+            timed_task.task_type = SurfaceTaskType::MainSession;
+            timed_task.subagent_id = None;
+            timed_task.started_at = Some(UnixMillis::new(
+                chrono::Utc::now().timestamp_millis() - 40_000,
+            ));
+            snapshot.tasks.push(timed_task);
+            let stream = snapshot
+                .assistant_streams
+                .iter_mut()
+                .find(|stream| stream.channel == orca_runtime::surface::AssistantChannel::Message)
+                .unwrap();
+            stream.text = orca_runtime::surface::DisplayText::new("before and during");
+            stream.next_offset = orca_runtime::surface::ByteOffset::new(17);
+            return_to_main(&mut state, thread, &snapshot);
+            assert_eq!(state.status, AppStatus::Running);
+            assert!(state.running_started_at.unwrap().elapsed().as_secs() >= 40);
+            assert_eq!(state.main_behind_child, None);
+            assert_no_label(&state);
+            let frame = crate::test_support::frame_string(&mut state, 120, 40);
+            assert_running_seconds(&frame, 40);
+            assert!(
+                frame.contains("before and during") && frame.contains("Esc interrupt"),
+                "{frame}"
+            );
+            state.update(TuiEvent::MessageDelta(" and after\n".into()));
+            state.update(TuiEvent::SessionCompleted {
+                status: "success".into(),
+            });
+            let frame = crate::test_support::frame_string(&mut state, 120, 40);
+            assert_eq!(
+                frame.matches("before and during and after").count(),
+                1,
+                "{frame}"
+            );
+            assert_eq!(frame.matches("before and during").count(), 1, "{frame}");
+        });
+    }
+
+    #[test]
+    fn a_late_queue_update_cannot_revive_the_turn_restored_on_return() {
+        with_streaming_main(|thread, snapshot| {
+            let mut state = state();
+            let mut running = crate::test_support::runtime_queue_running_the_first(&["queued"]);
+            let turn = &snapshot
+                .foreground_operation
+                .as_ref()
+                .unwrap()
+                .generations
+                .last()
+                .unwrap()
+                .logical_turn_id;
+            running.items[0].client_user_message_id =
+                orca_runtime::prompt_queue::ClientUserMessageId::parse(
+                    turn.as_str().strip_prefix("turn_").unwrap(),
+                )
+                .unwrap();
+            return_to_main(&mut state, thread, &snapshot);
+            state.update(TuiEvent::SessionCompleted {
+                status: "success".into(),
+            });
+            state.update(TuiEvent::PromptQueueUpdated(running));
+            assert_eq!(state.status, AppStatus::Idle);
+        });
+    }
+
+    #[test]
+    fn the_live_main_clock_uses_its_admitted_task_even_before_reconciliation() {
+        with_streaming_main(|thread, snapshot| {
+            let turn = &snapshot
+                .foreground_operation
+                .as_ref()
+                .unwrap()
+                .agent_loop_turns[0];
+            let admitted = turn.admitted_main_task_id.as_ref().unwrap();
+            assert_ne!(admitted, &turn.task_id);
+            assert!(!snapshot.tasks.iter().any(|row| &row.task_id == admitted));
+            let started = thread
+                .task_registry()
+                .get(admitted.as_str())
+                .unwrap()
+                .started_at_ms
+                .unwrap();
+            let mut state = state();
+            let hydrated_start = return_to_main(&mut state, thread, &snapshot);
+            assert_eq!(state.status, AppStatus::Running);
+            assert_eq!(hydrated_start, Some(started.try_into().unwrap()));
+        });
+    }
+
+    #[test]
+    fn an_agents_view_has_no_inherited_context_line() {
+        let mut state = state();
+        focus(
+            &mut state,
+            "child",
+            &parent_of_child(),
+            &snapshot_with_child(1, 6),
+        );
+        assert_no_label(&state);
+    }
+
+    #[test]
+    fn opening_a_sibling_keeps_main_shown_as_running() {
+        with_streaming_main(|thread, snapshot| {
+            let mut state = state();
+            let mut main = parent_of_child();
+            main.foreground_operation = snapshot.foreground_operation.clone();
+            state.enter_running();
+            focus(&mut state, "child", &main, &snapshot);
+            return_to_main(&mut state, thread, &snapshot);
+            state.set_status(AppStatus::Idle);
+            let mut sibling = main.tasks[0].clone();
+            sibling.task_id = orca_runtime::surface::SurfaceTaskId::try_new("sibling").unwrap();
+            main.tasks.push(sibling);
+            focus(&mut state, "sibling", &main, &snapshot);
+            assert_eq!(state.main_behind_child, Some(SideParentStatus::Running));
+            assert!(
+                crate::test_support::frame_string(&mut state, 120, 40)
+                    .contains("Main is running · Esc return")
+            );
+        });
+    }
+
+    #[test]
+    fn an_agents_timer_counts_from_its_start_however_often_it_is_opened() {
+        with_streaming_main(|thread, snapshot| {
+            let mut state = state();
+            let main = parent_of_child();
+            for _ in 0..2 {
+                focus(&mut state, "child", &main, &snapshot);
+                assert!(state.running_started_at.unwrap().elapsed().as_secs() >= 30);
+                assert_running_seconds(&crate::test_support::frame_string(&mut state, 120, 40), 30);
+                return_to_main(&mut state, thread, &snapshot);
+            }
+        });
+    }
+
+    #[test]
+    fn a_snapshot_clock_in_the_future_starts_now() {
+        let mut state = state();
+        let before = Instant::now();
+        state.update(TuiEvent::TurnStarted {
+            turn: 0,
+            task: None,
+            started_at_ms: Some(u64::MAX),
+        });
+        let start = state.running_started_at.unwrap();
+        assert!((before..=Instant::now()).contains(&start));
+    }
+
+    #[test]
+    fn a_child_view_reports_the_interaction_main_is_waiting_for() {
+        use orca_runtime::surface::{
+            DisplayText, InteractionRevision, InteractionUnavailableDisposition, NonEmptyText,
+            ResponseRouteEpoch, SurfaceInteractionId, SurfaceInteractionKind,
+            SurfaceInteractionLifecycle, SurfaceInteractionRequest, SurfaceInteractionRoute,
+            SurfaceInteractionView, SurfaceMcpElicitationRequest,
+        };
+
+        with_streaming_main(|_, mut main| {
+            let child = parent_of_child();
+            let mut state = state();
+            let question = NonEmptyText::try_new("Continue?").unwrap();
+            for (kind, request, status) in [
+                (
+                    SurfaceInteractionKind::McpElicitation,
+                    SurfaceInteractionRequest::McpElicitation {
+                        server_name: NonEmptyText::try_new("mock").unwrap(),
+                        server_request_id: NonEmptyText::try_new("1").unwrap(),
+                        message: DisplayText::new("Continue?"),
+                        request: SurfaceMcpElicitationRequest::Form {
+                            requested_schema: None,
+                            supported_schema: None,
+                        },
+                    },
+                    SideParentStatus::NeedsApproval,
+                ),
+                (
+                    SurfaceInteractionKind::UserInput,
+                    SurfaceInteractionRequest::UserInput {
+                        question,
+                        suggestions: vec![],
+                    },
+                    SideParentStatus::NeedsInput,
+                ),
+            ] {
+                main.interactions = vec![SurfaceInteractionView {
+                    interaction_id: SurfaceInteractionId::try_from_bytes([
+                        0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 3,
+                    ])
+                    .unwrap(),
+                    revision: InteractionRevision::try_new(1).unwrap(),
+                    fence: main
+                        .foreground_operation
+                        .as_ref()
+                        .unwrap()
+                        .generations
+                        .last()
+                        .unwrap()
+                        .fence
+                        .clone(),
+                    kind,
+                    request,
+                    route: SurfaceInteractionRoute::Unassigned {
+                        epoch: ResponseRouteEpoch::try_new(1).unwrap(),
+                    },
+                    lifecycle: SurfaceInteractionLifecycle::Requested,
+                    recovery_disposition: InteractionUnavailableDisposition::FailOperation,
+                }];
+                focus(&mut state, "child", &main, &child);
+                assert_eq!(state.main_behind_child, Some(status));
+            }
+        });
+    }
+
+    #[test]
+    fn returning_to_an_idle_main_does_not_keep_the_child_running() {
+        with_streaming_main(|thread, child| {
+            let main = parent_of_child();
+            let mut state = state();
+            focus(&mut state, "child", &main, &child);
+            assert_eq!(state.status, AppStatus::Running);
+            return_to_main(&mut state, thread, &main);
+            assert_eq!(state.status, AppStatus::Idle);
+            assert!(state.running_started_at.is_none());
+            assert_no_label(&state);
+        });
+    }
+
+    #[test]
+    fn reprojection_replaces_the_plan_without_ending_the_turn() {
+        let mut state = state();
+        state.enter_running();
+        for explanation in [Some("current plan"), None] {
+            state.update(TuiEvent::ConversationReprojected {
+                messages: vec![],
+                plan: explanation.map(|text| (Some(text.to_owned()), vec![])),
+            });
+            assert_eq!(
+                state.current_plan().and_then(|(text, _)| text.as_deref()),
+                explanation
+            );
+            assert_eq!(state.status, AppStatus::Running);
+            assert!(state.transcript.messages.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_side_conversation_keeps_its_label() {
+        let mut state = state();
+        let (sender, events) = mpsc::unbounded();
+        crate::hosted_session::project_hosted_thread_attached(
+            SurfaceProjectionState::from_surface_snapshot(&parent_of_child()),
+            crate::hosted_session::HostedConversation {
+                messages: vec![],
+                plan: None,
+            },
+            Some("Inherited conversation context."),
+            crate::protocol::SessionAttachmentId::new(3),
+            &sender,
+        )
+        .unwrap();
+        apply_attached(&mut state, events);
+        assert!(
+            matches!(state.transcript.messages.last(), Some(ChatMessage::System { text, .. }) if text == "Inherited conversation context.")
+        );
+        assert_eq!(state.status, AppStatus::Idle);
+    }
+}
+
 #[test]
 fn workflow_notification_action_carries_notification_boundary() {
     let expected = PendingWorkflowNotification {
@@ -1192,6 +1569,7 @@ fn child_projection_reset_preserves_parent_agent_dock() {
     projection.cursor = crate::surface_projection::test_surface_cursor(2);
     state.update(TuiEvent::ChildProjectionReset {
         task_id: child.id.clone(),
+        main_status: Some(SideParentStatus::Running),
         projection: Box::new(projection),
     });
 
@@ -2104,6 +2482,7 @@ fn end_a_turn_with_your_denial(state: &mut AppState) {
     state.push_message(ChatMessage::User("bash pwd".to_string()));
     state.enter_running();
     state.update(TuiEvent::TurnStarted {
+        started_at_ms: None,
         turn: 0,
         task: Some(crate::protocol::TuiTaskLifecycle {
             id: "typed-user-turn-1".to_string(),
@@ -2319,6 +2698,7 @@ fn recovery_projection_is_not_overwritten_by_lifecycle_events() {
     assert!(state.recovery_prompt_visible);
 
     state.update(TuiEvent::TurnStarted {
+        started_at_ms: None,
         turn: 2,
         task: None,
     });
@@ -4919,6 +5299,7 @@ fn backgrounded_main_session_suppresses_foreground_output_until_completion() {
         status: "success".to_string(),
     });
     state.update(TuiEvent::TurnStarted {
+        started_at_ms: None,
         turn: 2,
         task: None,
     });
@@ -5274,6 +5655,7 @@ fn running_timer_starts_and_stops_with_running_status() {
     assert!(state.running_started_at.is_none());
 
     state.update(TuiEvent::TurnStarted {
+        started_at_ms: None,
         turn: 1,
         task: None,
     });
@@ -5290,6 +5672,7 @@ fn running_timer_starts_and_stops_with_running_status() {
 fn approval_round_trip_preserves_running_timer() {
     let mut state = state();
     state.update(TuiEvent::TurnStarted {
+        started_at_ms: None,
         turn: 1,
         task: None,
     });

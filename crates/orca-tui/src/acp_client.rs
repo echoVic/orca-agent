@@ -402,6 +402,7 @@ impl TuiClient {
         // A denied observer action must not hide genuine remote work.
         if self.projection.borrow().active {
             let _ = self.events.send(TuiEvent::TurnStarted {
+                started_at_ms: None,
                 turn: 1,
                 task: None,
             });
@@ -657,6 +658,7 @@ impl ClientHandler for TuiClient {
                     projection.terminal_seen = false;
                     projection.terminal_diagnostic_seen = false;
                     lifecycle = Some(TuiEvent::TurnStarted {
+                        started_at_ms: None,
                         turn: 1,
                         task: None,
                     });
@@ -904,6 +906,7 @@ fn submit(
             "An ACP turn is already running; input was not sent".into(),
         );
         let _ = client.events.send(TuiEvent::TurnStarted {
+            started_at_ms: None,
             turn: 1,
             task: None,
         });

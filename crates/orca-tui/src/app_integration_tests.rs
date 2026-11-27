@@ -1870,6 +1870,7 @@ fn stale_attachment_events_do_not_mutate_switched_session() {
             mcp_catalog: Default::default(),
         })),
         TuiEvent::TurnStarted {
+            started_at_ms: None,
             turn: 3,
             task: None,
         },

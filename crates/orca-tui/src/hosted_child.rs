@@ -22,13 +22,36 @@ use crate::attachment_routing::{
     AttachmentRouting, send_attached_event, spawn_attached_event_sender_with_routing,
 };
 use crate::hosted_session::{
-    hosted_projection_batch_from_snapshot, project_hosted_thread_attached,
-    read_hosted_projection_batch,
+    HostedConversation, hosted_projection_batch_from_snapshot, project_hosted_thread_attached,
 };
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::protocol::{SessionAttachmentId, TuiEvent};
 use crate::surface_projection::{SurfaceProjectionState, TuiSurfaceProjection};
-use crate::transcript_state::ChatMessage;
+use crate::types::SideParentStatus;
+
+pub(crate) struct FocusedAgent {
+    task_id: String,
+    started_at_ms: Option<u64>,
+}
+
+impl FocusedAgent {
+    pub(crate) fn from_parent(task_id: &str, parent: &SurfaceSnapshot) -> Self {
+        let started_at_ms = parent
+            .tasks
+            .iter()
+            .find(|row| row.task_id.as_str() == task_id)
+            .and_then(|row| row.started_at)
+            .and_then(|time| u64::try_from(time.get()).ok());
+        Self {
+            task_id: task_id.to_owned(),
+            started_at_ms,
+        }
+    }
+
+    pub(crate) fn projection(&self, child: &SurfaceSnapshot) -> TuiSurfaceProjection {
+        TuiSurfaceProjection::for_conversation(child, self.started_at_ms)
+    }
+}
 
 /// A controller-owned attachment pair for an interactive child.
 ///
@@ -64,14 +87,14 @@ pub(crate) struct HostedChildEventBridge {
 impl HostedChildEventBridge {
     fn prepare(
         thread: &RuntimeThreadHandle,
-        task_id: String,
+        agent: FocusedAgent,
         event_tx: mpsc::Sender<TuiEvent>,
         control: &TuiSurfaceTaskControl,
     ) -> Result<
         (
             Self,
             SurfaceProjectionState,
-            Vec<ChatMessage>,
+            HostedConversation,
             Vec<TuiEvent>,
         ),
         String,
@@ -108,9 +131,9 @@ impl HostedChildEventBridge {
         };
         let client = attachment.client.clone();
         let snapshot = attachment.baseline.snapshot.clone();
-        let (initial_projection, initial_messages) =
+        let (initial_projection, conversation) =
             hosted_projection_batch_from_snapshot(thread, &snapshot);
-        let mut projection = TuiSurfaceProjection::from_surface_snapshot(&snapshot);
+        let mut projection = agent.projection(&snapshot);
         let operation_id = snapshot
             .foreground_operation
             .as_ref()
@@ -156,7 +179,7 @@ impl HostedChildEventBridge {
                     surface_for_thread,
                     client_for_thread,
                     control_for_thread,
-                    task_id,
+                    agent,
                 );
             })
             .map_err(|error| {
@@ -173,7 +196,7 @@ impl HostedChildEventBridge {
                 control: control.clone(),
             },
             initial_projection,
-            initial_messages,
+            conversation,
             initial_interactions,
         ))
     }
@@ -220,7 +243,7 @@ fn run_child_surface_bridge(
     surface: RuntimeSurfaceHandle,
     mut client: RuntimeSurfaceClientHandle,
     control: TuiSurfaceTaskControl,
-    task_id: String,
+    agent: FocusedAgent,
 ) {
     let (started_guard, wake) = &*started;
     let mut started_guard = match started_guard.lock() {
@@ -296,7 +319,10 @@ fn run_child_surface_bridge(
                 }
                 match projection.project_typed_batch(&batch) {
                     Ok(events) => {
-                        for event in events {
+                        for mut event in events {
+                            if let TuiEvent::TurnStarted { started_at_ms, .. } = &mut event {
+                                *started_at_ms = agent.started_at_ms;
+                            }
                             if event_tx.send(event).is_err() {
                                 end = true;
                                 break;
@@ -324,7 +350,7 @@ fn run_child_surface_bridge(
                     &mut subscription,
                     &mut followed,
                     &mut *projection,
-                    &task_id,
+                    &agent,
                     &event_tx,
                     &control,
                 ) {
@@ -422,7 +448,7 @@ fn recover_child_surface(
     subscription: &mut orca_runtime::surface::SurfaceSubscriptionReceiver,
     operation_id: &mut Option<SurfaceOperationId>,
     projection: &mut TuiSurfaceProjection,
-    task_id: &str,
+    agent: &FocusedAgent,
     event_tx: &mpsc::Sender<TuiEvent>,
     control: &TuiSurfaceTaskControl,
 ) -> Result<(), String> {
@@ -470,22 +496,22 @@ fn recover_child_surface(
         return Err(error.to_string());
     }
     *operation_id = next_operation;
-    *projection = TuiSurfaceProjection::from_surface_snapshot(&snapshot);
+    *projection = agent.projection(&snapshot);
     send_event(
         event_tx,
         TuiEvent::ChildProjectionReset {
-            task_id: task_id.to_string(),
+            task_id: agent.task_id.clone(),
+            main_status: None,
             projection: Box::new(projection_state),
         },
     )?;
     send_event(
         event_tx,
-        TuiEvent::HistoryLoaded {
-            messages,
-            plan: None,
-            label: "Recovered child conversation context.".to_string(),
-        },
+        HostedConversation::from_snapshot(&snapshot, messages).into_event(None),
     )?;
+    for event in projection.hydrate_open_streams() {
+        send_event(event_tx, event)?;
+    }
     for event in register_requested_interactions(&snapshot, control) {
         send_event(event_tx, event)?;
     }
@@ -503,10 +529,11 @@ fn send_event(event_tx: &mpsc::Sender<TuiEvent>, event: TuiEvent) -> Result<(), 
         .map_err(|_| "TUI event receiver closed".to_string())
 }
 
-fn project_hosted_child_attached(
+pub(crate) fn project_hosted_child_attached(
     task_id: String,
+    parent: &SurfaceSnapshot,
     projection: SurfaceProjectionState,
-    messages: Vec<ChatMessage>,
+    conversation: HostedConversation,
     attachment: SessionAttachmentId,
     root_event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<(), String> {
@@ -515,20 +542,13 @@ fn project_hosted_child_attached(
         attachment,
         TuiEvent::ChildProjectionReset {
             task_id,
+            main_status: Some(main_status_for_child(parent)),
             projection: Box::new(projection),
         },
     )
     .map_err(|error| error.to_string())?;
-    send_attached_event(
-        root_event_tx,
-        attachment,
-        TuiEvent::HistoryLoaded {
-            messages,
-            plan: None,
-            label: "Inherited conversation context.".to_string(),
-        },
-    )
-    .map_err(|error| error.to_string())
+    send_attached_event(root_event_tx, attachment, conversation.into_event(None))
+        .map_err(|error| error.to_string())
 }
 
 fn detach_child_surface(surface: &RuntimeSurfaceHandle, client: &RuntimeSurfaceClientHandle) {
@@ -538,6 +558,32 @@ fn detach_child_surface(surface: &RuntimeSurfaceHandle, client: &RuntimeSurfaceC
             request_id: SurfaceRequestId::new(),
         },
     );
+}
+
+fn main_status_for_child(snapshot: &SurfaceSnapshot) -> SideParentStatus {
+    let Some(operation) = snapshot
+        .foreground_operation
+        .as_ref()
+        .filter(|operation| operation.terminal.is_none())
+    else {
+        return SideParentStatus::Idle;
+    };
+    let mut status = SideParentStatus::Running;
+    for interaction in &snapshot.interactions {
+        if interaction.fence.operation_id != operation.operation_id
+            || interaction.lifecycle != SurfaceInteractionLifecycle::Requested
+        {
+            continue;
+        }
+        match interaction.kind {
+            SurfaceInteractionKind::UserInput => return SideParentStatus::NeedsInput,
+            SurfaceInteractionKind::ToolApproval
+            | SurfaceInteractionKind::PermissionRequest
+            | SurfaceInteractionKind::McpElicitation => status = SideParentStatus::NeedsApproval,
+            SurfaceInteractionKind::BackgroundApproval => {}
+        }
+    }
+    status
 }
 
 pub(crate) enum HostedChildAction {
@@ -701,7 +747,7 @@ fn focus_child(
     let (child_bridge, child_projection, child_messages, child_interactions) =
         match HostedChildEventBridge::prepare(
             &child_thread,
-            task_id.clone(),
+            FocusedAgent::from_parent(&task_id, &current_snapshot),
             child_event_tx.clone(),
             control,
         ) {
@@ -725,6 +771,7 @@ fn focus_child(
 
     if let Err(error) = project_hosted_child_attached(
         task_id.clone(),
+        &current_snapshot,
         child_projection,
         child_messages,
         child_attachment,
@@ -782,8 +829,8 @@ fn return_to_parent(
     let Some(mut child_focus) = focus.take() else {
         return;
     };
-    let parent_batch = match read_hosted_projection_batch(&child_focus.parent_thread) {
-        Ok(batch) => batch,
+    let parent_snapshot = match read_parent_snapshot(&child_focus.parent_thread) {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             reject(
                 event_tx,
@@ -808,9 +855,9 @@ fn return_to_parent(
     *event_tx = child_focus.parent_event_tx.clone();
     *session_attachment = child_focus.parent_attachment;
 
-    if let Err(error) = project_hosted_thread_attached(
-        parent_batch.0,
-        parent_batch.1,
+    if let Err(error) = project_returned_main(
+        &child_focus.parent_thread,
+        &parent_snapshot,
         child_focus.parent_attachment,
         root_event_tx,
     ) {
@@ -847,6 +894,66 @@ fn return_to_parent(
 
 fn reject(event_tx: &mpsc::Sender<TuiEvent>, message: &str) {
     let _ = event_tx.send(TuiEvent::OperationRejected(message.to_string()));
+}
+
+pub(crate) fn project_returned_main(
+    thread: &RuntimeThreadHandle,
+    snapshot: &SurfaceSnapshot,
+    attachment: SessionAttachmentId,
+    sender: &mpsc::Sender<TuiEvent>,
+) -> Result<(), String> {
+    let (projection, conversation) = hosted_projection_batch_from_snapshot(thread, snapshot);
+    project_hosted_thread_attached(projection, conversation, None, attachment, sender)?;
+    if let Some(generation) = snapshot
+        .foreground_operation
+        .as_ref()
+        .filter(|operation| operation.terminal.is_none())
+        .and_then(|operation| operation.generations.last())
+    {
+        send_attached_event(
+            sender,
+            attachment,
+            TuiEvent::RuntimeTurnRestored(generation.logical_turn_id.clone()),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let mut streams =
+        TuiSurfaceProjection::for_conversation(snapshot, main_started_at_ms(thread, snapshot));
+    for event in streams.hydrate_conversation() {
+        send_attached_event(sender, attachment, event).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn main_started_at_ms(thread: &RuntimeThreadHandle, snapshot: &SurfaceSnapshot) -> Option<u64> {
+    let operation = snapshot
+        .foreground_operation
+        .as_ref()
+        .filter(|op| op.terminal.is_none())?;
+    let generation = operation.generations.last()?;
+    let task_id = operation
+        .agent_loop_turns
+        .iter()
+        .rev()
+        .filter(|turn| turn.fence == generation.fence)
+        .find_map(|turn| turn.admitted_main_task_id.as_ref())?;
+    let start = snapshot
+        .tasks
+        .iter()
+        .find(|row| {
+            &row.task_id == task_id
+                && row.task_type == orca_runtime::surface::SurfaceTaskType::MainSession
+        })
+        .and_then(|row| row.started_at)
+        .map(|time| time.get())
+        .or_else(|| {
+            thread
+                .task_registry()
+                .get(task_id.as_str())
+                .filter(|row| row.task_type == orca_core::task_types::TaskType::MainSession)
+                .and_then(|row| row.started_at_ms)
+        })?;
+    u64::try_from(start).ok()
 }
 
 fn read_parent_snapshot(thread: &RuntimeThreadHandle) -> Result<SurfaceSnapshot, String> {
@@ -972,7 +1079,10 @@ pub(crate) mod live_child_for_test {
             let (event_bridge, _projection, _messages, _interactions) =
                 super::HostedChildEventBridge::prepare(
                     &child,
-                    "child".to_string(),
+                    super::FocusedAgent {
+                        task_id: "child".to_string(),
+                        started_at_ms: None,
+                    },
                     event_tx.clone(),
                     &control,
                 )
@@ -1009,7 +1119,7 @@ pub(crate) mod live_child_for_test {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use orca_core::conversation::ConversationTarget;
     use orca_core::cost_types::UsageTotals;
     use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
@@ -1091,7 +1201,7 @@ mod tests {
 
     /// A parent snapshot holding one running subagent task, `child`, at
     /// `revision`, bound to the hosted thread `child_thread_seed`.
-    fn snapshot_with_child(revision: u64, child_thread_seed: u8) -> SurfaceSnapshot {
+    pub(crate) fn snapshot_with_child(revision: u64, child_thread_seed: u8) -> SurfaceSnapshot {
         let path = CanonicalPath::try_new(std::env::temp_dir().join("orca-tui-child-binding"))
             .expect("canonical test path");
         let task_id = SurfaceTaskId::try_new("child").unwrap();
@@ -1323,17 +1433,27 @@ mod tests {
 
         project_hosted_child_attached(
             child_task.id.clone(),
+            &snapshot_with_child(1, 5),
             projection,
-            Vec::new(),
+            super::HostedConversation {
+                messages: Vec::new(),
+                plan: None,
+            },
             attachment,
             &root_tx,
         )
         .expect("project child");
-        for _ in 0..2 {
+        for index in 0..2 {
             let event = root_rx.recv().expect("hosted child event");
             if let Some(event) =
                 accept_attached_tui_event(&mut state, event).expect("active attachment")
             {
+                if index == 1 {
+                    assert!(matches!(
+                        event,
+                        super::TuiEvent::ConversationReprojected { .. }
+                    ));
+                }
                 state.update(event);
             }
         }
@@ -1405,7 +1525,10 @@ mod tests {
             let (bridge, projection, _messages, _interactions) =
                 super::HostedChildEventBridge::prepare(
                     &self.thread,
-                    "child".to_string(),
+                    super::FocusedAgent {
+                        task_id: "child".to_string(),
+                        started_at_ms: None,
+                    },
                     event_tx,
                     control,
                 )
@@ -1447,6 +1570,34 @@ mod tests {
             ),
             "the child's turn succeeds"
         );
+    }
+
+    pub(crate) fn with_streaming_main<T>(
+        read: impl FnOnce(&super::RuntimeThreadHandle, SurfaceSnapshot) -> T,
+    ) -> T {
+        let main = ChildThread::start();
+        let marker = main.home.path().join("release-streaming-main");
+        let (sender, events) = crossbeam_channel::unbounded();
+        let turn = {
+            let thread = main.thread.clone();
+            let config = main.config.clone();
+            let prompt = format!("mock_stream_release_marker {}", marker.display());
+            std::thread::spawn(move || run_child_turn(&thread, config, &prompt, &sender))
+        };
+        while !matches!(
+            events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            crate::protocol::TuiEvent::MessageDelta(_)
+        ) {}
+        let snapshot = super::read_parent_snapshot(&main.thread).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read(&main.thread, snapshot)
+        }));
+        std::fs::write(&marker, b"").unwrap();
+        turn.join().unwrap();
+        main.shutdown();
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 
     /// What the view was sent for one turn of the child.

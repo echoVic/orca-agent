@@ -13737,6 +13737,7 @@ mod tests {
             13 * 60 + 20,
         )));
         state.update(TuiEvent::TurnStarted {
+            started_at_ms: None,
             turn: 2,
             task: None,
         });
@@ -17416,6 +17417,7 @@ mod tests {
             .messages
             .push(ChatMessage::User("流式输出一篇长文".to_string()));
         state.update(TuiEvent::TurnStarted {
+            started_at_ms: None,
             turn: 1,
             task: None,
         });
@@ -17458,6 +17460,7 @@ mod tests {
             .messages
             .push(ChatMessage::User("流式输出一篇长文".to_string()));
         state.update(TuiEvent::TurnStarted {
+            started_at_ms: None,
             turn: 1,
             task: None,
         });
@@ -17500,6 +17503,7 @@ mod tests {
             .messages
             .push(ChatMessage::User("流式输出一篇长文".to_string()));
         state.update(TuiEvent::TurnStarted {
+            started_at_ms: None,
             turn: 1,
             task: None,
         });

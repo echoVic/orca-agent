@@ -1,6 +1,7 @@
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StreamingMarkdownAction {
     UpdateTail(String),
+    ExtendTail(String),
     FreezeTail { text: String, trailing_blank: bool },
     AppendFrozen { text: String, trailing_blank: bool },
     ClearTail,
@@ -15,6 +16,7 @@ pub(crate) struct StreamingMarkdownAssembler {
     active_table: Option<String>,
     fence: Option<FenceState>,
     finished: bool,
+    restored_reply: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,9 +26,16 @@ struct FenceState {
 }
 
 impl StreamingMarkdownAssembler {
+    pub(crate) fn restore_open_reply(&mut self) {
+        self.restored_reply = true;
+    }
+
     pub(crate) fn push(&mut self, text: &str) -> Vec<StreamingMarkdownAction> {
         if self.finished || text.is_empty() {
             return Vec::new();
+        }
+        if self.restored_reply {
+            return vec![StreamingMarkdownAction::ExtendTail(text.to_owned())];
         }
         self.partial_line.push_str(text);
         let Some(last_newline) = self.partial_line.rfind('\n') else {
@@ -281,6 +290,7 @@ mod tests {
         for action in actions {
             match action {
                 StreamingMarkdownAction::UpdateTail(text) => tail.clone_from(text),
+                StreamingMarkdownAction::ExtendTail(text) => tail.push_str(text),
                 StreamingMarkdownAction::FreezeTail { text, .. } => {
                     frozen.push_str(text);
                     tail.clear();

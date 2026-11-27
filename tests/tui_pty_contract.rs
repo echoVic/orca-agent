@@ -780,6 +780,132 @@ fn tui_shows_a_background_agents_progress_while_the_parent_turn_waits_on_it() {
 }
 
 #[test]
+fn tui_return_from_an_agent_keeps_the_running_main() {
+    return_from_marker_held_agent(false);
+}
+
+#[test]
+fn tui_return_from_an_agent_restores_the_queued_turns_open_text() {
+    return_from_marker_held_agent(true);
+}
+
+fn return_from_marker_held_agent(queue_next_turn: bool) {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let marker = cwd.path().join("release");
+    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n").unwrap();
+    let mut process = PtyProcess::spawn_with_prompt(
+        home.path(),
+        cwd.path(),
+        &format!(
+            "subagent async mock_stream_release_marker {}",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Delegating to 1 agent",
+        "missing live delegation",
+    );
+    assert_screen_has_text(&process, &mut output, "thinking,", "child has not started");
+    if queue_next_turn {
+        process.write(b"mock_stream_delay_ms 4000\r").unwrap();
+        assert_screen_shows(&process, &mut output, "Queued", "main prompt not queued");
+    }
+    let frame = reconstruct_screen(&output);
+    let row = frame
+        .lines()
+        .position(|line| line.contains("mock_stream_release_marker") && !line.contains("subagent"))
+        .unwrap()
+        + 1;
+    process
+        .write(format!("\x1b[<0;6;{row}M\x1b[<0;6;{row}m").as_bytes())
+        .unwrap();
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Main is running · Esc return",
+        "did not enter the live child",
+    );
+    if queue_next_turn {
+        std::fs::write(&marker, b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !session_contains_delta(&home.path().join("sessions")) {
+            assert!(
+                Instant::now() < deadline,
+                "queued main turn did not stream while visiting"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    process.write(b"\x1b").unwrap();
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Mock completed after tool execution.",
+        "did not return to main",
+    );
+    if queue_next_turn {
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Mock slow stream started.",
+            "main's open text did not return",
+        );
+    }
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Esc interrupt",
+        "main's running row did not return",
+    );
+    let frame = reconstruct_screen(&output);
+    assert!(
+        !frame.contains("Inherited conversation context."),
+        "{frame}"
+    );
+    if queue_next_turn {
+        assert!(
+            frame.contains("Mock slow stream started.")
+                && frame.contains("Esc interrupt")
+                && !frame.contains("Mock slow stream completed."),
+            "{frame}"
+        );
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Mock slow stream started.Mock slow stream completed.",
+            "the restored reply did not continue",
+        );
+    } else {
+        assert!(frame.contains("Agents 1 active"), "{frame}");
+        std::fs::write(&marker, b"").unwrap();
+    }
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130));
+}
+
+fn session_contains_delta(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path).unwrap().flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            session_contains_delta(&path)
+        } else {
+            path.extension().is_some_and(|ext| ext == "jsonl")
+                && std::fs::read_to_string(path)
+                    .unwrap()
+                    .contains(r#""text":"Mock slow stream started.""#)
+        }
+    })
+}
+
+#[test]
 fn tui_click_on_a_running_background_agent_opens_its_transcript() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");

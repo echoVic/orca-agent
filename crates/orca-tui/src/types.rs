@@ -1779,13 +1779,26 @@ impl AppState {
     }
 
     pub fn enter_running(&mut self) {
+        self.enter_running_at(None);
+    }
+
+    pub(crate) fn enter_running_at(&mut self, started_at_ms: Option<u64>) {
         self.plan_approval_dialog = None;
         self.config_dialog = None;
         self.mcp_dialog = None;
         self.rewind = None;
         if self.running_started_at.is_none() {
-            self.running_started_at = Some(Instant::now());
             self.turn_diagnostic_seen = false;
+        }
+        if self.running_started_at.is_none() || started_at_ms.is_some() {
+            let now = Instant::now();
+            let elapsed = started_at_ms.map_or(0, |start| {
+                (chrono::Utc::now().timestamp_millis().max(0) as u64).saturating_sub(start)
+            });
+            self.running_started_at = Some(
+                now.checked_sub(std::time::Duration::from_millis(elapsed))
+                    .unwrap_or(now),
+            );
         }
         self.status = AppStatus::Running;
     }

@@ -1044,6 +1044,11 @@ impl SurfaceProjectionState {
     }
 }
 
+struct PendingTurnStart {
+    task: Option<TuiTaskLifecycle>,
+    started_at_ms: Option<u64>,
+}
+
 pub(crate) struct TuiSurfaceProjection {
     cursor: SurfaceCursor,
     assistant_streams: BTreeMap<SurfaceStreamId, SurfaceAssistantStream>,
@@ -1051,7 +1056,7 @@ pub(crate) struct TuiSurfaceProjection {
     completed_items: Vec<SurfaceItem>,
     operation_turn_ids: BTreeMap<SurfaceOperationId, Vec<orca_runtime::surface::SurfaceTurnId>>,
     focused_operation: Option<SurfaceOperationId>,
-    pending_turn_started: Option<TuiTaskLifecycle>,
+    pending_turn_started: Option<PendingTurnStart>,
     goal: Option<SurfaceGoal>,
     reducer_state: Option<SurfaceReducerState>,
 }
@@ -1078,6 +1083,21 @@ impl TuiSurfaceProjection {
     }
 
     pub(crate) fn from_surface_snapshot(snapshot: &orca_runtime::surface::SurfaceSnapshot) -> Self {
+        Self::from_surface_snapshot_with_clock(snapshot, None, false)
+    }
+
+    pub(crate) fn for_conversation(
+        snapshot: &orca_runtime::surface::SurfaceSnapshot,
+        started_at_ms: Option<u64>,
+    ) -> Self {
+        Self::from_surface_snapshot_with_clock(snapshot, started_at_ms, true)
+    }
+
+    fn from_surface_snapshot_with_clock(
+        snapshot: &orca_runtime::surface::SurfaceSnapshot,
+        started_at_ms: Option<u64>,
+        include_unadmitted: bool,
+    ) -> Self {
         let mut projection = Self::from_snapshot(
             snapshot.cursor.clone(),
             snapshot.assistant_streams.as_slice(),
@@ -1090,12 +1110,20 @@ impl TuiSurfaceProjection {
             .foreground_operation
             .as_ref()
             .filter(|operation| operation.terminal.is_none())
-            .and_then(|operation| operation.agent_loop_turns.last())
-            .map(|turn| TuiTaskLifecycle {
-                id: turn.task_id.as_str().to_string(),
-                kind: "agent".to_string(),
-                status: "running".to_string(),
-                turn: turn.ordinal,
+            .and_then(|operation| {
+                let task = operation
+                    .agent_loop_turns
+                    .last()
+                    .map(|turn| TuiTaskLifecycle {
+                        id: turn.task_id.as_str().to_string(),
+                        kind: "agent".to_string(),
+                        status: "running".to_string(),
+                        turn: turn.ordinal,
+                    });
+                (include_unadmitted || task.is_some()).then_some(PendingTurnStart {
+                    task,
+                    started_at_ms,
+                })
             });
         projection.goal = snapshot.goal.clone();
         projection.completed_items = snapshot.items.clone();
@@ -1127,16 +1155,22 @@ impl TuiSurfaceProjection {
     }
 
     pub(crate) fn hydrate_open_streams(&mut self) -> Vec<TuiEvent> {
-        let mut projected = self
-            .pending_turn_started
-            .take()
-            .map(|task| {
-                vec![TuiEvent::TurnStarted {
-                    turn: task.turn,
-                    task: Some(task),
-                }]
-            })
-            .unwrap_or_default();
+        self.hydrate_streams(TuiEvent::MessageDelta)
+    }
+
+    pub(crate) fn hydrate_conversation(&mut self) -> Vec<TuiEvent> {
+        self.hydrate_streams(TuiEvent::OpenMessageRestored)
+    }
+
+    fn hydrate_streams(&mut self, message: fn(String) -> TuiEvent) -> Vec<TuiEvent> {
+        let mut projected = Vec::new();
+        if let Some(start) = self.pending_turn_started.take() {
+            projected.push(TuiEvent::TurnStarted {
+                turn: start.task.as_ref().map_or(0, |task| task.turn),
+                task: start.task,
+                started_at_ms: start.started_at_ms,
+            });
+        }
         projected.extend(
             self.assistant_stream_order
                 .iter()
@@ -1146,9 +1180,7 @@ impl TuiSurfaceProjection {
                         && !stream.text.as_str().is_empty()
                 })
                 .map(|stream| match stream.channel {
-                    AssistantChannel::Message => {
-                        TuiEvent::MessageDelta(stream.text.as_str().to_string())
-                    }
+                    AssistantChannel::Message => message(stream.text.as_str().to_string()),
                     AssistantChannel::Reasoning => {
                         TuiEvent::ReasoningDelta(stream.text.as_str().to_string())
                     }
@@ -1614,6 +1646,7 @@ impl TuiSurfaceProjection {
                     if focused_operation.as_ref() == Some(&turn.fence.operation_id) =>
                 {
                     projected.push(TuiEvent::TurnStarted {
+                        started_at_ms: None,
                         turn: turn.ordinal,
                         task: Some(TuiTaskLifecycle {
                             id: turn.task_id.as_str().to_string(),
@@ -4639,11 +4672,14 @@ mod tests {
             completed_items: Vec::new(),
             operation_turn_ids: BTreeMap::new(),
             focused_operation: None,
-            pending_turn_started: Some(TuiTaskLifecycle {
-                id: "task-1".to_string(),
-                kind: "agent".to_string(),
-                status: "running".to_string(),
-                turn: 4,
+            pending_turn_started: Some(PendingTurnStart {
+                started_at_ms: None,
+                task: Some(TuiTaskLifecycle {
+                    id: "task-1".to_string(),
+                    kind: "agent".to_string(),
+                    status: "running".to_string(),
+                    turn: 4,
+                }),
             }),
             goal: None,
             reducer_state: None,
@@ -4652,6 +4688,7 @@ mod tests {
         assert!(matches!(
             projection.hydrate_open_streams().as_slice(),
             [TuiEvent::TurnStarted {
+                started_at_ms: None,
                 turn: 4,
                 task: Some(TuiTaskLifecycle { id, status, .. }),
             }] if id == "task-1" && status == "running"

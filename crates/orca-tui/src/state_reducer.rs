@@ -253,6 +253,7 @@ impl AppState {
             }
             TuiEvent::ChildProjectionReset {
                 task_id,
+                main_status,
                 projection,
             } => {
                 if !SurfaceSessionProjectionState::accepts_reset(&projection)
@@ -260,7 +261,9 @@ impl AppState {
                 {
                     return;
                 }
-                self.note_main_behind_child();
+                if let Some(status) = main_status {
+                    self.main_behind_child = Some(status);
+                }
                 let background_tasks = self.background_workflow_tasks.clone();
                 self.reset_session_projection();
                 self.invalidate_recap();
@@ -317,10 +320,19 @@ impl AppState {
                 self.transcript.finalized_count = self.transcript.messages.len();
                 self.set_status(AppStatus::Idle);
             }
-            TuiEvent::TurnStarted { .. } => {
+            TuiEvent::ConversationReprojected { messages, plan } => {
+                self.replace_messages(messages);
+                self.settle_restored_command_rows();
+                self.restore_plan(plan);
+                self.transcript.finalized_count = self.transcript.messages.len();
+            }
+            TuiEvent::TurnStarted { started_at_ms, .. } => {
                 self.invalidate_recap();
                 self.suppress_background_main_session_output = false;
-                self.enter_running();
+                self.enter_running_at(started_at_ms);
+            }
+            TuiEvent::RuntimeTurnRestored(turn_id) => {
+                self.runtime_turn_id = Some(turn_id.to_string());
             }
             TuiEvent::RuntimeTurnStarted { turn_id } => {
                 self.invalidate_recap();
@@ -450,6 +462,10 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
+                self.handle_message_delta(&text);
+            }
+            TuiEvent::OpenMessageRestored(text) => {
+                self.transcript.assistant_stream.restore_open_reply();
                 self.handle_message_delta(&text);
             }
             TuiEvent::ProposedPlanDelta(text) => {
@@ -1717,20 +1733,8 @@ impl AppState {
     ) {
         for action in actions {
             match action {
-                StreamingMarkdownAction::UpdateTail(text) => {
-                    if let Some(index) = self.transcript.assistant_stream_tail {
-                        self.mutate_message(index, |message| {
-                            let ChatMessage::Assistant(existing) = message else {
-                                unreachable!();
-                            };
-                            *existing = text;
-                        });
-                    } else {
-                        let index = self.transcript.messages.len();
-                        self.push_message(ChatMessage::Assistant(text));
-                        self.transcript.assistant_stream_tail = Some(index);
-                    }
-                }
+                StreamingMarkdownAction::UpdateTail(text) => self.write_assistant_tail(text, false),
+                StreamingMarkdownAction::ExtendTail(text) => self.write_assistant_tail(text, true),
                 StreamingMarkdownAction::FreezeTail {
                     text,
                     trailing_blank,
@@ -1776,6 +1780,25 @@ impl AppState {
                     self.transcript.assistant_stream_tail = None;
                 }
             }
+        }
+    }
+
+    fn write_assistant_tail(&mut self, text: String, append: bool) {
+        if let Some(index) = self.transcript.assistant_stream_tail {
+            self.mutate_message(index, |message| {
+                let ChatMessage::Assistant(existing) = message else {
+                    unreachable!()
+                };
+                if append {
+                    existing.push_str(&text);
+                } else {
+                    *existing = text;
+                }
+            });
+        } else {
+            let index = self.transcript.messages.len();
+            self.push_message(ChatMessage::Assistant(text));
+            self.transcript.assistant_stream_tail = Some(index);
         }
     }
 

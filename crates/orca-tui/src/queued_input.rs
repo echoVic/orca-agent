@@ -1361,6 +1361,7 @@ mod tests {
         );
 
         state.update(TuiEvent::TurnStarted {
+            started_at_ms: None,
             turn: 1,
             task: None,
         });
@@ -1443,6 +1444,7 @@ mod tests {
         state.begin_next_queued_message().unwrap();
 
         state.update(TuiEvent::TurnStarted {
+            started_at_ms: None,
             turn: 1,
             task: None,
         });

@@ -263,6 +263,7 @@ pub enum TuiEvent {
     TurnStarted {
         turn: u32,
         task: Option<TuiTaskLifecycle>,
+        started_at_ms: Option<u64>,
     },
     QueuedSubmissionStarted {
         id: u64,
@@ -296,6 +297,8 @@ pub enum TuiEvent {
     },
     ReasoningDelta(String),
     MessageDelta(String),
+    OpenMessageRestored(String),
+    RuntimeTurnRestored(orca_runtime::surface::SurfaceTurnId),
     /// Text of the plan the model proposes, which the runtime streams apart
     /// from its message; in Plan mode, a completed turn's plan opens the
     /// plan approval.
@@ -393,6 +396,10 @@ pub enum TuiEvent {
         plan: Option<(Option<String>, Vec<PlanItem>)>,
         label: String,
     },
+    ConversationReprojected {
+        messages: Vec<ChatMessage>,
+        plan: Option<(Option<String>, Vec<PlanItem>)>,
+    },
     /// Authoritative ACP replica replacement; preserves live interaction state.
     AcpTranscriptSynced {
         messages: Vec<ChatMessage>,
@@ -405,6 +412,7 @@ pub enum TuiEvent {
     /// Escape continues to return to the parent.
     ChildProjectionReset {
         task_id: String,
+        main_status: Option<SideParentStatus>,
         projection: Box<crate::surface_projection::SurfaceProjectionState>,
     },
     SavedSessionsUpdated {
