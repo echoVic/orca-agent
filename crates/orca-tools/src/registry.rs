@@ -37,6 +37,16 @@ mod windows_shell_prompt_contract_tests {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn apply_patch_catalog_describes_partial_commit_results() {
+    let registry = tool_registry_for_session(None, &[], true);
+    let tool = registry.resolve("apply_patch").expect("apply_patch tool");
+    let description = tool.tool.description();
+    assert!(description.contains("preflight"));
+    assert!(description.contains("Written") && description.contains("Partially written"));
+}
+
 #[allow(dead_code)]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> &ToolSpec;
@@ -705,7 +715,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry, apply_patch: bool) {
     if apply_patch {
         let mut spec = conservative_builtin_spec(
             "apply_patch",
-            "Apply a patch to one or more workspace files. The whole patch is checked before any writes. If any check fails, no files are written. Use *** Add File, *** Delete File or *** Update File headers. Updates use @@ hunks with context lines prefixed by a space, removals by -, and additions by +. An update can include *** Move to immediately after its header. Example:\n*** Begin Patch\n*** Add File: notes.txt\n+Hello\n*** End Patch",
+            "Apply a patch to one or more workspace files. A preflight error leaves the workspace unchanged. A commit error can leave changes listed under Written or Partially written. Use *** Add File, *** Delete File or *** Update File headers. Updates use @@ hunks with context lines prefixed by a space, removals by -, and additions by +. An update can include *** Move to immediately after its header. Example:\n*** Begin Patch\n*** Add File: notes.txt\n+Hello\n*** End Patch",
             json!({
                 "type": "object",
                 "properties": { "input": { "type": "string" } },
