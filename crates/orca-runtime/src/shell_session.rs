@@ -2536,16 +2536,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let started_marker = temp.path().join("started");
         let release_marker = temp.path().join("release");
-        let leaked_marker = temp.path().join("leaked");
         let mut process = std::process::Command::new("sh");
         process
             .arg("-c")
             .arg(
-                "printf started > \"$STARTED\"; (while [ ! -e \"$RELEASE\" ]; do sleep 0.05; done; printf leaked > \"$LEAKED\") & wait",
+                "(printf started > \"$STARTED\"; while [ ! -e \"$RELEASE\" ]; do sleep 0.05; done) & wait",
             )
             .env("STARTED", &started_marker)
             .env("RELEASE", &release_marker)
-            .env("LEAKED", &leaked_marker)
             .current_dir(temp.path());
         let stdio = configure_shell_stdio(&mut process, ShellTerminalMode::pipe())
             .expect("configure shell stdio");
@@ -2568,49 +2566,39 @@ mod tests {
         let reader_stop = Arc::new(AtomicBool::new(false));
         let stdout_handle = Some(spawn_output_reader(
             stdout_reader,
-            output_store.clone(),
+            output_store,
             "registration-failure".to_string(),
             ShellOutputStream::Stdout,
             Arc::clone(&reader_stop),
             false,
         ));
-        let stderr_handle = stderr_reader.map(|reader| {
-            spawn_output_reader(
-                reader,
-                output_store,
-                "registration-failure".to_string(),
-                ShellOutputStream::Stderr,
-                Arc::clone(&reader_stop),
-                false,
-            )
-        });
+        let mut stderr = stderr_reader.expect("pipe mode has a nonblocking stderr reader");
         let deadline = Instant::now() + Duration::from_secs(2);
         while !started_marker.exists() {
             assert!(Instant::now() < deadline, "shell child did not start");
             thread::sleep(Duration::from_millis(10));
         }
         let error = io::Error::other("injected registration failure");
-        cleanup_failed_shell_start(
-            child,
-            process_job,
-            stdin,
-            reader_stop,
-            stdout_handle,
-            stderr_handle,
-        );
+        cleanup_failed_shell_start(child, process_job, stdin, reader_stop, stdout_handle, None);
         assert_eq!(error.to_string(), "injected registration failure");
 
-        // A signal sent to a process group does not reach every member at the
-        // same instant: a descendant already being killed can still look for
-        // the release marker once. Only one that is alive after this wait was
-        // left behind.
-        thread::sleep(Duration::from_millis(200));
-        std::fs::write(&release_marker, "release").expect("release descendant");
-        thread::sleep(Duration::from_millis(200));
-        assert!(
-            !leaked_marker.exists(),
-            "registration failure must reap the spawned process group"
-        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match stderr.read(&mut [0; 256]) {
+                Ok(0) => break,
+                Ok(_) if Instant::now() < deadline => continue,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                result => {
+                    std::fs::write(&release_marker, "release")
+                        .expect("release surviving descendant");
+                    panic!("registration failure left descendant pipe open: {result:?}");
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
