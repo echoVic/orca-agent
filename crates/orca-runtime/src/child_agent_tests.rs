@@ -2600,7 +2600,7 @@ fn assert_dispatched_fork_resume(change: ForkResumeChange) {
             "name": name, "arguments": arguments.to_string()
         }})
     };
-    let replies = vec![
+    let mut replies = vec![
         json!({"content": "completed parent evidence"}),
         json!({"reasoning_content": "dispatch two calls", "tool_calls": [
             tool(0, "sibling-read", "read_file", json!({"path": "sibling.txt"})),
@@ -2618,9 +2618,19 @@ fn assert_dispatched_fork_resume(change: ForkResumeChange) {
         json!({"content": "resumed fork child report"}),
         json!({"content": "parent resume report"}),
     ];
+    if change == ForkResumeChange::InstructionsChanged {
+        replies.extend([
+            json!({"reasoning_content": "resume again", "tool_calls": [
+                tool(0, "fork-resume-again", "subagent", json!({}))
+            ]}),
+            json!({"content": "second resumed child report"}),
+            json!({"content": "second parent resume report"}),
+        ]);
+    }
     let mut fork_task = None;
     let worker_registry = registry.clone();
     let parent_id = parent.id.clone();
+    let mut first_resume_source = None;
     let (base_url, server) = recorded_provider(replies, move |index, body, delta| match index {
         2 => {
             let request: Value = serde_json::from_slice(body).unwrap();
@@ -2652,6 +2662,30 @@ fn assert_dispatched_fork_resume(change: ForkResumeChange) {
             assert_eq!(task.status, TaskStatus::Completed, "{:?}", task.error);
             delta["tool_calls"][0]["function"]["arguments"] = json!({
                 "description": "resume the fork child", "prompt": "Continue your report.",
+                "resume_from": task_id, "mode": "sync"
+            })
+            .to_string()
+            .into();
+        }
+        7 if change == ForkResumeChange::InstructionsChanged => {
+            let request: Value = serde_json::from_slice(body).unwrap();
+            let resume = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["tool_call_id"] == "fork-resume")
+                .unwrap();
+            first_resume_source = resume["content"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("resume_from="))
+                .map(str::to_owned);
+        }
+        8 => {
+            let task_id = first_resume_source.as_deref().unwrap();
+            delta["tool_calls"][0]["function"]["arguments"] = json!({
+                "description": "resume again", "prompt": "Add a final detail.",
                 "resume_from": task_id, "mode": "sync"
             })
             .to_string()
@@ -2727,8 +2761,40 @@ fn assert_dispatched_fork_resume(change: ForkResumeChange) {
     }
     run_turn("Resume the fork.", "parent resume report");
 
+    if change == ForkResumeChange::InstructionsChanged {
+        run_turn("Resume again.", "second parent resume report");
+    }
     let bodies = server.join().unwrap();
-    assert_eq!(bodies.len(), 8);
+    assert_eq!(
+        bodies.len(),
+        if change == ForkResumeChange::InstructionsChanged {
+            11
+        } else {
+            8
+        }
+    );
+    if change == ForkResumeChange::InstructionsChanged {
+        let request = recorded_wire_messages(&bodies[9]);
+        let update_positions: Vec<_> = request
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                message
+                    .get()
+                    .contains("Follow the updated workspace runbook.")
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let first_resume = request
+            .iter()
+            .position(|message| message.get().contains("Continue your report."))
+            .unwrap();
+        assert_eq!(update_positions.len(), 1);
+        assert!(
+            update_positions[0] < first_resume,
+            "the second resume moved the previous notice"
+        );
+    }
     let parent = recorded_wire_messages(&bodies[1]);
     let cut = parent
         .iter()

@@ -28,7 +28,7 @@ use orca_core::conversation::{
     NestedInstructionSource, NestedInstructionVersion, PLAN_CONTEXT_FRAGMENT_ID,
     PLAN_CONTEXT_MAX_TOKENS, ProviderForkPrefix, RUNTIME_CONTEXT_FRAGMENT_ID,
     RUNTIME_CONTEXT_MAX_TOKENS, RawToolCall, SKILL_CONTEXT_FRAGMENT_ID, SKILL_CONTEXT_MAX_TOKENS,
-    SKILLS_CONTEXT_FRAGMENT_ID, SummaryState, normalize_tool_boundaries,
+    SKILLS_CONTEXT_FRAGMENT_ID, SummaryState, SystemPromptRecord, normalize_tool_boundaries,
     repaired_missing_tool_result,
 };
 use orca_core::external_config::ExternalToolConfig;
@@ -339,6 +339,9 @@ pub(crate) struct ChildConversationSnapshot {
     /// Context kinds added after Orca 0.5.25, kept outside its fragment enum.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) additional_context: Vec<StoredChildInternalContextFragment>,
+    /// Prompt notices already sent by this fork, in their original positions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fork_prompt_updates: Vec<StoredForkPromptUpdate>,
     /// Sources for rebuilding the live nested instruction chain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) nested_instruction_sources: Vec<NestedInstructionSource>,
@@ -347,15 +350,41 @@ pub(crate) struct ChildConversationSnapshot {
     pub(crate) next_turn: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StoredForkPromptUpdate {
+    before_message: usize,
+    content: String,
+    record: SystemPromptRecord,
+}
+
 impl ChildConversationSnapshot {
     fn capture_unchecked(conversation: &Conversation, next_turn: u32) -> Self {
-        let mut messages = conversation
-            .messages
-            .iter()
-            .filter(|message| !matches!(message, Message::System { .. }))
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut fork_prompt_updates = Vec::new();
+        let mut messages = conversation.messages.clone();
         normalize_tool_boundaries(&mut messages);
+        let mut message_count = 0;
+        messages.retain(|message| {
+            if !matches!(message, Message::System { .. }) {
+                message_count += 1;
+                return true;
+            }
+            if conversation.fork_prefix.is_some()
+                && let Some(record) = message
+                    .system_prompt_record()
+                    .filter(|record| record.update)
+                && let Some(content) = message.content_str()
+            {
+                let saved = crate::thread_store::redact_sensitive_text(content);
+                let mut record = record.clone();
+                crate::thread_store::redact_prompt_record(&mut record, saved != content);
+                fork_prompt_updates.push(StoredForkPromptUpdate {
+                    before_message: message_count,
+                    content: saved,
+                    record,
+                });
+            }
+            false
+        });
         repair_missing_tool_terminals(&mut messages);
 
         let (internal_context, additional_context) = conversation
@@ -375,6 +404,7 @@ impl ChildConversationSnapshot {
             summary: StoredChildSummaryState::from(&conversation.summary),
             internal_context,
             additional_context,
+            fork_prompt_updates,
             nested_instruction_sources: conversation
                 .nested_instructions
                 .versions
@@ -437,6 +467,24 @@ impl ChildConversationSnapshot {
             .collect::<Vec<_>>();
         normalize_tool_boundaries(&mut restored_messages);
         repair_missing_tool_terminals(&mut restored_messages);
+        if conversation.fork_prefix.is_some() {
+            let mut loaded_sources = HashMap::new();
+            for update in self.fork_prompt_updates.iter().rev() {
+                if crate::history::prompt_sources_can_replay(
+                    &update.record,
+                    cwd,
+                    &mut loaded_sources,
+                ) {
+                    restored_messages.insert(
+                        update.before_message.min(restored_messages.len()),
+                        Message::system_with_prompt_record(
+                            update.content.clone(),
+                            update.record.clone(),
+                        ),
+                    );
+                }
+            }
+        }
         conversation.messages.extend(restored_messages);
         conversation.rolling_summary = self.rolling_summary.clone();
         conversation.summary = SummaryState::from(&self.summary);
@@ -1154,6 +1202,7 @@ impl AgentCheckpoint {
         let conversation = &self.conversation;
         if conversation.summary.tool_output_spills.is_empty()
             && conversation.additional_context.is_empty()
+            && conversation.fork_prompt_updates.is_empty()
             && conversation.nested_instruction_sources.is_empty()
             && conversation
                 .internal_context
@@ -1170,6 +1219,7 @@ impl AgentCheckpoint {
         let mut legacy = conversation.clone();
         legacy.summary.tool_output_spills.clear();
         legacy.additional_context.clear();
+        legacy.fork_prompt_updates.clear();
         legacy.nested_instruction_sources.clear();
         legacy
             .internal_context
@@ -4568,7 +4618,19 @@ mod tests {
             sources: vec![cwd.path().join(".agents/skills/review/SKILL.md")],
         };
         let mut conversation = Conversation::new();
+        conversation.fork_prefix = Some(Arc::new(test_fork_prefix()));
         conversation.add_user("Review the report".into());
+        let mut recorded = crate::system_prompt::SystemPrompt::default();
+        recorded.push("identity", "Earlier prompt");
+        let mut current = crate::system_prompt::SystemPrompt::default();
+        current.push("identity", "Updated prompt");
+        conversation
+            .messages
+            .extend(crate::system_prompt::section_updates(
+                &[recorded.into_message()],
+                &current.into_message(),
+                None,
+            ));
         conversation.set_today(chrono::NaiveDate::from_ymd_opt(2026, 11, 27).unwrap());
         conversation.replace_runtime_context(Some("working in a child".into()));
         conversation.replace_skill_catalog(Some("Available skills: review".into()));
@@ -4592,6 +4654,7 @@ mod tests {
         checkpoint.conversation = ChildConversationSnapshot::try_capture_safe(&conversation, 1)
             .unwrap()
             .0;
+        assert_eq!(checkpoint.conversation.fork_prompt_updates.len(), 1);
         checkpoint.seal().unwrap();
         let bytes = serde_json::to_vec(&checkpoint).unwrap();
         let older: legacy_v0_5_25::AgentCheckpoint = serde_json::from_slice(&bytes).unwrap();

@@ -103,6 +103,13 @@ pub(crate) fn refresh_prompt_sections(conversation: &mut Conversation) {
         current.push_instructions(format!("\n\n{text}"), instructions.scope(cwd));
     }
     let current = current.into_message();
+    if conversation.messages.iter().any(|message| {
+        message
+            .system_prompt_record()
+            .is_some_and(|record| record.update && record.redacted)
+    }) {
+        return;
+    }
     let mut history = vec![leading];
     history.extend(recorded);
     history.extend(
