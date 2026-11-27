@@ -307,6 +307,7 @@ pub enum TuiEvent {
         retry: Option<orca_core::provider_types::ProviderRetry>,
     },
     AssistantResponseCompleted(Option<String>, Option<String>),
+    AssistantReplyKept(orca_core::conversation::CutShort),
     ToolRequested {
         id: String,
         name: String,

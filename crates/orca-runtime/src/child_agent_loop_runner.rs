@@ -351,6 +351,7 @@ where
             context.hooks,
             &response,
             context.child_cost_tracker,
+            None,
             lease.wall_time_deadline(),
         )?;
         if let Err(stop) = sync_child_cost_to_lease(
@@ -656,6 +657,7 @@ where
             context.hooks,
             &response,
             context.child_cost_tracker,
+            observer,
             lease.wall_time_deadline(),
         )?;
         if let Err(stop) = sync_child_cost_to_lease(
@@ -836,6 +838,7 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
     hooks: &HookRunner,
     response: &ProviderResponse,
     child_cost_tracker: &mut CostTracker,
+    observer: Option<&dyn ChildAgentActivityPublisher>,
     deadline: Option<std::time::Instant>,
 ) -> io::Result<Option<ChildAgentProviderErrorDecision>> {
     let has_provider_error = response
@@ -843,10 +846,10 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
         .iter()
         .any(|step| matches!(step, ProviderStep::Error(_)));
     if has_provider_error {
-        record_child_provider_usage(response.usage, child_cost_tracker, None)?;
+        record_child_provider_usage(response.usage, child_cost_tracker, observer)?;
     }
 
-    handle_child_agent_provider_error_with_cost(
+    let decision = handle_child_agent_provider_error_with_cost(
         config,
         setup,
         cwd,
@@ -854,7 +857,26 @@ pub(crate) fn handle_child_agent_provider_error_with_usage(
         response,
         Some(child_cost_tracker),
         deadline,
-    )
+    )?;
+    if matches!(decision, Some(ChildAgentProviderErrorDecision::Fail(_)))
+        && let Some(partial) = response
+            .error()
+            .and_then(|error| error.partial_reply.as_ref())
+        && crate::provider_turn::partial_reply_has_visible_text(&partial.content)
+    {
+        setup.conversation.internal_context.note_assistant_turn();
+        setup
+            .conversation
+            .messages
+            .push(orca_core::conversation::Message::Assistant {
+                content: Some(partial.content.clone()),
+                reasoning_content: partial.reasoning.clone(),
+                tool_calls: Vec::new(),
+                cut_short: Some(orca_core::conversation::CutShort::OutputLimit),
+                pinned: false,
+            });
+    }
+    Ok(decision)
 }
 
 fn publish_changed_child_usage(

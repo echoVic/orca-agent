@@ -44,8 +44,8 @@ use crate::surface::{
     SurfaceInteractionView, SurfaceItemId, SurfaceMcpElicitationDecision,
     SurfaceMcpElicitationRequest, SurfaceOperationId, SurfacePermissionClientDecision,
     SurfacePermissionProfile, SurfaceRequestId, SurfaceSchema, SurfaceStreamId,
-    SurfaceSubscriptionItem, SurfaceToolResultKind, SurfaceUserInputDecision, ToolPatch,
-    TurnRequestBudgetScope, UncommittedMutation,
+    SurfaceSubscriptionItem, SurfaceToolResultKind, SurfaceTurnId, SurfaceUserInputDecision,
+    ToolPatch, TurnRequestBudgetScope, UncommittedMutation,
 };
 
 use crate::runtime_surface::{
@@ -1368,7 +1368,9 @@ pub(super) struct ToolOutputAccumulator {
 
 struct StreamedItem {
     item_id: SurfaceItemId,
+    turn_id: SurfaceTurnId,
     channel: AssistantChannel,
+    text: String,
 }
 
 impl PreparedSurfacePrompt {
@@ -2480,8 +2482,15 @@ fn drain_surface_prompt(
         match item {
             SurfaceSubscriptionItem::Batch { batch } => {
                 let mut terminal = None;
+                let kept_turns = kept_response_turns(batch.events.as_slice());
                 for envelope in batch.events.as_slice() {
-                    project_surface_event(&mut prepared, &session_id, &note_tx, &envelope.event)?;
+                    project_surface_event(
+                        &mut prepared,
+                        &session_id,
+                        &note_tx,
+                        &envelope.event,
+                        &kept_turns,
+                    )?;
                     if let SurfaceEvent::Operation(OperationPatch::Terminal { record }) =
                         &envelope.event
                         && record.operation_id == prepared.operation_id
@@ -2864,17 +2873,32 @@ pub(super) fn emit_surface_event(
     }
 }
 
-/// Sends a prompt's assistant text to the client.
-///
-/// A response only completes once every open stream holds exactly the completed
-/// text, so an item that streamed has already been sent in full and is not sent
-/// again. A discarded stream no longer counts, so its completed message still
-/// goes out.
+pub(super) fn kept_response_turns(
+    events: &[crate::surface::SurfaceEventEnvelope],
+) -> Vec<&SurfaceTurnId> {
+    events
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            SurfaceEvent::Assistant(AssistantPatch::ResponseKept { response, .. }) => {
+                Some(&response.turn_id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+pub(super) fn kept_message_suffix<'a>(completed: &'a str, delivered: &str) -> Option<&'a str> {
+    completed
+        .strip_prefix(delivered)
+        .filter(|suffix| !suffix.is_empty())
+}
+
 fn emit_assistant_patch(
     session_id: &SessionId,
     note_tx: &AcpNotificationSender,
     patch: &AssistantPatch,
     streams: &mut HashMap<SurfaceStreamId, StreamedItem>,
+    kept_turns: &[&SurfaceTurnId],
 ) {
     let update = match patch {
         AssistantPatch::StreamOpened { stream } => {
@@ -2882,7 +2906,9 @@ fn emit_assistant_patch(
                 stream.stream_id.clone(),
                 StreamedItem {
                     item_id: stream.item_id.clone(),
+                    turn_id: stream.turn_id.clone(),
                     channel: stream.channel,
+                    text: String::new(),
                 },
             );
             None
@@ -2890,9 +2916,12 @@ fn emit_assistant_patch(
         AssistantPatch::Delta {
             stream_id, text, ..
         } => {
-            let channel = streams
-                .get(stream_id)
-                .map_or(AssistantChannel::Message, |stream| stream.channel);
+            let channel = if let Some(stream) = streams.get_mut(stream_id) {
+                stream.text.push_str(text.as_str());
+                stream.channel
+            } else {
+                AssistantChannel::Message
+            };
             Some(assistant_chunk(channel, text.as_str()))
         }
         AssistantPatch::ResponseCompleted { response } => response
@@ -2900,8 +2929,25 @@ fn emit_assistant_patch(
             .as_ref()
             .filter(|item| !streams.values().any(|stream| stream.item_id == item.id))
             .map(|item| assistant_chunk(AssistantChannel::Message, item.text.as_str())),
+        AssistantPatch::ResponseKept { response, .. } => {
+            let update = response.message_item.as_ref().and_then(|item| {
+                let delivered = streams
+                    .values()
+                    .find(|stream| stream.item_id == item.id)
+                    .map_or("", |stream| stream.text.as_str());
+                kept_message_suffix(item.text.as_str(), delivered)
+                    .map(|suffix| assistant_chunk(AssistantChannel::Message, suffix))
+            });
+            streams.retain(|_, stream| stream.turn_id != response.turn_id);
+            update
+        }
         AssistantPatch::StreamDiscarded { stream_id, .. } => {
-            streams.remove(stream_id);
+            if !streams
+                .get(stream_id)
+                .is_some_and(|stream| kept_turns.contains(&&stream.turn_id))
+            {
+                streams.remove(stream_id);
+            }
             None
         }
     };
@@ -2929,6 +2975,7 @@ fn project_surface_event(
     session_id: &SessionId,
     note_tx: &AcpNotificationSender,
     event: &SurfaceEvent,
+    kept_turns: &[&SurfaceTurnId],
 ) -> Result<(), String> {
     if let SurfaceEvent::Interaction(crate::surface::InteractionPatch::Requested { interaction }) =
         event
@@ -2988,7 +3035,13 @@ fn project_surface_event(
         }
     }
     if let SurfaceEvent::Assistant(patch) = event {
-        emit_assistant_patch(session_id, note_tx, patch, &mut prepared.assistant_streams);
+        emit_assistant_patch(
+            session_id,
+            note_tx,
+            patch,
+            &mut prepared.assistant_streams,
+            kept_turns,
+        );
         return Ok(());
     }
     emit_surface_event(session_id, note_tx, event, &mut prepared.tool_outputs);
@@ -4530,6 +4583,236 @@ mod tests {
         ));
         let error = reconcile_lost_subscription(&mut prepared, "sealed").unwrap_err();
         assert!(error.contains("after durable terminal EndTurn"));
+    }
+
+    #[tokio::test]
+    async fn a_kept_reply_with_split_redaction_is_not_resent() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        const TIMEOUT: Duration = Duration::from_secs(10);
+        let cwd = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (release, hold) = std_mpsc::channel();
+        let mut config = test_run_config(cwd.path().to_path_buf());
+        config.provider = ProviderKind::DeepSeek;
+        config.api_key = Some("test-only".into());
+        config.base_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+        let token_fragment = "secrettoken12345 ";
+        let incremental = format!(
+            "prefix-{}",
+            crate::thread_store::redact_sensitive_text(token_fragment)
+        );
+        let completed =
+            crate::thread_store::redact_sensitive_text(&format!("prefix-{token_fragment}"));
+        assert!(!completed.starts_with(&incremental));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; content_length]).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            for text in ["prefix-", token_fragment] {
+                let delta = serde_json::json!({"choices": [{"delta": {"content": text}, "finish_reason": null}]});
+                write!(stream, "data: {delta}\n\n").unwrap();
+                hold.recv_timeout(TIMEOUT).unwrap();
+            }
+            write!(stream, "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"length\"}}]}}\n\ndata: [DONE]\n\n").unwrap();
+        });
+
+        let host = RuntimeHost::start().unwrap();
+        let surface_host = host.surface_handle().bind_new_connection();
+        let config_for_thread = config.clone();
+        let thread = tokio::task::spawn_blocking(move || {
+            surface_host
+                .start_thread(config_for_thread, "ACP kept reply")
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let surface = thread.acp_surface().unwrap();
+        let session_id = SessionId::new("split-redaction-kept-reply");
+        let (observer_tx, mut observer_rx) = mpsc::channel(128);
+        let observer = super::super::observer::Observer::start(
+            surface.clone(),
+            session_id.clone(),
+            AcpNotificationSender::Buffered(observer_tx),
+            config.approval_mode,
+            config,
+        )
+        .await
+        .unwrap();
+        let (prompt_tx, mut prompt_rx) = mpsc::channel(128);
+        let prompt = tokio::task::spawn_blocking(move || {
+            let capabilities = AcpClientCapabilityProfile::negotiated_for_test();
+            let input =
+                decode_prompt_content(&[ContentBlock::from("explain".to_string())], capabilities)
+                    .unwrap();
+            let prepared =
+                prepare_surface_prompt(&surface, &session_id, input, 1, capabilities, None)
+                    .unwrap();
+            let operation_id = prepared.operation_id.clone();
+            let result = drain_surface_prompt(
+                prepared,
+                session_id,
+                AcpNotificationSender::Buffered(prompt_tx),
+            );
+            (operation_id, result)
+        });
+
+        let mut observer_text = String::new();
+        let mut reloaded = false;
+        let mut collect = |note: SessionNotification| {
+            reloaded |= note.meta.as_ref().is_some_and(|meta| {
+                meta.get(super::super::observer::PROJECTION_META)
+                    .is_some_and(|value| value["phase"] == "reload_required")
+            });
+            if let SessionUpdate::AgentMessageChunk(chunk) = note.update
+                && let ContentBlock::Text(text) = chunk.content
+            {
+                observer_text.push_str(&text.text);
+                true
+            } else {
+                false
+            }
+        };
+        for _ in 0..2 {
+            loop {
+                let note = tokio::time::timeout(TIMEOUT, observer_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if collect(note) {
+                    break;
+                }
+            }
+            release.send(()).unwrap();
+        }
+        let (operation_id, result) = tokio::time::timeout(TIMEOUT, prompt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().contains("finish_reason=length"));
+        observer
+            .delivery()
+            .wait_terminal(&operation_id)
+            .await
+            .unwrap();
+        while let Ok(note) = observer_rx.try_recv() {
+            collect(note);
+        }
+        let mut prompt_text = String::new();
+        while let Ok(note) = prompt_rx.try_recv() {
+            if let SessionUpdate::AgentMessageChunk(chunk) = note.update
+                && let ContentBlock::Text(text) = chunk.content
+            {
+                prompt_text.push_str(&text.text);
+            }
+        }
+        drop(observer);
+        tokio::task::spawn_blocking(move || host.shutdown().unwrap())
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert!(
+            observer_text == incremental && prompt_text == incremental && !reloaded,
+            "observer length {}, prompt length {}, expected length {}, reload requested {reloaded}",
+            observer_text.len(),
+            prompt_text.len(),
+            incremental.len()
+        );
+    }
+
+    #[test]
+    fn a_kept_stream_is_not_retracted() {
+        use crate::runtime_surface::{
+            ByteOffset, SurfaceAssistantMessageItem, SurfaceAssistantStream,
+            SurfaceAssistantStreamState, SurfaceCompletedModelResponse, SurfaceItemId,
+            SurfaceOperationFence, UuidV7,
+        };
+        use orca_core::conversation::CutShort;
+
+        let (note_tx, mut note_rx) = mpsc::channel(8);
+        let note_tx = AcpNotificationSender::Buffered(note_tx);
+        let session_id = SessionId::new("kept-reply");
+        let item_id = SurfaceItemId::new();
+        let stream_id = SurfaceStreamId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let turn_id = TurnId::new();
+        let fence = SurfaceOperationFence {
+            thread_id: crate::surface::SurfaceThreadId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            thread_owner_epoch: crate::surface::ThreadOwnerEpoch::new(1),
+            operation_id: crate::surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            generation_id: crate::surface::SurfaceGenerationId::new(1),
+        };
+        let mut streams = HashMap::new();
+        for patch in [
+            AssistantPatch::StreamOpened {
+                stream: SurfaceAssistantStream {
+                    stream_id: stream_id.clone(),
+                    fence,
+                    turn_id: turn_id.clone(),
+                    item_id: item_id.clone(),
+                    channel: AssistantChannel::Message,
+                    next_offset: ByteOffset::new(0),
+                    text: DisplayText::new(""),
+                    state: SurfaceAssistantStreamState::Open,
+                },
+            },
+            AssistantPatch::Delta {
+                stream_id,
+                offset: ByteOffset::new(0),
+                text: DisplayText::new("answer"),
+            },
+            AssistantPatch::ResponseKept {
+                response: SurfaceCompletedModelResponse {
+                    response_id: UuidV7::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+                    turn_id: turn_id.clone(),
+                    message_item: Some(SurfaceAssistantMessageItem {
+                        id: item_id,
+                        turn_id,
+                        text: DisplayText::new("answer"),
+                        pinned: false,
+                    }),
+                    reasoning_item: None,
+                    plan_item: None,
+                    tool_calls: Vec::new(),
+                },
+                reason: CutShort::Interrupted,
+            },
+        ] {
+            emit_assistant_patch(&session_id, &note_tx, &patch, &mut streams, &[]);
+        }
+        assert!(matches!(
+            note_rx.try_recv().unwrap().update,
+            SessionUpdate::AgentMessageChunk(_)
+        ));
+        assert!(matches!(
+            note_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

@@ -493,6 +493,7 @@ fn pressure_keeps_the_anchor_when_normalization_repairs_earlier_history() {
     conversation.messages.insert(
         3,
         Message::Assistant {
+            cut_short: None,
             content: None,
             reasoning_content: None,
             tool_calls: vec![RawToolCall {
@@ -1247,6 +1248,7 @@ mod replay_compaction {
             content: Some("older notes ".repeat(1_000)),
             reasoning_content: None,
             tool_calls: vec![],
+            cut_short: None,
             pinned: false,
         };
         let mut prepared = conversation.clone();

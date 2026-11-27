@@ -11,7 +11,8 @@ use orca_core::conversation::{
 };
 use orca_core::model::FLASH_MODEL;
 use orca_core::provider_types::{
-    ProviderError, ProviderErrorKind, ProviderReplayState, ProviderResponse, ProviderStep, Usage,
+    PartialReply, ProviderError, ProviderErrorKind, ProviderReplayState, ProviderResponse,
+    ProviderStep, Usage,
 };
 use orca_core::tool_images::{MAX_REQUEST_TOOL_IMAGES, keep_newest_tool_images};
 use orca_core::tool_types::{ToolName, ToolRequest};
@@ -44,6 +45,7 @@ struct DeepSeekRequestError {
     usage: Option<Usage>,
     http_status: Option<u16>,
     request_id: Option<String>,
+    partial_reply: Option<PartialReply>,
 }
 
 impl DeepSeekRequestError {
@@ -57,6 +59,7 @@ impl DeepSeekRequestError {
             kind: classify_deepseek_error(&message),
             message,
             usage,
+            partial_reply: None,
             http_status: None,
             request_id: None,
         }
@@ -81,9 +84,25 @@ impl DeepSeekRequestError {
                     usage,
                     http_status: Some(status),
                     request_id: failure.request_id,
+                    partial_reply: None,
                 }
             }
         }
+    }
+
+    fn at_output_limit(
+        content: Option<String>,
+        reasoning: Option<String>,
+        usage: Option<Usage>,
+    ) -> Self {
+        let mut error = Self::with_usage(length_finish_reason_error(), usage);
+        error.partial_reply = content
+            .filter(|text| !text.trim().is_empty())
+            .map(|content| PartialReply {
+                content,
+                reasoning: reasoning.filter(|text| !text.is_empty()),
+            });
+        error
     }
 
     fn into_provider_error(self) -> (ProviderError, Option<Usage>) {
@@ -127,17 +146,19 @@ impl DeepSeekRequestError {
             }
         }
         message.push_str(&suffix);
-        let diagnostic = if self.http_status.is_some() {
+        let mut diagnostic = if self.http_status.is_some() {
             // The HTTP client already redacted the bounded body before the metadata was added.
             ProviderError {
                 kind: self.kind,
                 message,
                 http_status: self.http_status,
                 request_id: self.request_id,
+                partial_reply: None,
             }
         } else {
             ProviderError::new(self.kind, message)
         };
+        diagnostic.partial_reply = self.partial_reply;
         (diagnostic, self.usage)
     }
 }
@@ -935,8 +956,9 @@ async fn request_chat_streaming_with_budget(
             accept_truncated_partial && stream_result.finish_reason.as_deref() == Some("length");
         match stream_result.finish_reason.as_deref() {
             Some("length") if !bounded_summary_truncated => {
-                return Err(DeepSeekRequestError::with_usage(
-                    length_finish_reason_error(),
+                return Err(DeepSeekRequestError::at_output_limit(
+                    Some(stream_result.content),
+                    Some(stream_result.reasoning),
                     accumulated_usage,
                 ));
             }
@@ -1152,8 +1174,9 @@ fn request_chat(
 
         match finish_reason.as_str() {
             "length" => {
-                return Err(DeepSeekRequestError::with_usage(
-                    length_finish_reason_error(),
+                return Err(DeepSeekRequestError::at_output_limit(
+                    message.content,
+                    message.reasoning_content,
                     accumulated_usage,
                 ));
             }
@@ -1390,6 +1413,9 @@ fn serialize_conversation_messages(
         .take_while(|message| matches!(message, Message::System { pinned: false, .. }))
         .count();
     let went_on = turn_went_on_after(source_messages);
+    let last_user = source_messages
+        .iter()
+        .rposition(|message| matches!(message, Message::User { .. }));
     // The full history determines which images and reasoning the ordinary
     // request sends, even when we only need a prefix of that request.
     let end = cut.unwrap_or(source_messages.len());
@@ -1420,6 +1446,7 @@ fn serialize_conversation_messages(
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 ..
             } => {
                 let api_tool_calls = if tool_calls.is_empty() {
@@ -1445,7 +1472,9 @@ fn serialize_conversation_messages(
                     images: Vec::new(),
                     reasoning_content: replayable_reasoning_content(
                         reasoning_content,
-                        !tool_calls.is_empty() || went_on[index],
+                        !tool_calls.is_empty()
+                            || went_on[index]
+                            || (cut_short.is_some() && last_user.is_none_or(|user| index > user)),
                     ),
                     tool_calls: api_tool_calls,
                     tool_call_id: None,
@@ -2757,6 +2786,37 @@ mod tests {
     }
 
     #[test]
+    fn the_request_after_a_kept_reply_is_valid_in_thinking_mode() {
+        use orca_core::conversation::CutShort;
+
+        let mut conversation = Conversation::new();
+        conversation.add_user("List the steps".into());
+        conversation.messages.push(Message::Assistant {
+            content: Some("First, gather the inputs.".into()),
+            reasoning_content: Some("Start at the beginning".into()),
+            tool_calls: Vec::new(),
+            pinned: false,
+            cut_short: Some(CutShort::Interrupted),
+        });
+        let messages = conversation_to_api_messages(&conversation);
+        assert_eq!(
+            messages[1].reasoning_content.as_deref(),
+            Some("Start at the beginning")
+        );
+
+        conversation.add_user("Go on".into());
+        let messages = serde_json::to_value(conversation_to_api_messages(&conversation)).unwrap();
+        assert_eq!(
+            messages,
+            serde_json::json!([
+                {"role": "user", "content": "List the steps"},
+                {"role": "assistant", "content": "First, gather the inputs."},
+                {"role": "user", "content": "Go on"}
+            ])
+        );
+    }
+
+    #[test]
     fn api_replay_omits_stale_reasoning_content() {
         let mut conv = Conversation::new();
         conv.add_user("first".to_string());
@@ -3411,10 +3471,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn streaming_length_finish_reason_is_a_truncation_error() {
+    async fn a_length_finish_returns_the_partial_reply() {
         // A streamed finish_reason=length must terminate as the same truncation
         // error as the non-streaming path, carrying the streamed usage.
-        let truncated = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n\
+        let truncated = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"first thought\",\"content\":\"partial\"},\"finish_reason\":null}]}\n\n\
+                         data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\n\
                          data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
                          data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":8,\"prompt_cache_hit_tokens\":6}}\n\n\
                          data: [DONE]\n\n";
@@ -3433,13 +3494,20 @@ mod tests {
         };
         let cancel = CancelToken::new();
 
-        let error = request_chat_streaming(&conversation, &config, &cancel, &mut |_| {})
-            .await
-            .expect_err("length must be an error");
+        let response = call_streaming_async(&conversation, &config, &cancel, |_| {}).await;
+        let error = response.error().expect("length must be an error");
 
-        assert_eq!(error.message, length_finish_reason_error());
         assert_eq!(
-            error.usage,
+            error.message,
+            "DeepSeek provider error: Response truncated: model hit max_tokens limit (finish_reason=length); ask the model to continue in smaller chunks"
+        );
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            serde_json::to_value(error).unwrap()["partial_reply"],
+            serde_json::json!({"content": "partial", "reasoning": "first thought"})
+        );
+        assert_eq!(
+            response.usage,
             Some(Usage {
                 input_tokens: 10,
                 output_tokens: 8,

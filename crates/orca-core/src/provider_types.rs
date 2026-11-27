@@ -61,6 +61,12 @@ pub enum ProviderErrorKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PartialReply {
+    pub content: String,
+    pub reasoning: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
@@ -68,6 +74,8 @@ pub struct ProviderError {
     pub http_status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_reply: Option<PartialReply>,
 }
 
 impl ProviderError {
@@ -86,6 +94,7 @@ impl ProviderError {
             message: crate::redaction::redact_sensitive_text(&message.into()),
             http_status,
             request_id,
+            partial_reply: None,
         }
     }
 

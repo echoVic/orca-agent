@@ -343,6 +343,7 @@ fn a_child_agent_on_a_model_that_cannot_see_images_gets_a_note() {
         let runtime_config = config(Some(model));
         let mut setup = child_loop_setup(&runtime_config);
         setup.conversation.messages.push(Message::Assistant {
+            cut_short: None,
             content: None,
             reasoning_content: None,
             tool_calls: vec![RawToolCall {
@@ -448,6 +449,7 @@ fn a_child_agent_on_a_custom_vision_model_gets_a_note_instead_of_tool_images() {
         vec![image.clone()],
     ));
     setup.conversation.messages.push(Message::Assistant {
+        cut_short: None,
         content: None,
         reasoning_content: None,
         tool_calls: vec![RawToolCall {
@@ -931,6 +933,86 @@ fn child_prompt_too_long_that_cannot_shrink_fails_without_sending_the_user_to_ne
 }
 
 #[test]
+fn a_child_reply_at_the_output_limit_is_kept() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut config = config(None);
+    config.provider = ProviderKind::DeepSeek;
+    config.api_key = Some("test-only".into());
+    config.base_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = BufReader::new(&mut stream);
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            assert_ne!(request.read_line(&mut line).unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':')
+                && key.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse().unwrap();
+            }
+        }
+        request.read_exact(&mut vec![0; content_length]).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.write_all(br#"data: {"choices":[{"delta":{"content":"Child text","reasoning_content":"Child reasoning","tool_calls":[{"index":0,"id":"call_1","function":{"name":"task_list","arguments":"{"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"length"}]}
+
+data: [DONE]
+
+"#).unwrap();
+    });
+    let cwd = tempfile::tempdir().unwrap();
+    let request =
+        ChildAgentRequest::new("inspect repo".into(), SubagentType::General, None, 2, false);
+    let mut checkpoint = Vec::new();
+    let observer = crate::child_agent_types::ChildAgentCheckpointObserver::new_with_tool_boundary(
+        |observation| {
+            checkpoint = observation.conversation.messages.clone();
+            Ok(())
+        },
+        |_| panic!("an unfinished tool must not start"),
+    );
+    let result =
+        crate::child_agent_loop_runner::run_child_agent_loop_with_tool_executor_checkpointed(
+            &config,
+            ChildAgentLoopContext {
+                request: &request,
+                cwd: cwd.path(),
+                instructions: &ProjectInstructions::default(),
+                memory: &MemoryBlock::default(),
+                hooks: &HookRunner::default(),
+                child_cost_tracker: &mut CostTracker::new(None),
+                lease: None,
+            },
+            Some(&observer),
+            |_, _, _| panic!("an unfinished tool must not execute"),
+        )
+        .unwrap();
+    drop(observer);
+    server.join().unwrap();
+    assert_eq!(result.status, RunStatus::Failed);
+    assert!(result.error.unwrap().contains("finish_reason=length"));
+    assert!(matches!(checkpoint.last(), Some(Message::Assistant {
+        content: Some(content), reasoning_content: Some(reasoning), tool_calls,
+        cut_short: Some(orca_core::conversation::CutShort::OutputLimit), ..
+    }) if content == "Child text" && reasoning == "Child reasoning" && tool_calls.is_empty()));
+}
+
+#[test]
 fn child_agent_provider_error_records_usage_before_failure() {
     let request = ChildAgentRequest::new(
         "inspect repo".to_string(),
@@ -969,6 +1051,7 @@ fn child_agent_provider_error_records_usage_before_failure() {
         &HookRunner::default(),
         &response,
         &mut tracker,
+        None,
         None,
     )
     .expect("provider-error handling should not fail")
@@ -1026,6 +1109,7 @@ fn fold_child_agent_provider_response_records_usage_and_terminal_assistant() {
         &HookRunner::default(),
         &response,
         &mut tracker,
+        None,
         None,
     )
     .expect("provider-error handling should not fail");

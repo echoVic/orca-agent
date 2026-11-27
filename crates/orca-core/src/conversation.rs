@@ -198,6 +198,13 @@ pub struct ImageInput {
     pub detail: ImageDetail,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CutShort {
+    Interrupted,
+    OutputLimit,
+}
+
 #[derive(Clone, Debug)]
 pub enum Message {
     System {
@@ -213,6 +220,7 @@ pub enum Message {
         content: Option<String>,
         reasoning_content: Option<String>,
         tool_calls: Vec<RawToolCall>,
+        cut_short: Option<CutShort>,
         pinned: bool,
     },
     Tool {
@@ -787,6 +795,7 @@ impl Conversation {
             content,
             reasoning_content,
             tool_calls,
+            cut_short: None,
             pinned: false,
         });
     }
@@ -965,6 +974,7 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             } if !tool_calls.is_empty() => {
                 let mut seen_call_ids = HashSet::new();
@@ -996,6 +1006,7 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
                     content: content.clone(),
                     reasoning_content: reasoning_content.clone(),
                     tool_calls: unique_tool_calls.clone(),
+                    cut_short: *cut_short,
                     pinned: *pinned,
                 });
                 for tool_call in &unique_tool_calls {
@@ -1751,6 +1762,7 @@ mod tests {
                     reasoning_content,
                     tool_calls,
                     pinned,
+                    ..
                 } => format!(
                     "ast|{pinned}|{content:?}|{reasoning_content:?}|{}",
                     tool_calls
@@ -1990,6 +2002,7 @@ mod tests {
         let mut messages = vec![
             Message::user("before".to_string()),
             Message::Assistant {
+                cut_short: None,
                 content: None,
                 reasoning_content: None,
                 tool_calls: vec![RawToolCall {
@@ -2027,6 +2040,7 @@ mod tests {
         let mut messages = vec![
             Message::user("before".to_string()),
             Message::Assistant {
+                cut_short: None,
                 content: None,
                 reasoning_content: Some("private reasoning".to_string()),
                 tool_calls: vec![],
@@ -2061,6 +2075,7 @@ mod tests {
     fn normalize_tool_boundaries_keeps_complete_assistant_tool_call() {
         let mut messages = vec![
             Message::Assistant {
+                cut_short: None,
                 content: None,
                 reasoning_content: None,
                 tool_calls: vec![RawToolCall {
@@ -2095,6 +2110,7 @@ mod tests {
     fn normalize_tool_boundaries_orders_results_and_discards_duplicate_orphans() {
         let mut messages = vec![
             Message::Assistant {
+                cut_short: None,
                 content: None,
                 reasoning_content: None,
                 tool_calls: vec![
@@ -2156,6 +2172,7 @@ mod tests {
     fn normalize_tool_boundaries_keeps_first_duplicate_assistant_call_id() {
         let mut messages = vec![
             Message::Assistant {
+                cut_short: None,
                 content: None,
                 reasoning_content: None,
                 tool_calls: vec![

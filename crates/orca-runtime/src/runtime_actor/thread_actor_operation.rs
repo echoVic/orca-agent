@@ -8256,6 +8256,7 @@ impl ThreadActor {
                         .map(|(interaction_id, _)| interaction_id)
                         .collect::<Vec<_>>(),
                 );
+                active.generation.user_interrupted = true;
                 Self::cancel_active_task_tree(active);
                 Ok(Self::committed_jsonl_turn_control(
                     request_id,
@@ -9353,6 +9354,19 @@ impl ThreadActor {
                         | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
                 )
             )
+    }
+
+    pub(super) fn surface_provider_response_admitted(
+        active: &ActiveOperation,
+        cut_short: Option<orca_core::conversation::CutShort>,
+    ) -> bool {
+        if cut_short == Some(orca_core::conversation::CutShort::Interrupted) {
+            return active.surface_terminalization
+                == Some(surface::TerminalizationCause::UserCancel)
+                || (active.surface_terminalization.is_none()
+                    && active.generation.user_interrupted);
+        }
+        !Self::surface_interaction_admission_closed(active)
     }
 
     pub(super) fn surface_interaction_admission_closed(active: &ActiveOperation) -> bool {

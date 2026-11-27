@@ -761,7 +761,13 @@ patch_name_matcher!(
 patch_name_matcher!(
     assistant_patch_name,
     AssistantPatch,
-    [StreamOpened, Delta, ResponseCompleted, StreamDiscarded]
+    [
+        StreamOpened,
+        Delta,
+        ResponseCompleted,
+        ResponseKept,
+        StreamDiscarded
+    ]
 );
 patch_name_matcher!(
     tool_patch_name,
@@ -1060,6 +1066,7 @@ fn every_manifest_patch_inventory_has_an_exhaustive_rust_match() {
                 "StreamOpened",
                 "Delta",
                 "ResponseCompleted",
+                "ResponseKept",
                 "StreamDiscarded",
             ],
         ),

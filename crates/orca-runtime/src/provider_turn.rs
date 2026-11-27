@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 use orca_approval::ApprovalPolicy;
 use orca_core::cancel::CancelToken;
 use orca_core::config::{ProviderKind, RunConfig};
-use orca_core::conversation::{Conversation, assistant_message_has_payload};
+use orca_core::conversation::{Conversation, CutShort, assistant_message_has_payload};
 use orca_core::event_schema::{EventFactory, RunStatus};
 use orca_core::event_sink::EventSink;
 use orca_core::model::{ImageRouteDecision, VISION_MODEL};
 use orca_core::provider_types::{
-    ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, Usage,
+    PartialReply, ProviderError, ProviderErrorKind, ProviderResponse, ProviderStep, Usage,
 };
 #[cfg(test)]
 use orca_core::subagent_types::SubagentType;
@@ -106,23 +106,32 @@ struct ProviderStepBatcher<'a> {
     identity: ModelResponseIdentity,
     pending: Vec<ProviderStep>,
     started_at: Instant,
+    cancel: &'a CancelToken,
+    delivered: PartialReply,
 }
 
 impl<'a> ProviderStepBatcher<'a> {
     fn new(
         ingress: Option<&'a dyn crate::runtime_surface::RuntimeProviderResponseIngress>,
         identity: &ModelResponseIdentity,
+        cancel: &'a CancelToken,
     ) -> Self {
         Self {
             ingress,
             identity: identity.clone(),
             pending: Vec::with_capacity(PROVIDER_STEP_BATCH_LIMIT),
             started_at: Instant::now(),
+            cancel,
+            delivered: PartialReply {
+                content: String::new(),
+                reasoning: None,
+            },
         }
     }
 
     fn push(&mut self, step: ProviderStep) -> io::Result<()> {
         if self.ingress.is_none() {
+            extend_partial_reply(&mut self.delivered, &step);
             return Ok(());
         }
         if self.pending.is_empty() {
@@ -152,10 +161,32 @@ impl<'a> ProviderStepBatcher<'a> {
             self.pending.clear();
             return Ok(());
         };
-        ingress.commit_provider_steps(&self.identity, &self.pending)?;
+        // Only acknowledge text that the surface accepted before cancellation.
+        match ingress.publish_provider_steps(&self.identity, &self.pending) {
+            Ok(()) => {
+                for step in &self.pending {
+                    extend_partial_reply(&mut self.delivered, step);
+                }
+            }
+            Err(_) if self.cancel.is_cancelled() => {}
+            Err(error) => return Err(error),
+        }
         self.pending.clear();
         self.started_at = Instant::now();
         Ok(())
+    }
+}
+
+pub(crate) fn extend_partial_reply(reply: &mut PartialReply, step: &ProviderStep) {
+    match step {
+        ProviderStep::MessageDelta(text) => reply.content.push_str(text),
+        ProviderStep::ReasoningDelta(text) if !text.is_empty() => {
+            reply
+                .reasoning
+                .get_or_insert_with(String::new)
+                .push_str(text);
+        }
+        _ => {}
     }
 }
 
@@ -627,7 +658,7 @@ impl RuntimeProviderTurnStep {
         let mut failed_attempt_usage = None;
         let mut retry_report_error = None;
         let mut attempt_usage;
-        let (mut response, response_identity) = loop {
+        let (mut response, response_identity, delivered) = loop {
             completed_attempts = completed_attempts.saturating_add(1);
             let sends_before = retry_budget.attempts();
             let response_identity = ModelResponseIdentity::new(input.turn_context.turn_id.clone());
@@ -654,6 +685,7 @@ impl RuntimeProviderTurnStep {
             let mut step_batcher = ProviderStepBatcher::new(
                 input.turn_context.provider_response_ingress(),
                 &response_identity,
+                input.cancel,
             );
             let response = loop {
                 match stream.recv_timeout(Duration::from_millis(10)) {
@@ -735,6 +767,7 @@ impl RuntimeProviderTurnStep {
                             stream,
                             input.provider_config.model.clone(),
                             response_identity,
+                            step_batcher.delivered,
                         )
                         .with_operation(
                             crate::provider_stream::SuspendedOperationHandle {
@@ -748,26 +781,29 @@ impl RuntimeProviderTurnStep {
             };
             attempt_usage = stream.attempt_usage(&response);
             if retry_report_error.is_some() {
-                break (response, response_identity);
+                break (response, response_identity, step_batcher.delivered);
             }
             step_batcher.flush()?;
+            let mut delivered = step_batcher.delivered;
 
             let Some(error) = response.error() else {
-                break (response, response_identity);
+                break (response, response_identity, delivered);
             };
             let ProviderRetryDecision::RetryAfter(delay) =
                 retry_policy.decide_with_budget(error, completed_attempts, &retry_budget)
             else {
-                break (response, response_identity);
+                break (response, response_identity, delivered);
             };
             if retry_budget.attempts() == sends_before {
-                break (response, response_identity);
+                break (response, response_identity, delivered);
             }
             let ingress = input.turn_context.provider_response_ingress();
             let waited = retry_budget.wait_before_retry(delay, input.cancel, error, |retry| {
                 if let Some(ingress) = ingress {
                     ingress.commit_provider_attempt_failure(&response_identity, &retry)?;
                 }
+                // The scheduled retry supersedes this attempt’s delivered text.
+                delivered.content.clear();
                 if emit_deltas {
                     sink.emit(events.provider_retry(&retry))?;
                 }
@@ -783,10 +819,10 @@ impl RuntimeProviderTurnStep {
                 Ok(true)
             }) {
                 Ok(true) => merge_provider_usage(&mut failed_attempt_usage, response.usage),
-                Ok(false) => break (response, response_identity),
+                Ok(false) => break (response, response_identity, delivered),
                 Err(error) => {
                     retry_report_error = Some(error);
-                    break (response, response_identity);
+                    break (response, response_identity, delivered);
                 }
             }
         };
@@ -883,6 +919,15 @@ impl RuntimeProviderTurnStep {
         }
 
         if input.cancel.is_cancelled() {
+            record_cut_short_reply(
+                delivered,
+                &response_identity,
+                CutShort::Interrupted,
+                &input.turn_context,
+                conversation,
+                events,
+                sink,
+            )?;
             return cancelled_provider_turn(emit_deltas, events, sink);
         }
         if let Some(stop) = budget_stop {
@@ -925,12 +970,37 @@ impl RuntimeProviderTurnStep {
             sink.emit(events.error(&warning))?;
         }
         if input.cancel.is_cancelled() {
+            record_cut_short_reply(
+                delivered,
+                &response_identity,
+                CutShort::Interrupted,
+                &input.turn_context,
+                conversation,
+                events,
+                sink,
+            )?;
             return cancelled_provider_turn(emit_deltas, events, sink);
+        }
+
+        if let Some(partial) = response
+            .error()
+            .and_then(|error| error.partial_reply.clone())
+        {
+            record_cut_short_reply(
+                partial,
+                &response_identity,
+                CutShort::OutputLimit,
+                &input.turn_context,
+                conversation,
+                events,
+                sink,
+            )?;
         }
 
         let mut response = RuntimeModelResponse::from_parts(response, response_identity);
         response.attempt_usage = attempt_usage;
         response.observation = Some(observation);
+        response.delivered = Some(delivered);
         Ok(RuntimeProviderTurnOutput::response(response))
     }
 
@@ -1000,11 +1070,28 @@ impl RuntimeProviderResponseStep {
             batch_child_executor,
         } = executors;
         let step_snapshot = step_context.snapshot();
+        let delivered = response.delivered.take();
         if let Some(ingress) = step_snapshot.turn_context.provider_response_ingress() {
             // The ingress answers with the names the surface recorded: a tool
             // call whose provider id the session already used is renamed there
             // (issue #67), and the conversation must use the same name.
-            ingress.commit_response(&mut response)?;
+            if let Err(error) = ingress.commit_response(&mut response) {
+                if error.kind() == io::ErrorKind::Interrupted
+                    && step_snapshot.capabilities.cancel.is_cancelled()
+                    && let Some(delivered) = delivered
+                {
+                    record_cut_short_reply(
+                        delivered,
+                        &response.identity,
+                        CutShort::Interrupted,
+                        &step_snapshot.turn_context,
+                        conversation,
+                        events,
+                        sink,
+                    )?;
+                }
+                return Err(error);
+            }
         }
         let completed_response = response.completed();
         let mut completion_event = events.model_response_completed(&completed_response);
@@ -1285,6 +1372,78 @@ impl RuntimeTurnProviderCycleStep {
     }
 }
 
+fn record_cut_short_reply<W: io::Write>(
+    partial: PartialReply,
+    identity: &ModelResponseIdentity,
+    reason: CutShort,
+    turn_context: &RuntimeTurnContext<'_>,
+    conversation: &mut Conversation,
+    events: &mut EventFactory,
+    sink: &mut EventSink<W>,
+) -> io::Result<()> {
+    let Some(mut response) = cut_short_response(partial, identity, reason) else {
+        return Ok(());
+    };
+    if let Some(ingress) = turn_context.provider_response_ingress() {
+        match ingress.commit_response(&mut response) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(error)
+                if reason == CutShort::Interrupted
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
+                    ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let completed = response.completed();
+    if turn_context.emit_deltas {
+        sink.emit(events.model_response_completed(&completed))?;
+    }
+    record_assistant_response_for_agent(conversation, &completed, false, events, sink)
+}
+
+pub(crate) fn cut_short_response(
+    partial: PartialReply,
+    identity: &ModelResponseIdentity,
+    reason: CutShort,
+) -> Option<RuntimeModelResponse> {
+    if !partial_reply_has_visible_text(&partial.content) {
+        return None;
+    }
+    let mut response = RuntimeModelResponse::from_parts(
+        ProviderResponse {
+            steps: Vec::new(),
+            assistant_content: Some(partial.content),
+            assistant_reasoning: partial.reasoning,
+            tool_calls: Vec::new(),
+            usage: None,
+        },
+        identity.clone(),
+    );
+    response.cut_short = Some(reason);
+    Some(response)
+}
+
+pub(crate) fn partial_reply_has_visible_text(content: &str) -> bool {
+    use orca_core::proposed_plan::{ProposedPlanSegment, ProposedPlanStreamParser};
+
+    let mut parser = ProposedPlanStreamParser::default();
+    let segments = parser.push(content);
+    segments
+        .into_iter()
+        .chain(parser.finish())
+        .any(|segment| match segment {
+            ProposedPlanSegment::Agent(text) | ProposedPlanSegment::Plan(text) => {
+                !text.trim().is_empty()
+            }
+        })
+}
+
 fn record_provider_retry<W: io::Write>(
     task_registry: &TaskRegistry,
     root_task_id: Option<&str>,
@@ -1497,11 +1656,96 @@ mod tests {
         ModelResponseIdentity::new(orca_core::thread_identity::TurnId::new())
     }
 
+    #[derive(Debug)]
+    struct ClosedProviderIngress(io::ErrorKind);
+
+    impl crate::runtime_surface::RuntimeProviderResponseIngress for ClosedProviderIngress {
+        fn commit_response(&self, _: &mut RuntimeModelResponse) -> io::Result<()> {
+            Err(io::Error::new(self.0, "runtime thread is shutting down"))
+        }
+
+        fn commit_provider_step(
+            &self,
+            _: &ModelResponseIdentity,
+            _: &ProviderStep,
+        ) -> io::Result<()> {
+            Err(io::Error::new(self.0, "runtime thread is shutting down"))
+        }
+
+        fn commit_tool_results(&self, _: &[orca_core::tool_types::ToolResult]) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn provider_step_batcher_preserves_cancellation_when_publication_fails() {
+        for kind in [
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::Other,
+        ] {
+            for cancelled in [false, true] {
+                let ingress = ClosedProviderIngress(kind);
+                let identity = response_identity();
+                let cancel = CancelToken::new();
+                if cancelled {
+                    cancel.cancel();
+                }
+                let mut batcher = ProviderStepBatcher::new(Some(&ingress), &identity, &cancel);
+                batcher.delivered.content = "earlier text".to_string();
+                let result = batcher
+                    .push(ProviderStep::MessageDelta("pending text".to_string()))
+                    .and_then(|()| batcher.flush());
+
+                assert_eq!(result.is_ok(), cancelled, "{kind:?}, cancelled={cancelled}");
+                if let Err(error) = result {
+                    assert_eq!(error.kind(), kind);
+                }
+                assert_eq!(batcher.delivered.content, "earlier text");
+                assert_eq!(batcher.pending.is_empty(), cancelled);
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_reply_recording_preserves_cancellation_when_publication_closes() {
+        for kind in [io::ErrorKind::NotConnected, io::ErrorKind::BrokenPipe] {
+            for (reason, succeeds) in [
+                (CutShort::Interrupted, true),
+                (CutShort::OutputLimit, false),
+            ] {
+                let ingress = ClosedProviderIngress(kind);
+                let context =
+                    RuntimeTurnContext::new(Path::new("."), "", 0, false, &SubagentType::General)
+                        .with_provider_response_ingress(Some(&ingress));
+                let mut conversation = Conversation::new();
+                let mut events = EventFactory::new("cancelled-publication".to_string());
+                let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+                let result = record_cut_short_reply(
+                    PartialReply {
+                        content: "published text".to_string(),
+                        reasoning: None,
+                    },
+                    &response_identity(),
+                    reason,
+                    &context,
+                    &mut conversation,
+                    &mut events,
+                    &mut sink,
+                );
+
+                assert_eq!(result.is_ok(), succeeds, "{kind:?}, {reason:?}");
+                assert!(conversation.messages.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn provider_step_batcher_commits_at_the_limit_and_flushes_the_tail() {
         let ingress = RecordingProviderStepIngress::default();
         let identity = response_identity();
-        let mut batcher = ProviderStepBatcher::new(Some(&ingress), &identity);
+        let cancel = CancelToken::new();
+        let mut batcher = ProviderStepBatcher::new(Some(&ingress), &identity, &cancel);
 
         for index in 0..PROVIDER_STEP_BATCH_LIMIT - 1 {
             batcher

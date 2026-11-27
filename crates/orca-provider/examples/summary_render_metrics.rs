@@ -96,6 +96,7 @@ fn main() {
         &[
             Message::user("user intent ".repeat(50)),
             Message::Assistant {
+                cut_short: None,
                 content: Some("assistant decision ".repeat(50)),
                 reasoning_content: None,
                 tool_calls: vec![],

@@ -23,6 +23,7 @@ pub enum ChatMessage {
         expanded: bool,
     },
     Assistant(String),
+    AssistantCutShort(orca_core::conversation::CutShort),
     AssistantChunk {
         text: String,
         trailing_blank: bool,

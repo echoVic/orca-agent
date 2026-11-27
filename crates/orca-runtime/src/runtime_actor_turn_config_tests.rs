@@ -695,6 +695,7 @@ async fn background_response_classifies_external_tools_with_turn_override() {
             task_id,
             task_registry: active.task_registry.clone(),
             external_tools: active.config.external_tools.clone(),
+            reply_journal: None,
             outcome: Arc::new(Mutex::new(Some(TypedProviderBackgroundOutcome {
                 response: Some(response),
                 status: RunStatus::Success,

@@ -66,10 +66,18 @@ fn fingerprint(message: &Message, include_images: bool) -> Option<[u8; 32]> {
             content,
             reasoning_content,
             tool_calls,
+            cut_short,
             pinned,
         } => serde_json::to_writer(
             &mut hash,
-            &("assistant", content, reasoning_content, tool_calls, pinned),
+            &(
+                "assistant",
+                content,
+                reasoning_content,
+                tool_calls,
+                cut_short,
+                pinned,
+            ),
         ),
         Message::Tool {
             tool_call_id,

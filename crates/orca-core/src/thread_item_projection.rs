@@ -227,6 +227,8 @@ pub struct CompletedModelResponse {
     pub assistant_content: Option<String>,
     pub assistant_reasoning: Option<String>,
     pub tool_calls: Vec<RawToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut_short: Option<crate::conversation::CutShort>,
 }
 
 impl CompletedModelResponse {
@@ -241,6 +243,7 @@ impl CompletedModelResponse {
             assistant_content,
             assistant_reasoning,
             tool_calls,
+            cut_short: None,
         }
     }
 
@@ -257,6 +260,7 @@ impl CompletedModelResponse {
             content: self.assistant_content.clone(),
             reasoning_content: self.assistant_reasoning.clone(),
             tool_calls: self.tool_calls.clone(),
+            cut_short: self.cut_short,
             pinned: false,
         }
     }
