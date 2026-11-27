@@ -829,10 +829,8 @@ mod agent_visit {
             SurfaceProjectionState::from_surface_snapshot(child),
             crate::hosted_session::HostedConversation::from_snapshot(
                 child,
-                crate::surface_projection::history_messages_from_surface_items(
-                    &child.items,
-                    &child.tools,
-                ),
+                crate::hosted_session::HistoryTarget::Conversation,
+                &SurfaceProjectionState::from_surface_snapshot(child),
             ),
             crate::protocol::SessionAttachmentId::new(2),
             &sender,
@@ -920,7 +918,27 @@ mod agent_visit {
     #[test]
     fn the_return_to_main_shows_what_its_agents_did_while_away() {
         with_streaming_main(|thread, mut main| {
-            let fixture = parent_of_child();
+            use orca_runtime::surface::{
+                DisplayText, SurfaceItem, SurfaceItemId, SurfaceSubagentOwner,
+            };
+            let mut fixture = parent_of_child();
+            let owner = main.foreground_operation.as_ref().unwrap();
+            fixture.tasks[0].parent_operation = Some(owner.operation_id.clone());
+            fixture.subagents[0].owner = SurfaceSubagentOwner::Generation {
+                fence: owner.generations[0].fence.clone(),
+            };
+            main.items.push(SurfaceItem::AssistantMessage {
+                id: SurfaceItemId::new(),
+                turn_id: owner.agent_loop_turns[0].turn_id.clone(),
+                text: DisplayText::new("owner's last item"),
+                pinned: false,
+            });
+            main.items.push(SurfaceItem::SystemMessage {
+                id: SurfaceItemId::new(),
+                content: DisplayText::new("after owner"),
+                pinned: false,
+                origin: orca_runtime::surface::SurfaceItemOrigin::RuntimeContext,
+            });
             main.tasks.extend(fixture.tasks.clone());
             main.subagents.extend(fixture.subagents.clone());
             let mut state = state();
@@ -933,6 +951,139 @@ mod agent_visit {
                 ["Delegating to 1 agent", "Agent completed: child"]
             );
             assert_eq!(state.status, AppStatus::Running);
+            assert!(state.transcript.messages.windows(4).any(|rows| matches!(rows, [ChatMessage::Assistant(before),ChatMessage::System{text:launch,..},ChatMessage::System{text:end,..}, ChatMessage::System{text:after,..}] if before == "owner's last item" && launch == "Delegating to 1 agent" && end == "Agent completed: child" && after == "after owner")), "{:?}", state.transcript.messages);
+        });
+    }
+
+    #[test]
+    fn a_visited_agent_shows_its_nested_end_live_and_when_reopened() {
+        use orca_runtime::surface::{
+            DisplayText, NonEmptyText, SequenceNumber, SurfaceSubagentId, SurfaceTaskId,
+            SurfaceTaskStatus,
+        };
+        with_streaming_main(|thread, _| {
+            let mut main = parent_of_child();
+            let mut child = parent_of_child();
+            let id = SurfaceTaskId::try_new("nested").unwrap();
+            let agent = SurfaceSubagentId::try_new("agent-nested").unwrap();
+            child.tasks[0].task_id = id.clone();
+            child.tasks[0].description = DisplayText::new("nested");
+            child.tasks[0].subagent_id = Some(agent.clone());
+            child.subagents[0].task_id = id;
+            child.subagents[0].subagent_id = agent;
+            child.subagents[0].batch_id = NonEmptyText::try_new("nested-batch").unwrap();
+            let mut state = state();
+            snapshot_update(&mut state, &main);
+            state.update(TuiEvent::ChildFocusChanged {
+                task_id: Some("child".into()),
+            });
+            let mut empty = child.clone();
+            empty.tasks.clear();
+            empty.subagents.clear();
+            focus(&mut state, "child", &main, &empty);
+            child.cursor.next_seq = SequenceNumber::new(1);
+            snapshot_update(&mut state, &child);
+            main.tasks[0].status = SurfaceTaskStatus::Completed;
+            state.update(TuiEvent::BackgroundTasksUpdated(
+                crate::surface_projection::workflow_task_summaries(&main),
+            ));
+            child.tasks[0].status = SurfaceTaskStatus::Stopped;
+            child.cursor.next_seq = SequenceNumber::new(2);
+            snapshot_update(&mut state, &child);
+            snapshot_update(&mut state, &child);
+            let expected = ["Delegating to 1 agent", "Agent stopped: nested"];
+            assert_eq!(agent_notes(&state), expected, "live child, not merged dock");
+            return_to_main(&mut state, thread, &main);
+            assert_eq!(
+                agent_notes(&state),
+                ["Delegating to 1 agent", "Agent completed: child"]
+            );
+            child
+                .items
+                .push(orca_runtime::surface::SurfaceItem::SystemMessage {
+                    id: orca_runtime::surface::SurfaceItemId::new(),
+                    content: DisplayText::new("child history"),
+                    pinned: false,
+                    origin: orca_runtime::surface::SurfaceItemOrigin::RuntimeContext,
+                });
+            focus(&mut state, "child", &main, &child);
+            snapshot_update(&mut state, &child);
+            assert_eq!(agent_notes(&state), expected, "reopened child");
+            assert!(
+                matches!(state.transcript.messages.as_slice(), [ChatMessage::System {text: first,..}, ChatMessage::System {text: launch,..}, ChatMessage::System {text: end,..}] if first == "child history" && launch == expected[0] && end == expected[1])
+            );
+        });
+    }
+
+    #[test]
+    fn resume_side_close_and_return_seed_only_the_notices_already_shown() {
+        use orca_runtime::surface::{SequenceNumber, SurfaceTaskStatus};
+        with_streaming_main(|thread, _| {
+            for route in ["resume", "side close", "agent return"] {
+                let mut main = parent_of_child();
+                let mut sibling = main.tasks[0].clone();
+                sibling.task_id = orca_runtime::surface::SurfaceTaskId::try_new("ended").unwrap();
+                sibling.subagent_id = None;
+                sibling.status = SurfaceTaskStatus::Completed;
+                sibling.description = orca_runtime::surface::DisplayText::new("earlier");
+                main.tasks.push(sibling);
+                let mut state = state();
+                let projection = SurfaceProjectionState::from_surface_snapshot(&main);
+                let (sender, events) = mpsc::unbounded();
+                if route == "resume" {
+                    state.update(TuiEvent::HistoryLoaded {
+                        agent_lines: crate::subagent_lines::AnnouncedAgentLines::from_tasks(
+                            &projection.workflow_tasks,
+                        ),
+                        messages: crate::surface_projection::history_messages_from_surface_snapshot(
+                            &main,
+                        ),
+                        plan: None,
+                        label: "Resumed saved conversation.".into(),
+                    });
+                } else {
+                    state.side_conversation_visible = route == "side close";
+                    crate::hosted_child::project_returned_main_with_label(
+                        thread,
+                        &main,
+                        crate::protocol::SessionAttachmentId::new(1),
+                        &sender,
+                        &crate::operation_controller::TuiSurfaceTaskControl::new(),
+                        &Default::default(),
+                        (route == "side close").then_some("Inherited conversation context."),
+                    )
+                    .unwrap();
+                    for event in events.try_iter() {
+                        let event = event.into_test_payload();
+                        if matches!(event, TuiEvent::SessionProjectionReset(_)) {
+                            state.update(event);
+                            assert!(
+                                agent_notes(&state).is_empty(),
+                                "{route} wrote discarded rows"
+                            );
+                        } else {
+                            state.update(event);
+                        }
+                    }
+                    state.side_conversation_visible = false;
+                }
+                let baseline = [
+                    "Delegating to 1 agent",
+                    "Delegating to 1 agent",
+                    "Agent completed: earlier",
+                ];
+                assert_eq!(agent_notes(&state), baseline, "{route} baseline");
+                snapshot_update(&mut state, &main);
+                assert_eq!(agent_notes(&state), baseline, "{route} repeated baseline");
+                main.tasks[0].status = SurfaceTaskStatus::Stopped;
+                main.cursor.next_seq = SequenceNumber::new(2);
+                snapshot_update(&mut state, &main);
+                assert_eq!(
+                    agent_notes(&state),
+                    [&baseline[..], &["Agent stopped: child"]].concat(),
+                    "{route} new end"
+                );
+            }
         });
     }
 
@@ -953,6 +1104,9 @@ mod agent_visit {
         );
         assert_eq!(state.status, AppStatus::Running);
         state.update(TuiEvent::ConversationReprojected {
+            agent_lines: crate::subagent_lines::AnnouncedAgentLines::from_tasks(
+                &SurfaceProjectionState::from_surface_snapshot(&main).workflow_tasks,
+            ),
             messages: crate::surface_projection::history_messages_from_surface_snapshot(&main),
             plan: None,
         });
@@ -1649,6 +1803,7 @@ mod agent_visit {
         state.enter_running();
         for explanation in [Some("current plan"), None] {
             state.update(TuiEvent::ConversationReprojected {
+                agent_lines: Default::default(),
                 messages: vec![],
                 plan: explanation.map(|text| (Some(text.to_owned()), vec![])),
             });

@@ -1447,9 +1447,24 @@ fn tui_resume_shows_what_the_agents_did() {
         "Resumed saved conversation.",
         "main was not resumed",
     );
-    let frame = reconstruct_screen(&output);
-    assert_eq!(frame.matches("Delegating to 1 agent").count(), 2, "{frame}");
-    assert_eq!(frame.matches(ended).count(), 2, "{frame}");
+    let check_restored = |frame: String| {
+        let (history, later) = frame
+            .split_once("Resumed saved conversation.")
+            .expect("resume label");
+        for line in ["Delegating to 1 agent", ended] {
+            assert_eq!(history.matches(line).count(), 2, "{frame}");
+            assert!(!later.contains(line), "{frame}");
+        }
+    };
+    check_restored(reconstruct_screen(&output));
+    resumed.write(b"mock_history_echo\r").unwrap();
+    assert_screen_has_text(
+        &resumed,
+        &mut output,
+        "Mock history users:",
+        "post-resume turn did not answer",
+    );
+    check_restored(reconstruct_screen(&output));
     arm_idle_exit(&mut resumed, &mut output);
     assert_eq!(
         resumed.wait_for_exit(Duration::from_secs(5)).code(),

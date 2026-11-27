@@ -5105,7 +5105,7 @@ mod tests {
         let (_, conversation) = crate::hosted_session::hosted_projection_batch_from_snapshot(
             &thread,
             &snapshot,
-            crate::hosted_session::HistoryTarget::Main,
+            crate::hosted_session::HistoryTarget::Conversation,
         );
         let messages = conversation.messages;
         assert!(

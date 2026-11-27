@@ -154,7 +154,7 @@ pub(crate) fn handle_hosted_side_action(
                         return;
                     }
                 };
-            let conversation = match read_hosted_projection_batch(&started, HistoryTarget::Other) {
+            let conversation = match read_hosted_projection_batch(&started, HistoryTarget::Side) {
                 Ok((_, conversation)) => conversation,
                 Err(error) => {
                     reap_hosted_thread(started);
@@ -258,16 +258,18 @@ pub(crate) fn handle_hosted_side_action(
                     .is_some_and(|current| current.thread_id() == side.side_thread.thread_id());
                 let (target_thread, target_event_tx, target_attachment, target_batch) =
                     if side_active {
-                        let batch =
-                            match read_hosted_projection_batch(&side.thread, HistoryTarget::Main) {
-                                Ok(batch) => batch,
-                                Err(error) => {
-                                    let _ = event_tx.send(TuiEvent::OperationRejected(format!(
-                                        "failed to switch to the main conversation: {error}"
-                                    )));
-                                    return;
-                                }
-                            };
+                        let batch = match read_hosted_projection_batch(
+                            &side.thread,
+                            HistoryTarget::Conversation,
+                        ) {
+                            Ok(batch) => batch,
+                            Err(error) => {
+                                let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                    "failed to switch to the main conversation: {error}"
+                                )));
+                                return;
+                            }
+                        };
                         (
                             side.thread.clone(),
                             side.event_tx.clone(),
@@ -277,7 +279,7 @@ pub(crate) fn handle_hosted_side_action(
                     } else {
                         let batch = match read_hosted_projection_batch(
                             &side.side_thread,
-                            HistoryTarget::Other,
+                            HistoryTarget::Side,
                         ) {
                             Ok(batch) => batch,
                             Err(error) => {

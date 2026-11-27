@@ -2834,6 +2834,129 @@ mod tests {
         });
     }
 
+    #[test]
+    fn an_async_acceptance_precedes_launch_but_not_the_end_of_an_undated_turn() {
+        use crate::transcript_state::ChatMessage;
+        crate::hosted_child::tests::with_streaming_main(|thread, mut snapshot| {
+            let current = snapshot.foreground_operation.as_ref().unwrap().clone();
+            let turn = current.agent_loop_turns[0].turn_id.clone();
+            let template = crate::hosted_child::tests::snapshot_with_child(1, 5);
+            snapshot.tasks.clear();
+            snapshot.items.clear();
+            let reply = |turn_id, text| SurfaceItem::AssistantMessage {
+                id: SurfaceItemId::new(),
+                turn_id,
+                text: DisplayText::new(text),
+                pinned: false,
+            };
+            let root = |task_id, start| {
+                let mut task = template.tasks[0].clone();
+                task.task_id = task_id;
+                task.task_type = SurfaceTaskType::MainSession;
+                task.subagent_id = None;
+                task.started_at = Some(UnixMillis::new(start));
+                task
+            };
+            for ordinal in 1..=3 {
+                let mut older = current.clone();
+                older.operation_id =
+                    SurfaceOperationId::try_from_bytes(uuid_v7_bytes(ordinal)).unwrap();
+                let logical = SurfaceTurnId::new();
+                let admitted = SurfaceTaskId::try_new(format!("admitted-{ordinal}")).unwrap();
+                older.initial_logical_turn_id = Some(logical.clone());
+                older.generations[0].logical_turn_id = logical.clone();
+                older.generations[0].fence.operation_id = older.operation_id.clone();
+                older.agent_loop_turns[0].turn_id = logical.clone();
+                older.agent_loop_turns[0].fence.operation_id = older.operation_id.clone();
+                older.agent_loop_turns[0].admitted_main_task_id = Some(admitted.clone());
+                snapshot.operation_history.push(older);
+                snapshot.tasks.push(root(admitted, i64::from(ordinal)));
+                snapshot.items.push(reply(logical, "older"));
+            }
+            let mut tool = completed_tool_view("async-accept", "subagent", "child", None);
+            tool.request.turn_id = turn.clone();
+            snapshot.items.push(SurfaceItem::ToolResultMessage {
+                id: SurfaceItemId::new(),
+                turn_id: turn.clone(),
+                tool_call_id: tool.request.tool_call_id.clone(),
+                content: DisplayText::new("accepted"),
+                terminal: tool.result.as_ref().unwrap().terminal.clone(),
+                pinned: false,
+            });
+            snapshot.tools.push(tool);
+            let mut agent = template.subagents[0].clone();
+            agent.batch_id = NonEmptyText::try_new("async-accept").unwrap();
+            agent.owner = SurfaceSubagentOwner::Generation {
+                fence: current.generations[0].fence.clone(),
+            };
+            snapshot.subagents.push(agent);
+            let mut task = template.tasks[0].clone();
+            task.parent_operation = Some(current.operation_id.clone());
+            snapshot.tasks.push(task);
+            let (sender, _) = crossbeam_channel::unbounded();
+            let mut live = AppState::new(sender, "test".into(), "mock".into(), "/tmp".into());
+            let sync = |state: &mut AppState, snapshot: &SurfaceSnapshot| {
+                state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+                    SurfaceProjectionState::from_surface_snapshot(snapshot),
+                )))
+            };
+            sync(&mut live, &snapshot);
+            live.update(TuiEvent::AssistantResponseCompleted(
+                Some("later work".into()),
+                None,
+            ));
+            snapshot.items.push(reply(turn, "later work"));
+            let task = snapshot.tasks.last_mut().unwrap();
+            task.status = SurfaceTaskStatus::Completed;
+            task.completed_at = Some(UnixMillis::new(8));
+            snapshot.cursor.next_seq = SequenceNumber::new(snapshot.cursor.next_seq.get() + 1);
+            sync(&mut live, &snapshot);
+            let notes = |messages: &[ChatMessage]| {
+                messages
+                    .iter()
+                    .filter_map(|message| match message {
+                        ChatMessage::System { text, .. }
+                            if text.starts_with("Agent ") || text.starts_with("Delegating") =>
+                        {
+                            Some(text.clone())
+                        }
+                        ChatMessage::Assistant(text) if text == "later work" => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let expected = [
+                "Delegating to 1 agent",
+                "later work",
+                "Agent completed: child",
+            ];
+            assert_eq!(notes(&live.transcript.messages), expected, "live");
+            let (_, returned) = crate::hosted_session::hosted_projection_batch_from_snapshot(
+                thread,
+                &snapshot,
+                crate::hosted_session::HistoryTarget::Conversation,
+            );
+            assert_eq!(notes(&returned.messages), expected, "undated return");
+            snapshot.tasks.push(root(
+                current.agent_loop_turns[0]
+                    .admitted_main_task_id
+                    .clone()
+                    .unwrap(),
+                4,
+            ));
+            assert_eq!(
+                notes(&history_messages_from_surface_snapshot(&snapshot)),
+                expected,
+                "dated resume"
+            );
+            assert_eq!(
+                crate::subagent_lines::positioned_lines(&snapshot)[0].0,
+                4,
+                "immediately after acceptance"
+            );
+        });
+    }
+
     fn goal_projection_goal() -> SurfaceGoal {
         SurfaceGoal {
             goal_id: SurfaceGoalId::try_new("tui-goal-projection").unwrap(),

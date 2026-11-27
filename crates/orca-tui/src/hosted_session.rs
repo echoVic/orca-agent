@@ -573,8 +573,8 @@ pub(crate) fn dispatch_queue_follows(
 
 #[derive(Clone, Copy)]
 pub(crate) enum HistoryTarget {
-    Main,
-    Other,
+    Conversation,
+    Side,
 }
 
 pub(crate) fn read_hosted_projection_batch(
@@ -593,27 +593,14 @@ pub(crate) fn hosted_projection_batch_from_snapshot(
     target: HistoryTarget,
 ) -> (SurfaceProjectionState, HostedConversation) {
     let projection = SurfaceProjectionState::from_surface_snapshot(snapshot);
-    let mut messages = match target {
-        HistoryTarget::Main => {
-            crate::surface_projection::history_messages_from_surface_snapshot(snapshot)
-        }
-        HistoryTarget::Other => crate::surface_projection::history_messages_from_surface_items(
-            &snapshot.items,
-            &snapshot.tools,
-        ),
-    };
+    let mut conversation = HostedConversation::from_snapshot(snapshot, target, &projection);
     if let Some(session_id) = thread.session_id()
         && let Ok(transcript) = load_saved_history_fallback(session_id)
     {
-        messages = attach_history_images(messages, &transcript.messages);
+        conversation.messages = attach_history_images(conversation.messages, &transcript.messages);
     }
     if let Some(message) = crate::surface_projection::latest_terminal_message(snapshot) {
-        messages.push(message);
-    }
-    let mut conversation = HostedConversation::from_snapshot(snapshot, messages);
-    if matches!(target, HistoryTarget::Main) {
-        conversation.agent_lines =
-            crate::subagent_lines::AnnouncedAgentLines::from_tasks(&projection.workflow_tasks);
+        conversation.messages.push(message);
     }
     (projection, conversation)
 }
@@ -627,12 +614,26 @@ pub(crate) struct HostedConversation {
 impl HostedConversation {
     pub(crate) fn from_snapshot(
         snapshot: &orca_runtime::surface::SurfaceSnapshot,
-        messages: Vec<ChatMessage>,
+        target: HistoryTarget,
+        projection: &SurfaceProjectionState,
     ) -> Self {
+        let (messages, agent_lines) = match target {
+            HistoryTarget::Conversation => (
+                crate::surface_projection::history_messages_from_surface_snapshot(snapshot),
+                crate::subagent_lines::AnnouncedAgentLines::from_tasks(&projection.workflow_tasks),
+            ),
+            HistoryTarget::Side => (
+                crate::surface_projection::history_messages_from_surface_items(
+                    &snapshot.items,
+                    &snapshot.tools,
+                ),
+                Default::default(),
+            ),
+        };
         Self {
             messages,
             plan: snapshot_plan(snapshot),
-            agent_lines: Default::default(),
+            agent_lines,
         }
     }
 
@@ -649,7 +650,11 @@ impl HostedConversation {
                 plan: None,
                 label: label.to_owned(),
             },
-            None => TuiEvent::ConversationReprojected { messages, plan },
+            None => TuiEvent::ConversationReprojected {
+                agent_lines,
+                messages,
+                plan,
+            },
         }
     }
 }
@@ -712,9 +717,18 @@ pub(crate) fn emit_typed_history_snapshot(
 ) -> Result<(), String> {
     let actions = TuiSurfaceActions::new(thread.typed_surface());
     let snapshot = actions.read_snapshot().map_err(|error| error.to_string())?;
-    let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
-    let mut plan = snapshot_plan(&snapshot);
-    if messages.is_empty()
+    emit_history_from_snapshot(&snapshot, mode, session_presentation, event_tx)
+}
+
+fn emit_history_from_snapshot(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+    mode: &HistoryMode,
+    session_presentation: Option<SessionProjectionPresentation>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), String> {
+    let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(snapshot);
+    let mut plan = snapshot_plan(snapshot);
+    if snapshot.items.is_empty()
         && let HistoryMode::Resume(selector) | HistoryMode::Fork(selector) = mode
     {
         let transcript = load_saved_history_fallback(selector)?;
@@ -723,6 +737,7 @@ pub(crate) fn emit_typed_history_snapshot(
             .messages
             .into_iter()
             .flat_map(|message| replay.convert(message))
+            .chain(messages)
             .collect();
         if plan.is_none() {
             plan = transcript.plan;
@@ -737,7 +752,7 @@ pub(crate) fn emit_typed_history_snapshot(
     } else {
         "Resumed saved conversation."
     };
-    let projection = SurfaceProjectionState::from_surface_snapshot(&snapshot);
+    let projection = SurfaceProjectionState::from_surface_snapshot(snapshot);
     event_tx
         .send(TuiEvent::HistoryLoaded {
             agent_lines: crate::subagent_lines::AnnouncedAgentLines::from_tasks(
@@ -1272,6 +1287,36 @@ mod tests {
                 ..
             }) if messages.is_empty() && label == "Unable to restore saved conversation."
         ));
+    }
+
+    #[test]
+    fn agent_notices_without_items_do_not_hide_the_saved_transcript() {
+        let home = crate::test_support::isolate_orca_home();
+        let mut writer =
+            history::SessionWriter::start(home.path(), "mock", None, "legacy").unwrap();
+        writer.enter_turn(orca_core::thread_identity::TurnId::new());
+        writer
+            .append_message(&Message::user("saved user".into()))
+            .unwrap();
+        writer.complete("completed").unwrap();
+        let mut snapshot = crate::hosted_child::tests::snapshot_with_child(1, 5);
+        snapshot.tasks[0].status = orca_runtime::surface::SurfaceTaskStatus::Completed;
+        assert!(snapshot.items.is_empty());
+        let (sender, events) = mpsc::unbounded();
+        emit_history_from_snapshot(
+            &snapshot,
+            &HistoryMode::Resume("latest".into()),
+            None,
+            &sender,
+        )
+        .unwrap();
+        let TuiEvent::HistoryLoaded { messages, .. } = events.recv().unwrap() else {
+            panic!("no history")
+        };
+        assert!(
+            matches!(messages.as_slice(), [ChatMessage::User(user), ChatMessage::System {text: launch,..}, ChatMessage::System {text: end,..}] if user == "saved user" && launch == "Delegating to 1 agent" && end == "Agent completed: child"),
+            "{messages:?}"
+        );
     }
 
     #[test]

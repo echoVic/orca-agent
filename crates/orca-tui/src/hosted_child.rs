@@ -134,7 +134,7 @@ impl HostedChildEventBridge {
         let client = attachment.client.clone();
         let snapshot = attachment.baseline.snapshot.clone();
         let (initial_projection, conversation) =
-            hosted_projection_batch_from_snapshot(thread, &snapshot, HistoryTarget::Other);
+            hosted_projection_batch_from_snapshot(thread, &snapshot, HistoryTarget::Conversation);
         let mut projection = agent.projection(&snapshot);
         let operation_id = snapshot
             .foreground_operation
@@ -507,9 +507,10 @@ fn recover_child_surface(
         .filter(|operation| operation.terminal.is_none())
         .map(|operation| operation.operation_id.clone());
     let projection_state = SurfaceProjectionState::from_surface_snapshot(&snapshot);
-    let messages = crate::surface_projection::history_messages_from_surface_items(
-        &snapshot.items,
-        &snapshot.tools,
+    let conversation = HostedConversation::from_snapshot(
+        &snapshot,
+        HistoryTarget::Conversation,
+        &projection_state,
     );
     if let Some(previous) = operation_id.take() {
         control.clear_focused_child_surface(&previous);
@@ -532,10 +533,7 @@ fn recover_child_surface(
             projection: Box::new(projection_state),
         },
     )?;
-    send_event(
-        event_tx,
-        HostedConversation::from_snapshot(&snapshot, messages).into_event(None),
-    )?;
+    send_event(event_tx, conversation.into_event(None))?;
     for event in projection.hydrate_open_streams() {
         send_event(event_tx, event)?;
     }
@@ -967,7 +965,7 @@ pub(crate) fn project_returned_main_with_label(
     label: Option<&str>,
 ) -> Result<(), String> {
     let (projection, conversation) =
-        hosted_projection_batch_from_snapshot(thread, snapshot, HistoryTarget::Main);
+        hosted_projection_batch_from_snapshot(thread, snapshot, HistoryTarget::Conversation);
     project_hosted_thread_attached(projection, conversation, label, attachment, sender)?;
     if let Some(generation) = snapshot
         .foreground_operation
@@ -1436,7 +1434,7 @@ pub(crate) mod live_child_for_test {
             visit();
             let (projection, conversation) = crate::hosted_session::read_hosted_projection_batch(
                 &fixture.child,
-                super::HistoryTarget::Other,
+                super::HistoryTarget::Conversation,
             )
             .unwrap();
             super::project_hosted_child_attached(
@@ -3512,10 +3510,15 @@ pub(crate) mod tests {
 
     impl ChildThread {
         fn start() -> Self {
+            Self::configured(|_| {})
+        }
+
+        fn configured(configure: impl FnOnce(&mut orca_core::config::RunConfig)) -> Self {
             let home = crate::test_support::isolate_orca_home();
             let mut config = crate::test_support::test_run_config();
             config.cwd = Some(home.path().to_path_buf());
             config.history_mode = orca_core::config::HistoryMode::Record;
+            configure(&mut config);
             let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
             let thread = host
                 .start_thread(config.clone(), "child")
@@ -3614,6 +3617,85 @@ pub(crate) mod tests {
         turn.join().unwrap();
         main.shutdown();
         result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    #[test]
+    fn a_uuid_sync_batch_has_no_launch_item_live_or_rebuilt() {
+        use crate::transcript_state::ChatMessage;
+        let child = ChildThread::configured(|config| {
+            config.approval_mode = orca_core::approval_types::ApprovalMode::FullAuto
+        });
+        child.host.handle().keep_subagents_in_process();
+        let (sender, events) = crossbeam_channel::unbounded();
+        run_child_turn(
+            &child.thread,
+            child.config.clone(),
+            "subagent batch schema_fail",
+            &sender,
+        );
+        let snapshot = super::read_parent_snapshot(&child.thread).unwrap();
+        let requests: Vec<_> = snapshot
+            .tools
+            .iter()
+            .filter(|tool| tool.request.name.as_str() == "subagent")
+            .collect();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|tool| tool.result.is_none()));
+        assert!(!snapshot.items.iter().any(|item| matches!(
+            item,
+            orca_runtime::surface::SurfaceItem::ToolResultMessage { .. }
+        )));
+        assert_eq!(snapshot.subagents.len(), 2);
+        let batch = &snapshot.subagents[0].batch_id;
+        uuid::Uuid::parse_str(batch.as_str()).unwrap();
+        assert!(
+            snapshot
+                .subagents
+                .iter()
+                .all(|agent| &agent.batch_id == batch && agent.batch_size == 2)
+        );
+        let mut state = crate::types::AppState::new(
+            crossbeam_channel::unbounded().0,
+            "test".into(),
+            "mock".into(),
+            "/tmp".into(),
+        );
+        for event in events.try_iter() {
+            state.update(event.into_test_payload());
+        }
+        let rows = |messages: &[ChatMessage]| {
+            messages
+                .iter()
+                .filter_map(|message| match message {
+                    ChatMessage::System { text, .. } if text.starts_with("Delegating") => {
+                        Some("launch")
+                    }
+                    ChatMessage::System { text, .. } if text.starts_with("Agent completed:") => {
+                        Some("success")
+                    }
+                    ChatMessage::System { text, .. } if text.starts_with("Agent failed:") => {
+                        Some("failure")
+                    }
+                    ChatMessage::Assistant(text) | ChatMessage::AssistantChunk { text, .. }
+                        if text.contains("Mock completed after tool execution.") =>
+                    {
+                        Some("reply")
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let live = rows(&state.transcript.messages);
+        let rebuilt =
+            rows(&crate::surface_projection::history_messages_from_surface_snapshot(&snapshot));
+        assert_eq!(live.len(), 4, "{live:?}");
+        assert_eq!((live[0], live[3]), ("launch", "reply"));
+        assert_eq!(&rebuilt[..2], ["reply", "launch"]);
+        for ends in [&live[1..3], &rebuilt[2..]] {
+            assert_eq!(ends.len(), 2);
+            assert!(ends.contains(&"success") && ends.contains(&"failure"));
+        }
+        child.shutdown();
     }
 
     /// What the view was sent for one turn of the child.

@@ -310,7 +310,9 @@ impl AppState {
                 self.scroll_to_bottom();
             }
             TuiEvent::SurfaceProjectionSynced(projection) => {
-                self.apply_surface_projection_state(*projection);
+                if self.apply_surface_projection_state(*projection) {
+                    self.announce_visible_agent_lines();
+                }
             }
             TuiEvent::NewSessionStarted => {
                 self.main_behind_child = None;
@@ -414,7 +416,13 @@ impl AppState {
                 self.transcript.finalized_count = self.transcript.messages.len();
                 self.set_status(AppStatus::Idle);
             }
-            TuiEvent::ConversationReprojected { messages, plan } => {
+            TuiEvent::ConversationReprojected {
+                agent_lines,
+                messages,
+                plan,
+            } => {
+                self.announced_subagent_batches = agent_lines.batches;
+                self.announced_subagent_terminals = agent_lines.terminals;
                 self.replace_messages(messages);
                 self.settle_restored_command_rows();
                 self.restore_plan(plan);
@@ -1557,12 +1565,9 @@ impl AppState {
             .map(|offset| first + 1 + offset)
     }
 
-    /// Materialize only the root-level delegation announcement. Child state is
-    /// owned by the dock and focused child surface; putting task snapshots in
-    /// `ChatMessage` makes the root transcript a second, stale authority.
     pub(crate) fn sync_subagent_transcript_messages(&mut self) {
         let tasks = self
-            .workflow_tasks()
+            .visible_conversation_tasks()
             .iter()
             .filter(|task| task.task_type == orca_core::task_types::TaskType::Subagent)
             .cloned()
@@ -1581,7 +1586,7 @@ impl AppState {
         }
     }
 
-    pub(crate) fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
+    fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) -> bool {
         let mut projection = projection;
         let mut surface_session = self.surface_session.clone();
         let session_apply = surface_session.apply_projection(&projection);
@@ -1596,7 +1601,7 @@ impl AppState {
                 .surface_metrics
                 .rejects_usage_revision(projection.usage_revision)
         {
-            return;
+            return false;
         }
         if self.conversation_target().task_id().is_some() {
             self.focused_workflow_tasks
@@ -1615,7 +1620,7 @@ impl AppState {
         self.surface_workflow_tasks = surface_workflow_tasks;
         self.surface_metrics.apply_projection(&projection);
         let goal_effect = self.surface_goal.apply_projection(&projection);
-        self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
+        self.update_workflow_panel(projection.workflow_tasks.clone());
         match operation_apply {
             SurfaceOperationProjectionApply::Rejected => unreachable!("projection was rejected"),
             SurfaceOperationProjectionApply::Accepted(operation_effect) => match operation_effect {
@@ -1677,6 +1682,7 @@ impl AppState {
             SurfaceSessionProjectionApply::Accepted(None)
             | SurfaceSessionProjectionApply::Rejected => {}
         }
+        true
     }
 
     pub(crate) fn promote_trailing_reasoning(&mut self) {

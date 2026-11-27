@@ -119,22 +119,34 @@ pub(crate) fn positioned_lines(snapshot: &SurfaceSnapshot) -> Vec<(usize, String
         };
         last_item.insert(turn, index + 1);
     }
-    let operations: HashMap<_, _> = snapshot
+    let ordered = snapshot
         .operation_history
         .iter()
-        .chain(&snapshot.foreground_operation)
-        .map(|operation| (&operation.operation_id, operation))
+        .chain(&snapshot.foreground_operation);
+    let operations: HashMap<_, _> = ordered
+        .clone()
+        .enumerate()
+        .map(|(index, operation)| (&operation.operation_id, (index, operation)))
         .collect();
-    let mut dated_turns: Vec<_> = operations
-        .values()
-        .flat_map(|operation| &operation.agent_loop_turns)
-        .filter_map(|turn| {
-            Some((
-                *main_starts.get(turn.admitted_main_task_id.as_ref()?)?,
-                *last_item.get(&turn.turn_id)?,
-            ))
-        })
-        .collect();
+    let mut dated_turns = Vec::new();
+    let mut last_undated = None;
+    for (index, operation) in ordered.enumerate() {
+        for (ordinal, turn) in operation.agent_loop_turns.iter().enumerate() {
+            let position = (index, ordinal);
+            match turn
+                .admitted_main_task_id
+                .as_ref()
+                .and_then(|task| main_starts.get(task))
+            {
+                Some(start) => {
+                    if let Some(boundary) = last_item.get(&turn.turn_id) {
+                        dated_turns.push((*start, position, *boundary));
+                    }
+                }
+                None => last_undated = Some(position),
+            }
+        }
+    }
     dated_turns.sort_unstable();
     let summaries = crate::surface_projection::workflow_task_summaries(snapshot);
     let mut rows = Vec::new();
@@ -150,7 +162,7 @@ pub(crate) fn positioned_lines(snapshot: &SurfaceSnapshot) -> Vec<(usize, String
             .iter()
             .find(|agent| agent.task_id == task.task_id);
         let operation = owner(task, agent).and_then(|id| operations.get(id));
-        let turns = operation.into_iter().flat_map(|op| {
+        let turns = operation.into_iter().flat_map(|(_, op)| {
             op.initial_logical_turn_id
                 .iter()
                 .chain(
@@ -166,18 +178,16 @@ pub(crate) fn positioned_lines(snapshot: &SurfaceSnapshot) -> Vec<(usize, String
             .max()
             .copied()
             .unwrap_or(snapshot.items.len());
-        let launch = agent
-            .and_then(|agent| {
-                turns
-                    .filter_map(|turn| tool_results.get(&(turn, agent.batch_id.as_str())))
-                    .min()
-                    .copied()
-            })
-            .unwrap_or(owning_end);
+        let launch_item = agent.and_then(|agent| {
+            turns
+                .filter_map(|turn| tool_results.get(&(turn, agent.batch_id.as_str())))
+                .min()
+                .copied()
+        });
         let key = batch_key(summary);
         if batches.insert(key) {
             rows.push((
-                launch,
+                launch_item.unwrap_or(owning_end),
                 task.created_at.get(),
                 false,
                 key,
@@ -188,11 +198,21 @@ pub(crate) fn positioned_lines(snapshot: &SurfaceSnapshot) -> Vec<(usize, String
             let time = task.completed_at.map(|time| time.get());
             let boundary = time
                 .and_then(|end| {
-                    dated_turns[..dated_turns.partition_point(|(start, _)| *start <= end)].last()
+                    dated_turns[..dated_turns.partition_point(|(start, ..)| *start <= end)].last()
                 })
-                .map_or(owning_end, |(_, boundary)| *boundary);
+                .filter(|(_, position, _)| {
+                    !last_undated.is_some_and(|undated| {
+                        undated > *position
+                            && operation.is_some_and(|(owner_index, _)| undated.0 >= *owner_index)
+                    })
+                })
+                .map_or(owning_end, |(_, _, boundary)| *boundary);
             rows.push((
-                boundary.max(launch),
+                if launch_item.is_some() {
+                    boundary
+                } else {
+                    boundary.max(owning_end)
+                },
                 time.unwrap_or(i64::MAX).max(task.created_at.get()),
                 true,
                 summary.id.as_str(),

@@ -518,6 +518,7 @@ pub enum TuiEvent {
         label: String,
     },
     ConversationReprojected {
+        agent_lines: crate::subagent_lines::AnnouncedAgentLines,
         messages: Vec<ChatMessage>,
         plan: Option<(Option<String>, Vec<PlanItem>)>,
     },

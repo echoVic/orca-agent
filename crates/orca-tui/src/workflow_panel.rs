@@ -537,6 +537,11 @@ impl AppState {
     }
 
     pub(crate) fn apply_workflow_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
+        self.update_workflow_panel(tasks);
+        self.announce_visible_agent_lines();
+    }
+
+    pub(crate) fn update_workflow_panel(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         // Only update the parent snapshot when Main is focused. While a child
         // is attached the background_workflow_tasks holds the parent baseline
         // used by apply_surface_projection_state for dock merging; overwriting
@@ -568,10 +573,6 @@ impl AppState {
         let selected_task_id = self.selected_workflow_task().map(|task| task.id.clone());
         self.workflow_panel.replace_tasks(tasks);
         self.agent_workspace.reconcile(self.workflow_panel.tasks());
-        if self.conversation_target().task_id().is_none() && !self.side_conversation_visible {
-            self.sync_subagent_transcript_messages();
-            self.emit_subagent_terminal_notices();
-        }
         self.refresh_open_task_transcript();
         if should_reveal_background_approval {
             // A background approval must surface without stealing the
@@ -609,9 +610,24 @@ impl AppState {
         self.learn_command_ends_from_tasks();
     }
 
+    pub(crate) fn announce_visible_agent_lines(&mut self) {
+        if !self.side_conversation_visible {
+            self.sync_subagent_transcript_messages();
+            self.emit_subagent_terminal_notices();
+        }
+    }
+
+    pub(crate) fn visible_conversation_tasks(&self) -> &[BackgroundTaskSummary] {
+        if self.conversation_target().task_id().is_some() {
+            &self.focused_workflow_tasks
+        } else {
+            self.workflow_tasks()
+        }
+    }
+
     fn emit_subagent_terminal_notices(&mut self) {
         let notices = self
-            .workflow_tasks()
+            .visible_conversation_tasks()
             .iter()
             .filter(|task| task.task_type == TaskType::Subagent)
             .filter_map(|task| {
@@ -636,12 +652,10 @@ impl AppState {
     pub(crate) fn apply_background_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         if self.conversation_target().task_id().is_some() {
             self.background_workflow_tasks = tasks.clone();
-            self.apply_workflow_tasks_update(
-                crate::state_reducer::merge_background_task_snapshots(
-                    &tasks,
-                    &self.focused_workflow_tasks,
-                ),
-            );
+            self.update_workflow_panel(crate::state_reducer::merge_background_task_snapshots(
+                &tasks,
+                &self.focused_workflow_tasks,
+            ));
             return;
         }
         self.background_workflow_tasks = tasks.clone();
