@@ -910,11 +910,19 @@ fn wire_equivalent_tokens_with_counter(
     provider_config: &ProviderConfig,
     counter: &impl TokenCounter,
 ) -> usize {
-    crate::deepseek_http::conversation_to_api_messages(conversation)
-        .iter()
-        .map(|message| message.estimated_tokens(counter))
-        .sum::<usize>()
-        + tools_schema_tokens_with_counter(provider_config, counter)
+    let inherited = conversation
+        .fork_prefix
+        .as_ref()
+        .map_or(0, |prefix| prefix.estimated_tokens);
+    inherited
+        + crate::deepseek_http::conversation_to_api_messages(conversation)
+            .iter()
+            .map(|message| message.estimated_tokens(counter))
+            .sum::<usize>()
+        + serialized_tools_tokens(
+            &crate::deepseek_http::deepseek_conversation_tools(conversation, provider_config),
+            counter,
+        )
 }
 
 fn tools_schema_tokens_with_counter(
@@ -1433,6 +1441,7 @@ fn summarize_collapsed_messages(
         ..
     } = partition;
     let mut result = Conversation::new();
+    result.keep_provider_turn_from(conversation);
     result.messages = prefix;
     result.messages.extend(kept);
     result.internal_context = conversation.internal_context.clone();

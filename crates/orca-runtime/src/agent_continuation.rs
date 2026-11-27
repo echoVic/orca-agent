@@ -1131,6 +1131,10 @@ pub(crate) struct AgentContinuationRecord {
     pub(crate) subagent_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) frozen_agent: Option<FrozenAgentConfig>,
+    /// Provider prefix lives beside the checkpoint so older readers can
+    /// verify and resume the child's own transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fork_prefix: Option<orca_core::conversation::ProviderForkPrefix>,
     /// Fixed or inherited model identity used for compatibility checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) model: Option<String>,
@@ -1432,6 +1436,7 @@ pub(crate) struct PreparedContinuation {
     pub(crate) prompt_id: AgentPromptId,
     /// Compatibility and workspace identity the child loop must retain.
     pub(crate) compatibility: ContinuationCompatibility,
+    pub(crate) fork_prefix: Option<orca_core::conversation::ProviderForkPrefix>,
     /// Source checkpoint for resume, or the latest checkpoint after settlement.
     pub(crate) checkpoint: Option<AgentCheckpoint>,
     /// Current durable revision to use when acquiring or committing.
@@ -1461,6 +1466,7 @@ impl From<&AgentContinuationRecord> for PreparedContinuation {
                 worktree: record.worktree.clone(),
                 compatibility_hash: record.compatibility_hash,
             },
+            fork_prefix: record.fork_prefix.clone(),
             checkpoint: record.checkpoint.clone(),
             revision: record.revision,
             source_task_id: record.source_task_id.clone(),
@@ -2590,6 +2596,14 @@ impl ChildAgentCoordinator {
         &self,
         input: CreateContinuationInput,
     ) -> Result<PreparedContinuation, AgentContinuationError> {
+        self.create_with_fork(input, None)
+    }
+
+    pub(crate) fn create_with_fork(
+        &self,
+        input: CreateContinuationInput,
+        fork_prefix: Option<orca_core::conversation::ProviderForkPrefix>,
+    ) -> Result<PreparedContinuation, AgentContinuationError> {
         validate_task_binding(&input.parent_task_id, &input.task_id)?;
         validate_compatibility_shape(&input.compatibility)?;
         let continuation_id = input
@@ -2602,6 +2616,7 @@ impl ChildAgentCoordinator {
                 && record.current_attempt.prompt_id == input.prompt_id
                 && record.subagent_type == input.compatibility.subagent_type
                 && record.frozen_agent == input.compatibility.frozen_agent
+                && record.fork_prefix == fork_prefix
                 && record.model == input.compatibility.model
                 && record.isolation == input.compatibility.isolation
                 && record.effective_cwd == input.compatibility.effective_cwd
@@ -2624,6 +2639,7 @@ impl ChildAgentCoordinator {
             latest_task_id: input.task_id,
             subagent_type: input.compatibility.subagent_type,
             frozen_agent: input.compatibility.frozen_agent,
+            fork_prefix,
             model: input.compatibility.model,
             isolation: input.compatibility.isolation,
             effective_cwd: input.compatibility.effective_cwd,
@@ -4041,6 +4057,7 @@ mod tests {
                 worktree: None,
                 compatibility_hash: legacy_hash,
             },
+            fork_prefix: None,
             checkpoint: None,
             revision: ContinuationRevision::ZERO,
             source_task_id: "task-source".to_string(),

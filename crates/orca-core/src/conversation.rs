@@ -543,7 +543,7 @@ pub struct UsageAnchor {
     boundary: u64,
 }
 
-/// In-memory DeepSeek request data used only for compaction replay.
+/// In-memory DeepSeek request data for compaction replay and child forks.
 pub struct CapturedProviderRequest {
     pub source_messages: Vec<[u8; 32]>,
     pub summary: SummaryState,
@@ -552,6 +552,8 @@ pub struct CapturedProviderRequest {
     pub reasoning_effort: crate::config::ReasoningEffort,
     pub messages: Vec<CapturedProviderMessage>,
     pub tools: Vec<serde_json::Value>,
+    pub fork_cut: Option<usize>,
+    pub fork_turn_id: Option<String>,
 }
 
 pub struct CapturedProviderMessage {
@@ -559,6 +561,36 @@ pub struct CapturedProviderMessage {
     pub estimated_tokens: usize,
     pub has_images: bool,
     pub has_tool_images: bool,
+}
+
+/// A child sends this independently of its own transcript and checkpoints.
+/// The message strings preserve the exact provider JSON, including field order.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderForkPrefix {
+    pub model: String,
+    pub endpoint: String,
+    pub reasoning_effort: crate::config::ReasoningEffort,
+    pub messages: Vec<String>,
+    pub tools: Vec<serde_json::Value>,
+    pub estimated_tokens: usize,
+}
+
+impl fmt::Debug for ProviderForkPrefix {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderForkPrefix")
+            .field("model", &self.model)
+            .field("message_count", &self.messages.len())
+            .field("tool_count", &self.tools.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProviderTurnBoundary {
+    id: String,
+    user_messages: usize,
+    summary: SummaryState,
 }
 
 #[derive(Clone, Default)]
@@ -600,6 +632,8 @@ pub struct NestedInstructionState {
 #[derive(Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
+    pub fork_prefix: Option<Arc<ProviderForkPrefix>>,
+    provider_turn: Option<ProviderTurnBoundary>,
     pub internal_context: InternalContext,
     /// Repeated tool calls since the latest user prompt, retained across
     /// compaction so reminders do not restart with the visible history tail.
@@ -634,6 +668,8 @@ impl Clone for Conversation {
     fn clone(&self) -> Self {
         Self {
             messages: self.messages.clone(),
+            fork_prefix: self.fork_prefix.clone(),
+            provider_turn: self.provider_turn.clone(),
             internal_context: self.internal_context.clone(),
             repeat_tool_streak: self.repeat_tool_streak.clone(),
             mcp_instructions: self.mcp_instructions.clone(),
@@ -656,6 +692,8 @@ impl Conversation {
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
+            fork_prefix: None,
+            provider_turn: None,
             internal_context: InternalContext::default(),
             repeat_tool_streak: None,
             mcp_instructions: Vec::new(),
@@ -668,6 +706,57 @@ impl Conversation {
             provider_request_capture: ProviderRequestCapture::default(),
             nested_instructions: NestedInstructionState::default(),
         }
+    }
+
+    pub fn start_provider_turn(&mut self, id: &str) {
+        if self.provider_turn_id() != Some(id) {
+            self.provider_turn = Some(ProviderTurnBoundary {
+                id: id.to_owned(),
+                user_messages: 1,
+                summary: self.summary.clone(),
+            });
+        }
+    }
+
+    pub fn provider_turn_id(&self) -> Option<&str> {
+        self.provider_turn.as_ref().map(|turn| turn.id.as_str())
+    }
+
+    pub fn note_provider_turn_steer(&mut self) {
+        if let Some(turn) = &mut self.provider_turn {
+            turn.user_messages += 1;
+        }
+    }
+
+    pub fn keep_provider_turn_from(&mut self, source: &Self) {
+        self.provider_turn.clone_from(&source.provider_turn);
+        self.fork_prefix.clone_from(&source.fork_prefix);
+    }
+
+    pub fn completed_provider_history_end(&self, messages: &[Message]) -> Option<usize> {
+        let turn = self.provider_turn.as_ref()?;
+        // A summary produced during the turn may already contain work from
+        // that turn, including tool results that followed its opening prompt.
+        if turn.summary != self.summary {
+            return None;
+        }
+        let cut = messages
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, message)| {
+                matches!(message, Message::User { content, images, .. }
+                if !images.is_empty() || !is_internal_image_analysis(content))
+            })
+            .nth(turn.user_messages - 1)?
+            .0;
+        (turn.summary.baseline.is_some()
+            || !turn.summary.deltas.is_empty()
+            || messages[..cut].iter().any(|message| {
+                matches!(message, Message::Assistant { content: Some(_), tool_calls, .. }
+                    if tool_calls.is_empty())
+            }))
+        .then_some(cut)
     }
 
     pub fn last_provider_request(&self) -> Option<Arc<CapturedProviderRequest>> {

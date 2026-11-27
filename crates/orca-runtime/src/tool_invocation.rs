@@ -911,10 +911,10 @@ mod tests {
         assert_eq!(
             patch_prefix_digests(),
             [
-                "54a976f10fd789046229c077c469b93e9f7ff2fe21d00bce61ab3128951671f2",
-                "50d7d340fccf8e68e3cc9424a5e5fbb74c3778135f3a87a7d02dfd46e34f3df4",
+                "e9436c436edda80e9a9e42973ca331f991ecec6649524129762fd5e96e183118",
+                "9dc6331b87461dc28c1d69deaba545d8d9902a4db50c63a96934d33674696572",
                 "0febb051947a213e39de3d5ae3088de50c3ecaaf592c0859451adbff38aa0567",
-                "39bce068e74a7974e956e0f523da308eda7a0ad5747d104848cd8fde9f155352",
+                "a5879bc00d3b77279c678d0a997d15f7ce2a93610023c3397f40ab2c034c7047",
             ]
         );
     }

@@ -440,7 +440,8 @@ mod tests {
         // 28,440 chars with the subagent routing description restored.
         // +600 (2026-11-14) for the read_document tool (DeepSeek OCR); the
         // measured prefix is 29,108 chars without the date line.
-        let limit = if cfg!(windows) { 29_900 } else { 29_200 };
+        // The fork context field adds 164 chars to the measured prefix.
+        let limit = if cfg!(windows) { 30_100 } else { 29_400 };
         assert!(
             prefix <= limit,
             "system + tool prefix is {prefix} chars (limit {limit})"

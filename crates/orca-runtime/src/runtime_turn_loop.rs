@@ -259,6 +259,11 @@ impl RuntimeTurnLoopStep {
         mut input: RuntimeTurnLoopInput<'_, '_, W>,
         executors: RuntimeTurnLoopExecutors,
     ) -> io::Result<AgentLoopOutcome> {
+        input
+            .prepared_conversation
+            .parts_mut()
+            .0
+            .start_provider_turn(input.request.turn_context.turn_id.as_str());
         let owner = input
             .request
             .turn_context
@@ -348,6 +353,7 @@ impl RuntimeTurnLoopStep {
             if summary_due {
                 let (conversation, _) = input.prepared_conversation.parts_mut();
                 if crate::investigation_convergence::ensure_summary_prompt(conversation) {
+                    conversation.note_provider_turn_steer();
                     emit_safe_child_checkpoint(
                         input.prepared_conversation,
                         input.operation.controller.usage(),

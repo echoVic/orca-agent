@@ -210,7 +210,28 @@ fn prepare_fresh_child_agent_conversation(
     let mut conversation =
         prepare_child_agent_system_conversation(config, request, cwd, instructions, memory);
     tell_child_today(&mut conversation);
-    conversation.add_user(request.prompt.clone());
+    let mut prompt = request.prompt.clone();
+    if request.fork_prefix.is_some() {
+        prompt.push_str(&format!("\n\nChild working directory: {}", cwd.display()));
+        prompt.push_str(&agent_common::format_child_agent_contract(
+            &request.subagent_type,
+            config
+                .subagents
+                .delegation
+                .for_child(request.depth, config.subagents.max_depth),
+        ));
+        if let Some(definition) = &config.subagents.effective_definition {
+            prompt.push_str("\n\n");
+            prompt.push_str(&definition.system_prompt);
+        }
+        if let Some(tools) = &request.allowed_tools {
+            prompt.push_str(&format!(
+                "\n\nTools allowed for this role: {}.",
+                tools.join(", ")
+            ));
+        }
+    }
+    conversation.add_user(prompt);
     conversation
 }
 
@@ -232,6 +253,10 @@ fn prepare_child_agent_system_conversation(
     memory: &MemoryBlock,
 ) -> Conversation {
     let mut conversation = Conversation::new();
+    if let Some(prefix) = &request.fork_prefix {
+        conversation.fork_prefix = Some(prefix.clone());
+        return conversation;
+    }
     let system_prompt = agent_common::build_agent_system_prompt_for_config(
         cwd,
         config,
@@ -398,6 +423,7 @@ mod tests {
             tool_policy_label: Some("custom agent desktop-audit".to_string()),
             workflow_ipc: None,
             continuation: None,
+            fork_prefix: None,
         };
         (config, request)
     }

@@ -1641,6 +1641,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         });
     }
     let mut execution_context = ToolExecutionContext::new(cwd, subagent_depth, emit_deltas, policy)
+        .with_parent_conversation(conversation)
         .with_goal_mode(goal_mode)
         .with_headless(headless)
         .with_root_task_id(root_task_id)

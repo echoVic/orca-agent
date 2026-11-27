@@ -937,6 +937,12 @@ fn register_builtin_tools(registry: &mut ToolRegistry, apply_patch: bool) {
                         ],
                         "description": "Override: auto routes, flash favors speed, pro deep reasoning."
                     },
+                    "context": {
+                        "type": "string",
+                        "enum": ["fresh", "fork"],
+                        "default": "fresh",
+                        "description": "Fork reuses completed parent history and its model. Fresh uses a standalone brief."
+                    },
                     "isolation": {
                         "type": "string",
                         "enum": ["none", "worktree"],

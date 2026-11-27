@@ -2134,6 +2134,7 @@ fn run_child_agent_applies_subagent_model_override() {
         tool_policy_label: None,
         workflow_ipc: None,
         continuation: None,
+        fork_prefix: None,
     };
     let cancel = CancelToken::new();
     let mut events = EventFactory::new("test-run".to_string());
@@ -2166,6 +2167,7 @@ fn run_child_agent_ignores_auto_override() {
         tool_policy_label: None,
         workflow_ipc: None,
         continuation: None,
+        fork_prefix: None,
     };
     let cancel = CancelToken::new();
     let mut events = EventFactory::new("test-run".to_string());
@@ -2196,6 +2198,7 @@ fn run_child_agent_preserves_cost_tracker_on_loop_error() {
         tool_policy_label: None,
         workflow_ipc: None,
         continuation: None,
+        fork_prefix: None,
     };
     let cancel = CancelToken::new();
     let mut events = EventFactory::new("test-run".to_string());
@@ -2216,4 +2219,317 @@ fn run_child_agent_preserves_cost_tracker_on_loop_error() {
     let tracker_debug = format!("{tracker:?}");
     assert!(tracker_debug.contains("input_tokens: 7"));
     assert!(tracker_debug.contains("output_tokens: 3"));
+}
+
+fn fork_tool_request(context: Option<&str>) -> ToolRequest {
+    let mut arguments = serde_json::json!({
+        "description": "inspect parent evidence",
+        "prompt": "Report the relevant evidence.",
+        "subagent_type": "explorer",
+        "model": "deepseek-flash"
+    });
+    if let Some(context) = context {
+        arguments["context"] = context.into();
+    }
+    ToolRequest {
+        id: "fork-child".into(),
+        name: ToolName::Subagent,
+        action: ActionKind::Agent,
+        target: None,
+        raw_arguments: Some(arguments.to_string()),
+    }
+}
+
+fn run_recorded_fork(
+    context: Option<&str>,
+    completed: bool,
+    attempt_write: bool,
+) -> (Vec<Vec<u8>>, ChildAgentResult) {
+    use orca_core::conversation::Conversation;
+    use orca_provider::tool_schema::ProviderToolDefinition;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let cwd = tempfile::tempdir().unwrap();
+    let orca_home = tempfile::tempdir().unwrap();
+    let _home = crate::history::redirect_test_orca_home(orca_home.path());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut config = config(Some(PRO_MODEL));
+    config.provider = ProviderKind::DeepSeek;
+    config.approval_mode = ApprovalMode::FullAuto;
+    config.api_key = Some("local-fixture".into());
+    config.base_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+    let server = std::thread::spawn(move || {
+        let mut bodies = Vec::new();
+        for index in 0..2 {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            bodies.push(body);
+            let (delta, finish) = if index == 1 && attempt_write {
+                (
+                    serde_json::json!({"reasoning_content":"try a write", "tool_calls":[{
+                        "index":0,"id":"child-write","function":{"name":"write_file", "arguments":"{\"file_path\":\"fork-write.txt\",\"content\":\"unexpected\"}"}
+                    }]}),
+                    "tool_calls",
+                )
+            } else {
+                (
+                    serde_json::json!({"content": if index == 0 { "parent response" } else { "child report" }}),
+                    "stop",
+                )
+            };
+            let chunk = serde_json::json!({"choices":[{"delta":delta,"finish_reason":finish}]});
+            let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        bodies
+    });
+    let mut parent = Conversation::new();
+    parent.add_system("Recorded parent system prompt".into());
+    if completed {
+        parent.add_user("Describe the recorded evidence".into());
+        parent.add_assistant(
+            None,
+            Some("recorded reasoning".into()),
+            vec![RawToolCall {
+                id: "parent-read".into(),
+                function_name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        parent.add_tool_result(
+            "parent-read".into(),
+            "recorded evidence from the completed turn\n".repeat(512),
+        );
+        parent.add_assistant(Some("parent completed report".into()), None, vec![]);
+    }
+    parent.add_user("in-flight parent prompt".into());
+    parent.start_provider_turn("parent-turn");
+    if completed {
+        parent.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "active-tool".into(),
+                function_name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        parent.add_tool_result("active-tool".into(), "in-flight result".into());
+        parent.add_user("in-flight steering".into());
+        parent.note_provider_turn_steer();
+    }
+    let registry = orca_tools::registry::default_tool_registry();
+    let parent_config = orca_provider::ProviderConfig {
+        api_key: config.api_key.clone(),
+        base_url: config.base_url.clone(),
+        model: Some(PRO_MODEL.into()),
+        reasoning_effort: orca_core::config::ReasoningEffort::High,
+        tools_override: Some(
+            ["write_file", "read_file"]
+                .map(|name| {
+                    let spec = registry.get(name).unwrap().spec();
+                    ProviderToolDefinition {
+                        name: name.into(),
+                        description: spec.description.clone(),
+                        input_schema: spec.input_schema.clone(),
+                        strict_capable: false,
+                    }
+                })
+                .to_vec(),
+        ),
+        mcp_registry: None,
+        external_tools: vec![],
+        max_output_tokens: None,
+    };
+    let cancel = CancelToken::new();
+    let recorded = orca_provider::call_streaming(
+        ProviderKind::DeepSeek,
+        &parent,
+        &parent_config,
+        &cancel,
+        &mut |_| {},
+    );
+    assert_eq!(
+        recorded.assistant_content.as_deref(),
+        Some("parent response")
+    );
+    if completed {
+        parent.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "pending-tool".into(),
+                function_name: "subagent".into(),
+                arguments: "{}".into(),
+            }],
+        );
+    }
+    let mut request = crate::subagent::create_subagent_request(&fork_tool_request(context));
+    crate::subagent::prepare_fork_request(&mut request, &config, Some(&parent)).unwrap();
+    let mut child = ChildAgentRequest::new(
+        request.prompt,
+        request.subagent_type,
+        request.model,
+        1,
+        false,
+    );
+    child.fork_prefix = request.fork_prefix.map(Arc::new);
+    let mut events = EventFactory::new("fork-child".into());
+    let mut sink = EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl);
+    let mut runtime = runtime(
+        &mut sink,
+        &mut events,
+        &cancel,
+        crate::agent_loop::execute_child_agent_loop,
+    );
+    runtime.cwd = cwd.path();
+    let (result, _) = run_child_agent(&config, &child, &mut runtime);
+    assert!(!cwd.path().join("fork-write.txt").exists());
+    (server.join().unwrap(), result)
+}
+
+fn recorded_wire_messages(body: &[u8]) -> Vec<Box<serde_json::value::RawValue>> {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        messages: Vec<Box<serde_json::value::RawValue>>,
+    }
+    serde_json::from_slice::<Request>(body).unwrap().messages
+}
+
+#[test]
+fn a_fork_childs_first_request_shares_the_parents_prefix() {
+    let (bodies, result) = run_recorded_fork(Some("fork"), true, false);
+    let parent = recorded_wire_messages(&bodies[0]);
+    let child = recorded_wire_messages(&bodies[1]);
+    let inherited = 5;
+    for (parent, child) in parent[..inherited].iter().zip(&child[..inherited]) {
+        assert_eq!(parent.get(), child.get());
+    }
+    assert!(
+        child[2]
+            .get()
+            .contains(r#""reasoning_content":"recorded reasoning""#)
+    );
+    assert!(
+        child[inherited]
+            .get()
+            .contains("Report the relevant evidence")
+    );
+    assert!(child[inherited].get().contains("read-only"));
+    #[derive(serde::Deserialize)]
+    struct Tools {
+        tools: Box<serde_json::value::RawValue>,
+    }
+    let tools = |body: &[u8]| serde_json::from_slice::<Tools>(body).unwrap().tools;
+    assert_eq!(tools(&bodies[0]).get(), tools(&bodies[1]).get());
+    let matching_message_bytes: usize = child[..inherited]
+        .iter()
+        .map(|message| message.get().len())
+        .sum();
+    let shared = matching_message_bytes + tools(&bodies[1]).get().len();
+    eprintln!(
+        "Recorded fork share: {shared}/{} request bytes ({:.2}%)",
+        bodies[1].len(),
+        100.0 * shared as f64 / bodies[1].len() as f64
+    );
+    assert_eq!(result.final_message.as_deref(), Some("child report"));
+}
+
+#[test]
+fn the_in_flight_turn_is_not_inherited() {
+    let (bodies, _) = run_recorded_fork(Some("fork"), true, false);
+    let child = std::str::from_utf8(&bodies[1]).unwrap();
+    for marker in ["in-flight", "active-tool", "pending-tool"] {
+        assert!(!child.contains(marker), "child inherited {marker}");
+    }
+}
+
+#[test]
+fn a_fork_childs_role_limits_are_enforced_at_execution() {
+    let (bodies, result) = run_recorded_fork(Some("fork"), true, true);
+    let first: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
+    assert!(
+        first["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "write_file")
+    );
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("disallows tool 'write_file'")
+    );
+    assert_eq!(result.status, RunStatus::Failed);
+}
+
+#[test]
+fn a_fork_child_uses_the_parents_model() {
+    let (bodies, _) = run_recorded_fork(Some("fork"), true, false);
+    let child: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
+    assert_eq!(child["model"], PRO_MODEL);
+    assert_eq!(child["reasoning_effort"], "high");
+}
+
+#[test]
+fn fresh_children_are_unchanged() {
+    for context in [None, Some("fresh")] {
+        let (bodies, _) = run_recorded_fork(context, true, false);
+        let child: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
+        assert_eq!(child["model"], FLASH_MODEL);
+        assert_eq!(child["messages"][0]["role"], "system");
+        assert!(
+            child["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("read-only")
+        );
+        assert_eq!(
+            child["messages"][1]["content"],
+            "Report the relevant evidence."
+        );
+        assert!(
+            !std::str::from_utf8(&bodies[1])
+                .unwrap()
+                .contains("Recorded parent system prompt")
+        );
+    }
+}
+
+#[test]
+fn a_fork_before_any_completed_turn_starts_fresh_with_a_note() {
+    let (bodies, _) = run_recorded_fork(Some("fork"), false, false);
+    let child: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
+    assert_eq!(child["model"], FLASH_MODEL);
+    let prompt = child["messages"][1]["content"].as_str().unwrap();
+    assert!(prompt.contains("no completed parent turn"), "{prompt}");
+    assert!(prompt.contains("Report the relevant evidence"));
+}
+
+#[test]
+fn the_subagent_schema_exposes_fork_with_a_fresh_default() {
+    let registry = orca_tools::registry::default_tool_registry();
+    let context = &registry.get("subagent").unwrap().spec().input_schema["properties"]["context"];
+    assert_eq!(context["enum"], serde_json::json!(["fresh", "fork"]));
+    assert_eq!(context["default"], "fresh");
 }

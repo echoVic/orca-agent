@@ -1,8 +1,8 @@
 use std::io::{self, Write};
 
 use orca_core::conversation::{
-    CapturedProviderMessage, CapturedProviderRequest, Conversation, Message, SummaryState,
-    normalize_tool_boundaries,
+    CapturedProviderMessage, CapturedProviderRequest, Conversation, Message, ProviderForkPrefix,
+    SummaryState, normalize_tool_boundaries,
 };
 use orca_core::model::{ModelRouteContext, ModelSelection, PRO_MODEL, accepts_tool_images};
 use orca_core::subagent_types::SubagentType;
@@ -145,6 +145,16 @@ pub(crate) fn record(
     let Some(messages) = messages.get(..source_messages.len() + summary_count) else {
         return;
     };
+    let fork_cut = if conversation.provider_turn_id().is_some() {
+        let mut normalized = conversation.messages.clone();
+        normalize_tool_boundaries(&mut normalized);
+        conversation
+            .completed_provider_history_end(&normalized)
+            .filter(|cut| *cut <= source_messages.len())
+            .map(|cut| cut + summary_count)
+    } else {
+        None
+    };
     let messages = messages
         .iter()
         .map(|message| {
@@ -165,6 +175,8 @@ pub(crate) fn record(
             reasoning_effort: config.reasoning_effort,
             messages,
             tools: tools.to_vec(),
+            fork_cut,
+            fork_turn_id: conversation.provider_turn_id().map(str::to_owned),
         });
     }
 }
@@ -187,6 +199,11 @@ pub(crate) fn load(
     config: &ProviderConfig,
     model: &str,
 ) -> Option<ReplayPrefix> {
+    // Compaction only summarizes the child's own work. The inherited bytes
+    // are kept in a separate prefix for ordinary child requests.
+    if conversation.fork_prefix.is_some() {
+        return None;
+    }
     let request = conversation.last_provider_request()?;
     if request.model != model
         || request.endpoint != endpoint(config)
@@ -228,5 +245,30 @@ pub(crate) fn load(
             .map(|message| message.estimated_tokens)
             .sum(),
         tools: request.tools.clone(),
+    })
+}
+
+pub(crate) fn fork(conversation: &Conversation) -> Option<ProviderForkPrefix> {
+    let request = conversation.last_provider_request()?;
+    if request.fork_turn_id.as_deref() != conversation.provider_turn_id() {
+        return None;
+    }
+    let captured = request.messages.get(..request.fork_cut?)?;
+    let (mut messages, inherited_tokens) = conversation.fork_prefix.as_ref().map_or_else(
+        || (Vec::new(), 0),
+        |prefix| (prefix.messages.clone(), prefix.estimated_tokens),
+    );
+    messages.extend(captured.iter().map(|message| message.json.get().to_owned()));
+    Some(ProviderForkPrefix {
+        model: request.model.clone(),
+        endpoint: request.endpoint.clone(),
+        reasoning_effort: request.reasoning_effort,
+        messages,
+        tools: request.tools.clone(),
+        estimated_tokens: inherited_tokens
+            + captured
+                .iter()
+                .map(|message| message.estimated_tokens)
+                .sum::<usize>(),
     })
 }

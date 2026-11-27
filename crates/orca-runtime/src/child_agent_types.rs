@@ -219,6 +219,7 @@ pub struct ChildAgentRequest {
     pub tool_policy_label: Option<String>,
     pub(crate) workflow_ipc: Option<WorkflowIpcContext>,
     pub(crate) continuation: Option<ChildAgentContinuationStart>,
+    pub(crate) fork_prefix: Option<std::sync::Arc<orca_core::conversation::ProviderForkPrefix>>,
 }
 
 impl ChildAgentRequest {
@@ -242,6 +243,7 @@ impl ChildAgentRequest {
             tool_policy_label: None,
             workflow_ipc: None,
             continuation: None,
+            fork_prefix: None,
         }
     }
 }

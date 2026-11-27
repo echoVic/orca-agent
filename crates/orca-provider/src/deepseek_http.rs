@@ -251,11 +251,59 @@ struct ChatRequest {
 enum ChatMessages {
     Conversation(Vec<ApiMessage>),
     Replay(Vec<Box<RawValue>>),
+    Fork(ForkMessages),
+}
+
+#[derive(Debug)]
+struct ForkMessages {
+    prefix: Vec<Box<RawValue>>,
+    child: Vec<ApiMessage>,
+}
+
+impl Serialize for ForkMessages {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.prefix.len() + self.child.len()))?;
+        for message in &self.prefix {
+            sequence.serialize_element(message)?;
+        }
+        for message in &self.child {
+            sequence.serialize_element(message)?;
+        }
+        sequence.end()
+    }
+}
+
+fn chat_messages(conversation: &Conversation) -> Result<ChatMessages, serde_json::Error> {
+    let child = conversation_to_api_messages(conversation);
+    let Some(prefix) = &conversation.fork_prefix else {
+        return Ok(ChatMessages::Conversation(child));
+    };
+    let prefix = prefix
+        .messages
+        .iter()
+        .cloned()
+        .map(RawValue::from_string)
+        .collect::<Result<_, _>>()?;
+    Ok(ChatMessages::Fork(ForkMessages { prefix, child }))
 }
 
 /// Associate an ordinary request prepared by the runtime with its live history.
 pub fn bind_replay_source(prepared: &mut Conversation, source: &Conversation) {
     replay_prefix::bind(prepared, source);
+}
+
+pub fn captured_fork_prefix(
+    conversation: &Conversation,
+) -> Option<orca_core::conversation::ProviderForkPrefix> {
+    replay_prefix::fork(conversation)
+}
+
+pub fn fork_prefix_matches_endpoint(
+    prefix: &orca_core::conversation::ProviderForkPrefix,
+    base_url: Option<&str>,
+) -> bool {
+    prefix.endpoint == base_url.unwrap_or(DEFAULT_BASE_URL).trim_end_matches('/')
 }
 
 #[derive(Debug, Serialize)]
@@ -273,8 +321,10 @@ impl Default for ThinkingConfig {
 }
 
 fn add_empty_response_recovery_instruction(request: &mut ChatRequest) -> Option<usize> {
-    let ChatMessages::Conversation(messages) = &mut request.messages else {
-        return None;
+    let messages = match &mut request.messages {
+        ChatMessages::Conversation(messages) => messages,
+        ChatMessages::Fork(messages) => &mut messages.child,
+        ChatMessages::Replay(_) => return None,
     };
     // Look past the trailing internal-context overlay to the prompt itself.
     if let Some((index, last)) = messages
@@ -790,8 +840,9 @@ async fn request_chat_streaming_with_budget(
     };
     let interactive = ordinary.is_some();
     let definitions = config.tools_override.as_deref().unwrap_or_default();
-    let mut strict_applied =
-        interactive && deepseek_strict_tools_schema_for_endpoint(definitions, base_url).is_some();
+    let mut strict_applied = ordinary
+        .is_some_and(|conversation| conversation.fork_prefix.is_none())
+        && deepseek_strict_tools_schema_for_endpoint(definitions, base_url).is_some();
     let accept_truncated_partial = matches!(
         request,
         StreamingRequest::Auxiliary {
@@ -802,8 +853,8 @@ async fn request_chat_streaming_with_budget(
     let auxiliary = matches!(request, StreamingRequest::Auxiliary { .. });
     let (messages, tools, max_tokens) = match request {
         StreamingRequest::Turn(conversation) => (
-            ChatMessages::Conversation(conversation_to_api_messages(conversation)),
-            deepseek_primary_request_tools(config),
+            chat_messages(conversation).map_err(|error| error.to_string())?,
+            deepseek_conversation_tools(conversation, config),
             chat_max_tokens(config),
         ),
         StreamingRequest::Auxiliary {
@@ -1062,7 +1113,12 @@ fn record_replay_source(
     request: &ChatRequest,
     recovery_edit: Option<usize>,
 ) {
-    if let ChatMessages::Conversation(messages) = &request.messages {
+    let messages = match &request.messages {
+        ChatMessages::Conversation(messages) => Some(messages),
+        ChatMessages::Fork(messages) => Some(&messages.child),
+        ChatMessages::Replay(_) => None,
+    };
+    if let Some(messages) = messages {
         replay_prefix::record(
             conversation,
             config,
@@ -1098,16 +1154,16 @@ fn request_chat(
     let model = replay_prefix::model(config);
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-    let messages = conversation_to_api_messages(conversation);
+    let messages = chat_messages(conversation).map_err(|error| error.to_string())?;
     let definitions = config.tools_override.as_deref().unwrap_or(&[]);
     let tools = cap_tools_for_deepseek(deepseek_tools_schema(definitions));
-    let mut strict_applied =
-        deepseek_strict_tools_schema_for_endpoint(definitions, base_url).is_some();
-    let primary_tools = deepseek_primary_request_tools(config);
+    let mut strict_applied = conversation.fork_prefix.is_none()
+        && deepseek_strict_tools_schema_for_endpoint(definitions, base_url).is_some();
+    let primary_tools = deepseek_conversation_tools(conversation, config);
 
     let mut request = ChatRequest {
         model,
-        messages: ChatMessages::Conversation(messages),
+        messages,
         thinking: ThinkingConfig::default(),
         stream: false,
         stream_options: None,
@@ -1295,6 +1351,16 @@ pub(crate) fn deepseek_primary_request_tools(config: &ProviderConfig) -> Vec<Val
     deepseek_strict_tools_schema_for_endpoint(definitions, base_url)
         .map(cap_tools_for_deepseek)
         .unwrap_or_else(|| deepseek_plain_request_tools(config))
+}
+
+pub(crate) fn deepseek_conversation_tools(
+    conversation: &Conversation,
+    config: &ProviderConfig,
+) -> Vec<Value> {
+    conversation.fork_prefix.as_ref().map_or_else(
+        || deepseek_primary_request_tools(config),
+        |prefix| prefix.tools.clone(),
+    )
 }
 
 pub(crate) fn deepseek_plain_request_tools(config: &ProviderConfig) -> Vec<Value> {

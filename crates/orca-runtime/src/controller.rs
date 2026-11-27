@@ -7022,6 +7022,7 @@ while IFS= read -r line; do
         let mut runtime = RuntimeToolActorContext::new(events.run_id().to_string());
         let result = RuntimeToolRouter::new(&mut runtime)
             .dispatch(RuntimeToolInvocationContext {
+                parent_conversation: None,
                 config: &config,
                 cwd: cwd.path(),
                 events: &mut events,
@@ -7099,6 +7100,7 @@ while IFS= read -r line; do
             let mut event_error = None;
             let result = RuntimeToolRouter::with_tool_call_runtime(&mut runtime, tool_calls)
                 .dispatch(RuntimeToolInvocationContext {
+                    parent_conversation: None,
                     config: &config,
                     cwd: cwd.path(),
                     events: &mut events,
