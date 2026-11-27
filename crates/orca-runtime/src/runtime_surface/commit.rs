@@ -6447,14 +6447,19 @@ fn actor_control_subagent_activity_authorized(
             owner,
             ..
         }) => {
-            if !matches!(&subagent_event.scope, SurfaceScope::Thread) {
-                return false;
-            }
+            let expected_generation = match (&subagent_event.scope, &subagent_event.event) {
+                (SurfaceScope::Thread, _) => None,
+                (
+                    SurfaceScope::Generation { fence },
+                    super::SurfaceEvent::Subagent(super::SubagentPatch::Settled { .. }),
+                ) => Some(fence),
+                _ => return false,
+            };
             (
                 subagent_id,
                 owner,
                 None,
-                None,
+                expected_generation,
                 Some(*expected_revision),
                 Some(*next_revision),
             )
@@ -6606,7 +6611,22 @@ fn actor_control_subagent_activity_authorized(
     match (owner, expected_generation) {
         (super::SurfaceSubagentOwner::Generation { fence: owner }, Some(scope_fence)) => {
             let Some(source) = source else {
-                return false;
+                return matches!(
+                    task_event.event,
+                    super::SurfaceEvent::Task(super::TaskPatch::StatusChanged { .. })
+                ) && task.task_type == super::SurfaceTaskType::Subagent
+                    && task.subagent_id.as_ref() == Some(subagent_id)
+                    && task.parent_operation.as_ref() == Some(&owner.operation_id)
+                    && snapshot.subagents.iter().any(|current| {
+                        current.subagent_id == *subagent_id && current.task_id == *task_id
+                    })
+                    && stopped_generation_admits_subagent_end(
+                        snapshot,
+                        &subagent_event.event,
+                        subagent_id,
+                        owner,
+                        scope_fence,
+                    );
             };
             operation_fence_is_known(snapshot, scope_fence)
                 && (matches!(
@@ -6735,7 +6755,9 @@ fn stopped_generation_admits_subagent_end(
 ) -> bool {
     matches!(
         event,
-        super::SurfaceEvent::Subagent(super::SubagentPatch::Completed { .. })
+        super::SurfaceEvent::Subagent(
+            super::SubagentPatch::Completed { .. } | super::SubagentPatch::Settled { .. }
+        )
     ) && owner == scope_fence
         && scope_fence.thread_id == snapshot.thread.thread_id
         && generation_phase(snapshot, scope_fence) == Some(super::GenerationPhase::Stopped)

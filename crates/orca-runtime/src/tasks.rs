@@ -4778,22 +4778,9 @@ impl TaskRegistry {
     /// on an approval, and for an unknown task. Persistent registries are
     /// refreshed so a detached worker's own settlement is observed.
     pub(crate) fn settled_subagent_record(&self, id: &str) -> Result<Option<TaskRecord>, String> {
-        let record = if self.persistence.is_some() {
-            self.refresh_task_from_persistence(id)?
-        } else {
-            self.get(id)
-        };
-        Ok(record.filter(|record| {
-            record.task_type == TaskType::Subagent
-                && matches!(
-                    record.status,
-                    TaskStatus::Completed
-                        | TaskStatus::Failed
-                        | TaskStatus::Blocked
-                        | TaskStatus::Cancelled
-                        | TaskStatus::Stopped
-                )
-        }))
+        Ok(self
+            .refresh_task_from_persistence(id)?
+            .filter(TaskRecord::is_settled_subagent))
     }
 
     pub fn get(&self, id: &str) -> Option<TaskRecord> {
@@ -6074,6 +6061,9 @@ impl TaskRegistry {
         &self,
         id: &str,
     ) -> Result<Option<TaskRecord>, String> {
+        if let Some(error) = self.persistent_open_error.as_deref() {
+            return Err(format!("persistent task registry is unavailable: {error}"));
+        }
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(self.get(id));
         };
@@ -6759,11 +6749,23 @@ impl PersistedTaskRecord {
 }
 
 impl TaskRecord {
+    pub(crate) fn is_settled_subagent(&self) -> bool {
+        self.task_type == TaskType::Subagent
+            && matches!(
+                self.status,
+                TaskStatus::Completed
+                    | TaskStatus::Failed
+                    | TaskStatus::Blocked
+                    | TaskStatus::Cancelled
+                    | TaskStatus::Stopped
+            )
+    }
+
     fn from_persisted(record: PersistedTaskRecord) -> (Self, bool) {
         record.into_task_record()
     }
 
-    fn continuation_projection(&self) -> Option<TaskContinuationProjection> {
+    pub(crate) fn continuation_projection(&self) -> Option<TaskContinuationProjection> {
         Some(TaskContinuationProjection {
             continuation_id: self.continuation_id.clone()?,
             attempt_id: self.continuation_attempt_id.clone()?,
@@ -11167,6 +11169,15 @@ while :; do :; done
                 .is_none(),
             "a child parked on an approval has not settled"
         );
+        let mut unavailable = TaskRegistry::new("unavailable".into());
+        assert!(
+            unavailable
+                .refresh_task_from_persistence("absent")
+                .unwrap()
+                .is_none()
+        );
+        unavailable.persistent_open_error = Some(Arc::from("failed to open"));
+        assert!(unavailable.refresh_task_from_persistence("absent").is_err());
     }
 
     #[test]
