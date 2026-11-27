@@ -32,7 +32,7 @@ pub(crate) struct RendererRuntimeEventOwner {
     mention_search: MentionSearchManager,
     pending_initial_prompt: Option<String>,
     local_shell_readiness: bool,
-    pub(crate) finished_tx: Option<mpsc::Sender<crate::hosted_child::FinishedTask>>,
+    finished_tx: Option<mpsc::Sender<crate::hosted_child::FinishedTask>>,
     /// The MCP servers in view when the mention catalog last looked at
     /// them.
     mcp_servers_seen: Vec<McpServerView>,
@@ -55,6 +55,13 @@ impl RendererRuntimeEventOwner {
     pub(crate) fn with_local_shell_readiness(mut self, enabled: bool) -> Self {
         self.local_shell_readiness = enabled;
         self
+    }
+
+    pub(crate) fn connect_finished_view(
+        &mut self,
+        runtime: &crate::agent_runtime::TuiAgentRuntime,
+    ) {
+        self.finished_tx = runtime.finished_sender();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -301,7 +308,7 @@ impl RendererRuntimeEventOwner {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     use crossbeam_channel as mpsc;
@@ -790,6 +797,18 @@ mod tests {
         vim_state: VimState,
         textarea: TextArea<'static>,
         presentation: TerminalPresentation,
+    }
+
+    pub(crate) fn deliver_to_hosted_view(
+        runtime: &crate::agent_runtime::TuiAgentRuntime,
+        state: &mut AppState,
+        event: TuiEvent,
+    ) {
+        let mut tui = ResumingTui::waiting_for_history(None);
+        tui.owner.connect_finished_view(runtime);
+        std::mem::swap(&mut tui.state, state);
+        tui.receive(event);
+        std::mem::swap(&mut tui.state, state);
     }
 
     impl ResumingTui {

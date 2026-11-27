@@ -625,7 +625,7 @@ pub(crate) struct FinishedTask {
     bound_thread_id: String,
 }
 
-fn ended(status: orca_core::task_types::TaskStatus) -> bool {
+pub(crate) fn ended(status: orca_core::task_types::TaskStatus) -> bool {
     use orca_core::task_types::TaskStatus::*;
     matches!(status, Completed | Failed | Cancelled | Stopped | Blocked)
 }
@@ -884,6 +884,10 @@ fn focus_child(
             }
         };
 
+    #[cfg(test)]
+    if let Some(before_reset) = BEFORE_CHILD_RESET.take() {
+        before_reset(&child_bridge);
+    }
     AttachmentRouting::switch_attachment(
         attachment_routing,
         root_event_tx,
@@ -952,14 +956,32 @@ fn focus_child(
     for interaction in child_interactions {
         let _ = send_attached_event(root_event_tx, child_attachment, interaction);
     }
-    if let Some((_, bridge)) = focus.as_ref().and_then(|focus| focus.interactive.as_ref()) {
+    if let Some(current) = focus.as_ref()
+        && let Some((_, bridge)) = &current.interactive
+    {
         bridge.start();
+        if let Ok(parent) = read_parent_snapshot(&current.parent_thread)
+            && finished_revision(&parent, &current.task_id).is_some()
+        {
+            let _ = send_attached_event(
+                root_event_tx,
+                current.child_attachment,
+                TuiEvent::BackgroundTasksUpdated(
+                    crate::surface_projection::workflow_task_summaries(&parent),
+                ),
+            );
+        }
     }
 }
 
 const READ_ONLY: &str = "This agent has finished. Its conversation is read-only.";
 const CHECKPOINT: &str =
     "This agent's conversation could not be loaded. Showing its last checkpoint.";
+
+#[cfg(test)]
+type BeforeChildReset = Box<dyn FnOnce(&HostedChildEventBridge)>;
+#[cfg(test)]
+thread_local! { static BEFORE_CHILD_RESET: std::cell::Cell<Option<BeforeChildReset>> = const { std::cell::Cell::new(None) }; }
 
 fn finished_revision(parent: &SurfaceSnapshot, task_id: &str) -> Option<u64> {
     parent
@@ -981,27 +1003,36 @@ fn show_finished_child(
     root: &mpsc::Sender<TuiEvent>,
     control: &TuiSurfaceTaskControl,
 ) {
-    let (projection, mut conversation) = live
-        .and_then(|child| {
-            let snapshot = read_parent_snapshot(child).ok()?;
-            let (projection, conversation) = hosted_projection_batch_from_snapshot(
-                child,
-                &snapshot,
-                HistoryTarget::Conversation,
-            );
-            Some((Some(Box::new(projection)), conversation))
-        })
-        .unwrap_or_else(|| {
-            (
-                None,
-                saved_or_checkpoint(
-                    &focus.parent_thread,
-                    &focus.task_id,
-                    revision,
-                    &focus.bound_thread_id,
-                ),
-            )
-        });
+    let live_view = live.and_then(|child| {
+        let snapshot = read_parent_snapshot(child).ok()?;
+        let (projection, conversation) =
+            hosted_projection_batch_from_snapshot(child, &snapshot, HistoryTarget::Conversation);
+        Some((Some(Box::new(projection)), conversation))
+    });
+    let (projection, mut conversation) = match live_view {
+        Some(view)
+            if sole_task_binding(&focus.parent_thread, &focus.task_id, &focus.bound_thread_id) =>
+        {
+            view
+        }
+        Some(_) => (
+            None,
+            checkpoint_conversation(task_checkpoint(
+                &focus.parent_thread,
+                &focus.task_id,
+                revision,
+            )),
+        ),
+        None => (
+            None,
+            saved_or_checkpoint(
+                &focus.parent_thread,
+                &focus.task_id,
+                revision,
+                &focus.bound_thread_id,
+            ),
+        ),
+    };
     conversation
         .messages
         .push(crate::transcript_state::ChatMessage::System {
@@ -1049,21 +1080,50 @@ fn saved_or_checkpoint(
     revision: u64,
     child_id: &str,
 ) -> HostedConversation {
-    let saved = crate::hosted_session::load_saved_history_fallback(child_id).ok();
+    let saved = crate::hosted_session::load_saved_history_fallback(child_id)
+        .ok()
+        .filter(|_| sole_task_binding(parent, task_id, child_id));
     cold_conversation(parent.thread_id(), child_id, saved, || {
-        let request = crate::protocol::TaskTranscriptRequest {
-            task_id: task_id.to_string(),
-            expected_revision: revision,
-        };
-        match crate::surface_client::read_task_transcript(&parent.typed_surface(), &request) {
-            crate::protocol::TaskTranscriptResult::Found(record)
-                if record.task_id.as_str() == task_id && record.checkpoint_revision != 0 =>
-            {
-                record.items
-            }
-            _ => Vec::new(),
-        }
+        task_checkpoint(parent, task_id, revision)
     })
+}
+
+fn sole_task_binding(parent: &RuntimeThreadHandle, task_id: &str, child_id: &str) -> bool {
+    let registry = parent.task_registry();
+    if registry.session_id() != parent.thread_id()
+        || !registry
+            .execution_scope(&Default::default())
+            .capacity()
+            .available
+    {
+        return false;
+    }
+    !registry
+        .list()
+        .iter()
+        .any(|row| row.id != task_id && row.subagent_child_thread_id.as_deref() == Some(child_id))
+        && registry
+            .summary(task_id)
+            .is_some_and(|row| row.subagent_child_thread_id.as_deref() == Some(child_id))
+}
+
+fn task_checkpoint(
+    parent: &RuntimeThreadHandle,
+    task_id: &str,
+    revision: u64,
+) -> Vec<orca_runtime::surface::TaskTranscriptItem> {
+    let request = crate::protocol::TaskTranscriptRequest {
+        task_id: task_id.to_string(),
+        expected_revision: revision,
+    };
+    match crate::surface_client::read_task_transcript(&parent.typed_surface(), &request) {
+        crate::protocol::TaskTranscriptResult::Found(record)
+            if record.task_id.as_str() == task_id && record.checkpoint_revision != 0 =>
+        {
+            record.items
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn cold_conversation(
@@ -1086,27 +1146,46 @@ fn cold_conversation(
             agent_lines: Default::default(),
         };
     }
+    checkpoint_conversation(checkpoint())
+}
+
+fn checkpoint_conversation(
+    items: Vec<orca_runtime::surface::TaskTranscriptItem>,
+) -> HostedConversation {
     use crate::transcript_state::ChatMessage;
-    use orca_runtime::surface::TaskTranscriptItem;
+    use orca_core::tool_types::ToolStatus;
+    use orca_runtime::surface::{TaskTranscriptItem, TaskTranscriptToolStatus};
     let mut messages = vec![ChatMessage::System {
         text: CHECKPOINT.to_owned(),
         expanded: false,
     }];
-    for item in checkpoint() {
+    for item in items {
         let row = match item {
             TaskTranscriptItem::User { content } => ChatMessage::User(content.as_str().to_owned()),
             TaskTranscriptItem::Assistant { content } => {
                 ChatMessage::Assistant(content.as_str().to_owned())
             }
-            TaskTranscriptItem::ToolCall { id, name } => {
-                checkpoint_tool(id.as_str(), name.as_str(), "checkpoint".into(), None)
-            }
+            TaskTranscriptItem::ToolCall { id, name } => checkpoint_tool(
+                id.as_str(),
+                name.as_str(),
+                ToolStatus::Running.as_str().into(),
+                None,
+            ),
             TaskTranscriptItem::ToolResult {
                 id,
                 content,
                 status,
             } => {
-                let status = format!("{status:?}").to_ascii_lowercase();
+                let status = match status {
+                    TaskTranscriptToolStatus::Completed => ToolStatus::Completed,
+                    TaskTranscriptToolStatus::Failed => ToolStatus::Failed,
+                    TaskTranscriptToolStatus::Denied => ToolStatus::Denied,
+                    TaskTranscriptToolStatus::NotImplemented => ToolStatus::NotImplemented,
+                    TaskTranscriptToolStatus::Cancelled => ToolStatus::Cancelled,
+                    TaskTranscriptToolStatus::Indeterminate => ToolStatus::Indeterminate,
+                }
+                .as_str()
+                .to_owned();
                 let output = Some(content.as_str().to_owned());
                 let call = messages.iter_mut().rev().find(|message| {
                     matches!(message, ChatMessage::ToolCall { id: call, .. } if call == id.as_str())
@@ -4150,13 +4229,18 @@ pub(crate) mod tests {
                 event_tx,
             )
             .expect("the child's turn");
-        assert!(
-            matches!(
-                &outcome,
-                crate::hosted_runtime::TuiHostedOperationOutcome::Turn { status }
-                    if status == "success"
-            ),
-            "the child's turn succeeds"
+        let crate::hosted_runtime::TuiHostedOperationOutcome::Turn { status } = outcome else {
+            panic!("expected a turn")
+        };
+        assert_eq!(
+            status,
+            "success",
+            "child turn: {prompt}; terminal: {:?}",
+            super::read_parent_snapshot(thread)
+                .unwrap()
+                .operation_history
+                .last()
+                .and_then(|op| op.terminal.as_ref())
         );
     }
 
@@ -4294,6 +4378,288 @@ pub(crate) mod tests {
         let row = agent_row(&parent);
         assert_eq!(row.status, TaskStatus::Completed);
         (parent, row)
+    }
+
+    #[test]
+    fn a_real_continuation_vetoes_the_original_tasks_live_and_saved_thread() {
+        let (parent, original) = finished_nested();
+        let child_id = original.subagent_child_thread_id.as_deref().unwrap();
+        let child = parent.host.handle().resolve_live_thread(child_id).unwrap();
+        let prompt = "second task on the same kept thread";
+        let (sender, _events) = crossbeam_channel::unbounded();
+        run_child_turn(&child, parent.config.clone(), prompt, &sender);
+        let later = parent
+            .thread
+            .task_registry()
+            .list()
+            .into_iter()
+            .find(|task| {
+                task.id != original.id && task.subagent_child_thread_id.as_deref() == Some(child_id)
+            })
+            .expect("the real continuation admits another task on the same thread");
+        assert_eq!(later.status, TaskStatus::Completed);
+        let saved = crate::hosted_session::load_saved_history_fallback(child_id).unwrap();
+        assert!(
+            saved
+                .messages
+                .iter()
+                .any(|message| format!("{message:?}").contains(prompt))
+        );
+        let live = super::read_parent_snapshot(&parent.thread).unwrap();
+        let live_binding =
+            super::child_binding(&live, &later.id, 1).map(|binding| binding.child_thread_id);
+        let mut visit = AgentVisit::new(&parent);
+        visit.open(&original);
+        let original_shows_later = visit.state.transcript.messages.iter().any(|message| matches!(message, crate::transcript_state::ChatMessage::User(text) if text == prompt));
+        let ChildThread {
+            thread,
+            host,
+            mut config,
+            home,
+        } = parent;
+        config.history_mode = orca_core::config::HistoryMode::Resume(thread.thread_id().into());
+        thread.shutdown().unwrap();
+        host.shutdown().unwrap();
+        let host = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let thread = host.start_thread(config.clone(), "resumed main").unwrap();
+        let resumed = super::read_parent_snapshot(&thread).unwrap();
+        let cold_binding =
+            super::child_binding(&resumed, &later.id, 1).map(|binding| binding.child_thread_id);
+        let cold_registry = thread.task_registry().get(&later.id).unwrap();
+        assert_eq!(
+            cold_registry.subagent_child_thread_id.as_deref(),
+            Some(child_id)
+        );
+        let resumed_parent = ChildThread {
+            thread,
+            host,
+            config,
+            home,
+        };
+        let mut cold_visit = AgentVisit::new(&resumed_parent);
+        cold_visit.open(&original);
+        let cold_shows_later = cold_visit.state.transcript.messages.iter().any(|message| matches!(message, crate::transcript_state::ChatMessage::User(text) if text == prompt));
+        resumed_parent.shutdown();
+        // Follow-up: publish the continuation's own row, binding and lifecycle in main.
+        assert!(live_binding.is_err() && cold_binding.is_err());
+        for snapshot in [live, resumed] {
+            assert!(
+                !snapshot
+                    .tasks
+                    .iter()
+                    .any(|row| row.task_id.as_str() == later.id)
+            );
+        }
+        assert!(
+            !original_shows_later && !cold_shows_later,
+            "A showed B: live={original_shows_later}, saved={cold_shows_later}"
+        );
+        for state in [visit.state, cold_visit.state] {
+            assert_only_checkpoint(&state);
+        }
+    }
+
+    fn assert_only_checkpoint(state: &AppState) {
+        use crate::transcript_state::ChatMessage;
+        assert!(
+            matches!(&state.transcript.messages[..], [ChatMessage::System{text:first,..}, ChatMessage::System{text:last,..}] if first==super::CHECKPOINT && last==super::READ_ONLY),
+            "{:?}",
+            state.transcript.messages
+        );
+    }
+
+    #[test]
+    fn nested_agent_enter_and_click_stay_in_the_childs_panel() {
+        use crate::agent_workspace_actions::{handle_agent_workspace_key, open_agent_task};
+        let (parent, row) = finished_nested();
+        for status in [TaskStatus::Completed, TaskStatus::Running] {
+            for by_click in [false, true] {
+                let mut visit = AgentVisit::new(&parent);
+                visit.open(&row);
+                let mut child = visit.state.focused_workflow_tasks.clone();
+                let nested = child
+                    .iter_mut()
+                    .find(|task| {
+                        task.task_type == TaskType::Subagent
+                            && task.subagent_child_thread_id.is_some()
+                    })
+                    .unwrap();
+                nested.status = status;
+                let id = nested.id.clone();
+                let mut projection = SurfaceProjectionState::from_surface_snapshot(
+                    &super::read_parent_snapshot(
+                        &parent
+                            .host
+                            .handle()
+                            .resolve_live_thread(row.subagent_child_thread_id.as_ref().unwrap())
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                );
+                projection.workflow_tasks = child;
+                visit
+                    .state
+                    .update(super::TuiEvent::SurfaceProjectionSynced(Box::new(
+                        projection,
+                    )));
+                visit.state.show_agents();
+                visit.state.select_agent_workspace_task(&id);
+                let frame = crate::test_support::frame_string(&mut visit.state, 120, 40);
+                assert!(
+                    frame.contains("Enter transcript")
+                        && !frame.contains("Enter open conversation"),
+                    "{frame}"
+                );
+                let (actions, source) = crossbeam_channel::unbounded();
+                if by_click {
+                    let hit = visit
+                        .state
+                        .agent_hit_areas
+                        .iter()
+                        .find(|hit| {
+                            hit.target
+                                == crate::agent_workspace::AgentHitTarget::WorkspaceRow(
+                                    visit.state.agent_selected_index(),
+                                )
+                        })
+                        .unwrap();
+                    let event = crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+                        kind: crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        ),
+                        column: hit.rect.x + 2,
+                        row: hit.rect.y,
+                        modifiers: crossterm::event::KeyModifiers::NONE,
+                    });
+                    let crate::input_event_actions::MouseFlow::OpenAgent(selected) =
+                        crate::input_event_actions::handle_mouse_event(
+                            &event,
+                            &mut visit.state,
+                            &mut Default::default(),
+                            std::time::Instant::now(),
+                        )
+                    else {
+                        panic!("click the nested row")
+                    };
+                    assert!(open_agent_task(&mut visit.state, &actions, &selected));
+                } else {
+                    assert!(handle_agent_workspace_key(
+                        crossterm::event::KeyCode::Enter,
+                        &mut visit.state,
+                        &actions
+                    ));
+                }
+                assert!(
+                    matches!(source.try_recv(),Ok(crate::protocol::UserAction::ReadTaskTranscript(request)) if request.task_id==id)
+                );
+                assert!(source.is_empty());
+                assert_eq!(visit.state.panel_mode, crate::types::PanelMode::Agents);
+                assert_eq!(
+                    visit.state.conversation_target().task_id(),
+                    Some(row.id.as_str())
+                );
+                assert!(
+                    !crate::test_support::frame_string(&mut visit.state, 120, 40)
+                        .contains("no longer present")
+                );
+            }
+        }
+        parent.shutdown();
+    }
+
+    #[test]
+    fn an_unreadable_registry_vetoes_even_a_cached_single_binding() {
+        let (parent, row) = finished_nested();
+        let path = parent
+            .home
+            .path()
+            .join("task-sessions")
+            .join(parent.thread.thread_id())
+            .join("tasks.json");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"not a registry").unwrap();
+        let mut visit = AgentVisit::new(&parent);
+        visit.open(&row);
+        std::fs::write(path, original).unwrap();
+        parent.shutdown();
+        assert_only_checkpoint(&visit.state);
+    }
+
+    #[test]
+    fn a_revision_zero_session_surrogate_is_not_a_task_checkpoint() {
+        use crate::transcript_state::ChatMessage;
+        let (parent, row) = finished_nested();
+        let revision = row.publication_revision.unwrap();
+        let request = crate::protocol::TaskTranscriptRequest {
+            task_id: row.id.clone(),
+            expected_revision: revision,
+        };
+        let answer =
+            crate::surface_client::read_task_transcript(&parent.thread.typed_surface(), &request);
+        assert!(
+            matches!(answer, crate::protocol::TaskTranscriptResult::Found(record) if record.checkpoint_revision == 0 && !record.items.is_empty())
+        );
+        let mut visit = AgentVisit::new(&parent);
+        visit.open(&row);
+        let mut focus = visit.view.close().unwrap();
+        focus.bound_thread_id = uuid::Uuid::new_v4().to_string();
+        let snapshot = super::read_parent_snapshot(&parent.thread).unwrap();
+        for expected in [revision, revision + 1] {
+            let candidate = super::saved_or_checkpoint(
+                &parent.thread,
+                &row.id,
+                expected,
+                &focus.bound_thread_id,
+            );
+            assert!(
+                matches!(&candidate.messages[..],[ChatMessage::System{text,..}] if text==super::CHECKPOINT)
+            );
+            let (root, events) = crossbeam_channel::unbounded();
+            let routing = super::Arc::new(super::Mutex::new(super::AttachmentRouting::new(
+                focus.parent_attachment,
+            )));
+            super::show_finished_child(
+                &mut focus,
+                &snapshot,
+                expected,
+                None,
+                &routing,
+                &root,
+                &visit.control,
+            );
+            visit.events = events;
+            visit.apply();
+            assert_only_checkpoint(&visit.state);
+        }
+        parent.shutdown();
+    }
+
+    #[test]
+    fn checkpoint_tool_rows_use_the_live_status_vocabulary() {
+        use crate::transcript_state::ChatMessage;
+        use orca_runtime::surface::{
+            SurfaceHistoryId, TaskTranscriptItem, TaskTranscriptToolStatus,
+        };
+        let call = |id| TaskTranscriptItem::ToolCall {
+            id: SurfaceHistoryId::try_new(id).unwrap(),
+            name: NonEmptyText::try_new("read").unwrap(),
+        };
+        let messages = super::cold_conversation("parent", "child", None, || {
+            vec![
+                call("one"),
+                TaskTranscriptItem::ToolResult {
+                    id: SurfaceHistoryId::try_new("one").unwrap(),
+                    content: DisplayText::new("unavailable"),
+                    status: TaskTranscriptToolStatus::NotImplemented,
+                },
+                call("two"),
+            ]
+        })
+        .messages;
+        assert!(
+            matches!(&messages[..],[_,ChatMessage::ToolCall{status:done,..},ChatMessage::ToolCall{status:pending,..}] if done==orca_core::tool_types::ToolStatus::NotImplemented.as_str() && pending=="running"),
+            "{messages:?}"
+        );
     }
 
     #[test]
@@ -4518,7 +4884,52 @@ pub(crate) mod tests {
             }
         };
         let mut visit = AgentVisit::new(&parent);
-        visit.open(&row);
+        let (captured, attachment_rx) = crossbeam_channel::bounded(1);
+        let thread = parent.thread.clone();
+        let id = row.id.clone();
+        super::BEFORE_CHILD_RESET.set(Some(Box::new(move |bridge| {
+            captured
+                .send((bridge.surface.clone(), bridge.client.clone()))
+                .unwrap();
+            std::fs::write(marker, b"").unwrap();
+            worker.join().unwrap();
+            let deadline = std::time::Instant::now() + super::Duration::from_secs(10);
+            while super::finished_revision(&super::read_parent_snapshot(&thread).unwrap(), &id)
+                .is_none()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "main never published the task's end"
+                );
+                std::thread::sleep(super::Duration::from_millis(10));
+            }
+        })));
+        visit.view.handle(
+            super::HostedChildAction::Focus {
+                task_id: row.id.clone(),
+                expected_revision: row.publication_revision.unwrap(),
+            },
+            &visit.control,
+        );
+        let (old_surface, old_client) = attachment_rx.try_recv().unwrap();
+        let (actions, source) = crossbeam_channel::unbounded();
+        let mut runtime = crate::agent_runtime::TuiAgentRuntime::spawn_hosted(
+            source,
+            visit.view.main_sender(),
+            4,
+            visit.control.clone(),
+            |_, _, _| {},
+        )
+        .unwrap();
+        let mut end_event = None;
+        for event in visit.events.try_iter() {
+            if matches!(&event,super::TuiEvent::Attached(attached) if matches!(attached.event,super::TuiEvent::BackgroundTasksUpdated(_)))
+            {
+                end_event = Some(event);
+            } else if let Ok(Some(payload)) = accept_attached_tui_event(&mut visit.state, event) {
+                visit.state.update(payload);
+            }
+        }
         let mut operating = Some(parent.thread.clone());
         let mut sender = visit.view.main_sender();
         let mut attachment = SessionAttachmentId::new(1);
@@ -4529,21 +4940,8 @@ pub(crate) mod tests {
             crate::hosted_view::Adoption::Child
         );
         let old = attachment;
-        std::fs::write(&marker, b"").unwrap();
-        worker.join().unwrap();
-        let deadline = std::time::Instant::now() + super::Duration::from_secs(10);
-        let ended = loop {
-            let row = agent_row(&parent);
-            if row.status == TaskStatus::Completed {
-                break row;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "main did not publish the agent's end: {:?}",
-                row.status
-            );
-            std::thread::sleep(super::Duration::from_millis(10));
-        };
+        let ended = agent_row(&parent);
+        assert_eq!(ended.status, TaskStatus::Completed);
         let notice = || super::FinishedTask {
             attachment: old,
             task_id: row.id.clone(),
@@ -4567,16 +4965,37 @@ pub(crate) mod tests {
                 Some(crate::hosted_view::OutOfStep::AgentOnScreen)
             );
         }
-        let end =
-            super::FinishedTask::for_view(&visit.state, std::slice::from_ref(&ended)).unwrap();
-        visit
-            .view
-            .handle(super::HostedChildAction::Finished(end), &visit.control);
+        crate::renderer_runtime::tests::deliver_to_hosted_view(&runtime,&mut visit.state,end_event.expect("an end committed during open is delivered after reset without another main publication"));
+        while !matches!(visit.state.transcript.messages.last(),Some(crate::transcript_state::ChatMessage::System{text,..}) if text==super::READ_ONLY)
+        {
+            let event = visit
+                .events
+                .recv_timeout(super::Duration::from_secs(5))
+                .expect("renderer and dispatcher install the finished view");
+            if let Ok(Some(payload)) = accept_attached_tui_event(&mut visit.state, event) {
+                visit.state.update(payload);
+            }
+        }
         visit.apply();
         visit.assert_finished("Main is idle · Esc return");
-        visit
-            .view
-            .handle(super::HostedChildAction::Finished(notice()), &visit.control);
+        let current = visit.state.active_session_attachment.unwrap();
+        visit.view.handle(
+            super::HostedChildAction::Finished(super::FinishedTask {
+                attachment: current,
+                ..notice()
+            }),
+            &visit.control,
+        );
+        assert!(!visit.control.has_focused_child_surface());
+        assert!(matches!(
+            old_surface.detach(
+                &old_client,
+                orca_runtime::surface::DetachRequest {
+                    request_id: super::SurfaceRequestId::new()
+                }
+            ),
+            orca_runtime::surface::DetachResult::AlreadyDetached { .. }
+        ));
         assert!(super::FinishedTask::for_view(&visit.state, &[ended]).is_none());
         assert!(visit.events.is_empty());
         assert_eq!(
@@ -4587,6 +5006,8 @@ pub(crate) mod tests {
         );
         assert_eq!(operating.unwrap().thread_id(), parent.thread.thread_id());
         assert_ne!(visit.state.active_session_attachment, Some(old));
+        runtime.shutdown().unwrap();
+        drop(actions);
         parent.shutdown();
     }
 

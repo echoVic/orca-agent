@@ -40,7 +40,6 @@ use crate::protocol::{
 };
 use crate::slash_command_actions::decode_settings_intent;
 use crate::submitted_turn::SubmittedTurn;
-use crate::surface_projection::SurfaceProjectionState;
 
 const IDLE_SURFACE_PROJECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -53,17 +52,13 @@ fn poll_idle_surface_projection(
         *last_cursor = None;
         return;
     };
-    let actions = crate::surface_actions::TuiSurfaceActions::new(thread.typed_surface());
-    let Ok(snapshot) = actions.read_snapshot() else {
+    let Ok(Some(projection)) =
+        crate::surface_client::changed_projection(&thread.typed_surface(), last_cursor.as_ref())
+    else {
         return;
     };
-    if last_cursor.as_ref() == Some(&snapshot.cursor) {
-        return;
-    }
-    *last_cursor = Some(snapshot.cursor.clone());
-    let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(
-        SurfaceProjectionState::from_surface_snapshot(&snapshot),
-    )));
+    *last_cursor = Some(projection.cursor.clone());
+    let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
 }
 
 /// Bridge a runtime-owned recap worker to the renderer as typed, attachment-
@@ -446,6 +441,7 @@ pub(crate) fn hosted_tui_controller_loop(
             &mut on_child,
         ) {
             last_idle_projection_cursor = None;
+            last_parent_projection_cursor = None;
         }
         while let Ok(completed_request_id) = recap_completion_rx.try_recv() {
             clear_completed_recap_request(&mut active_recap_request_id, completed_request_id);

@@ -380,6 +380,16 @@ pub(crate) fn update_settings(
     }
 }
 
+pub(crate) fn changed_projection(
+    thread: &RuntimeSurfaceThreadHandle,
+    last: Option<&orca_runtime::surface::SurfaceCursor>,
+) -> io::Result<Option<SurfaceProjectionState>> {
+    with_snapshot_attachment(thread, |attachment| {
+        Ok((last != Some(&attachment.baseline.cursor))
+            .then(|| SurfaceProjectionState::from_surface_snapshot(&attachment.baseline.snapshot)))
+    })
+}
+
 pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<SurfaceSnapshot> {
     with_snapshot_attachment(thread, |attachment| {
         #[cfg(test)]

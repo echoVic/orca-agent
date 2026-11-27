@@ -554,14 +554,15 @@ pub enum TuiEvent {
         Box<crate::surface_projection::SurfaceProjectionState>,
         Option<LifecycleDelivery>,
     ),
-    /// A focused child recovered its subscription from a fresh snapshot. The
-    /// reducer resets its visible projection but retains the child focus so
-    /// Escape continues to return to the parent.
+    /// Opens a finished task's read-only view without a live child subscription.
     FinishedChildProjection {
         task_id: String,
         main_status: crate::types::SideParentStatus,
         projection: Option<Box<crate::surface_projection::SurfaceProjectionState>>,
     },
+    /// A focused child recovered its subscription from a fresh snapshot. The
+    /// reducer resets its visible projection but retains the child focus so
+    /// Escape continues to return to the parent.
     ChildProjectionReset {
         task_id: String,
         main_status: Option<SideParentStatus>,

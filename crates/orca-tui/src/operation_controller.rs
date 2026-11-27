@@ -1858,6 +1858,11 @@ impl TuiSurfaceTaskControl {
         self.lock_hosted().focused_child_surface = None;
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_focused_child_surface(&self) -> bool {
+        self.lock_hosted().focused_child_surface.is_some()
+    }
+
     fn lock_hosted(&self) -> MutexGuard<'_, HostedOperationInner> {
         self.hosted
             .inner

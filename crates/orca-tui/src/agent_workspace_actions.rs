@@ -24,7 +24,7 @@ pub(crate) fn open_agent_task(
     let Some(expected_revision) = task.publication_revision else {
         return false;
     };
-    if opens_conversation(task) {
+    if agent_open_target(state, task) != AgentOpenTarget::Panel {
         let _ = action_tx.send(UserAction::FocusChildThread {
             task_id: task_id.to_string(),
             expected_revision,
@@ -42,8 +42,29 @@ pub(crate) fn open_agent_task(
     true
 }
 
-pub(crate) fn opens_conversation(task: &BackgroundTaskSummary) -> bool {
-    task.subagent_child_thread_id.is_some()
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentOpenTarget {
+    Panel,
+    Interactive,
+    Finished,
+}
+
+pub(crate) fn agent_open_target(state: &AppState, task: &BackgroundTaskSummary) -> AgentOpenTarget {
+    if task.subagent_child_thread_id.is_none()
+        || (state.conversation_target().task_id().is_some()
+            && state
+                .focused_workflow_tasks
+                .iter()
+                .any(|nested| nested.id == task.id))
+    {
+        AgentOpenTarget::Panel
+    } else if task.status.is_active() {
+        AgentOpenTarget::Interactive
+    } else if crate::hosted_child::ended(task.status) {
+        AgentOpenTarget::Finished
+    } else {
+        AgentOpenTarget::Panel
+    }
 }
 
 /// Leaves whatever agent is open for the main conversation: a focused child
@@ -549,6 +570,28 @@ mod tests {
                 crate::surface_projection::SurfaceProjectionState::from_surface_snapshot(&snapshot),
             ),
         });
+    }
+
+    #[test]
+    fn a_bound_attention_row_opens_only_its_transcript() {
+        let mut row = task("bound", 1);
+        row.subagent_child_thread_id = Some("child".into());
+        row.publication_revision = Some(3);
+        for (status, conversation) in [
+            (TaskStatus::Running, true),
+            (TaskStatus::Completed, true),
+            (TaskStatus::ApprovalRequired, false),
+        ] {
+            row.status = status;
+            let (mut state, rx) = state(vec![row.clone()]);
+            let actions = state.event_tx.clone();
+            assert!(open_agent_task(&mut state, &actions, &row.id));
+            match rx.try_recv().unwrap() {
+                UserAction::FocusChildThread { .. } => assert!(conversation),
+                UserAction::ReadTaskTranscript(_) => assert!(!conversation),
+                _ => panic!("unexpected open action"),
+            }
+        }
     }
 
     fn dock_key(

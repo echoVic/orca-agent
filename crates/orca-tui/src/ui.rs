@@ -2238,7 +2238,7 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
     let selected_index = state.agent_selected_index().min(rows.len() - 1);
     let selected = rows[selected_index];
     let summary = agent_workspace_summary_line(&rows, theme);
-    let hint = agent_workspace_action_hint(selected, theme, state.status == AppStatus::Idle);
+    let hint = agent_workspace_action_hint(selected, theme, state);
     let focus_lines =
         agent_workspace_focus_lines(selected, theme, inner.width as usize, state.tick);
     let fixed_height = 2_u16;
@@ -2509,13 +2509,15 @@ fn agent_workspace_summary_line<'a>(rows: &[AgentWorkspaceRow<'_>], theme: &Them
 fn agent_workspace_action_hint<'a>(
     row: AgentWorkspaceRow<'_>,
     theme: &Theme,
-    _idle: bool,
+    state: &AppState,
 ) -> Line<'a> {
     let mut text = " Esc close · ↑↓ select".to_string();
     match row {
         AgentWorkspaceRow::Subagent { task, .. } => {
             if task.publication_revision.is_some() {
-                if crate::agent_workspace_actions::opens_conversation(task) {
+                if crate::agent_workspace_actions::agent_open_target(state, task)
+                    != crate::agent_workspace_actions::AgentOpenTarget::Panel
+                {
                     text.push_str(" · Enter open conversation");
                 } else {
                     text.push_str(" · Enter transcript");
@@ -14873,8 +14875,14 @@ mod tests {
         child.publication_revision = Some(3);
         child.subagent_child_thread_id = Some("child-thread".to_string());
         let hint = |task: &BackgroundTaskSummary, idle: bool| {
+            let mut state = test_state();
+            state.status = if idle {
+                AppStatus::Idle
+            } else {
+                AppStatus::Running
+            };
             let row = AgentWorkspaceRow::Subagent { task, parent: None };
-            agent_workspace_action_hint(row, &theme, idle).to_string()
+            agent_workspace_action_hint(row, &theme, &state).to_string()
         };
 
         assert!(hint(&child, true).contains("Enter open conversation"));
