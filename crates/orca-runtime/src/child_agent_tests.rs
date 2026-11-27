@@ -2251,6 +2251,7 @@ enum RecordedHistory {
 
 fn recorded_provider(
     replies: Vec<serde_json::Value>,
+    mut observe: impl FnMut(usize, &[u8], &mut serde_json::Value) + Send + 'static,
 ) -> (String, std::thread::JoinHandle<Vec<Vec<u8>>>) {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
@@ -2261,7 +2262,7 @@ fn recorded_provider(
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         let mut bodies = Vec::new();
-        for delta in replies {
+        for (index, mut delta) in replies.into_iter().enumerate() {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut socket = loop {
                 match listener.accept() {
@@ -2293,6 +2294,7 @@ fn recorded_provider(
             }
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
+            observe(index, &body, &mut delta);
             bodies.push(body);
             let finish = if delta.get("tool_calls").is_some() {
                 "tool_calls"
@@ -2316,7 +2318,7 @@ fn run_recorded_fork(
     let mut replies = Vec::new();
     if attempt_write {
         replies.push(serde_json::json!({"reasoning_content":"try a write", "tool_calls":[{
-            "index":0,"id":"child-write","function":{"name":"write_file", "arguments":"{\"file_path\":\"fork-write.txt\",\"content\":\"unexpected\"}"}
+            "index":0,"id":"child-write","function":{"name":"write_file", "arguments":"{\"path\":\"fork-write.txt\",\"content\":\"unexpected\"}"}
         }]}));
     }
     run_recorded_fork_with(context, history, replies, |_, _| {})
@@ -2337,7 +2339,7 @@ fn run_recorded_fork_with(
     let mut replies = vec![serde_json::json!({"content": "parent response"})];
     replies.append(&mut child_replies);
     replies.push(serde_json::json!({"content": "child report"}));
-    let (base_url, server) = recorded_provider(replies);
+    let (base_url, server) = recorded_provider(replies, |_, _, _| {});
     let mut config = config(Some(PRO_MODEL));
     config.provider = ProviderKind::DeepSeek;
     config.approval_mode = ApprovalMode::FullAuto;
@@ -2545,8 +2547,168 @@ fn a_fork_childs_first_request_shares_the_parents_prefix() {
 fn the_in_flight_turn_is_not_inherited() {
     let (bodies, _) = run_recorded_fork(Some("fork"), RecordedHistory::Ordinary, false);
     let child = std::str::from_utf8(&bodies[1]).unwrap();
+    assert!(child.contains("parent completed report"));
     for marker in ["in-flight", "active-tool", "pending-tool"] {
         assert!(!child.contains(marker), "child inherited {marker}");
+    }
+}
+
+#[test]
+fn a_dispatched_fork_inherits_completed_history_after_queueing_and_resume() {
+    use crate::lifecycle::{AgentLoopContext, AgentLoopOutcome};
+    use crate::runtime_conversation_bootstrap::AgentConversationContext;
+    use crate::tasks::TaskRegistry;
+    use crate::tool_invocation::AgentToolPolicyContext;
+    use orca_core::conversation::Conversation;
+    use orca_core::task_types::TaskStatus;
+    use serde_json::{Value, json};
+
+    let cwd = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let _home = crate::history::redirect_test_orca_home(home.path());
+    std::fs::write(cwd.path().join("sibling.txt"), "active sibling evidence").unwrap();
+    let registry =
+        TaskRegistry::new_persistent("fork-dispatch".into(), home.path().join("task-sessions"))
+            .unwrap();
+    let parent = registry.create_main_session("fork dispatch parent".into());
+    registry.mark_running(&parent.id).unwrap();
+    let blocker = registry.create_subagent("occupy the child slot".into(), None);
+    registry.mark_running(&blocker.id).unwrap();
+
+    let tool = |index: usize, id: &str, name: &str, arguments: Value| {
+        json!({"index": index, "id": id, "type": "function", "function": {
+            "name": name, "arguments": arguments.to_string()
+        }})
+    };
+    let replies = vec![
+        json!({"content": "completed parent evidence"}),
+        json!({"reasoning_content": "dispatch two calls", "tool_calls": [
+            tool(0, "sibling-read", "read_file", json!({"path": "sibling.txt"})),
+            tool(1, "fork-launch", "subagent", json!({
+                "context": "fork", "mode": "async", "subagent_type": "explorer",
+                "description": "queued fork child", "prompt": "Report the completed evidence."
+            }))
+        ]}),
+        json!({"content": "waiting for the fork report"}),
+        json!({"content": "initial fork child report"}),
+        json!({"content": "integrated the fork report"}),
+        json!({"reasoning_content": "resume the child", "tool_calls": [
+            tool(0, "fork-resume", "subagent", json!({}))
+        ]}),
+        json!({"content": "resumed fork child report"}),
+        json!({"content": "parent resume report"}),
+    ];
+    let mut fork_task = None;
+    let worker_registry = registry.clone();
+    let parent_id = parent.id.clone();
+    let (base_url, server) = recorded_provider(replies, move |index, body, delta| match index {
+        2 => {
+            let request: Value = serde_json::from_slice(body).unwrap();
+            let messages = request["messages"].as_array().unwrap();
+            let tool_result = |id: &str| {
+                messages
+                    .iter()
+                    .find(|message| message["tool_call_id"] == id)
+                    .unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+            };
+            assert!(tool_result("sibling-read").contains("active sibling evidence"));
+            let launch: Value = serde_json::from_str(tool_result("fork-launch")).unwrap();
+            assert_eq!(launch["status"], "queued");
+            let task_id = launch["task_id"].as_str().unwrap();
+            let queued = worker_registry
+                .queued_subagent_launches(Some(&parent_id))
+                .unwrap();
+            assert!(queued.iter().any(|(id, _)| id == task_id));
+            fork_task = Some(task_id.to_owned());
+            worker_registry
+                .complete(&blocker.id, "slot released".into())
+                .unwrap();
+        }
+        5 => {
+            let task_id = fork_task.as_deref().unwrap();
+            let task = worker_registry.get(task_id).unwrap();
+            assert_eq!(task.status, TaskStatus::Completed, "{:?}", task.error);
+            delta["tool_calls"][0]["function"]["arguments"] = json!({
+                "description": "resume the fork child", "prompt": "Continue your report.",
+                "resume_from": task_id, "mode": "sync"
+            })
+            .to_string()
+            .into();
+        }
+        _ => {}
+    });
+    let mut config = config(Some(PRO_MODEL));
+    config.provider = ProviderKind::DeepSeek;
+    config.approval_mode = ApprovalMode::FullAuto;
+    config.api_key = Some("local-fixture".into());
+    config.base_url = Some(base_url);
+    config.subagents.limits.max_running = 1;
+
+    let mut conversation = Conversation::new();
+    conversation.add_system("production parent instructions".into());
+    let mut run_turn = |prompt: &str, expected: &str| {
+        conversation.add_user(prompt.into());
+        let outcome = crate::agent_loop::run_agent_loop(
+            &config,
+            AgentLoopContext::new(cwd.path(), prompt, 0, false, &SubagentType::General)
+                .with_root_task_id(Some(&parent.id))
+                .with_services(
+                    &ProjectInstructions::default(),
+                    &MemoryBlock::default(),
+                    &McpRegistry::default(),
+                    &HookRunner::default(),
+                )
+                .with_runtime(&mut CostTracker::new(None), &CancelToken::new(), &registry)
+                .with_execution(&mut Vec::new(), None, None),
+            &mut EventFactory::new("fork-dispatch".into()),
+            &mut EventSink::new(io::sink(), OutputFormat::Jsonl),
+            AgentConversationContext::borrowed(&mut conversation, None, false),
+            AgentToolPolicyContext::new(None, None),
+        )
+        .unwrap();
+        let AgentLoopOutcome::Completed(result) = outcome else {
+            panic!("parent turn did not complete");
+        };
+        assert_eq!(
+            result.status,
+            RunStatus::Success,
+            "{prompt}: {:?}",
+            result.error
+        );
+        assert_eq!(result.final_message.as_deref(), Some(expected));
+    };
+    run_turn("Gather earlier evidence.", "completed parent evidence");
+    run_turn(
+        "Active parent turn: dispatch the fork.",
+        "integrated the fork report",
+    );
+    run_turn("Resume the fork.", "parent resume report");
+
+    let bodies = server.join().unwrap();
+    assert_eq!(bodies.len(), 8);
+    let parent = recorded_wire_messages(&bodies[1]);
+    let cut = parent
+        .iter()
+        .position(|message| message.get().contains("Active parent turn"))
+        .unwrap();
+    for index in [3, 6] {
+        let child = recorded_wire_messages(&bodies[index]);
+        let body = std::str::from_utf8(&bodies[index]).unwrap();
+        assert!(body.contains("completed parent evidence"));
+        for (parent, inherited) in parent[..cut].iter().zip(&child[..cut]) {
+            assert_eq!(parent.get(), inherited.get());
+        }
+        for marker in [
+            "Active parent turn",
+            "sibling-read",
+            "active sibling evidence",
+            "fork-launch",
+        ] {
+            assert!(!body.contains(marker), "child inherited {marker}");
+        }
+        assert_eq!(body.contains("initial fork child report"), index == 6);
     }
 }
 
@@ -2563,6 +2725,16 @@ fn a_fork_childs_role_limits_are_enforced_at_execution() {
     );
     assert_eq!(result.status, RunStatus::Success, "{:?}", result.error);
     let continued: serde_json::Value = serde_json::from_slice(&bodies[2]).unwrap();
+    let call = continued["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+        .find(|call| call["id"] == "child-write")
+        .unwrap();
+    let arguments: serde_json::Value =
+        serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(arguments["path"], "fork-write.txt");
     assert!(
         continued
             .to_string()

@@ -105,10 +105,13 @@ child needs evidence from earlier turns of the parent conversation.
 
 A fork starts with the parent's DeepSeek system prompt, ordered tools, and
 completed history as sent to DeepSeek. Orca excludes the current turn and
-appends the task and role instructions as a user message. It uses the parent's
-model and reasoning effort, so omit `model`. The inherited catalog can show
-tools outside the child's role. Orca refuses those calls at execution. The
-child's transcript and result begin with its own task.
+appends the task and role instructions as a user message. The parent's goal
+and plan overlays, MCP instructions and catalogs, and request-only hook and
+directive fragments after the cut stay with the parent. The child uses the
+parent's model and reasoning effort, so omit `model`. The inherited catalog
+can show tools outside the child's role. Orca returns the role's refusal to
+the child so it can continue. The child's transcript and result begin with
+its own task.
 
 If Orca has no completed parent turn or cannot recover its request prefix, it
 starts a fresh child and includes a note. A fork requires a compatible parent
