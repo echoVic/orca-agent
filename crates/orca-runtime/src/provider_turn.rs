@@ -200,7 +200,6 @@ pub(crate) struct RuntimeProviderCycleInput<'a, 'runtime, W: io::Write> {
     pub(crate) image_route: ImageRouteDecision,
     pub(crate) runtime_system_messages: &'a [String],
     pub(crate) context_config: &'a context::ContextConfig,
-    pub(crate) base_provider_config: &'a ProviderConfig,
     pub(crate) capabilities: RuntimeStepCapabilitySnapshot<'a>,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) events: &'a mut EventFactory,
@@ -604,10 +603,13 @@ impl RuntimeProviderTurnStep {
 
         let model_conversation =
             conversation_with_hook_context(&prepared_images.conversation, &pre_model_outcome);
-        let model_conversation = conversation_with_runtime_system_messages(
+        let mut model_conversation = conversation_with_runtime_system_messages(
             &model_conversation,
             input.runtime_system_messages,
         );
+        if input.provider == ProviderKind::DeepSeek {
+            orca_provider::deepseek_http::bind_replay_source(&mut model_conversation, conversation);
+        }
         let measurement = context::measure_prompt(&model_conversation, input.provider_config);
         let request_config = context::with_request_reply_budget(
             input.provider_config,
@@ -1260,7 +1262,7 @@ impl RuntimeTurnProviderCycleStep {
                 &mut RuntimeCompactionStep::new(
                     input.provider,
                     input.context_config,
-                    input.base_provider_config,
+                    input.turn_provider_config,
                     turn_context.clone(),
                     capabilities.hooks,
                     input.events,
@@ -1268,10 +1270,26 @@ impl RuntimeTurnProviderCycleStep {
                     history_writer,
                 )
                 .with_cancel(capabilities.cancel)
-                .with_deadline(input.operation.remaining_deadline()?),
+                .with_deadline(input.operation.remaining_deadline()?)
+                .with_cost_tracker(input.cost_tracker)
+                .with_operation(input.operation),
                 conversation,
             )?
         };
+        if let Err(stop) = input.operation.sync_wall_time()? {
+            let (_, history_writer) = input.conversation.parts_mut();
+            let terminal = input.operation.commit_budget_stop_with_boundary(
+                turn_context.turn_id.as_str(),
+                input.events.run_id(),
+                history_writer,
+                &input.cost_tracker.totals(),
+                None,
+                stop,
+            )?;
+            return Ok(RuntimeTurnProviderCycleResult::Return(
+                AgentLoopResult::budget_stop(terminal, stop),
+            ));
+        }
         if let RuntimeProviderErrorStepOutcome::Failed(error) = &provider_error_outcome
             && let Some(ingress) = turn_context.provider_response_ingress()
         {
@@ -3621,7 +3639,6 @@ mod tests {
                     image_route: ImageRouteDecision::None,
                     runtime_system_messages: &[],
                     context_config: &context_config,
-                    base_provider_config: &provider_config,
                     capabilities: RuntimeStepCapabilitySnapshot::new(
                         &instructions,
                         &memory,

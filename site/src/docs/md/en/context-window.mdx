@@ -23,6 +23,16 @@ again until the conversation has grown by a tenth. This matters when the current
 prompt alone is larger than the limit. When a request no longer leaves room for
 a reply, compaction always runs and keeps any reduction.
 
+Deep compaction sends the conversation up to the cut to the session's model and
+appends one instruction for a structured checkpoint. It can carry exact paths,
+commands, errors and pending work into the next turn, merging facts that still
+apply from earlier summaries. Orca keeps the recent tail and pinned messages.
+
+DeepSeek charges cache-hit rates for the replayed input it already has cached.
+Orca includes the replay's reported usage in the session cost and cost budget.
+If the replay does not fit or fails to produce a smaller usable checkpoint,
+Orca tries a hierarchical summary on Flash, then local truncation.
+
 For a task that needs a precise earlier fact, include the file path, test name,
 or session boundary in the next prompt rather than relying on an implicit
 context guess.

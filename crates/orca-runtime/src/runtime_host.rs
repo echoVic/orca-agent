@@ -2213,21 +2213,29 @@ impl ThreadOperationExecutor for LegacyThreadOperationExecutor {
             let mut sink = EventSink::new(writer, config.output_format)
                 .with_optional_observer(request.event_observer());
             sink.emit(events.context_compaction_started("manual", before_messages))?;
-            let compaction = thread
-                .session_mut()
-                .compact(config, &cwd, cancel, |outcome| {
-                    generation.prepare_manual_compaction(outcome)
-                })?;
+            let session_tools = thread.thread_extensions_handle();
+            let compaction =
+                thread
+                    .session_mut()
+                    .compact(config, &cwd, &session_tools, cancel, |outcome| {
+                        generation.prepare_manual_compaction(outcome)
+                    })?;
+            if let Some(usage) = compaction.usage {
+                sink.emit(events.usage_updated(usage))?;
+            }
             let before_messages = compaction.before.messages.len();
             let after_messages = compaction.after.messages.len();
-            sink.emit(events.context_compacted(
+            let mut completed = events.context_compacted(
                 "manual",
                 compaction.strategy,
                 before_messages,
                 after_messages,
                 before_messages.saturating_sub(after_messages),
                 "compacted context manually",
-            ))?;
+            );
+            completed.payload["observation"] =
+                crate::compaction::compaction_observation_payload(&compaction.observation);
+            sink.emit(completed)?;
             return Ok(ThreadOperationOutcome::Completed {
                 status: if cancel.is_cancelled() {
                     RunStatus::Cancelled

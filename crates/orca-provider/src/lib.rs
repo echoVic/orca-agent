@@ -6,6 +6,7 @@ pub mod deepseek_http;
 pub mod http_client;
 pub mod key_check;
 pub mod prompt_cache;
+mod replay_prefix;
 pub mod streaming;
 pub mod summary_cache;
 pub mod tool_schema;
@@ -330,7 +331,7 @@ fn start_streaming_with_output_budget(
     bounded_timeout: Option<Duration>,
     retry_budget: Option<http_client::RetryBudget>,
 ) -> ProviderStreamingCall {
-    let conversation = conversation.clone();
+    let conversation = conversation.clone_for_provider_request();
     let config = config.clone();
     let worker_cancel = cancel.clone();
     let (step_tx, step_rx) = mpsc::sync_channel(0);

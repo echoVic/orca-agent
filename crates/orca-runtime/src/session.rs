@@ -15,7 +15,6 @@ use orca_core::task_types::TaskStatus;
 use orca_core::thread_item_projection::CompletedModelResponse;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolStatus};
 use orca_mcp::McpRegistry;
-use orca_provider::ProviderConfig;
 
 use crate::agent_common;
 use crate::cost::CostTracker;
@@ -84,6 +83,8 @@ pub(crate) struct ManualCompactionOutcome {
     pub before: Conversation,
     pub after: Conversation,
     pub strategy: &'static str,
+    pub observation: orca_provider::context::CompactionObservation,
+    pub usage: Option<UsageTotals>,
 }
 
 #[derive(Clone, Debug)]
@@ -864,6 +865,7 @@ impl InteractiveSession {
         &mut self,
         config: &RunConfig,
         cwd: &Path,
+        session_tools: &crate::extension::ExtensionData,
         cancel: &orca_core::cancel::CancelToken,
         precommit: F,
     ) -> io::Result<ManualCompactionOutcome>
@@ -902,37 +904,60 @@ impl InteractiveSession {
             },
             cancel,
         );
-        let provider_config = ProviderConfig {
-            api_key: config.api_key.clone(),
-            base_url: config.base_url.clone(),
-            model: Some(orca_core::model::auxiliary_model().to_string()),
-            reasoning_effort: config.reasoning_effort,
-            tools_override: Some(Vec::new()),
-            mcp_registry: None,
-            external_tools: Vec::new(),
-            max_output_tokens: None,
-        };
-        let compaction = orca_provider::context::compact_with_summary_cancellable(
+        let mut provider_config = crate::tool_invocation::provider_config_for_agent_loop(
+            config,
+            cwd,
+            0,
+            &SubagentType::General,
+            crate::tool_invocation::AgentToolPolicyContext::unrestricted(),
+            &self.mcp_registry,
+            session_tools,
+        );
+        let model = config.model.route(orca_core::model::ModelRouteContext {
+            subagent_type: &SubagentType::General,
+            subagent_model: None,
+            has_images: false,
+        });
+        provider_config.model = Some(model.actual_model);
+        let mut recorded = false;
+        let compaction = orca_provider::context::compact_with_summary_settled(
             config.provider,
             &candidate,
             &orca_provider::context::ContextConfig::for_model_with_runtime(
-                config.model.as_option().as_deref(),
+                provider_config.model.as_deref(),
                 &config.model_runtime,
                 config.reasoning_effort,
             ),
             &provider_config,
-            cancel,
+            Some(cancel),
+            false,
+            &mut |model, usage| {
+                if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
+                    self.cost_tracker.add_model_usage(model, usage);
+                    recorded = true;
+                }
+                config.budget.max_cost_usd_micros.is_none_or(|limit| {
+                    crate::cost::usd_to_micros(self.cost_tracker.totals().estimated_cost_usd)
+                        <= limit
+                })
+            },
         );
         let strategy = match &compaction.kind {
             orca_provider::context::CompactionKind::LocalTruncation => "local_truncation",
             orca_provider::context::CompactionKind::RemoteSummary(_) => "remote_summary",
         };
+        let usage = recorded.then(|| self.cost_tracker.totals());
+        if let (Some(writer), Some(totals)) = (&mut self.writer, usage) {
+            writer.append_usage(totals)?;
+        }
         let after = compaction.conversation;
         let after_messages = after.messages.len();
         let outcome = ManualCompactionOutcome {
             before,
             after,
             strategy,
+            observation: compaction.observation,
+            usage,
         };
         let identity = precommit(&outcome)?;
         if let Some(writer) = &mut self.writer {

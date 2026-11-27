@@ -43,4 +43,4 @@ cache_tokens 缺失时不要自行推导命中率。不同提供商可能采用�
 
 ## 压缩
 
-上下文压缩会改变后续回合发送给模型的材料，因此也可能改变缓存行为。排查变化时，可在 JSONL 流中观察 context.compaction.started 和 context.compacted。它们描述的是提示词管理；恢复时仍应以已记录会话和工具终态事件为准。
+深度压缩生成检查点时，会用当前模型回放已有的对话前缀。前缀仍在缓存中时，回放的大部分输入可以按缓存命中价计费。在 JSONL 流的 `context.compacted.payload.observation.summary_requests` 中，查看 `purpose: "replay"` 对应的服务端缓存 token 数。采用检查点后，下一次普通请求会从更新后的前缀开始。参见[上下文与压缩](#context-window)。
