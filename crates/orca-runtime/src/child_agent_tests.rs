@@ -2430,7 +2430,8 @@ fn run_recorded_fork(
         );
     }
     let mut request = crate::subagent::create_subagent_request(&fork_tool_request(context));
-    crate::subagent::prepare_fork_request(&mut request, &config, Some(&parent)).unwrap();
+    let registry = crate::tasks::TaskRegistry::new("recorded-fork".into());
+    crate::subagent::prepare_fork_request(&mut request, &config, Some(&parent), &registry).unwrap();
     let mut child = ChildAgentRequest::new(
         request.prompt,
         request.subagent_type,
@@ -2438,7 +2439,13 @@ fn run_recorded_fork(
         1,
         false,
     );
-    child.fork_prefix = request.fork_prefix.map(Arc::new);
+    child.fork_prefix = request.fork_prefix_ref.map(|reference| {
+        registry
+            .continuation_store()
+            .unwrap()
+            .load_fork_prefix(reference)
+            .unwrap()
+    });
     let mut events = EventFactory::new("fork-child".into());
     let mut sink = EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl);
     let mut runtime = runtime(

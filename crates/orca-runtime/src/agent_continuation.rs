@@ -24,7 +24,7 @@ use orca_core::conversation::{
     InternalContextFragment, InternalContextKind, InternalContextOrigin,
     MEMORY_CONTEXT_FRAGMENT_ID, MEMORY_CONTEXT_MAX_TOKENS, MODE_CONTEXT_FRAGMENT_ID,
     MODE_CONTEXT_MAX_TOKENS, Message, PLAN_CONTEXT_FRAGMENT_ID, PLAN_CONTEXT_MAX_TOKENS,
-    RUNTIME_CONTEXT_FRAGMENT_ID, RUNTIME_CONTEXT_MAX_TOKENS, RawToolCall,
+    ProviderForkPrefix, RUNTIME_CONTEXT_FRAGMENT_ID, RUNTIME_CONTEXT_MAX_TOKENS, RawToolCall,
     SKILL_CONTEXT_FRAGMENT_ID, SKILL_CONTEXT_MAX_TOKENS, SummaryState, normalize_tool_boundaries,
     repaired_missing_tool_result,
 };
@@ -1131,10 +1131,9 @@ pub(crate) struct AgentContinuationRecord {
     pub(crate) subagent_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) frozen_agent: Option<FrozenAgentConfig>,
-    /// Provider prefix lives beside the checkpoint so older readers can
-    /// verify and resume the child's own transcript.
+    /// Reference to the shared provider request prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) fork_prefix: Option<orca_core::conversation::ProviderForkPrefix>,
+    pub(crate) fork_prefix_ref: Option<Sha256Digest>,
     /// Fixed or inherited model identity used for compatibility checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) model: Option<String>,
@@ -1436,7 +1435,7 @@ pub(crate) struct PreparedContinuation {
     pub(crate) prompt_id: AgentPromptId,
     /// Compatibility and workspace identity the child loop must retain.
     pub(crate) compatibility: ContinuationCompatibility,
-    pub(crate) fork_prefix: Option<orca_core::conversation::ProviderForkPrefix>,
+    pub(crate) fork_prefix: Option<Arc<ProviderForkPrefix>>,
     /// Source checkpoint for resume, or the latest checkpoint after settlement.
     pub(crate) checkpoint: Option<AgentCheckpoint>,
     /// Current durable revision to use when acquiring or committing.
@@ -1466,7 +1465,7 @@ impl From<&AgentContinuationRecord> for PreparedContinuation {
                 worktree: record.worktree.clone(),
                 compatibility_hash: record.compatibility_hash,
             },
-            fork_prefix: record.fork_prefix.clone(),
+            fork_prefix: None,
             checkpoint: record.checkpoint.clone(),
             revision: record.revision,
             source_task_id: record.source_task_id.clone(),
@@ -1514,6 +1513,7 @@ impl ContinuationReconciliation {
 struct ProcessLocalContinuationState {
     index: HashMap<AgentContinuationId, String>,
     records: HashMap<AgentContinuationId, AgentContinuationRecord>,
+    fork_prefixes: HashMap<Sha256Digest, Arc<ProviderForkPrefix>>,
 }
 
 impl AgentContinuationStore {
@@ -1546,6 +1546,59 @@ impl AgentContinuationStore {
     /// Returns the parent session whose continuations this store may access.
     pub(crate) fn parent_session_id(&self) -> &str {
         &self.parent_session_id
+    }
+
+    pub(crate) fn store_fork_prefix(
+        &self,
+        prefix: ProviderForkPrefix,
+    ) -> Result<Sha256Digest, AgentContinuationError> {
+        let bytes =
+            serde_json::to_vec(&prefix).map_err(|_| persistence_error("serialize fork prefix"))?;
+        let digest = Sha256Digest::digest(&bytes);
+        match &self.backend {
+            AgentContinuationStoreBackend::ProcessLocal { state } => {
+                lock_process_state(state)?
+                    .fork_prefixes
+                    .entry(digest)
+                    .or_insert_with(|| Arc::new(prefix));
+            }
+            AgentContinuationStoreBackend::Persistent { root, .. } => {
+                let _lock = acquire_lock(
+                    &session_lock_path(root, &self.parent_session_id),
+                    "acquire fork prefix lock",
+                )?;
+                let path = fork_prefix_path(root, &self.parent_session_id, digest);
+                if read_fork_prefix_bytes(&path, digest)?.is_none() {
+                    fs::create_dir_all(path.parent().expect("fork prefix directory")).map_err(
+                        |error| persistence_io_error("create fork prefix directory", &error),
+                    )?;
+                    atomic_write(&path, &bytes, AtomicWritePolicy::NoFollow)
+                        .map_err(|_| persistence_error("write fork prefix"))?;
+                }
+            }
+        }
+        Ok(digest)
+    }
+
+    pub(crate) fn load_fork_prefix(
+        &self,
+        digest: Sha256Digest,
+    ) -> Result<Arc<ProviderForkPrefix>, AgentContinuationError> {
+        match &self.backend {
+            AgentContinuationStoreBackend::ProcessLocal { state } => lock_process_state(state)?
+                .fork_prefixes
+                .get(&digest)
+                .cloned()
+                .ok_or_else(|| corrupt_record("referenced fork prefix is missing")),
+            AgentContinuationStoreBackend::Persistent { root, .. } => {
+                let path = fork_prefix_path(root, &self.parent_session_id, digest);
+                let bytes = read_fork_prefix_bytes(&path, digest)?
+                    .ok_or_else(|| corrupt_record("referenced fork prefix is missing"))?;
+                serde_json::from_slice(&bytes)
+                    .map(Arc::new)
+                    .map_err(|_| corrupt_record("fork prefix does not match its schema"))
+            }
+        }
     }
 
     /// Creates one new revision-zero continuation after validating all durable invariants.
@@ -1652,6 +1705,23 @@ impl AgentContinuationStore {
                     }
                 }
 
+                if let Some(digest) = record.fork_prefix_ref {
+                    let association =
+                        fork_child_path(root, &self.parent_session_id, &record.continuation_id);
+                    match read_fork_child(&association)? {
+                        Some(existing) if existing != digest => {
+                            return Err(corrupt_record(
+                                "fork prefix association conflicts with the new continuation",
+                            ));
+                        }
+                        Some(_) => {}
+                        None => write_json_pretty(
+                            &association,
+                            &digest,
+                            "write fork prefix association",
+                        )?,
+                    }
+                }
                 write_json_pretty(&record_path, &record, "write continuation record")?;
                 index.insert(
                     record.continuation_id.as_str().to_string(),
@@ -2318,10 +2388,56 @@ fn read_record(
             found: schema_version,
         });
     }
-    let record: AgentContinuationRecord = serde_json::from_value(value)
+    let mut record: AgentContinuationRecord = serde_json::from_value(value)
         .map_err(|_| corrupt_record("continuation record does not match its schema"))?;
     validate_record(&record, Some(continuation_id), Some(parent_session_id))?;
+    let association = read_fork_child(&fork_child_path(root, parent_session_id, continuation_id))?;
+    if record.fork_prefix_ref.is_some() && record.fork_prefix_ref != association {
+        return Err(corrupt_record(
+            "fork prefix association does not match its continuation",
+        ));
+    }
+    record.fork_prefix_ref = association;
     Ok(record)
+}
+
+fn read_fork_prefix_bytes(
+    path: &Path,
+    digest: Sha256Digest,
+) -> Result<Option<Vec<u8>>, AgentContinuationError> {
+    match fs::read(path) {
+        Ok(bytes) if Sha256Digest::digest(&bytes) == digest => Ok(Some(bytes)),
+        Ok(_) => Err(corrupt_record("fork prefix digest mismatch")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(persistence_io_error("read fork prefix", &error)),
+    }
+}
+
+fn read_fork_child(path: &Path) -> Result<Option<Sha256Digest>, AgentContinuationError> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| corrupt_record("fork prefix association does not match its schema")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(persistence_io_error("read fork prefix association", &error)),
+    }
+}
+
+fn fork_prefix_path(root: &Path, session: &str, digest: Sha256Digest) -> PathBuf {
+    let name: String = digest
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    root.join(safe_path_component(session))
+        .join("fork-prefixes")
+        .join(format!("{name}.json"))
+}
+
+fn fork_child_path(root: &Path, session: &str, child: &AgentContinuationId) -> PathBuf {
+    root.join(safe_path_component(session))
+        .join("fork-children")
+        .join(format!("{}.json", child.as_str()))
 }
 
 fn write_json_pretty<T: Serialize>(
@@ -2602,7 +2718,7 @@ impl ChildAgentCoordinator {
     pub(crate) fn create_with_fork(
         &self,
         input: CreateContinuationInput,
-        fork_prefix: Option<orca_core::conversation::ProviderForkPrefix>,
+        fork_prefix_ref: Option<Sha256Digest>,
     ) -> Result<PreparedContinuation, AgentContinuationError> {
         validate_task_binding(&input.parent_task_id, &input.task_id)?;
         validate_compatibility_shape(&input.compatibility)?;
@@ -2616,7 +2732,7 @@ impl ChildAgentCoordinator {
                 && record.current_attempt.prompt_id == input.prompt_id
                 && record.subagent_type == input.compatibility.subagent_type
                 && record.frozen_agent == input.compatibility.frozen_agent
-                && record.fork_prefix == fork_prefix
+                && record.fork_prefix_ref == fork_prefix_ref
                 && record.model == input.compatibility.model
                 && record.isolation == input.compatibility.isolation
                 && record.effective_cwd == input.compatibility.effective_cwd
@@ -2624,7 +2740,7 @@ impl ChildAgentCoordinator {
                 && record.compatibility_hash == input.compatibility.compatibility_hash;
             if duplicate {
                 self.install_projection(&record)?;
-                return Ok(PreparedContinuation::from(&record));
+                return self.prepare_record(&record);
             }
             return Err(AgentContinuationError::AlreadyExists { continuation_id });
         }
@@ -2639,7 +2755,7 @@ impl ChildAgentCoordinator {
             latest_task_id: input.task_id,
             subagent_type: input.compatibility.subagent_type,
             frozen_agent: input.compatibility.frozen_agent,
-            fork_prefix,
+            fork_prefix_ref,
             model: input.compatibility.model,
             isolation: input.compatibility.isolation,
             effective_cwd: input.compatibility.effective_cwd,
@@ -2666,7 +2782,19 @@ impl ChildAgentCoordinator {
         };
         let record = self.store.create_record(record)?;
         self.install_projection(&record)?;
-        Ok(PreparedContinuation::from(&record))
+        self.prepare_record(&record)
+    }
+
+    fn prepare_record(
+        &self,
+        record: &AgentContinuationRecord,
+    ) -> Result<PreparedContinuation, AgentContinuationError> {
+        let mut prepared = PreparedContinuation::from(record);
+        prepared.fork_prefix = record
+            .fork_prefix_ref
+            .map(|digest| self.store.load_fork_prefix(digest))
+            .transpose()?;
+        Ok(prepared)
     }
 
     /// Resolves a UUIDv7 continuation directly or a compatibility task/agent selector through the task registry; it returns stable not-found or persistence errors and performs no writes.
@@ -2703,7 +2831,7 @@ impl ChildAgentCoordinator {
             .store
             .load_record(&continuation_id)?
             .ok_or(AgentContinuationError::NotFound)?;
-        let prepared = PreparedContinuation::from(&record);
+        let prepared = self.prepare_record(&record)?;
         validate_compatibility_shape(&prepared.compatibility)?;
         if let Some(checkpoint) = prepared.checkpoint.as_ref() {
             checkpoint.verify_digest()?;
@@ -2776,7 +2904,7 @@ impl ChildAgentCoordinator {
 
         if record.current_attempt.prompt_id == input.prompt_id {
             self.install_projection(&record)?;
-            return Ok(PreparedContinuation::from(&record));
+            return self.prepare_record(&record);
         }
 
         let now_ms = continuation_now_ms();
@@ -2826,7 +2954,7 @@ impl ChildAgentCoordinator {
                     Ok(())
                 })?;
         self.install_projection(&committed)?;
-        Ok(PreparedContinuation::from(&committed))
+        self.prepare_record(&committed)
     }
 
     fn validate_recorded_parent_recovery(
@@ -3984,6 +4112,148 @@ mod tests {
     use super::*;
     use orca_core::conversation::Conversation;
 
+    // Persistence fixture copied from the v0.5.25 tag.
+    mod legacy_v0_5_25 {
+        use super::*;
+
+        #[derive(Deserialize, Serialize)]
+        pub(super) struct AgentContinuationRecord {
+            #[serde(default = "default_schema_version")]
+            pub(crate) schema_version: u32,
+            pub(crate) continuation_id: AgentContinuationId,
+            pub(crate) parent_session_id: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) parent_task_id: Option<String>,
+            pub(crate) source_task_id: String,
+            pub(crate) latest_task_id: String,
+            pub(crate) subagent_type: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) frozen_agent: Option<FrozenAgentConfig>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) model: Option<String>,
+            pub(crate) isolation: SubagentIsolation,
+            pub(crate) effective_cwd: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) worktree: Option<WorktreeBinding>,
+            pub(crate) compatibility_hash: Sha256Digest,
+            #[serde(default)]
+            pub(crate) revision: ContinuationRevision,
+            #[serde(default)]
+            pub(crate) status: ContinuationStatus,
+            pub(crate) current_attempt: AgentAttemptRecord,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) checkpoint: Option<AgentCheckpoint>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) active_tool_boundary: Option<ToolBoundary>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) terminal: Option<AgentTerminal>,
+            pub(crate) created_at_ms: i64,
+            pub(crate) updated_at_ms: i64,
+        }
+    }
+
+    fn test_fork_prefix() -> orca_core::conversation::ProviderForkPrefix {
+        orca_core::conversation::ProviderForkPrefix {
+            model: orca_core::model::PRO_MODEL.into(),
+            endpoint: "https://api.deepseek.com".into(),
+            reasoning_effort: orca_core::config::ReasoningEffort::High,
+            messages: vec![
+                r#"{"role":"user","content":"parent evidence for both siblings"}"#.into(),
+            ],
+            tools: vec![],
+            estimated_tokens: 15,
+        }
+    }
+
+    fn create_test_fork(registry: &TaskRegistry) -> PreparedContinuation {
+        let child = registry.create_subagent_with_parent(
+            "inspect evidence".into(),
+            Some("general".into()),
+            None,
+        );
+        ChildAgentCoordinator::new(registry.clone())
+            .unwrap()
+            .create_with_fork(
+                CreateContinuationInput {
+                    continuation_id: None,
+                    parent_task_id: None,
+                    task_id: child.id,
+                    prompt_id: AgentPromptId::new(),
+                    compatibility: ContinuationCompatibility {
+                        subagent_type: "general".into(),
+                        frozen_agent: None,
+                        model: Some(orca_core::model::PRO_MODEL.into()),
+                        isolation: SubagentIsolation::None,
+                        effective_cwd: std::env::temp_dir().display().to_string(),
+                        worktree: None,
+                        compatibility_hash: Sha256Digest::new([7; 32]),
+                    },
+                },
+                Some(
+                    registry
+                        .continuation_store()
+                        .unwrap()
+                        .store_fork_prefix(test_fork_prefix())
+                        .unwrap(),
+                ),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn sibling_forks_store_the_prefix_once() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let siblings = [create_test_fork(&registry), create_test_fork(&registry)];
+        let path = root.path().join("parent");
+        let copies = walkdir::WalkDir::new(&path)
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| {
+                fs::read_to_string(entry.path())
+                    .is_ok_and(|text| text.contains("parent evidence for both siblings"))
+            })
+            .count();
+        assert_eq!(copies, 1);
+        let coordinator = ChildAgentCoordinator::new(registry).unwrap();
+        for child in siblings {
+            let restored = coordinator
+                .prepared(child.continuation_id.as_str())
+                .unwrap();
+            assert_eq!(
+                restored
+                    .fork_prefix
+                    .as_ref()
+                    .map(|prefix| prefix.messages.as_slice()),
+                Some(test_fork_prefix().messages.as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn a_continuation_rewritten_by_an_older_release_keeps_the_fork_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let child = create_test_fork(&registry);
+        let path = continuation_record_path(root.path(), "parent", &child.continuation_id);
+        let older: legacy_v0_5_25::AgentContinuationRecord =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&older).unwrap()).unwrap();
+        drop(registry);
+        let reopened = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let restored = ChildAgentCoordinator::new(reopened)
+            .unwrap()
+            .prepared(child.continuation_id.as_str())
+            .unwrap();
+        assert_eq!(
+            restored
+                .fork_prefix
+                .as_ref()
+                .map(|prefix| prefix.messages.as_slice()),
+            Some(test_fork_prefix().messages.as_slice())
+        );
+    }
     #[test]
     fn custom_agent_snapshot_does_not_change_legacy_builtin_hash_or_record_shape() {
         let delegation = DelegationSnapshot::default();

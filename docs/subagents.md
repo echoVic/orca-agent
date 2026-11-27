@@ -113,7 +113,11 @@ child's transcript and result begin with its own task.
 If Orca has no completed parent turn or cannot recover its request prefix, it
 starts a fresh child and includes a note. A fork requires a compatible parent
 DeepSeek model and endpoint. Use `resume_from` by itself to continue an existing
-child.
+child. Sibling forks in the same session share one saved copy of the prefix.
+Orca keeps that copy for the lifetime of the parent session because queued
+launches and resumable children can still need it after a restart. In Orca
+0.5.25, a fork child resumes from its own transcript without the inherited
+history. A newer build can restore the saved prefix again after upgrading.
 
 ## Scheduling And Capacity
 

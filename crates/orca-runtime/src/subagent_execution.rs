@@ -488,7 +488,12 @@ fn execute_subagent_batch(
             subagent::create_subagent_request(&effective),
             orca_core::config::DelegationSnapshot::from_config(config),
         );
-        match subagent::prepare_fork_request(&mut request, config, parent_conversation) {
+        match subagent::prepare_fork_request(
+            &mut request,
+            config,
+            parent_conversation,
+            task_registry,
+        ) {
             Ok(note) => fork_notes[idx] = note,
             Err(error) => {
                 let result = tool_types::ToolResult::failed_before_start(&effective, error, None);
@@ -703,8 +708,12 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
             None,
         ));
     }
-    let fork_note = match subagent::prepare_fork_request(&mut request, config, parent_conversation)
-    {
+    let fork_note = match subagent::prepare_fork_request(
+        &mut request,
+        config,
+        parent_conversation,
+        task_registry,
+    ) {
         Ok(note) => note,
         Err(error) => {
             return Ok((
