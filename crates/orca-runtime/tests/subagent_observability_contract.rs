@@ -210,13 +210,14 @@ fn task_transcript_action_is_dispatched_instead_of_dropped() {
 fn hosted_child_navigation_requires_a_surface_lifecycle_binding() {
     let focus = balanced_block(HOSTED_CHILD, "fn focus_child");
     let projection = balanced_block(HOSTED_CHILD, "fn project_hosted_child_attached");
-    let resolver = balanced_block(HOSTED_CHILD, "fn resolve_child_binding");
-    let surface_binding = balanced_block(HOSTED_CHILD, "fn child_binding");
+    let decision = balanced_block(HOSTED_CHILD, "fn resolve_child_open(");
 
     assert!(focus.contains("project_hosted_child_attached"));
     assert!(projection.contains("TuiEvent::ChildProjectionReset"));
-    assert!(resolver.contains("child_binding"));
-    assert!(surface_binding.contains("SurfaceSubagentStatus::Running"));
+    assert!(focus.contains("resolve_child_open(&current_snapshot"));
+    assert!(decision.contains("child_binding(snapshot, task_id, expected_revision)"));
+    assert!(decision.contains("finished_revision(snapshot, task_id)"));
+    assert!(decision.contains("SurfaceSubagentStatus::Running"));
     assert!(!HOSTED_CHILD.contains("registry_child_binding"));
     assert!(!HOSTED_CHILD.contains("agent_registry_snapshot"));
 }

@@ -15,7 +15,8 @@ use orca_runtime::runtime_host::{RuntimeHostHandle, RuntimeThreadHandle};
 use orca_runtime::surface::{
     AttachResult, FreshAttachRequest, RuntimeSurfaceClientHandle, RuntimeSurfaceHandle,
     SurfaceCapability, SurfaceEvent, SurfaceInteractionKind, SurfaceInteractionLifecycle,
-    SurfaceOperationId, SurfaceRequestId, SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskId,
+    SurfaceOperationId, SurfaceRequestId, SurfaceSnapshot, SurfaceSubagentStatus,
+    SurfaceSubscriptionItem, SurfaceTaskId,
 };
 
 use crate::attachment_routing::{
@@ -781,7 +782,7 @@ fn focus_child(
             return;
         }
     };
-    let binding = match resolve_child_binding(&parent_snapshot, &task_id, expected_revision) {
+    let binding = match child_binding(&parent_snapshot, &task_id, expected_revision) {
         Ok(binding) => binding,
         Err(error) => {
             reject(event_tx, &error);
@@ -816,11 +817,11 @@ fn focus_child(
             return;
         }
     };
-    let current_binding =
-        match resolve_child_binding(&current_snapshot, &task_id, expected_revision) {
-            Ok(binding) => binding,
+    let (current_binding, open) =
+        match resolve_child_open(&current_snapshot, &task_id, expected_revision) {
+            Ok(decision) => decision,
             Err(error) => {
-                reject(event_tx, &format!("child focus became stale: {error}"));
+                reject(event_tx, &error);
                 return;
             }
         };
@@ -834,7 +835,7 @@ fn focus_child(
 
     let parent_attachment = *session_attachment;
     let parent_event_tx = event_tx.clone();
-    if let Some(revision) = finished_revision(&current_snapshot, &task_id) {
+    if let ChildOpen::Finished { revision } = open {
         let mut finished = HostedChildFocus {
             parent_thread,
             parent_event_tx,
@@ -1451,12 +1452,36 @@ struct ChildBinding {
     child_thread_id: String,
 }
 
-fn resolve_child_binding(
+#[derive(Debug, Eq, PartialEq)]
+enum ChildOpen {
+    Finished { revision: u64 },
+    Interactive,
+}
+
+fn resolve_child_open(
     snapshot: &SurfaceSnapshot,
     task_id: &str,
     expected_revision: u64,
-) -> Result<ChildBinding, String> {
-    child_binding(snapshot, task_id, expected_revision)
+) -> Result<(ChildBinding, ChildOpen), String> {
+    let binding = child_binding(snapshot, task_id, expected_revision)
+        .map_err(|error| format!("child focus became stale: {error}"))?;
+    if let Some(revision) = finished_revision(snapshot, task_id) {
+        return Ok((binding, ChildOpen::Finished { revision }));
+    }
+    let bound_id = snapshot
+        .tasks
+        .iter()
+        .find(|task| task.task_id.as_str() == task_id)
+        .and_then(|task| task.subagent_id.as_ref());
+    if snapshot.subagents.iter().any(|agent| {
+        agent.task_id.as_str() == task_id
+            && Some(&agent.subagent_id) == bound_id
+            && agent.status == SurfaceSubagentStatus::Running
+    }) {
+        Ok((binding, ChildOpen::Interactive))
+    } else {
+        Err("the selected child is no longer running".to_owned())
+    }
 }
 
 fn child_binding(
@@ -4058,6 +4083,59 @@ pub(crate) mod tests {
             error,
             "the selected child task is stale (expected revision 3)"
         );
+    }
+
+    #[test]
+    fn child_open_uses_the_ended_tasks_current_revision() {
+        let mut snapshot = snapshot_with_child(7, 9);
+        snapshot.tasks[0].status = SurfaceTaskStatus::Completed;
+        snapshot.subagents[0].status = SurfaceSubagentStatus::Completed;
+        let (binding, open) = super::resolve_child_open(&snapshot, "child", 3).unwrap();
+        assert_eq!(
+            binding,
+            super::child_binding(&snapshot, "child", 3).unwrap()
+        );
+        assert_eq!(open, super::ChildOpen::Finished { revision: 7 });
+    }
+
+    #[test]
+    fn child_open_is_interactive_for_a_running_agent() {
+        let snapshot = snapshot_with_child(7, 9);
+        let (binding, open) = super::resolve_child_open(&snapshot, "child", 3).unwrap();
+        assert_eq!(
+            binding,
+            super::child_binding(&snapshot, "child", 3).unwrap()
+        );
+        assert_eq!(open, super::ChildOpen::Interactive);
+    }
+
+    fn assert_child_open_refused(status: SurfaceSubagentStatus) {
+        let mut snapshot = snapshot_with_child(7, 9);
+        snapshot.subagents[0].status = status;
+        assert_eq!(
+            super::resolve_child_open(&snapshot, "child", 3).unwrap_err(),
+            "the selected child is no longer running"
+        );
+    }
+
+    #[test]
+    fn child_open_refuses_a_completed_agent_before_its_task_ends() {
+        assert_child_open_refused(SurfaceSubagentStatus::Completed);
+    }
+
+    #[test]
+    fn child_open_refuses_a_failed_agent_before_its_task_ends() {
+        assert_child_open_refused(SurfaceSubagentStatus::Failed);
+    }
+
+    #[test]
+    fn child_open_refuses_a_cancelled_agent_before_its_task_ends() {
+        assert_child_open_refused(SurfaceSubagentStatus::Cancelled);
+    }
+
+    #[test]
+    fn child_open_refuses_a_blocked_agent_before_its_task_ends() {
+        assert_child_open_refused(SurfaceSubagentStatus::Blocked);
     }
 
     #[test]
