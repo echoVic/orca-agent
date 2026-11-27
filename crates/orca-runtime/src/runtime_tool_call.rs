@@ -47,6 +47,7 @@ pub(crate) struct RuntimeReadonlyToolInvocation {
     pub(crate) cwd: PathBuf,
     pub(crate) mcp_registry: McpRegistry,
     pub(crate) output_truncation: ToolOutputTruncation,
+    pub(crate) network_read: Option<Box<RuntimeNormalToolInvocation>>,
 }
 
 pub(crate) struct RuntimeNormalToolInvocation {
@@ -364,7 +365,9 @@ trait RuntimeReadonlyToolExecutor: Send + Sync {
     ) -> ToolResult;
 }
 
-struct DefaultRuntimeReadonlyToolExecutor;
+struct DefaultRuntimeReadonlyToolExecutor {
+    normal_handler: Arc<dyn RuntimeNormalToolHandler>,
+}
 
 impl RuntimeReadonlyToolExecutor for DefaultRuntimeReadonlyToolExecutor {
     fn execute(
@@ -372,6 +375,18 @@ impl RuntimeReadonlyToolExecutor for DefaultRuntimeReadonlyToolExecutor {
         invocation: &RuntimeReadonlyToolInvocation,
         cancel: &CancelToken,
     ) -> ToolResult {
+        if let Some(network_read) = &invocation.network_read {
+            return self.normal_handler.execute(
+                network_read,
+                &mut RuntimeNormalToolWorkerContext {
+                    cancel,
+                    permission_handler: None,
+                    mcp_elicitation_handler: None,
+                    output_handler: None,
+                    permission_overlay: &mut network_read.permission_overlay.clone(),
+                },
+            );
+        }
         let cancelled = || cancel.is_cancelled();
         let ctx = orca_tools::ToolContext::new(&invocation.cwd)
             .with_output_truncation(invocation.output_truncation)
@@ -423,11 +438,15 @@ pub(crate) struct RuntimeToolCallRuntime {
 
 impl RuntimeToolCallRuntime {
     pub(crate) fn for_current_execution() -> io::Result<Self> {
+        let normal_handler = default_normal_handler();
+        let executor = Arc::new(DefaultRuntimeReadonlyToolExecutor {
+            normal_handler: Arc::clone(&normal_handler),
+        });
         match Handle::try_current() {
             Ok(handle) => Ok(Self {
                 handle: Some(handle),
-                executor: Arc::new(DefaultRuntimeReadonlyToolExecutor),
-                normal_handler: Arc::new(DefaultRuntimeNormalToolHandler),
+                executor,
+                normal_handler,
                 _owned_runtime: None,
             }),
             Err(_) => {
@@ -443,8 +462,8 @@ impl RuntimeToolCallRuntime {
                 );
                 Ok(Self {
                     handle: Some(runtime.handle().clone()),
-                    executor: Arc::new(DefaultRuntimeReadonlyToolExecutor),
-                    normal_handler: Arc::new(DefaultRuntimeNormalToolHandler),
+                    executor,
+                    normal_handler,
                     _owned_runtime: Some(runtime),
                 })
             }
@@ -452,10 +471,13 @@ impl RuntimeToolCallRuntime {
     }
 
     pub(crate) fn for_normal_execution() -> Self {
+        let normal_handler = default_normal_handler();
         Self {
             handle: None,
-            executor: Arc::new(DefaultRuntimeReadonlyToolExecutor),
-            normal_handler: default_normal_handler(),
+            executor: Arc::new(DefaultRuntimeReadonlyToolExecutor {
+                normal_handler: Arc::clone(&normal_handler),
+            }),
+            normal_handler,
             _owned_runtime: None,
         }
     }
@@ -1244,6 +1266,7 @@ pub(crate) mod tests {
             cwd: PathBuf::from("."),
             mcp_registry: McpRegistry::default(),
             output_truncation: ToolOutputTruncation::default(),
+            network_read: None,
         }
     }
 

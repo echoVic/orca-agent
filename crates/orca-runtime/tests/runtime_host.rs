@@ -1775,6 +1775,7 @@ fn actor_owned_start_preserves_preloaded_session_usage_and_injected_mcp_registry
             Message::system("original system".to_string()),
             Message::user("resumed prompt".to_string()),
         ],
+        repeat_tool_streak: None,
         compactions: Vec::new(),
         summaries: Vec::new(),
         usage: Some(baseline),

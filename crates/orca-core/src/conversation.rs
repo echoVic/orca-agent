@@ -141,13 +141,21 @@ const DELIVERED_NOTICE_PREFIXES: [&str; 4] = [
     "[Budget soft landing]",
 ];
 
+pub const REPEAT_TOOL_REMINDER_PREFIX: &str = "You have called ";
+
+fn is_repeat_tool_reminder(content: &str) -> bool {
+    content.starts_with(REPEAT_TOOL_REMINDER_PREFIX)
+        && content.contains(" with the same arguments ")
+}
+
 /// Whether a system message is a delivered notice. Notices are ordinary
 /// conversation content: the model keeps seeing each one until compaction
 /// summarizes it, including across a resume.
 pub fn is_delivered_notice(content: &str) -> bool {
-    DELIVERED_NOTICE_PREFIXES
-        .iter()
-        .any(|prefix| content.starts_with(prefix))
+    is_repeat_tool_reminder(content)
+        || DELIVERED_NOTICE_PREFIXES
+            .iter()
+            .any(|prefix| content.starts_with(prefix))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -593,6 +601,9 @@ pub struct NestedInstructionState {
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub internal_context: InternalContext,
+    /// Repeated tool calls since the latest user prompt, retained across
+    /// compaction so reminders do not restart with the visible history tail.
+    pub repeat_tool_streak: Option<RepeatToolStreak>,
     /// Per-server guidance for the current tool set, sent in its own request message.
     pub mcp_instructions: Vec<(String, String)>,
     pub mcp_catalogs: Vec<McpToolCatalog>,
@@ -610,6 +621,13 @@ pub struct Conversation {
     pub nested_instructions: NestedInstructionState,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepeatToolStreak {
+    pub tool_name: String,
+    pub arguments: String,
+    pub count: u32,
+}
+
 // Prompt snapshots and inherited conversations must not publish into the
 // running conversation's read view.
 impl Clone for Conversation {
@@ -617,6 +635,7 @@ impl Clone for Conversation {
         Self {
             messages: self.messages.clone(),
             internal_context: self.internal_context.clone(),
+            repeat_tool_streak: self.repeat_tool_streak.clone(),
             mcp_instructions: self.mcp_instructions.clone(),
             mcp_catalogs: self.mcp_catalogs.clone(),
             rolling_summary: self.rolling_summary.clone(),
@@ -638,6 +657,7 @@ impl Conversation {
         Self {
             messages: Vec::new(),
             internal_context: InternalContext::default(),
+            repeat_tool_streak: None,
             mcp_instructions: Vec::new(),
             mcp_catalogs: Vec::new(),
             rolling_summary: None,
@@ -688,6 +708,7 @@ impl Conversation {
     pub fn adopt(&mut self, mut replacement: Self) {
         replacement.retained_tool_images = self.retained_tool_images.take();
         replacement.nested_instructions = std::mem::take(&mut self.nested_instructions);
+        replacement.repeat_tool_streak = self.repeat_tool_streak.take();
         *self = replacement;
         self.refresh_retained_tool_images();
     }
@@ -863,15 +884,18 @@ impl Conversation {
     }
 
     pub fn add_user(&mut self, content: String) {
+        self.repeat_tool_streak = None;
         self.messages.push(Message::user(content));
     }
 
     pub fn add_user_with_images(&mut self, content: String, images: Vec<ImageInput>) {
+        self.repeat_tool_streak = None;
         self.messages
             .push(Message::user_with_images(content, images));
     }
 
     pub fn add_user_pinned(&mut self, content: String) {
+        self.repeat_tool_streak = None;
         self.messages.push(Message::pinned_user(content));
     }
 
@@ -1079,16 +1103,25 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
                     .map(|tool_call| tool_call.id.as_str())
                     .collect::<HashSet<_>>();
                 let mut collected_tools = HashMap::new();
+                let mut reminders = Vec::new();
                 let mut next = index + 1;
 
                 while next < messages.len() {
-                    let Message::Tool { tool_call_id, .. } = &messages[next] else {
-                        break;
-                    };
-                    if expected.contains(tool_call_id.as_str()) {
-                        collected_tools
-                            .entry(tool_call_id.clone())
-                            .or_insert_with(|| messages[next].clone());
+                    match &messages[next] {
+                        Message::Tool { tool_call_id, .. } => {
+                            if expected.contains(tool_call_id.as_str()) {
+                                collected_tools
+                                    .entry(tool_call_id.clone())
+                                    .or_insert_with(|| messages[next].clone());
+                            }
+                        }
+                        Message::System {
+                            content,
+                            pinned: false,
+                        } if is_repeat_tool_reminder(content) => {
+                            reminders.push(messages[next].clone());
+                        }
+                        _ => break,
                     }
                     next += 1;
                 }
@@ -1107,6 +1140,8 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
                             .unwrap_or_else(|| repaired_missing_tool_result(tool_call)),
                     );
                 }
+                // Providers expect all results in a tool group to be adjacent.
+                normalized.extend(reminders);
                 index = next.max(index + 1);
             }
             message => {

@@ -161,6 +161,94 @@ pub(crate) fn conversation_records_to_thread_items(
         .collect())
 }
 
+#[cfg(test)]
+mod tests {
+    use orca_core::approval_types::ActionKind;
+    use orca_core::conversation::{Message, RawToolCall};
+    use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
+
+    use super::*;
+
+    #[test]
+    fn thread_read_projection_keeps_every_result_before_a_deferred_reminder() {
+        let calls = ["read-1", "read-2", "read-3", "write"]
+            .into_iter()
+            .map(|id| RawToolCall {
+                id: id.to_string(),
+                function_name: if id == "write" {
+                    "write_file"
+                } else {
+                    "read_file"
+                }
+                .to_string(),
+                arguments: "{}".to_string(),
+            })
+            .collect();
+        let mut records = vec![StoredConversationRecord::legacy(StoredMessage::from(
+            &Message::Assistant {
+                content: None,
+                reasoning_content: Some("thinking".to_string()),
+                tool_calls: calls,
+                cut_short: None,
+                pinned: false,
+            },
+        ))];
+        for id in ["read-1", "read-2", "read-3", "write"] {
+            let request = ToolRequest {
+                id: id.to_string(),
+                name: if id == "write" {
+                    ToolName::WriteFile
+                } else {
+                    ToolName::ReadFile
+                },
+                action: if id == "write" {
+                    ActionKind::Write
+                } else {
+                    ActionKind::Read
+                },
+                target: None,
+                raw_arguments: Some("{}".to_string()),
+            };
+            let result = ToolResult::completed(&request, format!("real result {id}"), false);
+            records.push(StoredConversationRecord::legacy(StoredMessage::from(
+                &Message::Tool {
+                    tool_call_id: id.to_string(),
+                    content: format!("real result {id}"),
+                    images: Vec::new(),
+                    terminal: Some(result.terminal().clone()),
+                    pinned: false,
+                },
+            )));
+        }
+        records.push(StoredConversationRecord::legacy(StoredMessage::from(
+            &Message::system(
+                "You have called read_file with the same arguments 3 times in a row. The result will not change; use what you already have, change the arguments, or try a different approach.".to_string(),
+            ),
+        )));
+
+        let turns = conversation_records_to_thread_turns(
+            "thread",
+            &records,
+            usize::MAX,
+            TurnItemsView::Full,
+        )
+        .expect("project tool group");
+        for id in ["read-1", "read-2", "read-3"] {
+            assert!(turns[0].items.iter().any(|item| {
+                item["id"] == id
+                    && item["type"] == "dynamicToolCall"
+                    && item["status"] == "completed"
+                    && item["contentItems"][0]["text"] == format!("real result {id}")
+            }));
+        }
+        assert!(turns[0].items.iter().any(|item| {
+            item["id"] == "write:file-change"
+                && item["type"] == "fileChange"
+                && item["status"] == "completed"
+        }));
+    }
+}
+
 pub(crate) fn normalized_stored_messages(
     records: &[StoredConversationRecord],
 ) -> Vec<StoredMessage> {

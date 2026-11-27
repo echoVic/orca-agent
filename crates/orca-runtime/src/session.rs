@@ -5,7 +5,10 @@ use std::io;
 use std::path::Path;
 
 use orca_core::config::{HistoryMode, RunConfig};
-use orca_core::conversation::{Conversation, Message, assistant_message_has_payload};
+use orca_core::conversation::{
+    Conversation, Message, REPEAT_TOOL_REMINDER_PREFIX, assistant_message_has_payload,
+    is_internal_image_analysis,
+};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::EventFactory;
 use orca_core::event_sink::EventSink;
@@ -13,7 +16,10 @@ use orca_core::hook_types::HookEvent;
 use orca_core::subagent_types::SubagentType;
 use orca_core::task_types::TaskStatus;
 use orca_core::thread_item_projection::CompletedModelResponse;
-use orca_core::tool_types::{ToolName, ToolRequest, ToolResult, ToolStatus};
+use orca_core::tool_types::{
+    ToolInvocationStarted, ToolName, ToolRequest, ToolResult, ToolStatus, ToolTerminal,
+    ToolTerminalSource,
+};
 use orca_mcp::McpRegistry;
 
 use crate::agent_common;
@@ -115,12 +121,26 @@ pub(crate) fn record_tool_result_for_agent(
             .pending_touches
             .push((path.clone(), modified));
     }
+    let reminders = settled_repeat_tool_reminders(conversation);
+    let reminder_messages = reminders
+        .iter()
+        .cloned()
+        .map(Message::system)
+        .collect::<Vec<_>>();
+    conversation
+        .messages
+        .extend(reminder_messages.iter().cloned());
     // Persistence is a durability concern, not an execution concern: a broken
     // transcript must not stop the tool turn. The item is already in memory, so
     // record the failure, mark the writer degraded, and let the turn continue.
     if emit_deltas
         && let Some(writer) = history_writer
-        && let Err(error) = writer.append_message(&message)
+        && let Err(error) = writer.append_message(&message).and_then(|()| {
+            for reminder in &reminder_messages {
+                writer.append_message(reminder)?;
+            }
+            Ok(())
+        })
     {
         tracing::warn!(
             path = %writer.path().display(),
@@ -135,6 +155,182 @@ pub(crate) fn record_tool_result_for_agent(
         return Ok(false);
     }
     Ok(true)
+}
+
+fn settled_repeat_tool_reminders(conversation: &mut Conversation) -> Vec<String> {
+    fn is_poll(name: &str) -> bool {
+        matches!(name, "task_wait" | "task_read_output" | "task_list")
+    }
+
+    fn finished(terminal: &ToolTerminal) -> bool {
+        terminal.source == ToolTerminalSource::Observed
+            && terminal.started != ToolInvocationStarted::No
+            && matches!(terminal.status, ToolStatus::Completed | ToolStatus::Failed)
+    }
+
+    fn canonical_arguments(arguments: &str) -> String {
+        match serde_json::from_str::<serde_json::Value>(arguments) {
+            Ok(mut value) => {
+                value.sort_all_objects();
+                value.to_string()
+            }
+            Err(_) => arguments.to_owned(),
+        }
+    }
+
+    // Reconstruct only the streak that can still produce a reminder. The
+    // transcript already gives each thread its own call order and user boundary.
+    let Some((calls, results)) = settled_tool_group(&conversation.messages) else {
+        return Vec::new();
+    };
+    let mut reminders = Vec::new();
+    for call in calls {
+        if is_poll(&call.function_name) {
+            continue;
+        }
+        let Some(result) = results
+            .iter()
+            .find(|(id, _)| id == &call.id)
+            .map(|(_, result)| result)
+        else {
+            continue;
+        };
+        if !finished(result) {
+            continue;
+        }
+        let arguments = canonical_arguments(&call.arguments);
+        let streak = match conversation.repeat_tool_streak.as_mut() {
+            Some(streak)
+                if streak.tool_name == call.function_name && streak.arguments == arguments =>
+            {
+                streak.count = streak.count.saturating_add(1);
+                streak
+            }
+            _ => {
+                conversation.repeat_tool_streak = Some(orca_core::conversation::RepeatToolStreak {
+                    tool_name: call.function_name.clone(),
+                    arguments: arguments.clone(),
+                    count: 1,
+                });
+                conversation
+                    .repeat_tool_streak
+                    .as_mut()
+                    .expect("streak set")
+            }
+        };
+        if matches!(streak.count, 3 | 5 | 8) {
+            let mut reminder = format!(
+                "{REPEAT_TOOL_REMINDER_PREFIX}{} with the same arguments {} times in a row. The result will not change; use what you already have, change the arguments, or try a different approach.",
+                streak.tool_name, streak.count
+            );
+            if streak.count > 3 {
+                reminder.push_str(" Arguments: ");
+                reminder.extend(streak.arguments.chars().take(300));
+            }
+            reminders.push(reminder);
+        }
+    }
+    reminders
+}
+
+fn settled_tool_group(
+    messages: &[Message],
+) -> Option<(
+    Vec<orca_core::conversation::RawToolCall>,
+    Vec<(String, orca_core::tool_types::ToolTerminal)>,
+)> {
+    let assistant_index = messages.iter().rposition(|message| {
+        matches!(message, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty())
+    })?;
+    let Message::Assistant { tool_calls, .. } = &messages[assistant_index] else {
+        unreachable!();
+    };
+    let mut results = Vec::new();
+    for message in &messages[assistant_index + 1..] {
+        match message {
+            Message::Tool {
+                tool_call_id,
+                terminal: Some(terminal),
+                ..
+            } => results.push((tool_call_id.clone(), terminal.clone())),
+            _ => break,
+        }
+    }
+    if tool_calls
+        .iter()
+        .any(|call| !results.iter().any(|(id, _)| id == &call.id))
+    {
+        return None;
+    }
+    Some((tool_calls.clone(), results))
+}
+
+pub(crate) fn repeat_tool_streak_from_history(
+    messages: &[Message],
+) -> Option<orca_core::conversation::RepeatToolStreak> {
+    fn canonical_arguments(arguments: &str) -> String {
+        match serde_json::from_str::<serde_json::Value>(arguments) {
+            Ok(mut value) => {
+                value.sort_all_objects();
+                value.to_string()
+            }
+            Err(_) => arguments.to_owned(),
+        }
+    }
+
+    let mut streak: Option<orca_core::conversation::RepeatToolStreak> = None;
+    let mut index = 0;
+    while index < messages.len() {
+        match &messages[index] {
+            Message::User {
+                content, images, ..
+            } if !images.is_empty() || !is_internal_image_analysis(content) => {
+                streak = None;
+                index += 1;
+            }
+            Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                let Some((calls, results)) = settled_tool_group(&messages[index..]) else {
+                    break;
+                };
+                for call in calls {
+                    if matches!(
+                        call.function_name.as_str(),
+                        "task_wait" | "task_read_output" | "task_list"
+                    ) {
+                        continue;
+                    }
+                    let Some((_, terminal)) = results.iter().find(|(id, _)| id == &call.id) else {
+                        continue;
+                    };
+                    if terminal.source != ToolTerminalSource::Observed
+                        || terminal.started == ToolInvocationStarted::No
+                        || !matches!(terminal.status, ToolStatus::Completed | ToolStatus::Failed)
+                    {
+                        continue;
+                    }
+                    let arguments = canonical_arguments(&call.arguments);
+                    match streak.as_mut() {
+                        Some(streak)
+                            if streak.tool_name == call.function_name
+                                && streak.arguments == arguments =>
+                        {
+                            streak.count = streak.count.saturating_add(1);
+                        }
+                        _ => {
+                            streak = Some(orca_core::conversation::RepeatToolStreak {
+                                tool_name: call.function_name,
+                                arguments,
+                                count: 1,
+                            });
+                        }
+                    }
+                }
+                index += 1 + results.len();
+            }
+            _ => index += 1,
+        }
+    }
+    streak
 }
 
 pub(crate) fn record_assistant_response_for_agent<W: io::Write>(
@@ -1581,6 +1777,250 @@ mod tests {
             matches!(&conversation.messages[1], orca_core::conversation::Message::User { content, .. }
                 if content == "inspect repo")
         );
+    }
+
+    mod repeat {
+        use super::*;
+        use orca_core::approval_types::ActionKind;
+        use orca_core::conversation::RawToolCall;
+
+        const THIRD: &str = "You have called read_file with the same arguments 3 times in a row. The result will not change; use what you already have, change the arguments, or try a different approach.";
+        const PATH_A: &str = r#"{"path":"a"}"#;
+        const PATH_B: &str = r#"{"path":"b"}"#;
+
+        fn record_call(
+            conversation: &mut Conversation,
+            mut writer: Option<&mut SessionWriter>,
+            name: ToolName,
+            args: &str,
+        ) {
+            let id = format!("call_{}", conversation.messages.len());
+            conversation.add_assistant(
+                None,
+                None,
+                vec![RawToolCall {
+                    id: id.clone(),
+                    function_name: name.as_str().to_string(),
+                    arguments: args.to_string(),
+                }],
+            );
+            if let Some(writer) = writer.as_deref_mut() {
+                writer
+                    .append_message(conversation.messages.last().unwrap())
+                    .unwrap();
+            }
+            let request = ToolRequest {
+                id,
+                name,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(args.to_string()),
+            };
+            let result = ToolResult::completed(&request, "tool output".to_string(), false);
+            record_tool_result_for_agent(conversation, writer, &result, true).unwrap();
+        }
+
+        fn read(conversation: &mut Conversation, args: &str) {
+            record_call(conversation, None, ToolName::ReadFile, args);
+        }
+
+        fn reminders(conversation: &Conversation) -> Vec<&str> {
+            conversation
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::System {
+                        content,
+                        pinned: false,
+                    } if content.starts_with("You have called ") => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn three_identical_calls_add_the_reminder() {
+            let mut conversation = Conversation::new();
+            for _ in 0..3 {
+                assert!(reminders(&conversation).is_empty());
+                read(&mut conversation, PATH_A);
+            }
+            assert_eq!(reminders(&conversation), [THIRD]);
+            assert!(matches!(conversation.messages.as_slice(),
+                [.., Message::Tool { content: output, .. }, Message::System { content, pinned: false }]
+                    if output == "tool output" && content == THIRD));
+        }
+
+        #[test]
+        fn the_fifth_reminder_includes_the_arguments() {
+            let mut conversation = Conversation::new();
+            let args = format!(r#"{{"path":"{}"}}"#, "界".repeat(310));
+            for _ in 0..9 {
+                read(&mut conversation, &args);
+            }
+            let excerpt = format!(r#"{{"path":"{}"#, "界".repeat(291));
+            let fifth = format!(
+                "{} Arguments: {excerpt}",
+                THIRD.replace("3 times", "5 times")
+            );
+            let eighth = format!(
+                "{} Arguments: {excerpt}",
+                THIRD.replace("3 times", "8 times")
+            );
+            assert_eq!(
+                reminders(&conversation),
+                [THIRD, fifth.as_str(), eighth.as_str()]
+            );
+        }
+
+        #[test]
+        fn reminders_wait_until_every_tool_in_the_assistant_group_has_settled() {
+            let mut conversation = Conversation::new();
+            let calls = (0..3)
+                .map(|index| RawToolCall {
+                    id: format!("call-{index}"),
+                    function_name: "read_file".to_string(),
+                    arguments: PATH_A.to_string(),
+                })
+                .collect();
+            conversation.add_assistant(None, None, calls);
+            for index in 0..2 {
+                let request = ToolRequest {
+                    id: format!("call-{index}"),
+                    name: ToolName::ReadFile,
+                    action: ActionKind::Read,
+                    target: None,
+                    raw_arguments: Some(PATH_A.to_string()),
+                };
+                record_tool_result_for_agent(
+                    &mut conversation,
+                    None,
+                    &ToolResult::completed(&request, "tool output".to_string(), false),
+                    false,
+                )
+                .unwrap();
+                assert!(reminders(&conversation).is_empty());
+            }
+            let request = ToolRequest {
+                id: "call-2".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: None,
+                raw_arguments: Some(PATH_A.to_string()),
+            };
+            record_tool_result_for_agent(
+                &mut conversation,
+                None,
+                &ToolResult::completed(&request, "tool output".to_string(), false),
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(reminders(&conversation), [THIRD]);
+            assert!(
+                matches!(conversation.messages.last(), Some(Message::System { content, .. }) if content == THIRD)
+            );
+        }
+
+        #[test]
+        fn reminder_streak_survives_compaction_of_older_tool_groups() {
+            let mut conversation = Conversation::new();
+            for _ in 0..3 {
+                read(&mut conversation, PATH_A);
+            }
+            conversation.messages = conversation
+                .messages
+                .split_off(conversation.messages.len() - 3);
+            for _ in 0..2 {
+                read(&mut conversation, PATH_A);
+            }
+
+            assert_eq!(reminders(&conversation).len(), 2);
+            assert!(reminders(&conversation)[1].contains("5 times"));
+        }
+
+        #[test]
+        fn a_different_call_resets_the_count() {
+            let mut conversation = Conversation::new();
+            for args in [PATH_A, PATH_A, PATH_B, PATH_A, PATH_A] {
+                read(&mut conversation, args);
+            }
+            assert!(reminders(&conversation).is_empty());
+            read(&mut conversation, PATH_A);
+            assert_eq!(reminders(&conversation), [THIRD]);
+        }
+
+        #[test]
+        fn a_user_message_resets_the_count() {
+            let mut conversation = Conversation::new();
+            read(&mut conversation, PATH_A);
+            read(&mut conversation, PATH_A);
+            conversation.add_user("Read it again".to_string());
+            read(&mut conversation, PATH_A);
+            read(&mut conversation, PATH_A);
+            assert!(reminders(&conversation).is_empty());
+            read(&mut conversation, PATH_A);
+            assert_eq!(reminders(&conversation), [THIRD]);
+        }
+
+        #[test]
+        fn argument_key_order_does_not_change_the_key() {
+            let mut conversation = Conversation::new();
+            for args in [
+                r#"{"a":[{"x":1,"y":2}],"z":3}"#,
+                r#"{"z":3,"a":[{"y":2,"x":1}]}"#,
+                r#"{"a":[{"y":2,"x":1}],"z":3}"#,
+            ] {
+                read(&mut conversation, args);
+            }
+            assert_eq!(reminders(&conversation), [THIRD]);
+        }
+
+        #[test]
+        fn task_wait_never_triggers_a_reminder() {
+            let mut conversation = Conversation::new();
+            read(&mut conversation, PATH_A);
+            read(&mut conversation, PATH_A);
+            for name in [
+                ToolName::TaskWait,
+                ToolName::TaskReadOutput,
+                ToolName::TaskList,
+            ] {
+                for _ in 0..8 {
+                    record_call(&mut conversation, None, name.clone(), "{}");
+                }
+            }
+            assert!(reminders(&conversation).is_empty());
+            read(&mut conversation, PATH_A);
+            assert_eq!(reminders(&conversation), [THIRD]);
+        }
+
+        #[test]
+        fn the_reminder_survives_resume_as_a_system_message() {
+            with_orca_home(|_| {
+                let cwd = tempdir().unwrap();
+                let mut writer = SessionWriter::start(cwd.path(), "mock", None, "prompt").unwrap();
+                writer.enter_turn(TurnId::new());
+                let mut conversation = Conversation::new();
+                for _ in 0..3 {
+                    record_call(
+                        &mut conversation,
+                        Some(&mut writer),
+                        ToolName::ReadFile,
+                        PATH_A,
+                    );
+                }
+                let transcript = history::load_session("latest").unwrap();
+                let resumed = crate::thread_store::resume_conversation(
+                    &transcript,
+                    "system prompt".to_string(),
+                );
+                assert_eq!(reminders(&resumed), [THIRD]);
+                assert!(matches!(resumed.messages.as_slice(),
+                    [.., Message::Tool { content: output, .. }, Message::System { content, pinned: false }]
+                        if output == "tool output" && content == THIRD));
+            });
+        }
     }
 
     #[test]
