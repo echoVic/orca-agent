@@ -179,11 +179,31 @@ fn open_completion_history_file(path: &Path) -> io::Result<File> {
 }
 
 pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
+    append_record(path, record).map(|_| ())
+}
+
+fn append_record(path: &Path, record: &SessionRecord) -> io::Result<bool> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
     let _lock = acquire_file_lock(path)?;
+    if let Some(update) = boundary_section_update(record) {
+        let stored = redact_session_record(record);
+        let mut last = None;
+        for candidate in iter_records(path, HydrateImages::NotToolMessages)? {
+            let candidate = candidate?;
+            if let Some(previous) = boundary_section_update(&candidate)
+                && previous.resume_boundary == update.resume_boundary
+                && previous.sections[0].name == update.sections[0].name
+            {
+                last = Some(candidate);
+            }
+        }
+        if last.as_ref().and_then(boundary_section_update) == boundary_section_update(&stored) {
+            return Ok(false);
+        }
+    }
     let line = encode_record_line(path, record)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(&line)?;
@@ -202,7 +222,7 @@ pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn write_durable_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
@@ -738,8 +758,38 @@ pub(crate) fn read_transcript_until(
     })?;
     transcript_from_records(
         path,
-        iter_records(path, HydrateImages::NotToolMessages)?.take(count),
+        iter_records(path, HydrateImages::NotToolMessages)?
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                Ok(record)
+                    if index >= count
+                        && !boundary_section_update(&record).is_some_and(|update| {
+                            update.resume_boundary.as_deref() == Some(boundary_message_id)
+                        }) =>
+                {
+                    None
+                }
+                item => Some(item),
+            }),
     )
+}
+
+fn boundary_section_update(
+    record: &SessionRecord,
+) -> Option<&orca_core::conversation::SystemPromptRecord> {
+    match record {
+        SessionRecord::Message {
+            message:
+                StoredMessage::System {
+                    system_prompt: Some(update),
+                    ..
+                },
+            ..
+        } if update.update && update.resume_boundary.is_some() && update.sections.len() == 1 => {
+            Some(update)
+        }
+        _ => None,
+    }
 }
 
 /// A user message that a `/rewind` can target, in effective-history order.
@@ -1630,7 +1680,9 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
                 redact_stored_message(message);
             }
             for version in &mut record.nested_instructions {
-                redact_string_in_place(&mut version.content);
+                if redact_string_in_place(&mut version.content) {
+                    version.identity.digest.clear();
+                }
             }
             if let Some(summary) = &mut record.rolling_summary {
                 redact_string_in_place(summary);
@@ -1705,8 +1757,28 @@ fn add_usage_totals(totals: &mut UsageTotals, usage: UsageTotals) {
 
 fn redact_stored_message(message: &mut StoredMessage) {
     match message {
-        StoredMessage::System { content, .. } | StoredMessage::User { content, .. } => {
-            redact_string_in_place(content)
+        StoredMessage::System {
+            content,
+            system_prompt,
+            context_fragments,
+            nested_instruction,
+            ..
+        } => {
+            let redacted = redact_sensitive_text(content);
+            let changed = redacted != *content;
+            if changed {
+                redact_fragment_metadata(content, &redacted, context_fragments);
+                *content = redacted;
+                if let Some(identity) = nested_instruction {
+                    identity.digest.clear();
+                }
+            }
+            if let Some(record) = system_prompt {
+                redact_prompt_record(record, changed);
+            }
+        }
+        StoredMessage::User { content, .. } => {
+            redact_string_in_place(content);
         }
         StoredMessage::Tool {
             content, terminal, ..
@@ -1742,9 +1814,61 @@ fn redact_stored_message(message: &mut StoredMessage) {
     }
 }
 
-fn redact_json_value(value: &mut serde_json::Value) {
+pub(crate) fn redact_prompt_record(
+    record: &mut orca_core::conversation::SystemPromptRecord,
+    content_changed: bool,
+) {
+    record.redacted |= content_changed;
+    for section in &mut record.sections {
+        if let Some(text) = &mut section.text {
+            record.redacted |= redact_string_in_place(text);
+        }
+    }
+}
+
+pub(crate) fn redact_fragment_metadata(
+    original: &str,
+    redacted: &str,
+    changes: &mut [orca_core::conversation::ContextFragmentChange],
+) {
+    let mut reconstructed = String::new();
+    let mut cursor = 0;
+    for change in changes.iter_mut() {
+        let Some(span) = change.span.clone() else {
+            break;
+        };
+        let Some(separator) = original.get(cursor..span.start) else {
+            break;
+        };
+        let Some(text) = original.get(span.clone()) else {
+            break;
+        };
+        reconstructed.push_str(separator);
+        let start = reconstructed.len();
+        let stored = redact_sensitive_text(text);
+        reconstructed.push_str(&stored);
+        change.span = Some(start..reconstructed.len());
+        if stored != text {
+            change.redacted = true;
+            change.digest = None;
+        }
+        cursor = span.end;
+    }
+    // A redaction can extend across fragments, invalidating individual spans.
+    if cursor != original.len() || reconstructed != redacted {
+        for change in changes {
+            change.span = None;
+            change.redacted = true;
+            change.digest = None;
+        }
+    }
+}
+
+pub(crate) fn redact_json_value(value: &mut serde_json::Value) {
     match value {
-        serde_json::Value::String(text) => redact_string_in_place(text),
+        serde_json::Value::String(text) => {
+            redact_string_in_place(text);
+        }
         serde_json::Value::Array(values) => {
             for value in values {
                 redact_json_value(value);
@@ -1759,8 +1883,13 @@ fn redact_json_value(value: &mut serde_json::Value) {
     }
 }
 
-fn redact_string_in_place(value: &mut String) {
-    *value = redact_sensitive_text(value);
+fn redact_string_in_place(value: &mut String) -> bool {
+    let redacted = redact_sensitive_text(value);
+    if redacted == *value {
+        return false;
+    }
+    *value = redacted;
+    true
 }
 
 pub(crate) fn acquire_file_lock(path: &Path) -> io::Result<ExclusiveFileLock> {
@@ -1999,6 +2128,8 @@ impl SessionWriter {
             content: version.content.clone(),
             pinned: false,
             nested_instruction: Some(Box::new(version.identity.clone())),
+            context_fragments: Vec::new(),
+            system_prompt: None,
         };
         let record = match &self.turn_id {
             Some(turn) => StoredConversationRecord::identified(
@@ -2094,8 +2225,9 @@ impl SessionWriter {
             .conversation_records
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        write_record(&self.path, &record.as_session_record())?;
-        records.push(record);
+        if append_record(&self.path, &record.as_session_record())? {
+            records.push(record);
+        }
         Ok(())
     }
 

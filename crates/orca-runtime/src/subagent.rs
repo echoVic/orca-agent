@@ -1,9 +1,10 @@
 use std::path::Path;
 
-use orca_core::config::{DelegationSnapshot, RunConfig};
+use orca_core::config::{DelegationSnapshot, ProviderKind, RunConfig};
+use orca_core::conversation::{Conversation, ProviderForkPrefix};
 use orca_core::subagent_config::FrozenAgentConfig;
-use orca_core::subagent_types::SubagentType;
 use orca_core::subagent_types::agent_definition::{AgentCatalog, validate_name};
+use orca_core::subagent_types::{RoleContextPolicy, SubagentType};
 use orca_core::tool_types::ToolRequest;
 use orca_mcp::McpRegistry;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,12 @@ pub struct SubagentRequest {
     pub prompt: String,
     pub subagent_type: SubagentType,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "is_fresh")]
+    pub(crate) context: RoleContextPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fork_prefix_ref: Option<crate::runtime_surface::Sha256Digest>,
+    #[serde(skip)]
+    pub(crate) captured_fork_prefix: Option<std::sync::Arc<ProviderForkPrefix>>,
     pub mode: SubagentMode,
     pub isolation: SubagentIsolation,
     pub schema: Option<Value>,
@@ -32,6 +39,10 @@ pub struct SubagentRequest {
     pub delegation: Option<DelegationSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_agent: Option<FrozenAgentConfig>,
+}
+
+fn is_fresh(context: &RoleContextPolicy) -> bool {
+    *context == RoleContextPolicy::Fresh
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -73,6 +84,10 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         .unwrap_or_default();
     let model = extract_subagent_field(tool_request, "model")
         .filter(|model| orca_core::model::validate_model(model).is_ok());
+    let context = match extract_subagent_field(tool_request, "context").as_deref() {
+        Some("fork") => RoleContextPolicy::Fork,
+        _ => RoleContextPolicy::Fresh,
+    };
     let mode = match extract_subagent_field(tool_request, "mode").as_deref() {
         Some("async") => SubagentMode::Async,
         Some("sync") => SubagentMode::Sync,
@@ -98,6 +113,9 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         prompt,
         subagent_type,
         model,
+        context,
+        fork_prefix_ref: None,
+        captured_fork_prefix: None,
         mode,
         isolation,
         schema,
@@ -106,6 +124,64 @@ pub fn create_subagent_request(tool_request: &ToolRequest) -> SubagentRequest {
         delegation: None,
         frozen_agent: None,
     }
+}
+
+/// Resolve the live parent request before the child is queued or detached.
+pub(crate) fn prepare_fork_request(
+    request: &mut SubagentRequest,
+    config: &RunConfig,
+    parent: Option<&Conversation>,
+    task_registry: &crate::tasks::TaskRegistry,
+) -> Result<Option<&'static str>, String> {
+    if request.context == RoleContextPolicy::Fresh {
+        return Ok(None);
+    }
+    if request.resume_from.is_some() {
+        return Err("context: fork starts a new child; omit context when resuming".into());
+    }
+    if config.provider != ProviderKind::DeepSeek {
+        return Err("the parent's provider cannot start a DeepSeek fork child".into());
+    }
+    let prefix = match parent
+        .ok_or("the parent conversation is unavailable")
+        .and_then(orca_provider::deepseek_http::captured_fork_prefix)
+    {
+        Ok(prefix) => prefix,
+        Err(note) => {
+            request.context = RoleContextPolicy::Fresh;
+            request.prompt = format!(
+                "Fork context unavailable: {note}. Starting fresh.\n\n{}",
+                request.prompt
+            );
+            return Ok(Some(note));
+        }
+    };
+    validate_fork_prefix(config, &prefix)?;
+    request.model = Some(prefix.model.clone());
+    request.fork_prefix_ref = Some(
+        task_registry
+            .continuation_store()?
+            .store_fork_prefix(prefix.clone())
+            .map_err(|error| error.to_string())?,
+    );
+    request.captured_fork_prefix = Some(std::sync::Arc::new(prefix));
+    Ok(None)
+}
+
+pub(crate) fn validate_fork_prefix(
+    config: &RunConfig,
+    prefix: &ProviderForkPrefix,
+) -> Result<(), String> {
+    if config.provider != ProviderKind::DeepSeek
+        || !orca_provider::deepseek_http::fork_prefix_matches_endpoint(
+            prefix,
+            config.base_url.as_deref(),
+        )
+        || orca_core::model::validate_model(&prefix.model).is_err()
+    {
+        return Err("the parent's model and endpoint cannot be used for this fork child".into());
+    }
+    Ok(())
 }
 
 pub fn with_delegation_snapshot(

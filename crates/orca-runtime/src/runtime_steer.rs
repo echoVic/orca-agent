@@ -30,6 +30,7 @@ impl RuntimeSteerStep {
                 writer.append_message(&message)?;
             }
             input.conversation.messages.push(message);
+            input.conversation.note_provider_turn_steer();
             Ok(())
         })? {
             injected += 1;

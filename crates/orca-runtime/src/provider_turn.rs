@@ -576,7 +576,7 @@ impl RuntimeProviderTurnStep {
         if let Some(error) = image_usage_error {
             return Ok(RuntimeProviderTurnOutput::terminal(error));
         }
-        let prepared_images = match prepared_images {
+        let mut prepared_images = match prepared_images {
             Ok(prepared) => prepared,
             Err(error) => {
                 return Ok(RuntimeProviderTurnOutput::terminal(RuntimeTurnStartError {
@@ -597,6 +597,15 @@ impl RuntimeProviderTurnStep {
                 writer.append_message(&analysis)?;
             }
             conversation.messages.push(analysis);
+        }
+        if input.provider == ProviderKind::DeepSeek
+            && let Some(context) = context::pending_context_message(conversation)
+        {
+            if let Some(writer) = history_writer.as_deref_mut() {
+                writer.append_message(&context)?;
+            }
+            prepared_images.conversation.messages.push(context.clone());
+            conversation.messages.push(context);
         }
         // The persisted messages this request is built from; the usage
         // anchor measures against them.
@@ -620,7 +629,7 @@ impl RuntimeProviderTurnStep {
         if input.provider == ProviderKind::DeepSeek
             && let Some(writer) = history_writer.as_deref_mut()
         {
-            let checkpoint = orca_provider::prompt_cache::checkpoint_for_deepseek_request(
+            let checkpoint = orca_provider::prompt_cache::checkpoint_for_deepseek_transcript(
                 &model_conversation,
                 input.provider_config,
             )
@@ -630,8 +639,12 @@ impl RuntimeProviderTurnStep {
                     format!("failed to calculate DeepSeek prompt-cache checkpoint: {error}"),
                 )
             })?;
-            writer
-                .append_prompt_cache_checkpoint(input.turn_context.turn_id.clone(), checkpoint)?;
+            if let Some(checkpoint) = checkpoint {
+                writer.append_prompt_cache_checkpoint(
+                    input.turn_context.turn_id.clone(),
+                    checkpoint,
+                )?;
+            }
         }
         let retry_policy = ProviderRetryPolicy::default();
         // Refresh live wall time after hooks/image preparation before deriving

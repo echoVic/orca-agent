@@ -255,28 +255,28 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         &fallback_task_registry
     };
     let mut background_workflows = Vec::new();
-    let mut checkpoint_conversation = runtime
-        .checkpoint_observer
-        .map(|_| {
-            try_prepare_child_agent_conversation(
-                config,
-                request,
-                runtime.cwd,
-                runtime.instructions,
-                runtime.memory,
+    let mut checkpoint_conversation = (runtime.checkpoint_observer.is_some()
+        || request.fork_prefix.is_some())
+    .then(|| {
+        try_prepare_child_agent_conversation(
+            config,
+            request,
+            runtime.cwd,
+            runtime.instructions,
+            runtime.memory,
+        )
+        .map(|prepared| prepared.conversation)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "child continuation setup failed [{}]: {error}",
+                    error.contract_code()
+                ),
             )
-            .map(|prepared| prepared.conversation)
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "child continuation setup failed [{}]: {error}",
-                        error.contract_code()
-                    ),
-                )
-            })
         })
-        .transpose()?;
+    })
+    .transpose()?;
     let conversation_context = match (
         checkpoint_conversation.as_mut(),
         runtime.checkpoint_observer,
@@ -284,6 +284,7 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
         (Some(conversation), Some(observer)) => {
             AgentConversationContext::borrowed_with_checkpoint_observer(conversation, observer)
         }
+        (Some(conversation), None) => AgentConversationContext::borrowed(conversation, None, false),
         _ => AgentConversationContext::owned(),
     };
     let child = run_agent_loop(

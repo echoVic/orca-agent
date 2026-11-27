@@ -35,6 +35,42 @@ mod windows_shell_prompt_contract_tests {
         assert!(bash.tool.description().contains("resolved host shell"));
         assert!(!bash.tool.description().contains("via sh -c"));
     }
+
+    #[test]
+    fn the_bash_description_has_the_guidance_and_no_stray_spaces() {
+        let registry = default_tool_registry();
+        let description = registry.get("bash").unwrap().description();
+        assert!(description.contains("system from process start"));
+        assert!(!description.contains("  "));
+        for guidance in [
+            "Each call starts a fresh shell",
+            "`workdir` instead of `cd`",
+            "A sandbox block is a policy decision",
+            "report it or ask",
+            "do not retry another way",
+            "${VAR:?}",
+            "delete or overwrite paths",
+        ] {
+            assert!(description.contains(guidance), "missing {guidance}");
+        }
+    }
+
+    #[test]
+    fn the_edit_description_says_to_read_first() {
+        let registry = default_tool_registry();
+        let description = registry.get("edit").unwrap().description();
+        assert!(description.contains("Read the file first"));
+        assert!(description.contains("unless you just created or edited it in this session"));
+    }
+
+    #[test]
+    fn the_read_file_description_prefers_it_over_shell() {
+        let registry = default_tool_registry();
+        let description = registry.get("read_file").unwrap().description();
+        assert!(
+            description.contains("Use this instead of `cat`, `head`, `tail` or `sed` through bash")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -515,7 +551,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry, apply_patch: bool) {
     registry.register(BuiltinTool::new(
         safe_local_read_builtin_spec(
             "read_file",
-            "Read the contents of a file at the given path relative to workspace root.",
+            "Read a file relative to the workspace root. Use this instead of `cat`, `head`, `tail` or `sed` through bash.",
             json!({
                 "type": "object",
                 "properties": {
@@ -651,12 +687,13 @@ fn register_builtin_tools(registry: &mut ToolRegistry, apply_patch: bool) {
     registry.register(BuiltinTool::new(
         cooperative_builtin_spec(
             "bash",
-            "Start one shell command. The command is owned by the runtime task system from              process start: this call waits at most `yield_time_ms` and then returns, and a \
-             command that is still running keeps running. Use `task_read_output` to read more, \
-             `task_send_input` to type into a pty, `task_wait` to block on completion, and \
-             `task_stop` to stop it. The command runs in the resolved host shell named in the \
-             environment section, so use that shell's syntax rather than assuming a POSIX \
-             shell from the tool name. This is the only command entry point.",
+            "Start a command in the resolved host shell named in the environment. Use its syntax. \
+             The command is owned by the runtime task system from process start and can outlast `yield_time_ms`. \
+             Use `task_read_output` for more output, `task_send_input` for pty input, `task_wait` to wait, \
+             and `task_stop` to stop. This is the only command entry point. \
+             Each call starts a fresh shell. Set `workdir` instead of `cd`. \
+             A sandbox block is a policy decision. If blocked, report it or ask, and do not retry another way. \
+             In POSIX shells, guard variables with `${VAR:?}` when commands delete or overwrite paths built from them.",
             json!({
                 "type": "object",
                 "properties": {
@@ -709,7 +746,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry, apply_patch: bool) {
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "edit",
-            "Edit a file by replacing exact text. The old_text must match exactly one location in the file.",
+            "Replace exact text. `old_text` must match once. Read the file first unless you just created or edited it in this session.",
             json!({
                 "type": "object",
                 "properties": {
@@ -936,6 +973,12 @@ fn register_builtin_tools(registry: &mut ToolRegistry, apply_patch: bool) {
                             "deepseek-v4-pro"
                         ],
                         "description": "Override: auto routes, flash favors speed, pro deep reasoning."
+                    },
+                    "context": {
+                        "type": "string",
+                        "enum": ["fresh", "fork"],
+                        "default": "fresh",
+                        "description": "Fork reuses completed parent history and its model. Fresh uses a standalone brief."
                     },
                     "isolation": {
                         "type": "string",

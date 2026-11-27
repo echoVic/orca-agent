@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt, fs, io,
     path::{Path, PathBuf},
@@ -20,12 +21,14 @@ use std::{
 use orca_core::budget::BudgetUsage;
 use orca_core::config::DelegationSnapshot;
 use orca_core::conversation::{
-    Conversation, GOAL_CONTEXT_FRAGMENT_ID, GOAL_CONTEXT_MAX_TOKENS, ImageInput,
-    InternalContextFragment, InternalContextKind, InternalContextOrigin,
-    MEMORY_CONTEXT_FRAGMENT_ID, MEMORY_CONTEXT_MAX_TOKENS, MODE_CONTEXT_FRAGMENT_ID,
-    MODE_CONTEXT_MAX_TOKENS, Message, PLAN_CONTEXT_FRAGMENT_ID, PLAN_CONTEXT_MAX_TOKENS,
-    RUNTIME_CONTEXT_FRAGMENT_ID, RUNTIME_CONTEXT_MAX_TOKENS, RawToolCall,
-    SKILL_CONTEXT_FRAGMENT_ID, SKILL_CONTEXT_MAX_TOKENS, SummaryState, normalize_tool_boundaries,
+    Conversation, DATE_CONTEXT_FRAGMENT_ID, DATE_CONTEXT_MAX_TOKENS, GOAL_CONTEXT_FRAGMENT_ID,
+    GOAL_CONTEXT_MAX_TOKENS, ImageInput, InstructionScope, InternalContextFragment,
+    InternalContextKind, InternalContextOrigin, MEMORY_CONTEXT_FRAGMENT_ID,
+    MEMORY_CONTEXT_MAX_TOKENS, MODE_CONTEXT_FRAGMENT_ID, MODE_CONTEXT_MAX_TOKENS, Message,
+    NestedInstructionSource, NestedInstructionVersion, PLAN_CONTEXT_FRAGMENT_ID,
+    PLAN_CONTEXT_MAX_TOKENS, ProviderForkPrefix, RUNTIME_CONTEXT_FRAGMENT_ID,
+    RUNTIME_CONTEXT_MAX_TOKENS, RawToolCall, SKILL_CONTEXT_FRAGMENT_ID, SKILL_CONTEXT_MAX_TOKENS,
+    SKILLS_CONTEXT_FRAGMENT_ID, SummaryState, SystemPromptRecord, normalize_tool_boundaries,
     repaired_missing_tool_result,
 };
 use orca_core::external_config::ExternalToolConfig;
@@ -34,7 +37,7 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_images::RESUMED_TOOL_IMAGE_NOTE;
 use orca_core::tool_types::{ToolResultKind, ToolStatus, ToolTerminal, ToolTerminalSource};
 use orca_mcp::McpRegistry;
-use orca_platform::fs::{AtomicWritePolicy, ExclusiveFileLock, atomic_write};
+use orca_platform::fs::{AtomicWritePolicy, ExclusiveFileLock, atomic_write, atomic_write_private};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::runtime_surface::Sha256Digest;
@@ -333,21 +336,63 @@ pub(crate) struct ChildConversationSnapshot {
     /// Bounded child-loop context fragments with stable runtime meanings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) internal_context: Vec<StoredChildInternalContextFragment>,
+    /// Context kinds added after Orca 0.5.25, kept outside its fragment enum.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) additional_context: Vec<StoredChildInternalContextFragment>,
+    /// Prompt notices already sent by this fork, in their original positions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fork_prompt_updates: Vec<StoredForkPromptUpdate>,
+    /// Sources for rebuilding the live nested instruction chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) nested_instruction_sources: Vec<NestedInstructionSource>,
     /// Turn cursor to use for the next child-loop iteration.
     #[serde(default)]
     pub(crate) next_turn: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StoredForkPromptUpdate {
+    before_message: usize,
+    content: String,
+    record: SystemPromptRecord,
+}
+
 impl ChildConversationSnapshot {
     fn capture_unchecked(conversation: &Conversation, next_turn: u32) -> Self {
-        let mut messages = conversation
-            .messages
-            .iter()
-            .filter(|message| !matches!(message, Message::System { .. }))
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut fork_prompt_updates = Vec::new();
+        let mut messages = conversation.messages.clone();
         normalize_tool_boundaries(&mut messages);
+        let mut message_count = 0;
+        messages.retain(|message| {
+            if !matches!(message, Message::System { .. }) {
+                message_count += 1;
+                return true;
+            }
+            if conversation.fork_prefix.is_some()
+                && let Some(record) = message
+                    .system_prompt_record()
+                    .filter(|record| record.update)
+                && let Some(content) = message.content_str()
+            {
+                let saved = crate::thread_store::redact_sensitive_text(content);
+                let mut record = record.clone();
+                crate::thread_store::redact_prompt_record(&mut record, saved != content);
+                fork_prompt_updates.push(StoredForkPromptUpdate {
+                    before_message: message_count,
+                    content: saved,
+                    record,
+                });
+            }
+            false
+        });
         repair_missing_tool_terminals(&mut messages);
+
+        let (internal_context, additional_context) = conversation
+            .internal_context
+            .fragments()
+            .iter()
+            .filter_map(StoredChildInternalContextFragment::from_fragment)
+            .partition(StoredChildInternalContextFragment::is_legacy_kind);
 
         Self {
             schema_version: CHILD_CONVERSATION_SNAPSHOT_SCHEMA_VERSION,
@@ -357,11 +402,18 @@ impl ChildConversationSnapshot {
                 .collect(),
             rolling_summary: conversation.rolling_summary.clone(),
             summary: StoredChildSummaryState::from(&conversation.summary),
-            internal_context: conversation
-                .internal_context
-                .fragments()
-                .iter()
-                .filter_map(StoredChildInternalContextFragment::from_fragment)
+            internal_context,
+            additional_context,
+            fork_prompt_updates,
+            nested_instruction_sources: conversation
+                .nested_instructions
+                .versions
+                .values()
+                .map(|version| {
+                    let mut identity = version.identity.clone();
+                    identity.digest.clear();
+                    identity
+                })
                 .collect(),
             next_turn,
         }
@@ -386,6 +438,7 @@ impl ChildConversationSnapshot {
     pub(crate) fn restore_into(
         &self,
         conversation: &mut Conversation,
+        cwd: &Path,
     ) -> Result<u32, AgentContinuationError> {
         if self.schema_version != CHILD_CONVERSATION_SNAPSHOT_SCHEMA_VERSION {
             return Err(AgentContinuationError::UnsupportedSchemaVersion {
@@ -414,13 +467,53 @@ impl ChildConversationSnapshot {
             .collect::<Vec<_>>();
         normalize_tool_boundaries(&mut restored_messages);
         repair_missing_tool_terminals(&mut restored_messages);
+        if conversation.fork_prefix.is_some() {
+            let mut loaded_sources = HashMap::new();
+            for update in self.fork_prompt_updates.iter().rev() {
+                if crate::history::prompt_sources_can_replay(
+                    &update.record,
+                    cwd,
+                    &mut loaded_sources,
+                ) {
+                    restored_messages.insert(
+                        update.before_message.min(restored_messages.len()),
+                        Message::system_with_prompt_record(
+                            update.content.clone(),
+                            update.record.clone(),
+                        ),
+                    );
+                }
+            }
+        }
         conversation.messages.extend(restored_messages);
         conversation.rolling_summary = self.rolling_summary.clone();
         conversation.summary = SummaryState::from(&self.summary);
-        for fragment in &self.internal_context {
-            conversation
-                .internal_context
-                .replace(fragment.to_fragment());
+        for stored in self.internal_context.iter().chain(&self.additional_context) {
+            let fragment = stored.to_fragment();
+            if fragment
+                .instruction_scope
+                .as_ref()
+                .is_none_or(|scope| crate::skill_context::catalog_scope_is_loaded(scope, cwd))
+            {
+                conversation.internal_context.replace(fragment);
+            } else {
+                crate::skill_context::refresh_catalog(conversation, cwd);
+            }
+        }
+        if !self.nested_instruction_sources.is_empty() {
+            let versions = self
+                .nested_instruction_sources
+                .iter()
+                .cloned()
+                .map(|mut identity| {
+                    identity.digest.clear();
+                    NestedInstructionVersion {
+                        identity,
+                        content: String::new(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            crate::instructions::restore_nested_state(conversation, cwd, &[], &versions, &[]);
         }
 
         Ok(self.next_turn)
@@ -897,23 +990,52 @@ impl From<&StoredChildSummaryState> for SummaryState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum StoredChildInternalContextFragment {
-    Runtime { content: String },
-    Mode { content: String },
-    Goal { content: String },
-    Plan { content: String },
-    Skill { content: String },
-    Memory { content: String },
+    Date {
+        content: String,
+    },
+    Runtime {
+        content: String,
+    },
+    Mode {
+        content: String,
+    },
+    Goal {
+        content: String,
+    },
+    Plan {
+        content: String,
+    },
+    Skill {
+        content: String,
+    },
+    SkillCatalog {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<InstructionScope>,
+    },
+    Memory {
+        content: String,
+    },
 }
 
 impl StoredChildInternalContextFragment {
+    fn is_legacy_kind(&self) -> bool {
+        !matches!(self, Self::Date { .. } | Self::SkillCatalog { .. })
+    }
+
     fn from_fragment(fragment: &InternalContextFragment) -> Option<Self> {
         let content = fragment.content.clone();
         match fragment.id.as_str() {
+            DATE_CONTEXT_FRAGMENT_ID => Some(Self::Date { content }),
             RUNTIME_CONTEXT_FRAGMENT_ID => Some(Self::Runtime { content }),
             MODE_CONTEXT_FRAGMENT_ID => Some(Self::Mode { content }),
             GOAL_CONTEXT_FRAGMENT_ID => Some(Self::Goal { content }),
             PLAN_CONTEXT_FRAGMENT_ID => Some(Self::Plan { content }),
             SKILL_CONTEXT_FRAGMENT_ID => Some(Self::Skill { content }),
+            SKILLS_CONTEXT_FRAGMENT_ID => Some(Self::SkillCatalog {
+                content,
+                scope: fragment.instruction_scope.clone(),
+            }),
             MEMORY_CONTEXT_FRAGMENT_ID => Some(Self::Memory { content }),
             _ => None,
         }
@@ -921,6 +1043,13 @@ impl StoredChildInternalContextFragment {
 
     fn to_fragment(&self) -> InternalContextFragment {
         let (id, kind, origin, content, max_tokens) = match self {
+            Self::Date { content } => (
+                DATE_CONTEXT_FRAGMENT_ID,
+                InternalContextKind::Runtime,
+                InternalContextOrigin::System,
+                content,
+                DATE_CONTEXT_MAX_TOKENS,
+            ),
             Self::Runtime { content } => (
                 RUNTIME_CONTEXT_FRAGMENT_ID,
                 InternalContextKind::Runtime,
@@ -956,6 +1085,13 @@ impl StoredChildInternalContextFragment {
                 content,
                 SKILL_CONTEXT_MAX_TOKENS,
             ),
+            Self::SkillCatalog { content, .. } => (
+                SKILLS_CONTEXT_FRAGMENT_ID,
+                InternalContextKind::Skill,
+                InternalContextOrigin::System,
+                content,
+                SKILL_CONTEXT_MAX_TOKENS,
+            ),
             Self::Memory { content } => (
                 MEMORY_CONTEXT_FRAGMENT_ID,
                 InternalContextKind::Memory,
@@ -970,6 +1106,10 @@ impl StoredChildInternalContextFragment {
             origin,
             content: content.clone(),
             max_tokens,
+            instruction_scope: match self {
+                Self::SkillCatalog { scope, .. } => scope.clone(),
+                _ => None,
+            },
         }
     }
 }
@@ -1030,41 +1170,102 @@ pub(crate) struct AgentCheckpoint {
     pub(crate) last_tool_boundary: Option<ToolBoundary>,
     /// Checkpoint creation time in Unix milliseconds.
     pub(crate) created_at_ms: i64,
-    /// SHA-256 digest of the canonical checkpoint payload.
+    /// Digest of the payload in the Orca 0.5.25 format.
     pub(crate) digest: Sha256Digest,
+    /// Digest covering every field written by the current release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) full_digest: Option<Sha256Digest>,
 }
 
 impl AgentCheckpoint {
-    /// Serializes the stable checkpoint digest input without including the digest itself.
-    pub(crate) fn canonical_payload_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+    fn digest_payload(
+        &self,
+        conversation: &ChildConversationSnapshot,
+    ) -> Result<Sha256Digest, AgentContinuationError> {
         serde_json::to_vec(&CanonicalAgentCheckpointPayload {
             schema_version: AGENT_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
             checkpoint_id: &self.checkpoint_id,
             attempt_id: &self.attempt_id,
             sequence: self.sequence,
-            conversation: &self.conversation,
+            conversation,
             turn: self.turn,
             usage: &self.usage,
             last_tool_boundary: self.last_tool_boundary.as_ref(),
             created_at_ms: self.created_at_ms,
         })
+        .map(Sha256Digest::digest)
+        .map_err(|_| persistence_error("serialize checkpoint digest payload"))
     }
 
-    /// Computes the digest required when creating or committing this checkpoint.
-    pub(crate) fn computed_digest(&self) -> Result<Sha256Digest, AgentContinuationError> {
-        self.canonical_payload_bytes()
-            .map(Sha256Digest::digest)
-            .map_err(|_| AgentContinuationError::Persistence {
-                message: "failed to serialize checkpoint digest payload".to_string(),
+    /// Orca 0.5.25 drops these fields when it reads and reserializes a checkpoint.
+    fn legacy_conversation(&self) -> Cow<'_, ChildConversationSnapshot> {
+        let conversation = &self.conversation;
+        if conversation.summary.tool_output_spills.is_empty()
+            && conversation.additional_context.is_empty()
+            && conversation.fork_prompt_updates.is_empty()
+            && conversation.nested_instruction_sources.is_empty()
+            && conversation
+                .internal_context
+                .iter()
+                .all(StoredChildInternalContextFragment::is_legacy_kind)
+            && !conversation.messages.iter().any(|message| {
+                matches!(message,
+                StoredChildMessage::Tool { terminal: Some(terminal), .. }
+                if terminal.spill.is_some() || terminal.mcp_tool_load.is_some())
             })
+        {
+            return Cow::Borrowed(conversation);
+        }
+        let mut legacy = conversation.clone();
+        legacy.summary.tool_output_spills.clear();
+        legacy.additional_context.clear();
+        legacy.fork_prompt_updates.clear();
+        legacy.nested_instruction_sources.clear();
+        legacy
+            .internal_context
+            .retain(StoredChildInternalContextFragment::is_legacy_kind);
+        for message in &mut legacy.messages {
+            if let StoredChildMessage::Tool {
+                terminal: Some(terminal),
+                ..
+            } = message
+            {
+                terminal.spill = None;
+                terminal.mcp_tool_load = None;
+            }
+        }
+        Cow::Owned(legacy)
     }
 
-    /// Verifies that the persisted digest matches the canonical checkpoint payload.
-    pub(crate) fn verify_digest(&self) -> Result<(), AgentContinuationError> {
-        if self.computed_digest()? != self.digest {
-            return Err(AgentContinuationError::DigestMismatch);
-        }
+    pub(crate) fn seal(&mut self) -> Result<(), AgentContinuationError> {
+        let legacy = self.legacy_conversation();
+        let full_digest = self.digest_payload(&self.conversation)?;
+        self.digest = match legacy {
+            Cow::Borrowed(_) => full_digest,
+            Cow::Owned(legacy) => self.digest_payload(&legacy)?,
+        };
+        self.full_digest = Some(full_digest);
         Ok(())
+    }
+
+    pub(crate) fn verify_digest(&self) -> Result<(), AgentContinuationError> {
+        let legacy = self.legacy_conversation();
+        // Checkpoints written before the dual digest sealed the entire snapshot.
+        let valid = if let Some(expected) = self.full_digest {
+            let legacy_digest = self.digest_payload(&legacy)?;
+            let full_digest = match legacy {
+                Cow::Borrowed(_) => legacy_digest,
+                Cow::Owned(_) => self.digest_payload(&self.conversation)?,
+            };
+            legacy_digest == self.digest && full_digest == expected
+        } else {
+            self.digest_payload(&self.conversation)? == self.digest
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(AgentContinuationError::DigestMismatch)
+        }
     }
 }
 
@@ -1131,6 +1332,9 @@ pub(crate) struct AgentContinuationRecord {
     pub(crate) subagent_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) frozen_agent: Option<FrozenAgentConfig>,
+    /// Reference to the shared provider request prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fork_prefix_ref: Option<Sha256Digest>,
     /// Fixed or inherited model identity used for compatibility checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) model: Option<String>,
@@ -1432,6 +1636,7 @@ pub(crate) struct PreparedContinuation {
     pub(crate) prompt_id: AgentPromptId,
     /// Compatibility and workspace identity the child loop must retain.
     pub(crate) compatibility: ContinuationCompatibility,
+    pub(crate) fork_prefix: Option<Arc<ProviderForkPrefix>>,
     /// Source checkpoint for resume, or the latest checkpoint after settlement.
     pub(crate) checkpoint: Option<AgentCheckpoint>,
     /// Current durable revision to use when acquiring or committing.
@@ -1461,6 +1666,7 @@ impl From<&AgentContinuationRecord> for PreparedContinuation {
                 worktree: record.worktree.clone(),
                 compatibility_hash: record.compatibility_hash,
             },
+            fork_prefix: None,
             checkpoint: record.checkpoint.clone(),
             revision: record.revision,
             source_task_id: record.source_task_id.clone(),
@@ -1508,6 +1714,7 @@ impl ContinuationReconciliation {
 struct ProcessLocalContinuationState {
     index: HashMap<AgentContinuationId, String>,
     records: HashMap<AgentContinuationId, AgentContinuationRecord>,
+    fork_prefixes: HashMap<Sha256Digest, Arc<ProviderForkPrefix>>,
 }
 
 impl AgentContinuationStore {
@@ -1540,6 +1747,69 @@ impl AgentContinuationStore {
     /// Returns the parent session whose continuations this store may access.
     pub(crate) fn parent_session_id(&self) -> &str {
         &self.parent_session_id
+    }
+
+    pub(crate) fn store_fork_prefix(
+        &self,
+        prefix: ProviderForkPrefix,
+    ) -> Result<Sha256Digest, AgentContinuationError> {
+        let mut prefix = prefix;
+        if matches!(
+            self.backend,
+            AgentContinuationStoreBackend::Persistent { .. }
+        ) {
+            crate::fork_context::redact_for_storage(&mut prefix)
+                .map_err(|_| persistence_error("redact fork prefix"))?;
+        }
+        let bytes =
+            serde_json::to_vec(&prefix).map_err(|_| persistence_error("serialize fork prefix"))?;
+        let digest = Sha256Digest::digest(&bytes);
+        match &self.backend {
+            AgentContinuationStoreBackend::ProcessLocal { state } => {
+                lock_process_state(state)?
+                    .fork_prefixes
+                    .entry(digest)
+                    .or_insert_with(|| Arc::new(prefix));
+            }
+            AgentContinuationStoreBackend::Persistent { root, .. } => {
+                let _lock = acquire_lock(
+                    &session_lock_path(root, &self.parent_session_id),
+                    "acquire fork prefix lock",
+                )?;
+                let path = fork_prefix_path(root, &self.parent_session_id, digest);
+                if read_fork_prefix_bytes(&path, digest)?.is_none() {
+                    fs::create_dir_all(path.parent().expect("fork prefix directory")).map_err(
+                        |error| persistence_io_error("create fork prefix directory", &error),
+                    )?;
+                    atomic_write_private(&path, &bytes, AtomicWritePolicy::NoFollow)
+                        .map_err(|_| persistence_error("write fork prefix"))?;
+                }
+            }
+        }
+        Ok(digest)
+    }
+
+    pub(crate) fn load_fork_prefix(
+        &self,
+        digest: Sha256Digest,
+    ) -> Result<Arc<ProviderForkPrefix>, AgentContinuationError> {
+        match &self.backend {
+            AgentContinuationStoreBackend::ProcessLocal { state } => lock_process_state(state)?
+                .fork_prefixes
+                .get(&digest)
+                .cloned()
+                .ok_or_else(|| corrupt_record("referenced fork prefix is missing")),
+            AgentContinuationStoreBackend::Persistent { root, .. } => {
+                let path = fork_prefix_path(root, &self.parent_session_id, digest);
+                let bytes = read_fork_prefix_bytes(&path, digest)?
+                    .ok_or_else(|| corrupt_record("referenced fork prefix is missing"))?;
+                let mut prefix = serde_json::from_slice(&bytes)
+                    .map_err(|_| corrupt_record("fork prefix does not match its schema"))?;
+                crate::fork_context::redact_for_storage(&mut prefix)
+                    .map_err(|_| corrupt_record("fork prefix contains an invalid message"))?;
+                Ok(Arc::new(prefix))
+            }
+        }
     }
 
     /// Creates one new revision-zero continuation after validating all durable invariants.
@@ -1646,6 +1916,23 @@ impl AgentContinuationStore {
                     }
                 }
 
+                // With neither an index entry nor a record, any association
+                // belongs to a creation that did not finish.
+                let association =
+                    fork_child_path(root, &self.parent_session_id, &record.continuation_id);
+                match fs::remove_file(&association) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(persistence_io_error(
+                            "remove orphan fork association",
+                            &error,
+                        ));
+                    }
+                }
+                if let Some(digest) = record.fork_prefix_ref {
+                    write_json_pretty(&association, &digest, "write fork prefix association")?;
+                }
                 write_json_pretty(&record_path, &record, "write continuation record")?;
                 index.insert(
                     record.continuation_id.as_str().to_string(),
@@ -2312,10 +2599,58 @@ fn read_record(
             found: schema_version,
         });
     }
-    let record: AgentContinuationRecord = serde_json::from_value(value)
+    let mut record: AgentContinuationRecord = serde_json::from_value(value)
         .map_err(|_| corrupt_record("continuation record does not match its schema"))?;
     validate_record(&record, Some(continuation_id), Some(parent_session_id))?;
+    let association = read_fork_child(&fork_child_path(root, parent_session_id, continuation_id))?;
+    if let (Some(inline), Some(associated)) = (record.fork_prefix_ref, association)
+        && inline != associated
+    {
+        return Err(corrupt_record(
+            "fork prefix association does not match its continuation",
+        ));
+    }
+    record.fork_prefix_ref = record.fork_prefix_ref.or(association);
     Ok(record)
+}
+
+fn read_fork_prefix_bytes(
+    path: &Path,
+    digest: Sha256Digest,
+) -> Result<Option<Vec<u8>>, AgentContinuationError> {
+    match fs::read(path) {
+        Ok(bytes) if Sha256Digest::digest(&bytes) == digest => Ok(Some(bytes)),
+        Ok(_) => Err(corrupt_record("fork prefix digest mismatch")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(persistence_io_error("read fork prefix", &error)),
+    }
+}
+
+fn read_fork_child(path: &Path) -> Result<Option<Sha256Digest>, AgentContinuationError> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| corrupt_record("fork prefix association does not match its schema")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(persistence_io_error("read fork prefix association", &error)),
+    }
+}
+
+fn fork_prefix_path(root: &Path, session: &str, digest: Sha256Digest) -> PathBuf {
+    let name: String = digest
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    root.join(safe_path_component(session))
+        .join("fork-prefixes")
+        .join(format!("{name}.json"))
+}
+
+fn fork_child_path(root: &Path, session: &str, child: &AgentContinuationId) -> PathBuf {
+    root.join(safe_path_component(session))
+        .join("fork-children")
+        .join(format!("{}.json", child.as_str()))
 }
 
 fn write_json_pretty<T: Serialize>(
@@ -2590,6 +2925,14 @@ impl ChildAgentCoordinator {
         &self,
         input: CreateContinuationInput,
     ) -> Result<PreparedContinuation, AgentContinuationError> {
+        self.create_with_fork(input, None)
+    }
+
+    pub(crate) fn create_with_fork(
+        &self,
+        input: CreateContinuationInput,
+        fork_prefix_ref: Option<Sha256Digest>,
+    ) -> Result<PreparedContinuation, AgentContinuationError> {
         validate_task_binding(&input.parent_task_id, &input.task_id)?;
         validate_compatibility_shape(&input.compatibility)?;
         let continuation_id = input
@@ -2602,6 +2945,7 @@ impl ChildAgentCoordinator {
                 && record.current_attempt.prompt_id == input.prompt_id
                 && record.subagent_type == input.compatibility.subagent_type
                 && record.frozen_agent == input.compatibility.frozen_agent
+                && record.fork_prefix_ref == fork_prefix_ref
                 && record.model == input.compatibility.model
                 && record.isolation == input.compatibility.isolation
                 && record.effective_cwd == input.compatibility.effective_cwd
@@ -2609,7 +2953,7 @@ impl ChildAgentCoordinator {
                 && record.compatibility_hash == input.compatibility.compatibility_hash;
             if duplicate {
                 self.install_projection(&record)?;
-                return Ok(PreparedContinuation::from(&record));
+                return self.prepare_record(&record);
             }
             return Err(AgentContinuationError::AlreadyExists { continuation_id });
         }
@@ -2624,6 +2968,7 @@ impl ChildAgentCoordinator {
             latest_task_id: input.task_id,
             subagent_type: input.compatibility.subagent_type,
             frozen_agent: input.compatibility.frozen_agent,
+            fork_prefix_ref,
             model: input.compatibility.model,
             isolation: input.compatibility.isolation,
             effective_cwd: input.compatibility.effective_cwd,
@@ -2650,7 +2995,19 @@ impl ChildAgentCoordinator {
         };
         let record = self.store.create_record(record)?;
         self.install_projection(&record)?;
-        Ok(PreparedContinuation::from(&record))
+        self.prepare_record(&record)
+    }
+
+    fn prepare_record(
+        &self,
+        record: &AgentContinuationRecord,
+    ) -> Result<PreparedContinuation, AgentContinuationError> {
+        let mut prepared = PreparedContinuation::from(record);
+        prepared.fork_prefix = record
+            .fork_prefix_ref
+            .map(|digest| self.store.load_fork_prefix(digest))
+            .transpose()?;
+        Ok(prepared)
     }
 
     /// Resolves a UUIDv7 continuation directly or a compatibility task/agent selector through the task registry; it returns stable not-found or persistence errors and performs no writes.
@@ -2687,7 +3044,7 @@ impl ChildAgentCoordinator {
             .store
             .load_record(&continuation_id)?
             .ok_or(AgentContinuationError::NotFound)?;
-        let prepared = PreparedContinuation::from(&record);
+        let prepared = self.prepare_record(&record)?;
         validate_compatibility_shape(&prepared.compatibility)?;
         if let Some(checkpoint) = prepared.checkpoint.as_ref() {
             checkpoint.verify_digest()?;
@@ -2759,15 +3116,17 @@ impl ChildAgentCoordinator {
         validate_resume_request(&record, &validation_input)?;
 
         if record.current_attempt.prompt_id == input.prompt_id {
+            let prepared = self.prepare_record(&record)?;
             self.install_projection(&record)?;
-            return Ok(PreparedContinuation::from(&record));
+            return Ok(prepared);
         }
 
         let now_ms = continuation_now_ms();
         reject_live_owner(&record, now_ms)?;
         ensure_record_resumable(&record)?;
         let expected_revision = record.revision;
-        let previous = PreparedContinuation::from(&record);
+        let previous = self.prepare_record(&record)?;
+        let fork_prefix = previous.fork_prefix.clone();
         let prompt_id = input.prompt_id;
         let task_id = input.task_id;
         let parent_task_id = input.parent_task_id;
@@ -2810,7 +3169,10 @@ impl ChildAgentCoordinator {
                     Ok(())
                 })?;
         self.install_projection(&committed)?;
-        Ok(PreparedContinuation::from(&committed))
+        Ok(PreparedContinuation {
+            fork_prefix,
+            ..PreparedContinuation::from(&committed)
+        })
     }
 
     fn validate_recorded_parent_recovery(
@@ -3968,6 +4330,737 @@ mod tests {
     use super::*;
     use orca_core::conversation::Conversation;
 
+    // Persistence fixture copied from the v0.5.25 tag.
+    mod legacy_v0_5_25 {
+        use super::*;
+
+        #[derive(Deserialize, Serialize)]
+        pub(super) struct AgentContinuationRecord {
+            #[serde(default = "default_schema_version")]
+            pub(crate) schema_version: u32,
+            pub(crate) continuation_id: AgentContinuationId,
+            pub(crate) parent_session_id: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) parent_task_id: Option<String>,
+            pub(crate) source_task_id: String,
+            pub(crate) latest_task_id: String,
+            pub(crate) subagent_type: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) frozen_agent: Option<FrozenAgentConfig>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) model: Option<String>,
+            pub(crate) isolation: SubagentIsolation,
+            pub(crate) effective_cwd: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) worktree: Option<WorktreeBinding>,
+            pub(crate) compatibility_hash: Sha256Digest,
+            #[serde(default)]
+            pub(crate) revision: ContinuationRevision,
+            #[serde(default)]
+            pub(crate) status: ContinuationStatus,
+            pub(crate) current_attempt: AgentAttemptRecord,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) checkpoint: Option<AgentCheckpoint>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) active_tool_boundary: Option<ToolBoundary>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) terminal: Option<AgentTerminal>,
+            pub(crate) created_at_ms: i64,
+            pub(crate) updated_at_ms: i64,
+        }
+
+        #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+        pub(super) struct AgentCheckpoint {
+            pub(crate) checkpoint_id: AgentCheckpointId,
+            pub(crate) attempt_id: AgentAttemptId,
+            #[serde(default)]
+            pub(crate) sequence: u64,
+            pub(crate) conversation: ChildConversationSnapshot,
+            #[serde(default)]
+            pub(crate) turn: u32,
+            #[serde(default)]
+            pub(crate) usage: BudgetUsage,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) last_tool_boundary: Option<ToolBoundary>,
+            pub(crate) created_at_ms: i64,
+            pub(crate) digest: Sha256Digest,
+        }
+
+        #[derive(Serialize)]
+        struct CanonicalAgentCheckpointPayload<'a> {
+            schema_version: u32,
+            checkpoint_id: &'a AgentCheckpointId,
+            attempt_id: &'a AgentAttemptId,
+            sequence: u64,
+            conversation: &'a ChildConversationSnapshot,
+            turn: u32,
+            usage: &'a BudgetUsage,
+            last_tool_boundary: Option<&'a ToolBoundary>,
+            created_at_ms: i64,
+        }
+
+        #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+        pub(super) struct ChildConversationSnapshot {
+            #[serde(default = "default_child_conversation_snapshot_schema_version")]
+            pub(crate) schema_version: u32,
+            #[serde(default)]
+            pub(crate) messages: Vec<StoredChildMessage>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) rolling_summary: Option<String>,
+            #[serde(default)]
+            pub(crate) summary: StoredChildSummaryState,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            pub(crate) internal_context: Vec<StoredChildInternalContextFragment>,
+            #[serde(default)]
+            pub(crate) next_turn: u32,
+        }
+
+        #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+        #[serde(rename_all = "snake_case", tag = "kind")]
+        pub(super) enum StoredChildInternalContextFragment {
+            Runtime { content: String },
+            Mode { content: String },
+            Goal { content: String },
+            Plan { content: String },
+            Skill { content: String },
+            Memory { content: String },
+        }
+
+        #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+        pub(super) struct StoredChildSummaryState {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            baseline: Option<String>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            deltas: Vec<String>,
+        }
+
+        #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+        #[serde(rename_all = "snake_case", tag = "role")]
+        pub(super) enum StoredChildMessage {
+            User {
+                content: String,
+                #[serde(default, skip_serializing_if = "Vec::is_empty")]
+                images: Vec<ImageInput>,
+                #[serde(default)]
+                pinned: bool,
+            },
+            Assistant {
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                content: Option<String>,
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                reasoning_content: Option<String>,
+                #[serde(default, skip_serializing_if = "Vec::is_empty")]
+                tool_calls: Vec<RawToolCall>,
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                cut_short: Option<orca_core::conversation::CutShort>,
+                #[serde(default)]
+                pinned: bool,
+            },
+            Tool {
+                tool_call_id: String,
+                content: String,
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                terminal: Option<ToolTerminal>,
+                #[serde(default)]
+                pinned: bool,
+            },
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+        pub struct ToolTerminal {
+            pub status: ToolStatus,
+            pub error: Option<String>,
+            pub exit_code: Option<i32>,
+            pub truncated: bool,
+            #[serde(default = "legacy_success", skip_serializing_if = "legacy_is_success")]
+            pub kind: ToolResultKind,
+            #[serde(
+                default,
+                rename = "terminal_source",
+                skip_serializing_if = "legacy_is_observed"
+            )]
+            pub source: ToolTerminalSource,
+            #[serde(
+                default,
+                rename = "invocation_started",
+                skip_serializing_if = "legacy_is_unknown"
+            )]
+            pub started: ToolInvocationStarted,
+        }
+
+        #[derive(Deserialize)]
+        struct ToolTerminalWire {
+            status: ToolStatus,
+            error: Option<String>,
+            exit_code: Option<i32>,
+            truncated: bool,
+            #[serde(default)]
+            kind: Option<ToolResultKind>,
+            #[serde(default, rename = "terminal_source")]
+            source: ToolTerminalSource,
+            #[serde(default, rename = "invocation_started")]
+            started: ToolInvocationStarted,
+        }
+
+        use orca_core::tool_types::ToolInvocationStarted;
+        fn legacy_success() -> ToolResultKind {
+            ToolResultKind::Success
+        }
+        fn legacy_is_success(kind: &ToolResultKind) -> bool {
+            *kind == ToolResultKind::Success
+        }
+        fn legacy_is_observed(source: &ToolTerminalSource) -> bool {
+            *source == ToolTerminalSource::Observed
+        }
+        fn legacy_is_unknown(started: &ToolInvocationStarted) -> bool {
+            *started == ToolInvocationStarted::Unknown
+        }
+
+        impl<'de> Deserialize<'de> for ToolTerminal {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let wire = ToolTerminalWire::deserialize(deserializer)?;
+                let terminal = orca_core::tool_types::ToolTerminal::try_from_parts(
+                    wire.status,
+                    wire.error,
+                    wire.exit_code,
+                    wire.truncated,
+                    wire.kind,
+                    wire.source,
+                    wire.started,
+                )
+                .map_err(serde::de::Error::custom)?;
+                Ok(Self {
+                    status: terminal.status,
+                    error: terminal.error,
+                    exit_code: terminal.exit_code,
+                    truncated: terminal.truncated,
+                    kind: terminal.kind,
+                    source: terminal.source,
+                    started: terminal.started,
+                })
+            }
+        }
+
+        impl AgentCheckpoint {
+            pub(super) fn verifiable(&self) -> bool {
+                let bytes = serde_json::to_vec(&CanonicalAgentCheckpointPayload {
+                    schema_version: AGENT_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+                    checkpoint_id: &self.checkpoint_id,
+                    attempt_id: &self.attempt_id,
+                    sequence: self.sequence,
+                    conversation: &self.conversation,
+                    turn: self.turn,
+                    usage: &self.usage,
+                    last_tool_boundary: self.last_tool_boundary.as_ref(),
+                    created_at_ms: self.created_at_ms,
+                })
+                .unwrap();
+                Sha256Digest::digest(bytes) == self.digest
+            }
+        }
+    }
+
+    fn checkpoint_with_tool_result(field: &str) -> AgentCheckpoint {
+        use orca_core::tool_types::{
+            McpToolLoad, ToolName, ToolOutputSpill, ToolRequest, ToolResult,
+        };
+        let mut checkpoint = checkpoint(AgentAttemptId::new(), 0, 0);
+        let request = ToolRequest {
+            id: "child-read".into(),
+            name: ToolName::ReadFile,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let mut result = ToolResult::completed(&request, "file evidence".into(), false);
+        if field == "spill" {
+            result.set_spill(
+                ToolOutputSpill::new(std::env::temp_dir(), request.id.clone(), 1024).unwrap(),
+            );
+        } else if field == "mcp_tool_load" {
+            result = result.with_mcp_tool_load(Some(McpToolLoad {
+                server: "fixture".into(),
+                names: ["inspect".into()].into(),
+            }));
+        }
+        let mut conversation = Conversation::new();
+        conversation.add_user("Read evidence".into());
+        conversation.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: request.id.clone(),
+                function_name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        conversation.add_tool_result_with_terminal(&result, "file evidence".into());
+        let (snapshot, boundary) =
+            ChildConversationSnapshot::try_capture_safe(&conversation, 1).unwrap();
+        checkpoint.conversation = snapshot;
+        checkpoint.last_tool_boundary = boundary;
+        checkpoint.seal().unwrap();
+        checkpoint
+    }
+
+    #[test]
+    fn v0_5_25_verifies_plain_spill_and_mcp_checkpoints() {
+        let mut rejected = Vec::new();
+        for field in ["plain", "spill", "mcp_tool_load"] {
+            let checkpoint = checkpoint_with_tool_result(field);
+            let bytes = serde_json::to_vec(&checkpoint).unwrap();
+            let older: legacy_v0_5_25::AgentCheckpoint = serde_json::from_slice(&bytes).unwrap();
+            if !older.verifiable() {
+                rejected.push(field);
+            }
+        }
+        assert!(rejected.is_empty(), "0.5.25 rejected {rejected:?}");
+    }
+
+    #[test]
+    fn v0_5_25_verifies_child_checkpoints_with_saved_context() {
+        let cwd = tempfile::tempdir().unwrap();
+        let scope = InstructionScope {
+            cwd: cwd.path().to_owned(),
+            sources: vec![cwd.path().join(".agents/skills/review/SKILL.md")],
+        };
+        let mut conversation = Conversation::new();
+        conversation.fork_prefix = Some(Arc::new(test_fork_prefix()));
+        conversation.add_user("Review the report".into());
+        let mut recorded = crate::system_prompt::SystemPrompt::default();
+        recorded.push("identity", "Earlier prompt");
+        let mut current = crate::system_prompt::SystemPrompt::default();
+        current.push("identity", "Updated prompt");
+        conversation
+            .messages
+            .extend(crate::system_prompt::section_updates(
+                &[recorded.into_message()],
+                &current.into_message(),
+                None,
+            ));
+        conversation.set_today(chrono::NaiveDate::from_ymd_opt(2026, 11, 27).unwrap());
+        conversation.replace_runtime_context(Some("working in a child".into()));
+        conversation.replace_skill_catalog(Some("Available skills: review".into()));
+        conversation
+            .internal_context
+            .set_instruction_scope(SKILLS_CONTEXT_FRAGMENT_ID, scope);
+        conversation.nested_instructions.versions.insert(
+            PathBuf::from("docs/AGENTS.md"),
+            NestedInstructionVersion {
+                identity: NestedInstructionSource {
+                    workspace: cwd.path().to_owned(),
+                    source: "docs/AGENTS.md".into(),
+                    digest: "fixture-digest".into(),
+                    updated: false,
+                    shortened: false,
+                },
+                content: "Review the headings".into(),
+            },
+        );
+        let mut checkpoint = checkpoint(AgentAttemptId::new(), 0, 0);
+        checkpoint.conversation = ChildConversationSnapshot::try_capture_safe(&conversation, 1)
+            .unwrap()
+            .0;
+        assert_eq!(checkpoint.conversation.fork_prompt_updates.len(), 1);
+        checkpoint.seal().unwrap();
+        let bytes = serde_json::to_vec(&checkpoint).unwrap();
+        let older: legacy_v0_5_25::AgentCheckpoint = serde_json::from_slice(&bytes).unwrap();
+        assert!(older.verifiable());
+        let rewritten: AgentCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(&older).unwrap()).unwrap();
+        rewritten.verify_digest().unwrap();
+        let full: AgentCheckpoint = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(full.conversation, checkpoint.conversation);
+        full.verify_digest().unwrap();
+        assert_ne!(full.full_digest, Some(full.digest));
+        let mut unsealed_extensions = full;
+        unsealed_extensions.full_digest = None;
+        assert!(matches!(
+            unsealed_extensions.verify_digest(),
+            Err(AgentContinuationError::DigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_checkpoint_rewritten_by_v0_5_25_still_verifies() {
+        let checkpoint = checkpoint_with_tool_result("plain");
+        let older: legacy_v0_5_25::AgentCheckpoint =
+            serde_json::from_value(serde_json::to_value(checkpoint).unwrap()).unwrap();
+        let restored: AgentCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(&older).unwrap()).unwrap();
+        restored.verify_digest().unwrap();
+    }
+
+    #[test]
+    fn the_full_checkpoint_digest_detects_changed_mcp_fields() {
+        let checkpoint = checkpoint_with_tool_result("mcp_tool_load");
+        checkpoint.verify_digest().unwrap();
+        let mut wire = serde_json::to_value(checkpoint).unwrap();
+        assert!(wire.get("full_digest").is_some());
+        let terminal = &mut wire["conversation"]["messages"][2]["terminal"];
+        assert_eq!(terminal["mcp_tool_load"]["server"], "fixture");
+        terminal["mcp_tool_load"]["server"] = "changed".into();
+        let older: legacy_v0_5_25::AgentCheckpoint = serde_json::from_value(wire.clone()).unwrap();
+        assert!(older.verifiable());
+        let altered: AgentCheckpoint = serde_json::from_value(wire).unwrap();
+        assert!(matches!(
+            altered.verify_digest(),
+            Err(AgentContinuationError::DigestMismatch)
+        ));
+    }
+
+    fn test_fork_prefix() -> orca_core::conversation::ProviderForkPrefix {
+        orca_core::conversation::ProviderForkPrefix {
+            model: orca_core::model::PRO_MODEL.into(),
+            endpoint: "https://api.deepseek.com".into(),
+            reasoning_effort: orca_core::config::ReasoningEffort::High,
+            messages: vec![
+                r#"{"role":"user","content":"parent evidence for both siblings"}"#.into(),
+            ],
+            tools: vec![],
+            estimated_tokens: 15,
+            system_messages: vec![],
+            redacted: false,
+        }
+    }
+
+    #[test]
+    fn fork_history_on_disk_is_redacted() {
+        use orca_core::conversation::{ContextFragmentChange, ForkSystemMessage};
+        let root = tempfile::tempdir().unwrap();
+        let store = AgentContinuationStore::new_persistent("parent".into(), root.path().to_owned())
+            .unwrap();
+        let marker = "fictional-fork-value";
+        let text = format!("token={marker}");
+        let content =
+            format!("Current memory context (this replaces any earlier version):\n{text}");
+        let mut prefix = test_fork_prefix();
+        let mut prompt = crate::system_prompt::SystemPrompt::default();
+        prompt.push("identity", &text);
+        let prompt = prompt.into_message();
+        prefix.messages = vec![
+            serde_json::json!({"role":"system", "content": prompt.content_str().unwrap()}).to_string(),
+            serde_json::json!({"role":"system", "content": content}).to_string(),
+            serde_json::json!({"role":"assistant", "reasoning_content":text, "tool_calls":[{
+                "id":"read", "type":"function", "function":{"name":"read_file", "arguments":serde_json::json!({"token":marker}).to_string()}
+            }]}).to_string(),
+        ];
+        prefix.system_messages = vec![
+            ForkSystemMessage {
+                index: 0,
+                context_fragments: vec![],
+                system_prompt: prompt.system_prompt_record().cloned().map(Box::new),
+            },
+            ForkSystemMessage {
+                index: 1,
+                context_fragments: vec![ContextFragmentChange {
+                    id: "memory".into(),
+                    digest: Some([42; 32]),
+                    span: Some(0..content.len()),
+                    redacted: false,
+                    instruction_scope: None,
+                }],
+                system_prompt: None,
+            },
+        ];
+        let unredacted = serde_json::to_vec(&prefix).unwrap();
+        let reference = store.store_fork_prefix(prefix.clone()).unwrap();
+        let file = fork_prefix_path(root.path(), "parent", reference);
+        let saved = fs::read_to_string(&file).unwrap();
+        assert!(!saved.contains(marker));
+        assert_ne!(reference, Sha256Digest::digest(&unredacted));
+        assert_eq!(reference, Sha256Digest::digest(saved.as_bytes()));
+        assert!(prefix.messages[1].contains(marker));
+        assert!(
+            !fork_prefix_path(root.path(), "parent", Sha256Digest::digest(unredacted)).exists()
+        );
+        let reopened =
+            AgentContinuationStore::new_persistent("parent".into(), root.path().to_owned())
+                .unwrap();
+        let loaded = reopened.load_fork_prefix(reference).unwrap();
+        assert_ne!(loaded.messages, prefix.messages);
+        assert!(loaded.redacted);
+        assert!(
+            loaded
+                .messages
+                .iter()
+                .all(|message| message.contains("<redacted>"))
+        );
+        assert!(
+            loaded.system_messages[0]
+                .system_prompt
+                .as_ref()
+                .unwrap()
+                .redacted
+        );
+        assert!(loaded.system_messages[1].context_fragments[0].redacted);
+        assert!(
+            loaded.system_messages[1].context_fragments[0]
+                .digest
+                .is_none()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    fn test_continuation_input(registry: &TaskRegistry) -> CreateContinuationInput {
+        let child = registry.create_subagent_with_parent(
+            "inspect evidence".into(),
+            Some("general".into()),
+            None,
+        );
+        CreateContinuationInput {
+            continuation_id: Some(AgentContinuationId::new()),
+            parent_task_id: None,
+            task_id: child.id,
+            prompt_id: AgentPromptId::new(),
+            compatibility: ContinuationCompatibility {
+                subagent_type: "general".into(),
+                frozen_agent: None,
+                model: Some(orca_core::model::PRO_MODEL.into()),
+                isolation: SubagentIsolation::None,
+                effective_cwd: std::env::temp_dir().display().to_string(),
+                worktree: None,
+                compatibility_hash: Sha256Digest::new([7; 32]),
+            },
+        }
+    }
+
+    fn create_test_fork(registry: &TaskRegistry) -> PreparedContinuation {
+        ChildAgentCoordinator::new(registry.clone())
+            .unwrap()
+            .create_with_fork(
+                test_continuation_input(registry),
+                Some(
+                    registry
+                        .continuation_store()
+                        .unwrap()
+                        .store_fork_prefix(test_fork_prefix())
+                        .unwrap(),
+                ),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_failed_fork_creation_does_not_bind_a_later_fresh_child() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let input = test_continuation_input(&registry);
+        let id = input.continuation_id.clone().unwrap();
+        let coordinator = ChildAgentCoordinator::new(registry).unwrap();
+        let digest = coordinator
+            .store
+            .store_fork_prefix(test_fork_prefix())
+            .unwrap();
+        let association = fork_child_path(root.path(), "parent", &id);
+        // A failed creation can leave the association before the record is written.
+        write_json_pretty(&association, &digest, "write test association").unwrap();
+
+        coordinator.create(input).unwrap();
+        let restored = coordinator.prepared(id.as_str()).unwrap();
+        assert!(restored.fork_prefix.is_none());
+        assert!(!association.exists());
+    }
+
+    #[test]
+    fn sibling_forks_store_the_prefix_once() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let siblings = [create_test_fork(&registry), create_test_fork(&registry)];
+        let path = root.path().join("parent");
+        let copies = walkdir::WalkDir::new(&path)
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| {
+                fs::read_to_string(entry.path())
+                    .is_ok_and(|text| text.contains("parent evidence for both siblings"))
+            })
+            .count();
+        assert_eq!(copies, 1);
+        let coordinator = ChildAgentCoordinator::new(registry).unwrap();
+        for child in siblings {
+            let restored = coordinator
+                .prepared(child.continuation_id.as_str())
+                .unwrap();
+            assert_eq!(
+                restored
+                    .fork_prefix
+                    .as_ref()
+                    .map(|prefix| prefix.messages.as_slice()),
+                Some(test_fork_prefix().messages.as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_fork_association_uses_the_inline_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let child = create_test_fork(&registry);
+        let association = fork_child_path(root.path(), "parent", &child.continuation_id);
+        fs::remove_file(&association).unwrap();
+
+        let coordinator = ChildAgentCoordinator::new(registry).unwrap();
+        let restored = coordinator
+            .prepared(child.continuation_id.as_str())
+            .unwrap();
+        assert_eq!(restored.fork_prefix, child.fork_prefix);
+
+        let other_digest = Sha256Digest::digest(b"another prefix");
+        write_json_pretty(&association, &other_digest, "write test association").unwrap();
+        assert_eq!(
+            coordinator
+                .prepared(child.continuation_id.as_str())
+                .unwrap_err(),
+            corrupt_record("fork prefix association does not match its continuation")
+        );
+    }
+
+    #[test]
+    fn a_broken_fork_prefix_does_not_block_other_tasks() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let broken = create_test_fork(&registry);
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let other = coordinator
+            .create(test_continuation_input(&registry))
+            .unwrap();
+        let digest = coordinator
+            .store
+            .load_record(&broken.continuation_id)
+            .unwrap()
+            .unwrap()
+            .fork_prefix_ref
+            .unwrap();
+        let prefix_path = fork_prefix_path(root.path(), "parent", digest);
+        fs::remove_file(&prefix_path).unwrap();
+        drop(coordinator);
+        drop(registry);
+
+        for problem in [
+            "referenced fork prefix is missing",
+            "fork prefix digest mismatch",
+        ] {
+            if problem == "fork prefix digest mismatch" {
+                fs::write(&prefix_path, b"corrupt history").unwrap();
+                fs::remove_file(fork_child_path(
+                    root.path(),
+                    "parent",
+                    &broken.continuation_id,
+                ))
+                .unwrap();
+            }
+            let reopened =
+                TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+            assert!(reopened.get(&other.latest_task_id).is_some());
+            let coordinator = ChildAgentCoordinator::new(reopened).unwrap();
+            assert!(coordinator.prepared(other.continuation_id.as_str()).is_ok());
+            assert_eq!(
+                coordinator
+                    .validate_resume_admission(broken.continuation_id.as_str(), None, None)
+                    .unwrap_err(),
+                corrupt_record(problem)
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_fork_prefix_leaves_the_continuation_resumable() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let child = create_test_fork(&registry);
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let lease = coordinator.acquire(&child).unwrap();
+        let saved = coordinator
+            .commit_checkpoint(
+                &lease,
+                lease.revision,
+                checkpoint(lease.attempt_id.clone(), 0, 0),
+            )
+            .unwrap();
+        coordinator
+            .commit_terminal(
+                &lease,
+                saved.revision,
+                AgentTerminal::Completed { result: None },
+            )
+            .unwrap();
+        let before = coordinator
+            .store
+            .load_record(&child.continuation_id)
+            .unwrap()
+            .unwrap();
+        let digest = before.fork_prefix_ref.unwrap();
+        fs::remove_file(fork_prefix_path(root.path(), "parent", digest)).unwrap();
+        let task = test_continuation_input(&registry);
+        let input = ResumeContinuationInput {
+            selector: child.continuation_id.to_string(),
+            parent_task_id: task.parent_task_id,
+            task_id: task.task_id,
+            prompt_id: task.prompt_id,
+            compatibility: child.compatibility,
+        };
+
+        assert_eq!(
+            coordinator.prepare_resume(input.clone()).unwrap_err(),
+            corrupt_record("referenced fork prefix is missing")
+        );
+        assert_eq!(
+            coordinator
+                .store
+                .load_record(&child.continuation_id)
+                .unwrap(),
+            Some(before)
+        );
+
+        assert_eq!(
+            coordinator
+                .store
+                .store_fork_prefix(test_fork_prefix())
+                .unwrap(),
+            digest
+        );
+        let resumed = coordinator
+            .prepare_resume(ResumeContinuationInput {
+                prompt_id: AgentPromptId::new(),
+                ..input
+            })
+            .unwrap();
+        assert_eq!(resumed.fork_prefix, child.fork_prefix);
+        assert_ne!(resumed.attempt_id, child.attempt_id);
+    }
+
+    #[test]
+    fn a_continuation_rewritten_by_an_older_release_keeps_the_fork_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let child = create_test_fork(&registry);
+        let path = continuation_record_path(root.path(), "parent", &child.continuation_id);
+        let older: legacy_v0_5_25::AgentContinuationRecord =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&older).unwrap()).unwrap();
+        drop(registry);
+        let reopened = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let restored = ChildAgentCoordinator::new(reopened)
+            .unwrap()
+            .prepared(child.continuation_id.as_str())
+            .unwrap();
+        assert_eq!(
+            restored
+                .fork_prefix
+                .as_ref()
+                .map(|prefix| prefix.messages.as_slice()),
+            Some(test_fork_prefix().messages.as_slice())
+        );
+    }
     #[test]
     fn custom_agent_snapshot_does_not_change_legacy_builtin_hash_or_record_shape() {
         let delegation = DelegationSnapshot::default();
@@ -4041,6 +5134,7 @@ mod tests {
                 worktree: None,
                 compatibility_hash: legacy_hash,
             },
+            fork_prefix: None,
             checkpoint: None,
             revision: ContinuationRevision::ZERO,
             source_task_id: "task-source".to_string(),
@@ -4143,8 +5237,9 @@ mod tests {
             last_tool_boundary,
             created_at_ms: continuation_now_ms(),
             digest: Sha256Digest::new([0; 32]),
+            full_digest: None,
         };
-        checkpoint.digest = checkpoint.computed_digest().expect("checkpoint digest");
+        checkpoint.seal().expect("checkpoint digest");
         checkpoint
     }
 
@@ -4262,6 +5357,77 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_child_gets_its_fragments_once() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust};
+        use orca_provider::context::pending_context_message;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(
+            &crate::history::isolated_test_orca_home_subdir("child-cache-context"),
+        );
+        set_trust(cwd.path(), TrustLevel::Trusted).unwrap();
+        let src = cwd.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("AGENTS.md"), "Child scoped runbook").unwrap();
+        let touched = src.join("sample.txt");
+        fs::write(&touched, "fixture").unwrap();
+
+        let mut conversation = Conversation::new();
+        conversation.add_system("original child prompt".into());
+        conversation.add_user("inspect sample".into());
+        conversation.set_today(chrono::NaiveDate::from_ymd_opt(2026, 11, 27).unwrap());
+        conversation.replace_runtime_context(Some("child runtime hint".into()));
+        conversation.replace_skill_catalog(Some("child skill catalog".into()));
+        conversation.replace_memory_context(Some("old child memory".into()));
+        conversation
+            .nested_instructions
+            .pending_touches
+            .push((touched, false));
+        crate::instructions::load_for_cwd(cwd.path())
+            .unwrap()
+            .append_nested_for_touches(&mut conversation, None);
+        conversation
+            .messages
+            .extend(pending_context_message(&conversation));
+        conversation.replace_memory_context(Some("current child memory".into()));
+        conversation.replace_plan_state("current child plan".into());
+        let (snapshot, _) = ChildConversationSnapshot::try_capture_safe(&conversation, 2).unwrap();
+        let snapshot: ChildConversationSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let mut resumed = Conversation::new();
+        resumed.add_system("rebuilt child prompt".into());
+        assert_eq!(snapshot.restore_into(&mut resumed, cwd.path()).unwrap(), 2);
+        resumed.add_user("continue the inspection".into());
+        resumed.messages.extend(pending_context_message(&resumed));
+        let history = resumed
+            .messages
+            .iter()
+            .filter_map(Message::content_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "rebuilt child prompt",
+            "2026-11-27",
+            "child runtime hint",
+            "child skill catalog",
+            "current child memory",
+            "Child scoped runbook",
+        ] {
+            assert_eq!(history.matches(expected).count(), 1, "{expected}");
+        }
+        assert!(
+            !history.contains("old child memory") && !history.contains("original child prompt")
+        );
+        assert!(
+            resumed
+                .internal_context
+                .render()
+                .contains("current child plan")
+        );
+        assert!(pending_context_message(&resumed).is_none());
+    }
+
+    #[test]
     fn a_restored_child_tool_message_notes_the_image_it_lost() {
         let mut conversation = Conversation::new();
         conversation.add_user("capture the screen".to_string());
@@ -4294,7 +5460,7 @@ mod tests {
                 .expect("load snapshot");
         let mut restored = Conversation::new();
         stored
-            .restore_into(&mut restored)
+            .restore_into(&mut restored, Path::new("."))
             .expect("restore snapshot");
 
         let Some(Message::Tool {

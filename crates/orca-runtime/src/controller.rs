@@ -2875,9 +2875,9 @@ mod tests {
             )
             .unwrap();
             let text = |content: &str| content.contains("Use the durable review checklist.");
-            assert_eq!(session.conversation().messages.iter().filter(|message| matches!(message, Message::System { content, pinned: false } if text(content))).count(), 1);
+            assert_eq!(session.conversation().messages.iter().filter(|message| matches!(message, Message::System { content, pinned: false, .. } if text(content))).count(), 1);
             let parts = session.runtime_parts();
-            assert_eq!(parts.writer.unwrap().conversation_records().iter().filter(|record| matches!(Message::from(record.message.clone()), Message::System { content, pinned: false } if text(&content))).count(), 1);
+            assert_eq!(parts.writer.unwrap().conversation_records().iter().filter(|record| matches!(Message::from(record.message.clone()), Message::System { content, pinned: false, .. } if text(&content))).count(), 1);
         });
     }
 
@@ -3017,7 +3017,7 @@ mod tests {
             }
             let one_shot = crate::session::bootstrap_agent_conversation(
                 Some(&transcript),
-                "System".into(),
+                Message::system("System".into()),
                 &nested,
                 "Continue",
             );
@@ -3393,6 +3393,20 @@ while IFS= read -r line; do
     }
 
     #[cfg(unix)]
+    fn requested_mcp_catalog(request: &serde_json::Value) -> &str {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .find_map(|message| {
+                message.split_once("Current mcp context (this replaces any earlier version):\n")
+            })
+            .unwrap()
+            .1
+    }
+
+    #[cfg(unix)]
     fn mcp_only_names(request: &serde_json::Value) -> Vec<&str> {
         request["tools"]
             .as_array()
@@ -3494,8 +3508,7 @@ while IFS= read -r line; do
             loader["function"]["parameters"]["properties"]["names"]["items"]["type"],
             "string"
         );
-        let messages = request["messages"].as_array().unwrap();
-        let mcp = messages.last().unwrap()["content"].as_str().unwrap();
+        let mcp = requested_mcp_catalog(&request);
         assert!(mcp.contains("<mcp_tool_catalog>"));
         assert!(mcp.contains(r#""name":"lookup""#));
         assert!(mcp.contains(r"\u003cexample\u003e"));
@@ -3911,9 +3924,19 @@ while IFS= read -r line; do
         );
         run_mcp_test_prompt(&config, &mut session);
         let requests = provider.join().unwrap();
-        let catalog = requests[0]["messages"].as_array().unwrap().last().unwrap()["content"]
-            .as_str()
-            .unwrap();
+        let catalog = requested_mcp_catalog(&requests[0]);
+        assert_eq!(requested_mcp_catalog(&requests[1]), catalog);
+        assert_eq!(
+            requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("<mcp_tool_catalog>")))
+                .count(),
+            1
+        );
         assert!(catalog.contains("MCP catalog shortened"));
         assert!(catalog.contains("mcp__catalog__load_tools"));
         assert!(catalog.contains("mcp__other__load_tools"));
@@ -4275,7 +4298,7 @@ while IFS= read -r line; do
         let message_count = thread.session().conversation().messages.len();
         assert!(matches!(
             thread.session().conversation().messages.last(),
-            Some(Message::System { content, pinned: false })
+            Some(Message::System { content, pinned: false, .. })
                 if content.contains("<task-notification>")
                     && content.contains("notified")
                     && content.contains(&task_id)
@@ -4571,9 +4594,337 @@ while IFS= read -r line; do
         serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})
     }
 
+    #[test]
+    fn a_redacted_prompt_is_sent_without_a_saved_cache_digest() {
+        let cwd = tempfile::tempdir().unwrap();
+        let home = crate::history::isolated_test_orca_home_subdir("redacted-cache-digest");
+        let _home = crate::history::redirect_test_orca_home(&home);
+        std::fs::write(home.join("AGENTS.md"), "Token: required").unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.history_mode = HistoryMode::Record;
+        config.pricing_refresh = false;
+        let provider = serve_scripted_provider(&mut config, [scripted_reply()]);
+        let mut thread = RuntimeThread::start(&config, "read the policy").unwrap();
+        assert_eq!(
+            thread
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("read the policy"),
+                    io::sink()
+                )
+                .unwrap(),
+            RunStatus::Success
+        );
+        let requests = provider.join().unwrap();
+        assert!(
+            requests[0]["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Token: required")
+        );
+        let raw =
+            std::fs::read_to_string(thread.session_mut().writer_mut().unwrap().path()).unwrap();
+        assert!(raw.contains("Token: <redacted>"));
+        assert!(!raw.contains("provider.prompt_cache_checkpoint"));
+    }
+
+    #[test]
+    fn runtime_capture_preserves_tool_groups_and_restores_current_fragments() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust};
+        use orca_core::conversation::REPEAT_TOOL_REMINDER_PREFIX;
+        use serde_json::{Value, json};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(
+            &crate::history::isolated_test_orca_home_subdir("runtime-cache-capture"),
+        );
+        set_trust(cwd.path(), TrustLevel::Trusted).unwrap();
+        let src = cwd.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("sample.txt"), "fixture output").unwrap();
+        let source = src.join("AGENTS.md");
+        let initial = "Use the first scoped runbook.";
+        let current = "Use the current scoped runbook.";
+        std::fs::write(&source, initial).unwrap();
+
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.history_mode = HistoryMode::Record;
+        config.auto_memory = false;
+        config.pricing_refresh = false;
+        let call = |index: usize, id: &str| {
+            json!({"index": index, "id": id, "type": "function", "function": {
+                "name": "read_file", "arguments": r#"{"path":"src/sample.txt"}"#
+            }})
+        };
+        let calls = |calls: Vec<Value>| {
+            json!({"choices": [{
+                "delta": {"reasoning_content": "Inspect the fixture.", "tool_calls": calls},
+                "finish_reason": "tool_calls"
+            }]})
+        };
+        let (capture, captures) = std::sync::mpsc::channel();
+        let capture_turn = capture.clone();
+        let provider = serve_scripted_provider_with(
+            &mut config,
+            [
+                calls(vec![call(0, "parallel-a"), call(1, "parallel-b")]),
+                calls(vec![call(0, "repeat-c")]),
+                scripted_reply(),
+            ],
+            move |index, body| {
+                capture_turn.send(body.to_vec()).unwrap();
+                if index == 1 {
+                    std::fs::write(&source, current).unwrap();
+                }
+            },
+        );
+        let mut thread = RuntimeThread::start(&config, "inspect scoped instructions").unwrap();
+        let prompt = format!(
+            "Inspect the fixture. {}",
+            "Old context for compaction. ".repeat(2400)
+        );
+        assert_eq!(
+            thread
+                .run_request(&config, &ThreadTurnRequest::new(&prompt), io::sink())
+                .unwrap(),
+            RunStatus::Success
+        );
+        let requests = provider.join().unwrap();
+        let session = thread.session_mut();
+        let id = session.session_id().unwrap().to_owned();
+        let path = session.writer_mut().unwrap().path().to_owned();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let raw_messages = raw
+            .lines()
+            .filter_map(|line| {
+                let record: Value = serde_json::from_str(line).unwrap();
+                (record["type"] == "conversation.message").then(|| record["message"].clone())
+            })
+            .collect::<Vec<_>>();
+
+        let assert_group = |messages: &[Value], ids: &[&str]| {
+            let index = messages
+                .iter()
+                .position(|message| message["tool_calls"][0]["id"] == ids[0])
+                .expect("recorded tool-call assistant");
+            assert_eq!(messages[index]["role"], "assistant");
+            assert_eq!(messages[index]["reasoning_content"], "Inspect the fixture.");
+            assert_eq!(
+                messages[index]["tool_calls"].as_array().unwrap().len(),
+                ids.len()
+            );
+            for (result, id) in messages[index + 1..].iter().zip(ids) {
+                assert_eq!(result["role"], "tool");
+                assert_eq!(result["tool_call_id"], *id);
+            }
+            assert!(messages.len() > index + ids.len());
+        };
+        let assert_notice_order = |messages: &[Value]| {
+            let repeat = messages
+                .iter()
+                .position(|message| message["tool_call_id"] == "repeat-c")
+                .unwrap();
+            let reminder = messages
+                .iter()
+                .position(|message| {
+                    message["role"] == "system"
+                        && message["content"].as_str().is_some_and(|text| {
+                            text.starts_with(REPEAT_TOOL_REMINDER_PREFIX)
+                                && text.contains("3 times in a row")
+                        })
+                })
+                .expect("repeat-call reminder");
+            let update = messages
+                .iter()
+                .position(|message| {
+                    message["role"] == "system"
+                        && message["content"].as_str().is_some_and(|text| {
+                            text.starts_with("Current nested-project-instructions context")
+                                && text.contains(current)
+                        })
+                })
+                .expect("updated fragment batch");
+            assert!(repeat < reminder && reminder < update);
+        };
+        let second = requests[1]["messages"].as_array().unwrap();
+        let third = requests[2]["messages"].as_array().unwrap();
+        assert!(second.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains(initial))
+        }));
+        for messages in [&raw_messages, third] {
+            assert_group(messages, &["parallel-a", "parallel-b"]);
+            assert_group(messages, &["repeat-c"]);
+            assert_notice_order(messages);
+        }
+        assert_group(second, &["parallel-a", "parallel-b"]);
+
+        let mut compact_config = config.clone();
+        compact_config.provider = ProviderKind::Mock;
+        compact_config.model_runtime.soft_compact_token_limit = Some(16_000);
+        let outcome = session
+            .compact(
+                &compact_config,
+                cwd.path(),
+                &crate::extension::ExtensionData::new(&id),
+                &orca_core::cancel::CancelToken::new(),
+                |_| {
+                    Ok(crate::session::ManualCompactionPersistenceIdentity {
+                        operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
+                            *uuid::Uuid::now_v7().as_bytes(),
+                        )
+                        .unwrap(),
+                        snapshot_id: uuid::Uuid::now_v7().to_string(),
+                    })
+                },
+            )
+            .unwrap();
+        assert!(outcome.after.messages.len() < outcome.before.messages.len());
+        drop(thread);
+
+        config.history_mode = HistoryMode::Resume(id);
+        let provider =
+            serve_scripted_provider_with(&mut config, [scripted_reply()], move |_, body| {
+                capture.send(body.to_vec()).unwrap();
+            });
+        let mut resumed = RuntimeThread::start(&config, "verify the current runbook").unwrap();
+        assert_eq!(
+            resumed
+                .run_request(
+                    &config,
+                    &ThreadTurnRequest::new("verify the current runbook"),
+                    io::sink()
+                )
+                .unwrap(),
+            RunStatus::Success
+        );
+        let mut requests = requests;
+        requests.extend(provider.join().unwrap());
+        let final_messages = requests[3]["messages"].as_array().unwrap();
+        let count_text = |needle: &str| {
+            final_messages
+                .iter()
+                .filter_map(|message| message["content"].as_str())
+                .map(|content| content.matches(needle).count())
+                .sum::<usize>()
+        };
+        assert_eq!(count_text(current), 1);
+        assert_eq!(count_text(initial), 0);
+        assert_eq!(count_text("Current date context"), 1);
+        report_context_request_bytes(&captures.into_iter().collect::<Vec<_>>(), &requests);
+    }
+
+    fn report_context_request_bytes(captures: &[Vec<u8>], requests: &[serde_json::Value]) {
+        use serde_json::value::RawValue;
+        #[derive(serde::Deserialize)]
+        struct CapturedBody<'a> {
+            #[serde(borrow)]
+            messages: Vec<&'a RawValue>,
+        }
+        #[derive(serde::Serialize)]
+        struct TailMessage<'a> {
+            role: &'static str,
+            content: &'a str,
+        }
+
+        assert_eq!(captures.len(), requests.len());
+        let mut previous_capture: &[u8] = &[];
+        let mut previous_tail = Vec::new();
+        for (index, (capture, request)) in captures.iter().zip(requests).enumerate() {
+            let CapturedBody { messages } = serde_json::from_slice(capture).unwrap();
+            let mut latest = std::collections::BTreeMap::<&str, &str>::new();
+            let mut retained = Vec::new();
+            for (message, raw) in request["messages"].as_array().unwrap().iter().zip(messages) {
+                let content = message["content"].as_str().unwrap_or_default();
+                if message["role"] != "system"
+                    || !content.starts_with("Current ")
+                    || !content.contains(" context (this replaces any earlier version):\n")
+                {
+                    retained.push(raw.get());
+                    continue;
+                }
+                for part in content.split("\n\nCurrent ") {
+                    let (id, text) = part
+                        .trim_start_matches("Current ")
+                        .split_once(" context (this replaces any earlier version):\n")
+                        .unwrap();
+                    latest.insert(id, text);
+                }
+            }
+            let sort_order = [
+                "date",
+                "mode",
+                "runtime",
+                "skills",
+                "nested-project-instructions",
+            ];
+            assert!(
+                latest.keys().all(|id| sort_order.contains(id)),
+                "{:?}",
+                latest.keys()
+            );
+            let tail = sort_order
+                .iter()
+                .filter_map(|id| latest.get(id).copied())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let tail_message = serde_json::to_string(&TailMessage {
+                role: "system",
+                content: &tail,
+            })
+            .unwrap();
+            retained.push(&tail_message);
+            let key = b"\"messages\":";
+            let start = capture
+                .windows(key.len())
+                .position(|bytes| bytes == key)
+                .unwrap()
+                + key.len();
+            let mut parser =
+                serde_json::Deserializer::from_slice(&capture[start..]).into_iter::<&RawValue>();
+            parser.next().unwrap().unwrap();
+            let end = start + parser.byte_offset();
+            let mut tail_request = capture[..start].to_vec();
+            tail_request.push(b'[');
+            tail_request.extend(retained.join(",").as_bytes());
+            tail_request.push(b']');
+            tail_request.extend(&capture[end..]);
+            let prefix = |left: &[u8], right: &[u8]| {
+                left.iter()
+                    .zip(right)
+                    .take_while(|(left, right)| left == right)
+                    .count()
+            };
+            let current_prefix = prefix(previous_capture, capture);
+            let tail_prefix = prefix(&previous_tail, &tail_request);
+            println!(
+                "request {}: captured prefix {}, suffix {}; computed old tail prefix {}, suffix {}",
+                index + 1,
+                current_prefix,
+                capture.len() - current_prefix,
+                tail_prefix,
+                tail_request.len() - tail_prefix
+            );
+            previous_capture = capture;
+            previous_tail = tail_request;
+        }
+    }
+
     fn serve_scripted_provider(
         config: &mut RunConfig,
         responses: impl IntoIterator<Item = serde_json::Value>,
+    ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
+        serve_scripted_provider_with(config, responses, |_, _| {})
+    }
+
+    fn serve_scripted_provider_with(
+        config: &mut RunConfig,
+        responses: impl IntoIterator<Item = serde_json::Value>,
+        mut before_reply: impl FnMut(usize, &[u8]) + Send + 'static,
     ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
@@ -4585,7 +4936,7 @@ while IFS= read -r line; do
         let provider = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let mut received = Vec::new();
-            for response in responses {
+            for (index, response) in responses.into_iter().enumerate() {
                 let mut socket = loop {
                     match listener.accept() {
                         Ok((socket, _)) => break socket,
@@ -4619,6 +4970,7 @@ while IFS= read -r line; do
                 }
                 let mut body = vec![0; length.unwrap()];
                 reader.read_exact(&mut body).unwrap();
+                before_reply(index, &body);
                 received.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
                 let body = format!("data: {response}\n\ndata: [DONE]\n\n");
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
@@ -6827,7 +7179,7 @@ while IFS= read -r line; do
         assert_eq!(model_conversation.messages.len(), 3);
         assert!(matches!(
             model_conversation.messages.last(),
-            Some(orca_core::conversation::Message::System { content, pinned: true })
+            Some(orca_core::conversation::Message::System { content, pinned: true, .. })
                 if content.contains("policy hint") && content.contains("repo hint")
         ));
     }
@@ -7022,6 +7374,7 @@ while IFS= read -r line; do
         let mut runtime = RuntimeToolActorContext::new(events.run_id().to_string());
         let result = RuntimeToolRouter::new(&mut runtime)
             .dispatch(RuntimeToolInvocationContext {
+                parent_conversation: None,
                 config: &config,
                 cwd: cwd.path(),
                 events: &mut events,
@@ -7099,6 +7452,7 @@ while IFS= read -r line; do
             let mut event_error = None;
             let result = RuntimeToolRouter::with_tool_call_runtime(&mut runtime, tool_calls)
                 .dispatch(RuntimeToolInvocationContext {
+                    parent_conversation: None,
                     config: &config,
                     cwd: cwd.path(),
                     events: &mut events,

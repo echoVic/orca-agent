@@ -2,7 +2,7 @@ use std::path::Path;
 
 use orca_approval::ApprovalPolicy;
 use orca_core::config::RunConfig;
-use orca_core::conversation::Conversation;
+use orca_core::conversation::{Conversation, Message};
 use orca_core::event_schema::RunStatus;
 use orca_core::subagent_types::SubagentType;
 
@@ -122,9 +122,10 @@ pub(crate) fn try_prepare_child_agent_conversation(
         start,
         restored_next_turn: None,
     };
-    let next_turn = restore_child_agent_continuation(&mut conversation, &continuation.start)?;
+    let next_turn = restore_child_agent_continuation(&mut conversation, &continuation.start, cwd)?;
     continuation.restored_next_turn = Some(next_turn);
     tell_child_today(&mut conversation);
+    crate::fork_context::refresh_prompt_sections(&mut conversation);
     conversation.add_user(request.prompt.clone());
     let turn = next_turn
         .checked_sub(1)
@@ -210,7 +211,28 @@ fn prepare_fresh_child_agent_conversation(
     let mut conversation =
         prepare_child_agent_system_conversation(config, request, cwd, instructions, memory);
     tell_child_today(&mut conversation);
-    conversation.add_user(request.prompt.clone());
+    let mut prompt = request.prompt.clone();
+    if request.fork_prefix.is_some() {
+        prompt.push_str(&format!("\n\nChild working directory: {}", cwd.display()));
+        prompt.push_str(&agent_common::format_child_agent_contract(
+            &request.subagent_type,
+            config
+                .subagents
+                .delegation
+                .for_child(request.depth, config.subagents.max_depth),
+        ));
+        if let Some(definition) = &config.subagents.effective_definition {
+            prompt.push_str("\n\n");
+            prompt.push_str(&definition.system_prompt);
+        }
+        if let Some(tools) = &request.allowed_tools {
+            prompt.push_str(&format!(
+                "\n\nTools allowed for this role: {}.",
+                tools.join(", ")
+            ));
+        }
+    }
+    conversation.add_user(prompt);
     conversation
 }
 
@@ -232,7 +254,18 @@ fn prepare_child_agent_system_conversation(
     memory: &MemoryBlock,
 ) -> Conversation {
     let mut conversation = Conversation::new();
-    let system_prompt = agent_common::build_agent_system_prompt_for_config(
+    let refreshed_instructions;
+    let instructions = if let Some(prefix) = &request.fork_prefix {
+        if crate::fork_context::sources_can_replay(prefix, cwd) {
+            conversation.fork_prefix = Some(prefix.clone());
+            return conversation;
+        }
+        refreshed_instructions = crate::instructions::load_for_cwd_or_default(cwd);
+        &refreshed_instructions
+    } else {
+        instructions
+    };
+    let system_prompt = agent_common::build_agent_system_prompt_sections(
         cwd,
         config,
         request.depth,
@@ -241,7 +274,12 @@ fn prepare_child_agent_system_conversation(
         Some(memory),
         request.allowed_tools.as_deref(),
     );
-    conversation.add_system(system_prompt);
+    conversation.messages.push(system_prompt.into_message());
+    if request.fork_prefix.is_some() {
+        conversation.messages.push(Message::pinned_system(
+            "Fork history was skipped because inherited instruction sources no longer apply. Continuing with the child's own history and a rebuilt prompt.".into(),
+        ));
+    }
     conversation
 }
 
@@ -254,6 +292,7 @@ fn prepare_child_agent_system_conversation(
 fn restore_child_agent_continuation(
     conversation: &mut Conversation,
     start: &ChildAgentContinuationStart,
+    cwd: &Path,
 ) -> Result<u32, AgentContinuationError> {
     AgentContinuationId::parse(start.continuation_id().as_str().to_string())?;
     AgentAttemptId::parse(start.attempt_id().as_str().to_string())?;
@@ -272,7 +311,10 @@ fn restore_child_agent_continuation(
         });
     }
 
-    start.checkpoint().conversation.restore_into(conversation)
+    start
+        .checkpoint()
+        .conversation
+        .restore_into(conversation, cwd)
 }
 
 /// Advances the child loop one turn through the child's budget lease. The
@@ -398,6 +440,7 @@ mod tests {
             tool_policy_label: Some("custom agent desktop-audit".to_string()),
             workflow_ipc: None,
             continuation: None,
+            fork_prefix: None,
         };
         (config, request)
     }

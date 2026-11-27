@@ -1,8 +1,8 @@
 use std::io::{self, Write};
 
 use orca_core::conversation::{
-    CapturedProviderMessage, CapturedProviderRequest, Conversation, Message, SummaryState,
-    normalize_tool_boundaries,
+    CapturedProviderMessage, CapturedProviderRequest, Conversation, ForkSystemMessage, Message,
+    ProviderForkPrefix, SummaryState, normalize_tool_boundaries,
 };
 use orca_core::model::{ModelRouteContext, ModelSelection, PRO_MODEL, accepts_tool_images};
 use orca_core::subagent_types::SubagentType;
@@ -56,9 +56,9 @@ fn fingerprint(message: &Message, include_images: bool) -> Option<[u8; 32]> {
         &[]
     };
     match message {
-        Message::System { content, pinned } => {
-            serde_json::to_writer(&mut hash, &("system", content, pinned))
-        }
+        Message::System {
+            content, pinned, ..
+        } => serde_json::to_writer(&mut hash, &("system", content, pinned)),
         Message::User {
             content, pinned, ..
         } => serde_json::to_writer(&mut hash, &("user", content, pinned, images)),
@@ -140,9 +140,44 @@ pub(crate) fn record(
         };
         source_messages.truncate(unchanged_transcript_messages);
     }
-    // The mapped transcript and summary end before the request's trailing
-    // internal context and any other request-only suffix.
-    let Some(messages) = messages.get(..source_messages.len() + summary_count) else {
+    // Compaction replay needs unchanged source fingerprints. A fork only
+    // needs the active prompt's boundary in the actual lowered request.
+    let mut normalized = conversation.messages.clone();
+    normalize_tool_boundaries(&mut normalized);
+    let history_cut = conversation.provider_fork_cut(&normalized);
+    let fork_cut = history_cut.map(|cut| cut + summary_count).and_then(|cut| {
+        if recovery_edit.is_some_and(|edited| edited < cut) {
+            Err("request recovery rewrote the earlier parent history")
+        } else if cut > messages.len() {
+            Err("the parent request ended before the fork boundary")
+        } else {
+            Ok(cut)
+        }
+    });
+    let mut fork_system_messages = Vec::new();
+    if let (Ok(cut), Ok(_)) = (history_cut, fork_cut) {
+        let leading = normalized
+            .iter()
+            .take_while(|message| message.is_leading_system())
+            .count();
+        for (index, message) in normalized[..cut].iter().enumerate() {
+            if let Message::System {
+                context_fragments,
+                system_prompt,
+                ..
+            } = message
+                && (!context_fragments.is_empty() || system_prompt.is_some())
+            {
+                fork_system_messages.push(ForkSystemMessage {
+                    index: index + if index >= leading { summary_count } else { 0 },
+                    context_fragments: context_fragments.clone(),
+                    system_prompt: system_prompt.clone(),
+                });
+            }
+        }
+    }
+    let capture_end = (source_messages.len() + summary_count).max(fork_cut.unwrap_or(0));
+    let Some(messages) = messages.get(..capture_end) else {
         return;
     };
     let messages = messages
@@ -165,6 +200,9 @@ pub(crate) fn record(
             reasoning_effort: config.reasoning_effort,
             messages,
             tools: tools.to_vec(),
+            fork_cut,
+            fork_turn_id: conversation.provider_turn_id().map(str::to_owned),
+            fork_system_messages,
         });
     }
 }
@@ -187,6 +225,11 @@ pub(crate) fn load(
     config: &ProviderConfig,
     model: &str,
 ) -> Option<ReplayPrefix> {
+    // Compaction only summarizes the child's own work. The inherited bytes
+    // are kept in a separate prefix for ordinary child requests.
+    if conversation.fork_prefix.is_some() {
+        return None;
+    }
     let request = conversation.last_provider_request()?;
     if request.model != model
         || request.endpoint != endpoint(config)
@@ -228,5 +271,57 @@ pub(crate) fn load(
             .map(|message| message.estimated_tokens)
             .sum(),
         tools: request.tools.clone(),
+    })
+}
+
+pub(crate) fn fork(conversation: &Conversation) -> Result<ProviderForkPrefix, &'static str> {
+    let request = conversation
+        .last_provider_request()
+        .ok_or("no outbound parent request was captured")?;
+    if request.fork_turn_id.as_deref() != conversation.provider_turn_id() {
+        return Err("the captured request belongs to a different parent turn");
+    }
+    let captured = request
+        .messages
+        .get(..request.fork_cut?)
+        .ok_or("the captured request ended before the fork boundary")?;
+    let (mut messages, mut system_messages, inherited_tokens) =
+        conversation.fork_prefix.as_ref().map_or_else(
+            || (Vec::new(), Vec::new(), 0),
+            |prefix| {
+                (
+                    prefix.messages.clone(),
+                    prefix.system_messages.clone(),
+                    prefix.estimated_tokens,
+                )
+            },
+        );
+    system_messages.extend(
+        request
+            .fork_system_messages
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                message.index += messages.len();
+                message
+            }),
+    );
+    messages.extend(captured.iter().map(|message| message.json.get().to_owned()));
+    Ok(ProviderForkPrefix {
+        model: request.model.clone(),
+        endpoint: request.endpoint.clone(),
+        reasoning_effort: request.reasoning_effort,
+        messages,
+        tools: request.tools.clone(),
+        system_messages,
+        redacted: conversation
+            .fork_prefix
+            .as_ref()
+            .is_some_and(|prefix| prefix.redacted),
+        estimated_tokens: inherited_tokens
+            + captured
+                .iter()
+                .map(|message| message.estimated_tokens)
+                .sum::<usize>(),
     })
 }

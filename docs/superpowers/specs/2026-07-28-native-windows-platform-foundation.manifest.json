@@ -152,6 +152,13 @@
   ],
   "deferred_boundaries": [
     [
+      "fork-history-owner-only-mode-fixture",
+      "crates/orca-runtime/src/agent_continuation.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "tool-execution-patch-alias-fixture",
       "crates/orca-runtime/src/tool_execution.rs",
       "unix_std_api",

@@ -544,6 +544,10 @@ pub(crate) enum StoredMessage {
         pinned: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nested_instruction: Option<Box<NestedInstructionSource>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        context_fragments: Vec<orca_core::conversation::ContextFragmentChange>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<Box<orca_core::conversation::SystemPromptRecord>>,
     },
     User {
         content: String,
@@ -728,6 +732,16 @@ impl Serialize for StoredToolTerminal {
     }
 }
 
+fn deserialize_prompt_metadata<'de, D>(
+    deserializer: D,
+) -> Result<Option<Box<orca_core::conversation::SystemPromptRecord>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).ok())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", tag = "role")]
 enum StoredMessageWire {
@@ -737,6 +751,10 @@ enum StoredMessageWire {
         pinned: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nested_instruction: Option<Box<NestedInstructionSource>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        context_fragments: Vec<orca_core::conversation::ContextFragmentChange>,
+        #[serde(default, deserialize_with = "deserialize_prompt_metadata")]
+        system_prompt: Option<Box<orca_core::conversation::SystemPromptRecord>>,
     },
     User {
         content: String,
@@ -776,10 +794,14 @@ impl<'de> Deserialize<'de> for StoredMessage {
                 content,
                 pinned,
                 nested_instruction,
+                context_fragments,
+                system_prompt,
             } => Ok(Self::System {
                 content,
                 pinned,
                 nested_instruction,
+                context_fragments,
+                system_prompt,
             }),
             StoredMessageWire::User {
                 content,
@@ -826,10 +848,17 @@ impl<'de> Deserialize<'de> for StoredMessage {
 impl From<&Message> for StoredMessage {
     fn from(message: &Message) -> Self {
         match message {
-            Message::System { content, pinned } => Self::System {
+            Message::System {
+                content,
+                pinned,
+                context_fragments,
+                system_prompt,
+            } => Self::System {
                 content: content.clone(),
                 pinned: *pinned,
                 nested_instruction: None,
+                context_fragments: context_fragments.clone(),
+                system_prompt: system_prompt.clone(),
             },
             Message::User {
                 content,
@@ -877,6 +906,8 @@ impl From<StoredMessage> for Message {
                 content,
                 pinned,
                 nested_instruction,
+                context_fragments,
+                system_prompt,
             } => Self::System {
                 content: match nested_instruction {
                     Some(identity) => {
@@ -885,6 +916,8 @@ impl From<StoredMessage> for Message {
                     None => content,
                 },
                 pinned,
+                context_fragments,
+                system_prompt,
             },
             StoredMessage::User {
                 content,

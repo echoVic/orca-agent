@@ -57,6 +57,97 @@ fn tool_fixture() -> Conversation {
 }
 
 #[test]
+fn deep_compaction_keeps_a_fork_childs_section_updates() {
+    use orca_core::conversation::{
+        ProviderForkPrefix, SYSTEM_PROMPT_RECORD_VERSION, SystemPromptRecord, SystemPromptSection,
+    };
+
+    let update = |name: &str, text: Option<&str>| {
+        Message::system_with_prompt_record(
+            format!("{name}: {}", text.unwrap_or("removed")),
+            SystemPromptRecord {
+                version: SYSTEM_PROMPT_RECORD_VERSION,
+                sections: vec![SystemPromptSection {
+                    name: name.into(),
+                    text: text.map(str::to_owned),
+                    instruction_scope: None,
+                }],
+                update: true,
+                resume_boundary: None,
+                redacted: false,
+            },
+        )
+    };
+    let mut child = Conversation::new();
+    child.fork_prefix = Some(Arc::new(ProviderForkPrefix {
+        model: orca_core::model::PRO_MODEL.into(),
+        endpoint: deepseek_http::DEFAULT_BASE_URL.into(),
+        reasoning_effort: Default::default(),
+        messages: vec![r#"{"role":"system","content":"parent instructions"}"#.into()],
+        tools: vec![],
+        estimated_tokens: 8,
+        system_messages: vec![],
+        redacted: false,
+    }));
+    child.add_user("old request ".repeat(10));
+    child.messages.extend([
+        update("environment", Some("earlier shell")),
+        update("environment", Some("current shell")),
+        update("project instructions", None),
+        update("cwd", Some("earlier workspace")),
+    ]);
+    child.add_user("latest request ".repeat(50));
+    child
+        .messages
+        .push(update("cwd", Some("current workspace")));
+
+    let config = config(110, 256);
+    let summarized = compact_with_summary(ProviderKind::DeepSeek, &child, &config, &provider());
+    assert!(matches!(summarized.kind, CompactionKind::RemoteSummary(_)));
+    for compacted in [compact(&child, &config), summarized.conversation] {
+        assert_eq!(compacted.fork_prefix, child.fork_prefix);
+        let updates = compacted
+            .messages
+            .iter()
+            .filter(|message| message.is_system_prompt_update())
+            .filter_map(Message::content_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            updates,
+            [
+                "environment: current shell",
+                "project instructions: removed",
+                "cwd: current workspace"
+            ]
+        );
+        let summary = compacted.summary.baseline.unwrap();
+        assert!(!compacted.messages.iter().any(|message| {
+            message
+                .content_str()
+                .is_some_and(|text| text.starts_with("old request"))
+        }));
+        assert!(!summary.contains("environment:") && !summary.contains("project instructions:"));
+    }
+
+    child.fork_prefix = None;
+    child
+        .messages
+        .insert(0, Message::system("old instructions".into()));
+    child.compaction_system_prompt = Some(Message::system("current instructions".into()));
+    let compacted = compact(&child, &config);
+    assert_eq!(
+        compacted.messages[0].content_str(),
+        Some("current instructions")
+    );
+    assert!(
+        !compacted
+            .messages
+            .iter()
+            .any(Message::is_system_prompt_update)
+    );
+}
+
+#[test]
 fn cache_aware_reduction_preserves_more_prefix_than_eager_micro_ab() {
     let before = tool_fixture();
     let provider = provider();
@@ -320,7 +411,7 @@ fn micro_compaction_shortens_output_beside_a_pinned_notice() {
     assert!(matches!(&messages[4],
         Message::Tool { content, .. } if content.starts_with("[tool output micro-compact]")));
     assert!(matches!(&messages[5],
-        Message::System { content, pinned: true } if content.contains("done")));
+        Message::System { content, pinned: true, .. } if content.contains("done")));
 }
 
 #[test]

@@ -171,6 +171,16 @@ running again.
 The retired `max_parallel` key is ignored and does not act as a second capacity
 authority. Use `delegation = "off"` to disable new delegation.
 
+The `subagent` tool defaults to `context: "fresh"`, which starts the child
+with a standalone brief. Use `context: "fork"` when the task needs completed
+turns from the parent. Orca reuses the parent's DeepSeek system prompt, ordered
+tools, model, and reasoning effort, then adds the child's task and role as a
+user message. The active parent turn is excluded and the child reports its own
+work. Orca refuses calls outside the child's role at execution. When the parent
+has no completed turn or the recorded prefix is unavailable, Orca starts a
+fresh child with a note. To continue an existing child, use `resume_from` and
+omit `context`.
+
 ## Credentials
 
 Prefer an environment variable:

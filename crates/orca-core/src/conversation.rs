@@ -217,11 +217,54 @@ pub enum CutShort {
     OutputLimit,
 }
 
+/// Identity of a rendered fragment in a system message. A missing digest
+/// records a removal, or a delivery whose saved text was redacted.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextFragmentChange {
+    pub id: String,
+    pub digest: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<std::ops::Range<usize>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_scope: Option<InstructionScope>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InstructionScope {
+    pub cwd: PathBuf,
+    pub sources: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SystemPromptSection {
+    pub name: String,
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_scope: Option<InstructionScope>,
+}
+
+pub const SYSTEM_PROMPT_RECORD_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SystemPromptRecord {
+    pub version: u32,
+    pub sections: Vec<SystemPromptSection>,
+    pub update: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_boundary: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum Message {
     System {
         content: String,
         pinned: bool,
+        context_fragments: Vec<ContextFragmentChange>,
+        system_prompt: Option<Box<SystemPromptRecord>>,
     },
     User {
         content: String,
@@ -249,13 +292,57 @@ impl Message {
         Self::System {
             content,
             pinned: false,
+            context_fragments: Vec::new(),
+            system_prompt: None,
         }
+    }
+
+    pub fn context_fragment_batch(content: String, changes: Vec<ContextFragmentChange>) -> Self {
+        Self::System {
+            content,
+            pinned: false,
+            context_fragments: changes,
+            system_prompt: None,
+        }
+    }
+
+    pub fn is_context_fragment_batch(&self) -> bool {
+        matches!(self, Self::System { context_fragments, .. } if !context_fragments.is_empty())
+    }
+
+    pub fn system_with_prompt_record(content: String, record: SystemPromptRecord) -> Self {
+        Self::System {
+            content,
+            pinned: false,
+            context_fragments: Vec::new(),
+            system_prompt: Some(Box::new(record)),
+        }
+    }
+
+    pub fn system_prompt_record(&self) -> Option<&SystemPromptRecord> {
+        match self {
+            Self::System { system_prompt, .. } => system_prompt.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn is_system_prompt_update(&self) -> bool {
+        self.system_prompt_record()
+            .is_some_and(|record| record.update)
+    }
+
+    pub fn is_leading_system(&self) -> bool {
+        matches!(self, Self::System { pinned: false, .. })
+            && !self.is_context_fragment_batch()
+            && !self.is_system_prompt_update()
     }
 
     pub fn pinned_system(content: String) -> Self {
         Self::System {
             content,
             pinned: true,
+            context_fragments: Vec::new(),
+            system_prompt: None,
         }
     }
 
@@ -393,6 +480,8 @@ pub struct InternalContextFragment {
     pub origin: InternalContextOrigin,
     pub content: String,
     pub max_tokens: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_scope: Option<InstructionScope>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -434,6 +523,12 @@ impl InternalContext {
             *existing = fragment;
         } else {
             self.fragments.push(fragment);
+        }
+    }
+
+    pub fn set_instruction_scope(&mut self, id: &str, scope: InstructionScope) {
+        if let Some(fragment) = self.fragments.iter_mut().find(|fragment| fragment.id == id) {
+            fragment.instruction_scope = Some(scope);
         }
     }
 
@@ -543,7 +638,7 @@ pub struct UsageAnchor {
     boundary: u64,
 }
 
-/// In-memory DeepSeek request data used only for compaction replay.
+/// In-memory DeepSeek request data for compaction replay and child forks.
 pub struct CapturedProviderRequest {
     pub source_messages: Vec<[u8; 32]>,
     pub summary: SummaryState,
@@ -552,6 +647,9 @@ pub struct CapturedProviderRequest {
     pub reasoning_effort: crate::config::ReasoningEffort,
     pub messages: Vec<CapturedProviderMessage>,
     pub tools: Vec<serde_json::Value>,
+    pub fork_cut: Result<usize, &'static str>,
+    pub fork_turn_id: Option<String>,
+    pub fork_system_messages: Vec<ForkSystemMessage>,
 }
 
 pub struct CapturedProviderMessage {
@@ -559,6 +657,53 @@ pub struct CapturedProviderMessage {
     pub estimated_tokens: usize,
     pub has_images: bool,
     pub has_tool_images: bool,
+}
+
+/// Context metadata for a system message at a position in the captured wire prefix.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ForkSystemMessage {
+    pub index: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_fragments: Vec<ContextFragmentChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<Box<SystemPromptRecord>>,
+}
+
+/// A child sends this independently of its own transcript and checkpoints.
+/// The message strings preserve the exact provider JSON, including field order.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderForkPrefix {
+    pub model: String,
+    pub endpoint: String,
+    pub reasoning_effort: crate::config::ReasoningEffort,
+    pub messages: Vec<String>,
+    pub tools: Vec<serde_json::Value>,
+    pub estimated_tokens: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_messages: Vec<ForkSystemMessage>,
+    /// The saved copy may differ from the original request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted: bool,
+}
+
+impl fmt::Debug for ProviderForkPrefix {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderForkPrefix")
+            .field("model", &self.model)
+            .field("message_count", &self.messages.len())
+            .field("redacted", &self.redacted)
+            .field("tool_count", &self.tools.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProviderTurnBoundary {
+    id: String,
+    user_messages: usize,
+    has_prior_history: bool,
+    compacted_active_turn: bool,
 }
 
 #[derive(Clone, Default)]
@@ -600,7 +745,11 @@ pub struct NestedInstructionState {
 #[derive(Debug, Default)]
 pub struct Conversation {
     pub messages: Vec<Message>,
+    pub fork_prefix: Option<Arc<ProviderForkPrefix>>,
+    provider_turn: Option<ProviderTurnBoundary>,
     pub internal_context: InternalContext,
+    /// Latest assembled system prompt, adopted only with a new compacted prefix.
+    pub compaction_system_prompt: Option<Message>,
     /// Repeated tool calls since the latest user prompt, retained across
     /// compaction so reminders do not restart with the visible history tail.
     pub repeat_tool_streak: Option<RepeatToolStreak>,
@@ -634,7 +783,10 @@ impl Clone for Conversation {
     fn clone(&self) -> Self {
         Self {
             messages: self.messages.clone(),
+            fork_prefix: self.fork_prefix.clone(),
+            provider_turn: self.provider_turn.clone(),
             internal_context: self.internal_context.clone(),
+            compaction_system_prompt: self.compaction_system_prompt.clone(),
             repeat_tool_streak: self.repeat_tool_streak.clone(),
             mcp_instructions: self.mcp_instructions.clone(),
             mcp_catalogs: self.mcp_catalogs.clone(),
@@ -652,9 +804,81 @@ impl Clone for Conversation {
     }
 }
 
+fn is_provider_turn_user(message: &Message) -> bool {
+    matches!(message, Message::User { content, images, .. }
+        if !images.is_empty() || !is_internal_image_analysis(content))
+}
+
 impl Conversation {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn start_provider_turn(&mut self, id: &str) {
+        if self.provider_turn_id() != Some(id) {
+            self.provider_turn = Some(ProviderTurnBoundary {
+                id: id.to_owned(),
+                user_messages: 1,
+                has_prior_history: self.fork_prefix.is_some()
+                    || !self.summary.is_empty()
+                    || self
+                        .messages
+                        .iter()
+                        .filter(|message| is_provider_turn_user(message))
+                        .nth(1)
+                        .is_some(),
+                compacted_active_turn: false,
+            });
+        }
+    }
+
+    pub fn provider_turn_id(&self) -> Option<&str> {
+        self.provider_turn.as_ref().map(|turn| turn.id.as_str())
+    }
+
+    pub fn note_provider_turn_steer(&mut self) {
+        if let Some(turn) = &mut self.provider_turn {
+            turn.user_messages += 1;
+        }
+    }
+
+    pub fn keep_provider_turn_from(&mut self, source: &Self) {
+        self.provider_turn.clone_from(&source.provider_turn);
+        self.fork_prefix.clone_from(&source.fork_prefix);
+    }
+
+    pub fn provider_turn_start(&self, messages: &[Message]) -> Option<usize> {
+        let turn = self.provider_turn.as_ref()?;
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, message)| is_provider_turn_user(message))
+            .nth(turn.user_messages - 1)
+            .map(|(index, _)| index)
+    }
+
+    pub fn note_provider_compaction(&mut self, includes_active_turn: bool) {
+        if let Some(turn) = &mut self.provider_turn {
+            turn.compacted_active_turn |= includes_active_turn;
+        }
+    }
+
+    pub fn provider_fork_cut(&self, messages: &[Message]) -> Result<usize, &'static str> {
+        let turn = self
+            .provider_turn
+            .as_ref()
+            .ok_or("the active parent turn is unavailable")?;
+        if turn.compacted_active_turn {
+            return Err("the parent summary includes work from the active turn");
+        }
+        let cut = self
+            .provider_turn_start(messages)
+            .ok_or("the active parent prompt is missing from the provider request")?;
+        if !turn.has_prior_history {
+            return Err("there is no completed parent turn");
+        }
+        Ok(cut)
     }
 
     pub fn last_provider_request(&self) -> Option<Arc<CapturedProviderRequest>> {
@@ -721,6 +945,7 @@ impl Conversation {
             origin: InternalContextOrigin::Model,
             content,
             max_tokens: PLAN_CONTEXT_MAX_TOKENS,
+            instruction_scope: None,
         });
         self.internal_context.plan_age_turns = 0;
     }
@@ -749,10 +974,8 @@ impl Conversation {
         );
     }
 
-    /// Tells the model today's date. Call it when a turn opens: the fragment
-    /// is rendered after the history on every request, so a session that
-    /// crosses midnight, or is resumed on a later day, sees the new date
-    /// without its cached prefix changing.
+    /// Updates the date fragment when a turn opens. A new date can be
+    /// appended to history without changing the system prompt.
     pub fn set_today(&mut self, today: chrono::NaiveDate) {
         self.replace_internal_context(
             DATE_CONTEXT_FRAGMENT_ID,
@@ -825,6 +1048,7 @@ impl Conversation {
                 origin,
                 content,
                 max_tokens: max_tokens.max(1),
+                instruction_scope: None,
             }),
             None => self.internal_context.remove(id),
         }
@@ -835,6 +1059,7 @@ impl Conversation {
             if let Message::System {
                 content,
                 pinned: true,
+                ..
             } = msg
             {
                 !content.starts_with("[Pinned plan state]")
@@ -850,7 +1075,7 @@ impl Conversation {
         self.messages.retain(|msg| {
             !matches!(
                 msg,
-                Message::System { content, pinned: false }
+                Message::System { content, pinned: false, .. }
                 if content.starts_with("[Summary of earlier conversation]")
                 || content.starts_with("[Earlier conversation history was truncated")
             )
@@ -861,7 +1086,9 @@ impl Conversation {
     /// ordinary messages.
     pub fn unpin_delivered_notices(&mut self) {
         for message in &mut self.messages {
-            if let Message::System { content, pinned } = message
+            if let Message::System {
+                content, pinned, ..
+            } = message
                 && *pinned
                 && is_delivered_notice(content)
             {
@@ -1105,6 +1332,7 @@ pub fn normalize_tool_boundaries(messages: &mut Vec<Message>) {
                         Message::System {
                             content,
                             pinned: false,
+                            ..
                         } if is_repeat_tool_reminder(content) => {
                             reminders.push(messages[next].clone());
                         }
@@ -1887,7 +2115,9 @@ mod tests {
         conv.messages
             .iter()
             .map(|message| match message {
-                Message::System { content, pinned } => format!("sys|{pinned}|{content}"),
+                Message::System {
+                    content, pinned, ..
+                } => format!("sys|{pinned}|{content}"),
                 Message::User {
                     content, pinned, ..
                 } => format!("usr|{pinned}|{content}"),
@@ -2070,6 +2300,7 @@ mod tests {
                 Message::System {
                     content,
                     pinned: false,
+                    ..
                 } if is_delivered_notice(content) => Some(content.as_str()),
                 _ => None,
             })
@@ -2105,7 +2336,7 @@ mod tests {
         conv.strip_legacy_pinned_volatile();
         assert_eq!(conv.messages.len(), 3);
         assert!(
-            matches!(&conv.messages[0], Message::System { content, pinned: false } if content == "sys")
+            matches!(&conv.messages[0], Message::System { content, pinned: false, .. } if content == "sys")
         );
         assert!(matches!(&conv.messages[1], Message::User { content, .. } if content == "hello"));
         assert!(matches!(&conv.messages[2], Message::Assistant { .. }));
@@ -2127,7 +2358,7 @@ mod tests {
         assert_eq!(conv.messages.len(), 3);
         assert!(conv.messages[1].is_pinned());
         assert!(
-            matches!(&conv.messages[2], Message::System { content, pinned: true } if content.contains("Hook context"))
+            matches!(&conv.messages[2], Message::System { content, pinned: true, .. } if content.contains("Hook context"))
         );
     }
 

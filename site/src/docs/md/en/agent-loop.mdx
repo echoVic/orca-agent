@@ -97,6 +97,15 @@ and cross-controller commits.
 
 ### Phase 3: Tool Dispatch
 
+Use `read_file` for file contents in place of `cat`, `head`, `tail`, or `sed`
+through `bash`. Before calling `edit`, read the file unless you just created
+or edited it in the current session.
+
+Every `bash` call starts a fresh shell. Set `workdir` to choose its directory.
+If the sandbox blocks a command, report the block or ask for approval. Respect
+the decision on subsequent calls. In POSIX shells, use `${VAR:?}` to guard a
+variable used to build a path the command deletes or overwrites.
+
 When the model emits tool calls, Orca's runtime:
 
 

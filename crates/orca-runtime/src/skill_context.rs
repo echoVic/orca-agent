@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use orca_core::config::folder_trust::is_trusted;
 use orca_core::conversation::{
-    Conversation, Message, SKILL_CONTEXT_MAX_TOKENS, SKILL_INVOCATION_PREFIX,
+    Conversation, InstructionScope, Message, SKILL_CONTEXT_MAX_TOKENS, SKILL_INVOCATION_PREFIX,
+    SKILLS_CONTEXT_FRAGMENT_ID,
 };
 use orca_provider::context::{DefaultTokenCounter, TokenCounter, truncate_text_to_token_limit};
 use orca_tools::skills::{self, Skill, SkillSource};
@@ -16,14 +17,38 @@ const CATALOG_GUIDANCE: &str =
     "When a task matches one of these skills, load it with read_skill before you act.";
 
 pub(crate) fn refresh_catalog(conversation: &mut Conversation, cwd: &Path) {
-    let catalog = match skills::discover_metadata_from_env(cwd) {
-        Ok(skills) => render_catalog(&skills),
+    match skills::discover_metadata_from_env(cwd) {
+        Ok(skills) => {
+            conversation.replace_skill_catalog(render_catalog(&skills));
+            conversation.internal_context.set_instruction_scope(
+                SKILLS_CONTEXT_FRAGMENT_ID,
+                InstructionScope {
+                    cwd: cwd.to_owned(),
+                    sources: project_skill_paths(&skills).cloned().collect(),
+                },
+            );
+        }
         Err(error) => {
             eprintln!("orca: warning: failed to list skills: {error}");
-            None
+            conversation.replace_skill_catalog(None);
         }
-    };
-    conversation.replace_skill_catalog(catalog);
+    }
+}
+
+fn project_skill_paths(skills: &[Skill]) -> impl Iterator<Item = &PathBuf> {
+    skills
+        .iter()
+        .filter(|skill| skill.source == SkillSource::Project)
+        .map(|skill| &skill.path)
+}
+
+pub(crate) fn catalog_scope_is_loaded(scope: &InstructionScope, cwd: &Path) -> bool {
+    scope.sources.is_empty()
+        || (scope.cwd == cwd
+            && skills::discover_metadata_from_env(cwd).is_ok_and(|skills| {
+                let loaded = project_skill_paths(&skills).collect::<std::collections::HashSet<_>>();
+                scope.sources.iter().all(|path| loaded.contains(path))
+            }))
 }
 
 fn render_catalog(skills: &[Skill]) -> Option<String> {

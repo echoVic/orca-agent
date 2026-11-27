@@ -152,13 +152,9 @@ fn main() {
 
     let ahead = |version| {
         let mut conversation = history.clone();
-        conversation.messages.insert(
-            1,
-            Message::System {
-                content: plan(version),
-                pinned: false,
-            },
-        );
+        conversation
+            .messages
+            .insert(1, Message::system(plan(version)));
         conversation
     };
     send(&ahead(3), &config, "context ahead, plan 3");

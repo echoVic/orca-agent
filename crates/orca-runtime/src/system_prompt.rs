@@ -1,26 +1,163 @@
 use std::path::Path;
 
-use orca_core::config::RunConfig;
+use orca_core::conversation::{
+    InstructionScope, Message, SYSTEM_PROMPT_RECORD_VERSION, SystemPromptRecord,
+    SystemPromptSection,
+};
 use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
+
+#[derive(Default)]
+pub(crate) struct SystemPrompt {
+    sections: Vec<SystemPromptSection>,
+}
+
+impl SystemPrompt {
+    pub(crate) fn push(&mut self, name: &str, text: impl Into<String>) {
+        self.sections.push(SystemPromptSection {
+            name: name.into(),
+            text: Some(text.into()),
+            instruction_scope: None,
+        });
+    }
+
+    pub(crate) fn push_instructions(&mut self, text: String, scope: InstructionScope) {
+        self.sections.push(SystemPromptSection {
+            name: "project instructions".into(),
+            text: Some(text),
+            instruction_scope: Some(scope),
+        });
+    }
+
+    pub(crate) fn render(&self) -> String {
+        self.sections
+            .iter()
+            .filter_map(|section| section.text.as_deref())
+            .collect()
+    }
+
+    pub(crate) fn into_message(self) -> Message {
+        Message::system_with_prompt_record(
+            self.render(),
+            SystemPromptRecord {
+                version: SYSTEM_PROMPT_RECORD_VERSION,
+                sections: self.sections,
+                update: false,
+                resume_boundary: None,
+                redacted: false,
+            },
+        )
+    }
+}
+
+pub(crate) fn section_updates(
+    history: &[Message],
+    current: &Message,
+    resume_boundary: Option<&str>,
+) -> Vec<Message> {
+    section_updates_filtered(history, current, resume_boundary, |_| true)
+}
+
+pub(crate) fn section_updates_matching(
+    history: &[Message],
+    current: &Message,
+    include: impl Fn(&str) -> bool,
+) -> Vec<Message> {
+    section_updates_filtered(history, current, None, include)
+}
+
+fn section_updates_filtered(
+    history: &[Message],
+    current: &Message,
+    resume_boundary: Option<&str>,
+    include: impl Fn(&str) -> bool,
+) -> Vec<Message> {
+    let Some(record) = history.first().and_then(Message::system_prompt_record) else {
+        return Vec::new();
+    };
+    let Some(current) = current.system_prompt_record() else {
+        return Vec::new();
+    };
+    let mut previous = std::collections::BTreeMap::new();
+    for record in std::iter::once(record).chain(
+        history
+            .iter()
+            .skip(1)
+            .filter_map(Message::system_prompt_record)
+            .filter(|record| record.update),
+    ) {
+        for section in record
+            .sections
+            .iter()
+            .filter(|section| include(&section.name))
+        {
+            if let Some(text) = section.text.as_deref() {
+                previous.insert(section.name.as_str(), text);
+            } else {
+                previous.remove(section.name.as_str());
+            }
+        }
+    }
+    let changes = current
+        .sections
+        .iter()
+        .filter(|section| include(&section.name))
+        .filter(|section| previous.remove(section.name.as_str()) != section.text.as_deref())
+        .cloned()
+        .collect::<Vec<_>>();
+    changes
+        .into_iter()
+        .chain(previous.into_keys().map(|name| SystemPromptSection {
+            name: name.to_owned(),
+            text: None,
+            instruction_scope: None,
+        }))
+        .map(|section| {
+            let name = &section.name;
+            let content = match &section.text {
+                Some(text) => format!(
+                    "The \"{name}\" instructions changed; they now read:\n{}",
+                    text.trim()
+                ),
+                None => format!("The \"{name}\" instructions no longer apply."),
+            };
+            Message::system_with_prompt_record(
+                content,
+                SystemPromptRecord {
+                    version: SYSTEM_PROMPT_RECORD_VERSION,
+                    sections: vec![section],
+                    update: true,
+                    resume_boundary: resume_boundary.map(str::to_owned),
+                    redacted: false,
+                },
+            )
+        })
+        .collect()
+}
 
 #[cfg(test)]
 pub fn build_system_prompt(cwd: &Path) -> String {
     build_system_prompt_for_tools(cwd, None)
 }
 
+#[cfg(test)]
 pub fn build_system_prompt_for_tools(cwd: &Path, allowed_tools: Option<&[String]>) -> String {
-    let shell = ShellResolver::for_current_host()
-        .resolve_from_environment()
-        .ok();
-    build_system_prompt_with_shell_and_tools(cwd, shell.as_ref(), allowed_tools)
+    build_system_prompt_sections(cwd, allowed_tools).render()
 }
 
+#[cfg(test)]
 pub(crate) fn build_system_prompt_for_config(
     cwd: &Path,
-    _config: &RunConfig,
+    _config: &orca_core::config::RunConfig,
     _subagent_depth: u32,
     allowed_tools: Option<&[String]>,
 ) -> String {
+    build_system_prompt_for_tools(cwd, allowed_tools)
+}
+
+pub(crate) fn build_system_prompt_sections(
+    cwd: &Path,
+    allowed_tools: Option<&[String]>,
+) -> SystemPrompt {
     let shell = ShellResolver::for_current_host()
         .resolve_from_environment()
         .ok();
@@ -29,14 +166,14 @@ pub(crate) fn build_system_prompt_for_config(
 
 #[cfg(test)]
 pub fn build_system_prompt_with_shell(cwd: &Path, shell: Option<&ShellSpec>) -> String {
-    build_system_prompt_with_shell_and_tools(cwd, shell, None)
+    build_system_prompt_with_shell_and_tools(cwd, shell, None).render()
 }
 
 fn build_system_prompt_with_shell_and_tools(
     cwd: &Path,
     shell: Option<&ShellSpec>,
     allowed_tools: Option<&[String]>,
-) -> String {
+) -> SystemPrompt {
     let git_repository = crate::workspace_git::is_git_work_tree(cwd);
     let git_environment = if git_repository {
         ""
@@ -53,14 +190,18 @@ fn build_system_prompt_with_shell_and_tools(
     let shell_guidance = shell_allowed
         .then(|| render_shell_guidance(shell))
         .unwrap_or("");
-    format!(
-        r#"You are Orca, an expert software engineering agent running in a terminal-based coding assistant. You are precise, safe, and helpful.
-
-## Environment
-- Working directory: {cwd}
-- Operating system: {os}
-- {shell_environment}
-{git_environment}
+    let mut prompt = SystemPrompt::default();
+    prompt.push("identity", "You are Orca, an expert software engineering agent running in a terminal-based coding assistant. You are precise, safe, and helpful.\n\n## Environment\n");
+    prompt.push("cwd", format!("- Working directory: {}\n", cwd.display()));
+    prompt.push(
+        "environment",
+        format!(
+            "- Operating system: {}\n- {shell_environment}\n{git_environment}",
+            std::env::consts::OS
+        ),
+    );
+    prompt.push("agent behavior", format!(
+        r#"
 # How you work
 
 ## Personality
@@ -151,10 +292,9 @@ Explicit workflow/ultracode, reusable orchestration, or dependent phases: Workfl
 When done, respond concisely — like a teammate summarizing a PR. Structure your answer only when complexity demands it. For simple results, use plain sentences. Keep it under 10 lines unless the task warrants more detail.
 
 If there's a logical next step you can help with, suggest it briefly."#,
-        cwd = cwd.display(),
-        os = std::env::consts::OS,
         command_guidance = command_guidance,
-    )
+    ));
+    prompt
 }
 
 fn render_command_guidance(shell_allowed: bool) -> &'static str {
@@ -440,7 +580,9 @@ mod tests {
         // 28,440 chars with the subagent routing description restored.
         // +600 (2026-11-14) for the read_document tool (DeepSeek OCR); the
         // measured prefix is 29,108 chars without the date line.
-        let limit = if cfg!(windows) { 29_900 } else { 29_200 };
+        // The fork context field and tool guidance bring the measured prefix
+        // to 29,483 chars.
+        let limit = if cfg!(windows) { 30_200 } else { 29_500 };
         assert!(
             prefix <= limit,
             "system + tool prefix is {prefix} chars (limit {limit})"

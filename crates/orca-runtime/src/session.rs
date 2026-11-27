@@ -357,12 +357,16 @@ pub(crate) fn record_assistant_response_for_agent<W: io::Write>(
 
 pub(crate) fn bootstrap_agent_conversation(
     resumed: Option<&SessionTranscript>,
-    system_prompt: String,
+    system_prompt: Message,
     cwd: &Path,
     prompt: &str,
 ) -> Conversation {
     let mut conversation = if let Some(resumed) = resumed {
-        let mut conv = crate::history::resume_conversation_in_cwd(resumed, system_prompt, cwd);
+        let mut conv = crate::history::resume_conversation_in_cwd(
+            resumed,
+            system_prompt.content_str().unwrap_or_default().to_owned(),
+            cwd,
+        );
         conv.strip_legacy_pinned_volatile();
         conv.strip_legacy_summary_messages();
         conv.unpin_delivered_notices();
@@ -370,7 +374,7 @@ pub(crate) fn bootstrap_agent_conversation(
         conv
     } else {
         let mut conversation = Conversation::new();
-        conversation.add_system(system_prompt);
+        conversation.messages.push(system_prompt);
         conversation
     };
     if resumed.and_then(|transcript| transcript.completion_status.as_deref()) == Some("interrupted")
@@ -395,7 +399,7 @@ pub(crate) fn bootstrap_agent_conversation_for_loop(
     memory: &MemoryBlock,
     allowed_tools: Option<&[String]>,
 ) -> Conversation {
-    let system_prompt = agent_common::build_agent_system_prompt_for_config(
+    let system_prompt = agent_common::build_agent_system_prompt_sections(
         cwd,
         config,
         subagent_depth,
@@ -404,7 +408,7 @@ pub(crate) fn bootstrap_agent_conversation_for_loop(
         Some(memory),
         allowed_tools,
     );
-    bootstrap_agent_conversation(None, system_prompt, cwd, prompt)
+    bootstrap_agent_conversation(None, system_prompt.into_message(), cwd, prompt)
 }
 
 pub(crate) fn record_plan_state_for_agent(
@@ -498,7 +502,7 @@ impl InteractiveSession {
             config.hooks.clone(),
             orca_core::capability::CapabilitySet::for_approval_mode(config.approval_mode),
         );
-        let system_prompt = agent_common::build_agent_system_prompt_for_config(
+        let sections = agent_common::build_agent_system_prompt_sections(
             &cwd,
             config,
             0,
@@ -507,6 +511,8 @@ impl InteractiveSession {
             Some(&memory),
             None,
         );
+        let system_prompt = sections.render();
+        let current_prompt = sections.into_message();
         let (mut conversation, loaded_transcript) = match &config.history_mode {
             HistoryMode::Resume(selector) | HistoryMode::Fork(selector) => {
                 let transcript = match preloaded {
@@ -544,10 +550,32 @@ impl InteractiveSession {
             }
             HistoryMode::Record | HistoryMode::Disabled => {
                 let mut conversation = Conversation::new();
-                conversation.add_system(system_prompt);
+                conversation.messages.push(current_prompt.clone());
                 (conversation, None)
             }
         };
+        let lead = &mut conversation.messages[0];
+        if matches!(config.history_mode, HistoryMode::Fork(_))
+            && lead.system_prompt_record().is_none()
+        {
+            *lead = current_prompt.clone();
+        }
+        if loaded_transcript.is_some()
+            && (lead.content_str() != current_prompt.content_str()
+                || lead.system_prompt_record() != current_prompt.system_prompt_record())
+        {
+            conversation.compaction_system_prompt = Some(current_prompt.clone());
+        }
+        let resume_boundary = match &config.history_mode {
+            HistoryMode::ResumeAt { resume_at, .. } => Some(resume_at.as_str()),
+            _ => None,
+        };
+        let prompt_updates = crate::system_prompt::section_updates(
+            &conversation.messages,
+            &current_prompt,
+            resume_boundary,
+        );
+        conversation.messages.extend(prompt_updates.iter().cloned());
         let usage_baseline = if matches!(
             config.history_mode,
             HistoryMode::Resume(_) | HistoryMode::ResumeAt { .. }
@@ -569,8 +597,15 @@ impl InteractiveSession {
                 Some(transcript) => {
                     let thread_session_id = transcript.meta.session_id.clone();
                     match SessionWriter::append_to_existing(transcript.path) {
-                        Ok(writer) => {
+                        Ok(mut writer) => {
                             session_id = Some(thread_session_id);
+                            for update in &prompt_updates {
+                                if let Err(error) = writer.append_message(update) {
+                                    eprintln!("orca: warning: history write failed: {error}");
+                                    writer.mark_degraded();
+                                    break;
+                                }
+                            }
                             Some(writer)
                         }
                         Err(error) => {
@@ -1333,6 +1368,681 @@ mod tests {
     }
 
     #[test]
+    fn resume_rebuilds_the_last_appended_state_without_new_messages() {
+        with_orca_home(|_| {
+            let cwd = tempdir().unwrap();
+            let mut writer =
+                SessionWriter::start(cwd.path(), "deepseek", None, "read records").unwrap();
+            writer
+                .append_message(&Message::system("system prompt".into()))
+                .unwrap();
+            writer.enter_turn(TurnId::new());
+            writer
+                .append_message(&Message::user("read records".into()))
+                .unwrap();
+            let content = "Current memory context (this replaces any earlier version):\n[Relevant memory]\nfirst fact";
+            let mut original = Conversation::new();
+            original.replace_memory_context(Some("first fact".into()));
+            let batch = orca_provider::context::pending_context_message(&original).unwrap();
+            writer.append_message(&batch).unwrap();
+            let transcript = history::load_session("latest").unwrap();
+            let mut resumed = history::resume_conversation(&transcript, "system prompt".into());
+            assert_eq!(resumed.messages.len(), 3);
+            assert_eq!(resumed.messages[2].content_str(), Some(content));
+            resumed.replace_memory_context(Some("first fact".into()));
+            assert!(orca_provider::context::pending_context_message(&resumed).is_none());
+        });
+    }
+
+    fn record_prompt_session(cwd: &Path) -> (std::path::PathBuf, String, SessionTranscript) {
+        let mut session = InteractiveSession::new_with_preloaded_and_mcp_registry(
+            &config(cwd.into(), HistoryMode::Record),
+            "read records",
+            None,
+            McpRegistry::default(),
+        )
+        .unwrap();
+        let prompt = session.conversation.messages[0]
+            .content_str()
+            .unwrap()
+            .to_owned();
+        let writer = session.writer_mut().unwrap();
+        writer.enter_turn(TurnId::new());
+        writer
+            .append_message(&Message::user("read records".into()))
+            .unwrap();
+        let path = writer.path().to_path_buf();
+        let transcript = history::load_session("latest").unwrap();
+        (path, prompt, transcript)
+    }
+
+    fn reopen_prompt_session(
+        cwd: &Path,
+        mode: HistoryMode,
+        transcript: SessionTranscript,
+    ) -> InteractiveSession {
+        InteractiveSession::new_with_preloaded_and_mcp_registry(
+            &config(cwd.into(), mode),
+            "continue",
+            Some(transcript),
+            McpRegistry::default(),
+        )
+        .unwrap()
+    }
+
+    fn prompt_section_notices(session: &InteractiveSession) -> Vec<&str> {
+        session
+            .conversation
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::System { content, .. } if content.starts_with("The \"") => {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn prompt_wire_record(path: &Path) -> String {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .find(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["message"]["role"]
+                    == "system"
+            })
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn the_system_prompt_sections_are_recorded_at_session_start() {
+        with_orca_home(|_| {
+            let cwd = tempdir().unwrap();
+            let (path, prompt, _) = record_prompt_session(cwd.path());
+            let record: serde_json::Value =
+                serde_json::from_str(&prompt_wire_record(&path)).unwrap();
+            let sections = record["message"]["system_prompt"]["sections"]
+                .as_array()
+                .expect("recorded sections");
+            assert!(sections.iter().any(|section| {
+                section["name"] == "cwd"
+                    && section["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&cwd.path().display().to_string())
+            }));
+            let reconstructed = sections
+                .iter()
+                .map(|section| section["text"].as_str().unwrap())
+                .collect::<String>();
+            assert_eq!(reconstructed, prompt);
+        });
+    }
+
+    #[test]
+    fn resume_with_an_unchanged_prompt_sends_the_recorded_prompt() {
+        with_orca_home(|_| {
+            let cwd = tempdir().unwrap();
+            let (path, prompt, transcript) = record_prompt_session(cwd.path());
+            let id = transcript.meta.session_id.clone();
+            let resumed = reopen_prompt_session(cwd.path(), HistoryMode::Resume(id), transcript);
+            assert_eq!(
+                resumed.conversation.messages[0].content_str(),
+                Some(prompt.as_str())
+            );
+            assert!(prompt_section_notices(&resumed).is_empty());
+            let record: serde_json::Value =
+                serde_json::from_str(&prompt_wire_record(&path)).unwrap();
+            assert!(record["message"]["system_prompt"]["sections"].is_array());
+        });
+    }
+
+    #[test]
+    fn resume_after_a_prompt_change_appends_one_notice() {
+        with_orca_home(|orca_home| {
+            let cwd = tempdir().unwrap();
+            let agents = orca_home.join("AGENTS.md");
+            std::fs::write(&agents, "Read the local runbook.").unwrap();
+            let (_, prompt, transcript) = record_prompt_session(cwd.path());
+            let id = transcript.meta.session_id.clone();
+            let mut original = Conversation::new();
+            original.add_system(prompt.clone());
+            original.add_user("read records".into());
+            std::fs::write(&agents, "Use the new local runbook.").unwrap();
+            let resumed =
+                reopen_prompt_session(cwd.path(), HistoryMode::Resume(id.clone()), transcript);
+            assert_eq!(prompt_section_notices(&resumed).len(), 1);
+            assert_eq!(
+                resumed.conversation.messages[0].content_str(),
+                Some(prompt.as_str())
+            );
+            let notice = prompt_section_notices(&resumed)[0];
+            assert!(notice.starts_with(
+                "The \"project instructions\" instructions changed; they now read:\n"
+            ));
+            assert!(notice.contains("Use the new local runbook."));
+            let provider = orca_provider::ProviderConfig {
+                api_key: None,
+                base_url: None,
+                model: None,
+                reasoning_effort: Default::default(),
+                tools_override: Some(Vec::new()),
+                mcp_registry: None,
+                external_tools: Vec::new(),
+                max_output_tokens: None,
+            };
+            let prior =
+                orca_provider::prompt_cache::checkpoint_for_deepseek_request(&original, &provider)
+                    .unwrap();
+            assert!(
+                prior
+                    .matches_deepseek_prefix(&resumed.conversation, &provider)
+                    .unwrap()
+            );
+            drop(resumed);
+            let reopened = reopen_prompt_session(
+                cwd.path(),
+                HistoryMode::Resume(id),
+                history::load_session("latest").unwrap(),
+            );
+            assert_eq!(prompt_section_notices(&reopened).len(), 1);
+        });
+    }
+
+    #[test]
+    fn revoked_trust_rebuilds_the_prompt_without_the_old_instructions() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust};
+
+        with_orca_home(|_| {
+            let cwd = tempdir().unwrap();
+            std::fs::create_dir(cwd.path().join(".git")).unwrap();
+            std::fs::write(cwd.path().join("AGENTS.md"), "Follow the deploy runbook.").unwrap();
+            set_trust(cwd.path(), TrustLevel::Trusted).unwrap();
+            let (_, prompt, transcript) = record_prompt_session(cwd.path());
+            assert!(prompt.contains("Follow the deploy runbook."));
+            set_trust(cwd.path(), TrustLevel::Untrusted).unwrap();
+
+            let id = transcript.meta.session_id.clone();
+            for mode in [
+                HistoryMode::Resume(id.clone()),
+                HistoryMode::Fork(id.clone()),
+            ] {
+                let session = reopen_prompt_session(cwd.path(), mode, transcript.clone());
+                assert!(prompt_section_notices(&session).is_empty());
+                assert!(session.conversation.messages.iter().all(|message| {
+                    !message
+                        .content_str()
+                        .unwrap_or_default()
+                        .contains("Follow the deploy runbook.")
+                }));
+            }
+        });
+    }
+
+    #[test]
+    fn revoked_nested_trust_rebuilds_the_prompt_without_the_delivered_instructions() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust};
+
+        with_orca_home(|home| {
+            let cwd = tempdir().unwrap();
+            let child = cwd.path().join("src");
+            std::fs::create_dir(&child).unwrap();
+            let touched = child.join("one.txt");
+            std::fs::write(&touched, "fixture").unwrap();
+            std::fs::write(child.join("AGENTS.md"), "Use the scoped runbook.").unwrap();
+            std::fs::write(home.join("AGENTS.md"), "Use the old global runbook.").unwrap();
+            set_trust(cwd.path(), TrustLevel::Trusted).unwrap();
+            let (path, _, transcript) = record_prompt_session(cwd.path());
+            let mut writer = SessionWriter::append_to_existing(path).unwrap();
+            let mut conversation = Conversation::new();
+            conversation
+                .nested_instructions
+                .pending_touches
+                .push((touched, false));
+            instructions::load_for_cwd(cwd.path())
+                .unwrap()
+                .append_nested_for_touches(&mut conversation, Some(&mut writer));
+            let batch = orca_provider::context::pending_context_message(&conversation).unwrap();
+            assert!(
+                batch
+                    .content_str()
+                    .unwrap()
+                    .contains("Use the scoped runbook.")
+            );
+            writer.append_message(&batch).unwrap();
+            drop(writer);
+
+            let id = transcript.meta.session_id;
+            let transcript = history::load_session(&id).unwrap();
+            set_trust(&child, TrustLevel::Untrusted).unwrap();
+            std::fs::write(home.join("AGENTS.md"), "Use the live global runbook.").unwrap();
+            for mode in [
+                HistoryMode::Resume(id.clone()),
+                HistoryMode::Fork(id.clone()),
+            ] {
+                let session = reopen_prompt_session(cwd.path(), mode, transcript.clone());
+                assert!(
+                    session.conversation.messages[0]
+                        .content_str()
+                        .unwrap()
+                        .contains("Use the live global runbook.")
+                );
+                assert!(prompt_section_notices(&session).is_empty());
+                assert!(session.conversation.messages.iter().all(|message| {
+                    !message
+                        .content_str()
+                        .unwrap_or_default()
+                        .contains("Use the scoped runbook.")
+                }));
+            }
+        });
+    }
+
+    #[test]
+    fn redaction_does_not_change_the_sent_prompt_or_fragments() {
+        with_orca_home(|home| {
+            let cwd = tempdir().unwrap();
+            std::fs::write(home.join("AGENTS.md"), "Token: required").unwrap();
+            let (path, prompt, transcript) = record_prompt_session(cwd.path());
+            let mut session = Conversation::new();
+            session.replace_runtime_context(Some("retained runtime hint".into()));
+            session.replace_memory_context(Some("Token: optional".into()));
+            let batch = orca_provider::context::pending_context_message(&session).unwrap();
+            assert!(prompt.contains("Token: required"));
+            assert!(batch.content_str().unwrap().contains("Token: optional"));
+            let mut writer = SessionWriter::append_to_existing(path.clone()).unwrap();
+            writer.append_message(&batch).unwrap();
+            drop(writer);
+            let raw = std::fs::read_to_string(path).unwrap();
+            assert!(raw.contains("Token: <redacted>"));
+            assert!(!raw.contains("Token: required") && !raw.contains("Token: optional"));
+            let transcript = history::load_session(&transcript.meta.session_id).unwrap();
+            let Message::System {
+                context_fragments, ..
+            } = transcript.messages.last().unwrap()
+            else {
+                panic!("expected saved context batch")
+            };
+            assert!(
+                context_fragments
+                    .iter()
+                    .find(|change| change.id == "memory")
+                    .unwrap()
+                    .digest
+                    .is_none()
+            );
+            assert!(
+                context_fragments
+                    .iter()
+                    .find(|change| change.id == "runtime")
+                    .unwrap()
+                    .digest
+                    .is_some()
+            );
+            let mut resumed = history::resume_conversation(&transcript, prompt);
+            resumed.replace_runtime_context(Some("retained runtime hint".into()));
+            resumed.replace_memory_context(Some("Token: optional".into()));
+            let pending = orca_provider::context::pending_context_message(&resumed).unwrap();
+            assert!(pending.content_str().unwrap().contains("Token: optional"));
+            assert!(
+                !pending
+                    .content_str()
+                    .unwrap()
+                    .contains("retained runtime hint")
+            );
+            assert!(resumed.messages.iter().all(|message| {
+                !message
+                    .content_str()
+                    .unwrap_or_default()
+                    .contains("Token: <redacted>")
+            }));
+            resumed.messages.push(pending);
+            assert!(orca_provider::context::pending_context_message(&resumed).is_none());
+        });
+    }
+
+    #[test]
+    fn a_change_hidden_by_redaction_is_still_delivered() {
+        let mut conversation = Conversation::new();
+        conversation.replace_memory_context(Some("Token: required".into()));
+        conversation
+            .messages
+            .extend(orca_provider::context::pending_context_message(
+                &conversation,
+            ));
+        conversation.replace_memory_context(Some("Token: optional".into()));
+        let update = orca_provider::context::pending_context_message(&conversation)
+            .expect("changed fragment");
+        assert!(update.content_str().unwrap().contains("Token: optional"));
+        conversation.messages.push(update);
+        assert!(orca_provider::context::pending_context_message(&conversation).is_none());
+    }
+
+    #[test]
+    fn a_redacted_section_resumes_by_rebuilding() {
+        with_orca_home(|home| {
+            let cwd = tempdir().unwrap();
+            let source = home.join("AGENTS.md");
+            std::fs::write(&source, "Token: required").unwrap();
+            let (_, _, transcript) = record_prompt_session(cwd.path());
+            std::fs::write(source, "Token: optional").unwrap();
+            let id = transcript.meta.session_id.clone();
+            let session = reopen_prompt_session(cwd.path(), HistoryMode::Resume(id), transcript);
+            assert!(
+                session.conversation.messages[0]
+                    .content_str()
+                    .unwrap()
+                    .contains("Token: optional")
+            );
+            assert!(prompt_section_notices(&session).is_empty());
+        });
+    }
+
+    #[test]
+    fn resuming_twice_at_the_same_boundary_writes_one_notice() {
+        with_orca_home(|home| {
+            let cwd = tempdir().unwrap();
+            let agents = home.join("AGENTS.md");
+            std::fs::write(&agents, "Use the original runbook.").unwrap();
+            let (path, _, transcript) = record_prompt_session(cwd.path());
+            let boundary = std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                    (record["message"]["role"] == "user")
+                        .then(|| record["id"].as_str().unwrap().to_owned())
+                })
+                .unwrap();
+            let id = transcript.meta.session_id;
+            std::fs::write(&agents, "Use the replacement runbook.").unwrap();
+            for _ in 0..2 {
+                let resumed = reopen_prompt_session(
+                    cwd.path(),
+                    HistoryMode::ResumeAt {
+                        selector: id.clone(),
+                        resume_at: boundary.clone(),
+                    },
+                    history::load_session(&id).unwrap(),
+                );
+                assert_eq!(prompt_section_notices(&resumed).len(), 1);
+            }
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                raw.lines()
+                    .filter(|line| line.contains("Use the replacement runbook."))
+                    .count(),
+                1
+            );
+            let resumed = reopen_prompt_session(
+                cwd.path(),
+                HistoryMode::Resume(id.clone()),
+                history::load_session(&id).unwrap(),
+            );
+            assert_eq!(prompt_section_notices(&resumed).len(), 1);
+        });
+    }
+
+    #[test]
+    fn a_removed_section_appends_the_no_longer_applies_note() {
+        with_orca_home(|orca_home| {
+            let cwd = tempdir().unwrap();
+            let agents = orca_home.join("AGENTS.md");
+            std::fs::write(&agents, "Use the old local runbook.").unwrap();
+            let (_, _, transcript) = record_prompt_session(cwd.path());
+            std::fs::remove_file(&agents).unwrap();
+            let id = transcript.meta.session_id.clone();
+            let resumed = reopen_prompt_session(cwd.path(), HistoryMode::Resume(id), transcript);
+            assert_eq!(
+                prompt_section_notices(&resumed),
+                ["The \"project instructions\" instructions no longer apply."]
+            );
+        });
+    }
+
+    #[test]
+    fn fork_reports_the_cwd_and_project_instruction_paths() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust};
+
+        with_orca_home(|_| {
+            let fixture = tempdir().unwrap();
+            let parent = fixture.path().join("source");
+            let child = fixture.path().join("worktree");
+            std::fs::create_dir(&parent).unwrap();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .current_dir(&parent)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&["init"]);
+            std::fs::write(parent.join("AGENTS.md"), "Use the repository runbook.").unwrap();
+            git(&["add", "AGENTS.md"]);
+            git(&[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "Add fixture instructions",
+            ]);
+            git(&[
+                "worktree",
+                "add",
+                "--detach",
+                child.to_str().unwrap(),
+                "HEAD",
+            ]);
+            assert_eq!(
+                std::fs::read(parent.join("AGENTS.md")).unwrap(),
+                std::fs::read(child.join("AGENTS.md")).unwrap()
+            );
+            set_trust(&parent, TrustLevel::Trusted).unwrap();
+            set_trust(&child, TrustLevel::Trusted).unwrap();
+            let (_, prompt, transcript) = record_prompt_session(&parent);
+            let parent_id = transcript.meta.session_id.clone();
+            let fork = reopen_prompt_session(&child, HistoryMode::Fork(parent_id), transcript);
+            assert_eq!(
+                fork.conversation.messages[0].content_str(),
+                Some(prompt.as_str())
+            );
+            assert_eq!(
+                prompt_section_notices(&fork),
+                [
+                    format!(
+                        "The \"cwd\" instructions changed; they now read:\n- Working directory: {}",
+                        child.display()
+                    ),
+                    format!(
+                        "The \"project instructions\" instructions changed; they now read:\n<project-instructions>\n# {}\nUse the repository runbook.\n</project-instructions>",
+                        child.join("AGENTS.md").display()
+                    )
+                ]
+            );
+            let fork_id = fork.session_id().unwrap().to_owned();
+            let persisted = history::load_session(&fork_id).unwrap();
+            let resumed = reopen_prompt_session(&child, HistoryMode::Resume(fork_id), persisted);
+            assert_eq!(prompt_section_notices(&resumed).len(), 2);
+        });
+    }
+
+    fn resumes_with_a_rebuilt_prompt(edit: impl FnOnce(&mut serde_json::Value)) {
+        with_orca_home(|home| {
+            let cwd = tempdir().unwrap();
+            let agents = home.join("AGENTS.md");
+            std::fs::write(&agents, "Use yesterday's runbook.").unwrap();
+            let (path, _, transcript) = record_prompt_session(cwd.path());
+            let original = prompt_wire_record(&path);
+            let mut record: serde_json::Value = serde_json::from_str(&original).unwrap();
+            edit(&mut record["message"]);
+            let raw =
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .replacen(&original, &record.to_string(), 1);
+            std::fs::write(&path, raw).unwrap();
+            std::fs::write(&agents, "Use today's runbook.").unwrap();
+            let id = transcript.meta.session_id;
+            let loaded =
+                history::load_session(&id).expect("optional metadata must leave history readable");
+            let session = reopen_prompt_session(cwd.path(), HistoryMode::Resume(id), loaded);
+            let prompt = session.conversation.messages[0].content_str().unwrap();
+            assert!(prompt.contains("Use today's runbook."));
+            assert!(prompt_section_notices(&session).is_empty());
+        });
+    }
+
+    #[test]
+    fn duplicate_prompt_section_names_rebuild_the_prompt() {
+        resumes_with_a_rebuilt_prompt(|message| {
+            message["system_prompt"]["sections"][1]["name"] =
+                message["system_prompt"]["sections"][0]["name"].clone();
+        });
+    }
+
+    #[test]
+    fn prompt_sections_must_reconstruct_the_stored_content() {
+        resumes_with_a_rebuilt_prompt(|message| {
+            message["content"] = "A different prompt".into();
+        });
+    }
+
+    #[test]
+    fn malformed_prompt_sections_leave_the_transcript_readable() {
+        resumes_with_a_rebuilt_prompt(|message| {
+            message["system_prompt"]["sections"] = serde_json::json!({});
+        });
+    }
+
+    #[test]
+    fn an_unknown_prompt_metadata_version_rebuilds_without_notices() {
+        resumes_with_a_rebuilt_prompt(|message| {
+            message["system_prompt"]["version"] = 999.into();
+            message["system_prompt"]["sections"][0]["name"] = "future section".into();
+        });
+    }
+
+    #[test]
+    fn a_session_without_recorded_sections_resumes_as_before() {
+        with_orca_home(|_| {
+            let cwd = tempdir().unwrap();
+            let (path, current, _) = record_prompt_session(cwd.path());
+            let fresh: serde_json::Value =
+                serde_json::from_str(&prompt_wire_record(&path)).unwrap();
+            assert!(fresh["message"]["system_prompt"]["sections"].is_array());
+            let mut writer = SessionWriter::start(cwd.path(), "mock", None, "legacy").unwrap();
+            writer
+                .append_message(&Message::system("old unsectioned prompt".into()))
+                .unwrap();
+            let transcript = history::load_session("latest").unwrap();
+            let id = transcript.meta.session_id.clone();
+            let resumed = reopen_prompt_session(cwd.path(), HistoryMode::Resume(id), transcript);
+            assert_eq!(
+                resumed.conversation.messages[0].content_str(),
+                Some(current.as_str())
+            );
+            assert!(prompt_section_notices(&resumed).is_empty());
+        });
+    }
+
+    #[test]
+    fn the_recorded_sections_are_readable_by_the_previous_release() {
+        // System-message arms from the v0.5.25 SessionRecord and StoredMessageWire.
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type")]
+        enum PreviousSessionRecord {
+            #[serde(rename = "conversation.message")]
+            Message {
+                id: Option<orca_core::thread_identity::ConversationItemId>,
+                turn_id: Option<TurnId>,
+                message: PreviousStoredMessage,
+            },
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case", tag = "role")]
+        enum PreviousStoredMessage {
+            System {
+                content: String,
+                #[serde(default)]
+                pinned: bool,
+            },
+        }
+        with_orca_home(|_| {
+            let cwd = tempdir().unwrap();
+            let (path, prompt, _) = record_prompt_session(cwd.path());
+            let line = prompt_wire_record(&path);
+            let record: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert!(record["message"]["system_prompt"]["sections"].is_array());
+            let PreviousSessionRecord::Message {
+                id,
+                turn_id,
+                message: PreviousStoredMessage::System { content, pinned },
+            } = serde_json::from_str(&line).unwrap();
+            assert_eq!(content, prompt);
+            assert!(!pinned);
+            assert!(id.is_none());
+            assert!(turn_id.is_none());
+        });
+    }
+
+    #[test]
+    fn compaction_rebuilds_the_changed_system_prompt() {
+        with_orca_home(|orca_home| {
+            let cwd = tempdir().unwrap();
+            let agents = orca_home.join("AGENTS.md");
+            std::fs::write(&agents, "Use the old local runbook.").unwrap();
+            let (_, _, transcript) = record_prompt_session(cwd.path());
+            std::fs::write(&agents, "Use the new local runbook.").unwrap();
+            let id = transcript.meta.session_id.clone();
+            let mut resumed =
+                reopen_prompt_session(cwd.path(), HistoryMode::Resume(id), transcript);
+            assert!(
+                resumed.conversation.messages[0]
+                    .content_str()
+                    .unwrap()
+                    .contains("Use the old local runbook.")
+            );
+            resumed
+                .conversation
+                .add_assistant(Some("old answer ".repeat(5000)), None, vec![]);
+            resumed.conversation.add_user("continue".into());
+            let compacted = orca_provider::context::compact(
+                &resumed.conversation,
+                &orca_provider::context::ContextConfig {
+                    max_tokens: 4000,
+                    compaction_threshold: 1.0,
+                    reserved_for_response: 0,
+                    auto_compact_token_limit: None,
+                    soft_compact_token_limit: None,
+                },
+            );
+            assert!(
+                compacted.messages[0]
+                    .content_str()
+                    .unwrap()
+                    .contains("Use the new local runbook.")
+            );
+            assert!(
+                !compacted
+                    .messages
+                    .iter()
+                    .any(|message| message.content_str().is_some_and(|text| text
+                        .starts_with("The \"project instructions\" instructions changed")))
+            );
+        });
+    }
+
+    #[test]
     fn session_from_handmade_run_config_installs_user_price_overrides() {
         crate::pricing::tests::with_isolated_user_overrides(|| {
             use orca_core::model::{ModelDefinition, ModelPriceOverride, UsdPerMillion};
@@ -1826,6 +2536,7 @@ mod tests {
                     Message::System {
                         content,
                         pinned: false,
+                        ..
                     } if content.starts_with("You have called ") => Some(content.as_str()),
                     _ => None,
                 })
@@ -1841,7 +2552,7 @@ mod tests {
             }
             assert_eq!(reminders(&conversation), [THIRD]);
             assert!(matches!(conversation.messages.as_slice(),
-                [.., Message::Tool { content: output, .. }, Message::System { content, pinned: false }]
+                [.., Message::Tool { content: output, .. }, Message::System { content, pinned: false, .. }]
                     if output == "tool output" && content == THIRD));
         }
 
@@ -2009,7 +2720,7 @@ mod tests {
                     crate::history::resume_conversation(&transcript, "system prompt".to_string());
                 assert_eq!(reminders(&resumed), [THIRD]);
                 assert!(matches!(resumed.messages.as_slice(),
-                    [.., Message::Tool { content: output, .. }, Message::System { content, pinned: false }]
+                    [.., Message::Tool { content: output, .. }, Message::System { content, pinned: false, .. }]
                         if output == "tool output" && content == THIRD));
             });
         }
@@ -2282,7 +2993,7 @@ mod tests {
 
             let conversation = bootstrap_agent_conversation(
                 Some(&transcript),
-                "sys".to_string(),
+                Message::system("sys".into()),
                 home,
                 "continue",
             );
@@ -2306,8 +3017,12 @@ mod tests {
             writer.complete("interrupted").expect("complete");
             let transcript = history::load_session("latest").expect("transcript");
 
-            let conversation =
-                bootstrap_agent_conversation(Some(&transcript), "sys".to_string(), home, "/exit");
+            let conversation = bootstrap_agent_conversation(
+                Some(&transcript),
+                Message::system("sys".into()),
+                home,
+                "/exit",
+            );
 
             assert!(
                 !conversation

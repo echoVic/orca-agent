@@ -2134,6 +2134,7 @@ fn run_child_agent_applies_subagent_model_override() {
         tool_policy_label: None,
         workflow_ipc: None,
         continuation: None,
+        fork_prefix: None,
     };
     let cancel = CancelToken::new();
     let mut events = EventFactory::new("test-run".to_string());
@@ -2166,6 +2167,7 @@ fn run_child_agent_ignores_auto_override() {
         tool_policy_label: None,
         workflow_ipc: None,
         continuation: None,
+        fork_prefix: None,
     };
     let cancel = CancelToken::new();
     let mut events = EventFactory::new("test-run".to_string());
@@ -2196,6 +2198,7 @@ fn run_child_agent_preserves_cost_tracker_on_loop_error() {
         tool_policy_label: None,
         workflow_ipc: None,
         continuation: None,
+        fork_prefix: None,
     };
     let cancel = CancelToken::new();
     let mut events = EventFactory::new("test-run".to_string());
@@ -2216,4 +2219,789 @@ fn run_child_agent_preserves_cost_tracker_on_loop_error() {
     let tracker_debug = format!("{tracker:?}");
     assert!(tracker_debug.contains("input_tokens: 7"));
     assert!(tracker_debug.contains("output_tokens: 3"));
+}
+
+fn fork_tool_request(context: Option<&str>) -> ToolRequest {
+    let mut arguments = serde_json::json!({
+        "description": "inspect parent evidence",
+        "prompt": "Report the relevant evidence.",
+        "subagent_type": "explorer",
+        "model": "deepseek-flash"
+    });
+    if let Some(context) = context {
+        arguments["context"] = context.into();
+    }
+    ToolRequest {
+        id: "fork-child".into(),
+        name: ToolName::Subagent,
+        action: ActionKind::Agent,
+        target: None,
+        raw_arguments: Some(arguments.to_string()),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordedHistory {
+    Empty,
+    Ordinary,
+    OpeningCompaction,
+    ImageRewrite,
+    Interrupted,
+}
+
+fn recorded_provider(
+    replies: Vec<serde_json::Value>,
+    mut observe: impl FnMut(usize, &[u8], &mut serde_json::Value) + Send + 'static,
+) -> (String, std::thread::JoinHandle<Vec<Vec<u8>>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let mut bodies = Vec::new();
+        for (index, mut delta) in replies.into_iter().enumerate() {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return bodies;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("provider accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            observe(index, &body, &mut delta);
+            bodies.push(body);
+            let finish = if delta.get("tool_calls").is_some() {
+                "tool_calls"
+            } else {
+                "stop"
+            };
+            let chunk = serde_json::json!({"choices":[{"delta":delta,"finish_reason":finish}]});
+            let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        bodies
+    });
+    (base_url, server)
+}
+
+fn run_recorded_fork(
+    context: Option<&str>,
+    history: RecordedHistory,
+    attempt_write: bool,
+) -> (Vec<Vec<u8>>, ChildAgentResult) {
+    let mut replies = Vec::new();
+    if attempt_write {
+        replies.push(serde_json::json!({"reasoning_content":"try a write", "tool_calls":[{
+            "index":0,"id":"child-write","function":{"name":"write_file", "arguments":"{\"path\":\"fork-write.txt\",\"content\":\"unexpected\"}"}
+        }]}));
+    }
+    run_recorded_fork_with(context, history, replies, |_, _| {})
+}
+
+fn run_recorded_fork_with(
+    context: Option<&str>,
+    history: RecordedHistory,
+    mut child_replies: Vec<serde_json::Value>,
+    configure: impl FnOnce(&std::path::Path, &mut RunConfig),
+) -> (Vec<Vec<u8>>, ChildAgentResult) {
+    use orca_core::conversation::Conversation;
+    use orca_provider::tool_schema::ProviderToolDefinition;
+
+    let cwd = tempfile::tempdir().unwrap();
+    let orca_home = tempfile::tempdir().unwrap();
+    let _home = crate::history::redirect_test_orca_home(orca_home.path());
+    let mut replies = vec![serde_json::json!({"content": "parent response"})];
+    replies.append(&mut child_replies);
+    replies.push(serde_json::json!({"content": "child report"}));
+    let (base_url, server) = recorded_provider(replies, |_, _, _| {});
+    let mut config = config(Some(PRO_MODEL));
+    config.provider = ProviderKind::DeepSeek;
+    config.approval_mode = ApprovalMode::FullAuto;
+    config.api_key = Some("local-fixture".into());
+    config.base_url = Some(base_url);
+    configure(cwd.path(), &mut config);
+    let completed = history != RecordedHistory::Empty;
+    let mut parent = Conversation::new();
+    parent.add_system("Recorded parent system prompt".into());
+    if completed {
+        parent.add_user("Describe the recorded evidence".into());
+        parent.add_assistant(
+            None,
+            Some("recorded reasoning".into()),
+            vec![RawToolCall {
+                id: "parent-read".into(),
+                function_name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        parent.add_tool_result(
+            "parent-read".into(),
+            "recorded evidence from the completed turn\n".repeat(512),
+        );
+        parent.add_assistant(Some("parent completed report".into()), None, vec![]);
+    }
+    if history == RecordedHistory::Interrupted {
+        // The prior turn was cancelled before it produced any reply.
+        parent.messages.truncate(2);
+    }
+    if history == RecordedHistory::ImageRewrite {
+        let Message::Tool { images, .. } = &mut parent.messages[3] else {
+            panic!("expected earlier tool result");
+        };
+        images.push(ImageInput {
+            source: ImageSource::Url {
+                url: "https://example.invalid/evidence.png".into(),
+            },
+            detail: ImageDetail::Low,
+        });
+    }
+    if history == RecordedHistory::OpeningCompaction {
+        parent.add_user("prior compaction evidence ".repeat(1500));
+        parent.add_assistant(Some("prior report".into()), None, vec![]);
+    }
+    parent.add_user("in-flight parent prompt".into());
+    parent.start_provider_turn("parent-turn");
+    if history == RecordedHistory::OpeningCompaction {
+        parent = orca_provider::context::compact(
+            &parent,
+            &orca_provider::context::ContextConfig {
+                max_tokens: 400,
+                reserved_for_response: 100,
+                ..Default::default()
+            },
+        );
+        assert!(
+            parent.summary.baseline.is_some(),
+            "compaction should leave a summary"
+        );
+    }
+
+    if completed {
+        parent.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "active-tool".into(),
+                function_name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        parent.add_tool_result("active-tool".into(), "in-flight result".into());
+        parent.add_user("in-flight steering".into());
+        parent.note_provider_turn_steer();
+    }
+    let registry = orca_tools::registry::default_tool_registry();
+    let parent_config = orca_provider::ProviderConfig {
+        api_key: config.api_key.clone(),
+        base_url: config.base_url.clone(),
+        model: Some(PRO_MODEL.into()),
+        reasoning_effort: orca_core::config::ReasoningEffort::High,
+        tools_override: Some(
+            ["write_file", "read_file"]
+                .map(|name| {
+                    let spec = registry.get(name).unwrap().spec();
+                    ProviderToolDefinition {
+                        name: name.into(),
+                        description: spec.description.clone(),
+                        input_schema: spec.input_schema.clone(),
+                        strict_capable: false,
+                    }
+                })
+                .to_vec(),
+        ),
+        mcp_registry: None,
+        external_tools: vec![],
+        max_output_tokens: None,
+    };
+    let cancel = CancelToken::new();
+    let mut prepared = parent.clone();
+    orca_core::tool_images::drop_tool_images(&mut prepared.messages, TOOL_IMAGE_UNAVAILABLE_NOTE);
+    orca_provider::deepseek_http::bind_replay_source(&mut prepared, &parent);
+    let recorded = orca_provider::call_streaming(
+        ProviderKind::DeepSeek,
+        &prepared,
+        &parent_config,
+        &cancel,
+        &mut |_| {},
+    );
+    assert_eq!(
+        recorded.assistant_content.as_deref(),
+        Some("parent response")
+    );
+    if completed {
+        parent.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: "pending-tool".into(),
+                function_name: "subagent".into(),
+                arguments: "{}".into(),
+            }],
+        );
+    }
+    let mut request = crate::subagent::create_subagent_request(&fork_tool_request(context));
+    let registry = crate::tasks::TaskRegistry::new("recorded-fork".into());
+    crate::subagent::prepare_fork_request(&mut request, &config, Some(&parent), &registry).unwrap();
+    let mut child = ChildAgentRequest::new(
+        request.prompt,
+        request.subagent_type,
+        request.model,
+        1,
+        false,
+    );
+    child.fork_prefix = request.fork_prefix_ref.map(|reference| {
+        registry
+            .continuation_store()
+            .unwrap()
+            .load_fork_prefix(reference)
+            .unwrap()
+    });
+    let mut events = EventFactory::new("fork-child".into());
+    let mut sink = EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl);
+    let mut runtime = runtime(
+        &mut sink,
+        &mut events,
+        &cancel,
+        crate::agent_loop::execute_child_agent_loop,
+    );
+    runtime.cwd = cwd.path();
+    let (result, _) = run_child_agent(&config, &child, &mut runtime);
+    assert!(!cwd.path().join("fork-write.txt").exists());
+    (server.join().unwrap(), result)
+}
+
+fn recorded_wire_messages(body: &[u8]) -> Vec<Box<serde_json::value::RawValue>> {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        messages: Vec<Box<serde_json::value::RawValue>>,
+    }
+    serde_json::from_slice::<Request>(body).unwrap().messages
+}
+
+#[test]
+fn a_fork_childs_first_request_shares_the_parents_prefix() {
+    let (bodies, result) = run_recorded_fork(Some("fork"), RecordedHistory::Ordinary, false);
+    let parent = recorded_wire_messages(&bodies[0]);
+    let child = recorded_wire_messages(&bodies[1]);
+    let inherited = 5;
+    for (parent, child) in parent[..inherited].iter().zip(&child[..inherited]) {
+        assert_eq!(parent.get(), child.get());
+    }
+    assert!(
+        child[2]
+            .get()
+            .contains(r#""reasoning_content":"recorded reasoning""#)
+    );
+    assert!(
+        child[inherited]
+            .get()
+            .contains("Report the relevant evidence")
+    );
+    assert!(child[inherited].get().contains("read-only"));
+    #[derive(serde::Deserialize)]
+    struct Tools {
+        tools: Box<serde_json::value::RawValue>,
+    }
+    let tools = |body: &[u8]| serde_json::from_slice::<Tools>(body).unwrap().tools;
+    assert_eq!(tools(&bodies[0]).get(), tools(&bodies[1]).get());
+    let matching_message_bytes: usize = child[..inherited]
+        .iter()
+        .map(|message| message.get().len())
+        .sum();
+    let shared = matching_message_bytes + tools(&bodies[1]).get().len();
+    eprintln!(
+        "Recorded fork share: {shared}/{} request bytes ({:.2}%)",
+        bodies[1].len(),
+        100.0 * shared as f64 / bodies[1].len() as f64
+    );
+    assert_eq!(result.final_message.as_deref(), Some("child report"));
+}
+
+#[test]
+fn the_in_flight_turn_is_not_inherited() {
+    let (bodies, _) = run_recorded_fork(Some("fork"), RecordedHistory::Ordinary, false);
+    let child = std::str::from_utf8(&bodies[1]).unwrap();
+    assert!(child.contains("parent completed report"));
+    for marker in ["in-flight", "active-tool", "pending-tool"] {
+        assert!(!child.contains(marker), "child inherited {marker}");
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForkResumeChange {
+    None,
+    InstructionsChanged,
+    TrustRevoked,
+}
+
+#[test]
+fn a_resumed_fork_child_keeps_its_prefix() {
+    assert_dispatched_fork_resume(ForkResumeChange::None);
+    assert_dispatched_fork_resume(ForkResumeChange::InstructionsChanged);
+}
+
+#[test]
+fn a_fork_child_drops_inherited_instructions_whose_trust_was_revoked() {
+    assert_dispatched_fork_resume(ForkResumeChange::TrustRevoked);
+}
+
+fn assert_dispatched_fork_resume(change: ForkResumeChange) {
+    use crate::lifecycle::{AgentLoopContext, AgentLoopOutcome};
+    use crate::runtime_conversation_bootstrap::AgentConversationContext;
+    use crate::tasks::TaskRegistry;
+    use crate::tool_invocation::AgentToolPolicyContext;
+    use orca_core::config::folder_trust::{TrustLevel, set_trust};
+    use orca_core::conversation::Conversation;
+    use orca_core::task_types::TaskStatus;
+    use serde_json::{Value, json};
+
+    let cwd = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(cwd.path().join("sibling.txt"), "active sibling evidence").unwrap();
+    let instruction_path = cwd.path().join("AGENTS.md");
+    std::fs::write(&instruction_path, "Follow the original workspace runbook.").unwrap();
+    set_trust(cwd.path(), TrustLevel::Trusted).unwrap();
+    let registry =
+        TaskRegistry::new_persistent("fork-dispatch".into(), home.path().join("task-sessions"))
+            .unwrap();
+    let parent = registry.create_main_session("fork dispatch parent".into());
+    registry.mark_running(&parent.id).unwrap();
+    let blocker = registry.create_subagent("occupy the child slot".into(), None);
+    registry.mark_running(&blocker.id).unwrap();
+
+    let tool = |index: usize, id: &str, name: &str, arguments: Value| {
+        json!({"index": index, "id": id, "type": "function", "function": {
+            "name": name, "arguments": arguments.to_string()
+        }})
+    };
+    let mut replies = vec![
+        json!({"content": "completed parent evidence"}),
+        json!({"reasoning_content": "dispatch two calls", "tool_calls": [
+            tool(0, "sibling-read", "read_file", json!({"path": "sibling.txt"})),
+            tool(1, "fork-launch", "subagent", json!({
+                "context": "fork", "mode": "async", "subagent_type": "explorer",
+                "description": "queued fork child", "prompt": "Report the completed evidence."
+            }))
+        ]}),
+        json!({"content": "waiting for the fork report"}),
+        json!({"content": "initial fork child report"}),
+        json!({"content": "integrated the fork report"}),
+        json!({"reasoning_content": "resume the child", "tool_calls": [
+            tool(0, "fork-resume", "subagent", json!({}))
+        ]}),
+        json!({"content": "resumed fork child report"}),
+        json!({"content": "parent resume report"}),
+    ];
+    if change == ForkResumeChange::InstructionsChanged {
+        replies.extend([
+            json!({"reasoning_content": "resume again", "tool_calls": [
+                tool(0, "fork-resume-again", "subagent", json!({}))
+            ]}),
+            json!({"content": "second resumed child report"}),
+            json!({"content": "second parent resume report"}),
+        ]);
+    }
+    let mut fork_task = None;
+    let worker_registry = registry.clone();
+    let parent_id = parent.id.clone();
+    let mut first_resume_source = None;
+    let (base_url, server) = recorded_provider(replies, move |index, body, delta| match index {
+        2 => {
+            let request: Value = serde_json::from_slice(body).unwrap();
+            let messages = request["messages"].as_array().unwrap();
+            let tool_result = |id: &str| {
+                messages
+                    .iter()
+                    .find(|message| message["tool_call_id"] == id)
+                    .unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+            };
+            assert!(tool_result("sibling-read").contains("active sibling evidence"));
+            let launch: Value = serde_json::from_str(tool_result("fork-launch")).unwrap();
+            assert_eq!(launch["status"], "queued");
+            let task_id = launch["task_id"].as_str().unwrap();
+            let queued = worker_registry
+                .queued_subagent_launches(Some(&parent_id))
+                .unwrap();
+            assert!(queued.iter().any(|(id, _)| id == task_id));
+            fork_task = Some(task_id.to_owned());
+            worker_registry
+                .complete(&blocker.id, "slot released".into())
+                .unwrap();
+        }
+        5 => {
+            let task_id = fork_task.as_deref().unwrap();
+            let task = worker_registry.get(task_id).unwrap();
+            assert_eq!(task.status, TaskStatus::Completed, "{:?}", task.error);
+            delta["tool_calls"][0]["function"]["arguments"] = json!({
+                "description": "resume the fork child", "prompt": "Continue your report.",
+                "resume_from": task_id, "mode": "sync"
+            })
+            .to_string()
+            .into();
+        }
+        7 if change == ForkResumeChange::InstructionsChanged => {
+            let request: Value = serde_json::from_slice(body).unwrap();
+            let resume = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["tool_call_id"] == "fork-resume")
+                .unwrap();
+            first_resume_source = resume["content"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("resume_from="))
+                .map(str::to_owned);
+        }
+        8 => {
+            let task_id = first_resume_source.as_deref().unwrap();
+            delta["tool_calls"][0]["function"]["arguments"] = json!({
+                "description": "resume again", "prompt": "Add a final detail.",
+                "resume_from": task_id, "mode": "sync"
+            })
+            .to_string()
+            .into();
+        }
+        _ => {}
+    });
+    let mut config = config(Some(PRO_MODEL));
+    config.provider = ProviderKind::DeepSeek;
+    config.approval_mode = ApprovalMode::FullAuto;
+    config.api_key = Some("local-fixture".into());
+    config.base_url = Some(base_url);
+    config.subagents.limits.max_running = 1;
+
+    let mut conversation = Conversation::new();
+    let parent_instructions = crate::instructions::load_for_cwd(cwd.path()).unwrap();
+    conversation.messages.push(
+        crate::agent_common::build_agent_system_prompt_sections(
+            cwd.path(),
+            &config,
+            0,
+            &SubagentType::General,
+            Some(&parent_instructions),
+            None,
+            None,
+        )
+        .into_message(),
+    );
+    let mut run_turn = |prompt: &str, expected: &str| {
+        conversation.add_user(prompt.into());
+        let outcome = crate::agent_loop::run_agent_loop(
+            &config,
+            AgentLoopContext::new(cwd.path(), prompt, 0, false, &SubagentType::General)
+                .with_root_task_id(Some(&parent.id))
+                .with_services(
+                    &ProjectInstructions::default(),
+                    &MemoryBlock::default(),
+                    &McpRegistry::default(),
+                    &HookRunner::default(),
+                )
+                .with_runtime(&mut CostTracker::new(None), &CancelToken::new(), &registry)
+                .with_execution(&mut Vec::new(), None, None),
+            &mut EventFactory::new("fork-dispatch".into()),
+            &mut EventSink::new(io::sink(), OutputFormat::Jsonl),
+            AgentConversationContext::borrowed(&mut conversation, None, false),
+            AgentToolPolicyContext::new(None, None),
+        )
+        .unwrap();
+        let AgentLoopOutcome::Completed(result) = outcome else {
+            panic!("parent turn did not complete");
+        };
+        assert_eq!(
+            result.status,
+            RunStatus::Success,
+            "{prompt}: {:?}",
+            result.error
+        );
+        assert_eq!(result.final_message.as_deref(), Some(expected));
+    };
+    run_turn("Gather earlier evidence.", "completed parent evidence");
+    run_turn(
+        "Active parent turn: dispatch the fork.",
+        "integrated the fork report",
+    );
+    match change {
+        ForkResumeChange::None => {}
+        ForkResumeChange::InstructionsChanged => {
+            std::fs::write(&instruction_path, "Follow the updated workspace runbook.").unwrap();
+        }
+        ForkResumeChange::TrustRevoked => {
+            set_trust(cwd.path(), TrustLevel::Untrusted).unwrap();
+        }
+    }
+    run_turn("Resume the fork.", "parent resume report");
+
+    if change == ForkResumeChange::InstructionsChanged {
+        run_turn("Resume again.", "second parent resume report");
+    }
+    let bodies = server.join().unwrap();
+    assert_eq!(
+        bodies.len(),
+        if change == ForkResumeChange::InstructionsChanged {
+            11
+        } else {
+            8
+        }
+    );
+    if change == ForkResumeChange::InstructionsChanged {
+        let request = recorded_wire_messages(&bodies[9]);
+        let update_positions: Vec<_> = request
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                message
+                    .get()
+                    .contains("Follow the updated workspace runbook.")
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let first_resume = request
+            .iter()
+            .position(|message| message.get().contains("Continue your report."))
+            .unwrap();
+        assert_eq!(update_positions.len(), 1);
+        assert!(
+            update_positions[0] < first_resume,
+            "the second resume moved the previous notice"
+        );
+    }
+    let parent = recorded_wire_messages(&bodies[1]);
+    let cut = parent
+        .iter()
+        .position(|message| message.get().contains("Active parent turn"))
+        .unwrap();
+    for index in [3, 6] {
+        let child = recorded_wire_messages(&bodies[index]);
+        let body = std::str::from_utf8(&bodies[index]).unwrap();
+        if index == 6 && change == ForkResumeChange::TrustRevoked {
+            assert!(!body.contains("completed parent evidence"));
+            assert!(!body.contains("Follow the original workspace runbook."));
+            assert!(body.contains("inherited instruction sources no longer apply"));
+            assert!(child[0].get().contains("read-only"));
+        } else {
+            assert!(body.contains("completed parent evidence"));
+            assert!(body.contains("Follow the original workspace runbook."));
+            for (parent, inherited) in parent[..cut].iter().zip(&child[..cut]) {
+                assert_eq!(parent.get(), inherited.get());
+            }
+        }
+        let updates: Vec<_> = child
+            .iter()
+            .filter(|message| {
+                message
+                    .get()
+                    .contains("instructions changed; they now read")
+            })
+            .collect();
+        if index == 6 && change == ForkResumeChange::InstructionsChanged {
+            assert_eq!(updates.len(), 1);
+            assert!(
+                updates[0]
+                    .get()
+                    .contains("Follow the updated workspace runbook.")
+            );
+        } else {
+            assert!(updates.is_empty());
+        }
+        for marker in [
+            "Active parent turn",
+            "sibling-read",
+            "active sibling evidence",
+            "fork-launch",
+        ] {
+            assert!(!body.contains(marker), "child inherited {marker}");
+        }
+        assert_eq!(body.contains("initial fork child report"), index == 6);
+    }
+}
+
+#[test]
+fn a_fork_childs_role_limits_are_enforced_at_execution() {
+    let (bodies, result) = run_recorded_fork(Some("fork"), RecordedHistory::Ordinary, true);
+    let first: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
+    assert!(
+        first["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "write_file")
+    );
+    assert_eq!(result.status, RunStatus::Success, "{:?}", result.error);
+    let continued: serde_json::Value = serde_json::from_slice(&bodies[2]).unwrap();
+    let call = continued["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["tool_calls"].as_array().into_iter().flatten())
+        .find(|call| call["id"] == "child-write")
+        .unwrap();
+    let arguments: serde_json::Value =
+        serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(arguments["path"], "fork-write.txt");
+    assert!(
+        continued
+            .to_string()
+            .contains("role 'explorer' tool policy disallows tool 'write_file'")
+    );
+    assert_eq!(continued["tools"], first["tools"]);
+    assert_eq!(result.final_message.as_deref(), Some("child report"));
+}
+
+#[test]
+fn a_fork_childs_final_report_request_sends_no_tools() {
+    let (bodies, result) = run_recorded_fork_with(
+        Some("fork"),
+        RecordedHistory::Ordinary,
+        vec![
+            serde_json::json!({"reasoning_content":"read the evidence", "tool_calls":[{
+                "index":0,"id":"child-read","function":{"name":"read_file", "arguments":"{\"path\":\"evidence.txt\"}"}
+            }]}),
+        ],
+        |cwd, config| {
+            std::fs::write(cwd.join("evidence.txt"), "child evidence").unwrap();
+            config.subagents.max_investigation_tool_calls = 1;
+        },
+    );
+    assert_eq!(result.status, RunStatus::Success, "{:?}", result.error);
+    let report: serde_json::Value = serde_json::from_slice(&bodies[2]).unwrap();
+    assert!(
+        report
+            .to_string()
+            .contains("Read-only investigation finalization")
+    );
+    assert!(report.to_string().contains("child evidence"));
+    assert_eq!(report["tools"], serde_json::json!([]));
+    assert!(report.to_string().contains("parent completed report"));
+}
+
+#[test]
+fn a_fork_child_uses_the_parents_model() {
+    let (bodies, _) = run_recorded_fork(Some("fork"), RecordedHistory::Ordinary, false);
+    let child: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
+    assert_eq!(child["model"], PRO_MODEL);
+    assert_eq!(child["reasoning_effort"], "high");
+}
+
+#[test]
+fn fresh_children_are_unchanged() {
+    for context in [None, Some("fresh")] {
+        let (bodies, _) = run_recorded_fork(context, RecordedHistory::Ordinary, false);
+        let child: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
+        assert_eq!(child["model"], FLASH_MODEL);
+        assert_eq!(child["messages"][0]["role"], "system");
+        assert!(
+            child["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("read-only")
+        );
+        assert_eq!(
+            child["messages"][1]["content"],
+            "Report the relevant evidence."
+        );
+        assert!(
+            !std::str::from_utf8(&bodies[1])
+                .unwrap()
+                .contains("Recorded parent system prompt")
+        );
+    }
+}
+
+#[test]
+fn a_fork_before_any_completed_turn_starts_fresh_with_a_note() {
+    let (bodies, _) = run_recorded_fork(Some("fork"), RecordedHistory::Empty, false);
+    let child: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
+    assert_eq!(child["model"], FLASH_MODEL);
+    let prompt = child["messages"][1]["content"].as_str().unwrap();
+    assert!(prompt.contains("no completed parent turn"), "{prompt}");
+    assert!(prompt.contains("Report the relevant evidence"));
+}
+
+#[test]
+fn the_subagent_schema_exposes_fork_with_a_fresh_default() {
+    let registry = orca_tools::registry::default_tool_registry();
+    let context = &registry.get("subagent").unwrap().spec().input_schema["properties"]["context"];
+    assert_eq!(context["enum"], serde_json::json!(["fresh", "fork"]));
+    assert_eq!(context["default"], "fresh");
+}
+
+fn assert_recorded_history_is_inherited(history: RecordedHistory, marker: &str) {
+    let (bodies, result) = run_recorded_fork(Some("fork"), history, false);
+    let parent = recorded_wire_messages(&bodies[0]);
+    let child = recorded_wire_messages(&bodies[1]);
+    let inherited = parent
+        .iter()
+        .position(|message| message.get().contains("in-flight parent prompt"))
+        .unwrap();
+    assert!(
+        parent[..inherited]
+            .iter()
+            .any(|message| message.get().contains(marker))
+    );
+    assert!(
+        child.len() > inherited && child[0].get() == parent[0].get(),
+        "child started fresh or lost history"
+    );
+    assert_eq!(
+        child[..inherited]
+            .iter()
+            .map(|message| message.get())
+            .collect::<Vec<_>>(),
+        parent[..inherited]
+            .iter()
+            .map(|message| message.get())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(result.status, RunStatus::Success);
+}
+
+#[test]
+fn a_fork_after_opening_compaction_inherits_the_summary() {
+    assert_recorded_history_is_inherited(RecordedHistory::OpeningCompaction, "[Summary baseline]");
+}
+
+#[test]
+fn a_fork_after_an_image_rewrite_still_inherits() {
+    assert_recorded_history_is_inherited(
+        RecordedHistory::ImageRewrite,
+        TOOL_IMAGE_UNAVAILABLE_NOTE,
+    );
+}
+
+#[test]
+fn an_interrupted_earlier_turn_is_inherited_as_the_parent_sent_it() {
+    assert_recorded_history_is_inherited(
+        RecordedHistory::Interrupted,
+        "Describe the recorded evidence",
+    );
 }
