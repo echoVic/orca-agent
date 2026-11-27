@@ -333,7 +333,8 @@ impl WorkflowHost {
         }
         command
             .arg(mailbox_path.unwrap_or_else(|| Path::new("")))
-            .arg(&task_list_reply);
+            .arg(&task_list_reply)
+            .arg(MAX_WORKFLOW_HOST_FRAME_BYTES.to_string());
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1937,6 +1938,29 @@ console.log(JSON.stringify({
         assert_eq!(seen["command"], "ERR_ACCESS_DENIED");
         assert_ne!(seen["code"], "allowed");
         assert!(!temp.path().join("made.txt").exists());
+    }
+
+    #[test]
+    fn workflow_task_list_reports_oversized_requests_to_the_script() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("workflow.js");
+        fs::write(
+            &script,
+            "export const meta = { name: 'limit', description: 'Task list limit', phases: [] };
+             let error;
+             try { createTaskList('oversized', ['界'.repeat(350_000)]); }
+             catch (e) { error = e.message; }
+             export default [error, listTasks('oversized').length, createTaskList('small', ['ok']).length];",
+        )
+        .unwrap();
+        let events = WorkflowHost::run_collecting_events_with_agent(&script, Value::Null, |_| {
+            unreachable!("script makes no agent calls")
+        })
+        .unwrap();
+        assert!(
+            matches!(events.last(), Some(HostEvent::WorkflowCompleted { result })
+            if *result == serde_json::json!(["Workflow task list request exceeds 1048576 bytes", 0, 1]))
+        );
     }
 
     #[test]

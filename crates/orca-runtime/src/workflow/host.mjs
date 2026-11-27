@@ -6,6 +6,7 @@ const scriptPath = process.argv[2];
 const argsJson = process.argv[3] ?? "null";
 const mailboxPath = process.argv[4] || null;
 const taskListReplyPath = process.argv[5];
+const maxFrameBytes = Number(process.argv[6]);
 JSON.parse(argsJson);
 
 // The source scan below turns the obvious ways out of a workflow script into a
@@ -234,7 +235,11 @@ function callTaskList(operation, args) {
     throw new Error("Workflow task lists require a runner");
   }
   const id = ++taskListCallSeq;
-  emit({ task_list_call: { id, request: { operation, ...args } } });
+  const frame = `${JSON.stringify({ task_list_call: { id, request: { operation, ...args } } })}\n`;
+  if (Buffer.byteLength(frame) > maxFrameBytes) {
+    throw new Error(`Workflow task list request exceeds ${maxFrameBytes} bytes`);
+  }
+  writeFileSync(1, frame);
   const deadline = performance.now() + 30_000;
   while (performance.now() < deadline) {
     let reply;
