@@ -147,6 +147,11 @@ descendants, including parents that released their execution lease while
 waiting for children. A waiting parent must re-enter the fair queue before it
 can continue.
 
+A steer from the user ends the parent's `task_wait` or end-of-turn child wait
+so the parent can handle it on the next model step. The parent can wait again
+afterward. When only child results remain, the parent can end its reply and
+Orca resumes the turn as those results arrive.
+
 The retired `max_parallel` key is ignored. Use `delegation = "off"` to disable
 new child submission.
 

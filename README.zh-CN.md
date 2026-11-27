@@ -124,6 +124,9 @@ Orca 还提供可选的[共享 ACP 会话](docs/acp-daemon.md)（Unix 上的 `or
 - 通过 `suggest`、沙箱内 `auto-edit`、完全访问 `full-auto` 和只读 `plan`
   模式控制风险，同时提供目录信任机制。
 - 在本地保存对话历史，支持恢复、分叉、搜索、重命名、归档和压缩。
+- 保存有历史记录的会话中较长的 MCP、外部工具和网页工具结果，模型可以用
+  `read_file` 分段读取，也可以用 `grep` 搜索。在 `[tools]` 下设置
+  `apply_patch = true`，可以一次修改多个文件。
 - 默认没有隐式轮次上限；可通过 `[budget]` 配置（`--max-turns`、
   `--max-tool-calls`、`--max-cost-usd`、`--max-wall-time-secs`）显式约束
   单次运行，预算耗尽时先结算当前工具、创建检查点，再以退出码 4 结束，并在
@@ -135,8 +138,11 @@ Orca 还提供可选的[共享 ACP 会话](docs/acp-daemon.md)（Unix 上的 `or
 - 直接、嵌套、Workflow、托管、续跑和恢复的子代理共用每棵根任务树的持久执行
   作用域。默认 32 个执行 lease 是容量上限而非派单目标；超出的已接受任务排队且
   不提前创建 worker，等待子任务的父代理会释放名额并在恢复前重新进入公平队列。
+  新建子代理时，`subagent` 可用 `context: "fork"` 传入父代理已完成的 DeepSeek 对话。
 - 在工作区受信任后加载项目指令、Skills、Plugins、自定义工具、MCP 工具和资源。
+  读取或修改文件时，Orca 会查找子目录中的 `AGENTS.md`，也会把可用的 skill 目录发给模型。
 - 用 `orca mcp add`、`list`、`get`、`remove`、`login` 和 `logout` 管理 MCP 服务器：本地 stdio 服务器，以及通过 streamable HTTP 或旧版 SSE 连接、用 OAuth 或环境变量里的 bearer token 登录的远程服务器。
+  在服务器配置中设置 `tool_loading = "on-demand"` 可按需加载工具。
 - 为编辑器、测试框架和 CI 提供稳定的 JSONL、app-server 与 Agent Client
   Protocol（ACP）协议。
 

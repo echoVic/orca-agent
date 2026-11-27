@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.26":
+        "Deep compaction replays the cached DeepSeek prefix to write a structured checkpoint. Resumed sessions keep their recorded prompt and append notices for changed instructions. A subagent started with context: \"fork\" can use the parent's completed conversation. Orca saves large tool results for read_file and grep, discovers nested AGENTS.md files, and gives the model a skills catalog. Set tool_loading = \"on-demand\" on an MCP server to load tools as needed, or enable apply_patch under [tools] for multi-file patches. A steer reaches a parent waiting for children, concurrent workflow task-list updates are preserved, repeated calls get a reminder, and eligible network reads run in parallel.",
       "v0.5.25":
         "Replies cut short by Esc or the output limit stay in the conversation after a resume. The terminal shows when a provider will retry, orca exec JSONL emits provider.retry, and DeepSeek errors include the HTTP status and request ID when available. The session picker marks transcripts that need a newer Orca as Newer version. Background commands can report completion during the same turn and include the end of their output. DeepSeek's 128-tool cap gives Orca's tools priority, and MCP server instructions reach the model. Scripts stopped by a limit keep their logs, and edit and write_file preserve CRLF line endings.",
       "v0.5.24":
@@ -724,6 +726,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.26":
+        "深度压缩会回放 DeepSeek 已缓存的对话前缀，生成结构化检查点。恢复会话时沿用原来的提示词，指令有变化才追加说明。子代理可用 context: \"fork\" 继承父代理已完成的对话。大段工具输出存成文件，可以继续用 read_file 分段读取或用 grep 搜索。Orca 会发现子目录的 AGENTS.md，并把 skill 目录发给模型。MCP 服务器可设 tool_loading = \"on-demand\" 按需加载工具，也可在 [tools] 中开启 apply_patch 一次修改多个文件。父代理等待子任务时也能收到你的消息。工作流任务清单会保留每次并发更新。连续重复的工具调用会收到提醒，审批策略已允许的一批网络读取可以并行执行。",
       "v0.5.25":
         "按 Esc 打断回复，或回复达到输出上限时，已经显示的内容会随会话保存，恢复会话后还能接着问。终端会显示重试还要等多久，orca exec 的 JSONL 输出会发出 provider.retry 事件。DeepSeek 报错时会附上可用的 HTTP 状态码和请求 ID。需要升级 Orca 才能打开的会话会标为 Newer version。后台命令可以在当前轮次报告完成，并附上输出末尾。DeepSeek 的 128 个工具名额优先留给 Orca 自带的工具，MCP 服务器提供的说明也会发给模型。脚本达到时间或内存上限时会保留已有日志，edit 和 write_file 会保留 CRLF 换行。",
       "v0.5.24":
