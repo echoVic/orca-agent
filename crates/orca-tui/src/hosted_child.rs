@@ -23,7 +23,6 @@ use crate::attachment_routing::{
 };
 use crate::hosted_session::{
     HistoryTarget, HostedConversation, hosted_projection_batch_from_snapshot,
-    project_hosted_thread_attached,
 };
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::protocol::{SessionAttachmentId, TuiEvent};
@@ -966,7 +965,37 @@ pub(crate) fn project_returned_main_with_label(
 ) -> Result<(), String> {
     let (projection, conversation) =
         hosted_projection_batch_from_snapshot(thread, snapshot, HistoryTarget::Conversation);
-    project_hosted_thread_attached(projection, conversation, label, attachment, sender)?;
+    let owner = snapshot
+        .foreground_operation
+        .as_ref()
+        .filter(|owner| owner.terminal.is_none());
+    let recovery = owner.and_then(|owner| {
+        control
+            .follow_recovery(&owner.operation_id)
+            .map(|message| (&owner.operation_id, message))
+    });
+    let requests = register_requested_interactions(snapshot, control);
+    let reader_live = owner
+        .and_then(|owner| control.main_reader(&owner.operation_id))
+        .is_some_and(|reader| reader.seed(&snapshot.cursor));
+    let seed = routing
+        .lock()
+        .map_err(|error| error.to_string())?
+        .snapshot_projected(
+            attachment,
+            snapshot,
+            &requests,
+            recovery.map(|(owner, _)| owner.clone()),
+            reader_live,
+        );
+    send_attached_event(
+        sender,
+        attachment,
+        TuiEvent::ReturnedMainProjection(Box::new(projection), seed),
+    )
+    .map_err(|error| error.to_string())?;
+    send_attached_event(sender, attachment, conversation.into_event(label))
+        .map_err(|error| error.to_string())?;
     if let Some(generation) = snapshot
         .foreground_operation
         .as_ref()
@@ -989,15 +1018,6 @@ pub(crate) fn project_returned_main_with_label(
         send_attached_event(sender, attachment, TuiEvent::PromptQueueUpdated(queue))
             .map_err(|error| error.to_string())?;
     }
-    let recovery = snapshot
-        .foreground_operation
-        .as_ref()
-        .filter(|owner| owner.terminal.is_none())
-        .and_then(|owner| {
-            control
-                .follow_recovery(&owner.operation_id)
-                .map(|message| (&owner.operation_id, message))
-        });
     if let Some((owner, message)) = recovery {
         send_attached_event(
             sender,
@@ -1010,16 +1030,6 @@ pub(crate) fn project_returned_main_with_label(
         )
         .map_err(|error| error.to_string())?;
     }
-    let requests = register_requested_interactions(snapshot, control);
-    routing
-        .lock()
-        .map_err(|error| error.to_string())?
-        .snapshot_projected(
-            attachment,
-            snapshot,
-            &requests,
-            recovery.map(|(owner, _)| owner.clone()),
-        );
     for event in requests {
         send_attached_event(sender, attachment, event).map_err(|error| error.to_string())?;
     }
@@ -2130,7 +2140,7 @@ pub(crate) mod live_child_for_test {
     }
 
     struct MainDisplay {
-        route: crate::attachment_routing::AttachmentRouting,
+        route: std::sync::Arc<std::sync::Mutex<crate::attachment_routing::AttachmentRouting>>,
         state: crate::types::AppState,
     }
 
@@ -2140,7 +2150,9 @@ pub(crate) mod live_child_for_test {
             let mut state = fresh_state();
             state.active_session_attachment = Some(main);
             Self {
-                route: crate::attachment_routing::AttachmentRouting::new(main),
+                route: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::attachment_routing::AttachmentRouting::new(main),
+                )),
                 state,
             }
         }
@@ -2148,7 +2160,13 @@ pub(crate) mod live_child_for_test {
         fn send(&mut self, event: TuiEvent) -> bool {
             let (sender, events) = crossbeam_channel::unbounded();
             self.route
+                .lock()
+                .unwrap()
                 .route(&sender, SessionAttachmentId::new(1), event);
+            self.apply(events)
+        }
+
+        fn apply(&mut self, events: crossbeam_channel::Receiver<TuiEvent>) -> bool {
             let mut accepted = false;
             for event in events.try_iter() {
                 if let Some(event) =
@@ -2161,12 +2179,49 @@ pub(crate) mod live_child_for_test {
             }
             accepted
         }
+
+        fn reproject(&mut self, fixture: &ViewOnChild, snapshot: &super::SurfaceSnapshot) {
+            let (sender, events) = crossbeam_channel::unbounded();
+            let main = SessionAttachmentId::new(1);
+            crate::attachment_routing::AttachmentRouting::switch_attachment_deferred(
+                &self.route,
+                &sender,
+                main,
+                Some(main),
+            );
+            super::project_returned_main(
+                &fixture.parent,
+                snapshot,
+                main,
+                &sender,
+                &fixture.control,
+                &self.route,
+            )
+            .unwrap();
+            crate::attachment_routing::AttachmentRouting::release_deferred_parent_events(
+                &self.route,
+                &sender,
+            );
+            self.apply(events);
+        }
     }
 
     fn background_turn(
         fixture: &ViewOnChild,
         shown: &mut MainDisplay,
         label: &str,
+    ) -> (
+        orca_runtime::surface::SurfaceBackgroundOperation,
+        std::path::PathBuf,
+    ) {
+        background_turn_after(fixture, shown, label, false)
+    }
+
+    fn background_turn_after(
+        fixture: &ViewOnChild,
+        shown: &mut MainDisplay,
+        label: &str,
+        reproject: bool,
     ) -> (
         orca_runtime::surface::SurfaceBackgroundOperation,
         std::path::PathBuf,
@@ -2203,6 +2258,23 @@ pub(crate) mod live_child_for_test {
                 break owner;
             }
         };
+        let baseline = reproject.then(|| {
+            use orca_runtime::surface::{NonEmptyVec, RuntimeSettingsPatch};
+            let effort = super::read_parent_snapshot(&fixture.parent)
+                .unwrap()
+                .settings
+                .effective
+                .reasoning_effort;
+            crate::surface_client::update_settings(
+                &fixture.parent.typed_surface(),
+                NonEmptyVec::try_new(vec![RuntimeSettingsPatch::SetReasoning { effort }]).unwrap(),
+            )
+            .unwrap();
+            let snapshot = super::read_parent_snapshot(&fixture.parent).unwrap();
+            shown.reproject(fixture, &snapshot);
+            assert!(shown.state.lifecycle_cursor.as_ref().unwrap().live);
+            snapshot.cursor.next_seq
+        });
         let (actions, received) = crossbeam_channel::unbounded();
         crate::running_actions::handle_running_shortcut(
             crate::shortcuts::RunningShortcut::BackgroundCurrentTurn,
@@ -2217,8 +2289,17 @@ pub(crate) mod live_child_for_test {
         assert!(
             matches!(worker.join().unwrap().unwrap(),crate::hosted_runtime::TuiHostedOperationOutcome::Turn{status} if status=="backgrounded")
         );
+        let mut released = None;
         for event in events.try_iter() {
+            if let TuiEvent::SurfaceDelivery(delivery) = &event
+                && matches!(delivery.1, TuiEvent::OperationReleased)
+            {
+                released = Some(delivery.0.next_seq);
+            }
             shown.send(event);
+        }
+        if let Some(head) = baseline {
+            assert!(released.unwrap() < head);
         }
         let background = super::read_parent_snapshot(&fixture.parent)
             .unwrap()
@@ -2242,20 +2323,37 @@ pub(crate) mod live_child_for_test {
             interaction_id,
             expected_revision: InteractionRevision::try_new(1).unwrap(),
             next_revision: InteractionRevision::try_new(2).unwrap(),
-            background_fence: background.fence,
+            background_fence: background.fence.clone(),
             route: SurfaceInteractionRoute::Unassigned {
                 epoch: ResponseRouteEpoch::try_new(2).unwrap(),
             },
         };
+        let settlement = crate::surface_client::forwarded_transfer_for_test(
+            &background,
+            patch,
+            &fixture.control,
+        );
         std::fs::write(marker, "").unwrap();
         fixture.shutdown();
-        let settlement = crate::surface_client::settlement_event(&patch)
-            .expect("typed transfer is a foreground settlement");
         crate::attachment_routing::tests::assert_settlement_releases(&key, settlement);
     }
 
     #[test]
     fn fix5_cancelled_compact_after_background_p_takes_typing() {
+        compact_after_background(true, false);
+    }
+
+    #[test]
+    fn fix6_cancelled_compact_after_reprojected_handoff_takes_typing() {
+        compact_after_background(true, true);
+    }
+
+    #[test]
+    fn fix6_successful_compact_after_reprojected_handoff_ends_idle() {
+        compact_after_background(false, true);
+    }
+
+    fn compact_after_background(cancelled: bool, reproject: bool) {
         use orca_runtime::runtime_host::{RuntimeHost, ThreadOperationExecutor};
         struct HoldCompact;
         impl ThreadOperationExecutor for HoldCompact {
@@ -2281,12 +2379,16 @@ pub(crate) mod live_child_for_test {
                     .run_turn(thread, request, generation, events, writer, cancel)
             }
         }
-        let fixture = ViewOnChild::with_host(
-            || RuntimeHost::start_with_executor(std::sync::Arc::new(HoldCompact)).unwrap(),
-            |_| {},
-        );
+        let fixture = if cancelled {
+            ViewOnChild::with_host(
+                || RuntimeHost::start_with_executor(std::sync::Arc::new(HoldCompact)).unwrap(),
+                |_| {},
+            )
+        } else {
+            ViewOnChild::start()
+        };
         let mut shown = MainDisplay::new();
-        let (first, release) = background_turn(&fixture, &mut shown, "finish-p");
+        let (first, release) = background_turn_after(&fixture, &mut shown, "finish-p", reproject);
         std::fs::write(release, "").unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !crate::surface_client::snapshot_operation_is_terminal(
@@ -2311,16 +2413,195 @@ pub(crate) mod live_child_for_test {
                 break;
             }
         }
-        assert!(fixture.control.interrupt_current().unwrap());
+        if cancelled {
+            assert!(fixture.control.interrupt_current().unwrap());
+        }
         worker.join().unwrap().unwrap();
         let mut accepted = false;
+        let mut compacted = false;
         for event in events.try_iter() {
-            let cancelled = matches!(&event,TuiEvent::SurfaceDelivery(item) if item.2.is_some() && matches!(&item.1,TuiEvent::SessionCompleted{status} if status=="cancelled"));
-            accepted |= shown.send(event) && cancelled;
+            let terminal = matches!(&event,TuiEvent::SurfaceDelivery(item) if item.2.is_some() && matches!(&item.1,TuiEvent::SessionCompleted{status} if status== if cancelled {"cancelled"} else {"success"}));
+            let completion = matches!(&event,TuiEvent::SurfaceDelivery(item) if item.2.is_some() && matches!(item.1,TuiEvent::Compacted{..}));
+            let delivered = shown.send(event);
+            compacted |= completion && delivered;
+            accepted |= terminal && delivered;
         }
         fixture.shutdown();
-        assert!(accepted, "cancelled /compact must pass both gates");
+        assert!(accepted, "the /compact terminal must pass both gates");
+        if !cancelled {
+            assert!(compacted, "owned Compacted was not accepted");
+        }
         crate::status_key_actions::tests::assert_idle_takes_typing(&mut shown.state);
+    }
+
+    #[test]
+    fn fix6_return_after_follow_projection_error_accepts_a_startless_terminal() {
+        use orca_runtime::prompt_queue::{PromptQueueAction, PromptQueueInput};
+        let fixture = ViewOnChild::start();
+        let marker = fixture._home.path().join("orphan");
+        let (sender, follows) = std::sync::mpsc::channel();
+        fixture.parent.set_prompt_queue_surface_observer(
+            std::sync::Arc::new(|_: &orca_core::event_schema::EventEnvelope| Ok(())),
+            sender,
+        );
+        fixture
+            .parent
+            .prompt_queue(PromptQueueAction::Add {
+                input: PromptQueueInput::text(format!(
+                    "mock_stream_release_marker {}",
+                    marker.display()
+                )),
+            })
+            .unwrap();
+        let mut follow = follows
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        std::sync::Arc::make_mut(&mut follow.baseline.snapshot)
+            .cursor
+            .next_seq = orca_runtime::surface::SequenceNumber::new(1000);
+        let (output, _events) = crossbeam_channel::unbounded();
+        let err = crate::surface_client::follow_queue_operation(
+            follow,
+            &fixture.parent,
+            &fixture.control,
+            &output,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("CursorGap"), "{err}");
+        let snapshot = fixture.wait_for(|snapshot| {
+            (!snapshot.assistant_streams.is_empty() && snapshot.foreground_operation.is_some())
+                .then_some(snapshot)
+        });
+        let mut shown = MainDisplay::new();
+        shown.reproject(&fixture, &snapshot);
+        std::fs::write(marker, "").unwrap();
+        fixture.shutdown();
+        let mut cursor = snapshot.cursor;
+        cursor.next_seq = orca_runtime::surface::SequenceNumber::new(cursor.next_seq.get() + 1);
+        let other = orca_runtime::surface::SurfaceOperationId::try_from_bytes(
+            *uuid::Uuid::now_v7().as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            !shown.state.lifecycle_cursor.as_ref().unwrap().live,
+            "reprojection revived the absent reader"
+        );
+        assert!(
+            shown.send(
+                TuiEvent::SessionCompleted {
+                    status: "success".into()
+                }
+                .at_operation_cursor(true, &cursor, &other)
+            )
+        );
+    }
+
+    #[test]
+    fn fix6_closing_side_restores_mains_approval_turn_and_reply_once() {
+        use crate::hosted_side::{HostedSideAction, handle_hosted_side_action};
+        let fixture = ViewOnChild::start();
+        let mut shown = MainDisplay::new();
+        let main = SessionAttachmentId::new(1);
+        let (root, displayed) = crossbeam_channel::unbounded();
+        let mut attachment = main;
+        let mut thread = Some(fixture.parent.clone());
+        let mut sender = root.clone();
+        let mut side = None;
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(fixture._home.path().to_owned());
+        let config = std::sync::Arc::new(std::sync::Mutex::new(config));
+        let routing = shown.route.clone();
+        let mut action = |action| {
+            handle_hosted_side_action(
+                action,
+                &mut thread,
+                &mut side,
+                &fixture.host.handle(),
+                &config,
+                &Default::default(),
+                &root,
+                &mut sender,
+                &mut attachment,
+                &routing,
+                &fixture.control,
+                &Default::default(),
+            )
+        };
+        action(HostedSideAction::Start { prompt: None });
+        shown.apply(displayed.clone());
+        let witness = fixture._home.path().join("witness.txt");
+        std::fs::write(&witness, "before").unwrap();
+        let marker = fixture._home.path().join("side-approval");
+        let events = fixture.enqueue(format!("mock_stream_tool_release_marker {}",serde_json::json!({"marker":marker,"toolPrompt":"edit witness.txt :: before => after","retainText":true})));
+        std::fs::write(marker, "").unwrap();
+        let request = loop {
+            let event = events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            routing.lock().unwrap().route(&root, main, event.clone());
+            if matches!(&event,TuiEvent::SurfaceDelivery(item) if matches!(item.1,TuiEvent::ApprovalNeeded{..}))
+            {
+                break event;
+            }
+        };
+        shown.apply(displayed.clone());
+        let snapshot = super::read_parent_snapshot(&fixture.parent).unwrap();
+        let turn = snapshot
+            .foreground_operation
+            .unwrap()
+            .generations
+            .last()
+            .unwrap()
+            .logical_turn_id
+            .to_string();
+        action(HostedSideAction::Close);
+        routing.lock().unwrap().route(&root, main, request);
+        let mut approvals = 0;
+        for event in displayed.try_iter() {
+            if let Some(event) =
+                crate::attachment_routing::accept_attached_tui_event(&mut shown.state, event)
+                    .unwrap()
+            {
+                approvals += usize::from(matches!(event, TuiEvent::ApprovalNeeded { .. }));
+                shown.state.update(event);
+            }
+        }
+        assert_eq!(approvals, 1);
+        assert_eq!(shown.state.status, crate::types::AppStatus::WaitingApproval);
+        assert_eq!(shown.state.runtime_turn_id.as_deref(), Some(turn.as_str()));
+        let key = shown
+            .state
+            .approval_dialog
+            .as_ref()
+            .unwrap()
+            .interaction
+            .clone()
+            .unwrap();
+        let prefix = "Mock slow tool stream started.";
+        assert_eq!(
+            format!("{:?}", shown.state.transcript.messages)
+                .matches(prefix)
+                .count(),
+            1
+        );
+        assert!(
+            fixture
+                .control
+                .respond_surface_interaction(
+                    &key,
+                    &crate::protocol::TuiInteractionResponse::Approval(false)
+                )
+                .unwrap()
+        );
+        fixture.wait_for(|snapshot| {
+            snapshot
+                .operation_history
+                .iter()
+                .any(|op| op.terminal.is_some())
+                .then_some(())
+        });
+        assert_eq!(std::fs::read_to_string(witness).unwrap(), "before");
+        fixture.shutdown();
     }
 
     #[test]

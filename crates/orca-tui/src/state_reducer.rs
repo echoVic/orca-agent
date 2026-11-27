@@ -132,7 +132,8 @@ impl AppState {
             {
                 return None;
             }
-            self.lifecycle_cursor = Some(event.lifecycle_delivery(owner, cursor));
+            self.lifecycle_cursor =
+                Some(event.lifecycle_delivery(owner, cursor, self.lifecycle_cursor.as_ref()));
             if matches!(event, TuiEvent::OperationReleased) {
                 return None;
             }
@@ -327,22 +328,18 @@ impl AppState {
                 self.announced_subagent_terminals.clear();
             }
             TuiEvent::SessionProjectionReset(projection) => {
-                if !SurfaceSessionProjectionState::accepts_reset(&projection)
-                    || !SurfaceOperationProjectionState::accepts_reset(&projection)
-                {
-                    return;
-                }
-                self.reset_session_projection();
-                self.invalidate_recap();
-                self.task_transcript = None;
-                self.lifecycle_cursor = projection.foreground_operation_id.clone().map(|owner| {
+                let seed = projection.foreground_operation_id.clone().map(|owner| {
                     crate::protocol::LifecycleDelivery {
                         owner,
                         cursor: projection.cursor.clone(),
+                        delivered: None,
                         live: true,
                     }
                 });
-                self.apply_surface_projection_state(*projection);
+                self.reset_main_projection(*projection, seed);
+            }
+            TuiEvent::ReturnedMainProjection(projection, seed) => {
+                self.reset_main_projection(*projection, seed);
             }
             TuiEvent::ChildProjectionReset {
                 task_id,
@@ -1584,6 +1581,23 @@ impl AppState {
                 });
             }
         }
+    }
+
+    fn reset_main_projection(
+        &mut self,
+        projection: SurfaceProjectionState,
+        lifecycle: Option<crate::protocol::LifecycleDelivery>,
+    ) {
+        if !SurfaceSessionProjectionState::accepts_reset(&projection)
+            || !SurfaceOperationProjectionState::accepts_reset(&projection)
+        {
+            return;
+        }
+        self.reset_session_projection();
+        self.invalidate_recap();
+        self.task_transcript = None;
+        self.lifecycle_cursor = lifecycle;
+        self.apply_surface_projection_state(projection);
     }
 
     fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) -> bool {

@@ -233,10 +233,11 @@ pub struct AcpMetricsSnapshot {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LifecycleDelivery {
-    pub owner: orca_runtime::surface::SurfaceOperationId,
-    pub cursor: orca_runtime::surface::SurfaceCursor,
-    pub live: bool,
+pub struct LifecycleDelivery {
+    pub(crate) owner: orca_runtime::surface::SurfaceOperationId,
+    pub(crate) cursor: orca_runtime::surface::SurfaceCursor,
+    pub(crate) delivered: Option<orca_runtime::surface::SequenceNumber>,
+    pub(crate) live: bool,
 }
 
 impl TuiEvent {
@@ -260,15 +261,20 @@ impl TuiEvent {
             previous.cursor.thread_id == cursor.thread_id
                 && previous.cursor.incarnation == cursor.incarnation
         }) else {
-            return true;
+            return !matches!(self, Self::OperationReleased);
         };
+        if matches!(self, Self::OperationReleased) {
+            return previous.owner == *owner
+                && previous
+                    .delivered
+                    .is_none_or(|last| last <= cursor.next_seq);
+        }
         if previous.cursor.next_seq > cursor.next_seq {
             return false;
         }
         match self {
             Self::SessionCompleted { .. }
             | Self::TerminalRecoveryNeeded(_)
-            | Self::OperationReleased
             | Self::Compacted { .. }
             | Self::Diagnostic(_) => !previous.live || previous.owner == *owner,
             Self::TurnStarted { .. } | Self::RuntimeTurnStarted { .. }
@@ -284,9 +290,24 @@ impl TuiEvent {
         &self,
         owner: orca_runtime::surface::SurfaceOperationId,
         cursor: orca_runtime::surface::SurfaceCursor,
+        previous: Option<&LifecycleDelivery>,
     ) -> LifecycleDelivery {
+        if matches!(self, Self::OperationReleased)
+            && let Some(previous) = previous
+        {
+            return LifecycleDelivery {
+                cursor: if cursor.next_seq > previous.cursor.next_seq {
+                    cursor
+                } else {
+                    previous.cursor.clone()
+                },
+                live: false,
+                ..previous.clone()
+            };
+        }
         LifecycleDelivery {
             owner,
+            delivered: Some(cursor.next_seq),
             cursor,
             live: !matches!(
                 self,
@@ -529,6 +550,10 @@ pub enum TuiEvent {
     AcpMetricsUpdated(AcpMetricsSnapshot),
     NewSessionStarted,
     SessionProjectionReset(Box<crate::surface_projection::SurfaceProjectionState>),
+    ReturnedMainProjection(
+        Box<crate::surface_projection::SurfaceProjectionState>,
+        Option<LifecycleDelivery>,
+    ),
     /// A focused child recovered its subscription from a fresh snapshot. The
     /// reducer resets its visible projection but retains the child focus so
     /// Escape continues to return to the parent.

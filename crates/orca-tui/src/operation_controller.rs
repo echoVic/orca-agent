@@ -1209,6 +1209,7 @@ impl TuiSurfaceTaskControl {
             let background_requested = hosted.background_requested;
             hosted.background_requested = false;
             hosted.surface_active = Some(SurfaceActiveOperation {
+                reader: Default::default(),
                 client: client.clone(),
                 operation_id: operation_id.clone(),
                 goal_fence,
@@ -1768,6 +1769,7 @@ impl TuiSurfaceTaskControl {
         self.lock_hosted().followed_surfaces.insert(
             operation_id.clone(),
             SurfaceActiveOperation {
+                reader: Default::default(),
                 client,
                 operation_id,
                 goal_fence: None,
@@ -1784,6 +1786,19 @@ impl TuiSurfaceTaskControl {
         operation_id: &orca_runtime::surface::SurfaceOperationId,
     ) {
         self.lock_hosted().followed_surfaces.remove(operation_id);
+    }
+
+    pub(crate) fn main_reader(
+        &self,
+        operation: &orca_runtime::surface::SurfaceOperationId,
+    ) -> Option<MainReader> {
+        let hosted = self.lock_hosted();
+        hosted
+            .surface_active
+            .as_ref()
+            .filter(|active| &active.operation_id == operation)
+            .or_else(|| hosted.followed_surfaces.get(operation))
+            .map(|active| active.reader.clone())
     }
 
     pub(crate) fn note_follow_recovery(
@@ -1818,6 +1833,7 @@ impl TuiSurfaceTaskControl {
             ));
         }
         hosted.focused_child_surface = Some(SurfaceActiveOperation {
+            reader: Default::default(),
             client,
             operation_id,
             goal_fence: None,
@@ -1857,6 +1873,7 @@ impl TuiSurfaceTaskControl {
 
 #[derive(Clone)]
 struct SurfaceActiveOperation {
+    reader: MainReader,
     client: orca_runtime::surface::RuntimeSurfaceClientHandle,
     operation_id: orca_runtime::surface::SurfaceOperationId,
     goal_fence: Option<orca_runtime::surface::SurfaceGoalFence>,
@@ -1864,6 +1881,39 @@ struct SurfaceActiveOperation {
     interactions: HashMap<TuiInteractionKey, SurfaceInteractionBinding>,
     background_requested: bool,
     background_handoff_pending: bool,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct MainReader(Arc<Mutex<ReaderDelivery>>);
+
+#[derive(Default)]
+struct ReaderDelivery {
+    draining: bool,
+    seeded: Option<orca_runtime::surface::SurfaceCursor>,
+}
+
+impl MainReader {
+    pub(crate) fn begin(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .draining = true;
+    }
+
+    pub(crate) fn seed(&self, cursor: &orca_runtime::surface::SurfaceCursor) -> bool {
+        let mut reader = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        if !reader.draining {
+            return false;
+        }
+        reader.seeded.get_or_insert_with(|| cursor.clone());
+        true
+    }
+
+    pub(crate) fn close(&self) -> Option<orca_runtime::surface::SurfaceCursor> {
+        let mut reader = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        reader.draining = false;
+        reader.seeded.take()
+    }
 }
 
 #[derive(Clone)]

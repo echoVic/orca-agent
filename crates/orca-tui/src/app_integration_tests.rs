@@ -3568,10 +3568,10 @@ fn hosted_side_switches_project_recorded_parent_and_ephemeral_side_identity() {
 
         harness.send(UserAction::CloseSideConversation);
         let parent_reset =
-            harness.recv_until(|event| matches!(event, TuiEvent::SessionProjectionReset(_)));
+            harness.recv_until(|event| matches!(event, TuiEvent::ReturnedMainProjection(_, _)));
         assert!(matches!(
             parent_reset,
-            TuiEvent::SessionProjectionReset(projection)
+            TuiEvent::ReturnedMainProjection(projection, _)
                 if projection.session_id.as_deref() == Some(parent_id.as_str())
                     && projection.title == parent_title
         ));

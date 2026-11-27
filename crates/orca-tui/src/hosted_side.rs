@@ -478,6 +478,109 @@ mod tests {
     use orca_core::config::HistoryMode;
 
     #[test]
+    fn fix6_failed_side_close_read_routes_deferred_events_once() {
+        failed_close(true);
+    }
+
+    #[test]
+    fn fix6_failed_side_shutdown_routes_deferred_events_once() {
+        failed_close(false);
+    }
+
+    fn failed_close(fail_read: bool) {
+        let home = crate::test_support::isolate_orca_home();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_owned());
+        config.history_mode = HistoryMode::Record;
+        let runtime = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let parent = runtime.start_thread(config.clone(), "main").unwrap();
+        let main = SessionAttachmentId::new(1);
+        let routing = Arc::new(Mutex::new(AttachmentRouting::new(main)));
+        let (root, events) = mpsc::unbounded();
+        let mut attachment = main;
+        let mut sender = root.clone();
+        let mut thread = Some(parent.clone());
+        let mut side = None;
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let config = Arc::new(Mutex::new(config));
+        let act = |action, thread: &mut _, side: &mut _, attachment: &mut _, sender: &mut _| {
+            handle_hosted_side_action(
+                action,
+                thread,
+                side,
+                &runtime.handle(),
+                &config,
+                &Default::default(),
+                &root,
+                sender,
+                attachment,
+                &routing,
+                &control,
+                &Default::default(),
+            )
+        };
+        act(
+            HostedSideAction::Start { prompt: None },
+            &mut thread,
+            &mut side,
+            &mut attachment,
+            &mut sender,
+        );
+        let visible = attachment;
+        let doomed = if fail_read {
+            &parent
+        } else {
+            thread.as_ref().unwrap()
+        };
+        doomed.shutdown().unwrap();
+        let (errors, rejected) = mpsc::unbounded();
+        sender = errors;
+        let task = serde_json::from_value(serde_json::json!({"id":"deferred dock","type":"subagent","description":"child","status":"running","createdAtMs":1})).unwrap();
+        {
+            let mut routing = routing.lock().unwrap();
+            routing.defer_parent(main);
+            routing.route(&root, main, TuiEvent::WorkflowTasksUpdated(vec![task]));
+            routing.route(
+                &root,
+                main,
+                TuiEvent::TurnKeptInForeground("deferred keep".into()),
+            );
+        }
+        act(
+            HostedSideAction::Close,
+            &mut thread,
+            &mut side,
+            &mut attachment,
+            &mut sender,
+        );
+        let expected = if fail_read {
+            "failed to return"
+        } else {
+            "failed to close"
+        };
+        assert!(
+            matches!(rejected.try_recv(), Ok(TuiEvent::OperationRejected(reason)) if reason.contains(expected))
+        );
+        assert!(side.is_some());
+        assert_eq!(attachment, visible);
+        let effects: Vec<_> = events
+            .try_iter()
+            .filter_map(|event| match event {
+                TuiEvent::BackgroundTasksUpdated(rows)
+                    if rows.iter().any(|task| task.id == "deferred dock") =>
+                {
+                    Some("dock")
+                }
+                TuiEvent::TurnKeptInForeground(text) if text == "deferred keep" => Some("notice"),
+                _ => None,
+            })
+            .collect();
+        control.shutdown();
+        runtime.shutdown().unwrap();
+        assert_eq!(effects, ["dock", "notice"]);
+    }
+
+    #[test]
     fn fix5_closing_side_reseeds_mains_stale_owner() {
         let home = crate::test_support::isolate_orca_home();
         let mut config = crate::test_support::test_run_config();

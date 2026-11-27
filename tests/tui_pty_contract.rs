@@ -1511,6 +1511,70 @@ fn tui_restart_recovers_history_from_the_runtime_snapshot() {
 }
 
 #[test]
+fn tui_side_close_restores_running_main_and_stream_once() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let mut process =
+        PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "side close seed").unwrap();
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    assert_screen_has_text(&process, &mut output, ASSISTANT_SENTINEL, "main seed");
+    process.write(b"/side\r").unwrap();
+    assert_screen_has_text(&process, &mut output, "Ctrl+/ back", "open side");
+    process.write(b"\x1b[47;5u").unwrap();
+    assert_screen_has_text(&process, &mut output, "Side · Ctrl+/", "back on main");
+    let first = cwd.path().join("first");
+    let second = cwd.path().join("second");
+    std::fs::write(cwd.path().join("witness.txt"), "hello").unwrap();
+    process
+        .write(format!("mock_stream_release_marker {}\r", first.display()).as_bytes())
+        .unwrap();
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Esc interrupt",
+        "first main turn running",
+    );
+    process.write(format!("mock_stream_tool_release_marker {}\r",serde_json::json!({"marker":second,"toolPrompt":"read witness.txt","retainText":true})).as_bytes()).unwrap();
+    assert_screen_has_text(&process, &mut output, "Queued 1", "second turn queued");
+    std::fs::write(first, "").unwrap();
+    let prefix = "Mock slow tool stream started.";
+    assert_screen_has_text(&process, &mut output, prefix, "queued turn streaming");
+    process.write(b"\x1b[47;5u").unwrap();
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Ctrl+/ back",
+        "side visible while main runs",
+    );
+    process.write(&[0x03]).unwrap();
+    assert_screen_has_text(&process, &mut output, prefix, "close restored main's reply");
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Esc interrupt",
+        "close restored running status",
+    );
+    let frame = reconstruct_screen(&output);
+    assert!(
+        frame.contains("Running ") && !frame.contains("Ctrl+/ back"),
+        "{frame}"
+    );
+    assert_eq!(frame.matches(prefix).count(), 1, "{frame}");
+    std::fs::write(second, "").unwrap();
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Mock completed after tool execution.",
+        "main finished",
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130));
+}
+
+#[test]
 fn tui_side_conversation_is_separate_disposable_and_returns_to_parent() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");

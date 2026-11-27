@@ -2556,6 +2556,7 @@ struct OperationDeliveryGuard<'sender> {
     operation: SurfaceOperationId,
     routed: bool,
     release_at: Option<orca_runtime::surface::SurfaceCursor>,
+    reader: Option<crate::operation_controller::MainReader>,
 }
 
 impl<'sender> OperationDeliveryGuard<'sender> {
@@ -2569,7 +2570,21 @@ impl<'sender> OperationDeliveryGuard<'sender> {
             operation: operation.clone(),
             routed,
             release_at: None,
+            reader: None,
         }
+    }
+
+    fn for_reader(
+        sender: &'sender mpsc::Sender<TuiEvent>,
+        operation: &SurfaceOperationId,
+        controller: &TuiSurfaceTaskControl,
+    ) -> Self {
+        let mut guard = Self::new(sender, operation, controller.view().is_some());
+        guard.reader = controller.main_reader(operation);
+        if let Some(reader) = &guard.reader {
+            reader.begin();
+        }
+        guard
     }
 
     fn send(&mut self, event: TuiEvent, cursor: &orca_runtime::surface::SurfaceCursor) -> bool {
@@ -2579,6 +2594,9 @@ impl<'sender> OperationDeliveryGuard<'sender> {
         );
         let event = event.at_operation_cursor(self.routed, cursor, &self.operation);
         let owned = matches!(&event, TuiEvent::SurfaceDelivery(delivery) if delivery.2.is_some());
+        if terminal && let Some(reader) = self.reader.take() {
+            reader.close();
+        }
         if self.sender.send(event).is_err() {
             return false;
         }
@@ -2614,7 +2632,8 @@ impl<'sender> OperationDeliveryGuard<'sender> {
 
 impl Drop for OperationDeliveryGuard<'_> {
     fn drop(&mut self) {
-        if let Some(cursor) = self.release_at.take() {
+        let seeded = self.reader.take().and_then(|reader| reader.close());
+        if let Some(cursor) = self.release_at.take().or(seeded) {
             let _ = self
                 .sender
                 .send(TuiEvent::OperationReleased.at_operation_cursor(
@@ -2651,8 +2670,7 @@ fn drain_operation_with_boundary(
     let mut failure: Option<io::Error> = None;
     let mut projected_terminal_event = None;
     let mut projected_compacted_event = None;
-    let mut delivery =
-        OperationDeliveryGuard::new(event_tx, operation_id, controller.view().is_some());
+    let mut delivery = OperationDeliveryGuard::for_reader(event_tx, operation_id, controller);
     while (!terminal_seen || terminal_receipt.is_none()) && !sealed {
         if projection.active_generation_fence(operation_id).is_some()
             && controller.begin_surface_background_handoff(operation_id)
@@ -2906,9 +2924,55 @@ fn send_operation_requests(
     }
 }
 
-pub(crate) fn settlement_event(
-    patch: &orca_runtime::surface::InteractionPatch,
-) -> Option<TuiEvent> {
+#[cfg(test)]
+pub(crate) fn forwarded_transfer_for_test(
+    background: &orca_runtime::surface::SurfaceBackgroundOperation,
+    patch: orca_runtime::surface::InteractionPatch,
+    control: &TuiSurfaceTaskControl,
+) -> TuiEvent {
+    use orca_runtime::surface::*;
+    let before = background.transferred_at.clone();
+    let CursorSourceRevision::Recorded { durable_revision } = before.source_revision else {
+        panic!("expected recorded transfer")
+    };
+    let revision = DurableRevision::try_new(durable_revision.get() + 1).unwrap();
+    let class = CommitClass::Recorded {
+        thread_owner_epoch: background.fence.operation_fence.thread_owner_epoch,
+        durable_revision: revision,
+        commit_id: SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+    };
+    let envelope = SurfaceEventEnvelope {
+        ordinal: 0,
+        event_id: SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+        commit_class: class.clone(),
+        scope: SurfaceScope::Background {
+            fence: background.fence.clone(),
+        },
+        event: SurfaceEvent::Interaction(patch),
+    };
+    let mut batch = SurfaceCommitBatch {
+        cursor_after: SurfaceCursor {
+            next_seq: SequenceNumber::new(before.next_seq.get() + 1),
+            source_revision: CursorSourceRevision::Recorded {
+                durable_revision: revision,
+            },
+            ..before.clone()
+        },
+        cursor_before: before,
+        commit_class: class,
+        event_count: 1,
+        batch_digest: Sha256Digest::new([0; 32]),
+        events: NonEmptyVec::try_new(vec![envelope]).unwrap(),
+    };
+    batch.batch_digest = canonical_batch_digest(&batch);
+    let (sender, events) = mpsc::unbounded();
+    let mut delivery = OperationDeliveryGuard::new(&sender, &background.operation_id, true);
+    send_operation_requests(&batch, &background.operation_id, control, &mut delivery);
+    assert_eq!(events.len(), 1);
+    events.try_recv().unwrap().into_test_payload()
+}
+
+fn settlement_event(patch: &orca_runtime::surface::InteractionPatch) -> Option<TuiEvent> {
     use orca_runtime::surface::InteractionPatch;
     match patch {
         InteractionPatch::Resolved { interaction_id, .. }
@@ -2947,8 +3011,7 @@ pub(crate) fn follow_queue_operation_with_read(
     let _binding = Binding(controller, follow.operation.clone());
     let mut projection = TuiSurfaceProjection::from_surface_snapshot(&follow.baseline.snapshot);
     projection.focus_operation(follow.operation.clone());
-    let mut delivery =
-        OperationDeliveryGuard::new(sender, &follow.operation, controller.view().is_some());
+    let mut delivery = OperationDeliveryGuard::for_reader(sender, &follow.operation, controller);
     while !controller.is_shutdown() {
         let Some(item) = follow.subscription.recv_timeout(Duration::from_millis(25)) else {
             if let Ok(failure) = follow.terminal_failure.try_recv() {

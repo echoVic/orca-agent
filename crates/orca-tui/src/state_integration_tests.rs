@@ -1055,7 +1055,7 @@ mod agent_visit {
                     .unwrap();
                     for event in events.try_iter() {
                         let event = event.into_test_payload();
-                        if matches!(event, TuiEvent::SessionProjectionReset(_)) {
+                        if matches!(event, TuiEvent::ReturnedMainProjection(..)) {
                             state.update(event);
                             assert!(
                                 agent_notes(&state).is_empty(),
