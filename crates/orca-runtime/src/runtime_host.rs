@@ -36361,7 +36361,7 @@ mod tests {
                 .subagent_activity_history
                 .last()
                 .map(|entry| entry.activity.as_str()),
-            Some("completed")
+            Some("cancelled") // Task 9 item 2: the activity names how the agent ended.
         );
         assert!(shown.usage.is_some(), "the agent's final usage is kept");
         assert_eq!(shown.usage, record.usage.map(surface_usage_totals));
@@ -36545,7 +36545,7 @@ mod tests {
                 .subagent_activity_history
                 .last()
                 .map(|entry| entry.activity.as_str()),
-            Some("completed")
+            Some("cancelled") // Task 9 item 2: the activity names how the agent ended.
         );
         assert_eq!(shown.usage, record.usage.map(surface_usage_totals));
         std::thread::sleep(Duration::from_millis(300));
@@ -36743,7 +36743,7 @@ mod tests {
                 .subagent_activity_history
                 .last()
                 .map(|entry| entry.activity.as_str()),
-            Some("completed")
+            Some("cancelled") // Task 9 item 2: the activity names how the agent ended.
         );
         // The end took the place of the cancelled tool's report, which the
         // parent refused: that report never landed, so what came before the
@@ -36885,7 +36885,7 @@ mod tests {
                 .subagent_activity_history
                 .last()
                 .map(|entry| entry.activity.as_str()),
-            Some("completed")
+            Some("cancelled") // Task 9 item 2: the activity names how the agent ended.
         );
         std::thread::sleep(Duration::from_millis(300));
         subagent_terminals_seen(
