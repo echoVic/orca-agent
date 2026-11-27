@@ -662,6 +662,34 @@ mod tests {
     }
 
     #[test]
+    fn finishing_the_visible_agent_preserves_the_sibling_mark() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let (mut state, events, mut tasks) = dock_visit();
+        dock_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            false,
+        );
+        assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("second"));
+        tasks[0].status = TaskStatus::Completed;
+        state.update(crate::protocol::TuiEvent::BackgroundTasksUpdated(tasks));
+        state.update(crate::protocol::TuiEvent::FinishedChildProjection {
+            task_id: "first".into(),
+            main_status: crate::types::SideParentStatus::Idle,
+            projection: None,
+        });
+        assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("second"));
+        dock_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            false,
+        );
+        assert!(
+            matches!(events.try_recv(), Ok(UserAction::FocusChildThread {task_id,..}) if task_id=="second")
+        );
+    }
+
+    #[test]
     fn a_reorder_keeps_the_mark_but_removing_its_row_clears_it() {
         use crossterm::event::{KeyEvent, KeyModifiers};
         let (mut state, _, mut tasks) = dock_visit();

@@ -1597,7 +1597,7 @@ impl AppState {
         main_status: Option<SideParentStatus>,
         finished: bool,
     ) {
-        let selected = if !finished && self.conversation_target().task_id() == Some(&task_id) {
+        let selected = if self.conversation_target().task_id() == Some(&task_id) {
             self.agent_dock_selected_task_id.take()
         } else {
             Some(task_id.clone())
