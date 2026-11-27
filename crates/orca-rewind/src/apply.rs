@@ -12,6 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use orca_platform::fs::VerifiedDirectory;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -19,7 +20,7 @@ use crate::MAX_SNAPSHOT_FILE_BYTES;
 use crate::error::RewindError;
 use crate::path::{
     BoundedFile, atomic_publish, excluded_directory, file_sha256, read_regular_file,
-    resolve_directory, resolve_inside, sha256_hex, sync_dir, validate_digest,
+    relative_components, resolve_inside, sha256_hex, sync_dir, validate_digest,
 };
 use crate::plan::{PlanSkip, PlannedDelete, PlannedWrite, RestorePlan, skip_reason};
 use crate::store::RewindStore;
@@ -307,10 +308,14 @@ impl Applier {
         let mut report = RollbackReport::default();
         for entry in applied.iter().rev() {
             if let JournalEntry::RemovedDirectory { path } = entry {
-                let absolute = resolve_directory(&self.root, path)?;
-                if !absolute.exists() {
-                    fs::create_dir(absolute)?;
-                    report.restored += 1;
+                let (parent, name) = self.directory_parent(path)?;
+                match parent.child(name) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        parent.create_directory(name)?;
+                        report.restored += 1;
+                    }
+                    Err(error) => return Err(error),
                 }
                 continue;
             }
@@ -396,18 +401,26 @@ impl Applier {
                 "directory is excluded",
             ));
         }
-        let absolute = resolve_directory(&self.root, path)?;
-        if !absolute.symlink_metadata()?.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotADirectory,
-                "expected a created directory",
-            ));
-        }
-        // Keep entries added since the patch by removing empty directories only.
-        fs::remove_dir(absolute)?;
+        let (parent, name) = self.directory_parent(path)?;
+        parent.child(name)?;
         journal.append(&JournalEntry::RemovedDirectory {
             path: path.to_owned(),
-        })
+        })?;
+        // Keep entries added since the patch by removing empty directories only.
+        parent.remove_directory(name)
+    }
+
+    fn directory_parent<'a>(
+        &self,
+        path: &'a str,
+    ) -> io::Result<(VerifiedDirectory, &'a std::ffi::OsStr)> {
+        let mut parts = relative_components(path)?;
+        let name = parts.pop().expect("validated path has a name");
+        let mut parent = VerifiedDirectory::open(&self.root)?;
+        for part in parts {
+            parent = parent.child(part)?;
+        }
+        Ok((parent, name))
     }
 
     fn apply_write(
@@ -656,9 +669,28 @@ mod tests {
         Fixture {
             journal_dir: session_root.join("journals"),
             _temp: temp,
-            root,
+            root: root.canonicalize().unwrap(),
             store,
         }
+    }
+
+    #[test]
+    fn directory_removal_waits_for_the_journal() {
+        let fixture = fixture();
+        let directory = fixture.root.join("empty");
+        fs::create_dir(&directory).unwrap();
+        let journal_path = fixture.store.root().join("readonly-journal");
+        fs::write(&journal_path, "").unwrap();
+        let mut journal = JournalWriter {
+            file: File::open(journal_path).unwrap(),
+        };
+        assert!(
+            fixture
+                .applier()
+                .remove_created_directory("empty", &mut journal)
+                .is_err()
+        );
+        assert!(directory.is_dir());
     }
 
     fn write_op(

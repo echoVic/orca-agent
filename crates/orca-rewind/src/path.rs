@@ -173,40 +173,7 @@ pub(crate) fn resolve_directory(root: &Path, rel: &str) -> io::Result<PathBuf> {
 }
 
 fn resolve_path(root: &Path, rel: &str, directory: bool) -> io::Result<PathBuf> {
-    if rel.is_empty() {
-        return Err(escape(rel, "empty path"));
-    }
-    if rel.contains('\0') {
-        return Err(escape(rel, "NUL byte"));
-    }
-    let rel_path = Path::new(rel);
-    if rel_path.is_absolute() || has_windows_prefix(rel) {
-        // Attack samples include Windows drive/UNC spellings even when the
-        // process runs on a unix host, so those forms are rejected everywhere.
-        return Err(escape(rel, "absolute path"));
-    }
-
-    let mut components = Vec::new();
-    for component in rel_path.components() {
-        match component {
-            Component::Normal(part) => components.push(part.to_os_string()),
-            Component::CurDir => {}
-            Component::ParentDir => return Err(escape(rel, "parent-directory component")),
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(escape(rel, "absolute path"));
-            }
-        }
-    }
-    if components.is_empty() {
-        return Err(escape(rel, "empty path"));
-    }
-    // A relative path that still carries a root separator on another platform
-    // (for example a lone backslash on unix) is harmless, but a Windows drive
-    // or UNC prefix must never be accepted even when running on unix.
-    if cfg!(windows) && rel_path.has_root() {
-        return Err(escape(rel, "absolute path"));
-    }
-
+    let components = relative_components(rel)?;
     let root_metadata = fs::symlink_metadata(root)?;
     if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
         return Err(RewindError::RootNotDirectory {
@@ -247,6 +214,44 @@ fn resolve_path(root: &Path, rel: &str, directory: bool) -> io::Result<PathBuf> 
         }
     }
     Ok(current)
+}
+
+pub(crate) fn relative_components(rel: &str) -> io::Result<Vec<&std::ffi::OsStr>> {
+    if rel.is_empty() {
+        return Err(escape(rel, "empty path"));
+    }
+    if rel.contains('\0') {
+        return Err(escape(rel, "NUL byte"));
+    }
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() || has_windows_prefix(rel) {
+        // Attack samples include Windows drive/UNC spellings even when the
+        // process runs on a unix host, so those forms are rejected everywhere.
+        return Err(escape(rel, "absolute path"));
+    }
+
+    let mut components = Vec::new();
+    for component in rel_path.components() {
+        match component {
+            Component::Normal(part) => components.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => return Err(escape(rel, "parent-directory component")),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(escape(rel, "absolute path"));
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err(escape(rel, "empty path"));
+    }
+    // A relative path that still carries a root separator on another platform
+    // (for example a lone backslash on unix) is harmless, but a Windows drive
+    // or UNC prefix must never be accepted even when running on unix.
+    if cfg!(windows) && rel_path.has_root() {
+        return Err(escape(rel, "absolute path"));
+    }
+
+    Ok(components)
 }
 
 /// Atomically replace `path` with `bytes`: temp file in the same directory,
