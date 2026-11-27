@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.25":
+        "Replies cut short by Esc or the output limit stay in the conversation after a resume. The terminal shows when a provider will retry, orca exec JSONL emits provider.retry, and DeepSeek errors include the HTTP status and request ID when available. The session picker marks transcripts that need a newer Orca as Newer version. Background commands can report completion during the same turn and include the end of their output. DeepSeek's 128-tool cap gives Orca's tools priority, and MCP server instructions reach the model. Scripts stopped by a limit keep their logs, and edit and write_file preserve CRLF line endings.",
       "v0.5.24":
         "grep now accepts patterns that start with -. A search for -> Result used to fail with an rg usage error and now finds matching lines. Patterns still use regular expressions. Your ripgrep config file no longer changes the results. A path outside the workspace or a symlink leading out of it is refused with path escapes workspace. The grep tests cover patterns starting with -, a file named -, paths that resolve to the workspace root, and refusals for paths outside the workspace, including through a symlink. Session search now finds text that starts with -.",
       "v0.5.23":
@@ -722,6 +724,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.25":
+        "按 Esc 打断回复，或回复达到输出上限时，已经显示的内容会随会话保存，恢复会话后还能接着问。终端会显示重试还要等多久，orca exec 的 JSONL 输出会发出 provider.retry 事件。DeepSeek 报错时会附上可用的 HTTP 状态码和请求 ID。需要升级 Orca 才能打开的会话会标为 Newer version。后台命令可以在当前轮次报告完成，并附上输出末尾。DeepSeek 的 128 个工具名额优先留给 Orca 自带的工具，MCP 服务器提供的说明也会发给模型。脚本达到时间或内存上限时会保留已有日志，edit 和 write_file 会保留 CRLF 换行。",
       "v0.5.24":
         "grep 现在接受以 - 开头的模式。搜索 -> Result 以前会收到 rg 的用法报错，现在能找到匹配的行。搜索模式仍然使用正则表达式。个人的 ripgrep 配置文件不再影响搜索结果。搜索路径位于工作区之外，或符号链接指向工作区之外时，grep 会拒绝搜索并报告 path escapes workspace。grep 测试覆盖以 - 开头的模式、名为 - 的文件，以及解析到工作区根目录的路径，也检查了直接或经由符号链接指向工作区之外的路径会被拒绝。会话搜索现在能找到以 - 开头的文本。",
       "v0.5.23":

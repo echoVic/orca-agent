@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.24";
+export const releaseVersion = "v0.5.25";
 
 export const releases = [
+  {
+    version: "v0.5.25",
+    date: "2026-11-27",
+    title: "Keep interrupted replies and see provider retries",
+    body: "Replies cut short by Esc or the output limit stay in the conversation after a resume. The terminal shows when a provider will retry, and DeepSeek errors include the HTTP status and request ID when available. The session picker identifies transcripts that need a newer Orca. Background commands can report completion during the same turn. DeepSeek's 128-tool cap gives Orca's tools priority, and MCP server instructions reach the model. Scripts stopped by a limit keep their logs, and edit and write_file preserve CRLF line endings.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.25",
+  },
   {
     version: "v0.5.24",
     date: "2026-11-27",
