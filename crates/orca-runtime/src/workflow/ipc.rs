@@ -15,6 +15,7 @@ pub(crate) struct WorkflowIpcContext {
     mailbox: Arc<WorkflowMailbox>,
     task_lists: Arc<WorkflowTaskLists>,
     sender: String,
+    child_claimant: Option<String>,
 }
 
 impl WorkflowIpcContext {
@@ -24,6 +25,7 @@ impl WorkflowIpcContext {
             mailbox: Arc::new(WorkflowMailbox::default()),
             task_lists: Arc::new(WorkflowTaskLists::default()),
             sender: "workflow-agent".to_string(),
+            child_claimant: None,
         }
     }
 
@@ -33,15 +35,16 @@ impl WorkflowIpcContext {
             mailbox: Arc::new(WorkflowMailbox::durable(mailbox_path)?),
             task_lists: Arc::new(WorkflowTaskLists::default()),
             sender: "workflow-agent".to_string(),
+            child_claimant: None,
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn new_durable_task_lists(task_lists_path: PathBuf) -> io::Result<Self> {
         Ok(Self {
             mailbox: Arc::new(WorkflowMailbox::default()),
             task_lists: Arc::new(WorkflowTaskLists::durable(task_lists_path)?),
             sender: "workflow-agent".to_string(),
+            child_claimant: None,
         })
     }
 
@@ -50,14 +53,17 @@ impl WorkflowIpcContext {
             mailbox: Arc::new(WorkflowMailbox::durable(mailbox_path)?),
             task_lists: Arc::new(WorkflowTaskLists::durable(task_lists_path)?),
             sender: "workflow-agent".to_string(),
+            child_claimant: None,
         })
     }
 
     pub(crate) fn for_sender(&self, sender: impl Into<String>) -> Self {
+        let sender = sender.into();
         Self {
             mailbox: Arc::clone(&self.mailbox),
             task_lists: Arc::clone(&self.task_lists),
-            sender: sender.into(),
+            child_claimant: Some(sender.clone()),
+            sender,
         }
     }
 
@@ -88,8 +94,11 @@ impl WorkflowIpcContext {
     }
 
     pub(crate) fn claim_task(&self, name: &str, by: Option<&str>) -> Result<Value, String> {
-        self.task_lists
-            .claim_task(name, by.unwrap_or(self.default_sender()))
+        self.task_lists.claim_task(
+            name,
+            by.unwrap_or(self.default_sender()),
+            self.child_claimant.as_deref(),
+        )
     }
 
     pub(crate) fn complete_task(
@@ -99,8 +108,17 @@ impl WorkflowIpcContext {
         result: Value,
         by: Option<&str>,
     ) -> Result<Value, String> {
-        self.task_lists
-            .complete_task(name, task_id, result, by.unwrap_or(self.default_sender()))
+        self.task_lists.complete_task(
+            name,
+            task_id,
+            result,
+            by.unwrap_or(self.default_sender()),
+            self.child_claimant.as_deref(),
+        )
+    }
+
+    pub(crate) fn release_child_claims(&self, child: &str) -> Result<(), String> {
+        self.task_lists.release_child_claims(child)
     }
 
     pub(crate) fn list_tasks(&self, name: &str) -> Result<Value, String> {
@@ -298,6 +316,8 @@ struct WorkflowTaskItem {
     status: WorkflowTaskStatus,
     value: Value,
     claimed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    child_claimant: Option<String>,
     completed_by: Option<String>,
     result: Value,
 }
@@ -334,50 +354,44 @@ impl WorkflowTaskLists {
 
     fn create_task_list(&self, name: &str, items: Vec<Value>) -> Result<Value, String> {
         let name = normalize_task_list_name(name)?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "workflow task list lock poisoned".to_string())?;
-        let tasks = items
-            .into_iter()
-            .map(|value| {
-                state.next_task_seq += 1;
-                WorkflowTaskItem {
-                    id: format!("workflow-task-{}", state.next_task_seq),
-                    status: WorkflowTaskStatus::Pending,
-                    value,
-                    claimed_by: None,
-                    completed_by: None,
-                    result: Value::Null,
-                }
-            })
-            .collect::<Vec<_>>();
-        state.lists.insert(name.clone(), tasks);
-        self.persist_locked_state(&state)?;
-        Ok(tasks_to_value(
-            state.lists.get(&name).expect("inserted task list"),
-        ))
+        self.update(|state| {
+            let tasks = items
+                .into_iter()
+                .map(|value| {
+                    state.next_task_seq += 1;
+                    WorkflowTaskItem {
+                        id: format!("workflow-task-{}", state.next_task_seq),
+                        status: WorkflowTaskStatus::Pending,
+                        value,
+                        claimed_by: None,
+                        child_claimant: None,
+                        completed_by: None,
+                        result: Value::Null,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let value = tasks_to_value(&tasks);
+            state.lists.insert(name, tasks);
+            Ok(Some(value))
+        })
     }
 
-    fn claim_task(&self, name: &str, by: &str) -> Result<Value, String> {
+    fn claim_task(&self, name: &str, by: &str, child: Option<&str>) -> Result<Value, String> {
         let name = normalize_task_list_name(name)?;
         let by = normalize_task_worker(by);
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "workflow task list lock poisoned".to_string())?;
-        let Some(task) = state.lists.get_mut(&name).and_then(|tasks| {
-            tasks
-                .iter_mut()
-                .find(|task| task.status == WorkflowTaskStatus::Pending)
-        }) else {
-            return Ok(Value::Null);
-        };
-        task.status = WorkflowTaskStatus::Running;
-        task.claimed_by = Some(by);
-        let value = task_to_value(task);
-        self.persist_locked_state(&state)?;
-        Ok(value)
+        self.update(|state| {
+            let Some(task) = state.lists.get_mut(&name).and_then(|tasks| {
+                tasks
+                    .iter_mut()
+                    .find(|task| task.status == WorkflowTaskStatus::Pending)
+            }) else {
+                return Ok(None);
+            };
+            task.status = WorkflowTaskStatus::Running;
+            task.claimed_by = Some(by);
+            task.child_claimant = child.map(str::to_owned);
+            Ok(Some(task_to_value(task)))
+        })
     }
 
     fn complete_task(
@@ -386,27 +400,57 @@ impl WorkflowTaskLists {
         task_id: &str,
         result: Value,
         by: &str,
+        child: Option<&str>,
     ) -> Result<Value, String> {
         let name = normalize_task_list_name(name)?;
         let task_id = normalize_task_id(task_id)?;
         let by = normalize_task_worker(by);
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "workflow task list lock poisoned".to_string())?;
-        let Some(task) = state
-            .lists
-            .get_mut(&name)
-            .and_then(|tasks| tasks.iter_mut().find(|task| task.id == task_id))
-        else {
-            return Err(format!("workflow task not found: {task_id}"));
-        };
-        task.status = WorkflowTaskStatus::Completed;
-        task.completed_by = Some(by);
-        task.result = result;
-        let value = task_to_value(task);
-        self.persist_locked_state(&state)?;
-        Ok(value)
+        self.update(|state| {
+            let Some(task) = state
+                .lists
+                .get_mut(&name)
+                .and_then(|tasks| tasks.iter_mut().find(|task| task.id == task_id))
+            else {
+                return Err(format!("workflow task not found: {task_id}"));
+            };
+            if task.status != WorkflowTaskStatus::Running {
+                return Err(format!(
+                    "workflow task {task_id} must be running to complete it"
+                ));
+            }
+            let is_claimant = match (task.child_claimant.as_deref(), child) {
+                (None, None) => task.claimed_by.as_deref() == Some(by.as_str()),
+                (Some(claimant), Some(child)) => claimant == child,
+                _ => false,
+            };
+            if !is_claimant {
+                return Err(format!(
+                    "only the claimant can complete workflow task {task_id}"
+                ));
+            }
+            task.status = WorkflowTaskStatus::Completed;
+            task.child_claimant = None;
+            task.completed_by = Some(by);
+            task.result = result;
+            Ok(Some(task_to_value(task)))
+        })
+    }
+
+    fn release_child_claims(&self, child: &str) -> Result<(), String> {
+        self.update(|state| {
+            let mut released = false;
+            for task in state.lists.values_mut().flatten() {
+                if task.status == WorkflowTaskStatus::Running
+                    && task.child_claimant.as_deref() == Some(child)
+                {
+                    task.status = WorkflowTaskStatus::Pending;
+                    task.claimed_by = None;
+                    task.child_claimant = None;
+                    released = true;
+                }
+            }
+            Ok(released.then_some(()))
+        })
     }
 
     fn list_tasks(&self, name: &str) -> Result<Value, String> {
@@ -418,6 +462,23 @@ impl WorkflowTaskLists {
         Ok(tasks_to_value(
             state.lists.get(&name).map(Vec::as_slice).unwrap_or(&[]),
         ))
+    }
+
+    fn update<T: Default>(
+        &self,
+        edit: impl FnOnce(&mut WorkflowTaskListState) -> Result<Option<T>, String>,
+    ) -> Result<T, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "workflow task list lock poisoned".to_string())?;
+        let mut updated = state.clone();
+        let Some(result) = edit(&mut updated)? else {
+            return Ok(T::default());
+        };
+        self.persist_locked_state(&updated)?;
+        *state = updated;
+        Ok(result)
     }
 
     fn persist_locked_state(&self, state: &WorkflowTaskListState) -> Result<(), String> {
@@ -548,5 +609,56 @@ mod tests {
         assert_eq!(tasks[0]["id"], "workflow-task-1");
         assert_eq!(tasks[0]["status"], "running");
         assert_eq!(tasks[0]["claimedBy"], "worker-a");
+    }
+
+    #[test]
+    fn completing_an_unclaimed_task_is_refused() {
+        let ipc = WorkflowIpcContext::new();
+        ipc.create_task_list("audit", vec![json!("api")]).unwrap();
+        let owner = ipc.for_sender("child-a");
+        let other = ipc.for_sender("child-b");
+        let claimed = owner.claim_task("audit", Some("worker")).unwrap();
+        let id = claimed["id"].as_str().unwrap();
+
+        let refusal = other.complete_task("audit", id, json!("wrong"), Some("worker"));
+        assert!(refusal.unwrap_err().contains("claimant"));
+        assert_eq!(ipc.list_tasks("audit").unwrap(), json!([claimed]));
+
+        let completed = owner
+            .complete_task("audit", id, json!("done"), None)
+            .unwrap();
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["result"], "done");
+        assert!(
+            owner
+                .complete_task("audit", id, json!("again"), None)
+                .is_err()
+        );
+        assert_eq!(ipc.list_tasks("audit").unwrap(), json!([completed]));
+    }
+
+    #[test]
+    fn concurrent_claims_do_not_share_a_task() {
+        let ipc = WorkflowIpcContext::new();
+        ipc.create_task_list("audit", vec![json!("api"), json!("docs")])
+            .unwrap();
+        let start = std::sync::Barrier::new(2);
+        let claimed = std::thread::scope(|scope| {
+            let claim = |name| {
+                let child = ipc.for_sender(name);
+                start.wait();
+                child.claim_task("audit", None).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            let left = scope.spawn(move || claim("left"));
+            let right = scope.spawn(move || claim("right"));
+            let mut ids = [left.join().unwrap(), right.join().unwrap()];
+            ids.sort();
+            ids
+        });
+        assert_eq!(claimed, ["workflow-task-1", "workflow-task-2"]);
+        assert!(ipc.claim_task("audit", None).unwrap().is_null());
     }
 }

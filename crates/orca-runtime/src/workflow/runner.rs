@@ -1358,7 +1358,7 @@ impl WorkflowRunner {
         match WorkflowHost::run_with_agent_event_control_and_ipc_paths(
             &resolved.persisted_path,
             args,
-            &ipc_paths,
+            (&ipc_paths, &workflow_ipc),
             workflow_limits.max_concurrent_agents,
             |call| {
                 self.answer_agent_call(
@@ -1784,7 +1784,7 @@ impl WorkflowRunner {
             if let Some(budget_cap) = permit.budget_cap() {
                 child_execution_policy.max_agent_tokens = Some(budget_cap);
             }
-            match self.run_child_agent_call(
+            let child_result = self.run_child_agent_call(
                 task_id,
                 &call,
                 workflow_ipc,
@@ -1794,7 +1794,9 @@ impl WorkflowRunner {
                     .as_ref()
                     .map(|continuation| continuation.continuation_id.as_str()),
                 permit.budget_spec(),
-            ) {
+            );
+            let release_error = workflow_ipc.release_child_claims(&call.call_path).err();
+            match child_result {
                 Ok(child_output) => {
                     permit.settle_usage(
                         child_output.usage.total_tokens(),
@@ -1810,7 +1812,10 @@ impl WorkflowRunner {
                     let transcript_path =
                         write_agent_transcript(transcript_dir, &call, &output, false)?;
                     let result = workflow_agent_result(&call, Value::String(output.clone()), false);
-                    if let Err(error_message) = validate_workflow_agent_schema(&call, &result) {
+                    let failed_release = release_error.is_some();
+                    if let Err(error_message) = release_error
+                        .map_or_else(|| validate_workflow_agent_schema(&call, &result), Err)
+                    {
                         self.state.record_agent_completed(
                             run_id,
                             WorkflowAgentRecord {
@@ -1838,6 +1843,9 @@ impl WorkflowRunner {
                         )?;
                         if let Ok(state) = self.state.load_run(run_id) {
                             let _ = self.refresh_task_progress(task_id, &state);
+                        }
+                        if failed_release {
+                            return Err(io::Error::other(error_message));
                         }
 
                         return Ok(HostCommand::AgentError {
@@ -1882,7 +1890,7 @@ impl WorkflowRunner {
                 Err(error) => {
                     let completed_at_ms = now_ms();
                     let WorkflowChildAgentCallError {
-                        message: error_message,
+                        message: mut error_message,
                         usage,
                         retryable,
                         cancelled,
@@ -1891,6 +1899,10 @@ impl WorkflowRunner {
                         continuation,
                         budget_usage,
                     } = error;
+                    let failed_release = release_error.is_some();
+                    if let Some(error) = release_error {
+                        error_message.push_str(&format!("\n{error}"));
+                    }
                     permit.settle_usage(
                         usage.map(UsageTotals::total_tokens).unwrap_or_default(),
                         budget_usage,
@@ -1934,6 +1946,9 @@ impl WorkflowRunner {
                         let _ = self.refresh_task_progress(task_id, &state);
                     }
 
+                    if failed_release {
+                        return Err(io::Error::other(error_message));
+                    }
                     if attempt < max_attempts && retryable && !cancelled {
                         previous_errors.push(error_message);
                         continuation_selector =
@@ -3852,6 +3867,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn updates_from_the_host_and_the_runner_are_both_kept() {
+        let result = run_task_list_workflow(
+            "createTaskList('host', ['from host']);
+             await agent('create runner list');
+             export default [listTasks('host'), listTasks('runner')];",
+        );
+        assert_eq!(result[0][0]["value"], "from host");
+        assert_eq!(result[1][0]["value"], "from runner");
+        assert_ne!(result[0][0]["id"], result[1][0]["id"]);
+    }
+
+    #[test]
+    fn a_crashed_claimant_releases_its_task() {
+        let result = run_task_list_workflow(
+            "await agent('create runner list');
+             let failed = false;
+             try { await agent('claim and fail'); } catch { failed = true; }
+             const released = listTasks('runner')[0];
+             await agent('claim and complete');
+             export default { failed, released, completed: listTasks('runner')[0] };",
+        );
+        assert_eq!(result["failed"], true);
+        assert_eq!(result["released"]["status"], "pending");
+        assert!(result["released"]["claimedBy"].is_null());
+        assert_eq!(result["released"]["id"], "workflow-task-1");
+        assert_eq!(result["completed"]["id"], "workflow-task-1");
+        assert_eq!(result["completed"]["status"], "completed");
+        assert_eq!(result["completed"]["result"], "finished");
+    }
+
+    fn run_task_list_workflow(script_body: &str) -> Value {
+        let temp = tempdir().unwrap();
+        let script = temp.path().join("workflow.js");
+        fs::write(
+            &script,
+            format!(
+                "export const meta = {{ name: 'task-list-test', description: 'Shared task list', phases: [] }};\n{script_body}"
+            ),
+        )
+        .unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().into());
+        let runner = WorkflowRunner::new(
+            config,
+            TaskRegistry::new("task-list-test".into()),
+            temp.path().join("session"),
+        )
+        .with_child_executor(task_list_child_executor);
+        let launched = runner
+            .launch(WorkflowLaunchRequest::from_script_path(
+                script.display().to_string(),
+            ))
+            .unwrap();
+        serde_json::from_str(&launched.summary).unwrap()
+    }
+
+    fn task_list_child_executor(
+        _config: &RunConfig,
+        request: &ChildAgentRequest,
+        _runtime: &mut ChildAgentRuntime<'_, SharedEventBuffer>,
+        _cost_tracker: &mut CostTracker,
+    ) -> io::Result<ChildAgentResult> {
+        let ipc = request.workflow_ipc.as_ref().unwrap();
+        match request.prompt.as_str() {
+            "create runner list" => {
+                ipc.create_task_list("runner", vec![serde_json::json!("from runner")])
+                    .map_err(io::Error::other)?;
+            }
+            "claim and fail" => {
+                let task = ipc.claim_task("runner", None).map_err(io::Error::other)?;
+                assert_eq!(task["status"], "running");
+                panic!("claimant stopped unexpectedly");
+            }
+            "claim and complete" => {
+                let task = ipc.claim_task("runner", None).map_err(io::Error::other)?;
+                if let Some(id) = task["id"].as_str() {
+                    ipc.complete_task("runner", id, serde_json::json!("finished"), None)
+                        .map_err(io::Error::other)?;
+                }
+            }
+            prompt => panic!("unexpected child prompt: {prompt}"),
+        }
+        Ok(ChildAgentResult {
+            status: RunStatus::Success,
+            final_message: Some("done".into()),
+            error: None,
+            budget_usage: None,
+        })
     }
 
     #[test]
