@@ -1941,6 +1941,56 @@ console.log(JSON.stringify({
     }
 
     #[test]
+    fn workflow_task_list_call_waits_for_the_reply_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("workflow.js");
+        fs::write(
+            &script,
+            "export const meta = { name: 'retry', description: 'Wait for task list reply', phases: [] };
+             export default createTaskList('audit', ['check'])[0].status;",
+        )
+        .unwrap();
+        let preload = temp.path().join("reply-reads.cjs");
+        fs::write(
+            &preload,
+            r#"const fs = require('node:fs');
+const { syncBuiltinESMExports } = require('node:module');
+const readFileSync = fs.readFileSync;
+const codes = ['EBUSY', 'EBUSY', 'EPERM', 'EPERM', 'EACCES', 'EACCES'];
+fs.readFileSync = (path, ...options) => {
+  if (path === process.argv[5] && codes.length > 0) {
+    const code = codes.shift();
+    throw Object.assign(new Error(`Reply read failed with ${code}`), { code });
+  }
+  return readFileSync(path, ...options);
+};
+syncBuiltinESMExports();
+"#,
+        )
+        .unwrap();
+
+        let mut command = Command::new(WorkflowHost::node_executable());
+        command.arg("--require").arg(node_entry_path(preload));
+        let events = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
+            command,
+            &script,
+            Value::Null,
+            None,
+            WorkflowHostRunPolicy::collecting(),
+            |_| unreachable!("script makes no agent calls"),
+            |_| Ok(()),
+            || Ok(false),
+            || {},
+        )
+        .unwrap();
+        assert!(
+            matches!(events.last(), Some(HostEvent::WorkflowCompleted { result }) if result == "pending"),
+            "last host event: {:?}",
+            events.last()
+        );
+    }
+
+    #[test]
     fn workflow_task_list_reports_oversized_requests_to_the_script() {
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("workflow.js");

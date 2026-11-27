@@ -246,7 +246,8 @@ function callTaskList(operation, args) {
     try {
       reply = JSON.parse(readFileSync(taskListReplyPath, "utf8"));
     } catch (error) {
-      if (error.code !== "ENOENT") {
+      // Windows can briefly deny reads while the runner replaces the reply.
+      if (!["ENOENT", "EBUSY", "EPERM", "EACCES"].includes(error.code)) {
         throw error;
       }
     }
