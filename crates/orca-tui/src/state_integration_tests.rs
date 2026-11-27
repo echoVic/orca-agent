@@ -52,6 +52,75 @@ fn state() -> AppState {
     )
 }
 
+#[test]
+fn shift_tab_refusal_preserves_the_running_side_and_agent() {
+    for visiting in [false, true] {
+        let fixture = crate::hosted_child::live_child_for_test::ViewOnChild::start();
+        if !visiting {
+            fixture.view.handle(
+                crate::hosted_child::HostedChildAction::Return,
+                &fixture.control,
+            );
+            fixture.view.set_side_active(true);
+        }
+        let (actions, source) = mpsc::unbounded();
+        let (sender, events) = mpsc::unbounded();
+        let (_dispatcher, _commands) = crate::action_dispatcher::TuiActionDispatcher::spawn(
+            source,
+            sender,
+            fixture.control.clone(),
+            4,
+            4,
+        )
+        .unwrap();
+        let mut state = state();
+        if visiting {
+            state.set_conversation_target(ConversationTarget::subagent("agent"));
+        }
+        state.approval_mode = orca_core::approval_types::ApprovalMode::Suggest;
+        state.enter_running();
+        state.update(TuiEvent::MessageDelta("still writing\n".into()));
+        let tail = state.transcript.assistant_stream_tail.expect("open tail");
+        let dialog = crate::user_input_dialog::UserInputDialog::new(
+            crate::protocol::TuiUserInputQuestionnaire::single("which?", vec![]),
+        );
+        crate::key_event_actions::handle_key_event_preflight(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::BackTab,
+                crossterm::event::KeyModifiers::SHIFT,
+            ),
+            &mut state,
+            &crate::test_support::test_run_config(),
+            &actions,
+            &mut crate::vim::VimState::new(false),
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        state.user_input_dialog = Some(dialog.clone());
+        state.update(
+            events
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+        );
+        assert_eq!(state.status, AppStatus::Running);
+        assert_eq!(state.user_input_dialog, Some(dialog));
+        state.update(TuiEvent::MessageDelta("more\n".into()));
+        assert!(
+            matches!(&state.transcript.messages[tail], ChatMessage::Assistant(text) if text.contains("still writing\nmore"))
+        );
+        assert_eq!(state.transcript.assistant_stream_tail, Some(tail));
+        let place = if visiting {
+            "an agent's conversation"
+        } else {
+            "a side conversation"
+        };
+        let sentence = format!("this command is unavailable in {place}; return to main first");
+        assert!(format!("{:?}", state.transcript.messages.last()).contains(&sentence));
+        fixture.shutdown();
+    }
+}
+
 /// Matches `ui.rs`'s test `tool_call` helper field-for-field.
 fn tool_call(
     name: &str,

@@ -235,7 +235,7 @@ impl HostedView {
                 inner.adopted = None;
             }
             Adoption::Unchanged => {
-                if inner.adopted.is_none() {
+                if inner.adopted.is_none() && !side_active {
                     inner.main = MainBinding {
                         thread: thread.clone(),
                         event_tx: event_tx.clone(),
@@ -251,6 +251,7 @@ impl HostedView {
         self.lock().focus.is_some()
     }
 
+    /// The main conversation, retained when the controller switches to another thread.
     pub(crate) fn main_runtime(
         &self,
         control: &TuiSurfaceTaskControl,
@@ -259,11 +260,8 @@ impl HostedView {
         if let Some(focus) = &inner.focus {
             return Some(focus.parent_thread.clone());
         }
-        if inner.adopted.is_some() {
+        if inner.adopted.is_some() || inner.side_active {
             return inner.main.thread.clone();
-        }
-        if inner.side_active {
-            return control.runtime_thread();
         }
         inner
             .main
@@ -327,11 +325,31 @@ impl HostedView {
         }
     }
 
+    pub(crate) fn returned_to_parent_of(
+        &self,
+        bound: &RuntimeThreadHandle,
+    ) -> Option<RuntimeThreadHandle> {
+        let inner = self.lock();
+        if inner.focus.is_some() || inner.side_active {
+            return None;
+        }
+        inner
+            .main
+            .thread
+            .as_ref()
+            .filter(|main| Some(main.thread_id()) == bound.parent_thread_id())
+            .cloned()
+    }
+
     /// Said by the controller before it starts or switches to a side
     /// conversation, so that no child is focused meanwhile. The controller
     /// records the truth again as it next follows the view.
     pub(crate) fn set_side_active(&self, active: bool) {
         self.lock().side_active = active;
+    }
+
+    pub(crate) fn side_active(&self) -> bool {
+        self.lock().side_active
     }
 }
 
@@ -404,6 +422,37 @@ mod tests {
             task_id: "child".to_string(),
             expected_revision: 1,
         }
+    }
+
+    #[test]
+    fn main_runtime_stays_main_in_a_side_conversation() {
+        let home = crate::test_support::isolate_orca_home();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().into());
+        let (view, control, _, host) = view_for_test();
+        control.bind_view(view.clone());
+        let main = host.start_thread(config.clone(), "main").unwrap();
+        let side = host
+            .handle()
+            .start_side_thread(&main, config, "side")
+            .unwrap();
+        let (mut sender, _events) = crossbeam_channel::unbounded();
+        let mut attachment = id(1);
+        view.adopt(&mut Some(main.clone()), &mut sender, &mut attachment, false);
+        view.set_side_active(true);
+        let _ = control.bind_prompt_queue_runtime(side.clone(), &sender);
+        view.adopt(&mut Some(side.clone()), &mut sender, &mut attachment, true);
+        assert_eq!(
+            control.runtime_thread().unwrap().thread_id(),
+            side.thread_id()
+        );
+        assert_eq!(
+            control.main_runtime().unwrap().thread_id(),
+            main.thread_id()
+        );
+        assert!(
+            matches!(control.mcp_servers(),Some(crate::prestart_mcp::McpServers::Thread(owner)) if owner.thread_id()==side.thread_id())
+        );
     }
 
     #[test]

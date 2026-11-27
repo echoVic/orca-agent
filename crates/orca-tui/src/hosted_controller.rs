@@ -444,7 +444,7 @@ pub(crate) fn hosted_tui_controller_loop(
         if let Some(reason) = action.as_ref().ok().and_then(|action| {
             restricted_command(action, side_parent.is_some(), on_child || view.has_focus())
         }) {
-            let _ = event_tx.send(TuiEvent::OperationRejected(reason.to_string()));
+            let _ = event_tx.send(TuiEvent::CommandRefused(reason.to_string()));
             control.cancel_surface_activation_if_idle();
             continue;
         }
@@ -1140,9 +1140,10 @@ pub(crate) fn hosted_tui_controller_loop(
                 let _ = event_tx.send(TuiEvent::TaskTranscriptResult { request, result });
             }
             Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
+                let owner = control.main_or_side_runtime();
                 handle_hosted_task_action(
                     HostedTaskAction::ResolveBackgroundApproval { id, approved },
-                    thread.as_ref(),
+                    owner.as_ref(),
                     &control,
                     &event_tx,
                 );
@@ -1196,13 +1197,19 @@ pub(crate) fn hosted_tui_controller_loop(
                 );
             }
             Ok(UserAction::GoalPause) => {
+                let mut main = on_child.then(|| (control.main_runtime(), view.main_sender()));
+                let (owner, sender) = main
+                    .as_mut()
+                    .map_or((&mut thread, &event_tx), |(thread, sender)| {
+                        (thread, &*sender)
+                    });
                 handle_hosted_goal_action(
                     HostedGoalAction::Pause,
-                    &mut thread,
+                    owner,
                     &host,
                     &config,
                     &preloaded,
-                    &event_tx,
+                    sender,
                     &control,
                     &pending_workflow_notifications,
                 );
@@ -1254,7 +1261,9 @@ pub(crate) fn restricted_command(
     if !side && !child {
         return None;
     }
-    let restricted = (side && matches!(action, UserAction::StopTask { .. }))
+    let restricted = (side
+        && matches!(action, UserAction::StopTask { .. } | UserAction::GoalPause))
+        || (child && matches!(action, UserAction::ForegroundTask { .. }))
         || matches!(
             action,
             UserAction::NewSession
@@ -1272,7 +1281,6 @@ pub(crate) fn restricted_command(
                 | UserAction::GoalSet(_)
                 | UserAction::GoalEdit(_)
                 | UserAction::GoalClear
-                | UserAction::GoalPause
                 | UserAction::GoalResume
                 | UserAction::RunWorkflow { .. }
                 | UserAction::ResumeTask { .. }
@@ -1331,7 +1339,7 @@ mod tests {
         for action in [
             UserAction::NewSession,
             UserAction::Compact,
-            UserAction::GoalPause,
+            UserAction::GoalResume,
             UserAction::SetModel("mock".into()),
             UserAction::ListRewindCheckpoints,
         ] {
@@ -1343,6 +1351,24 @@ mod tests {
         };
         assert_eq!(super::restricted_command(&stop, true, false), side);
         assert_eq!(super::restricted_command(&stop, false, true), None);
+        assert_eq!(
+            super::restricted_command(&UserAction::GoalPause, true, false),
+            side
+        );
+        assert_eq!(
+            super::restricted_command(&UserAction::GoalPause, false, true),
+            None
+        );
+        assert_eq!(
+            super::restricted_command(
+                &UserAction::ForegroundTask {
+                    task_id: "parent".into()
+                },
+                false,
+                true
+            ),
+            child
+        );
     }
 
     #[test]

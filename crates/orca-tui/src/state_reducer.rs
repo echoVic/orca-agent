@@ -881,6 +881,12 @@ impl AppState {
                 )));
                 self.set_status(AppStatus::Idle);
             }
+            TuiEvent::CommandRefused(text) => {
+                self.push_message(ChatMessage::System {
+                    text,
+                    expanded: false,
+                });
+            }
             TuiEvent::OperationRejected(message) => {
                 self.cancel_latest_queued_edit();
                 self.user_input_dialog = None;

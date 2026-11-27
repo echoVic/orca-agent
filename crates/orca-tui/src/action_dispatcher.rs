@@ -261,7 +261,10 @@ fn route_action(
     }
     if matches!(
         action,
-        UserAction::SetModel(_) | UserAction::GoalPause | UserAction::StopTask { .. }
+        UserAction::SetModel(_)
+            | UserAction::GoalPause
+            | UserAction::StopTask { .. }
+            | UserAction::ForegroundTask { .. }
     ) && let Some(reason) = controller
         .view()
         .and_then(|view| view.command_refusal(&action))
@@ -269,7 +272,7 @@ fn route_action(
         return deliver_dispatcher_outcome(
             event_tx,
             &mut pending.event,
-            TuiEvent::OperationRejected(reason.to_string()),
+            TuiEvent::CommandRefused(reason.to_string()),
         );
     }
     match action {

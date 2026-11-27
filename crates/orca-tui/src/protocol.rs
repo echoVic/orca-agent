@@ -485,6 +485,7 @@ pub enum TuiEvent {
         message: String,
     },
     OperationRejected(String),
+    CommandRefused(String),
     Diagnostic(TuiDiagnostic),
     Error(String),
     /// The ACP attachment behind the TUI ended for good: it could not attach,

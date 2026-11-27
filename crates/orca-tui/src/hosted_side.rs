@@ -165,6 +165,9 @@ pub(crate) fn handle_hosted_side_action(
                 }
             };
             let parent_event_tx = event_tx.clone();
+            if let Some(view) = control.view() {
+                view.note_main_thread(&parent);
+            }
             let parent_attachment = *session_attachment;
             let side_config = Arc::new(Mutex::new(side_config));
             let side_attachment = AttachmentRouting::allocate_next(attachment_routing);

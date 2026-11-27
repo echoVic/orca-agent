@@ -231,6 +231,7 @@ impl HostedChildEventBridge {
     }
 
     pub(crate) fn stop(&mut self) {
+        self.main_mcp_subscription = None;
         self.stop.store(true, Ordering::Release);
         self.start();
         if let Some(handle) = self.handle.take() {
@@ -1132,8 +1133,10 @@ pub(crate) mod live_child_for_test {
                 .start_thread(config.clone(), "parent")
                 .expect("parent thread");
             let child = host
-                .start_thread(child_config, "child")
+                .handle()
+                .start_side_thread(&parent, child_config, "child")
                 .expect("child thread");
+            assert_eq!(child.parent_thread_id(), Some(parent.thread_id()));
             let control = TuiSurfaceTaskControl::isolated_for_test();
             let (event_tx, events) = crossbeam_channel::unbounded();
             let main_attachment = SessionAttachmentId::new(1);
@@ -1277,6 +1280,49 @@ pub(crate) mod live_child_for_test {
             }
         }
         assert_eq!(observed, ["prefix", "tool", "tail", "terminal"]);
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn settings_after_return_target_main_before_the_controller_adopts_it() {
+        let fixture = ViewOnChild::start();
+        fixture.adopt();
+        fixture
+            .control
+            .bind_hosted_settings_config(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::test_support::test_run_config(),
+            )));
+        let marker = fixture._home.path().join("hold-settings-child");
+        let operation = fixture
+            .child
+            .start_turn(
+                orca_runtime::runtime_host::HostedTurnRequest::new(format!(
+                    "mock_stream_release_marker {}",
+                    marker.display()
+                )),
+                std::io::sink(),
+            )
+            .unwrap();
+        fixture
+            .view
+            .handle(super::HostedChildAction::Return, &fixture.control);
+        let encoded = crate::slash_command_actions::encode_confirmed_full_access_intent(None, None);
+        let stamped = fixture.control.stamp_settings_action(encoded);
+        assert!(fixture.child.is_busy());
+        assert!(!fixture.control.try_apply_active_full_access(&stamped));
+        let queued = crate::hosted_settings::QueuedSettings::decode(&stamped).unwrap();
+        assert_eq!(
+            queued.thread_id.as_deref(),
+            Some(fixture.parent.thread_id())
+        );
+        assert_eq!(
+            fixture.control.runtime_thread().unwrap().thread_id(),
+            fixture.child.thread_id()
+        );
+        std::fs::write(marker, "").unwrap();
+        operation
+            .wait_timeout(std::time::Duration::from_secs(5))
+            .expect("child finished");
         fixture.shutdown();
     }
 
@@ -1736,11 +1782,51 @@ pub(crate) mod live_child_for_test {
             })
         });
         fixture.adopt();
-        let (sender, _events) = crossbeam_channel::unbounded();
-        let result = fixture
-            .control
-            .stop_background_task(task.task_id.as_str(), &sender);
-        assert!(result.unwrap().is_some());
+        let (sender, screen) = crossbeam_channel::unbounded();
+        let (actions, source) = crossbeam_channel::unbounded();
+        let (_dispatcher, _backlog) = crate::action_dispatcher::TuiActionDispatcher::spawn(
+            source,
+            sender,
+            fixture.control.clone(),
+            4,
+            4,
+        )
+        .unwrap();
+        actions
+            .send(crate::protocol::UserAction::StopTask {
+                task_id: task.task_id.as_str().into(),
+            })
+            .unwrap();
+        let projection = loop {
+            match fixture
+                ._events
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+            {
+                TuiEvent::SurfaceProjectionSynced(projection)
+                    if projection
+                        .workflow_tasks
+                        .iter()
+                        .any(|row| row.id == task.task_id.as_str()) =>
+                {
+                    break projection;
+                }
+                TuiEvent::Notice(text) => panic!("stop notice went to main: {text}"),
+                _ => (),
+            }
+        };
+        let label = crate::background_tasks::task_notice_label(
+            &projection.workflow_tasks,
+            task.task_id.as_str(),
+        );
+        assert!(
+            matches!(screen.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), TuiEvent::Notice(text) if text==format!("Stopping {label}."))
+        );
+        assert!(
+            !screen
+                .try_iter()
+                .any(|event| matches!(event, TuiEvent::SurfaceProjectionSynced(_)))
+        );
         fixture.wait_for(|snapshot| {
             snapshot.tasks.into_iter().find(|row| {
                 row.task_id == task.task_id

@@ -814,7 +814,19 @@ fn tui_ctrl_c_from_a_finished_agent_interrupts_mains_queued_turn() {
     return_from_marker_held_agent(ReturnScenario::Interrupt);
 }
 
+#[test]
+fn tui_quit_with_a_running_agent_and_main_by_sigterm() {
+    return_from_marker_held_agent(ReturnScenario::QuitBySignal);
+}
+
+#[test]
+fn tui_quit_with_a_running_agent_and_main_by_keyboard() {
+    return_from_marker_held_agent(ReturnScenario::QuitByKeyboard);
+}
+
 enum ReturnScenario {
+    QuitBySignal,
+    QuitByKeyboard,
     Running,
     Queued,
     Interrupt,
@@ -825,7 +837,13 @@ enum ReturnScenario {
 
 fn return_from_marker_held_agent(scenario: ReturnScenario) {
     let interrupt = matches!(scenario, ReturnScenario::Interrupt);
-    let queue_next_turn = !matches!(scenario, ReturnScenario::Running | ReturnScenario::Approval);
+    let queue_next_turn = !matches!(
+        scenario,
+        ReturnScenario::Running
+            | ReturnScenario::Approval
+            | ReturnScenario::QuitBySignal
+            | ReturnScenario::QuitByKeyboard
+    );
     let approval = matches!(scenario, ReturnScenario::Approval);
     let queued_approval = matches!(scenario, ReturnScenario::QueuedApproval);
     let queued_tool = matches!(scenario, ReturnScenario::QueuedTool { .. });
@@ -912,6 +930,48 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
             "Main is running · Esc return",
             "did not enter the live child",
         );
+    }
+    if matches!(
+        scenario,
+        ReturnScenario::QuitBySignal | ReturnScenario::QuitByKeyboard
+    ) {
+        assert!(!marker.exists());
+        let (started, trigger, code) = if matches!(scenario, ReturnScenario::QuitByKeyboard) {
+            process.write(b"\x03").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let frame = reconstruct_screen(&output);
+                if !frame.contains("Main is running") && !frame.contains("Esc interrupt") {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "turns did not settle: {frame}");
+                if let Some(chunk) = process.receive_output(Duration::from_millis(100)) {
+                    output.extend_from_slice(&chunk);
+                }
+            }
+            process.write(b"\x03").unwrap();
+            assert_screen_has_text(
+                &process,
+                &mut output,
+                "Press Ctrl+C again to quit",
+                "keyboard quit was not armed",
+            );
+            let started = Instant::now();
+            process.write(b"\x03").unwrap();
+            (started, "keyboard (last Ctrl+C)", 130)
+        } else {
+            let started = Instant::now();
+            process.sigterm();
+            (started, "SIGTERM", 143)
+        };
+        let status = process.wait_for_exit(Duration::from_secs(10));
+        eprintln!(
+            "running agent and main: {trigger} to exit {:.3} s",
+            started.elapsed().as_secs_f64()
+        );
+        assert_eq!(status.code(), Some(code));
+        process.close_io_and_join();
+        return;
     }
     if queue_next_turn {
         std::fs::write(&marker, b"").unwrap();
@@ -2502,7 +2562,7 @@ fn tui_sigterm_during_a_turn_interrupts_it() {
     let turn = wait_for_a_turn_record(home.path(), "\"type\":\"turn_started\"");
     process.drain_output(&mut output);
     let signalled_at = output.len();
-    process.signal(libc::SIGTERM);
+    process.sigterm();
     let status = process.wait_for_exit(Duration::from_secs(5));
     process.close_io_and_join();
     process.drain_output(&mut output);
@@ -3073,6 +3133,10 @@ impl PtyProcess {
 
     fn pid(&self) -> u32 {
         self.child.as_ref().expect("PTY child remains owned").id()
+    }
+
+    fn sigterm(&self) {
+        self.signal(libc::SIGTERM);
     }
 
     /// Sends `signal` to the TUI, as `kill` does.

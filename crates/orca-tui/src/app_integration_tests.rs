@@ -2796,6 +2796,197 @@ impl Drop for AttachedHostedTuiHarness {
     }
 }
 
+fn focus_mains_running_agent(
+    harness: &mut AttachedHostedTuiHarness,
+) -> orca_runtime::runtime_host::RuntimeThreadHandle {
+    let main = harness.runtime.controller().main_runtime().unwrap();
+    let actions = crate::surface_actions::TuiSurfaceActions::new(main.typed_surface());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let task = loop {
+        let snapshot = actions.read_snapshot().unwrap();
+        if let Some(task) = snapshot.tasks.into_iter().find(|task| {
+            task.task_type == orca_runtime::surface::SurfaceTaskType::Subagent
+                && task.status == orca_runtime::surface::SurfaceTaskStatus::Running
+                && snapshot.subagents.iter().any(|agent| {
+                    Some(&agent.subagent_id) == task.subagent_id.as_ref()
+                        && agent.child_thread_id.is_some()
+                })
+        }) {
+            break task;
+        }
+        assert!(Instant::now() < deadline, "no live child on main");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    harness.send(UserAction::FocusChildThread {
+        task_id: task.task_id.as_str().into(),
+        expected_revision: task.revision.get(),
+    });
+    harness.recv_until(|event| matches!(event, TuiEvent::ChildProjectionReset { .. }));
+    main
+}
+
+#[test]
+fn visiting_goal_pause_reaches_mains_active_goal() {
+    with_orca_home(|home| {
+        let mut config = test_config(HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut harness = AttachedHostedTuiHarness::start(config);
+        harness.send(UserAction::GoalSet(
+            format!(
+                "subagent async mock_stream_release_marker {}",
+                home.join("goal-agent").display()
+            )
+            .into(),
+        ));
+        harness.recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_)));
+        let main = focus_mains_running_agent(&mut harness);
+        harness.send(UserAction::GoalPause);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !crate::surface_client::read_goal(&main.typed_surface())
+            .unwrap()
+            .is_some_and(|goal| goal.status == orca_core::goal_types::ThreadGoalStatus::Paused)
+        {
+            assert!(Instant::now() < deadline, "main goal was not paused");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+}
+
+#[test]
+fn visiting_background_approval_denies_mains_request() {
+    with_orca_home(|home| {
+        let mut config = test_config(HistoryMode::Record);
+        config.cwd = Some(home.into());
+        let mut harness = AttachedHostedTuiHarness::start(config);
+        let marker = home.join("ask-edit");
+        let witness = home.join("witness.txt");
+        std::fs::write(&witness, "before").unwrap();
+        harness.send(UserAction::Submit(format!(
+            "mock_stream_tool_release_marker {}",
+            serde_json::json!({"marker":marker,"toolPrompt":"edit witness.txt :: before => after"})
+        )));
+        harness.recv_until(|event|matches!(event,TuiEvent::MessageDelta(text) if text.contains("slow tool stream started")));
+        harness.send(UserAction::BackgroundCurrentTurn);
+        harness.recv_until(|event| {
+            matching_task_update(event.clone(), |row| {
+                row.task_type == orca_core::task_types::TaskType::MainSession && row.is_backgrounded
+            })
+            .is_some()
+        });
+        std::fs::write(marker, "").unwrap();
+        let request = |row: &orca_core::task_types::BackgroundTaskSummary| {
+            row.is_backgrounded && row.pending_tool_call.is_some()
+        };
+        let event =
+            harness.recv_until(|event| matching_task_update(event.clone(), request).is_some());
+        let row = matching_task_update(event, request).unwrap();
+        let hold_agent = home.join("hold-agent");
+        harness.send(UserAction::Submit(format!(
+            "subagent async mock_stream_release_marker {}",
+            hold_agent.display()
+        )));
+        let TuiEvent::ApprovalNeeded { key, .. } =
+            harness.recv_until(|event| matches!(event, TuiEvent::ApprovalNeeded { .. }))
+        else {
+            unreachable!()
+        };
+        harness.send(UserAction::RespondToInteraction {
+            key,
+            response: TuiInteractionResponse::Approval(true),
+        });
+        let main = focus_mains_running_agent(&mut harness);
+        harness.send(UserAction::ForegroundTask {
+            task_id: row.id.clone(),
+        });
+        assert!(
+            matches!(harness.recv_until(|event|matches!(event,TuiEvent::CommandRefused(_) | TuiEvent::Error(_))), TuiEvent::CommandRefused(text) if text=="this command is unavailable in an agent's conversation; return to main first")
+        );
+        std::fs::write(hold_agent, "").unwrap();
+        harness.recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(thread) if thread.thread_id() != main.thread_id()));
+        harness.send(UserAction::ResolveBackgroundApproval {
+            id: row.pending_tool_call.unwrap().id,
+            approved: false,
+        });
+        let answer = harness.recv_until(|event| {
+            matches!(event, TuiEvent::Notice(text) if text.starts_with("Denied;"))
+                || matches!(event, TuiEvent::Error(_))
+        });
+        assert!(
+            matches!(answer, TuiEvent::Notice(ref text) if text.ends_with("stops.")),
+            "{answer:?}"
+        );
+        let snapshot = crate::surface_actions::TuiSurfaceActions::new(main.typed_surface())
+            .read_snapshot()
+            .unwrap();
+        let projection =
+            crate::surface_projection::SurfaceProjectionState::from_surface_snapshot(&snapshot);
+        assert!(
+            projection
+                .workflow_tasks
+                .iter()
+                .any(|task| task.id == row.id
+                    && matches!(
+                        task.status,
+                        orca_core::task_types::TaskStatus::Stopped
+                            | orca_core::task_types::TaskStatus::Cancelled
+                    )
+                    && task.pending_tool_call.is_none())
+        );
+        assert_eq!(std::fs::read_to_string(witness).unwrap(), "before");
+    });
+}
+
+#[test]
+fn visiting_mcp_catalog_follows_main_until_return() {
+    with_orca_home(|home| {
+        use crate::surface_projection::McpServerStatusView;
+        let mut config = test_config(HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        for name in ["archive", "after-return"] {
+            config
+                .mcp_servers
+                .push(orca_core::mcp_types::McpServerConfig {
+                    name: name.into(),
+                    command: Some(home.join("absent-server").display().to_string()),
+                    ..Default::default()
+                });
+        }
+        let mut harness = AttachedHostedTuiHarness::start(config);
+        harness.send(UserAction::Submit(format!(
+            "subagent async mock_stream_release_marker {}",
+            home.join("hold").display()
+        )));
+        harness.recv_until(|event| matches!(event, TuiEvent::MentionRuntimeReady(_)));
+        let main = focus_mains_running_agent(&mut harness);
+        let registry = main.mcp_registry();
+        harness.recv_until(|event|matches!(event,TuiEvent::MainMcpCatalogWhileVisiting(catalog) if catalog.servers.len()==2 && catalog.servers.iter().all(|server| matches!(server.status,McpServerStatusView::Failed(_)))));
+        harness.state.mcp_dialog = Some(crate::types::McpDialog {
+            selected: 0,
+            showing_details: false,
+        });
+        assert!(registry.reconnect_server("archive").is_err());
+        harness.recv_until(|event|matches!(event,TuiEvent::MainMcpCatalogWhileVisiting(catalog) if catalog.servers.iter().any(|server|server.name=="archive" && server.status==McpServerStatusView::Starting)));
+        let frame = crate::test_support::frame_string(&mut harness.state, 120, 40);
+        assert!(
+            frame
+                .lines()
+                .any(|line| line.contains("archive") && line.contains("starting")),
+            "{frame}"
+        );
+        harness.recv_until(|event|matches!(event,TuiEvent::MainMcpCatalogWhileVisiting(catalog) if catalog.servers.iter().all(|server|matches!(server.status,McpServerStatusView::Failed(_)))));
+        harness.send(UserAction::ReturnToParentThread);
+        harness.recv_until(|event| matches!(event, TuiEvent::ChildFocusChanged { task_id: None }));
+        assert!(!harness.runtime.controller().view().unwrap().has_focus());
+        assert!(registry.reconnect_server("after-return").is_err());
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while let Ok(event) = harness.event_rx.recv_deadline(deadline) {
+            assert!(
+                !matches!(event,TuiEvent::Attached(item) if matches!(item.event,TuiEvent::MainMcpCatalogWhileVisiting(ref catalog) if catalog.servers.iter().any(|server|server.name=="after-return" && server.status==McpServerStatusView::Starting)))
+            );
+        }
+    });
+}
+
 #[test]
 fn hosted_tui_submit_clears_actor_operation_before_terminal_ui_event() {
     with_orca_home(|_| {

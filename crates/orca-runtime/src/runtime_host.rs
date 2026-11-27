@@ -4031,6 +4031,8 @@ impl RuntimeThreadHandle {
         self.interrupt_active_with_completion().map(|_| ())
     }
 
+    /// Interrupt the current generation and return its completion, or `None` if idle.
+    /// Waiting for that generation to settle is the caller's choice.
     pub fn interrupt_active_with_completion(
         &self,
     ) -> Result<Option<OperationCompletion>, RuntimeHostError> {
