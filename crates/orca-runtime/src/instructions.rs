@@ -954,9 +954,13 @@ mod tests {
             };
             let operation_id = identity.operation_id.clone();
             let outcome = session
-                .compact(&config, cwd, &orca_core::cancel::CancelToken::new(), |_| {
-                    Ok(identity)
-                })
+                .compact(
+                    &config,
+                    cwd,
+                    &crate::extension::ExtensionData::new(&id),
+                    &orca_core::cancel::CancelToken::new(),
+                    |_| Ok(identity),
+                )
                 .unwrap();
             assert!(outcome.before.messages.iter().any(|msg| {
                 msg.content_str()

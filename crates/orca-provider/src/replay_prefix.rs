@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use orca_core::conversation::{
-    CapturedProviderMessage, CapturedProviderRequest, Conversation, Message,
+    CapturedProviderMessage, CapturedProviderRequest, Conversation, Message, SummaryState,
     normalize_tool_boundaries,
 };
 use orca_core::model::{ModelRouteContext, ModelSelection, PRO_MODEL, accepts_tool_images};
@@ -132,7 +132,7 @@ pub(crate) fn record(
             .unwrap_or_default()
     };
     let summary = conversation.summary.clone();
-    let summary_count = usize::from(summary.baseline.is_some()) + summary.deltas.len();
+    let summary_count = summary_message_count(&summary);
     if let Some(edited_index) = recovery_edit {
         // The summary is serialized ahead of every user message.
         let Some(unchanged_transcript_messages) = edited_index.checked_sub(summary_count) else {
@@ -169,6 +169,12 @@ pub(crate) fn record(
     }
 }
 
+fn summary_message_count(summary: &SummaryState) -> usize {
+    usize::from(summary.baseline.is_some())
+        + summary.deltas.len()
+        + usize::from(!summary.tool_output_spills.is_empty())
+}
+
 pub(crate) struct ReplayPrefix {
     pub messages: Vec<Box<RawValue>>,
     pub estimated_tokens: usize,
@@ -201,8 +207,7 @@ pub(crate) fn load(
     {
         return None;
     }
-    let summary_count =
-        usize::from(request.summary.baseline.is_some()) + request.summary.deltas.len();
+    let summary_count = summary_message_count(&request.summary);
     let messages = request.messages.get(..cut + summary_count)?;
     // A screenshot added after the last request can change the next request's
     // image cap. Replay uses the earlier cap, image routing and tool variant

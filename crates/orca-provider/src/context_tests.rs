@@ -1478,6 +1478,55 @@ mod replay_compaction {
     }
 
     #[test]
+    fn replay_checkpoint_keeps_existing_and_new_spill_references() {
+        use orca_core::tool_types::{ToolOutputSpill, ToolStatus, ToolTerminal};
+
+        let mut conversation = conversation();
+        let current_request = conversation.messages.pop().unwrap();
+        let dir = std::env::current_dir().unwrap().join("spill-fixture");
+        let earlier = ToolOutputSpill::new(dir.clone(), "earlier".into(), 10_000).unwrap();
+        let collapsed = ToolOutputSpill::new(dir, "call-0".into(), 10_000).unwrap();
+        conversation
+            .summary
+            .tool_output_spills
+            .push(earlier.clone());
+        tool_turn(&mut conversation, 0, 1_000);
+        let Some(Message::Tool { terminal, .. }) = conversation.messages.last_mut() else {
+            panic!("expected tool result");
+        };
+        let mut receipt = ToolTerminal::try_from_parts(
+            ToolStatus::Completed,
+            None,
+            None,
+            true,
+            None,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        receipt.spill = Some(Box::new(collapsed.clone()));
+        *terminal = Some(receipt);
+        conversation.messages.push(current_request);
+
+        let server = server(json!({"content": CHECKPOINT}), "stop");
+        let result = compact(&server, &conversation, 100_000);
+        assert!(
+            matches!(result.kind, CompactionKind::RemoteSummary(summary) if summary == CHECKPOINT),
+            "{:?}",
+            result.observation.summary_requests
+        );
+        let requests = server.requests.lock().unwrap();
+        let [request] = requests.as_slice() else {
+            panic!("expected one checkpoint request, got {}", requests.len());
+        };
+        assert_eq!(request.messages[request.messages.len() - 2].role, "tool");
+        assert_eq!(
+            result.conversation.summary.tool_output_spills,
+            [earlier, collapsed]
+        );
+    }
+
+    #[test]
     fn a_replay_cost_receipt_stops_the_remote_chain_before_fallback() {
         let server = server(json!({"content": "incomplete checkpoint"}), "stop");
         let mut provider = server.config();

@@ -1369,6 +1369,11 @@ fn summarize_collapsed_messages(
     result
         .mcp_instructions
         .clone_from(&conversation.mcp_instructions);
+    result
+        .summary
+        .tool_output_spills
+        .clone_from(&conversation.summary.tool_output_spills);
+    keep_spill_references(&mut result.summary, &collapsed);
     if let Some(checkpoint) = checkpoint {
         result.rolling_summary = Some(checkpoint.clone());
         result.summary.baseline = Some(checkpoint.clone());
@@ -1421,7 +1426,7 @@ fn summarize_collapsed_messages(
     result.rolling_summary = Some(new_delta.clone());
 
     let mut summary = conversation.summary.clone();
-    keep_spill_references(&mut summary, &collapsed);
+    summary.tool_output_spills = result.summary.tool_output_spills;
     if summary.baseline.is_none() {
         summary.baseline = Some(new_delta.clone());
     } else {
@@ -2967,6 +2972,13 @@ mod tests {
                 &conv,
                 &config,
                 &provider,
+                &mut ReplayAdoption {
+                    measured: measure_prompt(&conv, &provider),
+                    emergency: false,
+                    max_tokens: config.max_tokens,
+                    settle_usage: &mut |_, _| true,
+                    stopped: false,
+                },
                 None,
                 &mut CompactionObservation::new(),
             )
