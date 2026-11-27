@@ -80,6 +80,8 @@ fn live_shell_survives_foreign_read_and_second_open_without_a_write() {
 
 #[test]
 fn ownerless_record_and_unknown_fields_remain_compatible() {
+    // An unknown field stands in for registry_owner as seen by an older reader:
+    // neither v0.5.13 nor v0.5.24 used deny_unknown_fields on this record.
     let temp = tempfile::tempdir().unwrap();
     let registry = open(temp.path(), "legacy");
     let task = registry.create_main_session("older host".into());

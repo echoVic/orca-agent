@@ -73,8 +73,10 @@ immediately. Unread output is preserved until the terminal result is polled.
 
 ## Durable Output
 
-Each persistent task registry owns one OS lock in
+Each persistent task registry tries to acquire one OS lock in
 `task-sessions/<session>/owners/<id>.lock` for the lifetime of its clones.
+If acquisition fails, tasks still persist without owner stamps, but the
+registry cannot archive shell output.
 Only its first shell registration creates `output/owners/<id>/` under that
 session. Its v1 SQLite archive stores a shell-session
 to task mapping, terminal mode, terminal outcome, automatic cursor, absolute
@@ -125,8 +127,11 @@ creating it. Stamps are published after lock acquisition, only B's sweep can
 unlink a dead lock under B's store lock, and IDs are never reused. Thus a
 foreign probe cannot see create-before-lock, obstruct the owner, or deadlock
 with the other session. Missing or lockable means dead; other errors leave
-the record alone. This uses flock on Unix and LockFileEx on Windows. If an
-open Windows handle prevents removal, a later sweep tries again.
+the record alone. This uses flock on Unix and LockFileEx on Windows. As with
+`tasks.lock`, Unix locking requires per-open-file locks. Linux NFS mounts
+that emulate flock with per-process locks cannot reliably distinguish live
+registries in one process. If an open Windows handle prevents removal, a
+later sweep tries again.
 
 Managers in one process can read each other's live sub-archives. A new host
 can read a dead owner's output: remaining running rows become interrupted
@@ -141,8 +146,12 @@ or stdin is presumed to survive a host restart.
 The older `output/archive.sqlite3` is a read-only fallback. A newer reader
 never creates, probes or holds `output/owner.lock`, changes an old row, or
 writes an automatic cursor there. Its cursor stays in memory; a running row
-whose task is terminal is presented as interrupted. Read failure is missing
-or expired. Older readers cannot see new sub-archive output. Two record-store
+whose task is terminal is presented as interrupted. After an older process
+crashes, resuming with `attach_for_cwd` runs no recovery: its nonterminal
+task can still make a dead shell read as `running`. A read-only connection
+cannot roll back a hot journal left by that process; in that case all shells
+in the top-level archive read as “missing or expired”, as for other read
+failures. Older readers cannot see new sub-archive output. Two record-store
 limitations remain across versions: an older opener can fail a newer live
 record, and its next whole-map write drops unknown owner stamps; a newer
 opener still recovers ownerless running records from an older live host.
