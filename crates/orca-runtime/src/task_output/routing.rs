@@ -84,7 +84,9 @@ impl ArchiveRoute {
         if let Some(writer) = writer.as_ref() {
             return Ok(writer.clone());
         }
-        self.sweep(ArchiveLimits::default())?;
+        if let Err(error) = self.sweep(ArchiveLimits::default()) {
+            tracing::warn!(session_id = self.tasks.session_id(), %error, "could not sweep dead task output archives");
+        }
         let archive = OutputArchive::open(&self.own, self.tasks.session_id())?;
         *writer = Some(archive.clone());
         Ok(archive)

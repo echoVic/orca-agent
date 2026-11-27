@@ -91,6 +91,28 @@ fn legacy_read_ignores_held_owner_lock_and_never_updates_database_or_cursor() {
 }
 
 #[test]
+fn failed_sweep_preserves_dead_archive_and_does_not_block_new_shell() {
+    let home = tempfile::tempdir().unwrap();
+    let open = || TaskRegistry::new_persistent("sweep".into(), home.path().into()).unwrap();
+    let first = open();
+    let archive = first.output_storage_root().unwrap().unwrap();
+    let shell = first.create_shell("first".into(), "echo".into());
+    TaskOutputStore::for_tasks(&first)
+        .register_shell("first", &shell.id, false, false)
+        .unwrap();
+    drop(first);
+    let second = open();
+    let shell = second.create_shell("second".into(), "echo".into());
+    let store = TaskOutputStore::for_tasks(&second);
+    std::fs::write(home.path().join("sweep/tasks.json"), b"{").unwrap();
+    store
+        .register_shell("second", &shell.id, false, false)
+        .unwrap();
+    assert_eq!(store.archived_shell("second").unwrap().task_id, shell.id);
+    assert!(archive.join("archive.sqlite3").is_file());
+}
+
+#[test]
 fn sweep_caps_only_dead_archives_in_newest_task_sequence_order() {
     let home = tempfile::tempdir().unwrap();
     let open = || TaskRegistry::new_persistent("cap".into(), home.path().into()).unwrap();
