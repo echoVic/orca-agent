@@ -62,6 +62,8 @@ struct HostedOperationInner {
     /// conversation. This is separate from the parent's active operation so
     /// focusing a child never steals cancellation/background ownership.
     focused_child_surface: Option<SurfaceActiveOperation>,
+    followed_surfaces: HashMap<orca_runtime::surface::SurfaceOperationId, SurfaceActiveOperation>,
+    follow_recovery: Option<(orca_runtime::surface::SurfaceOperationId, &'static str)>,
     surface_presentation_tasks: Vec<SurfacePresentationTask>,
     surface_activation_armed: bool,
     interrupt_requested: bool,
@@ -1326,7 +1328,9 @@ impl TuiSurfaceTaskControl {
                 .as_mut()
                 .expect("focused child surface checked")
         } else {
-            return None;
+            hosted
+                .followed_surfaces
+                .get_mut(&interaction.fence.operation_id)?
         };
         let request_id = format!("{:?}", interaction.interaction_id);
         let legacy_user_input = matches!(
@@ -1533,23 +1537,14 @@ impl TuiSurfaceTaskControl {
         key: &TuiInteractionKey,
         response: &TuiInteractionResponse,
     ) -> io::Result<bool> {
-        let (binding, focused_child) = {
+        let binding = {
             let hosted = self.lock_hosted();
-            if let Some(binding) = hosted
+            hosted
                 .surface_active
-                .as_ref()
-                .and_then(|active| active.interactions.get(key).cloned())
-            {
-                (Some(binding), false)
-            } else {
-                (
-                    hosted
-                        .focused_child_surface
-                        .as_ref()
-                        .and_then(|active| active.interactions.get(key).cloned()),
-                    true,
-                )
-            }
+                .iter()
+                .chain(hosted.focused_child_surface.iter())
+                .chain(hosted.followed_surfaces.values())
+                .find_map(|active| active.interactions.get(key).cloned())
         };
         let Some(binding) = binding else {
             return Ok(false);
@@ -1701,19 +1696,15 @@ impl TuiSurfaceTaskControl {
         ) {
             Ok(orca_runtime::surface::MutationReply::Committed { .. }) => {
                 let mut hosted = self.lock_hosted();
-                let interactions = if focused_child {
-                    hosted
-                        .focused_child_surface
-                        .as_mut()
-                        .map(|surface| &mut surface.interactions)
-                } else {
-                    hosted
-                        .surface_active
-                        .as_mut()
-                        .map(|surface| &mut surface.interactions)
-                };
-                if let Some(interactions) = interactions {
-                    interactions.remove(key);
+                let hosted = &mut *hosted;
+                if let Some(surface) = hosted
+                    .surface_active
+                    .iter_mut()
+                    .chain(hosted.focused_child_surface.iter_mut())
+                    .chain(hosted.followed_surfaces.values_mut())
+                    .find(|surface| surface.ui_operation_id == key.operation_id)
+                {
+                    surface.interactions.remove(key);
                 }
                 Ok(true)
             }
@@ -1767,6 +1758,51 @@ impl TuiSurfaceTaskControl {
             })
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         hosted.surface_active.is_none()
+    }
+
+    pub(crate) fn bind_followed_surface(
+        &self,
+        client: orca_runtime::surface::RuntimeSurfaceClientHandle,
+        operation_id: orca_runtime::surface::SurfaceOperationId,
+    ) {
+        self.lock_hosted().followed_surfaces.insert(
+            operation_id.clone(),
+            SurfaceActiveOperation {
+                client,
+                operation_id,
+                goal_fence: None,
+                ui_operation_id: self.surface_ids.allocate(),
+                interactions: HashMap::new(),
+                background_requested: false,
+                background_handoff_pending: false,
+            },
+        );
+    }
+
+    pub(crate) fn unbind_followed_surface(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) {
+        self.lock_hosted().followed_surfaces.remove(operation_id);
+    }
+
+    pub(crate) fn note_follow_recovery(
+        &self,
+        operation: orca_runtime::surface::SurfaceOperationId,
+        message: &'static str,
+    ) {
+        self.lock_hosted().follow_recovery = Some((operation, message));
+    }
+
+    pub(crate) fn follow_recovery(
+        &self,
+        operation: &orca_runtime::surface::SurfaceOperationId,
+    ) -> Option<&'static str> {
+        self.lock_hosted()
+            .follow_recovery
+            .as_ref()
+            .filter(|(owner, _)| owner == operation)
+            .map(|(_, message)| *message)
     }
 
     pub(crate) fn install_focused_child_surface(

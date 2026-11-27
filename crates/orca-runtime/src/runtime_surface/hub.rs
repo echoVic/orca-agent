@@ -19,6 +19,7 @@ use super::projection::{SurfaceCapabilityCallKind, SurfaceTerminalExitStatus};
 use super::reducer::canonical_batch_encoded_bytes;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{
     Receiver as SyncReceiver, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
@@ -98,7 +99,7 @@ struct SurfaceSubscriber {
     queued_events: u64,
     queued_bytes: u64,
     claimed: bool,
-    gapped: bool,
+    gapped: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -313,6 +314,7 @@ enum QueuedSubscriptionItem {
 }
 
 pub struct SurfaceSubscriptionReceiver {
+    gapped: Arc<AtomicBool>,
     hub: Weak<Mutex<SurfaceHubState>>,
     attachment_id: SurfaceAttachmentId,
     dispatcher: Option<Arc<dyn RuntimeSurfaceCommandDispatcher>>,
@@ -320,6 +322,10 @@ pub struct SurfaceSubscriptionReceiver {
 }
 
 impl SurfaceSubscriptionReceiver {
+    pub(crate) fn gap_signal(&self) -> Arc<AtomicBool> {
+        self.gapped.clone()
+    }
+
     pub fn try_recv(&mut self) -> Option<SurfaceSubscriptionItem> {
         let hub = self.hub.upgrade()?;
         let item = {
@@ -686,6 +692,7 @@ impl SurfaceHub {
         }
         subscriber.claimed = true;
         Some(SurfaceSubscriptionReceiver {
+            gapped: subscriber.gapped.clone(),
             hub: Arc::downgrade(&self.inner),
             attachment_id: attachment_id.clone(),
             dispatcher: self.dispatcher.clone(),
@@ -1518,7 +1525,7 @@ impl SurfaceHub {
                 queued_events: 0,
                 queued_bytes: 0,
                 claimed: false,
-                gapped: false,
+                gapped: Default::default(),
             },
         );
         (attachment_id, client, subscription, capabilities)
@@ -1713,7 +1720,7 @@ fn publish_batch(
         .map(|retained| retained.batch.cursor_before.clone());
     let mut overflowed = Vec::new();
     for (attachment_id, subscriber) in &mut state.subscriptions {
-        if subscriber.gapped {
+        if subscriber.gapped.load(Ordering::Acquire) {
             continue;
         }
         if !enqueue_batch(subscriber, batch.clone(), config) {
@@ -1724,7 +1731,7 @@ fn publish_batch(
                     retained_from: retained_from.clone(),
                     head: batch.batch.cursor_after.clone(),
                 }));
-            subscriber.gapped = true;
+            subscriber.gapped.store(true, Ordering::Release);
             overflowed.push(attachment_id.clone());
         }
     }
@@ -1797,7 +1804,7 @@ fn signal_gap(
                 retained_from: retained_from.clone(),
                 head: head.clone(),
             }));
-        subscriber.gapped = true;
+        subscriber.gapped.store(true, Ordering::Release);
         gapped.push(attachment_id.clone());
     }
     retire_subscriptions(state, &gapped);
@@ -1928,7 +1935,7 @@ mod tests {
             queued_events: 0,
             queued_bytes: 0,
             claimed: false,
-            gapped: false,
+            gapped: Default::default(),
         }
     }
 

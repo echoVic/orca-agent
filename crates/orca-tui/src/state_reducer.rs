@@ -74,6 +74,34 @@ fn put_output(text: &mut String, offset: Option<usize>, chunk: &str) {
 }
 
 impl AppState {
+    pub(crate) fn accept_surface_delivery(&mut self, event: TuiEvent) -> Option<TuiEvent> {
+        let TuiEvent::SurfaceDelivery(delivery) = event else {
+            return Some(event);
+        };
+        let (cursor, event, owner) = *delivery;
+        if let Some(owner) = owner {
+            if !event.accepts_lifecycle(
+                self.lifecycle_cursor.as_ref(),
+                &owner,
+                &cursor,
+                matches!(
+                    self.status,
+                    AppStatus::WaitingApproval | AppStatus::WaitingUserInput
+                ),
+            ) || matches!(event, TuiEvent::TerminalRecoveryNeeded(_))
+                && self.status == AppStatus::Idle
+                && self
+                    .lifecycle_cursor
+                    .as_ref()
+                    .is_some_and(|(current, previous)| current == &owner && previous == &cursor)
+            {
+                return None;
+            }
+            self.lifecycle_cursor = Some((owner, cursor));
+        }
+        Some(event)
+    }
+
     /// Adds output a tool wrote to its row: to a script's calls, or to any
     /// other tool's output.
     fn take_tool_output(&mut self, id: String, offset: Option<usize>, chunk: &str) {
@@ -168,7 +196,15 @@ impl AppState {
                     Err(error) => self.push_message(ChatMessage::Error(error)),
                 }
             }
-            TuiEvent::SurfaceDelivery(delivery) => self.update(delivery.1),
+            event @ TuiEvent::SurfaceDelivery(_) => {
+                if let Some(event) = self.accept_surface_delivery(event) {
+                    self.update(event);
+                }
+            }
+            TuiEvent::TerminalRecoveryNeeded(message) => {
+                self.update(TuiEvent::Error(message));
+                self.set_status(AppStatus::Idle);
+            }
             TuiEvent::Attached(_) => {
                 eprintln!("orca: ignored an attached TUI event that bypassed attachment fencing");
             }
@@ -248,6 +284,10 @@ impl AppState {
                 self.reset_session_projection();
                 self.invalidate_recap();
                 self.task_transcript = None;
+                self.lifecycle_cursor = projection
+                    .foreground_operation_id
+                    .clone()
+                    .map(|owner| (owner, projection.cursor.clone()));
                 self.apply_surface_projection_state(*projection);
             }
             TuiEvent::ChildProjectionReset {

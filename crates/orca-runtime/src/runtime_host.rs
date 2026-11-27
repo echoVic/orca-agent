@@ -3294,6 +3294,8 @@ pub struct RuntimeThreadHandle {
 
 pub struct QueueSurfaceFollow {
     pub operation: surface::SurfaceOperationId,
+    pub client: surface::RuntimeSurfaceClientHandle,
+    pub terminal_failure: mpsc::Receiver<surface::WaitOperationTerminalResult>,
     pub baseline: surface::SnapshotAtCursor,
     pub subscription: surface::SurfaceSubscriptionReceiver,
 }
@@ -4036,8 +4038,25 @@ impl RuntimeThreadHandle {
     pub fn interrupt_active_with_completion(
         &self,
     ) -> Result<Option<OperationCompletion>, RuntimeHostError> {
+        self.interrupt_current(None)
+    }
+
+    pub fn interrupt_followed_operation(
+        &self,
+        operation: surface::SurfaceOperationId,
+    ) -> Result<Option<OperationCompletion>, RuntimeHostError> {
+        self.interrupt_current(Some(operation))
+    }
+
+    fn interrupt_current(
+        &self,
+        expected_follow: Option<surface::SurfaceOperationId>,
+    ) -> Result<Option<OperationCompletion>, RuntimeHostError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.try_send(ThreadCommand::InterruptActive { reply: reply_tx })?;
+        self.try_send(ThreadCommand::InterruptActive {
+            expected_follow,
+            reply: reply_tx,
+        })?;
         receive_reply(reply_rx, "runtime thread")?
     }
 
@@ -4889,6 +4908,18 @@ impl RuntimeHost {
         Self::start_with_background_capacity(HOST_BACKGROUND_TASK_CAPACITY)
     }
 
+    #[cfg(feature = "test-utils")]
+    pub fn start_with_subscriber_limit_for_test(limit: u64) -> Result<Self, RuntimeHostError> {
+        Self::start_inner(
+            Arc::new(LegacyThreadOperationExecutor),
+            HOST_BACKGROUND_TASK_CAPACITY,
+            surface::SurfaceHubConfig {
+                subscriber_event_limit: limit,
+                ..Default::default()
+            },
+        )
+    }
+
     pub fn start_with_background_capacity(
         background_capacity: usize,
     ) -> Result<Self, RuntimeHostError> {
@@ -5684,6 +5715,7 @@ enum ThreadCommand {
         reply: SyncSender<Result<InterruptOperationResult, RuntimeHostError>>,
     },
     InterruptActive {
+        expected_follow: Option<surface::SurfaceOperationId>,
         reply: SyncSender<Result<Option<OperationCompletion>, RuntimeHostError>>,
     },
     PauseGoalRun {
@@ -12794,9 +12826,8 @@ struct PreparedSurfaceAdmission {
 /// What a turn the thread starts on its own (the next queued message, a wake
 /// for finished agents) carries that a turn a client admits does not. It is
 /// recorded on the surface like any other, so the conversation holds it when
-/// it is read back, but no surface client admitted it: whoever shows the
-/// thread watches it through `observer` and answers what it asks through
-/// `interaction_handlers`.
+/// it is read back. A TUI follow gets its events and interactions through
+/// the surface; other callers retain their own observer and handlers.
 #[derive(Clone)]
 struct RuntimeStartedTurn {
     /// The turn's id, when whoever queued the message already named it.
@@ -12813,6 +12844,7 @@ impl RuntimeStartedTurn {
     fn apply_on_surface(mut self, request: HostedTurnRequest) -> HostedTurnRequest {
         if self.surface_observers.is_some() {
             self.observer = None;
+            self.interaction_handlers = PromptQueueInteractionHandlers::default();
         }
         self.apply(request)
     }
@@ -17737,12 +17769,13 @@ impl ThreadActor {
         self.last_child_results_wake_owed = owed;
         let follows_surface =
             started.surface_observers.is_some() && self.resident_surface.0.is_some();
-        if self
-            .start_runtime_turn_on_surface(CHILD_RESULTS_WAKE_PROMPT, &[], started.clone())
-            .is_ok()
-            || follows_surface
-        {
-            return;
+        match self.start_runtime_turn_on_surface(CHILD_RESULTS_WAKE_PROMPT, &[], started.clone()) {
+            Ok(_) => return,
+            Err(error) if follows_surface => {
+                eprintln!("orca: finished background agents could not wake the thread: {error:?}");
+                return;
+            }
+            Err(_) => {}
         }
         // The surface could not take the turn: it runs unrecorded there, as
         // on a thread that has none.
@@ -19448,7 +19481,7 @@ impl ThreadActor {
                 ThreadCommand::InterruptOperation { reply, .. } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
-                ThreadCommand::InterruptActive { reply } => {
+                ThreadCommand::InterruptActive { reply, .. } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
                 ThreadCommand::PauseGoalRun { reply, .. } => {
@@ -20556,7 +20589,7 @@ impl ThreadActor {
                     requested_operation_id: operation_id,
                 }));
             }
-            ThreadCommand::InterruptActive { reply } => {
+            ThreadCommand::InterruptActive { reply, .. } => {
                 let _ = reply.send(Ok(None));
             }
             ThreadCommand::PauseGoalRun {
@@ -20798,6 +20831,17 @@ impl ThreadActor {
     }
 
     fn handle_running_command(&mut self, command: ThreadCommand, active: &mut ActiveOperation) {
+        if matches!(
+            &command,
+            ThreadCommand::SurfaceRequestToolApproval { .. }
+                | ThreadCommand::SurfaceRequestPermission { .. }
+                | ThreadCommand::SurfaceRequestUserInput { .. }
+                | ThreadCommand::SurfaceRequestMcpElicitation { .. }
+        ) && self.interrupt_if_follow_gapped(active)
+        {
+            Self::reject_thread_command_unavailable(command);
+            return;
+        }
         let permitted_during_manual_precommit = matches!(
             &command,
             ThreadCommand::SurfaceWaitOperationTerminal { .. }
@@ -21897,10 +21941,12 @@ impl ThreadActor {
                 };
                 let _ = reply.send(Ok(result));
             }
-            ThreadCommand::InterruptActive { reply } => {
-                self.pause_prompt_queue_for_interrupt();
-                Self::cancel_active_task_tree(active);
-                let _ = reply.send(Ok(Some(active.completion.clone())));
+            ThreadCommand::InterruptActive {
+                expected_follow,
+                reply,
+            } => {
+                let _ =
+                    reply.send(self.interrupt_current_generation(active, expected_follow.as_ref()));
             }
             ThreadCommand::PauseGoalRun {
                 operation_id,
@@ -22259,6 +22305,70 @@ impl ThreadActor {
             cancel,
             join,
         }
+    }
+
+    fn interrupt_if_follow_gapped(&mut self, active: &mut ActiveOperation) -> bool {
+        let Some(follow) = self.operation_recovery.followed.as_ref().filter(|follow| {
+            active
+                .surface_operation
+                .as_ref()
+                .is_some_and(|fence| fence.operation_id == follow.operation)
+                && follow.gapped.load(std::sync::atomic::Ordering::Acquire)
+        }) else {
+            return false;
+        };
+        let operation = follow.operation.clone();
+        if let Err(error) = self.interrupt_current_generation(active, Some(&operation)) {
+            eprintln!("orca: cannot interrupt gapped follow: {error}");
+        }
+        true
+    }
+
+    fn interrupt_current_generation(
+        &mut self,
+        active: &mut ActiveOperation,
+        expected_follow: Option<&surface::SurfaceOperationId>,
+    ) -> Result<Option<OperationCompletion>, RuntimeHostError> {
+        let followed = active.surface_operation.as_ref().filter(|fence| {
+            self.operation_recovery
+                .followed
+                .as_ref()
+                .is_some_and(|follow| follow.operation == fence.operation_id)
+        });
+        if expected_follow
+            .is_some_and(|expected| followed.is_none_or(|fence| &fence.operation_id != expected))
+        {
+            return Ok(None);
+        }
+        self.pause_prompt_queue_for_interrupt();
+        if let Some(fence) = followed.cloned().filter(|fence| {
+            expected_follow.is_some()
+                || self
+                    .resident_surface
+                    .coordinator
+                    .state()
+                    .snapshot()
+                    .interactions
+                    .iter()
+                    .any(|request| {
+                        request.fence == *fence
+                            && request.lifecycle == surface::SurfaceInteractionLifecycle::Requested
+                    })
+        }) {
+            if active.surface_terminalization.is_none() {
+                self.commit_surface_terminalization_batch(
+                    active,
+                    &fence,
+                    surface::TerminalizationCause::UserCancel,
+                )
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!("failed to commit typed user interrupt: {error:?}"),
+                })?;
+            }
+        } else {
+            Self::cancel_active_task_tree(active);
+        }
+        Ok(Some(active.completion.clone()))
     }
 
     fn cancel_active_task_tree(active: &ActiveOperation) {
@@ -29339,6 +29449,138 @@ mod tests {
         assert!(after.queued_operations == before.queued_operations);
         assert!(after.operation_history == before.operation_history);
         assert!(after.foreground_operation == before.foreground_operation);
+    }
+
+    #[test]
+    fn queued_surface_request_is_committed_and_granted_to_the_follower() {
+        followed_queued_approval(false);
+    }
+
+    #[test]
+    fn host_interrupt_commits_followed_request_cancellation_before_terminal() {
+        followed_queued_approval(true);
+    }
+
+    fn followed_queued_approval(interrupt: bool) {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("witness.txt"), "before").unwrap();
+        let mut config = surface_test_config(cwd.path().to_owned(), HistoryMode::Record);
+        config.approval_mode = orca_core::approval_types::ApprovalMode::Suggest;
+        let host = RuntimeHost::start().unwrap();
+        let thread = host.start_thread(config, "queued approval").unwrap();
+        let (sender, follows) = mpsc::channel();
+        thread.set_prompt_queue_surface_observer(
+            Arc::new(|_: &orca_core::event_schema::EventEnvelope| Ok(())),
+            sender,
+        );
+        thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text(
+                    "edit witness.txt :: before => after",
+                ),
+            })
+            .unwrap();
+        let mut follow = follows.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let mut requested = None;
+        while let Some(surface::SurfaceSubscriptionItem::Batch { batch }) = follow
+            .subscription
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            if let Some(interaction) =
+                batch
+                    .events
+                    .as_slice()
+                    .iter()
+                    .find_map(|envelope| match &envelope.event {
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Requested { interaction },
+                        ) if interaction.fence.operation_id == follow.operation => {
+                            Some(interaction.clone())
+                        }
+                        _ => None,
+                    })
+            {
+                requested = Some(interaction);
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        let request = requested.expect("missing committed request for queued edit");
+        assert!(
+            matches!(&request.route, surface::SurfaceInteractionRoute::Exclusive { attachment_id, .. } if attachment_id == follow.client.attachment_id())
+        );
+        if interrupt {
+            assert!(thread.interrupt_active_with_completion().unwrap().is_some());
+            let mut cancelled_at = None;
+            'terminal: loop {
+                let Some(surface::SurfaceSubscriptionItem::Batch { batch }) =
+                    follow.subscription.recv_timeout(SURFACE_TEST_TIMEOUT)
+                else {
+                    panic!("missing committed terminal")
+                };
+                for envelope in batch.events.as_slice() {
+                    match &envelope.event {
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Cancelled {
+                                interaction_id,
+                                reason:
+                                    surface::InteractionCancelReason::OperationCancelled {
+                                        reason: surface::CancelReason::User,
+                                    },
+                                ..
+                            },
+                        ) if interaction_id == &request.interaction_id => {
+                            cancelled_at = Some(batch.cursor_after.next_seq)
+                        }
+                        surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                            record,
+                        }) if record.operation_id == follow.operation => {
+                            assert!(matches!(
+                                record.terminal,
+                                surface::OperationTerminal::Cancelled {
+                                    reason: surface::CancelReason::User
+                                }
+                            ));
+                            assert!(
+                                cancelled_at.is_some_and(|seq| seq < batch.cursor_after.next_seq),
+                                "request cancellation must be committed before the operation terminal"
+                            );
+                            break 'terminal;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            committed_surface_value(
+                follow
+                    .client
+                    .respond_interaction_by_id(
+                        surface_request_id(),
+                        request.interaction_id,
+                        surface::SurfaceClientInteractionAnswer::ToolApproval {
+                            decision: surface::SurfaceAllowDeny::Deny,
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            follow
+                .client
+                .wait_operation_terminal(surface_request_id(), follow.operation.clone())
+                .unwrap(),
+            surface::WaitOperationTerminalResult::Terminal { .. }
+        ));
+        drop(follow);
+        host.shutdown().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cwd.path().join("witness.txt")).unwrap(),
+            "before"
+        );
     }
 
     #[test]

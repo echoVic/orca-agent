@@ -443,17 +443,10 @@ fn spawn_unwrapped_tui_test_event_sender(
         .name("orca-tui-test-event-unwrapper".to_string())
         .spawn(move || {
             while let Ok(event) = event_rx.recv() {
-                let event = match event {
-                    TuiEvent::Attached(attached) => {
-                        let AttachedTuiEvent { event, .. } = *attached;
-                        if matches!(event, TuiEvent::SessionAttachmentActivated) {
-                            continue;
-                        }
-                        event
-                    }
-                    TuiEvent::SessionAttachmentActivated => continue,
-                    event => event,
-                };
+                let event = TuiEvent::into_test_payload(event);
+                if matches!(event, TuiEvent::SessionAttachmentActivated) {
+                    continue;
+                }
                 if output_tx.send(event).is_err() {
                     break;
                 }

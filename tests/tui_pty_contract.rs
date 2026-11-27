@@ -898,7 +898,10 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
     assert_screen_has_text(&process, &mut output, "thinking,", "child has not started");
     if queue_next_turn {
         let prompt = if queued_approval {
-            "edit witness.txt :: before => after\r".to_owned()
+            format!(
+                "mock_stream_tool_release_marker {}\r",
+                serde_json::json!({"marker":ask,"toolPrompt":"edit witness.txt :: before => after"})
+            )
         } else if queued_tool {
             format!(
                 "mock_stream_tool_release_marker {}\r",
@@ -977,9 +980,16 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
         std::fs::write(&marker, b"").unwrap();
     }
     if approval || queued_approval {
-        if approval {
-            std::fs::write(&ask, b"").unwrap();
+        if queued_approval {
+            process.write(b"/side\r").unwrap();
+            assert_screen_has_text(
+                &process,
+                &mut output,
+                "side conversations are unavailable while a child is focused",
+                "controller did not answer on the adopted child",
+            );
         }
+        std::fs::write(&ask, b"").unwrap();
         assert_screen_has_text(
             &process,
             &mut output,
@@ -1020,6 +1030,17 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
                 &format!(r#""text":"{prefix}\n""#),
             ) {
                 assert!(Instant::now() < deadline, "queued tool turn did not stream");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            std::fs::write(&ask, b"").unwrap();
+            while !session_contains(
+                &home.path().join("sessions"),
+                r#""name":"read_file","terminal":{"kind":"Success""#,
+            ) {
+                assert!(
+                    Instant::now() < deadline,
+                    "queued tool did not finish during visit"
+                );
                 std::thread::sleep(Duration::from_millis(25));
             }
             process.write(b"\x1b").unwrap();

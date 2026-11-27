@@ -15,11 +15,17 @@ pub(crate) struct AttachmentRouting {
     deferred_parent_attachment: Option<SessionAttachmentId>,
     deferred_parent_events: Vec<TuiEvent>,
     restored: Option<RestoredParent>,
+    parent_lifecycle: Option<(
+        orca_runtime::surface::SurfaceOperationId,
+        orca_runtime::surface::SurfaceCursor,
+    )>,
+    parent_waiting: bool,
 }
 
 struct RestoredParent {
     attachment: SessionAttachmentId,
     cursor: orca_runtime::surface::SurfaceCursor,
+    recovery: Option<orca_runtime::surface::SurfaceOperationId>,
     // Kept until the next return; request identities are unique per operation.
     requests: Vec<TuiInteractionKey>,
 }
@@ -32,8 +38,9 @@ impl AttachmentRouting {
             .filter(|parent| parent.attachment == attachment);
         let event = match event {
             TuiEvent::SurfaceDelivery(delivery) => {
-                let (cursor, event) = delivery.as_ref();
+                let (cursor, event, owner) = delivery.as_ref();
                 if restored.is_some_and(|parent| {
+                    (!matches!(event, TuiEvent::TerminalRecoveryNeeded(_)) || owner.is_some() && owner == &parent.recovery) &&
                     parent.cursor.thread_id == cursor.thread_id
                         && parent.cursor.incarnation == cursor.incarnation
                         // Hydration delivers at the baseline cursor itself.
@@ -54,10 +61,19 @@ impl AttachmentRouting {
         attachment: SessionAttachmentId,
         snapshot: &orca_runtime::surface::SurfaceSnapshot,
         requests: &[TuiEvent],
+        recovery: Option<orca_runtime::surface::SurfaceOperationId>,
     ) {
+        self.parent_lifecycle = snapshot
+            .foreground_operation
+            .as_ref()
+            .map(|op| (op.operation_id.clone(), snapshot.cursor.clone()));
+        self.parent_waiting = !requests.is_empty();
+        self.pending_parent_interactions
+            .retain(|(source, _)| *source != attachment);
         self.restored = Some(RestoredParent {
             attachment,
             cursor: snapshot.cursor.clone(),
+            recovery,
             requests: requests
                 .iter()
                 .filter_map(interaction_key)
@@ -75,6 +91,8 @@ impl AttachmentRouting {
             deferred_parent_attachment: None,
             deferred_parent_events: Vec::new(),
             restored: None,
+            parent_lifecycle: None,
+            parent_waiting: false,
         }
     }
 
@@ -252,7 +270,7 @@ impl AttachmentRouting {
 
 fn unpack(event: TuiEvent) -> TuiEvent {
     match event {
-        TuiEvent::SurfaceDelivery(delivery) => delivery.1,
+        TuiEvent::SurfaceDelivery(delivery) if delivery.2.is_none() => delivery.1,
         event => event,
     }
 }
@@ -289,7 +307,7 @@ pub(crate) fn accept_attached_tui_event(
     event: TuiEvent,
 ) -> Result<Option<TuiEvent>, ()> {
     let TuiEvent::Attached(attached) = event else {
-        return Ok(Some(event));
+        return Ok(state.accept_surface_delivery(event));
     };
     let AttachedTuiEvent { attachment, event } = *attached;
     if matches!(event, TuiEvent::SessionAttachmentActivated) {
@@ -299,7 +317,7 @@ pub(crate) fn accept_attached_tui_event(
     if attachment.is_some() && attachment != state.active_session_attachment {
         return Err(());
     }
-    Ok(Some(event))
+    Ok(state.accept_surface_delivery(event))
 }
 
 #[cfg(test)]
@@ -393,6 +411,22 @@ impl AttachmentRouting {
         if self.covered(attachment, &event) {
             return true;
         }
+        if let TuiEvent::SurfaceDelivery(delivery) = &event
+            && let (cursor, event, Some(owner)) = delivery.as_ref()
+            && (self.parent_while_side == Some(attachment)
+                || self.parent_while_side.is_none() && self.active == Some(attachment))
+        {
+            if !event.accepts_lifecycle(
+                self.parent_lifecycle.as_ref(),
+                owner,
+                cursor,
+                self.parent_waiting,
+            ) {
+                return true;
+            }
+            self.parent_lifecycle = Some((owner.clone(), cursor.clone()));
+            self.parent_waiting = interaction_key(event).is_some();
+        }
         if self.parent_while_side == Some(attachment) && self.active != Some(attachment) {
             if let Some(tasks) = background_tasks_from_event(payload(&event)) {
                 let _ = root_event_tx.send(TuiEvent::BackgroundTasksUpdated(tasks));
@@ -432,7 +466,8 @@ pub(crate) fn send_attached_event(
 }
 
 pub(crate) fn side_parent_status_for_event(event: &TuiEvent) -> Option<SideParentStatus> {
-    match event {
+    match payload(event) {
+        TuiEvent::TerminalRecoveryNeeded(_) => Some(SideParentStatus::Failed),
         TuiEvent::TurnStarted { .. } | TuiEvent::RuntimeTurnStarted { .. } => {
             Some(SideParentStatus::Running)
         }

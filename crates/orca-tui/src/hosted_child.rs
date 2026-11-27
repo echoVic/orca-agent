@@ -455,10 +455,11 @@ fn register_requested_interactions(
         .interactions
         .iter()
         .filter(|interaction| {
-            matches!(
-                interaction.lifecycle,
-                SurfaceInteractionLifecycle::Requested
-            )
+            interaction.lifecycle == SurfaceInteractionLifecycle::Requested
+                && !crate::surface_client::snapshot_operation_is_terminal(
+                    snapshot,
+                    &interaction.fence.operation_id,
+                )
         })
         .filter_map(|interaction| control.register_surface_interaction(interaction))
         .collect()
@@ -973,12 +974,37 @@ pub(crate) fn project_returned_main(
         send_attached_event(sender, attachment, TuiEvent::PromptQueueUpdated(queue))
             .map_err(|error| error.to_string())?;
     }
-    let mut requests = register_requested_interactions(snapshot, control);
-    requests.extend(control.pending_queue_interactions(thread.thread_id()));
+    let recovery = snapshot
+        .foreground_operation
+        .as_ref()
+        .filter(|owner| owner.terminal.is_none())
+        .and_then(|owner| {
+            control
+                .follow_recovery(&owner.operation_id)
+                .map(|message| (&owner.operation_id, message))
+        });
+    if let Some((owner, message)) = recovery {
+        send_attached_event(
+            sender,
+            attachment,
+            TuiEvent::TerminalRecoveryNeeded(message.into()).at_operation_cursor(
+                true,
+                &snapshot.cursor,
+                owner,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let requests = register_requested_interactions(snapshot, control);
     routing
         .lock()
         .map_err(|error| error.to_string())?
-        .snapshot_projected(attachment, snapshot, &requests);
+        .snapshot_projected(
+            attachment,
+            snapshot,
+            &requests,
+            recovery.map(|(owner, _)| owner.clone()),
+        );
     for event in requests {
         send_attached_event(sender, attachment, event).map_err(|error| error.to_string())?;
     }
@@ -1331,6 +1357,8 @@ pub(crate) mod live_child_for_test {
         BeforeVisit,
         BeforeAdoption,
         AfterAdoption,
+        Cancelled,
+        LegacyTerminal,
     }
 
     fn queued_approval(timing: RequestTiming) {
@@ -1366,7 +1394,8 @@ pub(crate) mod live_child_for_test {
             let event = events
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("request on main's relay");
-            if matches!(event, TuiEvent::ApprovalNeeded { .. }) {
+            if matches!(&event, TuiEvent::SurfaceDelivery(delivery) if matches!(delivery.1, TuiEvent::ApprovalNeeded { .. }))
+            {
                 break event;
             }
         };
@@ -1376,8 +1405,32 @@ pub(crate) mod live_child_for_test {
             .route(&root, parent, request.clone());
         let before = displayed.try_iter().collect::<Vec<_>>();
         if matches!(timing, RequestTiming::BeforeVisit) {
-            assert!(before.iter().any(|event| matches!(event, TuiEvent::Attached(item) if item.attachment == Some(parent) && matches!(item.event, TuiEvent::ApprovalNeeded { .. }))));
+            assert!(before.iter().any(|event| matches!(event, TuiEvent::Attached(item) if item.attachment == Some(parent) && matches!(&item.event, TuiEvent::SurfaceDelivery(delivery) if matches!(delivery.1, TuiEvent::ApprovalNeeded { .. })))));
             visit();
+            let (projection, conversation) =
+                crate::hosted_session::read_hosted_projection_batch(&fixture.child).unwrap();
+            super::project_hosted_child_attached(
+                "child".into(),
+                &super::read_parent_snapshot(&fixture.parent).unwrap(),
+                projection,
+                conversation,
+                parent.next(),
+                &root,
+            )
+            .unwrap();
+            let mut entering = fresh_state();
+            for event in displayed.try_iter() {
+                if let Some(event) =
+                    crate::attachment_routing::accept_attached_tui_event(&mut entering, event)
+                        .unwrap()
+                {
+                    entering.update(event);
+                }
+            }
+            assert_eq!(
+                entering.main_behind_child,
+                Some(super::SideParentStatus::NeedsApproval)
+            );
         } else {
             assert!(before.iter().any(|event| matches!(
                 event,
@@ -1385,10 +1438,46 @@ pub(crate) mod live_child_for_test {
             )));
             assert!(!before.iter().any(|event| matches!(event,TuiEvent::Attached(item) if matches!(item.event,TuiEvent::ApprovalNeeded{..}))));
         }
-        let snapshot = super::snapshot_for_return(&routing, &root, parent, || {
+        if matches!(timing, RequestTiming::Cancelled) {
+            assert!(fixture.control.interrupt_current().unwrap());
+            fixture.wait_for(|snapshot| snapshot.operation_history.iter().any(|operation| matches!(&operation.terminal, Some(record) if matches!(record.terminal, orca_runtime::surface::OperationTerminal::Cancelled { .. }))).then_some(()));
+        }
+        let mut snapshot = super::snapshot_for_return(&routing, &root, parent, || {
             super::read_parent_snapshot(&fixture.parent)
         })
         .unwrap();
+        if matches!(timing, RequestTiming::LegacyTerminal) {
+            use orca_runtime::surface::{
+                CancelReason, OperationPhase, OperationTerminal, OperationTerminalRecord,
+                SurfaceFinalizeIntentId, UnixMillis,
+            };
+            let mut ended = snapshot.foreground_operation.take().unwrap();
+            assert!(
+                snapshot
+                    .interactions
+                    .iter()
+                    .any(|request| request.fence.operation_id == ended.operation_id
+                        && request.lifecycle
+                            == orca_runtime::surface::SurfaceInteractionLifecycle::Requested)
+            );
+            ended.phase = OperationPhase::Terminal;
+            ended.terminal = Some(OperationTerminalRecord {
+                operation_id: ended.operation_id.clone(),
+                finalize_intent_id: SurfaceFinalizeIntentId::try_from_bytes(
+                    *ended.operation_id.as_bytes(),
+                )
+                .unwrap(),
+                terminal: OperationTerminal::Cancelled {
+                    reason: CancelReason::User,
+                },
+                usage: Default::default(),
+                source_diagnostic_digest: None,
+                settlement_receipts: vec![],
+                completion_proof: Default::default(),
+                committed_at: UnixMillis::new(1),
+            });
+            snapshot.operation_history.push(ended);
+        }
         super::project_returned_main(
             &fixture.parent,
             &snapshot,
@@ -1399,23 +1488,49 @@ pub(crate) mod live_child_for_test {
         )
         .unwrap();
         AttachmentRouting::release_deferred_parent_events(&routing, &root);
-        routing.lock().unwrap().route(&root, parent, request);
-        let keys: Vec<_> = displayed
-            .try_iter()
-            .filter_map(|event| match event {
-                TuiEvent::Attached(item) => match item.event {
-                    TuiEvent::ApprovalNeeded { key, .. } => Some(key),
+        let displayed_keys = || {
+            displayed
+                .try_iter()
+                .filter_map(|event| match event {
+                    TuiEvent::Attached(item) => match item.event {
+                        TuiEvent::ApprovalNeeded { key, .. } => Some(key),
+                        TuiEvent::SurfaceDelivery(delivery) => match delivery.1 {
+                            TuiEvent::ApprovalNeeded { key, .. } => Some(key),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
-            })
-            .collect();
-        assert_eq!(keys.len(), 1, "one actionable request after return");
+                })
+                .collect::<Vec<_>>()
+        };
+        let keys = displayed_keys();
+        routing
+            .lock()
+            .unwrap()
+            .route(&root, parent, request.clone());
+        let repeats = displayed_keys();
+        let TuiEvent::SurfaceDelivery(delivery) = &request else {
+            unreachable!()
+        };
+        let key = match &delivery.1 {
+            TuiEvent::ApprovalNeeded { key, .. } => key,
+            _ => unreachable!(),
+        };
+        if matches!(timing, RequestTiming::Cancelled) {
+            assert!(
+                keys.is_empty() && repeats.is_empty(),
+                "cancelled request reopened"
+            );
+            assert_eq!(std::fs::read_to_string(witness).unwrap(), "before");
+            fixture.shutdown();
+            return;
+        }
         assert!(
             fixture
                 .control
-                .respond_queue_interaction(
-                    &keys[0],
+                .respond_surface_interaction(
+                    key,
                     &crate::protocol::TuiInteractionResponse::Approval(false)
                 )
                 .unwrap()
@@ -1429,6 +1544,15 @@ pub(crate) mod live_child_for_test {
         });
         assert_eq!(std::fs::read_to_string(witness).unwrap(), "before");
         fixture.shutdown();
+        if matches!(timing, RequestTiming::LegacyTerminal) {
+            assert!(
+                keys.is_empty() && repeats.is_empty(),
+                "returned view offered an approval for a terminal operation: {keys:?}"
+            );
+            return;
+        }
+        assert_eq!(keys, [key.clone()], "restore, before any redelivery");
+        assert!(repeats.is_empty(), "original request delivered again");
     }
 
     #[test]
@@ -1445,10 +1569,467 @@ pub(crate) mod live_child_for_test {
     }
 
     #[test]
-    fn foregrounding_a_queued_background_turn_only_shows_unseen_output() {
+    fn cancelled_queued_approval_is_not_restored() {
+        queued_approval(RequestTiming::Cancelled);
+    }
+
+    #[test]
+    fn return_ignores_requested_interaction_of_a_terminal_operation() {
+        queued_approval(RequestTiming::LegacyTerminal);
+    }
+
+    fn fresh_state() -> crate::types::AppState {
+        crate::types::AppState::new(
+            crossbeam_channel::unbounded().0,
+            "test".into(),
+            "mock".into(),
+            "/tmp".into(),
+        )
+    }
+
+    fn returned_state(fixture: &ViewOnChild) -> crate::types::AppState {
+        use crate::attachment_routing::{AttachmentRouting, accept_attached_tui_event};
+        let parent = SessionAttachmentId::new(1);
+        let routing = std::sync::Arc::new(std::sync::Mutex::new(AttachmentRouting::new(parent)));
+        let (root, displayed) = crossbeam_channel::unbounded();
+        AttachmentRouting::switch_attachment(&routing, &root, parent.next(), Some(parent), false);
+        let snapshot = super::snapshot_for_return(&routing, &root, parent, || {
+            super::read_parent_snapshot(&fixture.parent)
+        })
+        .unwrap();
+        super::project_returned_main(
+            &fixture.parent,
+            &snapshot,
+            parent,
+            &root,
+            &fixture.control,
+            &routing,
+        )
+        .unwrap();
+        AttachmentRouting::release_deferred_parent_events(&routing, &root);
+        let mut state = fresh_state();
+        for event in displayed.try_iter() {
+            if let Some(event) = accept_attached_tui_event(&mut state, event).unwrap() {
+                state.update(event);
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn queued_tool_committed_during_a_visit_is_rebuilt_in_order() {
+        let fixture = ViewOnChild::start();
+        let marker = fixture._home.path().join("release-read");
+        std::fs::write(fixture._home.path().join("witness.txt"), "before").unwrap();
+        let events = fixture.enqueue(format!(
+            "mock_stream_tool_release_marker {}",
+            serde_json::json!({"marker":marker,"toolPrompt":"read witness.txt","retainText":true})
+        ));
+        std::fs::write(marker, "").unwrap();
+        while !matches!(events.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), TuiEvent::SurfaceDelivery(item) if matches!(item.1, TuiEvent::SessionCompleted { .. }))
+        {
+        }
+        let frame = crate::test_support::frame_string(&mut returned_state(&fixture), 120, 40);
+        let (_, after) = frame
+            .split_once("Mock slow tool stream started.")
+            .expect(&frame);
+        let (between, _) = after
+            .split_once("Mock completed after tool execution.")
+            .expect(&frame);
+        assert!(
+            between
+                .lines()
+                .any(|row| row.contains("✓ read") && row.contains("witness.txt")),
+            "{frame}"
+        );
+        assert_eq!(frame.matches("✓ read").count(), 1, "{frame}");
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_gap_on_a_running_follow_cancels_its_request_and_ends_the_row() {
+        use orca_runtime::{
+            history::SessionStore,
+            prompt_queue::{PromptQueueAction, PromptQueueInput},
+            runtime_host::RuntimeHost,
+            surface::{self, InteractionPatch, OperationPatch, SurfaceEvent},
+        };
+        use std::{
+            sync::{Arc, mpsc},
+            time::{Duration, Instant},
+        };
+        let timeout = Duration::from_secs(10);
+        let home = crate::test_support::isolate_orca_home();
+        let witness = home.path().join("witness.txt");
+        std::fs::write(&witness, "before").unwrap();
+        let host = RuntimeHost::start_with_subscriber_limit_for_test(32).unwrap();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_owned());
+        config.history_mode = orca_core::config::HistoryMode::Record;
+        config.approval_mode = orca_core::approval_types::ApprovalMode::Suggest;
+        let thread = host.start_thread(config, "gap during approval").unwrap();
+        let (send, follows) = mpsc::channel();
+        thread.set_prompt_queue_surface_observer(
+            Arc::new(|_: &orca_core::event_schema::EventEnvelope| Ok(())),
+            send,
+        );
+        thread
+            .prompt_queue(PromptQueueAction::Add {
+                input: PromptQueueInput::text("edit witness.txt :: before => after"),
+            })
+            .unwrap();
+        let follow = follows.recv_timeout(timeout).unwrap();
+        let operation = follow.operation.clone();
+        let deadline = Instant::now() + timeout;
+        let request = loop {
+            let snapshot = super::read_parent_snapshot(&thread).unwrap();
+            if let Some(request) = snapshot
+                .interactions
+                .iter()
+                .find(|request| request.fence.operation_id == operation)
+            {
+                break request.interaction_id.clone();
+            }
+            assert!(Instant::now() < deadline, "no committed approval");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap()
+            .path;
+        let baseline = follow.baseline.cursor.clone();
+        overflow_delayed_reader(&thread, 32);
+        let owner = thread.clone();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (sender, events) = crossbeam_channel::unbounded();
+        let reader = std::thread::spawn(move || {
+            crate::surface_client::follow_queue_operation(follow, &owner, &control, &sender)
+        });
+        let mut state = fresh_state();
+        let mut saw_running = false;
+        let mut terminals = Vec::new();
+        let limit = Instant::now() + timeout;
+        loop {
+            let event = match events.recv_deadline(limit) {
+                Ok(event) => event,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    panic!("gapped reader did not end")
+                }
+            };
+            if let TuiEvent::SessionCompleted { status } = &event {
+                terminals.push(status.clone());
+            }
+            state.update(event);
+            saw_running |= state.status == crate::types::AppStatus::Running;
+        }
+        reader.join().unwrap().unwrap();
+        let frame = crate::test_support::frame_string(&mut state, 120, 40);
+        assert!(saw_running);
+        assert_eq!(state.status, crate::types::AppStatus::Idle, "{frame}");
+        assert_eq!(
+            frame
+                .matches("typed TUI subscription gap requires SlowSubscriber")
+                .count(),
+            1,
+            "{frame}"
+        );
+        assert_eq!(terminals, ["cancelled"]);
+        let mut requests = Vec::new();
+        let mut cancelled = None;
+        let mut terminal = None;
+        let ledger = surface::JsonlSurfaceCommitLedger::new(path, baseline);
+        for batch in ledger.recover_batches().unwrap().committed {
+            for envelope in batch.events.as_slice() {
+                match &envelope.event {
+                    SurfaceEvent::Interaction(InteractionPatch::Requested { interaction })
+                        if interaction.fence.operation_id == operation =>
+                    {
+                        requests.push(interaction.interaction_id.clone())
+                    }
+                    SurfaceEvent::Interaction(InteractionPatch::Cancelled {
+                        interaction_id,
+                        reason:
+                            surface::InteractionCancelReason::OperationCancelled {
+                                reason: surface::CancelReason::User,
+                            },
+                        ..
+                    }) if *interaction_id == request => {
+                        cancelled = Some(batch.cursor_after.next_seq)
+                    }
+                    SurfaceEvent::Interaction(InteractionPatch::RouteChanged {
+                        interaction_id,
+                        ..
+                    }) if *interaction_id == request => {
+                        panic!("a gapped follow cannot transfer its request")
+                    }
+                    SurfaceEvent::Operation(OperationPatch::Terminal { record })
+                        if record.operation_id == operation =>
+                    {
+                        assert!(matches!(
+                            record.terminal,
+                            surface::OperationTerminal::Cancelled {
+                                reason: surface::CancelReason::User
+                            }
+                        ));
+                        terminal = Some(batch.cursor_after.next_seq);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(requests, [request]);
+        assert!(
+            cancelled.expect("committed User cancellation") < terminal.expect("committed terminal")
+        );
+        assert_eq!(std::fs::read_to_string(witness).unwrap(), "before");
+        host.shutdown().unwrap();
+    }
+
+    fn overflow_delayed_reader(
+        thread: &orca_runtime::runtime_host::RuntimeThreadHandle,
+        capacity: u64,
+    ) {
+        use orca_runtime::surface::{DisplayText, SessionMetadataPatch};
+        let mut revision = super::read_parent_snapshot(thread)
+            .unwrap()
+            .thread
+            .metadata_revision;
+        for index in 0..=capacity {
+            revision = crate::surface_client::update_session_metadata(
+                &thread.typed_surface(),
+                revision,
+                SessionMetadataPatch::SetTitle {
+                    title: DisplayText::new(format!("gap {index}")),
+                },
+            )
+            .unwrap()
+            .metadata_revision;
+        }
+    }
+
+    #[test]
+    fn a_delayed_gapped_queue_reader_does_not_block_the_next_follow() {
+        use orca_runtime::{
+            prompt_queue::{PromptQueueAction, PromptQueueInput},
+            runtime_host::RuntimeHost,
+        };
+        use std::{
+            sync::{Arc, mpsc},
+            time::Duration,
+        };
+        let timeout = Duration::from_secs(10);
+        let home = crate::test_support::isolate_orca_home();
+        let host = RuntimeHost::start_with_subscriber_limit_for_test(64).unwrap();
+        let mut config = crate::test_support::test_run_config();
+        config.history_mode = orca_core::config::HistoryMode::Record;
+        config.cwd = Some(home.path().to_owned());
+        let thread = host.start_thread(config, "two follows").unwrap();
+        let (send, follows) = mpsc::channel();
+        thread.set_prompt_queue_surface_observer(
+            Arc::new(|_: &orca_core::event_schema::EventEnvelope| Ok(())),
+            send,
+        );
+        let (start, started) = mpsc::channel();
+        let (release, gate) = crossbeam_channel::bounded(1);
+        let (finish, finished) = mpsc::channel();
+        let ordinal = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = thread.clone();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let dispatcher = std::thread::spawn(move || {
+            crate::hosted_session::dispatch_queue_follows(
+                follows,
+                move |follow| {
+                    let index = ordinal.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if index == 0 {
+                        start.send(follow.operation.clone()).unwrap();
+                        gate.recv_timeout(timeout).expect("release first reader");
+                    }
+                    let (sender, events) = crossbeam_channel::unbounded();
+                    crate::surface_client::follow_queue_operation(
+                        follow, &owner, &control, &sender,
+                    )
+                    .unwrap();
+                    let shown = events.try_iter().collect::<Vec<_>>();
+                    let terminals = shown.iter().filter(|event| matches!(event,TuiEvent::SessionCompleted{status} if status=="success")).count();
+                    let text: String = shown
+                        .iter()
+                        .filter_map(|event| match event {
+                            TuiEvent::MessageDelta(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let gaps = shown.iter().filter(|event| matches!(event, TuiEvent::Error(message) if message == "typed TUI subscription gap requires SlowSubscriber")).count();
+                    finish.send((index, terminals, text, gaps)).unwrap();
+                },
+                &crossbeam_channel::unbounded().0,
+            );
+        });
+        let add = |prompt: &str| {
+            thread
+                .prompt_queue(PromptQueueAction::Add {
+                    input: PromptQueueInput::text(prompt),
+                })
+                .unwrap()
+        };
+        let marker = home.path().join("finish-first");
+        add(&format!("mock_stream_release_marker {}", marker.display()));
+        let first = started.recv_timeout(timeout).unwrap();
+        overflow_delayed_reader(&thread, 64);
+        std::fs::write(marker, "").unwrap();
+        let deadline = std::time::Instant::now() + timeout;
+        while !crate::surface_client::snapshot_operation_is_terminal(
+            &super::read_parent_snapshot(&thread).unwrap(),
+            &first,
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first operation did not end"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        add("second independent reader");
+        let (index, terminals, _, gaps) = finished
+            .recv_timeout(timeout)
+            .expect("second terminal while first reader held");
+        assert_eq!((index, terminals, gaps), (1, 1, 0));
+        release.send(()).unwrap();
+        let (index, terminals, text, gaps) = finished
+            .recv_timeout(timeout)
+            .expect("terminal from snapshot after gap");
+        assert_eq!((index, terminals, gaps), (0, 1, 1));
+        assert_eq!(
+            text.matches("Mock release-marker stream completed.")
+                .count(),
+            1,
+            "{text}"
+        );
+        host.shutdown().unwrap();
+        dispatcher.join().unwrap();
+    }
+
+    #[test]
+    fn queued_terminal_append_failure_ends_the_live_and_returned_row_until_cold_resume() {
+        use orca_runtime::{
+            history::SessionStore,
+            prompt_queue::{PromptQueueAction, PromptQueueInput},
+            runtime_host::RuntimeHost,
+            surface::{JsonlSurfaceCommitLedger, OperationPhase},
+        };
+        let fixture = ViewOnChild::start();
+        let id = fixture.parent.thread_id().to_owned();
+        let path = SessionStore::new().load_session(&id).unwrap().path;
+        let marker = fixture._home.path().join("fail-terminal");
+        let events = fixture.enqueue(format!("mock_stream_release_marker {}", marker.display()));
+        let mut state = fresh_state();
+        loop {
+            let event = events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let opened = matches!(&event, TuiEvent::SurfaceDelivery(item) if matches!(item.1,TuiEvent::MessageDelta(_)));
+            state.update(event);
+            if opened {
+                break;
+            }
+        }
+        assert_eq!(state.status, crate::types::AppStatus::Running);
+        JsonlSurfaceCommitLedger::inject_terminal_append_failure_once(path);
+        let second = "held behind recovery";
+        fixture
+            .parent
+            .prompt_queue(PromptQueueAction::Add {
+                input: PromptQueueInput::text(second),
+            })
+            .unwrap();
+        std::fs::write(marker, "").unwrap();
+        loop {
+            let event = events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            assert!(
+                !matches!(&event,TuiEvent::SurfaceDelivery(item) if matches!(item.1, TuiEvent::SessionCompleted{ .. }))
+            );
+            let failed = matches!(&event, TuiEvent::SurfaceDelivery(item) if matches!(&item.1,TuiEvent::TerminalRecoveryNeeded(message) if message=="typed TUI terminal commit requires recovery"));
+            state.update(event);
+            if failed {
+                break;
+            }
+        }
+        for mut shown in [state, returned_state(&fixture)] {
+            let frame = crate::test_support::frame_string(&mut shown, 120, 40);
+            assert_eq!(shown.status, crate::types::AppStatus::Idle, "{frame}");
+            assert_eq!(frame.matches("requires recovery").count(), 1, "{frame}");
+        }
+        let snapshot = super::read_parent_snapshot(&fixture.parent).unwrap();
+        let failed = snapshot.foreground_operation.unwrap();
+        assert!(
+            matches!(failed.phase, OperationPhase::Finalizing { .. }) && failed.terminal.is_none()
+        );
+        let queue = fixture
+            .parent
+            .prompt_queue(PromptQueueAction::List)
+            .unwrap();
+        assert!(queue.items.iter().any(|item| item.input.text == second));
+        assert!(
+            !queue
+                .running_item()
+                .is_some_and(|item| item.input.text == second)
+        );
+        fixture.control.unbind_view();
+        drop(fixture.view.close());
+        fixture.child.shutdown().unwrap();
+        assert!(fixture.parent.shutdown().is_err());
+        assert!(fixture.host.shutdown().is_err());
+        drop((fixture.parent, fixture.child, fixture.view, fixture.control));
+        let host = RuntimeHost::start().unwrap();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(fixture._home.path().to_owned());
+        config.history_mode = orca_core::config::HistoryMode::Resume(id);
+        let resumed = host.start_thread(config, "cold resume").unwrap();
+        assert!(
+            super::read_parent_snapshot(&resumed)
+                .unwrap()
+                .operation_history
+                .iter()
+                .any(|op| op.operation_id == failed.operation_id && op.terminal.is_some())
+        );
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (sender, visible) = crossbeam_channel::unbounded();
+        crate::hosted_session::announce_runtime_ready(&resumed, &sender, &control);
+        let fresh = "fresh queued message after recovery";
+        let queue = resumed
+            .prompt_queue(PromptQueueAction::Add {
+                input: PromptQueueInput::text(fresh),
+            })
+            .unwrap();
+        let fresh_turn = queue
+            .items
+            .iter()
+            .find(|item| item.input.text == fresh)
+            .unwrap()
+            .client_user_message_id
+            .turn_id();
+        if queue.paused {
+            resumed
+                .prompt_queue(PromptQueueAction::Start {
+                    expected_revision: queue.revision,
+                })
+                .unwrap();
+        }
+        while !matches!(visible.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), TuiEvent::RuntimeTurnStarted {turn_id} if turn_id == fresh_turn.as_str())
+        {
+        }
+        while !matches!(visible.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), TuiEvent::SessionCompleted {status} if status=="success")
+        {
+        }
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn another_attachment_cannot_background_a_live_followed_turn() {
         use orca_runtime::surface::{
-            AttachResult, BackgroundTarget, FreshAttachRequest, MutationReply,
-            SurfaceAttachmentRole, SurfaceCapability, SurfaceRequestId,
+            AttachResult, BackgroundTarget, FreshAttachRequest, SurfaceAttachmentRole,
+            SurfaceCapability, SurfaceClientCommandError, SurfaceRequestId,
         };
         let fixture = ViewOnChild::start();
         let marker = fixture._home.path().join("finish-provider");
@@ -1486,63 +2067,25 @@ pub(crate) mod live_child_for_test {
             .fence
             .clone();
         assert!(matches!(
-            attachment
-                .client
-                .transfer_background(
-                    SurfaceRequestId::new(),
-                    BackgroundTarget::ActiveGeneration {
-                        fence: fence.clone()
-                    }
-                )
-                .unwrap(),
-            MutationReply::Committed { .. }
+            attachment.client.transfer_background(
+                SurfaceRequestId::new(),
+                BackgroundTarget::ActiveGeneration {
+                    fence: fence.clone()
+                }
+            ),
+            Err(SurfaceClientCommandError::RuntimeUnavailable)
         ));
-        let task = fixture.wait_for(|snapshot| {
-            snapshot
-                .background_operations
-                .iter()
-                .find(|op| op.operation_id == fence.operation_id)?
-                .task_id
-                .as_ref()
-                .map(|id| id.as_str().to_owned())
-        });
+        let snapshot = super::read_parent_snapshot(&fixture.parent).unwrap();
+        assert_eq!(
+            snapshot.foreground_operation.unwrap().operation_id,
+            fence.operation_id
+        );
+        assert!(snapshot.background_operations.is_empty());
         super::detach_child_surface(&surface, &attachment.client);
         std::fs::write(marker, "").unwrap();
-        fixture.wait_for(|snapshot| {
-            snapshot
-                .operation_history
-                .iter()
-                .any(|op| op.operation_id == fence.operation_id && op.terminal.is_some())
-                .then_some(())
-        });
-        let (send, shown) = crossbeam_channel::unbounded();
-        crate::surface_client::foreground_task(
-            &fixture.parent.typed_surface(),
-            &task,
-            &fixture.control,
-            &send,
-        )
-        .unwrap();
-        let shown = shown.try_iter().collect::<Vec<_>>();
-        let text = shown
-            .iter()
-            .filter_map(|event| match event {
-                TuiEvent::MessageDelta(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        assert!(!text.contains("started"), "{text}");
-        assert_eq!(text.matches("completed.").count(), 1, "{text}");
-        assert_eq!(
-            shown
-                .iter()
-                .filter(
-                    |event| matches!(event,TuiEvent::SessionCompleted{status} if status=="success")
-                )
-                .count(),
-            1
-        );
-        assert!(!events.try_iter().any(|event| matches!(event,TuiEvent::SurfaceDelivery(item) if matches!(item.1,TuiEvent::SessionCompleted{..}))));
+        while !matches!(next(), TuiEvent::SurfaceDelivery(item) if matches!(&item.1,TuiEvent::SessionCompleted{status} if status=="success"))
+        {
+        }
         fixture.shutdown();
     }
 

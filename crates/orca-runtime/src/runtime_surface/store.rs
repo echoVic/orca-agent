@@ -56,9 +56,11 @@ use orca_platform::PlatformError;
 use orca_platform::fs::ExclusiveFileLock;
 use orca_platform::fs::{AtomicWritePolicy, atomic_write};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(any(test, feature = "test-utils"))]
+use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -3095,7 +3097,7 @@ impl SurfaceCommitIndex {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 static TERMINAL_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static GOAL_CONTINUATION_APPEND_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -3348,8 +3350,8 @@ impl JsonlSurfaceCommitLedger {
         &self.path
     }
 
-    #[cfg(test)]
-    pub(crate) fn inject_terminal_append_failure_once(path: impl Into<PathBuf>) {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn inject_terminal_append_failure_once(path: impl Into<PathBuf>) {
         TERMINAL_APPEND_FAILURES
             .get_or_init(|| Mutex::new(HashSet::new()))
             .lock()
@@ -3642,7 +3644,7 @@ impl JsonlSurfaceCommitLedger {
             .insert(path.into(), count);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     fn take_terminal_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
         let is_terminal = batch.events.as_slice().iter().any(|event| {
             matches!(
@@ -4444,7 +4446,7 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         &mut self,
         batch: &SurfaceCommitBatch,
     ) -> Result<SurfaceBatchReceipt, SurfaceLedgerError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-utils"))]
         if self.take_terminal_append_failure(batch) {
             return Err(SurfaceLedgerError::AppendFailed);
         }

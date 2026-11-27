@@ -1065,6 +1065,7 @@ mod agent_visit {
             let delivery = TuiEvent::SurfaceDelivery(Box::new((
                 snapshot.cursor.clone(),
                 TuiEvent::MessageDelta(text.into()),
+                None,
             )));
             routing
                 .lock()
@@ -1323,17 +1324,12 @@ mod agent_visit {
 
     #[test]
     fn the_live_main_clock_uses_its_admitted_task_even_before_reconciliation() {
-        with_streaming_main(|thread, mut snapshot| {
-            let registry = thread.task_registry();
-            let record = registry.create_main_session("main clock".into());
-            registry.mark_running(&record.id).unwrap();
-            let turn = &mut snapshot
+        with_streaming_main(|thread, snapshot| {
+            let turn = &snapshot
                 .foreground_operation
-                .as_mut()
+                .as_ref()
                 .unwrap()
                 .agent_loop_turns[0];
-            turn.admitted_main_task_id =
-                Some(orca_runtime::surface::SurfaceTaskId::try_new(record.id).unwrap());
             let admitted = turn.admitted_main_task_id.as_ref().unwrap();
             assert_ne!(admitted, &turn.task_id);
             assert!(!snapshot.tasks.iter().any(|row| &row.task_id == admitted));
@@ -3202,6 +3198,100 @@ fn recovery_projection_is_not_overwritten_by_lifecycle_events() {
     ))));
     assert!(state.recoverable_operation_id().is_none());
     assert!(!state.recovery_prompt_visible);
+}
+
+#[test]
+fn committed_lifecycle_keeps_the_newer_operations_dialog() {
+    for submitted in [false, true] {
+        let mut state = state();
+        let operation =
+            || SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let first = operation();
+        let second = operation();
+        let deliver = |state: &mut AppState, seq, owner, event: TuiEvent| {
+            state.update(event.at_operation_cursor(
+                true,
+                &crate::surface_projection::test_surface_cursor(seq),
+                owner,
+            ))
+        };
+        let queued_start = || TuiEvent::RuntimeTurnStarted {
+            turn_id: "B".into(),
+        };
+        deliver(
+            &mut state,
+            1,
+            &first,
+            if submitted {
+                TuiEvent::TurnStarted {
+                    started_at_ms: None,
+                    task: None,
+                    turn: 1,
+                }
+            } else {
+                TuiEvent::RuntimeTurnStarted {
+                    turn_id: "A".into(),
+                }
+            },
+        );
+        deliver(&mut state, 3, &second, queued_start());
+        deliver(
+            &mut state,
+            2,
+            &first,
+            TuiEvent::SessionCompleted {
+                status: "success".into(),
+            },
+        );
+        assert_eq!(
+            state.status,
+            AppStatus::Running,
+            "late terminal after B started"
+        );
+        deliver(
+            &mut state,
+            4,
+            &second,
+            TuiEvent::ApprovalNeeded {
+                key: interaction_key(TuiInteractionKind::Approval, "B-request"),
+                tool: "edit".into(),
+                target: None,
+                preview: None,
+            },
+        );
+        deliver(
+            &mut state,
+            2,
+            &first,
+            TuiEvent::SessionCompleted {
+                status: "success".into(),
+            },
+        );
+        assert_eq!(
+            state.status,
+            AppStatus::WaitingApproval,
+            "submitted A: {submitted}"
+        );
+        deliver(&mut state, 3, &second, queued_start());
+        assert_eq!(state.status, AppStatus::WaitingApproval);
+        assert_eq!(state.approval_dialog.unwrap().id, "B-request");
+        state.approval_dialog = None;
+        deliver(
+            &mut state,
+            5,
+            &second,
+            TuiEvent::UserInputRequested {
+                key: interaction_key(TuiInteractionKind::UserInput, "B-input"),
+                questionnaire: crate::protocol::TuiUserInputQuestionnaire::single(
+                    "choice?",
+                    vec!["yes".into()],
+                ),
+            },
+        );
+        deliver(&mut state, 6, &second, queued_start());
+        assert_eq!(state.status, AppStatus::WaitingUserInput);
+        assert!(state.user_input_dialog.is_some());
+    }
 }
 
 #[test]

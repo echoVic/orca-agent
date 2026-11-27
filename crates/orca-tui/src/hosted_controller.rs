@@ -1309,22 +1309,14 @@ mod tests {
     use crate::agent_runtime::TuiAgentRuntime;
     use crate::bridge;
     use crate::operation_controller::TuiSurfaceTaskControl;
-    use crate::protocol::{
-        AttachedTuiEvent, SubmitToken, TaskTranscriptResult, TuiEvent, UserAction,
-    };
+    use crate::protocol::{SubmitToken, TaskTranscriptResult, TuiEvent, UserAction};
 
     fn next_controller_event(event_rx: &mpsc::Receiver<TuiEvent>) -> TuiEvent {
         loop {
             let event = event_rx
                 .recv_timeout(Duration::from_secs(10))
-                .expect("hosted controller event");
-            let event = match event {
-                TuiEvent::Attached(attached) => {
-                    let AttachedTuiEvent { event, .. } = *attached;
-                    event
-                }
-                event => event,
-            };
+                .expect("hosted controller event")
+                .into_test_payload();
             if !matches!(event, TuiEvent::SessionAttachmentActivated) {
                 return event;
             }
@@ -1576,14 +1568,7 @@ mod tests {
     /// The first running agent with a thread of its own, whose own turn has
     /// started, that an event shows.
     fn kept_running_agent(event: TuiEvent) -> Option<String> {
-        let event = match event {
-            TuiEvent::Attached(attached) => {
-                let AttachedTuiEvent { event, .. } = *attached;
-                event
-            }
-            event => event,
-        };
-        let tasks = match event {
+        let tasks = match event.into_test_payload() {
             TuiEvent::SurfaceProjectionSynced(projection) => projection.workflow_tasks,
             TuiEvent::WorkflowTasksUpdated(tasks) | TuiEvent::BackgroundTasksUpdated(tasks) => {
                 tasks
@@ -1683,14 +1668,8 @@ mod tests {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let event = event_rx
                 .recv_timeout(remaining)
-                .expect("an agent is shown running with a thread of its own");
-            let event = match event {
-                TuiEvent::Attached(attached) => {
-                    let AttachedTuiEvent { event, .. } = *attached;
-                    event
-                }
-                event => event,
-            };
+                .expect("an agent is shown running with a thread of its own")
+                .into_test_payload();
             // In suggest the person approves the call that starts the agent.
             if let TuiEvent::ApprovalNeeded { key, .. } = event {
                 action_tx
@@ -1860,10 +1839,7 @@ mod tests {
         runtime.shutdown().expect("hosted controller shutdown");
         let mut events = Vec::new();
         while let Ok(event) = event_rx.recv_timeout(Duration::from_millis(500)) {
-            match event {
-                TuiEvent::Attached(attached) => events.push(attached.event),
-                event => events.push(event),
-            }
+            events.push(event.into_test_payload());
         }
         events
     }

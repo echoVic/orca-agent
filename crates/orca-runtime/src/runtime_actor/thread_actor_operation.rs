@@ -4038,11 +4038,11 @@ impl ThreadActor {
     /// a wake for finished agents) as an operation of the surface, so the
     /// conversation holds the turn when a surface reads it back: after a
     /// switch to another view and back, and after a resume. It is admitted
-    /// the way a turn typed into the terminal is, under an attachment of its
-    /// own that no client holds.
+    /// the way a turn typed into the terminal is, with the follow attachment
+    /// as its interaction responder when the TUI observes it.
     ///
-    /// `Err` means no turn was started and nothing of one is left waiting:
-    /// the caller starts it the way a thread with no surface does.
+    /// On refusal a surface-observed queue rolls back and pauses rather
+    /// than running the input a second time outside the surface.
     pub(super) fn start_runtime_turn_on_surface(
         &mut self,
         prompt: &str,
@@ -4122,8 +4122,40 @@ impl ThreadActor {
                 expected_policy_epoch: settings.effective.policy_epoch,
             },
         };
-        let origin = surface::SurfaceAttachmentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
-            .expect("generated UUID is v7");
+        let followed = if let Some(sender) = &runtime_started.surface_observers {
+            let surface = self.handle.surface();
+            let surface::AttachResult::FreshAttached { attachment } =
+                surface.attach_fresh(surface::FreshAttachRequest {
+                    request_id: surface::SurfaceRequestId::new(),
+                    role: surface::SurfaceAttachmentRole::Tui,
+                    requested_capabilities: BTreeSet::from([
+                        surface::SurfaceCapability::ReadSnapshot,
+                        surface::SurfaceCapability::RespondGrantedInteraction,
+                    ]),
+                    interaction_capabilities: BTreeSet::from([
+                        surface::SurfaceInteractionKind::ToolApproval,
+                        surface::SurfaceInteractionKind::PermissionRequest,
+                        surface::SurfaceInteractionKind::UserInput,
+                        surface::SurfaceInteractionKind::McpElicitation,
+                    ]),
+                })
+            else {
+                return Err(UNAVAILABLE);
+            };
+            let subscription = surface
+                .claim_subscription(&attachment.subscription)
+                .ok_or(UNAVAILABLE)?;
+            Some((sender, attachment, subscription))
+        } else {
+            None
+        };
+        let origin = followed
+            .as_ref()
+            .map(|(_, attachment, _)| attachment.attachment_id.clone())
+            .unwrap_or_else(|| {
+                surface::SurfaceAttachmentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7")
+            });
         let reserved = match self.reserve_surface_operation(
             surface::SurfaceRequestId::new(),
             intent,
@@ -4137,24 +4169,17 @@ impl ThreadActor {
             }
         };
         let operation_id = reserved.operation_id;
-        if let Some(follows) = &runtime_started.surface_observers {
-            let surface = self.handle.surface();
-            let follow = match surface.attach_fresh(surface::FreshAttachRequest {
-                request_id: surface::SurfaceRequestId::new(),
-                role: surface::SurfaceAttachmentRole::Tui,
-                requested_capabilities: BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
-                interaction_capabilities: BTreeSet::new(),
-            }) {
-                surface::AttachResult::FreshAttached { attachment } => surface
-                    .claim_subscription(&attachment.subscription)
-                    .map(|subscription| QueueSurfaceFollow {
-                        operation: operation_id.clone(),
-                        baseline: attachment.baseline,
-                        subscription,
-                    }),
-                _ => None,
+        if let Some((follows, attachment, subscription)) = followed {
+            let (failure, terminal_failure) = mpsc::channel();
+            let gapped = subscription.gap_signal();
+            let follow = QueueSurfaceFollow {
+                operation: operation_id.clone(),
+                client: attachment.client,
+                baseline: attachment.baseline,
+                subscription,
+                terminal_failure,
             };
-            if !follow.is_some_and(|follow| follows.send(follow).is_ok()) {
+            if follows.send(follow).is_err() {
                 let _ = self.terminalize_surface_reservation(
                     operation_id,
                     surface::ReservationFinalizerReason::AdmissionRejected {
@@ -4164,6 +4189,13 @@ impl ThreadActor {
                 );
                 return Err(UNAVAILABLE);
             }
+            self.operation_recovery.followed = Some(
+                crate::runtime_actor::operation_recovery::ActiveSurfaceFollow {
+                    operation: operation_id.clone(),
+                    failure,
+                    gapped,
+                },
+            );
         }
         let prepared = self
             .prepare_surface_admission_from(
@@ -4930,7 +4962,9 @@ impl ThreadActor {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let answered_by_the_surface = runtime_started.is_none();
+        let answered_by_the_surface = runtime_started
+            .as_ref()
+            .is_none_or(|started| started.surface_observers.is_some());
         let mut hosted_request =
             if matches!(operation.intent.origin, surface::OperationOrigin::Headless) {
                 HostedTurnRequest::headless_session(provider_input)
@@ -4971,9 +5005,6 @@ impl ThreadActor {
                             fence: interaction_fence.clone(),
                         },
                     ));
-                // Whoever shows the thread answers what a turn the thread
-                // started on its own asks: no surface client admitted it, so
-                // none is there to answer.
                 if answered_by_the_surface {
                     handlers
                         .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
@@ -5653,6 +5684,14 @@ impl ThreadActor {
 
     pub(super) fn cache_surface_terminal(&mut self, value: surface::OperationTerminalAtCursor) {
         let operation_id = value.operation_id.clone();
+        if self
+            .operation_recovery
+            .followed
+            .as_ref()
+            .is_some_and(|follow| follow.operation == operation_id)
+        {
+            self.operation_recovery.followed = None;
+        }
         self.clear_ephemeral_reservation_expiry(&operation_id);
         self.operation_recovery
             .live_input_capsules
@@ -5730,6 +5769,15 @@ impl ThreadActor {
     pub(super) fn cache_surface_terminal_failure(&mut self, pending: PendingSurfaceTerminalCommit) {
         let operation_id = pending.value.operation_id.clone();
         let failure = pending.failure.clone();
+        if self
+            .operation_recovery
+            .followed
+            .as_ref()
+            .is_some_and(|follow| follow.operation == operation_id)
+            && let Some(follow) = self.operation_recovery.followed.take()
+        {
+            let _ = follow.failure.send(failure.clone());
+        }
         self.operation_recovery.terminal_blocked =
             Some("typed surface terminal commit failed and requires cold recovery".to_string());
         self.resident_surface

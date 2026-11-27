@@ -529,23 +529,44 @@ fn observe_prompt_queue(
     let (send, follows) = std::sync::mpsc::channel();
     let relay = event_tx.clone();
     let control = control.clone();
-    let surface = thread.surface();
+    let owner = thread.clone();
     match std::thread::Builder::new()
         .name("orca-tui-queue-presentation".into())
         .spawn(move || {
-            for follow in follows {
-                if let Err(error) = crate::surface_client::follow_queue_operation(
-                    follow, &surface, &control, &relay,
-                ) {
-                    let _ = relay.send(TuiEvent::Error(error.to_string()));
-                }
-            }
+            let errors = relay.clone();
+            dispatch_queue_follows(
+                follows,
+                move |follow| {
+                    if let Err(error) = crate::surface_client::follow_queue_operation(
+                        follow, &owner, &control, &relay,
+                    ) {
+                        let _ = relay.send(TuiEvent::Error(error.to_string()));
+                    }
+                },
+                &errors,
+            );
         }) {
         Ok(_) => thread.set_prompt_queue_surface_observer(raw, send),
         Err(error) => {
             let _ = event_tx.send(TuiEvent::Error(format!(
                 "cannot follow queued operations: {error}"
             )));
+        }
+    }
+}
+
+pub(crate) fn dispatch_queue_follows(
+    follows: std::sync::mpsc::Receiver<orca_runtime::runtime_host::QueueSurfaceFollow>,
+    run: impl Fn(orca_runtime::runtime_host::QueueSurfaceFollow) + Clone + Send + 'static,
+    errors: &mpsc::Sender<TuiEvent>,
+) {
+    for follow in follows {
+        let run = run.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("orca-tui-follow-operation".into())
+            .spawn(move || run(follow))
+        {
+            let _ = errors.send(TuiEvent::Error(error.to_string()));
         }
     }
 }

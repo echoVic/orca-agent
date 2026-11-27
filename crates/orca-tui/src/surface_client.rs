@@ -381,6 +381,15 @@ pub(crate) fn update_settings(
 }
 
 pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<SurfaceSnapshot> {
+    with_snapshot_attachment(thread, |attachment| {
+        Ok((*attachment.baseline.snapshot).clone())
+    })
+}
+
+fn with_snapshot_attachment<T>(
+    thread: &RuntimeSurfaceThreadHandle,
+    read: impl FnOnce(&orca_runtime::surface::FreshSurfaceAttachment) -> io::Result<T>,
+) -> io::Result<T> {
     let surface = thread.surface();
     let attachment = match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
@@ -410,9 +419,9 @@ pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<S
             ));
         }
     };
-    let snapshot = (*attachment.baseline.snapshot).clone();
+    let result = read(&attachment);
     detach(&surface, &attachment.client);
-    Ok(snapshot)
+    result
 }
 
 /// Read a child transcript through the runtime-owned typed surface.
@@ -2661,19 +2670,7 @@ fn drain_operation_with_boundary(
                                 if &record.operation_id == operation_id
                         )
                     });
-                    for envelope in batch.events.as_slice() {
-                        if let SurfaceEvent::Interaction(
-                            orca_runtime::surface::InteractionPatch::Requested { interaction },
-                        ) = &envelope.event
-                        {
-                            if let Some(event) =
-                                controller.register_surface_interaction(interaction)
-                            {
-                                let _ = event_tx
-                                    .send(event.at_surface_cursor(routed, &batch.cursor_after));
-                            }
-                        }
-                    }
+                    send_operation_requests(&batch, operation_id, controller, event_tx, routed);
                     match projection.project_typed_batch(&batch) {
                         Ok(events) => {
                             for event in events {
@@ -2684,8 +2681,11 @@ fn drain_operation_with_boundary(
                                 {
                                     projected_compacted_event = Some(event);
                                 } else {
-                                    let _ = event_tx
-                                        .send(event.at_surface_cursor(routed, &batch.cursor_after));
+                                    let _ = event_tx.send(event.at_operation_cursor(
+                                        routed,
+                                        &batch.cursor_after,
+                                        operation_id,
+                                    ));
                                 }
                             }
                         }
@@ -2771,10 +2771,18 @@ fn drain_operation_with_boundary(
             let _ = event_tx.send(compacted);
         }
         if let Some(terminal_event) = projected_terminal_event {
-            let _ = event_tx.send(terminal_event.at_surface_cursor(routed, &terminal.cursor));
+            let _ = event_tx.send(terminal_event.at_operation_cursor(
+                routed,
+                &terminal.cursor,
+                operation_id,
+            ));
         } else {
             for event in operation_terminal_events(&terminal.terminal) {
-                let _ = event_tx.send(event.at_surface_cursor(routed, &terminal.cursor));
+                let _ = event_tx.send(event.at_operation_cursor(
+                    routed,
+                    &terminal.cursor,
+                    operation_id,
+                ));
             }
         }
         waiter_guard.join();
@@ -2798,36 +2806,122 @@ fn drain_operation_with_boundary(
     })
 }
 
+fn send_operation_requests(
+    batch: &orca_runtime::surface::SurfaceCommitBatch,
+    operation: &SurfaceOperationId,
+    controller: &TuiSurfaceTaskControl,
+    sender: &mpsc::Sender<TuiEvent>,
+    routed: bool,
+) {
+    for envelope in batch.events.as_slice() {
+        if let SurfaceEvent::Interaction(orca_runtime::surface::InteractionPatch::Requested {
+            interaction,
+        }) = &envelope.event
+            && &interaction.fence.operation_id == operation
+            && let Some(event) = controller.register_surface_interaction(interaction)
+        {
+            let _ = sender.send(event.at_operation_cursor(routed, &batch.cursor_after, operation));
+        }
+    }
+}
+
 pub(crate) fn follow_queue_operation(
     mut follow: orca_runtime::runtime_host::QueueSurfaceFollow,
-    surface: &RuntimeSurfaceHandle,
+    owner: &orca_runtime::runtime_host::RuntimeThreadHandle,
     controller: &TuiSurfaceTaskControl,
     sender: &mpsc::Sender<TuiEvent>,
 ) -> io::Result<()> {
+    struct Binding<'control>(&'control TuiSurfaceTaskControl, SurfaceOperationId);
+    impl Drop for Binding<'_> {
+        fn drop(&mut self) {
+            self.0.unbind_followed_surface(&self.1);
+        }
+    }
+    controller.bind_followed_surface(follow.client.clone(), follow.operation.clone());
+    let _binding = Binding(controller, follow.operation.clone());
     let mut projection = TuiSurfaceProjection::from_surface_snapshot(&follow.baseline.snapshot);
     projection.focus_operation(follow.operation.clone());
     let routed = controller.view().is_some();
     while !controller.is_shutdown() {
         let Some(item) = follow.subscription.recv_timeout(Duration::from_millis(25)) else {
+            if let Ok(failure) = follow.terminal_failure.try_recv() {
+                let message = terminal_wait_failure_message(&failure);
+                controller.note_follow_recovery(follow.operation.clone(), message);
+                let _ = sender.send(
+                    TuiEvent::TerminalRecoveryNeeded(message.into()).at_operation_cursor(
+                        routed,
+                        projection.cursor(),
+                        &follow.operation,
+                    ),
+                );
+                break;
+            }
             continue;
         };
         let batch = match item {
             SurfaceSubscriptionItem::Batch { batch } => batch,
             SurfaceSubscriptionItem::Gap { required } => {
-                return Err(io::Error::other(format!(
-                    "queued operation subscription gap: {:?}",
+                let _ = sender.send(TuiEvent::Error(format!(
+                    "typed TUI subscription gap requires {:?}",
                     required.reason
                 )));
+                owner
+                    .interrupt_followed_operation(follow.operation.clone())
+                    .map_err(io::Error::other)?;
+                let thread = owner.typed_surface();
+                let receipt = with_snapshot_attachment(&thread, |attachment| {
+                    attachment
+                        .client
+                        .wait_operation_terminal(SurfaceRequestId::new(), follow.operation.clone())
+                        .map_err(|error| {
+                            io::Error::other(format!("queued terminal read: {error:?}"))
+                        })
+                })?;
+                let terminal = match receipt {
+                    WaitOperationTerminalResult::Terminal { value } => value,
+                    failure @ (WaitOperationTerminalResult::TerminalCommitFailure { .. }
+                    | WaitOperationTerminalResult::TerminalProjectionFailure {
+                        ..
+                    }) => {
+                        let message = terminal_wait_failure_message(&failure);
+                        controller.note_follow_recovery(follow.operation.clone(), message);
+                        let _ =
+                            sender.send(
+                                TuiEvent::TerminalRecoveryNeeded(message.into())
+                                    .at_operation_cursor(routed, &required.head, &follow.operation),
+                            );
+                        break;
+                    }
+                    other => return Err(io::Error::other(terminal_wait_failure_message(&other))),
+                };
+                let snapshot = read_snapshot(&thread)?;
+                projection = TuiSurfaceProjection::from_surface_snapshot(&snapshot);
+                projection.focus_operation(follow.operation.clone());
+                let watermark = controller.surface_delivery_watermark(&follow.operation);
+                let mut events = projection
+                    .hydrate_after_delivery_watermark(&follow.operation, &watermark)
+                    .map_err(|error| io::Error::other(format!("queued hydration: {error:?}")))?;
+                events.extend(operation_terminal_events(&terminal.terminal));
+                for event in events {
+                    let _ = sender.send(event.at_operation_cursor(
+                        routed,
+                        &terminal.cursor,
+                        &follow.operation,
+                    ));
+                }
+                controller.remember_surface_delivery_watermark(
+                    follow.operation.clone(),
+                    projection.delivery_watermark(&follow.operation),
+                );
+                controller.remember_surface_terminal_delivery(follow.operation);
+                break;
             }
             SurfaceSubscriptionItem::Sealed { .. } => break,
         };
         let events = projection.project_typed_batch(&batch).map_err(|error| {
             io::Error::other(format!("queued operation projection failed: {error:?}"))
         })?;
-        if projection.operation_is_runtime_backgrounded(&follow.operation) {
-            spawn_background_presentation(surface, follow.operation, controller, sender.clone())?;
-            break;
-        }
+        send_operation_requests(&batch, &follow.operation, controller, sender, routed);
         let start = batch
             .events
             .as_slice()
@@ -2849,7 +2943,7 @@ pub(crate) fn follow_queue_operation(
                 _ => event,
             };
             if sender
-                .send(event.at_surface_cursor(routed, &batch.cursor_after))
+                .send(event.at_operation_cursor(routed, &batch.cursor_after, &follow.operation))
                 .is_err()
             {
                 return Ok(());
@@ -2861,6 +2955,15 @@ pub(crate) fn follow_queue_operation(
         );
         if terminal {
             controller.remember_surface_terminal_delivery(follow.operation);
+            break;
+        }
+        if projection.operation_is_runtime_backgrounded(&follow.operation) {
+            spawn_background_presentation(
+                &owner.surface(),
+                follow.operation,
+                controller,
+                sender.clone(),
+            )?;
             break;
         }
     }
@@ -3112,7 +3215,7 @@ fn background_presentation_stopped(
     cancellation.is_cancelled() || controller.is_shutdown()
 }
 
-fn snapshot_operation_is_terminal(
+pub(crate) fn snapshot_operation_is_terminal(
     snapshot: &SurfaceSnapshot,
     operation_id: &SurfaceOperationId,
 ) -> bool {
@@ -3121,7 +3224,14 @@ fn snapshot_operation_is_terminal(
         .iter()
         .chain(snapshot.queued_operations.iter())
         .chain(snapshot.operation_history.iter())
-        .any(|operation| &operation.operation_id == operation_id && operation.terminal.is_some())
+        .any(|operation| {
+            &operation.operation_id == operation_id
+                && (operation.terminal.is_some()
+                    || matches!(
+                        operation.phase,
+                        orca_runtime::surface::OperationPhase::Terminal
+                    ))
+        })
 }
 
 fn terminal_wait_failure_message(result: &WaitOperationTerminalResult) -> &'static str {

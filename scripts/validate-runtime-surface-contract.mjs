@@ -1244,6 +1244,8 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
 const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
+  // The TUI's local map of followed operations, not a runtime mutation.
+  ["crates/orca-tui/src/operation_controller.rs:bind_followed_surface:self.lock_hosted().followed_surfaces.insert", 1],
   [
     "crates/orca-tui/src/background_approval_actions.rs:continue_allowed_background_approvals:state.continued_background_approvals.insert",
     1,

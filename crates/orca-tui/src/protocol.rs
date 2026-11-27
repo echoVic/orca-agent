@@ -233,13 +233,76 @@ pub struct AcpMetricsSnapshot {
 }
 
 impl TuiEvent {
+    #[cfg(test)]
+    pub(crate) fn into_test_payload(self) -> Self {
+        match self {
+            Self::Attached(attached) => attached.event.into_test_payload(),
+            Self::SurfaceDelivery(delivery) => delivery.1,
+            event => event,
+        }
+    }
+
+    pub(crate) fn accepts_lifecycle(
+        &self,
+        previous: Option<&(
+            orca_runtime::surface::SurfaceOperationId,
+            orca_runtime::surface::SurfaceCursor,
+        )>,
+        owner: &orca_runtime::surface::SurfaceOperationId,
+        cursor: &orca_runtime::surface::SurfaceCursor,
+        waiting: bool,
+    ) -> bool {
+        let Some((current, previous)) = previous.filter(|(_, previous)| {
+            previous.thread_id == cursor.thread_id && previous.incarnation == cursor.incarnation
+        }) else {
+            return true;
+        };
+        if previous.next_seq > cursor.next_seq {
+            return false;
+        }
+        match self {
+            Self::SessionCompleted { .. } | Self::TerminalRecoveryNeeded(_) => current == owner,
+            Self::TurnStarted { .. } | Self::RuntimeTurnStarted { .. } if current == owner => {
+                !waiting
+            }
+            _ => true,
+        }
+    }
+
+    pub(crate) fn at_operation_cursor(
+        self,
+        routed: bool,
+        cursor: &orca_runtime::surface::SurfaceCursor,
+        operation: &orca_runtime::surface::SurfaceOperationId,
+    ) -> Self {
+        if routed && self.owns_operation_status() {
+            Self::SurfaceDelivery(Box::new((cursor.clone(), self, Some(operation.clone()))))
+        } else {
+            self.at_surface_cursor(routed, cursor)
+        }
+    }
+
+    fn owns_operation_status(&self) -> bool {
+        matches!(
+            self,
+            Self::TurnStarted { .. }
+                | Self::RuntimeTurnStarted { .. }
+                | Self::SessionCompleted { .. }
+                | Self::ApprovalNeeded { .. }
+                | Self::PermissionApprovalNeeded { .. }
+                | Self::McpElicitationRequested { .. }
+                | Self::UserInputRequested { .. }
+                | Self::TerminalRecoveryNeeded(_)
+        )
+    }
+
     pub(crate) fn at_surface_cursor(
         self,
         routed: bool,
         cursor: &orca_runtime::surface::SurfaceCursor,
     ) -> Self {
         if routed {
-            Self::SurfaceDelivery(Box::new((cursor.clone(), self)))
+            Self::SurfaceDelivery(Box::new((cursor.clone(), self, None)))
         } else {
             self
         }
@@ -256,7 +319,14 @@ pub enum TuiEvent {
     #[doc(hidden)]
     Attached(Box<AttachedTuiEvent>),
     #[doc(hidden)]
-    SurfaceDelivery(Box<(orca_runtime::surface::SurfaceCursor, TuiEvent)>),
+    SurfaceDelivery(
+        Box<(
+            orca_runtime::surface::SurfaceCursor,
+            TuiEvent,
+            Option<orca_runtime::surface::SurfaceOperationId>,
+        )>,
+    ),
+    TerminalRecoveryNeeded(String),
     #[doc(hidden)]
     SessionAttachmentActivated,
     SideConversationChanged {
