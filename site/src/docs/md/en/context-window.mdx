@@ -37,6 +37,16 @@ For a task that needs a precise earlier fact, include the file path, test name,
 or session boundary in the next prompt rather than relying on an implicit
 context guess.
 
+## Context after compaction
+
+DeepSeek requests get a new context message when a fragment changes or no
+longer applies. When Orca adopts a compaction, it sends the current fragments
+once after the summary on the next request. The plan still appears at the
+end of each request so the model sees its latest state.
+
+A resumed session keeps its recorded leading prompt until compaction folds
+in the current instructions. See [Prefix Cache](#prefix-cache).
+
 ## Large tool results
 
 In a recorded session, Orca saves a completed MCP, external tool, `web_fetch`,

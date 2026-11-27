@@ -19,6 +19,18 @@ Custom-agent definitions are fixed at the session's first turn. Later edits in
 `.orca/agents/` or the user agent directory do not change the catalog or
 instructions used by that session; start a new session to use the edit.
 
+## Context across requests and restarts
+
+Orca records a context update when its text changes. The date, working mode,
+goal, skills, recalled memory, and on-demand MCP catalog can then be reused as
+part of the history on later DeepSeek requests. The current plan stays at the
+end of each request.
+
+Resuming or forking a recorded session reuses its original system prompt.
+Orca appends a notice for each section that changed or was removed. A session
+recorded without prompt sections still rebuilds its prompt on resume.
+Compaction can fold the updated sections into a new leading prompt.
+
 ## Observe provider-reported usage
 
 When the provider returns cache-token usage, Orca includes it in
