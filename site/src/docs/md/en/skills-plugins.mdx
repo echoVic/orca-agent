@@ -12,9 +12,10 @@ For duplicate IDs, the first matching location wins. Orca uses the nearest
 ancestor containing `.git` as the project root, or the workspace root outside
 Git. Trust that directory to enable its project skills.
 
-At the start of each turn, Orca gives the model a catalog of skill IDs and
-descriptions so it can call `read_skill` when a task matches. The catalog is
-limited to 4,096 tokens. `list_skills` shows the full list.
+Orca gives the model a catalog of skill IDs and descriptions so it can call
+`read_skill` when a task matches. The catalog becomes part of the conversation
+and updates when it changes. It is limited to 4,096 tokens. `list_skills`
+shows the full list.
 
 ## Minimal skill
 

@@ -24,7 +24,7 @@ DeepSeek 的联网搜索、网页抓取和 OCR 在 token 之外单独计费（�
 
 估算是一个总数，这部分费用也会单独列出。一旦产生了费用，`/cost` 和 `/status` 会显示工具服务费，以及对应计费的搜索次数、抓取次数和 OCR 页数；每个 `usage.updated` 事件带有 `service_cost_usd`（`estimated_cost_usd` 中属于服务费的部分）和 `service_usage`（计费的 `deepseek_searches`、`deepseek_fetches`、`deepseek_ocr_pages`）。
 
-Orca 自带的价格上次核对日期是 2026-11-16。进程中的第一个会话会检查缓存是否缺失或已满 24 小时，满足条件就在后台从 models.dev 刷新。刷新不阻塞启动，失败时继续使用已有价格。开发构建默认不刷新，除非把 `ORCA_PRICING_URL` 设为 URL。`ORCA_PRICING_URL=off` 可在任何构建中关闭刷新，不区分大小写并忽略首尾空白。运行 `orca doctor`，可以在 `pricing` 行查看价格来源、刷新开关和当前 DeepSeek 高峰或空闲时段。不想联网刷新价格，或者想自己给模型定价，在用户配置里添加：
+Orca 自带的价格上次核对日期是 2026-11-28。进程中的第一个会话会检查缓存是否缺失或已满 24 小时，满足条件就在后台从 models.dev 刷新。刷新不阻塞启动，失败时继续使用已有价格。开发构建默认不刷新，除非把 `ORCA_PRICING_URL` 设为 URL。`ORCA_PRICING_URL=off` 可在任何构建中关闭刷新，不区分大小写并忽略首尾空白。运行 `orca doctor`，可以在 `pricing` 行查看价格来源、刷新开关和当前 DeepSeek 高峰或空闲时段。不想联网刷新价格，或者想自己给模型定价，在用户配置里添加：
 
 ~~~toml
 [pricing]

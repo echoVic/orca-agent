@@ -21,8 +21,9 @@ When the model requests consecutive reads such as `web_search`, `web_fetch`,
 and `read_document`, Orca can run them alongside local read tools in a batch
 of up to `tools.max_read_parallel` calls. Every call in the batch must already
 be allowed by the active approval policy. If any call needs approval, Orca
-processes that batch one call at a time. Results are recorded in the model's
-request order.
+processes that batch one call at a time. Network reads also run one at a time
+under a cost cap, such as `--max-cost-usd`. Reads of the same document run
+sequentially. Orca records results in the model's request order.
 
 ## Select a mode
 

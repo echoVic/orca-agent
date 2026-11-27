@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.25";
+export const releaseVersion = "v0.5.26";
 
 export const releases = [
+  {
+    version: "v0.5.26",
+    date: "2026-11-28",
+    title: "Reuse conversation context and keep full tool results",
+    body: "Deep compaction writes a structured checkpoint from the cached conversation. Resumed sessions keep their recorded prompt, and a fork child can start from the parent's completed history. Large tool results remain readable after compaction. Orca discovers nested AGENTS.md files, shows the model a skills catalog, and supports on-demand MCP tools and opt-in multi-file patches. You can steer a parent waiting for children, and concurrent workflow task-list updates are preserved.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.26",
+  },
   {
     version: "v0.5.25",
     date: "2026-11-27",

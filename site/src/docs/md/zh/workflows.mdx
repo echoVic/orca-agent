@@ -38,6 +38,11 @@ Workflow 子任务与直接子代理共用 `task_list`、`task_wait`、
 `task_read_output`、`task_send_input` 和 `task_stop`。旧的
 `subagent_status` 以及模型可见的 sync/async 模式不再属于当前协议。
 
+## 任务清单
+
+任务清单会保留每次并发更新。只有认领者能完成正在运行的任务。子代理从检查点重试时，
+会保留自己认领的任务，最终退出时会释放。任务清单请求超过 1 MiB 时，工作流脚本可以捕获抛出的错误。
+
 ## 观察与恢复
 
 ~~~bash
