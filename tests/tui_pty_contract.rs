@@ -1646,6 +1646,46 @@ fn tui_side_close_restores_running_main_and_stream_once() {
         "Ctrl+/ back",
         "side visible while main runs",
     );
+    let inherited = "Inherited conversation context.";
+    let side = wait_for_screen(
+        &process,
+        &mut output,
+        |screen| screen.contains(inherited) && screen.contains("Ctrl+/ back"),
+        "side inherited history",
+    );
+    assert_eq!(side.matches(inherited).count(), 1);
+    let assert_main = |frame: &str| {
+        assert!(!frame.contains(inherited), "{frame}");
+        let (_, after_prompt) = frame
+            .rsplit_once("mock_stream_tool_release_marker")
+            .expect("queued prompt visible");
+        let (before_reply, _) = after_prompt.split_once(prefix).expect("reply after prompt");
+        let (_, between) = before_reply.rsplit_once('}').expect("end of queued input");
+        assert!(
+            between.chars().all(|ch| ch.is_whitespace() || ch == '●'),
+            "{frame}"
+        );
+        assert_eq!(frame.matches(prefix).count(), 1, "{frame}");
+    };
+    process.write(b"\x1b[47;5u").unwrap();
+    let returned = wait_for_screen(
+        &process,
+        &mut output,
+        |screen| {
+            screen.contains("Side · Ctrl+/")
+                && screen.contains(prefix)
+                && screen.contains("Esc interrupt")
+        },
+        "toggle back to streaming main",
+    );
+    assert_main(&returned);
+    process.write(b"\x1b[47;5u").unwrap();
+    wait_for_screen(
+        &process,
+        &mut output,
+        |screen| screen.contains("Ctrl+/ back") && screen.contains(inherited),
+        "side restored before closing",
+    );
     process.write(&[0x03]).unwrap();
     let frame = wait_for_screen(
         &process,
@@ -1657,7 +1697,7 @@ fn tui_side_close_restores_running_main_and_stream_once() {
         },
         "side close did not restore running main",
     );
-    assert_eq!(frame.matches(prefix).count(), 1, "{frame}");
+    assert_main(&frame);
     std::fs::write(second, "").unwrap();
     assert_screen_has_text(
         &process,

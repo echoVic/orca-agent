@@ -256,56 +256,38 @@ pub(crate) fn handle_hosted_side_action(
                 let side_active = thread
                     .as_ref()
                     .is_some_and(|current| current.thread_id() == side.side_thread.thread_id());
-                let (target_thread, target_event_tx, target_attachment, target_batch) =
-                    if side_active {
-                        let batch = match read_hosted_projection_batch(
-                            &side.thread,
-                            HistoryTarget::Conversation,
-                        ) {
-                            Ok(batch) => batch,
-                            Err(error) => {
-                                let _ = event_tx.send(TuiEvent::OperationRejected(format!(
-                                    "failed to switch to the main conversation: {error}"
-                                )));
-                                return;
+                let target_thread = if side_active {
+                    &side.thread
+                } else {
+                    &side.side_thread
+                };
+                if side_active {
+                    attachment_routing
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .defer_parent(side.attachment);
+                }
+                let snapshot =
+                    match TuiSurfaceActions::new(target_thread.typed_surface()).read_snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            if side_active {
+                                AttachmentRouting::cancel_deferred_parent_events(
+                                    attachment_routing,
+                                    root_event_tx,
+                                );
                             }
-                        };
-                        (
-                            side.thread.clone(),
-                            side.event_tx.clone(),
-                            side.attachment,
-                            batch,
-                        )
-                    } else {
-                        let batch = match read_hosted_projection_batch(
-                            &side.side_thread,
-                            HistoryTarget::Side,
-                        ) {
-                            Ok(batch) => batch,
-                            Err(error) => {
-                                let _ = event_tx.send(TuiEvent::OperationRejected(format!(
-                                    "failed to switch to the side conversation: {error}"
-                                )));
-                                return;
-                            }
-                        };
-                        let side_event_tx = rotate_side_event_sender(
-                            root_event_tx,
-                            &mut side.side_attachment,
-                            attachment_routing,
-                        );
-                        side.side_event_tx = side_event_tx.clone();
-                        (
-                            side.side_thread.clone(),
-                            side_event_tx,
-                            side.side_attachment,
-                            batch,
-                        )
+                            let target = if side_active { "main" } else { "side" };
+                            let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                "failed to switch to the {target} conversation: {error}"
+                            )));
+                            return;
+                        }
                     };
                 *thread = Some(target_thread.clone());
-                *event_tx = target_event_tx;
-                *session_attachment = target_attachment;
                 if side_active {
+                    *event_tx = side.event_tx.clone();
+                    *session_attachment = side.attachment;
                     AttachmentRouting::switch_attachment_deferred(
                         attachment_routing,
                         root_event_tx,
@@ -313,6 +295,13 @@ pub(crate) fn handle_hosted_side_action(
                         Some(side.attachment),
                     );
                 } else {
+                    side.side_event_tx = rotate_side_event_sender(
+                        root_event_tx,
+                        &mut side.side_attachment,
+                        attachment_routing,
+                    );
+                    *event_tx = side.side_event_tx.clone();
+                    *session_attachment = side.side_attachment;
                     AttachmentRouting::switch_attachment(
                         attachment_routing,
                         root_event_tx,
@@ -321,13 +310,36 @@ pub(crate) fn handle_hosted_side_action(
                         false,
                     );
                 }
-                if let Err(error) = project_hosted_thread_attached(
-                    target_batch.0,
-                    target_batch.1,
-                    Some("Inherited conversation context."),
-                    *session_attachment,
-                    root_event_tx,
-                ) {
+                let projected = if side_active && snapshot.foreground_operation.is_some() {
+                    crate::hosted_child::project_returned_main(
+                        target_thread,
+                        &snapshot,
+                        *session_attachment,
+                        root_event_tx,
+                        control,
+                        attachment_routing,
+                    )
+                } else {
+                    let (target, label) = if side_active {
+                        (HistoryTarget::Conversation, None)
+                    } else {
+                        (HistoryTarget::Side, Some("Inherited conversation context."))
+                    };
+                    let (projection, conversation) =
+                        crate::hosted_session::hosted_projection_batch_from_snapshot(
+                            target_thread,
+                            &snapshot,
+                            target,
+                        );
+                    project_hosted_thread_attached(
+                        projection,
+                        conversation,
+                        label,
+                        *session_attachment,
+                        root_event_tx,
+                    )
+                };
+                if let Err(error) = projected {
                     let _ = event_tx.send(TuiEvent::Error(format!(
                         "failed to project switched conversation: {error}"
                     )));
@@ -432,14 +444,13 @@ pub(crate) fn handle_hosted_side_action(
                         *session_attachment,
                         Some(side.attachment),
                     );
-                    if let Err(error) = crate::hosted_child::project_returned_main_with_label(
+                    if let Err(error) = crate::hosted_child::project_returned_main(
                         &side.thread,
                         &parent_snapshot.expect("parent snapshot"),
                         *session_attachment,
                         root_event_tx,
                         control,
                         attachment_routing,
-                        Some("Inherited conversation context."),
                     ) {
                         let _ = event_tx.send(TuiEvent::Error(format!(
                             "failed to project main conversation: {error}"
