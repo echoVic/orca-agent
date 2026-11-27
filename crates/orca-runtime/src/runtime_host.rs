@@ -2081,6 +2081,16 @@ struct RuntimeSurfaceSubagentActivityIngress {
     seen: Arc<std::sync::Mutex<VecDeque<(surface::SurfaceCommitId, surface::Sha256Digest)>>>,
 }
 
+#[cfg(test)]
+type HeldAgentEnd = (mpsc::SyncSender<()>, mpsc::Receiver<()>);
+
+#[cfg(test)]
+fn held_agent_ends_before_ingress() -> &'static std::sync::Mutex<HashMap<String, HeldAgentEnd>> {
+    static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, HeldAgentEnd>>> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(Default::default)
+}
+
 impl surface::RuntimeSubagentActivityIngress for RuntimeSurfaceSubagentActivityIngress {
     fn owner(&self) -> SubagentActivityOwner {
         SubagentActivityOwner::Generation {
@@ -2093,6 +2103,20 @@ impl surface::RuntimeSubagentActivityIngress for RuntimeSurfaceSubagentActivityI
     }
 
     fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
+        #[cfg(test)]
+        if matches!(
+            event.payload,
+            crate::child_agent_types::SubagentActivityPayload::Completed { .. }
+        ) {
+            let gate = held_agent_ends_before_ingress()
+                .lock()
+                .unwrap()
+                .remove(event.task_id.as_str());
+            if let Some((reached, release)) = gate {
+                let _ = reached.send(());
+                let _ = release.recv_timeout(Duration::from_secs(10));
+            }
+        }
         if !event.verify_digest() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -4624,8 +4648,8 @@ impl RuntimeHostHandle {
 
     /// Asks every running subagent kept on a thread of this process to stop,
     /// as an interrupted turn stops the children it started, and waits up to
-    /// `wait` for their tasks to settle. Returns how many were still running
-    /// when it gave up: those end with the process. Only subagents on this
+    /// `wait` for their ends to be reported. Returns how many were still
+    /// pending when it gave up. Only subagents on this
     /// host's agent threads are asked, never a detached worker, a workflow or
     /// a command; a host that was not asked to keep its subagents, or that
     /// cannot say in time which threads it runs, asks none.
@@ -4660,17 +4684,18 @@ impl RuntimeHostHandle {
                 .filter(|task| task.subagent_child_thread_id.as_deref() == Some(thread_id))
                 .map(|task| task.id);
             for task_id in std::iter::once(agent.task_id.clone()).chain(bound) {
-                let kept_and_running = registry.get(&task_id).is_some_and(|task| {
+                let Some(task) = registry.get(&task_id).filter(|task| {
                     task.task_type == orca_core::task_types::TaskType::Subagent
-                        && task.status.is_active()
                         && task.worker_pid.is_none()
-                });
+                }) else {
+                    continue;
+                };
                 // The registry's stop for a child in this process marks the
                 // task and cancels its turn without waiting for it.
-                if kept_and_running
-                    && asked.insert(task_id.clone())
-                    && registry.request_stop(&task_id).is_ok()
-                {
+                if asked.insert(task_id.clone()) && registry.local_subagent_end_pending(&task_id) {
+                    if task.status.is_active() {
+                        let _ = registry.request_stop(&task_id);
+                    }
                     stopping.push((registry.clone(), task_id));
                 }
             }
@@ -4678,11 +4703,7 @@ impl RuntimeHostHandle {
         loop {
             let running = stopping
                 .iter()
-                .filter(|(registry, task_id)| {
-                    registry
-                        .get(task_id)
-                        .is_some_and(|task| task.status.is_active())
-                })
+                .filter(|(registry, task_id)| registry.local_subagent_end_pending(task_id))
                 .count();
             let now = Instant::now();
             if running == 0 || now >= deadline {
@@ -35624,6 +35645,63 @@ mod tests {
     #[test]
     fn a_live_kept_agent_of_an_ended_generation_is_left_alone() {
         interrupted_agent_with_held_end(false, false);
+    }
+
+    #[test]
+    fn fix4_quitting_waits_for_the_stopped_agents_commit_before_sealing_main() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().unwrap();
+        let marker = ReleaseMarker(cwd.path().join("finish-cancelled-agent"));
+        let prompt = format!(
+            "mock_stream_usage_after_cancel_marker {}",
+            marker.0.display()
+        );
+        let (thread, attachment, parent, _cleanup) =
+            start_keeping_parent_turn(&host, cwd.path(), &format!("subagent async {prompt}"));
+        let surface = thread.surface();
+        let read = || fresh_surface_attachment(&surface).baseline.snapshot;
+        let agent = kept_agents_under_way(read, &[&prompt]).remove(0);
+        let path = crate::history::SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap()
+            .path;
+        let baseline = attachment.baseline.cursor.clone();
+        let (reached, held) = mpsc::sync_channel(1);
+        let (release, gate) = mpsc::channel();
+        held_agent_ends_before_ingress()
+            .lock()
+            .unwrap()
+            .insert(agent.task_id.as_str().to_owned(), (reached, gate));
+        interrupt_parent_turn(&attachment, &parent);
+        marker.release();
+        held.recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("end held before ledger ingress");
+        assert!(
+            !thread
+                .task_registry()
+                .get(agent.task_id.as_str())
+                .unwrap()
+                .status
+                .is_active()
+        );
+        assert_eq!(
+            read().subagents[0].status,
+            surface::SurfaceSubagentStatus::Running
+        );
+        let handle = host.handle();
+        let outstanding = handle.stop_kept_subagents(Duration::from_millis(250));
+        if outstanding == 0 {
+            thread.shutdown().unwrap();
+        }
+        release.send(()).unwrap();
+        if outstanding != 0 {
+            assert_eq!(handle.stop_kept_subagents(Duration::from_secs(5)), 0);
+            thread.shutdown().unwrap();
+        }
+        host.shutdown().unwrap();
+        let ledger = surface::JsonlSurfaceCommitLedger::new(path, baseline);
+        assert!(ledger.recover_batches().unwrap().committed.iter().any(|batch| batch.events.as_slice().iter().any(|envelope| matches!(&envelope.event, surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {task_id,status: surface::SurfaceTaskStatus::Cancelled,..}) if task_id == &agent.task_id))), "saved conversation still shows Running");
+        assert_eq!(outstanding, 1);
     }
 
     #[test]
