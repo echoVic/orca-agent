@@ -2956,6 +2956,77 @@ mod tests {
     }
 
     #[test]
+    fn resuming_from_an_untrusted_subfolder_omits_project_skill_mentions() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust_with_config_dir};
+        with_skill_session(|home, config, session| {
+            let cwd = config.cwd.as_deref().unwrap();
+            std::fs::create_dir(cwd.join(".git")).unwrap();
+            let nested = cwd.join("nested");
+            std::fs::create_dir(&nested).unwrap();
+            set_trust_with_config_dir(cwd, home, TrustLevel::Trusted).unwrap();
+            set_trust_with_config_dir(&nested, home, TrustLevel::Untrusted).unwrap();
+            let skill_body = "Check the project-specific scope: {{arg}}.";
+            write_test_skill(
+                &cwd.join(".orca"),
+                "project-review",
+                "Project review",
+                skill_body,
+            );
+            ThreadTurnContext::prepare(
+                config,
+                session,
+                &ThreadTurnRequest::new("$project-review:weekly"),
+            )
+            .unwrap();
+            let has_skill = |conversation: &Conversation| {
+                conversation.messages.iter().any(|message| {
+                    message
+                        .content_str()
+                        .is_some_and(|text| text.contains("Check the project-specific scope"))
+                })
+            };
+            assert!(has_skill(session.conversation()));
+            let id = session.session_id().unwrap();
+            let transcript = crate::history::load_session(id).unwrap();
+            let boundary = session
+                .conversation_records()
+                .unwrap()
+                .last()
+                .unwrap()
+                .item_id
+                .as_ref()
+                .unwrap()
+                .to_string();
+            let mut resumed_config = config.clone();
+            resumed_config.cwd = Some(nested.clone());
+            for mode in [
+                HistoryMode::Resume(id.into()),
+                HistoryMode::ResumeAt {
+                    selector: id.into(),
+                    resume_at: boundary.clone(),
+                },
+                HistoryMode::Fork(id.into()),
+            ] {
+                resumed_config.history_mode = mode;
+                let resumed = InteractiveSession::new_with_preloaded(
+                    &resumed_config,
+                    "continue",
+                    Some(transcript.clone()),
+                )
+                .unwrap();
+                assert!(!has_skill(resumed.conversation()));
+            }
+            let one_shot = crate::session::bootstrap_agent_conversation(
+                Some(&transcript),
+                "System".into(),
+                &nested,
+                "Continue",
+            );
+            assert!(!has_skill(&one_shot));
+        });
+    }
+
+    #[test]
     fn a_skill_body_is_restored_with_the_session() {
         with_skill_session(|home, config, session| {
             write_test_skill(
@@ -3001,6 +3072,36 @@ mod tests {
                 Some("Use $orca-test-rewind")
             );
             assert_eq!(conversation.messages.len(), 1);
+        });
+    }
+
+    #[test]
+    fn saved_rewind_ordinals_count_only_submitted_prompts() {
+        with_skill_session(|home, config, session| {
+            write_test_skill(home, "review", "Review context", "Review {{arg}}.");
+            for prompt in ["$review:permissions", "Continue"] {
+                ThreadTurnContext::prepare(config, session, &ThreadTurnRequest::new(prompt))
+                    .unwrap();
+            }
+            let path = session.runtime_parts().writer.unwrap().path().to_path_buf();
+            let entries = crate::thread_store::read_effective_user_messages(&path).unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.prompt.as_str())
+                    .collect::<Vec<_>>(),
+                ["$review:permissions", "Continue"]
+            );
+            let cut =
+                crate::thread_store::read_transcript_before_message(&path, &entries[1].message_id)
+                    .unwrap();
+            assert_eq!(cut.ordinal, 1);
+            let transcript = crate::history::load_session(session.session_id().unwrap()).unwrap();
+            let mut resumed = crate::history::resume_conversation(&transcript, "System".into());
+            assert_eq!(
+                resumed.truncate_before_user_ordinal(1).as_deref(),
+                Some("Continue")
+            );
         });
     }
 

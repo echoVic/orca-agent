@@ -283,6 +283,14 @@ impl JsonlThreadStore {
 }
 
 pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String) -> Conversation {
+    resume_conversation_in_cwd(transcript, system_prompt, Path::new(&transcript.meta.cwd))
+}
+
+pub(crate) fn resume_conversation_in_cwd(
+    transcript: &SessionTranscript,
+    system_prompt: String,
+    active_cwd: &Path,
+) -> Conversation {
     let mut conversation = Conversation::new();
     conversation.add_system(system_prompt);
     let mut restored_messages = replay_compactions_for_resume(
@@ -295,9 +303,7 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
     // than restored. The truncation marker, delivered notices and mentioned
     // skills are conversation content and stay until compaction.
     .filter(|message| {
-        if let Some(replay) =
-            crate::skill_context::should_replay_mention(message, Path::new(&transcript.meta.cwd))
-        {
+        if let Some(replay) = crate::skill_context::should_replay_mention(message, active_cwd) {
             return replay;
         }
         !matches!(

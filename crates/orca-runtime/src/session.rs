@@ -165,7 +165,7 @@ pub(crate) fn bootstrap_agent_conversation(
     prompt: &str,
 ) -> Conversation {
     let mut conversation = if let Some(resumed) = resumed {
-        let mut conv = crate::thread_store::resume_conversation(resumed, system_prompt);
+        let mut conv = crate::history::resume_conversation_in_cwd(resumed, system_prompt, cwd);
         conv.strip_legacy_pinned_volatile();
         conv.strip_legacy_summary_messages();
         conv.unpin_delivered_notices();
@@ -315,7 +315,8 @@ impl InteractiveSession {
                     Some(t) => t,
                     None => store.load_session(selector)?,
                 };
-                let mut conv = store.resume_conversation(&transcript, system_prompt);
+                let mut conv =
+                    crate::history::resume_conversation_in_cwd(&transcript, system_prompt, &cwd);
                 conv.strip_legacy_pinned_volatile();
                 conv.strip_legacy_summary_messages();
                 conv.unpin_delivered_notices();
@@ -334,7 +335,8 @@ impl InteractiveSession {
                 // calls) are not replayed to the model.
                 let transcript =
                     crate::thread_store::truncate_transcript_at_boundary(&transcript, resume_at)?;
-                let mut conv = store.resume_conversation(&transcript, system_prompt);
+                let mut conv =
+                    crate::history::resume_conversation_in_cwd(&transcript, system_prompt, &cwd);
                 conv.strip_legacy_pinned_volatile();
                 conv.strip_legacy_summary_messages();
                 conv.unpin_delivered_notices();

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
-use orca_core::conversation::{Message, SummaryState, is_internal_image_analysis};
+use orca_core::conversation::{Message, SummaryState, is_rewindable_user_prompt};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventEnvelope, EventPublicationStore, EventType};
 use orca_core::plan_types::{PlanItem, PlanStatus};
@@ -776,15 +776,14 @@ fn no_saved_message(boundary_message_id: &str) -> io::Error {
 /// A persisted user message that a `/rewind` can target. Unlike
 /// `Conversation::backtrack_last_user`, pinned user messages are included:
 /// headless `orca exec --save-history` persists real prompts as pinned user
-/// turns, and those must stay rewindable. Only internal image-analysis
-/// sidecar observations are excluded (pinned *system* messages are a different
-/// variant and are naturally not candidates).
+/// turns. Internal image observations and expanded skill invocations are
+/// excluded from submission boundaries.
 fn is_rewindable_user_message(message: &StoredMessage) -> bool {
     matches!(
         message,
         StoredMessage::User {
-            content, images, ..
-        } if !images.is_empty() || !is_internal_image_analysis(content)
+            content, images, pinned
+        } if is_rewindable_user_prompt(content, images, *pinned)
     )
 }
 

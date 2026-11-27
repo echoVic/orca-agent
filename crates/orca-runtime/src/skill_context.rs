@@ -2,7 +2,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use orca_core::config::folder_trust::is_trusted;
-use orca_core::conversation::{Conversation, Message, SKILL_CONTEXT_MAX_TOKENS};
+use orca_core::conversation::{
+    Conversation, Message, SKILL_CONTEXT_MAX_TOKENS, SKILL_INVOCATION_PREFIX,
+};
 use orca_provider::context::{DefaultTokenCounter, TokenCounter, truncate_text_to_token_limit};
 use orca_tools::skills::{self, Skill, SkillSource};
 use sha2::{Digest, Sha256};
@@ -10,7 +12,6 @@ use sha2::{Digest, Sha256};
 use crate::history::SessionWriter;
 
 const SKILL_MESSAGE_PREFIX: &str = "[Mentioned skill version ";
-const SKILL_ARGUMENT_PREFIX: &str = "[Mentioned skill invocation ";
 const CATALOG_GUIDANCE: &str =
     "When a task matches one of these skills, load it with read_skill before you act.";
 
@@ -107,7 +108,7 @@ pub(crate) fn append_mentions(
             messages.push(message);
         }
         if let Some(argument) = argument.filter(|_| skill.body.contains("{{arg}}")) {
-            let header = format!("{SKILL_ARGUMENT_PREFIX}{version}]\n");
+            let header = format!("{SKILL_INVOCATION_PREFIX}{version}]\n");
             let expanded = skill.body.replace("{{arg}}", &argument);
             let budget =
                 SKILL_CONTEXT_MAX_TOKENS.saturating_sub(DefaultTokenCounter.count_text(&header));
@@ -131,7 +132,7 @@ pub(crate) fn should_replay_mention(message: &Message, cwd: &Path) -> Option<boo
             content,
             pinned: true,
             ..
-        } => content.strip_prefix(SKILL_ARGUMENT_PREFIX),
+        } => content.strip_prefix(SKILL_INVOCATION_PREFIX),
         _ => None,
     }?;
     // Older mention records lack provenance and can contain expanded arguments.

@@ -316,7 +316,25 @@ pub const MODE_CONTEXT_MAX_TOKENS: usize = 2_048;
 pub const GOAL_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const PLAN_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const SKILL_CONTEXT_MAX_TOKENS: usize = 4_096;
-const SKILL_INVOCATION_PREFIX: &str = "[Mentioned skill invocation ";
+pub const SKILL_INVOCATION_PREFIX: &str = "[Mentioned skill invocation ";
+
+/// Distinguishes submitted prompts from internal user-role messages in history.
+pub fn is_rewindable_user_prompt(content: &str, images: &[ImageInput], pinned: bool) -> bool {
+    if !images.is_empty() {
+        return true;
+    }
+    let skill_invocation = pinned
+        && content
+            .strip_prefix(SKILL_INVOCATION_PREFIX)
+            .and_then(|rest| rest.split_once("]\n"))
+            .and_then(|(header, _)| header.split_once(' '))
+            .is_some_and(|(version, root)| {
+                version.len() == 64
+                    && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && serde_json::from_str::<Option<String>>(root).is_ok()
+            });
+    !is_internal_image_analysis(content) && !skill_invocation
+}
 pub const MEMORY_CONTEXT_MAX_TOKENS: usize = 3_072;
 pub const MCP_CONTEXT_MAX_TOKENS: usize = 4_096;
 
@@ -806,9 +824,8 @@ impl Conversation {
         let mut index = None;
         for (position, message) in self.messages.iter().enumerate() {
             if matches!(message,
-                Message::User { content, images, .. }
-                    if (!images.is_empty() || !is_internal_image_analysis(content))
-                        && !content.starts_with(SKILL_INVOCATION_PREFIX))
+                Message::User { content, images, pinned }
+                    if is_rewindable_user_prompt(content, images, *pinned))
             {
                 if seen == ordinal {
                     index = Some(position);
@@ -2182,11 +2199,15 @@ mod tests {
     fn rewind_skips_generated_skill_invocations_but_keeps_pinned_prompts() {
         let mut conversation = Conversation::new();
         conversation.add_user("$review:permissions".to_string());
-        conversation.messages.push(Message::pinned_user(
-            "[Mentioned skill invocation abc /project]\nexpanded skill".to_string(),
-        ));
-        conversation.add_user("Continue".to_string());
+        conversation.messages.push(Message::pinned_user(format!(
+            "{SKILL_INVOCATION_PREFIX}{} null]\nexpanded skill",
+            "a".repeat(64),
+        )));
+        conversation.add_user_pinned("Continue".to_string());
 
-        assert_eq!(conversation.truncate_before_user_ordinal(1).as_deref(), Some("Continue"));
+        assert_eq!(
+            conversation.truncate_before_user_ordinal(1).as_deref(),
+            Some("Continue")
+        );
     }
 }

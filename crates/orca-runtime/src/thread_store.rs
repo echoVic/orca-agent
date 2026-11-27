@@ -14,8 +14,6 @@ mod storage_tests;
 mod types;
 mod writer;
 
-use orca_core::conversation::Conversation;
-
 pub(crate) use assets::HydrateImages;
 pub use live_thread::LiveThread;
 #[cfg(test)]
@@ -63,13 +61,6 @@ pub(crate) use writer::{
     stored_session_health_error_details, truncate_transcript_at_boundary,
     write_prompt_queue_snapshot,
 };
-
-pub(crate) fn resume_conversation(
-    transcript: &SessionTranscript,
-    system_prompt: String,
-) -> Conversation {
-    crate::history::resume_conversation(transcript, system_prompt)
-}
 
 #[cfg(test)]
 mod tests {
