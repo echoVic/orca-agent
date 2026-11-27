@@ -1244,8 +1244,8 @@ pub(crate) fn hosted_tui_controller_loop(
     // them so their tasks are recorded as stopped, not left as running.
     // The controller's shutdown already interrupts main, including a turn
     // its thread started from the queue while a child was on screen.
-    // An attached session never runs this loop. The wait lets an agent that takes a few seconds to end report its
-    // end to the conversation before that conversation's thread ends.
+    // An attached session never runs this loop. The wait lets a stopping agent report its end
+    // to the conversation before that conversation's thread ends.
     let _ = host.stop_kept_subagents(Duration::from_secs(5));
     control.unbind_view();
     if let Some(focus) = view.close() {

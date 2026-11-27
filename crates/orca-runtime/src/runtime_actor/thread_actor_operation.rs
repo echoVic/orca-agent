@@ -9675,7 +9675,7 @@ fn subagent_already_terminal(
 /// process nor a workflow's agent, whose task is the workflow's, can match.
 /// And its turn must run on a thread of its own that the record's stop
 /// ends: a child that runs in this process without one (a sync child with a
-/// custom type, an isolation or a finite budget) also reports as the
+/// custom type or an isolation) also reports as the
 /// turn's, but watches only its parent's cancel, so it would run on. The
 /// record says so from before the child's row is shown; the row names the
 /// thread only once it has started, and a stop in between is taken. And the
