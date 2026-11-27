@@ -336,6 +336,9 @@ pub(crate) struct ChildConversationSnapshot {
     /// Bounded child-loop context fragments with stable runtime meanings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) internal_context: Vec<StoredChildInternalContextFragment>,
+    /// Context kinds added after Orca 0.5.25, kept outside its fragment enum.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) additional_context: Vec<StoredChildInternalContextFragment>,
     /// Sources for rebuilding the live nested instruction chain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) nested_instruction_sources: Vec<NestedInstructionSource>,
@@ -355,6 +358,13 @@ impl ChildConversationSnapshot {
         normalize_tool_boundaries(&mut messages);
         repair_missing_tool_terminals(&mut messages);
 
+        let (internal_context, additional_context) = conversation
+            .internal_context
+            .fragments()
+            .iter()
+            .filter_map(StoredChildInternalContextFragment::from_fragment)
+            .partition(StoredChildInternalContextFragment::is_legacy_kind);
+
         Self {
             schema_version: CHILD_CONVERSATION_SNAPSHOT_SCHEMA_VERSION,
             messages: messages
@@ -363,12 +373,8 @@ impl ChildConversationSnapshot {
                 .collect(),
             rolling_summary: conversation.rolling_summary.clone(),
             summary: StoredChildSummaryState::from(&conversation.summary),
-            internal_context: conversation
-                .internal_context
-                .fragments()
-                .iter()
-                .filter_map(StoredChildInternalContextFragment::from_fragment)
-                .collect(),
+            internal_context,
+            additional_context,
             nested_instruction_sources: conversation
                 .nested_instructions
                 .versions
@@ -434,7 +440,7 @@ impl ChildConversationSnapshot {
         conversation.messages.extend(restored_messages);
         conversation.rolling_summary = self.rolling_summary.clone();
         conversation.summary = SummaryState::from(&self.summary);
-        for stored in &self.internal_context {
+        for stored in self.internal_context.iter().chain(&self.additional_context) {
             let fragment = stored.to_fragment();
             if fragment
                 .instruction_scope
@@ -965,6 +971,10 @@ pub(crate) enum StoredChildInternalContextFragment {
 }
 
 impl StoredChildInternalContextFragment {
+    fn is_legacy_kind(&self) -> bool {
+        !matches!(self, Self::Date { .. } | Self::SkillCatalog { .. })
+    }
+
     fn from_fragment(fragment: &InternalContextFragment) -> Option<Self> {
         let content = fragment.content.clone();
         match fragment.id.as_str() {
@@ -1143,6 +1153,12 @@ impl AgentCheckpoint {
     fn legacy_conversation(&self) -> Cow<'_, ChildConversationSnapshot> {
         let conversation = &self.conversation;
         if conversation.summary.tool_output_spills.is_empty()
+            && conversation.additional_context.is_empty()
+            && conversation.nested_instruction_sources.is_empty()
+            && conversation
+                .internal_context
+                .iter()
+                .all(StoredChildInternalContextFragment::is_legacy_kind)
             && !conversation.messages.iter().any(|message| {
                 matches!(message,
                 StoredChildMessage::Tool { terminal: Some(terminal), .. }
@@ -1153,6 +1169,11 @@ impl AgentCheckpoint {
         }
         let mut legacy = conversation.clone();
         legacy.summary.tool_output_spills.clear();
+        legacy.additional_context.clear();
+        legacy.nested_instruction_sources.clear();
+        legacy
+            .internal_context
+            .retain(StoredChildInternalContextFragment::is_legacy_kind);
         for message in &mut legacy.messages {
             if let StoredChildMessage::Tool {
                 terminal: Some(terminal),
@@ -1179,20 +1200,22 @@ impl AgentCheckpoint {
 
     pub(crate) fn verify_digest(&self) -> Result<(), AgentContinuationError> {
         let legacy = self.legacy_conversation();
-        let legacy_digest = self.digest_payload(&legacy)?;
-        if legacy_digest != self.digest {
-            return Err(AgentContinuationError::DigestMismatch);
-        }
-        if let Some(expected) = self.full_digest {
-            let actual = match legacy {
+        // Checkpoints written before the dual digest sealed the entire snapshot.
+        let valid = if let Some(expected) = self.full_digest {
+            let legacy_digest = self.digest_payload(&legacy)?;
+            let full_digest = match legacy {
                 Cow::Borrowed(_) => legacy_digest,
                 Cow::Owned(_) => self.digest_payload(&self.conversation)?,
             };
-            if actual != expected {
-                return Err(AgentContinuationError::DigestMismatch);
-            }
+            legacy_digest == self.digest && full_digest == expected
+        } else {
+            self.digest_payload(&self.conversation)? == self.digest
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(AgentContinuationError::DigestMismatch)
         }
-        Ok(())
     }
 }
 
@@ -4325,6 +4348,17 @@ mod tests {
             pub(crate) next_turn: u32,
         }
 
+        #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+        #[serde(rename_all = "snake_case", tag = "kind")]
+        pub(super) enum StoredChildInternalContextFragment {
+            Runtime { content: String },
+            Mode { content: String },
+            Goal { content: String },
+            Plan { content: String },
+            Skill { content: String },
+            Memory { content: String },
+        }
+
         #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
         pub(super) struct StoredChildSummaryState {
             #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4514,6 +4548,57 @@ mod tests {
             }
         }
         assert!(rejected.is_empty(), "0.5.25 rejected {rejected:?}");
+    }
+
+    #[test]
+    fn v0_5_25_verifies_child_checkpoints_with_saved_context() {
+        let cwd = tempfile::tempdir().unwrap();
+        let scope = InstructionScope {
+            cwd: cwd.path().to_owned(),
+            sources: vec![cwd.path().join(".agents/skills/review/SKILL.md")],
+        };
+        let mut conversation = Conversation::new();
+        conversation.add_user("Review the report".into());
+        conversation.set_today(chrono::NaiveDate::from_ymd_opt(2026, 11, 27).unwrap());
+        conversation.replace_runtime_context(Some("working in a child".into()));
+        conversation.replace_skill_catalog(Some("Available skills: review".into()));
+        conversation
+            .internal_context
+            .set_instruction_scope(SKILLS_CONTEXT_FRAGMENT_ID, scope);
+        conversation.nested_instructions.versions.insert(
+            PathBuf::from("docs/AGENTS.md"),
+            NestedInstructionVersion {
+                identity: NestedInstructionSource {
+                    workspace: cwd.path().to_owned(),
+                    source: "docs/AGENTS.md".into(),
+                    digest: "fixture-digest".into(),
+                    updated: false,
+                    shortened: false,
+                },
+                content: "Review the headings".into(),
+            },
+        );
+        let mut checkpoint = checkpoint(AgentAttemptId::new(), 0, 0);
+        checkpoint.conversation = ChildConversationSnapshot::try_capture_safe(&conversation, 1)
+            .unwrap()
+            .0;
+        checkpoint.seal().unwrap();
+        let bytes = serde_json::to_vec(&checkpoint).unwrap();
+        let older: legacy_v0_5_25::AgentCheckpoint = serde_json::from_slice(&bytes).unwrap();
+        assert!(older.verifiable());
+        let rewritten: AgentCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(&older).unwrap()).unwrap();
+        rewritten.verify_digest().unwrap();
+        let full: AgentCheckpoint = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(full.conversation, checkpoint.conversation);
+        full.verify_digest().unwrap();
+        assert_ne!(full.full_digest, Some(full.digest));
+        let mut unsealed_extensions = full;
+        unsealed_extensions.full_digest = None;
+        assert!(matches!(
+            unsealed_extensions.verify_digest(),
+            Err(AgentContinuationError::DigestMismatch)
+        ));
     }
 
     #[test]
