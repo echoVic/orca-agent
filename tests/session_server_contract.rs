@@ -6099,11 +6099,8 @@ fn server_mode_two_servers_on_one_home_each_run_command_exec() {
         .expect("write command/exec/list");
         stdin.flush().expect("flush command/exec/list");
     }
-    let first_events = first.drain_events_until_event_or_error("first-list", "command_exec_listed");
-    let first_result = first_events
-        .iter()
-        .find(|event| event["id"] == "first-cmd")
-        .unwrap_or_else(|| panic!("first command/exec result: {first_events:?}"));
+    first.expect_event("first-list", "command_exec_listed");
+    let first_result = first.expect_event("first-cmd", "command_exec_completed");
     assert_eq!(first_result["event"], "command_exec_completed");
     assert_eq!(first_result["exitCode"], 0);
     assert_eq!(first_result["stdout"], "first-done");
