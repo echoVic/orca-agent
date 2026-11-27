@@ -1438,10 +1438,11 @@ fn summarize_collapsed_messages(
         prefix,
         collapsed,
         kept,
-        ..
+        cut,
     } = partition;
     let mut result = Conversation::new();
     result.keep_provider_turn_from(conversation);
+    note_provider_compaction(&mut result, conversation, cut);
     result.messages = prefix;
     result.messages.extend(kept);
     result.internal_context = conversation.internal_context.clone();
@@ -1755,6 +1756,16 @@ fn partition_for_compaction(
         kept,
         cut,
     })
+}
+
+fn note_provider_compaction(result: &mut Conversation, source: &Conversation, cut: usize) {
+    if source.provider_turn_id().is_some() {
+        result.note_provider_compaction(
+            source
+                .provider_turn_start(&source.messages)
+                .is_none_or(|start| cut > start),
+        );
+    }
 }
 
 fn render_summary_evidence(messages: &[Message]) -> String {
@@ -2594,6 +2605,7 @@ fn local_compaction(
     let mut result = conversation.clone();
     let budget = summary_budget(config);
     if let Some(partition) = partition_for_compaction(conversation, config, counter, tool_tokens) {
+        note_provider_compaction(&mut result, conversation, partition.cut);
         let rendered = render_summary_delta(&partition.collapsed);
         let delta = bounded_summary(&rendered.text, budget / 2);
         if result.summary.is_empty() {

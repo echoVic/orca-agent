@@ -140,20 +140,25 @@ pub(crate) fn record(
         };
         source_messages.truncate(unchanged_transcript_messages);
     }
-    // The mapped transcript and summary end before the request's trailing
-    // internal context and any other request-only suffix.
-    let Some(messages) = messages.get(..source_messages.len() + summary_count) else {
+    // Compaction replay needs unchanged source fingerprints. A fork only
+    // needs the active prompt's boundary in the actual lowered request.
+    let mut normalized = conversation.messages.clone();
+    normalize_tool_boundaries(&mut normalized);
+    let fork_cut = conversation
+        .provider_fork_cut(&normalized)
+        .map(|cut| cut + summary_count)
+        .and_then(|cut| {
+            if recovery_edit.is_some_and(|edited| edited < cut) {
+                Err("request recovery rewrote the earlier parent history")
+            } else if cut > messages.len() {
+                Err("the parent request ended before the fork boundary")
+            } else {
+                Ok(cut)
+            }
+        });
+    let capture_end = (source_messages.len() + summary_count).max(fork_cut.unwrap_or(0));
+    let Some(messages) = messages.get(..capture_end) else {
         return;
-    };
-    let fork_cut = if conversation.provider_turn_id().is_some() {
-        let mut normalized = conversation.messages.clone();
-        normalize_tool_boundaries(&mut normalized);
-        conversation
-            .completed_provider_history_end(&normalized)
-            .filter(|cut| *cut <= source_messages.len())
-            .map(|cut| cut + summary_count)
-    } else {
-        None
     };
     let messages = messages
         .iter()
@@ -248,18 +253,23 @@ pub(crate) fn load(
     })
 }
 
-pub(crate) fn fork(conversation: &Conversation) -> Option<ProviderForkPrefix> {
-    let request = conversation.last_provider_request()?;
+pub(crate) fn fork(conversation: &Conversation) -> Result<ProviderForkPrefix, &'static str> {
+    let request = conversation
+        .last_provider_request()
+        .ok_or("no outbound parent request was captured")?;
     if request.fork_turn_id.as_deref() != conversation.provider_turn_id() {
-        return None;
+        return Err("the captured request belongs to a different parent turn");
     }
-    let captured = request.messages.get(..request.fork_cut?)?;
+    let captured = request
+        .messages
+        .get(..request.fork_cut?)
+        .ok_or("the captured request ended before the fork boundary")?;
     let (mut messages, inherited_tokens) = conversation.fork_prefix.as_ref().map_or_else(
         || (Vec::new(), 0),
         |prefix| (prefix.messages.clone(), prefix.estimated_tokens),
     );
     messages.extend(captured.iter().map(|message| message.json.get().to_owned()));
-    Some(ProviderForkPrefix {
+    Ok(ProviderForkPrefix {
         model: request.model.clone(),
         endpoint: request.endpoint.clone(),
         reasoning_effort: request.reasoning_effort,

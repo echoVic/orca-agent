@@ -295,7 +295,7 @@ pub fn bind_replay_source(prepared: &mut Conversation, source: &Conversation) {
 
 pub fn captured_fork_prefix(
     conversation: &Conversation,
-) -> Option<orca_core::conversation::ProviderForkPrefix> {
+) -> Result<orca_core::conversation::ProviderForkPrefix, &'static str> {
     replay_prefix::fork(conversation)
 }
 

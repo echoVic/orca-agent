@@ -2240,9 +2240,18 @@ fn fork_tool_request(context: Option<&str>) -> ToolRequest {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordedHistory {
+    Empty,
+    Ordinary,
+    OpeningCompaction,
+    ImageRewrite,
+    Interrupted,
+}
+
 fn run_recorded_fork(
     context: Option<&str>,
-    completed: bool,
+    history: RecordedHistory,
     attempt_write: bool,
 ) -> (Vec<Vec<u8>>, ChildAgentResult) {
     use orca_core::conversation::Conversation;
@@ -2301,6 +2310,7 @@ fn run_recorded_fork(
         }
         bodies
     });
+    let completed = history != RecordedHistory::Empty;
     let mut parent = Conversation::new();
     parent.add_system("Recorded parent system prompt".into());
     if completed {
@@ -2320,8 +2330,42 @@ fn run_recorded_fork(
         );
         parent.add_assistant(Some("parent completed report".into()), None, vec![]);
     }
+    if history == RecordedHistory::Interrupted {
+        // The prior turn was cancelled before it produced any reply.
+        parent.messages.truncate(2);
+    }
+    if history == RecordedHistory::ImageRewrite {
+        let Message::Tool { images, .. } = &mut parent.messages[3] else {
+            panic!("expected earlier tool result");
+        };
+        images.push(ImageInput {
+            source: ImageSource::Url {
+                url: "https://example.invalid/evidence.png".into(),
+            },
+            detail: ImageDetail::Low,
+        });
+    }
+    if history == RecordedHistory::OpeningCompaction {
+        parent.add_user("prior compaction evidence ".repeat(1500));
+        parent.add_assistant(Some("prior report".into()), None, vec![]);
+    }
     parent.add_user("in-flight parent prompt".into());
     parent.start_provider_turn("parent-turn");
+    if history == RecordedHistory::OpeningCompaction {
+        parent = orca_provider::context::compact(
+            &parent,
+            &orca_provider::context::ContextConfig {
+                max_tokens: 400,
+                reserved_for_response: 100,
+                ..Default::default()
+            },
+        );
+        assert!(
+            parent.summary.baseline.is_some(),
+            "compaction should leave a summary"
+        );
+    }
+
     if completed {
         parent.add_assistant(
             None,
@@ -2360,9 +2404,12 @@ fn run_recorded_fork(
         max_output_tokens: None,
     };
     let cancel = CancelToken::new();
+    let mut prepared = parent.clone();
+    orca_core::tool_images::drop_tool_images(&mut prepared.messages, TOOL_IMAGE_UNAVAILABLE_NOTE);
+    orca_provider::deepseek_http::bind_replay_source(&mut prepared, &parent);
     let recorded = orca_provider::call_streaming(
         ProviderKind::DeepSeek,
-        &parent,
+        &prepared,
         &parent_config,
         &cancel,
         &mut |_| {},
@@ -2416,7 +2463,7 @@ fn recorded_wire_messages(body: &[u8]) -> Vec<Box<serde_json::value::RawValue>> 
 
 #[test]
 fn a_fork_childs_first_request_shares_the_parents_prefix() {
-    let (bodies, result) = run_recorded_fork(Some("fork"), true, false);
+    let (bodies, result) = run_recorded_fork(Some("fork"), RecordedHistory::Ordinary, false);
     let parent = recorded_wire_messages(&bodies[0]);
     let child = recorded_wire_messages(&bodies[1]);
     let inherited = 5;
@@ -2455,7 +2502,7 @@ fn a_fork_childs_first_request_shares_the_parents_prefix() {
 
 #[test]
 fn the_in_flight_turn_is_not_inherited() {
-    let (bodies, _) = run_recorded_fork(Some("fork"), true, false);
+    let (bodies, _) = run_recorded_fork(Some("fork"), RecordedHistory::Ordinary, false);
     let child = std::str::from_utf8(&bodies[1]).unwrap();
     for marker in ["in-flight", "active-tool", "pending-tool"] {
         assert!(!child.contains(marker), "child inherited {marker}");
@@ -2464,7 +2511,7 @@ fn the_in_flight_turn_is_not_inherited() {
 
 #[test]
 fn a_fork_childs_role_limits_are_enforced_at_execution() {
-    let (bodies, result) = run_recorded_fork(Some("fork"), true, true);
+    let (bodies, result) = run_recorded_fork(Some("fork"), RecordedHistory::Ordinary, true);
     let first: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
     assert!(
         first["tools"]
@@ -2485,7 +2532,7 @@ fn a_fork_childs_role_limits_are_enforced_at_execution() {
 
 #[test]
 fn a_fork_child_uses_the_parents_model() {
-    let (bodies, _) = run_recorded_fork(Some("fork"), true, false);
+    let (bodies, _) = run_recorded_fork(Some("fork"), RecordedHistory::Ordinary, false);
     let child: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
     assert_eq!(child["model"], PRO_MODEL);
     assert_eq!(child["reasoning_effort"], "high");
@@ -2494,7 +2541,7 @@ fn a_fork_child_uses_the_parents_model() {
 #[test]
 fn fresh_children_are_unchanged() {
     for context in [None, Some("fresh")] {
-        let (bodies, _) = run_recorded_fork(context, true, false);
+        let (bodies, _) = run_recorded_fork(context, RecordedHistory::Ordinary, false);
         let child: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
         assert_eq!(child["model"], FLASH_MODEL);
         assert_eq!(child["messages"][0]["role"], "system");
@@ -2518,7 +2565,7 @@ fn fresh_children_are_unchanged() {
 
 #[test]
 fn a_fork_before_any_completed_turn_starts_fresh_with_a_note() {
-    let (bodies, _) = run_recorded_fork(Some("fork"), false, false);
+    let (bodies, _) = run_recorded_fork(Some("fork"), RecordedHistory::Empty, false);
     let child: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
     assert_eq!(child["model"], FLASH_MODEL);
     let prompt = child["messages"][1]["content"].as_str().unwrap();
@@ -2532,4 +2579,55 @@ fn the_subagent_schema_exposes_fork_with_a_fresh_default() {
     let context = &registry.get("subagent").unwrap().spec().input_schema["properties"]["context"];
     assert_eq!(context["enum"], serde_json::json!(["fresh", "fork"]));
     assert_eq!(context["default"], "fresh");
+}
+
+fn assert_recorded_history_is_inherited(history: RecordedHistory, marker: &str) {
+    let (bodies, result) = run_recorded_fork(Some("fork"), history, false);
+    let parent = recorded_wire_messages(&bodies[0]);
+    let child = recorded_wire_messages(&bodies[1]);
+    let inherited = parent
+        .iter()
+        .position(|message| message.get().contains("in-flight parent prompt"))
+        .unwrap();
+    assert!(
+        parent[..inherited]
+            .iter()
+            .any(|message| message.get().contains(marker))
+    );
+    assert!(
+        child.len() > inherited && child[0].get() == parent[0].get(),
+        "child started fresh or lost history"
+    );
+    assert_eq!(
+        child[..inherited]
+            .iter()
+            .map(|message| message.get())
+            .collect::<Vec<_>>(),
+        parent[..inherited]
+            .iter()
+            .map(|message| message.get())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(result.status, RunStatus::Success);
+}
+
+#[test]
+fn a_fork_after_opening_compaction_inherits_the_summary() {
+    assert_recorded_history_is_inherited(RecordedHistory::OpeningCompaction, "[Summary baseline]");
+}
+
+#[test]
+fn a_fork_after_an_image_rewrite_still_inherits() {
+    assert_recorded_history_is_inherited(
+        RecordedHistory::ImageRewrite,
+        TOOL_IMAGE_UNAVAILABLE_NOTE,
+    );
+}
+
+#[test]
+fn an_interrupted_earlier_turn_is_inherited_as_the_parent_sent_it() {
+    assert_recorded_history_is_inherited(
+        RecordedHistory::Interrupted,
+        "Describe the recorded evidence",
+    );
 }

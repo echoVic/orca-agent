@@ -138,22 +138,19 @@ pub(crate) fn prepare_fork_request(
     if config.provider != ProviderKind::DeepSeek {
         return Err("the parent's provider cannot start a DeepSeek fork child".into());
     }
-    let Some(prefix) = parent.and_then(orca_provider::deepseek_http::captured_fork_prefix) else {
-        let note = if parent.is_some_and(|parent| {
-            parent
-                .completed_provider_history_end(&parent.messages)
-                .is_some()
-        }) {
-            "the completed parent history is unavailable for reuse"
-        } else {
-            "there is no completed parent turn"
-        };
-        request.context = RoleContextPolicy::Fresh;
-        request.prompt = format!(
-            "Fork context unavailable: {note}. Starting fresh.\n\n{}",
-            request.prompt
-        );
-        return Ok(Some(note));
+    let prefix = match parent
+        .ok_or("the parent conversation is unavailable")
+        .and_then(orca_provider::deepseek_http::captured_fork_prefix)
+    {
+        Ok(prefix) => prefix,
+        Err(note) => {
+            request.context = RoleContextPolicy::Fresh;
+            request.prompt = format!(
+                "Fork context unavailable: {note}. Starting fresh.\n\n{}",
+                request.prompt
+            );
+            return Ok(Some(note));
+        }
     };
     validate_fork_prefix(config, &prefix)?;
     request.model = Some(prefix.model.clone());

@@ -552,7 +552,7 @@ pub struct CapturedProviderRequest {
     pub reasoning_effort: crate::config::ReasoningEffort,
     pub messages: Vec<CapturedProviderMessage>,
     pub tools: Vec<serde_json::Value>,
-    pub fork_cut: Option<usize>,
+    pub fork_cut: Result<usize, &'static str>,
     pub fork_turn_id: Option<String>,
 }
 
@@ -590,7 +590,8 @@ impl fmt::Debug for ProviderForkPrefix {
 struct ProviderTurnBoundary {
     id: String,
     user_messages: usize,
-    summary: SummaryState,
+    has_prior_history: bool,
+    compacted_active_turn: bool,
 }
 
 #[derive(Clone, Default)]
@@ -688,6 +689,11 @@ impl Clone for Conversation {
     }
 }
 
+fn is_provider_turn_user(message: &Message) -> bool {
+    matches!(message, Message::User { content, images, .. }
+        if !images.is_empty() || !is_internal_image_analysis(content))
+}
+
 impl Conversation {
     pub fn new() -> Self {
         Self {
@@ -713,7 +719,15 @@ impl Conversation {
             self.provider_turn = Some(ProviderTurnBoundary {
                 id: id.to_owned(),
                 user_messages: 1,
-                summary: self.summary.clone(),
+                has_prior_history: self.fork_prefix.is_some()
+                    || !self.summary.is_empty()
+                    || self
+                        .messages
+                        .iter()
+                        .filter(|message| is_provider_turn_user(message))
+                        .nth(1)
+                        .is_some(),
+                compacted_active_turn: false,
             });
         }
     }
@@ -733,30 +747,38 @@ impl Conversation {
         self.fork_prefix.clone_from(&source.fork_prefix);
     }
 
-    pub fn completed_provider_history_end(&self, messages: &[Message]) -> Option<usize> {
+    pub fn provider_turn_start(&self, messages: &[Message]) -> Option<usize> {
         let turn = self.provider_turn.as_ref()?;
-        // A summary produced during the turn may already contain work from
-        // that turn, including tool results that followed its opening prompt.
-        if turn.summary != self.summary {
-            return None;
-        }
-        let cut = messages
+        messages
             .iter()
             .enumerate()
             .rev()
-            .filter(|(_, message)| {
-                matches!(message, Message::User { content, images, .. }
-                if !images.is_empty() || !is_internal_image_analysis(content))
-            })
-            .nth(turn.user_messages - 1)?
-            .0;
-        (turn.summary.baseline.is_some()
-            || !turn.summary.deltas.is_empty()
-            || messages[..cut].iter().any(|message| {
-                matches!(message, Message::Assistant { content: Some(_), tool_calls, .. }
-                    if tool_calls.is_empty())
-            }))
-        .then_some(cut)
+            .filter(|(_, message)| is_provider_turn_user(message))
+            .nth(turn.user_messages - 1)
+            .map(|(index, _)| index)
+    }
+
+    pub fn note_provider_compaction(&mut self, includes_active_turn: bool) {
+        if let Some(turn) = &mut self.provider_turn {
+            turn.compacted_active_turn |= includes_active_turn;
+        }
+    }
+
+    pub fn provider_fork_cut(&self, messages: &[Message]) -> Result<usize, &'static str> {
+        let turn = self
+            .provider_turn
+            .as_ref()
+            .ok_or("the active parent turn is unavailable")?;
+        if turn.compacted_active_turn {
+            return Err("the parent summary includes work from the active turn");
+        }
+        let cut = self
+            .provider_turn_start(messages)
+            .ok_or("the active parent prompt is missing from the provider request")?;
+        if !turn.has_prior_history {
+            return Err("there is no completed parent turn");
+        }
+        Ok(cut)
     }
 
     pub fn last_provider_request(&self) -> Option<Arc<CapturedProviderRequest>> {
