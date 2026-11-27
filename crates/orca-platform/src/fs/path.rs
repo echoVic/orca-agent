@@ -70,6 +70,11 @@ impl PathIdentity {
                 .all(|(candidate, expected)| candidate.key == expected.key)
     }
 
+    #[cfg(windows)]
+    pub(super) fn is_direct_parent_of(&self, child: &Self) -> bool {
+        child.components.len() == self.components.len() + 1 && child.is_within(self)
+    }
+
     pub fn storage_key(&self) -> String {
         let mut key = match &self.prefix {
             WindowsPrefix::Drive { key, .. } => format!("drive:{key}"),

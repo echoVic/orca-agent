@@ -239,7 +239,6 @@ mod platform {
 
     impl Directory {
         pub(super) fn open(path: &Path, create: bool) -> io::Result<Self> {
-            let path = crate::fs::extended_length_path(path);
             let policy = PathPolicy::windows_sandbox().with_unc_paths(true);
             policy
                 .identity(path.to_str().ok_or_else(invalid_path)?)
@@ -253,23 +252,27 @@ mod platform {
             }
             let mut current = PathBuf::from(prefix.as_os_str());
             current.push("\\");
-            let mut parents = vec![pin(policy, &current)?];
+            let root = pin(policy, &current, None)?;
+            current = root.identity().display_path();
+            let mut parents = vec![root];
             for part in parts {
                 let Component::Normal(name) = part else {
                     return Err(invalid_path());
                 };
                 current.push(name);
-                let directory = match pin(policy, &current) {
+                let parent = parents.last();
+                let directory = match pin(policy, &current, parent) {
                     Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
                         match fs::create_dir(&current) {
                             Ok(()) => {}
                             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                             Err(error) => return Err(error),
                         }
-                        pin(policy, &current)?
+                        pin(policy, &current, parent)?
                     }
                     result => result?,
                 };
+                current = directory.identity().display_path();
                 parents.push(directory);
             }
             Ok(Self {
@@ -318,7 +321,12 @@ mod platform {
         pub(super) fn remove_files(&self, name: &OsStr) -> io::Result<()> {
             let path = self.path.join(name);
             let policy = PathPolicy::windows_sandbox().with_unc_paths(true);
-            let directory = pin_with_access(policy, &path, FILE_READ_ATTRIBUTES | DELETE)?;
+            let directory = pin_with_access(
+                policy,
+                &path,
+                self._parents.last(),
+                FILE_READ_ATTRIBUTES | DELETE,
+            )?;
             let child = Self {
                 path,
                 _parents: Vec::new(),
@@ -338,21 +346,36 @@ mod platform {
         }
     }
 
-    fn pin(policy: PathPolicy, path: &Path) -> io::Result<VerifiedPath> {
+    fn pin(
+        policy: PathPolicy,
+        path: &Path,
+        parent: Option<&VerifiedPath>,
+    ) -> io::Result<VerifiedPath> {
         // Traversal access makes the handle participate in sharing checks.
-        pin_with_access(policy, path, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+        pin_with_access(policy, path, parent, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
     }
 
-    fn pin_with_access(policy: PathPolicy, path: &Path, access: u32) -> io::Result<VerifiedPath> {
+    fn pin_with_access(
+        policy: PathPolicy,
+        path: &Path,
+        parent: Option<&VerifiedPath>,
+        access: u32,
+    ) -> io::Result<VerifiedPath> {
         let directory = policy
             .open_no_follow_shared(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE)
             .map_err(io_error)?;
-        if !directory.file().metadata()?.is_dir()
-            || directory.identity()
-                != &policy
-                    .identity(path.to_str().ok_or_else(invalid_path)?)
-                    .map_err(io_error)?
-        {
+        // Windows can expand a short name when it reports the opened path.
+        // Check that it still belongs directly to the directory we pinned.
+        let matches = match parent {
+            Some(parent) => parent.identity().is_direct_parent_of(directory.identity()),
+            None => {
+                directory.identity()
+                    == &policy
+                        .identity(path.to_str().ok_or_else(invalid_path)?)
+                        .map_err(io_error)?
+            }
+        };
+        if !matches || !directory.file().metadata()?.is_dir() {
             return Err(invalid_path());
         }
         Ok(directory)
@@ -405,14 +428,23 @@ mod platform {
         #[test]
         fn an_open_directory_keeps_its_ancestors_in_place() {
             let root = tempfile::tempdir().unwrap();
-            let parent = root.path().join("parent");
-            let child = parent.join("child");
-            fs::create_dir_all(&child).unwrap();
-            let directory = Directory::open(&child, false).unwrap();
-            let renamed = root.path().join("renamed");
-            assert!(fs::rename(&parent, &renamed).is_err());
-            drop(directory);
-            fs::rename(&parent, &renamed).unwrap();
+            // The system temp path can include a short name. Also exercise the
+            // spelling returned by Windows for an existing directory.
+            for base in [
+                root.path().to_path_buf(),
+                root.path().canonicalize().unwrap(),
+            ] {
+                let parent = base.join("parent");
+                let child = parent.join("child");
+                fs::create_dir_all(&child).unwrap();
+                let directory = Directory::open(&child, false)
+                    .unwrap_or_else(|error| panic!("open {}: {error}", child.display()));
+                let renamed = base.join("renamed");
+                assert!(fs::rename(&parent, &renamed).is_err());
+                drop(directory);
+                fs::rename(&parent, &renamed).unwrap();
+                fs::rename(&renamed, &parent).unwrap();
+            }
         }
     }
 }
