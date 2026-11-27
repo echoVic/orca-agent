@@ -376,8 +376,15 @@ fn subagent_activity_projection(
             None,
             None,
         ),
-        SubagentActivityPayload::Completed { .. } => {
-            (surface::DisplayText::new("completed"), None, None)
+        SubagentActivityPayload::Completed { status, .. } => {
+            use surface::SurfaceSubagentTerminalStatus as End;
+            let word = match status {
+                End::Completed => "completed",
+                End::Failed => "failed",
+                End::Cancelled => "cancelled",
+                End::Blocked => "blocked",
+            };
+            (surface::DisplayText::new(word), None, None)
         }
     }
 }
@@ -6361,6 +6368,26 @@ mod subagent_activity_tests {
     }
     use crate::child_agent_types::SubagentActivityPayload;
     use crate::runtime_surface as surface;
+
+    #[test]
+    fn terminal_activity_names_the_actual_agent_outcome() {
+        use surface::SurfaceSubagentTerminalStatus as End;
+        for (status, word) in [
+            (End::Completed, "completed"),
+            (End::Failed, "failed"),
+            (End::Cancelled, "cancelled"),
+            (End::Blocked, "blocked"),
+        ] {
+            let (activity, _, _) =
+                subagent_activity_projection(&SubagentActivityPayload::Completed {
+                    status,
+                    output: None,
+                    error: None,
+                    usage: None,
+                });
+            assert_eq!(activity.as_str(), word);
+        }
+    }
 
     #[test]
     fn a_phase_reads_as_words() {
