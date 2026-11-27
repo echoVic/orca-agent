@@ -2056,7 +2056,9 @@ fn execute_acquired_sync_subagent(
         headless_root: child_config.tools.headless_exec,
         allowed_tools: None,
         tool_policy_label: None,
-        workflow_ipc,
+        workflow_ipc: workflow_ipc
+            .as_ref()
+            .map(WorkflowIpcContext::for_nested_attempt),
         continuation: continuation_start,
     };
     let surface_task_id = match SurfaceTaskId::try_new(registry_task_id.clone()) {
@@ -2202,26 +2204,42 @@ fn execute_acquired_sync_subagent(
         });
         run_child_agent(&child_config, &child_request, &mut runtime)
     }));
+    let claim_cleanup_error = child_request
+        .workflow_ipc
+        .as_ref()
+        .and_then(|ipc| ipc.release_child_claims().err());
     let worktree = worktree_execution.finish();
     let (output, panicked) = match child {
-        Ok((child, cost_tracker)) => (
-            finish_child_output(
-                tool_request,
-                description,
-                schema.as_ref(),
-                child,
-                cost_tracker,
-                worktree,
-                lifecycle,
-                started_task,
-            ),
-            false,
-        ),
+        Ok((mut child, cost_tracker)) => {
+            if let Some(error) = claim_cleanup_error {
+                child.status = RunStatus::Failed;
+                child.error = Some(match child.error {
+                    Some(existing) => format!("{existing}\n{error}"),
+                    None => error,
+                });
+            }
+            (
+                finish_child_output(
+                    tool_request,
+                    description,
+                    schema.as_ref(),
+                    child,
+                    cost_tracker,
+                    worktree,
+                    lifecycle,
+                    started_task,
+                ),
+                false,
+            )
+        }
         Err(payload) => {
             let mut error = format!(
                 "Subagent worker panicked after execution started: {}. Inspect external state before retrying.",
                 panic_payload_message(payload)
             );
+            if let Some(cleanup_error) = claim_cleanup_error {
+                error.push_str(&format!("\n{cleanup_error}"));
+            }
             match worktree {
                 Ok(worktree) => append_worktree_outcome(&mut error, worktree.as_ref()),
                 Err(cleanup_error) => error.push_str(&format!(

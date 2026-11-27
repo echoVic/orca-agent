@@ -1163,6 +1163,7 @@ impl WorkflowRunner {
         {
             return Ok(());
         }
+        WorkflowIpcContext::reconcile_dead_claims(&self.state.task_lists_path(run_id))?;
         state.status = WorkflowRunStatus::Failed;
         state.final_summary = None;
         state.error = Some("Workflow interrupted by runtime restart".to_string());
@@ -1317,6 +1318,9 @@ impl WorkflowRunner {
         let args = request.input.args.clone().unwrap_or(Value::Null);
         let resume_from = request.input.resume_from_run_id.clone();
         let restart_phase = request.input.restart_phase.clone();
+        if let Some(source) = &resume_from {
+            WorkflowIpcContext::reconcile_dead_claims(&self.state.task_lists_path(source))?;
+        }
         let cached_agents = Arc::new(AtomicU32::new(0));
         let mut failed_error = None;
         let mut completed_result = None;
@@ -1688,6 +1692,7 @@ impl WorkflowRunner {
 
         let execution_policy = workflow_agent_execution_policy(&call, workflow_limits);
         let max_attempts = execution_policy.max_agent_retries.saturating_add(1).max(1);
+        let mut child_ipc = workflow_ipc.for_sender(call.call_path.clone());
         let mut previous_errors = Vec::new();
         for attempt in 1..=max_attempts {
             if self.workflow_stop_requested(run_id, task_id, workflow_cancel)? {
@@ -1787,7 +1792,7 @@ impl WorkflowRunner {
             let child_result = self.run_child_agent_call(
                 task_id,
                 &call,
-                workflow_ipc,
+                &child_ipc,
                 &child_execution_policy,
                 workflow_cancel,
                 continuation_selector
@@ -1795,9 +1800,9 @@ impl WorkflowRunner {
                     .map(|continuation| continuation.continuation_id.as_str()),
                 permit.budget_spec(),
             );
-            let release_error = workflow_ipc.release_child_claims(&call.call_path).err();
             match child_result {
                 Ok(child_output) => {
+                    let release_error = child_ipc.release_child_claims().err();
                     permit.settle_usage(
                         child_output.usage.total_tokens(),
                         child_output.budget_usage,
@@ -1899,10 +1904,6 @@ impl WorkflowRunner {
                         continuation,
                         budget_usage,
                     } = error;
-                    let failed_release = release_error.is_some();
-                    if let Some(error) = release_error {
-                        error_message.push_str(&format!("\n{error}"));
-                    }
                     permit.settle_usage(
                         usage.map(UsageTotals::total_tokens).unwrap_or_default(),
                         budget_usage,
@@ -1911,6 +1912,14 @@ impl WorkflowRunner {
                         workflow_cancel.cancel();
                     }
                     drop(permit);
+                    let will_retry = attempt < max_attempts && retryable && !cancelled;
+                    let keep_claims =
+                        will_retry && continuation.as_ref().is_some_and(|state| state.resumable);
+                    let mut failed_release = false;
+                    if !keep_claims && let Err(error) = child_ipc.release_child_claims() {
+                        error_message.push_str(&format!("\n{error}"));
+                        failed_release = true;
+                    }
                     let transcript_path =
                         write_agent_transcript(transcript_dir, &call, &error_message, false)?;
                     self.state.record_agent_completed(
@@ -1949,7 +1958,10 @@ impl WorkflowRunner {
                     if failed_release {
                         return Err(io::Error::other(error_message));
                     }
-                    if attempt < max_attempts && retryable && !cancelled {
+                    if will_retry {
+                        if !keep_claims {
+                            child_ipc = workflow_ipc.for_sender(call.call_path.clone());
+                        }
                         previous_errors.push(error_message);
                         continuation_selector =
                             continuation.filter(|continuation| continuation.resumable);
@@ -2325,7 +2337,7 @@ impl WorkflowRunner {
             headless_root: false,
             allowed_tools: execution_policy.allowed_tools.clone(),
             tool_policy_label: execution_policy.tool_policy_label.clone(),
-            workflow_ipc: Some(workflow_ipc.for_sender(call.call_path.clone())),
+            workflow_ipc: Some(workflow_ipc.clone()),
             continuation: continuation_start,
         };
         let mut lifecycle =
@@ -3900,6 +3912,87 @@ mod tests {
         assert_eq!(result["completed"]["result"], "finished");
     }
 
+    #[test]
+    fn workflow_checkpointed_retry_keeps_its_claim() {
+        let result = run_task_list_workflow(
+            "createTaskList('runner', ['keep']);
+             await agent('claim and retry');
+             export default listTasks('runner');",
+        );
+        assert_eq!(result[0]["status"], "completed");
+        assert_eq!(result[0]["result"], "retried");
+    }
+
+    #[test]
+    fn workflow_resume_releases_dead_claims_and_reruns_mutating_calls() {
+        const ENTRY: &str = "workflow::runner::tests::workflow_abandon_task_list_claim";
+        let temp = tempdir().unwrap();
+        let script = temp.path().join("workflow.js");
+        fs::write(
+            &script,
+            "export const meta = { name: 'restart', description: 'Task list restart', phases: [] };
+            await agent('create runner list');
+            await agent('read runner list');
+            export default listTasks('runner');",
+        )
+        .unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(temp.path().into());
+        let session = temp.path().join("session");
+        let request = WorkflowLaunchRequest::from_script_path(script.display().to_string());
+        let runner = WorkflowRunner::new(
+            config.clone(),
+            TaskRegistry::new("restart".into()),
+            session.clone(),
+        )
+        .with_child_executor(task_list_child_executor);
+        let original = runner.launch(request.clone()).unwrap();
+        let run_id = original.output.run_id.unwrap();
+        let path = runner.state.task_lists_path(&run_id);
+        drop(runner);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", ENTRY])
+            .env("ORCA_TEST_ABANDON_TASK_LIST", &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let persisted = || serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted()["lists"]["runner"][0]["status"], "running");
+
+        let reopened = WorkflowRunner::new(config, TaskRegistry::new("restart".into()), session)
+            .with_child_executor(task_list_child_executor);
+        let resumed = reopened.resume(request.with_resume_from(run_id)).unwrap();
+        assert_eq!(persisted()["lists"]["runner"][0]["status"], "pending");
+        assert!(persisted()["lists"]["runner"][0]["claimedBy"].is_null());
+        let result = resumed
+            .summary
+            .strip_suffix(" (cached 1 agent)")
+            .expect(&resumed.summary);
+        assert_eq!(
+            serde_json::from_str::<Value>(result).unwrap()[0]["value"],
+            "from runner"
+        );
+    }
+
+    #[test]
+    fn workflow_abandon_task_list_claim() {
+        let Some(path) = std::env::var_os("ORCA_TEST_ABANDON_TASK_LIST") else {
+            return;
+        };
+        let ipc = WorkflowIpcContext::new_durable_task_lists(path.into()).unwrap();
+        let child = ipc.for_sender("abandoned");
+        assert_eq!(
+            child.claim_task("runner", None).unwrap()["status"],
+            "running"
+        );
+        std::process::exit(0);
+    }
+
     fn run_task_list_workflow(script_body: &str) -> Value {
         let temp = tempdir().unwrap();
         let script = temp.path().join("workflow.js");
@@ -3912,6 +4005,7 @@ mod tests {
         .unwrap();
         let mut config = test_run_config();
         config.cwd = Some(temp.path().into());
+        config.workflows.max_agent_retries = 1;
         let runner = WorkflowRunner::new(
             config,
             TaskRegistry::new("task-list-test".into()),
@@ -3929,7 +4023,7 @@ mod tests {
     fn task_list_child_executor(
         _config: &RunConfig,
         request: &ChildAgentRequest,
-        _runtime: &mut ChildAgentRuntime<'_, SharedEventBuffer>,
+        runtime: &mut ChildAgentRuntime<'_, SharedEventBuffer>,
         _cost_tracker: &mut CostTracker,
     ) -> io::Result<ChildAgentResult> {
         let ipc = request.workflow_ipc.as_ref().unwrap();
@@ -3937,6 +4031,48 @@ mod tests {
             "create runner list" => {
                 ipc.create_task_list("runner", vec![serde_json::json!("from runner")])
                     .map_err(io::Error::other)?;
+            }
+            "read runner list" => {
+                ipc.list_tasks("runner").map_err(io::Error::other)?;
+            }
+            "claim and retry" if request.continuation.is_none() => {
+                assert_eq!(ipc.claim_task("runner", None).unwrap()["status"], "running");
+                let mut conversation = orca_core::conversation::Conversation::new();
+                conversation.add_user("claim and retry".into());
+                runtime
+                    .checkpoint_observer
+                    .unwrap()
+                    .checkpoint(crate::child_agent_types::ChildAgentCheckpointObservation {
+                        conversation: &conversation,
+                        turn: 1,
+                        usage: orca_core::budget::BudgetUsage {
+                            turns: 1,
+                            ..Default::default()
+                        },
+                        last_tool_boundary: None,
+                    })
+                    .map_err(io::Error::other)?;
+                return Ok(ChildAgentResult {
+                    status: RunStatus::Failed,
+                    final_message: None,
+                    error: Some("provider disconnected".into()),
+                    budget_usage: None,
+                });
+            }
+            "claim and retry" => {
+                assert!(
+                    ipc.for_sender("competing child")
+                        .claim_task("runner", None)
+                        .unwrap()
+                        .is_null()
+                );
+                ipc.complete_task(
+                    "runner",
+                    "workflow-task-1",
+                    serde_json::json!("retried"),
+                    None,
+                )
+                .map_err(io::Error::other)?;
             }
             "claim and fail" => {
                 let task = ipc.claim_task("runner", None).map_err(io::Error::other)?;
