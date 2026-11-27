@@ -462,16 +462,7 @@ pub(crate) fn announce_runtime_ready(
             control: control.clone(),
         })),
     });
-    let runtime_events = event_tx.clone();
-    thread.set_prompt_queue_event_observer(Arc::new(move |event: &EventEnvelope| {
-        if let Some(projected) = runtime_event_to_tui(event) {
-            let _ = runtime_events.send(projected);
-            if let Some(script) = runtime_event_script(event) {
-                let _ = runtime_events.send(script);
-            }
-        }
-        Ok(())
-    }));
+    observe_prompt_queue(thread, event_tx, control.view().is_some());
     let _ = event_tx.send(TuiEvent::MentionRuntimeReady(thread.typed_surface()));
     if let Ok(snapshot) = thread.prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::List) {
         let _ = event_tx.send(TuiEvent::PromptQueueUpdated(snapshot));
@@ -522,6 +513,63 @@ pub(crate) fn announce_runtime_ready(
             )));
         }
     }
+}
+
+fn observe_prompt_queue(
+    thread: &RuntimeThreadHandle,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    routed: bool,
+) {
+    let runtime_events = event_tx.clone();
+    let committed = event_tx.clone();
+    let raw: Arc<dyn orca_core::event_sink::EventObserver> =
+        Arc::new(move |event: &EventEnvelope| {
+            if let Some(projected) = runtime_event_to_tui(event) {
+                let _ = runtime_events.send(projected);
+                if let Some(script) = runtime_event_script(event) {
+                    let _ = runtime_events.send(script);
+                }
+            }
+            Ok(())
+        });
+    let supplemental = raw.clone();
+    thread.set_prompt_queue_surface_observer(
+        raw,
+        Arc::new(move |event: &EventEnvelope| match event.event_type {
+            EventType::AssistantReasoningDelta
+            | EventType::AssistantMessageDelta
+            | EventType::ModelResponseCompleted
+            | EventType::SessionCompleted => Ok(()),
+            _ => supplemental.observe(event),
+        }),
+        move |update| {
+            use orca_runtime::runtime_host::QueueSurfaceUpdate;
+            let send = |cursor: &orca_runtime::surface::SurfaceCursor, event: TuiEvent| {
+                let _ = committed.send(event.at_surface_cursor(routed, cursor));
+            };
+            match update {
+                QueueSurfaceUpdate::Assistant(batch, streams) => {
+                    for event in
+                        crate::surface_projection::committed_queue_assistant_events(batch, streams)
+                    {
+                        send(&batch.cursor_after, event);
+                    }
+                }
+                QueueSurfaceUpdate::Terminal(receipt) => {
+                    if let Some(status) =
+                        crate::surface_projection::operation_terminal_status(&receipt.terminal)
+                    {
+                        send(
+                            &receipt.cursor,
+                            TuiEvent::SessionCompleted {
+                                status: status.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+        },
+    );
 }
 
 pub(crate) fn read_hosted_projection_batch(

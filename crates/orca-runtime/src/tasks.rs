@@ -4833,10 +4833,7 @@ impl TaskRegistry {
     }
 
     pub fn get(&self, id: &str) -> Option<TaskRecord> {
-        if let Some(record) = self
-            .with_tasks(|tasks| tasks.get(id).cloned())
-            .expect("task registry lock poisoned")
-        {
+        if let Some(record) = self.get_cached(id) {
             return Some(record);
         }
 
@@ -4849,6 +4846,11 @@ impl TaskRegistry {
         })
         .expect("task registry lock poisoned");
         Some(record)
+    }
+
+    pub fn get_cached(&self, id: &str) -> Option<TaskRecord> {
+        self.with_tasks(|tasks| tasks.get(id).cloned())
+            .expect("task registry lock poisoned")
     }
 
     pub fn update_workflow_progress(
@@ -9599,6 +9601,18 @@ mod tests {
         let refreshed = observer.summary(&task.id).expect("refreshed task");
         assert_eq!(refreshed.status, TaskStatus::Stopping);
         assert!(local_cancel.is_cancelled());
+    }
+
+    #[test]
+    fn cached_lookup_does_not_load_a_record_from_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().to_path_buf();
+        let reader = TaskRegistry::new_persistent("session".into(), root.clone()).unwrap();
+        let writer = TaskRegistry::new_persistent_attached("session".into(), root).unwrap();
+        let task = writer.create_main_session("running".into());
+        assert!(reader.get_cached(&task.id).is_none());
+        assert!(reader.get(&task.id).is_some());
+        assert!(reader.get_cached(&task.id).is_some());
     }
 
     #[test]

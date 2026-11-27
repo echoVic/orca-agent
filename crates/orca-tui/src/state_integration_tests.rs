@@ -785,6 +785,8 @@ mod agent_visit {
             snapshot,
             crate::protocol::SessionAttachmentId::new(1),
             &sender,
+            &crate::operation_controller::TuiSurfaceTaskControl::new(),
+            &std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         )
         .unwrap();
         let start = apply_attached(state, events);
@@ -896,6 +898,239 @@ mod agent_visit {
     }
 
     #[test]
+    fn return_fences_the_stream_delta_already_in_the_snapshot() {
+        use crate::attachment_routing::AttachmentRouting;
+        with_streaming_main(|thread, snapshot| {
+            let parent = crate::protocol::SessionAttachmentId::new(1);
+            let routing =
+                std::sync::Arc::new(std::sync::Mutex::new(AttachmentRouting::new(parent)));
+            let (sender, events) = mpsc::unbounded();
+            AttachmentRouting::switch_attachment_deferred(&routing, &sender, parent, None);
+            let text = snapshot
+                .assistant_streams
+                .iter()
+                .find(|stream| stream.channel == orca_runtime::surface::AssistantChannel::Message)
+                .unwrap()
+                .text
+                .as_str();
+            let delivery = TuiEvent::SurfaceDelivery(Box::new((
+                snapshot.cursor.clone(),
+                TuiEvent::MessageDelta(text.into()),
+            )));
+            routing
+                .lock()
+                .unwrap()
+                .route(&sender, parent, delivery.clone());
+            crate::hosted_child::project_returned_main(
+                thread,
+                &snapshot,
+                parent,
+                &sender,
+                &crate::operation_controller::TuiSurfaceTaskControl::new(),
+                &routing,
+            )
+            .unwrap();
+            AttachmentRouting::release_deferred_parent_events(&routing, &sender);
+            routing.lock().unwrap().route(&sender, parent, delivery);
+            let mut later = snapshot.cursor.clone();
+            later.next_seq = orca_runtime::surface::SequenceNumber::new(later.next_seq.get() + 1);
+            routing.lock().unwrap().route(
+                &sender,
+                parent,
+                TuiEvent::MessageDelta(" continues".into()).at_surface_cursor(true, &later),
+            );
+            let mut state = state();
+            apply_attached(&mut state, events);
+            let frame = crate::test_support::frame_string(&mut state, 120, 40);
+            assert_eq!(frame.matches(text).count(), 1, "{frame}");
+            assert!(frame.contains(&format!("{text} continues")), "{frame}");
+        });
+    }
+
+    #[test]
+    fn completion_between_return_snapshot_and_reset_still_ends_the_row() {
+        use crate::attachment_routing::AttachmentRouting;
+        with_streaming_main(|thread, snapshot| {
+            let parent = crate::protocol::SessionAttachmentId::new(1);
+            let routing =
+                std::sync::Arc::new(std::sync::Mutex::new(AttachmentRouting::new(parent)));
+            let (sender, events) = mpsc::unbounded();
+            AttachmentRouting::switch_attachment(
+                &routing,
+                &sender,
+                parent.next(),
+                Some(parent),
+                false,
+            );
+            let snapshot =
+                crate::hosted_child::snapshot_for_return(&routing, &sender, parent, || {
+                    let mut terminal_cursor = snapshot.cursor.clone();
+                    terminal_cursor.next_seq = orca_runtime::surface::SequenceNumber::new(
+                        terminal_cursor.next_seq.get() + 1,
+                    );
+                    routing.lock().unwrap().route(
+                        &sender,
+                        parent,
+                        TuiEvent::SessionCompleted {
+                            status: "success".into(),
+                        }
+                        .at_surface_cursor(true, &terminal_cursor),
+                    );
+                    Ok(snapshot)
+                })
+                .unwrap();
+            crate::hosted_child::project_returned_main(
+                thread,
+                &snapshot,
+                parent,
+                &sender,
+                &crate::operation_controller::TuiSurfaceTaskControl::new(),
+                &routing,
+            )
+            .unwrap();
+            AttachmentRouting::release_deferred_parent_events(&routing, &sender);
+            let mut state = state();
+            for event in events.try_iter() {
+                if let Ok(Some(event)) =
+                    crate::attachment_routing::accept_attached_tui_event(&mut state, event)
+                {
+                    state.update(event)
+                }
+            }
+            assert_eq!(state.status, AppStatus::Idle);
+        });
+    }
+
+    #[test]
+    fn main_clock_spans_generations_including_one_not_yet_admitted() {
+        use orca_runtime::surface::{SurfaceGenerationId, SurfaceTaskId};
+        with_streaming_main(|thread, mut snapshot| {
+            let operation = snapshot.foreground_operation.as_mut().unwrap();
+            let mut next = operation.generations.last().unwrap().clone();
+            next.fence.generation_id = SurfaceGenerationId::new(next.fence.generation_id.get() + 1);
+            let mut next_turn = operation.agent_loop_turns[0].clone();
+            let mut first = snapshot_with_child(1, 2).tasks.remove(0);
+            first.task_type = SurfaceTaskType::MainSession;
+            first.task_id = next_turn.admitted_main_task_id.clone().unwrap();
+            let start = chrono::Utc::now().timestamp_millis() - 40_000;
+            first.started_at = Some(UnixMillis::new(start));
+            let mut second = first.clone();
+            second.task_id = SurfaceTaskId::try_new("next-main").unwrap();
+            second.started_at = Some(UnixMillis::new(start + 30_000));
+            next_turn.fence = next.fence.clone();
+            next_turn.admitted_main_task_id = Some(second.task_id.clone());
+            operation.generations.push(next);
+            snapshot.tasks.extend([first, second]);
+            for admitted in [false, true] {
+                if admitted {
+                    snapshot
+                        .foreground_operation
+                        .as_mut()
+                        .unwrap()
+                        .agent_loop_turns
+                        .push(next_turn.clone());
+                }
+                let mut state = state();
+                assert_eq!(
+                    return_to_main(&mut state, thread, &snapshot),
+                    Some(start as u64),
+                    "admitted={admitted}"
+                );
+                assert_running_seconds(&crate::test_support::frame_string(&mut state, 120, 40), 40);
+            }
+            let operation = snapshot.foreground_operation.as_mut().unwrap();
+            operation.agent_loop_turns[0].admitted_main_task_id = None;
+            let mut unadmitted = operation.generations.last().unwrap().clone();
+            unadmitted.fence.generation_id =
+                SurfaceGenerationId::new(unadmitted.fence.generation_id.get() + 1);
+            operation.generations.push(unadmitted);
+            assert_eq!(
+                return_to_main(&mut state(), thread, &snapshot),
+                Some((start + 30_000) as u64)
+            );
+        });
+    }
+
+    #[test]
+    fn return_reseeds_main_queue_before_another_update() {
+        with_streaming_main(|thread, snapshot| {
+            thread
+                .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: "later".into(),
+                })
+                .unwrap();
+            let mut state = state();
+            return_to_main(&mut state, thread, &snapshot);
+            let frame = crate::test_support::frame_string(&mut state, 120, 40);
+            assert!(frame.contains("Queued 1"), "{frame}");
+        });
+    }
+
+    #[test]
+    fn a_terminal_main_return_cannot_be_revived_by_its_queued_start() {
+        use orca_runtime::surface::{
+            OperationTerminal, OperationTerminalRecord, SurfaceFinalizeIntentId,
+        };
+        with_streaming_main(|thread, mut snapshot| {
+            let operation = snapshot.foreground_operation.as_mut().unwrap();
+            let turn = operation
+                .generations
+                .last()
+                .unwrap()
+                .logical_turn_id
+                .clone();
+            operation.terminal = Some(OperationTerminalRecord {
+                operation_id: operation.operation_id.clone(),
+                finalize_intent_id: SurfaceFinalizeIntentId::try_from_bytes(
+                    *operation.operation_id.as_bytes(),
+                )
+                .unwrap(),
+                terminal: OperationTerminal::Succeeded {
+                    usage: Default::default(),
+                },
+                usage: Default::default(),
+                source_diagnostic_digest: None,
+                settlement_receipts: vec![],
+                completion_proof: Default::default(),
+                committed_at: UnixMillis::new(1),
+            });
+            let mut state = state();
+            return_to_main(&mut state, thread, &snapshot);
+            let mut running = crate::test_support::runtime_queue_running_the_first(&["queued"]);
+            running.items[0].client_user_message_id =
+                orca_runtime::prompt_queue::ClientUserMessageId::parse(
+                    turn.as_str().strip_prefix("turn_").unwrap(),
+                )
+                .unwrap();
+            state.update(TuiEvent::PromptQueueUpdated(running));
+            assert_eq!(state.status, AppStatus::Idle);
+        });
+    }
+
+    #[test]
+    fn restored_text_remains_visible_at_response_completion() {
+        let mut state = state();
+        state.enter_running();
+        state.update(TuiEvent::OpenMessageRestored("prefix".into()));
+        state.update(TuiEvent::AssistantResponseCompleted(
+            Some("prefix and tail".into()),
+            None,
+        ));
+        let frame = crate::test_support::frame_string(&mut state, 120, 40);
+        assert_eq!(frame.matches("prefix and tail").count(), 1, "{frame}");
+    }
+
+    #[test]
+    fn child_focus_does_not_invent_a_parent_status() {
+        let mut state = state();
+        state.enter_running();
+        state.update(TuiEvent::ChildFocusChanged {
+            task_id: Some("child".into()),
+        });
+        assert_eq!(state.main_behind_child, None);
+    }
+
+    #[test]
     fn the_live_main_clock_uses_its_admitted_task_even_before_reconciliation() {
         with_streaming_main(|thread, snapshot| {
             let turn = &snapshot
@@ -916,6 +1151,9 @@ mod agent_visit {
             let hydrated_start = return_to_main(&mut state, thread, &snapshot);
             assert_eq!(state.status, AppStatus::Running);
             assert_eq!(hydrated_start, Some(started.try_into().unwrap()));
+            let until_second = (started + 1000 - chrono::Utc::now().timestamp_millis()).max(0);
+            std::thread::sleep(std::time::Duration::from_millis(until_second as u64 + 1));
+            assert_running_seconds(&crate::test_support::frame_string(&mut state, 120, 40), 1);
         });
     }
 
@@ -989,7 +1227,7 @@ mod agent_visit {
             SurfaceInteractionView, SurfaceMcpElicitationRequest,
         };
 
-        with_streaming_main(|_, mut main| {
+        with_streaming_main(|thread, mut main| {
             let child = parent_of_child();
             let mut state = state();
             let question = NonEmptyText::try_new("Continue?").unwrap();
@@ -1041,6 +1279,54 @@ mod agent_visit {
                 }];
                 focus(&mut state, "child", &main, &child);
                 assert_eq!(state.main_behind_child, Some(status));
+                use orca_runtime::surface::{
+                    AttachResult, FreshAttachRequest, SurfaceAttachmentRole, SurfaceRequestId,
+                };
+                let control = crate::operation_controller::TuiSurfaceTaskControl::new();
+                let AttachResult::FreshAttached { attachment } =
+                    thread.surface().attach_fresh(FreshAttachRequest {
+                        request_id: SurfaceRequestId::new(),
+                        role: SurfaceAttachmentRole::Tui,
+                        requested_capabilities: [
+                            orca_runtime::surface::SurfaceCapability::ReadSnapshot,
+                        ]
+                        .into(),
+                        interaction_capabilities: Default::default(),
+                    })
+                else {
+                    panic!("attach")
+                };
+                control
+                    .install_surface(
+                        attachment.client,
+                        main.interactions[0].fence.operation_id.clone(),
+                    )
+                    .unwrap();
+                let parent = crate::protocol::SessionAttachmentId::new(1);
+                let (sender, events) = mpsc::unbounded();
+                let routing = std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::attachment_routing::AttachmentRouting::new(parent),
+                ));
+                crate::attachment_routing::AttachmentRouting::switch_attachment_deferred(
+                    &routing, &sender, parent, None,
+                );
+                let duplicate = control
+                    .register_surface_interaction(&main.interactions[0])
+                    .unwrap();
+                crate::hosted_child::project_returned_main(
+                    thread, &main, parent, &sender, &control, &routing,
+                )
+                .unwrap();
+                apply_attached(&mut state, events.clone());
+                assert_eq!(state.status, AppStatus::WaitingUserInput);
+                assert!(
+                    crate::test_support::frame_string(&mut state, 120, 40).contains("Continue?")
+                );
+                routing.lock().unwrap().route(&sender, parent, duplicate);
+                crate::attachment_routing::AttachmentRouting::release_deferred_parent_events(
+                    &routing, &sender,
+                );
+                assert_eq!(events.try_iter().count(), 0, "request replayed twice");
             }
         });
     }

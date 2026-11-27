@@ -519,6 +519,7 @@ pub struct HostedTurnRequest {
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler + Send + Sync>>,
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
     event_observer: Option<Arc<dyn EventObserver>>,
+    queue_presentation: Option<Arc<QueuePresentation>>,
     continuation: Option<RuntimeTurnContinuation>,
     resumes_existing_turn: bool,
     task_id: Option<String>,
@@ -684,6 +685,7 @@ impl HostedTurnRequest {
             user_input_handler: None,
             mcp_elicitation_handler: None,
             event_observer: None,
+            queue_presentation: None,
             continuation: None,
             resumes_existing_turn: false,
             task_id: None,
@@ -3284,12 +3286,34 @@ pub struct RuntimeThreadHandle {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     surface: surface::RuntimeSurfaceHandle,
     prompt_queue_updates: tokio::sync::watch::Sender<crate::prompt_queue::PromptQueueSnapshot>,
-    prompt_queue_observer: Arc<Mutex<Option<Arc<dyn EventObserver>>>>,
+    prompt_queue_observer: Arc<Mutex<Option<QueueObservers>>>,
     prompt_queue_interaction_handlers: Arc<Mutex<PromptQueueInteractionHandlers>>,
     prompt_queue_dispatch_ready: Arc<AtomicBool>,
     /// Whether an interactive surface shows this thread now: set with the
     /// surface's event observer, cleared when the surface moves elsewhere.
     prompt_queue_surface_attached: Arc<AtomicBool>,
+}
+
+pub enum QueueSurfaceUpdate<'a> {
+    Assistant(
+        &'a surface::SurfaceCommitBatch,
+        &'a [surface::SurfaceAssistantStream],
+    ),
+    Terminal(&'a surface::OperationTerminalAtCursor),
+}
+
+type QueuePresentation = dyn Fn(QueueSurfaceUpdate<'_>) + Send + Sync;
+
+#[derive(Clone)]
+struct QueueObservers {
+    raw: Arc<dyn EventObserver>,
+    surface: Option<QueueSurfaceObservers>,
+}
+
+#[derive(Clone)]
+struct QueueSurfaceObservers {
+    supplemental: Arc<dyn EventObserver>,
+    committed: Arc<QueuePresentation>,
 }
 
 /// Interaction handlers used when the durable prompt queue starts a legacy
@@ -3591,10 +3615,32 @@ impl RuntimeThreadHandle {
     /// Observes the turns this thread starts on its own; an interactive
     /// surface calls it when it shows the thread.
     pub fn set_prompt_queue_event_observer(&self, observer: Arc<dyn EventObserver>) {
+        self.set_queue_observers(QueueObservers {
+            raw: observer,
+            surface: None,
+        });
+    }
+
+    pub fn set_prompt_queue_surface_observer(
+        &self,
+        legacy: Arc<dyn EventObserver>,
+        supplemental: Arc<dyn EventObserver>,
+        committed: impl Fn(QueueSurfaceUpdate<'_>) + Send + Sync + 'static,
+    ) {
+        self.set_queue_observers(QueueObservers {
+            raw: legacy,
+            surface: Some(QueueSurfaceObservers {
+                supplemental,
+                committed: Arc::new(committed),
+            }),
+        });
+    }
+
+    fn set_queue_observers(&self, observers: QueueObservers) {
         *self
             .prompt_queue_observer
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observers);
         self.prompt_queue_surface_attached
             .store(true, Ordering::Release);
     }
@@ -3920,6 +3966,7 @@ impl RuntimeThreadHandle {
         let started = RuntimeStartedTurn {
             turn_id: None,
             observer: Some(request.observer),
+            surface_observers: None,
             interaction_handlers: PromptQueueInteractionHandlers {
                 approval: request.approval,
                 permission: request.permission,
@@ -12763,6 +12810,7 @@ struct RuntimeStartedTurn {
     /// The turn's id, when whoever queued the message already named it.
     turn_id: Option<TurnId>,
     observer: Option<Arc<dyn EventObserver>>,
+    surface_observers: Option<QueueSurfaceObservers>,
     interaction_handlers: PromptQueueInteractionHandlers,
     /// A delegated child turn carries its root's headless flag, which the
     /// raw start took from `HostedTurnRequest::with_headless_root`.
@@ -12770,6 +12818,14 @@ struct RuntimeStartedTurn {
 }
 
 impl RuntimeStartedTurn {
+    fn apply_on_surface(mut self, mut request: HostedTurnRequest) -> HostedTurnRequest {
+        if let Some(surface) = self.surface_observers.take() {
+            self.observer = Some(surface.supplemental);
+            request.queue_presentation = Some(surface.committed);
+        }
+        self.apply(request)
+    }
+
     fn apply(self, mut request: HostedTurnRequest) -> HostedTurnRequest {
         if let Some(turn_id) = self.turn_id {
             request = request.with_turn_id(turn_id);
@@ -17682,19 +17738,12 @@ impl ThreadActor {
         if owed.is_empty() || owed == self.last_child_results_wake_owed {
             return;
         }
-        let Some(observer) = self
-            .handle
-            .prompt_queue_observer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        else {
+        let started = self.runtime_started_turn(None);
+        if started.observer.is_none() {
             return;
-        };
+        }
         self.last_child_results_wake = Some(Instant::now());
         self.last_child_results_wake_owed = owed;
-        let mut started = self.runtime_started_turn(None);
-        started.observer = Some(observer);
         if self
             .start_runtime_turn_on_surface(CHILD_RESULTS_WAKE_PROMPT, &[], started.clone())
             .is_ok()
@@ -17722,14 +17771,16 @@ impl ThreadActor {
     /// What a turn this thread starts on its own is watched and answered
     /// through: whatever the surface that shows the thread last handed over.
     fn runtime_started_turn(&self, turn_id: Option<TurnId>) -> RuntimeStartedTurn {
+        let observers = self
+            .handle
+            .prompt_queue_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         RuntimeStartedTurn {
             turn_id,
-            observer: self
-                .handle
-                .prompt_queue_observer
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
+            observer: observers.as_ref().map(|observers| observers.raw.clone()),
+            surface_observers: observers.and_then(|observers| observers.surface),
             interaction_handlers: self
                 .handle
                 .prompt_queue_interaction_handlers
@@ -19591,7 +19642,10 @@ impl ThreadActor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let _ = observe_event(observer.as_deref(), event);
+        let _ = observe_event(
+            observer.as_ref().map(|observers| observers.raw.as_ref()),
+            event,
+        );
     }
 
     fn handle_idle_command(&mut self, command: ThreadCommand) {

@@ -862,20 +862,6 @@ impl AppState {
         self.conversation_target = target;
     }
 
-    /// Called as a child's conversation replaces the main one: what main
-    /// was doing is what it is doing behind the child, until it says more.
-    pub(crate) fn note_main_behind_child(&mut self) {
-        if self.conversation_target.task_id().is_some() {
-            return;
-        }
-        self.main_behind_child = Some(match self.status {
-            AppStatus::Idle | AppStatus::Setup | AppStatus::SessionPicker => SideParentStatus::Idle,
-            AppStatus::WaitingApproval => SideParentStatus::NeedsApproval,
-            AppStatus::WaitingUserInput => SideParentStatus::NeedsInput,
-            AppStatus::Running | AppStatus::Compacting => SideParentStatus::Running,
-        });
-    }
-
     pub(crate) fn clear_task_transcript(&mut self) {
         self.task_transcript = None;
     }

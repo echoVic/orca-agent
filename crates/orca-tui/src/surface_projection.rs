@@ -1486,17 +1486,7 @@ impl TuiSurfaceProjection {
                     stream.next_offset = orca_runtime::surface::ByteOffset::new(
                         offset.get().saturating_add(text.as_str().len() as u64),
                     );
-                    match stream.channel {
-                        AssistantChannel::Message => {
-                            projected.push(TuiEvent::MessageDelta(text.as_str().to_string()));
-                        }
-                        AssistantChannel::Reasoning => {
-                            projected.push(TuiEvent::ReasoningDelta(text.as_str().to_string()));
-                        }
-                        AssistantChannel::Plan => {
-                            projected.push(TuiEvent::ProposedPlanDelta(text.as_str().to_string()));
-                        }
-                    }
+                    projected.push(assistant_delta(stream.channel, text.as_str()));
                 }
                 SurfaceEvent::Assistant(AssistantPatch::StreamDiscarded { stream_id, .. }) => {
                     if let Some(stream) = assistant_streams.get_mut(stream_id) {
@@ -2439,6 +2429,47 @@ pub(crate) fn operation_terminal_status(terminal: &OperationTerminal) -> Option<
         OperationTerminal::Blocked { .. } => Some("blocked"),
         OperationTerminal::Shutdown { .. } => Some("cancelled"),
     }
+}
+
+fn assistant_delta(channel: AssistantChannel, text: &str) -> TuiEvent {
+    match channel {
+        AssistantChannel::Message => TuiEvent::MessageDelta(text.to_owned()),
+        AssistantChannel::Reasoning => TuiEvent::ReasoningDelta(text.to_owned()),
+        AssistantChannel::Plan => TuiEvent::ProposedPlanDelta(text.to_owned()),
+    }
+}
+
+pub(crate) fn committed_queue_assistant_events(
+    batch: &SurfaceCommitBatch,
+    streams: &[SurfaceAssistantStream],
+) -> Vec<TuiEvent> {
+    let mut events = Vec::new();
+    for envelope in batch.events.as_slice() {
+        match &envelope.event {
+            SurfaceEvent::Assistant(AssistantPatch::Delta {
+                stream_id, text, ..
+            }) => {
+                if let Some(stream) = streams
+                    .iter()
+                    .rev()
+                    .find(|stream| &stream.stream_id == stream_id)
+                {
+                    events.push(assistant_delta(stream.channel, text.as_str()));
+                }
+            }
+            SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted { response }) => {
+                events.push(response_completed_event(response));
+                if let Some(plan) = &response.plan_item {
+                    events.push(TuiEvent::ProposedPlanDelta(plan.text.as_str().to_owned()));
+                }
+            }
+            SurfaceEvent::Assistant(AssistantPatch::StreamDiscarded { .. }) => {
+                events.push(TuiEvent::AssistantAttemptDiscarded)
+            }
+            _ => {}
+        }
+    }
+    events
 }
 
 fn response_completed_event(response: &SurfaceCompletedModelResponse) -> TuiEvent {

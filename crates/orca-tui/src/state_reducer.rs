@@ -168,6 +168,7 @@ impl AppState {
                     Err(error) => self.push_message(ChatMessage::Error(error)),
                 }
             }
+            TuiEvent::SurfaceDelivery(delivery) => self.update(delivery.1),
             TuiEvent::Attached(_) => {
                 eprintln!("orca: ignored an attached TUI event that bypassed attachment fencing");
             }
@@ -202,9 +203,7 @@ impl AppState {
                 }
             }
             TuiEvent::ChildFocusChanged { task_id } => {
-                if task_id.is_some() {
-                    self.note_main_behind_child();
-                } else {
+                if task_id.is_none() {
                     self.main_behind_child = None;
                 }
                 self.pending_tool_image_call_id = None;
@@ -337,8 +336,8 @@ impl AppState {
             TuiEvent::RuntimeTurnStarted { turn_id } => {
                 self.invalidate_recap();
                 self.suppress_background_main_session_output = false;
-                self.enter_running();
                 if self.runtime_turn_id.as_deref() != Some(turn_id.as_str()) {
+                    self.enter_running();
                     // Nobody typed this turn here: it answers the next queued
                     // message, or wakes for agents that finished. Say which,
                     // so its reply reads as a new one.
@@ -1604,6 +1603,7 @@ impl AppState {
         // transcript and is replaced, and put them back after the completed
         // text; left in place they would keep the streamed reasoning above
         // them and gain a second copy below.
+        let restored = self.transcript.assistant_stream.is_restored_reply();
         let receiving = self.take_trailing_receiving_tool_calls();
         // The response's own streamed text is what trails the transcript:
         // the text before the last tool row, notice, or message belongs to
@@ -1619,6 +1619,9 @@ impl AppState {
         // Streaming markdown may still hold an unfinished partial line from the
         // content being replaced; drop it so the completed response renders alone.
         self.reset_assistant_stream();
+        if restored {
+            self.transcript.assistant_stream.restore_open_reply();
+        }
         if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
             self.push_message(ChatMessage::Reasoning {
                 text: reasoning.to_string(),

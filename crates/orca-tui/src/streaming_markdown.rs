@@ -26,6 +26,10 @@ struct FenceState {
 }
 
 impl StreamingMarkdownAssembler {
+    pub(crate) fn is_restored_reply(&self) -> bool {
+        self.restored_reply
+    }
+
     pub(crate) fn restore_open_reply(&mut self) {
         self.restored_reply = true;
     }

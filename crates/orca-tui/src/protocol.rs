@@ -232,6 +232,38 @@ pub struct AcpMetricsSnapshot {
     pub context_limit_tokens: usize,
 }
 
+impl TuiEvent {
+    pub(crate) fn at_surface_cursor(
+        self,
+        routed: bool,
+        cursor: &orca_runtime::surface::SurfaceCursor,
+    ) -> Self {
+        if routed
+            && matches!(
+                &self,
+                Self::TurnStarted { .. }
+                    | Self::SessionCompleted { .. }
+                    | Self::MessageDelta(_)
+                    | Self::OpenMessageRestored(_)
+                    | Self::ReasoningDelta(_)
+                    | Self::ProposedPlanDelta(_)
+                    | Self::AssistantResponseCompleted(..)
+                    | Self::AssistantAttemptDiscarded
+                    | Self::SurfaceProjectionSynced(_)
+                    | Self::PlanUpdated { .. }
+                    | Self::ApprovalNeeded { .. }
+                    | Self::PermissionApprovalNeeded { .. }
+                    | Self::UserInputRequested { .. }
+                    | Self::McpElicitationRequested { .. }
+            )
+        {
+            Self::SurfaceDelivery(Box::new((cursor.clone(), self)))
+        } else {
+            self
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TuiEvent {
@@ -241,6 +273,8 @@ pub enum TuiEvent {
     },
     #[doc(hidden)]
     Attached(Box<AttachedTuiEvent>),
+    #[doc(hidden)]
+    SurfaceDelivery(Box<(orca_runtime::surface::SurfaceCursor, TuiEvent)>),
     #[doc(hidden)]
     SessionAttachmentActivated,
     SideConversationChanged {

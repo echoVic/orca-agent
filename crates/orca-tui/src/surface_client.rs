@@ -274,7 +274,8 @@ pub(crate) fn manual_compact(
         .ok_or_else(|| io::Error::other("typed TUI surface subscription unavailable"))?;
     let mut projection = TuiSurfaceProjection::from_surface_snapshot(&attachment.baseline.snapshot);
     for event in projection.hydrate_open_streams() {
-        let _ = event_tx.send(event);
+        let _ = event_tx
+            .send(event.at_surface_cursor(controller.view().is_some(), projection.cursor()));
     }
     let output = match attachment
         .client
@@ -2189,7 +2190,8 @@ fn run_typed_surface(
         ));
     }
     for event in projection.hydrate_open_streams() {
-        let _ = event_tx.send(event);
+        let _ = event_tx
+            .send(event.at_surface_cursor(controller.view().is_some(), projection.cursor()));
     }
     let mut input_blocks = vec![SurfaceInputRequestBlock::Text {
         text: orca_runtime::surface::DisplayText::new(request.prompt()),
@@ -2347,7 +2349,8 @@ fn control_recovered_operation(
     let mut projection = TuiSurfaceProjection::from_surface_snapshot(&attachment.baseline.snapshot);
     projection.focus_operation(operation_id.clone());
     for event in projection.hydrate_open_streams() {
-        let _ = event_tx.send(event);
+        let _ = event_tx
+            .send(event.at_surface_cursor(controller.view().is_some(), projection.cursor()));
     }
 
     match control {
@@ -2551,6 +2554,7 @@ fn drain_operation_with_boundary(
     let mut failure: Option<io::Error> = None;
     let mut projected_terminal_event = None;
     let mut projected_compacted_event = None;
+    let routed = controller.view().is_some();
     while (!terminal_seen || terminal_receipt.is_none()) && !sealed {
         if projection.active_generation_fence(operation_id).is_some()
             && controller.begin_surface_background_handoff(operation_id)
@@ -2664,7 +2668,8 @@ fn drain_operation_with_boundary(
                             if let Some(event) =
                                 controller.register_surface_interaction(interaction)
                             {
-                                let _ = event_tx.send(event);
+                                let _ = event_tx
+                                    .send(event.at_surface_cursor(routed, &batch.cursor_after));
                             }
                         }
                     }
@@ -2678,7 +2683,8 @@ fn drain_operation_with_boundary(
                                 {
                                     projected_compacted_event = Some(event);
                                 } else {
-                                    let _ = event_tx.send(event);
+                                    let _ = event_tx
+                                        .send(event.at_surface_cursor(routed, &batch.cursor_after));
                                 }
                             }
                         }
@@ -2759,10 +2765,10 @@ fn drain_operation_with_boundary(
             let _ = event_tx.send(compacted);
         }
         if let Some(terminal_event) = projected_terminal_event {
-            let _ = event_tx.send(terminal_event);
+            let _ = event_tx.send(terminal_event.at_surface_cursor(routed, &terminal.cursor));
         } else {
             for event in operation_terminal_events(&terminal.terminal) {
-                let _ = event_tx.send(event);
+                let _ = event_tx.send(event.at_surface_cursor(routed, &terminal.cursor));
             }
         }
         waiter_guard.join();

@@ -634,6 +634,7 @@ pub(crate) fn handle_hosted_child_action(
             event_tx,
             session_attachment,
             attachment_routing,
+            control,
         ),
     }
 }
@@ -825,46 +826,32 @@ fn return_to_parent(
     event_tx: &mut mpsc::Sender<TuiEvent>,
     session_attachment: &mut SessionAttachmentId,
     attachment_routing: &Arc<Mutex<AttachmentRouting>>,
+    control: &TuiSurfaceTaskControl,
 ) {
     let Some(mut child_focus) = focus.take() else {
         return;
     };
-    let parent_snapshot = match read_parent_snapshot(&child_focus.parent_thread) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            reject(
-                event_tx,
-                &format!("failed to return to parent conversation: {error}"),
-            );
-            *focus = Some(child_focus);
-            return;
-        }
-    };
-
-    // Install the parent attachment first, but hold parent events until its
-    // reset/history projection is visible. This is the same barrier used by
-    // side conversations and prevents a late child event from mutating the
-    // newly restored parent view.
-    AttachmentRouting::switch_attachment_deferred(
+    let projected = snapshot_for_return(
         attachment_routing,
         root_event_tx,
         child_focus.parent_attachment,
-        None,
-    );
-    *thread = Some(child_focus.parent_thread.clone());
-    *event_tx = child_focus.parent_event_tx.clone();
-    *session_attachment = child_focus.parent_attachment;
-
-    if let Err(error) = project_returned_main(
-        &child_focus.parent_thread,
-        &parent_snapshot,
-        child_focus.parent_attachment,
-        root_event_tx,
-    ) {
-        reject(
-            event_tx,
-            &format!("failed to project parent conversation: {error}"),
-        );
+        || {
+            read_parent_snapshot(&child_focus.parent_thread)
+                .map_err(|error| format!("failed to return to parent conversation: {error}"))
+        },
+    )
+    .and_then(|parent_snapshot| {
+        project_returned_main(
+            &child_focus.parent_thread,
+            &parent_snapshot,
+            child_focus.parent_attachment,
+            root_event_tx,
+            control,
+            attachment_routing,
+        )
+        .map_err(|error| format!("failed to project parent conversation: {error}"))
+    });
+    if let Err(error) = projected {
         // Restore the child attachment as the active route before returning;
         // otherwise the focus record and event routing would disagree.
         // Keeping the focus record lets a subsequent return retry without
@@ -877,12 +864,13 @@ fn return_to_parent(
             false,
         );
         AttachmentRouting::cancel_deferred_parent_events(attachment_routing, root_event_tx);
-        *thread = Some(child_focus.child_thread.clone());
-        *event_tx = child_focus.child_event_tx.clone();
-        *session_attachment = child_focus.child_attachment;
+        reject(event_tx, &error);
         *focus = Some(child_focus);
         return;
     }
+    *thread = Some(child_focus.parent_thread.clone());
+    *event_tx = child_focus.parent_event_tx.clone();
+    *session_attachment = child_focus.parent_attachment;
     child_focus.event_bridge.stop();
     AttachmentRouting::release_deferred_parent_events(attachment_routing, root_event_tx);
     let _ = send_attached_event(
@@ -896,18 +884,30 @@ fn reject(event_tx: &mpsc::Sender<TuiEvent>, message: &str) {
     let _ = event_tx.send(TuiEvent::OperationRejected(message.to_string()));
 }
 
+pub(crate) fn snapshot_for_return(
+    routing: &Arc<Mutex<AttachmentRouting>>,
+    sender: &mpsc::Sender<TuiEvent>,
+    attachment: SessionAttachmentId,
+    read: impl FnOnce() -> Result<SurfaceSnapshot, String>,
+) -> Result<SurfaceSnapshot, String> {
+    AttachmentRouting::switch_attachment_deferred(routing, sender, attachment, None);
+    read()
+}
+
 pub(crate) fn project_returned_main(
     thread: &RuntimeThreadHandle,
     snapshot: &SurfaceSnapshot,
     attachment: SessionAttachmentId,
     sender: &mpsc::Sender<TuiEvent>,
+    control: &TuiSurfaceTaskControl,
+    routing: &Arc<Mutex<AttachmentRouting>>,
 ) -> Result<(), String> {
     let (projection, conversation) = hosted_projection_batch_from_snapshot(thread, snapshot);
     project_hosted_thread_attached(projection, conversation, None, attachment, sender)?;
     if let Some(generation) = snapshot
         .foreground_operation
         .as_ref()
-        .filter(|operation| operation.terminal.is_none())
+        .or_else(|| snapshot.operation_history.last())
         .and_then(|operation| operation.generations.last())
     {
         send_attached_event(
@@ -922,6 +922,18 @@ pub(crate) fn project_returned_main(
     for event in streams.hydrate_conversation() {
         send_attached_event(sender, attachment, event).map_err(|error| error.to_string())?;
     }
+    if let Ok(queue) = thread.prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::List) {
+        send_attached_event(sender, attachment, TuiEvent::PromptQueueUpdated(queue))
+            .map_err(|error| error.to_string())?;
+    }
+    let requests = register_requested_interactions(snapshot, control);
+    routing
+        .lock()
+        .map_err(|error| error.to_string())?
+        .snapshot_projected(attachment, snapshot, &requests);
+    for event in requests {
+        send_attached_event(sender, attachment, event).map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -930,30 +942,33 @@ fn main_started_at_ms(thread: &RuntimeThreadHandle, snapshot: &SurfaceSnapshot) 
         .foreground_operation
         .as_ref()
         .filter(|op| op.terminal.is_none())?;
-    let generation = operation.generations.last()?;
-    let task_id = operation
-        .agent_loop_turns
-        .iter()
-        .rev()
-        .filter(|turn| turn.fence == generation.fence)
-        .find_map(|turn| turn.admitted_main_task_id.as_ref())?;
-    let start = snapshot
-        .tasks
-        .iter()
-        .find(|row| {
-            &row.task_id == task_id
-                && row.task_type == orca_runtime::surface::SurfaceTaskType::MainSession
-        })
-        .and_then(|row| row.started_at)
-        .map(|time| time.get())
-        .or_else(|| {
-            thread
-                .task_registry()
-                .get(task_id.as_str())
-                .filter(|row| row.task_type == orca_core::task_types::TaskType::MainSession)
-                .and_then(|row| row.started_at_ms)
-        })?;
-    u64::try_from(start).ok()
+    let generation_start = |generation: &orca_runtime::surface::GenerationRecord| {
+        let task_id = operation
+            .agent_loop_turns
+            .iter()
+            .filter(|turn| turn.fence == generation.fence)
+            .find_map(|turn| turn.admitted_main_task_id.as_ref())?;
+        let start = snapshot
+            .tasks
+            .iter()
+            .find(|row| {
+                &row.task_id == task_id
+                    && row.task_type == orca_runtime::surface::SurfaceTaskType::MainSession
+            })
+            .and_then(|row| row.started_at)
+            .map(|time| time.get())
+            .or_else(|| {
+                // Remove the cache fallback once admission publishes the main task's start on the surface.
+                thread
+                    .task_registry()
+                    .get_cached(task_id.as_str())
+                    .filter(|row| row.task_type == orca_core::task_types::TaskType::MainSession)
+                    .and_then(|row| row.started_at_ms)
+            })?;
+        u64::try_from(start).ok()
+    };
+    let (first, later) = operation.generations.split_first()?;
+    generation_start(first).or_else(|| later.iter().rev().find_map(generation_start))
 }
 
 fn read_parent_snapshot(thread: &RuntimeThreadHandle) -> Result<SurfaceSnapshot, String> {

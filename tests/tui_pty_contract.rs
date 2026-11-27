@@ -781,36 +781,69 @@ fn tui_shows_a_background_agents_progress_while_the_parent_turn_waits_on_it() {
 
 #[test]
 fn tui_return_from_an_agent_keeps_the_running_main() {
-    return_from_marker_held_agent(false);
+    return_from_marker_held_agent(ReturnScenario::Running);
 }
 
 #[test]
 fn tui_return_from_an_agent_restores_the_queued_turns_open_text() {
-    return_from_marker_held_agent(true);
+    return_from_marker_held_agent(ReturnScenario::Queued);
 }
 
-fn return_from_marker_held_agent(queue_next_turn: bool) {
+#[test]
+fn tui_return_from_an_agent_restores_mains_pending_approval() {
+    return_from_marker_held_agent(ReturnScenario::Approval);
+}
+
+enum ReturnScenario {
+    Running,
+    Queued,
+    Approval,
+}
+
+fn return_from_marker_held_agent(scenario: ReturnScenario) {
+    let queue_next_turn = matches!(scenario, ReturnScenario::Queued);
+    let approval = matches!(scenario, ReturnScenario::Approval);
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
     let marker = cwd.path().join("release");
-    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n").unwrap();
-    let mut process = PtyProcess::spawn_with_prompt(
-        home.path(),
-        cwd.path(),
-        &format!(
-            "subagent async mock_stream_release_marker {}",
-            marker.display()
-        ),
+    let mode = if approval { "suggest" } else { "full-auto" };
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!("mode = \"{mode}\"\n"),
     )
     .unwrap();
+    let mut prompt = format!(
+        "subagent async mock_stream_release_marker {}",
+        marker.display()
+    );
+    let ask = cwd.path().join("ask");
+    if approval {
+        std::fs::write(cwd.path().join("witness.txt"), "before").unwrap();
+        prompt = format!(
+            "mock_stream_tool_release_marker {}",
+            serde_json::json!({"marker":ask, "toolPrompt":"edit witness.txt :: before => after", "firstToolPrompt":prompt})
+        );
+    }
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), &prompt).unwrap();
     let mut output = Vec::new();
     accept_new_workspace(&mut process, &mut output);
-    assert_screen_has_text(
-        &process,
-        &mut output,
-        "Delegating to 1 agent",
-        "missing live delegation",
-    );
+    if approval {
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Approve · subagent",
+            "main did not ask to start the agent",
+        );
+        process.write(b"1").unwrap();
+    }
+    if !approval {
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Delegating to 1 agent",
+            "missing live delegation",
+        );
+    }
     assert_screen_has_text(&process, &mut output, "thinking,", "child has not started");
     if queue_next_turn {
         process.write(b"mock_stream_delay_ms 4000\r").unwrap();
@@ -833,6 +866,41 @@ fn return_from_marker_held_agent(queue_next_turn: bool) {
     );
     if queue_next_turn {
         std::fs::write(&marker, b"").unwrap();
+    }
+    if approval {
+        std::fs::write(&ask, b"").unwrap();
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Main needs your approval",
+            "main did not ask during the visit",
+        );
+        process.write(b"\x1b").unwrap();
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Approve · edit",
+            "Esc did not restore main's request",
+        );
+        process.write(b"4").unwrap();
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Denied. Tell Orca what to do instead.",
+            "returned approval did not take the answer",
+        );
+        std::fs::write(&marker, b"").unwrap();
+        arm_idle_exit(&mut process, &mut output);
+        let status = process.wait_for_exit(Duration::from_secs(5));
+        process.close_io_and_join();
+        assert_eq!(status.code(), Some(130));
+        assert_eq!(
+            std::fs::read_to_string(cwd.path().join("witness.txt")).unwrap(),
+            "before"
+        );
+        return;
+    }
+    if queue_next_turn {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !session_contains_delta(&home.path().join("sessions")) {
             assert!(
@@ -868,6 +936,12 @@ fn return_from_marker_held_agent(queue_next_turn: bool) {
         !frame.contains("Inherited conversation context."),
         "{frame}"
     );
+    assert!(
+        frame.lines().any(|line| line.contains("Running")
+            && line.contains("Esc interrupt")
+            && !line.contains("Main is running")),
+        "{frame}"
+    );
     if queue_next_turn {
         assert!(
             frame.contains("Mock slow stream started.")
@@ -880,6 +954,19 @@ fn return_from_marker_held_agent(queue_next_turn: bool) {
             &mut output,
             "Mock slow stream started.Mock slow stream completed.",
             "the restored reply did not continue",
+        );
+        let frame = reconstruct_screen(&output);
+        assert_eq!(
+            frame
+                .matches("Mock slow stream started.Mock slow stream completed.")
+                .count(),
+            1,
+            "{frame}"
+        );
+        assert_eq!(
+            frame.matches("Mock slow stream started.").count(),
+            1,
+            "{frame}"
         );
     } else {
         assert!(frame.contains("Agents 1 active"), "{frame}");
@@ -1155,6 +1242,12 @@ fn tui_side_conversation_is_separate_disposable_and_returns_to_parent() {
         "Ctrl+/ back",
         Duration::from_secs(5),
         "TUI did not open Side",
+    );
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Inherited conversation context.",
+        "Side lost its inherited history label",
     );
     process
         .write(b"mock_history_echo\r")

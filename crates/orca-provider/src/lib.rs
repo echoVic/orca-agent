@@ -403,7 +403,25 @@ async fn call_streaming_async_with_output_budget(
 ) -> ProviderResponse {
     match kind {
         ProviderKind::Mock => {
-            if current_turn_has_tool_results(conversation) {
+            let gated_tool = mock_stream_tool_release_marker(conversation);
+            let results = current_turn_tool_results(conversation).count();
+            let first_tool = gated_tool
+                .as_ref()
+                .and_then(|fixture| fixture.first_tool_prompt.as_deref());
+            if results == 0
+                && let Some(first) = first_tool
+                && let Some(response) = mock_stream_tool_response(
+                    ProviderStep::ReasoningDelta("Mock first tool.".into()),
+                    first,
+                    "mock-tool-1",
+                )
+            {
+                for step in &response.steps {
+                    on_step(step);
+                }
+                return response;
+            }
+            if results > usize::from(first_tool.is_some()) {
                 let response = mock_call(conversation);
                 for step in &response.steps {
                     on_step(step);
@@ -494,13 +512,11 @@ async fn call_streaming_async_with_output_budget(
                     }),
                 };
             }
-            if let Some((release_marker, tool_prompt)) =
-                mock_stream_tool_release_marker(conversation)
-            {
+            if let Some(fixture) = gated_tool {
                 let started =
                     ProviderStep::MessageDelta("Mock slow tool stream started.".to_string());
                 on_step(&started);
-                while !release_marker.exists() {
+                while !fixture.marker.exists() {
                     if !sleep_with_cancel(Duration::from_millis(10), cancel).await {
                         return ProviderResponse {
                             steps: vec![started],
@@ -511,7 +527,13 @@ async fn call_streaming_async_with_output_budget(
                         };
                     }
                 }
-                if let Some(response) = mock_stream_tool_response(started, &tool_prompt) {
+                let id = if fixture.first_tool_prompt.is_some() {
+                    "mock-tool-2"
+                } else {
+                    "mock-tool-1"
+                };
+                if let Some(response) = mock_stream_tool_response(started, &fixture.tool_prompt, id)
+                {
                     return response;
                 }
             }
@@ -528,7 +550,9 @@ async fn call_streaming_async_with_output_budget(
                         usage: None,
                     };
                 }
-                if let Some(response) = mock_stream_tool_response(started, &tool_prompt) {
+                if let Some(response) =
+                    mock_stream_tool_response(started, &tool_prompt, "mock-tool-1")
+                {
                     return response;
                 }
             }
@@ -845,23 +869,32 @@ fn mock_stream_tool_delay_ms(conversation: &Conversation) -> Option<(u64, String
     Some((delay, tool_prompt.trim().to_string()))
 }
 
-fn mock_stream_tool_release_marker(
-    conversation: &Conversation,
-) -> Option<(std::path::PathBuf, String)> {
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MockToolRelease {
+    marker: std::path::PathBuf,
+    tool_prompt: String,
+    first_tool_prompt: Option<String>,
+}
+
+fn mock_stream_tool_release_marker(conversation: &Conversation) -> Option<MockToolRelease> {
     let payload = conversation
         .last_user_message()
         .unwrap_or("")
         .trim()
         .strip_prefix("mock_stream_tool_release_marker ")?;
-    let payload: serde_json::Value = serde_json::from_str(payload).ok()?;
-    let marker = payload.get("marker")?.as_str()?.trim();
-    let tool_prompt = payload.get("toolPrompt")?.as_str()?.trim();
-    (!marker.is_empty() && !tool_prompt.is_empty())
-        .then(|| (std::path::PathBuf::from(marker), tool_prompt.to_string()))
+    let fixture: MockToolRelease = serde_json::from_str(payload).ok()?;
+    (!fixture.marker.as_os_str().is_empty() && !fixture.tool_prompt.trim().is_empty())
+        .then_some(fixture)
 }
 
-fn mock_stream_tool_response(started: ProviderStep, tool_prompt: &str) -> Option<ProviderResponse> {
-    let tool_request = parse_mock_prompt(tool_prompt)?;
+fn mock_stream_tool_response(
+    started: ProviderStep,
+    tool_prompt: &str,
+    id: &str,
+) -> Option<ProviderResponse> {
+    let mut tool_request = parse_mock_prompt(tool_prompt)?;
+    tool_request.id = id.to_owned();
     let raw_call = RawToolCall {
         id: tool_request.id.clone(),
         function_name: tool_request.name.as_str().to_string(),
@@ -928,13 +961,13 @@ fn mock_stream_usage_delay_ms(conversation: &Conversation) -> Option<u64> {
         .map(|delay| delay.min(10_000))
 }
 
-fn current_turn_has_tool_results(conversation: &Conversation) -> bool {
+fn current_turn_tool_results(conversation: &Conversation) -> impl Iterator<Item = &Message> {
     conversation
         .messages
         .iter()
         .rev()
         .take_while(|message| !matches!(message, Message::User { .. }))
-        .any(|message| matches!(message, Message::Tool { .. }))
+        .filter(|message| matches!(message, Message::Tool { .. }))
 }
 
 fn mock_repeat_read_state(conversation: &Conversation) -> Option<(usize, usize, usize)> {
@@ -1009,7 +1042,7 @@ fn mock_offered_tools(
 }
 
 fn mock_call(conversation: &Conversation) -> ProviderResponse {
-    let has_tool_results = current_turn_has_tool_results(conversation);
+    let has_tool_results = current_turn_tool_results(conversation).next().is_some();
     let prompt = conversation.last_user_message().unwrap_or("");
 
     if prompt == "mock_echo_task_notifications" {

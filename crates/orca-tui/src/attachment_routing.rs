@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crossbeam_channel as mpsc;
 
 use crate::protocol::SessionAttachmentId;
-use crate::protocol::{AttachedTuiEvent, TuiEvent};
+use crate::protocol::{AttachedTuiEvent, TuiEvent, TuiInteractionKey};
 use crate::types::{AppState, SideParentStatus};
 
 #[derive(Default)]
@@ -14,9 +14,56 @@ pub(crate) struct AttachmentRouting {
     pending_parent_interactions: Vec<(SessionAttachmentId, TuiEvent)>,
     deferred_parent_attachment: Option<SessionAttachmentId>,
     deferred_parent_events: Vec<TuiEvent>,
+    restored: Option<RestoredParent>,
+}
+
+struct RestoredParent {
+    attachment: SessionAttachmentId,
+    cursor: orca_runtime::surface::SurfaceCursor,
+    requests: Vec<TuiInteractionKey>,
 }
 
 impl AttachmentRouting {
+    fn covered(&self, attachment: SessionAttachmentId, event: &TuiEvent) -> bool {
+        let restored = self
+            .restored
+            .as_ref()
+            .filter(|parent| parent.attachment == attachment);
+        let event = match event {
+            TuiEvent::SurfaceDelivery(delivery) => {
+                let (cursor, event) = delivery.as_ref();
+                if restored.is_some_and(|parent| {
+                    parent.cursor.thread_id == cursor.thread_id
+                        && parent.cursor.incarnation == cursor.incarnation
+                        && cursor.next_seq <= parent.cursor.next_seq
+                }) {
+                    return true;
+                }
+                event
+            }
+            event => event,
+        };
+        interaction_key(event)
+            .is_some_and(|key| restored.is_some_and(|parent| parent.requests.contains(key)))
+    }
+
+    pub(crate) fn snapshot_projected(
+        &mut self,
+        attachment: SessionAttachmentId,
+        snapshot: &orca_runtime::surface::SurfaceSnapshot,
+        requests: &[TuiEvent],
+    ) {
+        self.restored = Some(RestoredParent {
+            attachment,
+            cursor: snapshot.cursor.clone(),
+            requests: requests
+                .iter()
+                .filter_map(interaction_key)
+                .cloned()
+                .collect(),
+        });
+    }
+
     pub(crate) fn new(active: SessionAttachmentId) -> Self {
         Self {
             active: Some(active),
@@ -25,6 +72,7 @@ impl AttachmentRouting {
             pending_parent_interactions: Vec::new(),
             deferred_parent_attachment: None,
             deferred_parent_events: Vec::new(),
+            restored: None,
         }
     }
 
@@ -71,7 +119,7 @@ impl AttachmentRouting {
         }
         if replay_parent_interactions {
             for (_, event) in std::mem::take(&mut routing.pending_parent_interactions) {
-                if send_attached_event(root_event_tx, attachment, event).is_err() {
+                if send_attached_event(root_event_tx, attachment, unpack(event)).is_err() {
                     break;
                 }
             }
@@ -94,6 +142,13 @@ impl AttachmentRouting {
             .retain(|(source, _)| *source != attachment);
         if routing.parent_while_side == Some(attachment) {
             routing.parent_while_side = None;
+        }
+        if routing
+            .restored
+            .as_ref()
+            .is_some_and(|parent| parent.attachment == attachment)
+        {
+            routing.restored = None;
         }
     }
 
@@ -135,12 +190,19 @@ impl AttachmentRouting {
         let Some(attachment) = routing.deferred_parent_attachment.take() else {
             return;
         };
-        for (_, event) in std::mem::take(&mut routing.pending_parent_interactions) {
-            if send_attached_event(root_event_tx, attachment, event).is_err() {
+        for (source, event) in std::mem::take(&mut routing.pending_parent_interactions) {
+            if routing.covered(source, &event) {
+                continue;
+            }
+            if send_attached_event(root_event_tx, attachment, unpack(event)).is_err() {
                 return;
             }
         }
         for event in std::mem::take(&mut routing.deferred_parent_events) {
+            if routing.covered(attachment, &event) {
+                continue;
+            }
+            let event = unpack(event);
             if send_attached_event(root_event_tx, attachment, event.clone()).is_err() {
                 return;
             }
@@ -162,29 +224,46 @@ impl AttachmentRouting {
         };
         routing.deferred_parent_attachment = None;
         for event in std::mem::take(&mut routing.deferred_parent_events) {
-            if is_tui_interaction_event(&event) {
-                let source = routing
-                    .parent_while_side
-                    .unwrap_or_else(|| routing.active.unwrap_or(SessionAttachmentId::new(1)));
+            let source = routing
+                .parent_while_side
+                .unwrap_or_else(|| routing.active.unwrap_or(SessionAttachmentId::new(1)));
+            if routing.covered(source, &event) {
+                continue;
+            }
+            if interaction_key(payload(&event)).is_some() {
                 routing
                     .pending_parent_interactions
                     .push((source, event.clone()));
             }
-            if let Some(status) = side_parent_status_for_event(&event) {
+            if let Some(status) = side_parent_status_for_event(payload(&event)) {
                 let _ = root_event_tx.send(TuiEvent::SideParentStatusChanged(status));
             }
         }
     }
 }
 
-fn is_tui_interaction_event(event: &TuiEvent) -> bool {
-    matches!(
-        event,
-        TuiEvent::ApprovalNeeded { .. }
-            | TuiEvent::PermissionApprovalNeeded { .. }
-            | TuiEvent::UserInputRequested { .. }
-            | TuiEvent::McpElicitationRequested { .. }
-    )
+fn unpack(event: TuiEvent) -> TuiEvent {
+    match event {
+        TuiEvent::SurfaceDelivery(delivery) => delivery.1,
+        event => event,
+    }
+}
+
+fn payload(event: &TuiEvent) -> &TuiEvent {
+    match event {
+        TuiEvent::SurfaceDelivery(delivery) => &delivery.1,
+        event => event,
+    }
+}
+
+fn interaction_key(event: &TuiEvent) -> Option<&TuiInteractionKey> {
+    match event {
+        TuiEvent::ApprovalNeeded { key, .. }
+        | TuiEvent::PermissionApprovalNeeded { key, .. }
+        | TuiEvent::UserInputRequested { key, .. }
+        | TuiEvent::McpElicitationRequested { key, .. } => Some(key),
+        _ => None,
+    }
 }
 
 fn background_tasks_from_event(
@@ -280,43 +359,57 @@ pub(crate) fn spawn_attached_event_sender_with_routing(
                     let Ok(mut routing) = routing.lock() else {
                         break;
                     };
-                    if routing.deferred_parent_attachment == Some(attachment) {
-                        routing.deferred_parent_events.push(event);
-                    } else if routing.parent_while_side == Some(attachment)
-                        && routing.active != Some(attachment)
-                    {
-                        if let Some(tasks) = background_tasks_from_event(&event) {
-                            let _ = root_event_tx.send(TuiEvent::BackgroundTasksUpdated(tasks));
-                        }
-                        if is_tui_interaction_event(&event) {
-                            routing
-                                .pending_parent_interactions
-                                .push((attachment, event.clone()));
-                        }
-                        if let Some(status) = side_parent_status_for_event(&event) {
-                            let _ = root_event_tx.send(TuiEvent::SideParentStatusChanged(status));
-                        }
-                        // The background key acts on main's turn from any
-                        // view, so its answer goes to the view on screen.
-                        // An answer that comes later (see the reducer's
-                        // arm) goes to the view on screen when it arrives,
-                        // and restores only that view's status; stage 2's
-                        // work on returning to main is to revisit this.
-                        if let TuiEvent::TurnKeptInForeground(notice) = event {
-                            let _ = root_event_tx.send(TuiEvent::TurnKeptInForeground(notice));
-                        }
-                    } else if send_attached_event(&root_event_tx, attachment, event).is_err() {
+                    if !routing.route(&root_event_tx, attachment, event) {
                         break;
                     }
-                    continue;
-                }
-                if send_attached_event(&root_event_tx, attachment, event).is_err() {
+                } else if send_attached_event(&root_event_tx, attachment, event).is_err() {
                     break;
                 }
             }
         })
         .expect("spawn TUI attachment relay");
     event_tx
+}
+
+impl AttachmentRouting {
+    pub(crate) fn route(
+        &mut self,
+        root_event_tx: &mpsc::Sender<TuiEvent>,
+        attachment: SessionAttachmentId,
+        event: TuiEvent,
+    ) -> bool {
+        if self.deferred_parent_attachment == Some(attachment) {
+            self.deferred_parent_events.push(event);
+            return true;
+        }
+        if self.covered(attachment, &event) {
+            return true;
+        }
+        if self.parent_while_side == Some(attachment) && self.active != Some(attachment) {
+            if let Some(tasks) = background_tasks_from_event(payload(&event)) {
+                let _ = root_event_tx.send(TuiEvent::BackgroundTasksUpdated(tasks));
+            }
+            if interaction_key(payload(&event)).is_some() {
+                self.pending_parent_interactions
+                    .push((attachment, event.clone()));
+            }
+            if let Some(status) = side_parent_status_for_event(payload(&event)) {
+                let _ = root_event_tx.send(TuiEvent::SideParentStatusChanged(status));
+            }
+            // The background key acts on main's turn from any
+            // view, so its answer goes to the view on screen.
+            // An answer that comes later (see the reducer's
+            // arm) goes to the view on screen when it arrives,
+            // and restores only that view's status; stage 2's
+            // work on returning to main is to revisit this.
+            if let TuiEvent::TurnKeptInForeground(notice) = event {
+                let _ = root_event_tx.send(TuiEvent::TurnKeptInForeground(notice));
+            }
+        } else if send_attached_event(root_event_tx, attachment, unpack(event)).is_err() {
+            return false;
+        }
+        true
+    }
 }
 
 pub(crate) fn send_attached_event(

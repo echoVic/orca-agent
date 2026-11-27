@@ -737,9 +737,14 @@ mod tests {
         let mut child = task("child", 1_000);
         child.subagent_child_thread_id = Some("child-thread".to_string());
         let (mut state, _rx) = conversation_with(vec![child]);
-        state.status = crate::types::AppStatus::Running;
-        state.update(crate::protocol::TuiEvent::ChildFocusChanged {
-            task_id: Some("child".to_string()),
+        state.update(crate::protocol::TuiEvent::ChildProjectionReset {
+            task_id: "child".to_string(),
+            main_status: Some(crate::types::SideParentStatus::Running),
+            projection: Box::new(
+                crate::surface_projection::SurfaceProjectionState::from_surface_snapshot(
+                    &crate::hosted_child::tests::snapshot_with_child(1, 6),
+                ),
+            ),
         });
         assert_eq!(
             state.main_behind_child,

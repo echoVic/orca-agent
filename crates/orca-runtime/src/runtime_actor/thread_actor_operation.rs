@@ -4975,7 +4975,7 @@ impl ThreadActor {
                 }
             });
         if let Some(started) = runtime_started {
-            hosted_request = started.apply(hosted_request);
+            hosted_request = started.apply_on_surface(hosted_request);
         }
         if let Some((_, task_id)) = &main_session_task {
             hosted_request = hosted_request.with_task_id(task_id.clone());
@@ -6686,6 +6686,9 @@ impl ThreadActor {
             );
         }
         self.cache_surface_terminal(value.clone());
+        if let Some(observer) = &active.request.queue_presentation {
+            observer(QueueSurfaceUpdate::Terminal(&value));
+        }
         Ok(Some(value))
     }
 
