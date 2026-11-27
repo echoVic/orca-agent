@@ -80,7 +80,7 @@ impl AppState {
         };
         let (cursor, event, owner) = *delivery;
         if let Some(owner) = owner {
-            if !event.accepts_lifecycle(
+            let accepted = event.accepts_lifecycle(
                 self.lifecycle_cursor.as_ref(),
                 &owner,
                 &cursor,
@@ -88,18 +88,36 @@ impl AppState {
                     self.status,
                     AppStatus::WaitingApproval | AppStatus::WaitingUserInput
                 ),
-            ) || matches!(event, TuiEvent::TerminalRecoveryNeeded(_))
-                && self.status == AppStatus::Idle
-                && self
-                    .lifecycle_cursor
-                    .as_ref()
-                    .is_some_and(|(current, previous)| current == &owner && previous == &cursor)
+            );
+            if let TuiEvent::Diagnostic(diagnostic) = event {
+                if accepted {
+                    return Some(TuiEvent::Diagnostic(diagnostic));
+                }
+                let current_turn_seen = self.turn_diagnostic_seen;
+                self.push_message(ChatMessage::Diagnostic(diagnostic));
+                self.turn_diagnostic_seen = current_turn_seen;
+                return None;
+            }
+            if !accepted
+                || matches!(event, TuiEvent::TerminalRecoveryNeeded(_))
+                    && self.status == AppStatus::Idle
+                    && self.lifecycle_cursor.as_ref().is_some_and(|previous| {
+                        !previous.live && previous.owner == owner && previous.cursor == cursor
+                    })
             {
                 return None;
             }
-            self.lifecycle_cursor = Some((owner, cursor));
+            self.lifecycle_cursor = Some(event.lifecycle_delivery(owner, cursor));
         }
         Some(event)
+    }
+
+    fn clear_terminal_interactions(&mut self) {
+        self.approval_dialog = None;
+        self.interaction.pending_input = None;
+        self.interaction.pending_mcp_elicitation_mode = None;
+        self.interaction.pending_submission = None;
+        self.user_input_dialog = None;
     }
 
     /// Adds output a tool wrote to its row: to a script's calls, or to any
@@ -202,13 +220,14 @@ impl AppState {
                 }
             }
             TuiEvent::TerminalRecoveryNeeded(message) => {
+                self.clear_terminal_interactions();
                 self.update(TuiEvent::Error(message));
                 self.set_status(AppStatus::Idle);
             }
             TuiEvent::Attached(_) => {
                 eprintln!("orca: ignored an attached TUI event that bypassed attachment fencing");
             }
-            TuiEvent::SessionAttachmentActivated => {}
+            TuiEvent::SessionAttachmentActivated | TuiEvent::SurfaceRequestSettled(_) => {}
             TuiEvent::SideConversationChanged {
                 active,
                 available,
@@ -284,10 +303,13 @@ impl AppState {
                 self.reset_session_projection();
                 self.invalidate_recap();
                 self.task_transcript = None;
-                self.lifecycle_cursor = projection
-                    .foreground_operation_id
-                    .clone()
-                    .map(|owner| (owner, projection.cursor.clone()));
+                self.lifecycle_cursor = projection.foreground_operation_id.clone().map(|owner| {
+                    crate::protocol::LifecycleDelivery {
+                        owner,
+                        cursor: projection.cursor.clone(),
+                        live: true,
+                    }
+                });
                 self.apply_surface_projection_state(*projection);
             }
             TuiEvent::ChildProjectionReset {
@@ -1228,11 +1250,7 @@ impl AppState {
                         TuiDiagnostic::from_completion_status(&status)
                     };
                 self.suppress_background_main_session_output = false;
-                self.approval_dialog = None;
-                self.interaction.pending_input = None;
-                self.interaction.pending_mcp_elicitation_mode = None;
-                self.interaction.pending_submission = None;
-                self.user_input_dialog = None;
+                self.clear_terminal_interactions();
                 self.clear_receiving_tool_progress();
                 self.flush_proposed_plan_parser();
                 self.finish_assistant_stream();

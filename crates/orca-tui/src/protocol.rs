@@ -232,6 +232,13 @@ pub struct AcpMetricsSnapshot {
     pub context_limit_tokens: usize,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct LifecycleDelivery {
+    pub owner: orca_runtime::surface::SurfaceOperationId,
+    pub cursor: orca_runtime::surface::SurfaceCursor,
+    pub live: bool,
+}
+
 impl TuiEvent {
     #[cfg(test)]
     pub(crate) fn into_test_payload(self) -> Self {
@@ -244,28 +251,45 @@ impl TuiEvent {
 
     pub(crate) fn accepts_lifecycle(
         &self,
-        previous: Option<&(
-            orca_runtime::surface::SurfaceOperationId,
-            orca_runtime::surface::SurfaceCursor,
-        )>,
+        previous: Option<&LifecycleDelivery>,
         owner: &orca_runtime::surface::SurfaceOperationId,
         cursor: &orca_runtime::surface::SurfaceCursor,
         waiting: bool,
     ) -> bool {
-        let Some((current, previous)) = previous.filter(|(_, previous)| {
-            previous.thread_id == cursor.thread_id && previous.incarnation == cursor.incarnation
+        let Some(previous) = previous.filter(|previous| {
+            previous.cursor.thread_id == cursor.thread_id
+                && previous.cursor.incarnation == cursor.incarnation
         }) else {
             return true;
         };
-        if previous.next_seq > cursor.next_seq {
+        if previous.cursor.next_seq > cursor.next_seq {
             return false;
         }
         match self {
-            Self::SessionCompleted { .. } | Self::TerminalRecoveryNeeded(_) => current == owner,
-            Self::TurnStarted { .. } | Self::RuntimeTurnStarted { .. } if current == owner => {
+            Self::SessionCompleted { .. }
+            | Self::TerminalRecoveryNeeded(_)
+            | Self::Diagnostic(_) => !previous.live || previous.owner == *owner,
+            Self::TurnStarted { .. } | Self::RuntimeTurnStarted { .. }
+                if previous.owner == *owner =>
+            {
                 !waiting
             }
             _ => true,
+        }
+    }
+
+    pub(crate) fn lifecycle_delivery(
+        &self,
+        owner: orca_runtime::surface::SurfaceOperationId,
+        cursor: orca_runtime::surface::SurfaceCursor,
+    ) -> LifecycleDelivery {
+        LifecycleDelivery {
+            owner,
+            cursor,
+            live: !matches!(
+                self,
+                Self::SessionCompleted { .. } | Self::TerminalRecoveryNeeded(_)
+            ),
         }
     }
 
@@ -275,7 +299,7 @@ impl TuiEvent {
         cursor: &orca_runtime::surface::SurfaceCursor,
         operation: &orca_runtime::surface::SurfaceOperationId,
     ) -> Self {
-        if routed && self.owns_operation_status() {
+        if routed && (self.owns_operation_status() || matches!(self, Self::Diagnostic(_))) {
             Self::SurfaceDelivery(Box::new((cursor.clone(), self, Some(operation.clone()))))
         } else {
             self.at_surface_cursor(routed, cursor)
@@ -458,6 +482,7 @@ pub enum TuiEvent {
         target: Option<String>,
         preview: Option<String>,
     },
+    SurfaceRequestSettled(String),
     PermissionApprovalNeeded {
         key: TuiInteractionKey,
         tool: String,

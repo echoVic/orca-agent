@@ -3201,6 +3201,85 @@ fn recovery_projection_is_not_overwritten_by_lifecycle_events() {
 }
 
 #[test]
+fn fix4_late_failure_keeps_its_line_without_finishing_the_new_stream() {
+    let mut state = state();
+    let op = || SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+    let first = op();
+    let second = op();
+    let send = |state: &mut AppState, seq, owner, event: TuiEvent| {
+        state.update(event.at_operation_cursor(
+            true,
+            &crate::surface_projection::test_surface_cursor(seq),
+            owner,
+        ))
+    };
+    send(
+        &mut state,
+        1,
+        &first,
+        TuiEvent::TurnStarted {
+            turn: 1,
+            started_at_ms: None,
+            task: None,
+        },
+    );
+    send(
+        &mut state,
+        3,
+        &second,
+        TuiEvent::RuntimeTurnStarted {
+            turn_id: "next".into(),
+        },
+    );
+    state.update(TuiEvent::OpenMessageRestored("not finished".into()));
+    let tail = state
+        .transcript
+        .assistant_stream_tail
+        .expect("second operation is streaming");
+    let failure = TuiDiagnostic::from_message(
+        crate::diagnostics::DiagnosticContext::Runtime,
+        "first provider failed",
+    );
+    send(&mut state, 2, &first, TuiEvent::Diagnostic(failure));
+    send(
+        &mut state,
+        2,
+        &first,
+        TuiEvent::SessionCompleted {
+            status: "failed".into(),
+        },
+    );
+    assert_eq!(state.transcript.assistant_stream_tail, Some(tail));
+    assert!(!state.current_turn_has_diagnostic());
+    assert!(state.last_completed_at.is_none());
+    assert_eq!(state.status, AppStatus::Running);
+    assert_eq!(state.transcript.messages.iter().filter(|row| matches!(row, ChatMessage::Diagnostic(diag) if diag.detail().contains("first provider failed"))).count(), 1);
+}
+
+#[test]
+fn fix4_recovery_closes_the_owners_approval() {
+    let mut state = state();
+    let owner = SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+    let cursor = crate::surface_projection::test_surface_cursor(3);
+    state.update(
+        TuiEvent::ApprovalNeeded {
+            key: interaction_key(TuiInteractionKind::Approval, "request"),
+            tool: "edit".into(),
+            target: None,
+            preview: None,
+        }
+        .at_operation_cursor(true, &cursor, &owner),
+    );
+    assert!(state.approval_dialog.is_some());
+    state.update(
+        TuiEvent::TerminalRecoveryNeeded("typed TUI terminal commit requires recovery".into())
+            .at_operation_cursor(true, &cursor, &owner),
+    );
+    assert_eq!(state.status, AppStatus::Idle);
+    assert!(state.approval_dialog.is_none());
+}
+
+#[test]
 fn committed_lifecycle_keeps_the_newer_operations_dialog() {
     for submitted in [false, true] {
         let mut state = state();

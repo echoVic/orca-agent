@@ -812,6 +812,75 @@ mod tests {
     }
 
     #[test]
+    fn fix4_cancelled_compaction_after_a_finished_turn_takes_typing() {
+        let (action_tx, _actions) = mpsc::unbounded();
+        let mut state = AppState::new(
+            action_tx.clone(),
+            "test".into(),
+            "mock".into(),
+            "/tmp".into(),
+        );
+        let operation = || {
+            orca_runtime::surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap()
+        };
+        let previous = operation();
+        let send = |state: &mut AppState, seq, owner, event: crate::protocol::TuiEvent| {
+            state.update(event.at_operation_cursor(
+                true,
+                &crate::surface_projection::test_surface_cursor(seq),
+                owner,
+            ))
+        };
+        use crate::protocol::TuiEvent;
+        send(
+            &mut state,
+            1,
+            &previous,
+            TuiEvent::TurnStarted {
+                started_at_ms: None,
+                turn: 1,
+                task: None,
+            },
+        );
+        send(
+            &mut state,
+            2,
+            &previous,
+            TuiEvent::SessionCompleted {
+                status: "success".into(),
+            },
+        );
+        state.update(TuiEvent::CompactionStarted);
+        send(
+            &mut state,
+            3,
+            &operation(),
+            TuiEvent::SessionCompleted {
+                status: "cancelled".into(),
+            },
+        );
+        let mut config = config();
+        let shared = Arc::new(Mutex::new(config.clone()));
+        let mut textarea = TextArea::default();
+        press_status_key(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut config,
+            &shared,
+            &action_tx,
+            &mut textarea,
+            &mut VimState::new(false),
+            &Theme::named(ThemeName::Dark),
+        );
+        assert_eq!(textarea.lines(), &["x"]);
+        assert_eq!(state.status, AppStatus::Idle);
+    }
+
+    #[test]
     fn compacting_keys_clear_only_pending_vim_command_state() {
         for (code, modifiers) in [
             (KeyCode::Esc, KeyModifiers::NONE),

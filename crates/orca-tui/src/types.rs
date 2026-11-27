@@ -25,6 +25,7 @@ use orca_runtime::history::SessionSummary;
 use orca_runtime::mentions::{MentionBindings, MentionCandidate};
 use orca_runtime::onboarding::FirstRunState;
 use orca_runtime::runtime_permission::RuntimePermissionRequestKind;
+#[cfg(test)]
 use orca_runtime::surface::SurfaceOperationId;
 
 use crate::agent_workspace::AgentWorkspaceState;
@@ -653,7 +654,7 @@ pub struct AppState {
     pub(crate) side_conversation: Option<SideConversationUiState>,
     pub(crate) side_conversation_visible: bool,
     pub(crate) active_session_attachment: Option<SessionAttachmentId>,
-    pub(crate) lifecycle_cursor: Option<(SurfaceOperationId, orca_runtime::surface::SurfaceCursor)>,
+    pub(crate) lifecycle_cursor: Option<crate::protocol::LifecycleDelivery>,
     pub(crate) workspace_git: Option<GitIdentity>,
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,

@@ -4142,8 +4142,10 @@ impl ThreadActor {
             else {
                 return Err(UNAVAILABLE);
             };
-            let subscription = surface
-                .claim_subscription(&attachment.subscription)
+            let subscription = self
+                .resident_surface
+                .hub
+                .claim_origin_subscription(&attachment.subscription)
                 .ok_or(UNAVAILABLE)?;
             Some((sender, attachment, subscription))
         } else {

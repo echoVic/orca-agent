@@ -20833,10 +20833,11 @@ impl ThreadActor {
     fn handle_running_command(&mut self, command: ThreadCommand, active: &mut ActiveOperation) {
         if matches!(
             &command,
-            ThreadCommand::SurfaceRequestToolApproval { .. }
-                | ThreadCommand::SurfaceRequestPermission { .. }
-                | ThreadCommand::SurfaceRequestUserInput { .. }
-                | ThreadCommand::SurfaceRequestMcpElicitation { .. }
+            ThreadCommand::SurfaceRequestToolApproval { fence, .. }
+                | ThreadCommand::SurfaceRequestPermission { fence, .. }
+                | ThreadCommand::SurfaceRequestUserInput { fence, .. }
+                | ThreadCommand::SurfaceRequestMcpElicitation { fence, .. }
+                if active.surface_operation.as_ref() == Some(fence)
         ) && self.interrupt_if_follow_gapped(active)
         {
             Self::reject_thread_command_unavailable(command);
@@ -29449,6 +29450,84 @@ mod tests {
         assert!(after.queued_operations == before.queued_operations);
         assert!(after.operation_history == before.operation_history);
         assert!(after.foreground_operation == before.foreground_operation);
+    }
+
+    #[test]
+    fn fix4_foreign_request_at_a_gapped_follow_does_not_cancel_the_active_turn() {
+        let cwd = tempfile::tempdir().unwrap();
+        let marker = ReleaseMarker(cwd.path().join("release-follow"));
+        let host = RuntimeHost::start().unwrap();
+        let config = surface_test_config(cwd.path().to_owned(), HistoryMode::Record);
+        let thread = host.start_thread(config, "foreign request").unwrap();
+        let (sender, follows) = mpsc::channel();
+        thread.set_prompt_queue_surface_observer(
+            Arc::new(|_: &orca_core::event_schema::EventEnvelope| Ok(())),
+            sender,
+        );
+        thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text(format!(
+                    "mock_stream_release_marker {}",
+                    marker.0.display()
+                )),
+            })
+            .unwrap();
+        let mut follow = follows.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        let fence = loop {
+            let Some(surface::SurfaceSubscriptionItem::Batch { batch }) =
+                follow.subscription.recv_timeout(SURFACE_TEST_TIMEOUT)
+            else {
+                panic!("no followed start")
+            };
+            if let Some(fence) = batch
+                .events
+                .as_slice()
+                .iter()
+                .find_map(|envelope| match &envelope.event {
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::AgentLoopTurnStarted { turn },
+                    ) => Some(turn.fence.clone()),
+                    _ => None,
+                })
+            {
+                break fence;
+            }
+        };
+        follow
+            .subscription
+            .gap_signal()
+            .store(true, std::sync::atomic::Ordering::Release);
+        let foreign = surface::SurfaceOperationFence {
+            operation_id: surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            ..fence
+        };
+        let (reply, answer) = mpsc::sync_channel(1);
+        thread
+            .command_tx
+            .try_send(ThreadCommand::SurfaceRequestUserInput {
+                fence: foreign,
+                request: crate::lifecycle::RuntimeUserInputRequest::single(
+                    "foreign",
+                    "?",
+                    Vec::new(),
+                ),
+                reply,
+            })
+            .unwrap();
+        assert!(answer.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap().is_err());
+        marker.release();
+        let receipt = follow
+            .client
+            .wait_operation_terminal(surface_request_id(), follow.operation.clone())
+            .unwrap();
+        host.shutdown().unwrap();
+        assert!(
+            matches!(receipt, surface::WaitOperationTerminalResult::Terminal { value } if matches!(value.terminal, surface::OperationTerminal::Succeeded {..})),
+            "foreign request cancelled main"
+        );
     }
 
     #[test]

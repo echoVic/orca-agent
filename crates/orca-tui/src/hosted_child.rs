@@ -1786,6 +1786,174 @@ pub(crate) mod live_child_for_test {
         host.shutdown().unwrap();
     }
 
+    #[test]
+    fn fix4_shutdown_releases_a_gapped_reader_before_its_worker_finishes() {
+        use orca_runtime::{
+            prompt_queue::{PromptQueueAction, PromptQueueInput},
+            runtime_host::RuntimeHost,
+        };
+        let timeout = std::time::Duration::from_secs(10);
+        let home = crate::test_support::isolate_orca_home();
+        let marker = home.path().join("held-after-interrupt");
+        let host = RuntimeHost::start_with_subscriber_limit_for_test(32).unwrap();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_owned());
+        config.history_mode = orca_core::config::HistoryMode::Record;
+        let thread = host.start_thread(config, "shutdown gap waiter").unwrap();
+        let (send, follows) = std::sync::mpsc::channel();
+        thread.set_prompt_queue_surface_observer(
+            std::sync::Arc::new(|_: &orca_core::event_schema::EventEnvelope| Ok(())),
+            send,
+        );
+        thread
+            .prompt_queue(PromptQueueAction::Add {
+                input: PromptQueueInput::text(format!(
+                    "mock_stream_usage_after_cancel_marker {}",
+                    marker.display()
+                )),
+            })
+            .unwrap();
+        let follow = follows.recv_timeout(timeout).unwrap();
+        let deadline = std::time::Instant::now() + timeout;
+        while !super::read_parent_snapshot(&thread)
+            .unwrap()
+            .assistant_streams
+            .iter()
+            .any(|stream| {
+                stream
+                    .text
+                    .as_str()
+                    .contains("Mock usage-after-cancel stream started.")
+            })
+        {
+            assert!(std::time::Instant::now() < deadline, "worker not streaming");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        overflow_delayed_reader(&thread, 32);
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let observer = control.clone();
+        let (sender, events) = crossbeam_channel::unbounded();
+        let (finished, done) = crossbeam_channel::bounded(1);
+        let worker = std::thread::spawn(move || {
+            finished
+                .send(crate::surface_client::follow_queue_operation(
+                    follow, &thread, &observer, &sender,
+                ))
+                .unwrap()
+        });
+        while !matches!(events.recv_timeout(timeout).unwrap(), TuiEvent::Error(_)) {}
+        control.shutdown();
+        let before_release = done.recv_timeout(std::time::Duration::from_secs(1));
+        std::fs::write(marker, "").unwrap();
+        worker.join().unwrap();
+        host.shutdown().unwrap();
+        before_release
+            .expect("gap waiter ignored shutdown")
+            .unwrap();
+    }
+
+    #[test]
+    fn fix4_refused_gap_interrupt_reports_one_error_and_ends_the_row() {
+        use orca_runtime::{
+            history::SessionStore,
+            prompt_queue::{PromptQueueAction, PromptQueueInput},
+            runtime_host::RuntimeHost,
+        };
+        let timeout = std::time::Duration::from_secs(10);
+        let home = crate::test_support::isolate_orca_home();
+        let marker = home.path().join("release-refused-turn");
+        let host = RuntimeHost::start_with_subscriber_limit_for_test(32).unwrap();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_owned());
+        config.history_mode = orca_core::config::HistoryMode::Record;
+        let thread = host.start_thread(config, "refused gap interrupt").unwrap();
+        let (send, follows) = std::sync::mpsc::channel();
+        thread.set_prompt_queue_surface_observer(
+            std::sync::Arc::new(|_: &orca_core::event_schema::EventEnvelope| Ok(())),
+            send,
+        );
+        thread
+            .prompt_queue(PromptQueueAction::Add {
+                input: PromptQueueInput::text(format!(
+                    "mock_stream_release_marker {}",
+                    marker.display()
+                )),
+            })
+            .unwrap();
+        let follow = follows.recv_timeout(timeout).unwrap();
+        let operation = follow.operation.clone();
+        let path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap()
+            .path;
+        overflow_delayed_reader(&thread, 32);
+        let held = path.with_extension("held");
+        std::fs::rename(&path, &held).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (display, events) = crossbeam_channel::unbounded();
+        let result =
+            crate::surface_client::follow_queue_operation(follow, &thread, &control, &display);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(held, &path).unwrap();
+        std::fs::write(marker, "").unwrap();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(terminal) = super::read_parent_snapshot(&thread)
+                .unwrap()
+                .operation_history
+                .into_iter()
+                .find(|entry| entry.operation_id == operation)
+                .and_then(|entry| entry.terminal)
+            {
+                assert!(
+                    matches!(
+                        terminal.terminal,
+                        orca_runtime::surface::OperationTerminal::Succeeded { .. }
+                    ),
+                    "refused interrupt must not stop worker: {:?}",
+                    terminal.terminal
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        host.shutdown().unwrap();
+        result.expect("the reader must not report a second error to its dispatcher");
+        let shown: Vec<_> = events.try_iter().collect();
+        assert_eq!(
+            shown
+                .iter()
+                .filter(|event| matches!(event, TuiEvent::Error(_)))
+                .count(),
+            1
+        );
+        assert!(
+            matches!(shown.last(),Some(TuiEvent::SessionCompleted{status}) if status=="failed")
+        );
+        let mut state = fresh_state();
+        for event in shown {
+            state.update(event);
+        }
+        assert_eq!(state.status, crate::types::AppStatus::Idle);
+        assert_eq!(
+            state
+                .transcript
+                .messages
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    crate::transcript_state::ChatMessage::Diagnostic(_)
+                ))
+                .count(),
+            1
+        );
+    }
+
     fn overflow_delayed_reader(
         thread: &orca_runtime::runtime_host::RuntimeThreadHandle,
         capacity: u64,
@@ -1809,7 +1977,98 @@ pub(crate) mod live_child_for_test {
     }
 
     #[test]
+    fn fix4_foregrounded_live_turn_ends_without_another_start() {
+        use crate::surface_client::{foreground_task, run};
+        use orca_runtime::runtime_host::HostedTurnRequest;
+        use orca_runtime::surface::SurfaceOperationId;
+        use std::time::Duration;
+        let fixture = ViewOnChild::start();
+        let marker = fixture._home.path().join("foreground-release");
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(fixture._home.path().to_owned());
+        let owner = fixture.parent.typed_surface();
+        let control = fixture.control.clone();
+        let (sender, visible) = crossbeam_channel::unbounded();
+        let prompt = format!("mock_stream_release_marker {}", marker.display());
+        let worker = std::thread::spawn(move || {
+            run(
+                &owner,
+                HostedTurnRequest::new(prompt),
+                config,
+                &control,
+                &sender,
+            )
+        });
+        let timeout = Duration::from_secs(10);
+        while !matches!(
+            visible.recv_timeout(timeout).unwrap().into_test_payload(),
+            TuiEvent::MessageDelta(_)
+        ) {}
+        assert!(fixture.control.request_background_current());
+        assert!(
+            matches!(worker.join().unwrap().unwrap(), crate::hosted_runtime::TuiHostedOperationOutcome::Turn {status} if status=="backgrounded")
+        );
+        let snapshot = super::read_parent_snapshot(&fixture.parent).unwrap();
+        let task = snapshot.background_operations[0]
+            .task_id
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .to_owned();
+        let previous =
+            SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let mut state = fresh_state();
+        state.update(
+            TuiEvent::TurnStarted {
+                turn: 1,
+                task: None,
+                started_at_ms: None,
+            }
+            .at_operation_cursor(true, &snapshot.cursor, &previous),
+        );
+        state.update(
+            TuiEvent::SessionCompleted {
+                status: "success".into(),
+            }
+            .at_operation_cursor(true, &snapshot.cursor, &previous),
+        );
+        state.set_status(crate::types::AppStatus::Running);
+        let owner = fixture.parent.typed_surface();
+        let control = fixture.control.clone();
+        let (sender, events) = crossbeam_channel::unbounded();
+        let foreground =
+            std::thread::spawn(move || foreground_task(&owner, &task, &control, &sender));
+        assert!(fixture.control.wait_for_surface_active(timeout));
+        std::fs::write(marker, "").unwrap();
+        foreground.join().unwrap().unwrap();
+        let mut ended = false;
+        for event in events.try_iter() {
+            if let TuiEvent::SurfaceDelivery(item) = &event {
+                assert!(!matches!(
+                    item.1,
+                    TuiEvent::TurnStarted { .. } | TuiEvent::RuntimeTurnStarted { .. }
+                ));
+                ended |= item.2.is_some()
+                    && matches!(&item.1,TuiEvent::SessionCompleted{status} if status=="success");
+            }
+            state.update(event);
+        }
+        fixture.shutdown();
+        assert!(ended);
+        assert_eq!(state.status, crate::types::AppStatus::Idle);
+    }
+
+    #[test]
     fn a_delayed_gapped_queue_reader_does_not_block_the_next_follow() {
+        delayed_reader_does_not_block_the_next_follow(true);
+    }
+
+    #[test]
+    fn fix4_delayed_healthy_reader_delivers_everything_after_the_second_finishes() {
+        delayed_reader_does_not_block_the_next_follow(false);
+    }
+
+    fn delayed_reader_does_not_block_the_next_follow(gap: bool) {
         use orca_runtime::{
             prompt_queue::{PromptQueueAction, PromptQueueInput},
             runtime_host::RuntimeHost,
@@ -1833,6 +2092,7 @@ pub(crate) mod live_child_for_test {
         let (start, started) = mpsc::channel();
         let (release, gate) = crossbeam_channel::bounded(1);
         let (finish, finished) = mpsc::channel();
+        let (display, events) = crossbeam_channel::unbounded();
         let ordinal = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let owner = thread.clone();
         let control = TuiSurfaceTaskControl::isolated_for_test();
@@ -1845,22 +2105,11 @@ pub(crate) mod live_child_for_test {
                         start.send(follow.operation.clone()).unwrap();
                         gate.recv_timeout(timeout).expect("release first reader");
                     }
-                    let (sender, events) = crossbeam_channel::unbounded();
                     crate::surface_client::follow_queue_operation(
-                        follow, &owner, &control, &sender,
+                        follow, &owner, &control, &display,
                     )
                     .unwrap();
-                    let shown = events.try_iter().collect::<Vec<_>>();
-                    let terminals = shown.iter().filter(|event| matches!(event,TuiEvent::SessionCompleted{status} if status=="success")).count();
-                    let text: String = shown
-                        .iter()
-                        .filter_map(|event| match event {
-                            TuiEvent::MessageDelta(text) => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    let gaps = shown.iter().filter(|event| matches!(event, TuiEvent::Error(message) if message == "typed TUI subscription gap requires SlowSubscriber")).count();
-                    finish.send((index, terminals, text, gaps)).unwrap();
+                    finish.send(index).unwrap();
                 },
                 &crossbeam_channel::unbounded().0,
             );
@@ -1875,7 +2124,9 @@ pub(crate) mod live_child_for_test {
         let marker = home.path().join("finish-first");
         add(&format!("mock_stream_release_marker {}", marker.display()));
         let first = started.recv_timeout(timeout).unwrap();
-        overflow_delayed_reader(&thread, 64);
+        if gap {
+            overflow_delayed_reader(&thread, 64);
+        }
         std::fs::write(marker, "").unwrap();
         let deadline = std::time::Instant::now() + timeout;
         while !crate::surface_client::snapshot_operation_is_terminal(
@@ -1888,16 +2139,46 @@ pub(crate) mod live_child_for_test {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        add("second independent reader");
-        let (index, terminals, _, gaps) = finished
+        add("mock_stream_delay_ms 1");
+        let shown = || {
+            let batch = events.try_iter().collect::<Vec<_>>();
+            let terminals = batch
+                .iter()
+                .filter(
+                    |event| matches!(event,TuiEvent::SessionCompleted{status} if status=="success"),
+                )
+                .count();
+            let text: String = batch
+                .iter()
+                .filter_map(|event| match event {
+                    TuiEvent::MessageDelta(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let gaps = batch.iter().filter(|event| matches!(event, TuiEvent::Error(message) if message == "typed TUI subscription gap requires SlowSubscriber")).count();
+            (terminals, text, gaps)
+        };
+        let index = finished
             .recv_timeout(timeout)
             .expect("second terminal while first reader held");
+        let (terminals, second_text, gaps) = shown();
         assert_eq!((index, terminals, gaps), (1, 1, 0));
+        assert_eq!(
+            second_text,
+            "Mock slow stream started.Mock slow stream completed."
+        );
         release.send(()).unwrap();
-        let (index, terminals, text, gaps) = finished
+        let index = finished
             .recv_timeout(timeout)
-            .expect("terminal from snapshot after gap");
-        assert_eq!((index, terminals, gaps), (0, 1, 1));
+            .expect("first reader finishes after release");
+        let (terminals, text, gaps) = shown();
+        assert_eq!((index, terminals, gaps), (0, 1, usize::from(gap)));
+        if !gap {
+            assert_eq!(
+                text,
+                "Mock release-marker stream started.Mock release-marker stream completed."
+            );
+        }
         assert_eq!(
             text.matches("Mock release-marker stream completed.")
                 .count(),
