@@ -20,13 +20,14 @@ use std::{
 use orca_core::budget::BudgetUsage;
 use orca_core::config::DelegationSnapshot;
 use orca_core::conversation::{
-    Conversation, GOAL_CONTEXT_FRAGMENT_ID, GOAL_CONTEXT_MAX_TOKENS, ImageInput,
-    InternalContextFragment, InternalContextKind, InternalContextOrigin,
-    MEMORY_CONTEXT_FRAGMENT_ID, MEMORY_CONTEXT_MAX_TOKENS, MODE_CONTEXT_FRAGMENT_ID,
-    MODE_CONTEXT_MAX_TOKENS, Message, PLAN_CONTEXT_FRAGMENT_ID, PLAN_CONTEXT_MAX_TOKENS,
-    RUNTIME_CONTEXT_FRAGMENT_ID, RUNTIME_CONTEXT_MAX_TOKENS, RawToolCall,
-    SKILL_CONTEXT_FRAGMENT_ID, SKILL_CONTEXT_MAX_TOKENS, SummaryState, normalize_tool_boundaries,
-    repaired_missing_tool_result,
+    Conversation, DATE_CONTEXT_FRAGMENT_ID, DATE_CONTEXT_MAX_TOKENS, GOAL_CONTEXT_FRAGMENT_ID,
+    GOAL_CONTEXT_MAX_TOKENS, ImageInput, InstructionScope, InternalContextFragment,
+    InternalContextKind, InternalContextOrigin, MEMORY_CONTEXT_FRAGMENT_ID,
+    MEMORY_CONTEXT_MAX_TOKENS, MODE_CONTEXT_FRAGMENT_ID, MODE_CONTEXT_MAX_TOKENS, Message,
+    NestedInstructionSource, NestedInstructionVersion, PLAN_CONTEXT_FRAGMENT_ID,
+    PLAN_CONTEXT_MAX_TOKENS, RUNTIME_CONTEXT_FRAGMENT_ID, RUNTIME_CONTEXT_MAX_TOKENS, RawToolCall,
+    SKILL_CONTEXT_FRAGMENT_ID, SKILL_CONTEXT_MAX_TOKENS, SKILLS_CONTEXT_FRAGMENT_ID, SummaryState,
+    normalize_tool_boundaries, repaired_missing_tool_result,
 };
 use orca_core::external_config::ExternalToolConfig;
 use orca_core::subagent_config::FrozenAgentConfig;
@@ -333,6 +334,9 @@ pub(crate) struct ChildConversationSnapshot {
     /// Bounded child-loop context fragments with stable runtime meanings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) internal_context: Vec<StoredChildInternalContextFragment>,
+    /// Sources for rebuilding the live nested instruction chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) nested_instruction_sources: Vec<NestedInstructionSource>,
     /// Turn cursor to use for the next child-loop iteration.
     #[serde(default)]
     pub(crate) next_turn: u32,
@@ -363,6 +367,16 @@ impl ChildConversationSnapshot {
                 .iter()
                 .filter_map(StoredChildInternalContextFragment::from_fragment)
                 .collect(),
+            nested_instruction_sources: conversation
+                .nested_instructions
+                .versions
+                .values()
+                .map(|version| {
+                    let mut identity = version.identity.clone();
+                    identity.digest.clear();
+                    identity
+                })
+                .collect(),
             next_turn,
         }
     }
@@ -386,6 +400,7 @@ impl ChildConversationSnapshot {
     pub(crate) fn restore_into(
         &self,
         conversation: &mut Conversation,
+        cwd: &Path,
     ) -> Result<u32, AgentContinuationError> {
         if self.schema_version != CHILD_CONVERSATION_SNAPSHOT_SCHEMA_VERSION {
             return Err(AgentContinuationError::UnsupportedSchemaVersion {
@@ -417,10 +432,32 @@ impl ChildConversationSnapshot {
         conversation.messages.extend(restored_messages);
         conversation.rolling_summary = self.rolling_summary.clone();
         conversation.summary = SummaryState::from(&self.summary);
-        for fragment in &self.internal_context {
-            conversation
-                .internal_context
-                .replace(fragment.to_fragment());
+        for stored in &self.internal_context {
+            let fragment = stored.to_fragment();
+            if fragment
+                .instruction_scope
+                .as_ref()
+                .is_none_or(|scope| crate::skill_context::catalog_scope_is_loaded(scope, cwd))
+            {
+                conversation.internal_context.replace(fragment);
+            } else {
+                crate::skill_context::refresh_catalog(conversation, cwd);
+            }
+        }
+        if !self.nested_instruction_sources.is_empty() {
+            let versions = self
+                .nested_instruction_sources
+                .iter()
+                .cloned()
+                .map(|mut identity| {
+                    identity.digest.clear();
+                    NestedInstructionVersion {
+                        identity,
+                        content: String::new(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            crate::instructions::restore_nested_state(conversation, cwd, &[], &versions, &[]);
         }
 
         Ok(self.next_turn)
@@ -897,23 +934,48 @@ impl From<&StoredChildSummaryState> for SummaryState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum StoredChildInternalContextFragment {
-    Runtime { content: String },
-    Mode { content: String },
-    Goal { content: String },
-    Plan { content: String },
-    Skill { content: String },
-    Memory { content: String },
+    Date {
+        content: String,
+    },
+    Runtime {
+        content: String,
+    },
+    Mode {
+        content: String,
+    },
+    Goal {
+        content: String,
+    },
+    Plan {
+        content: String,
+    },
+    Skill {
+        content: String,
+    },
+    SkillCatalog {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<InstructionScope>,
+    },
+    Memory {
+        content: String,
+    },
 }
 
 impl StoredChildInternalContextFragment {
     fn from_fragment(fragment: &InternalContextFragment) -> Option<Self> {
         let content = fragment.content.clone();
         match fragment.id.as_str() {
+            DATE_CONTEXT_FRAGMENT_ID => Some(Self::Date { content }),
             RUNTIME_CONTEXT_FRAGMENT_ID => Some(Self::Runtime { content }),
             MODE_CONTEXT_FRAGMENT_ID => Some(Self::Mode { content }),
             GOAL_CONTEXT_FRAGMENT_ID => Some(Self::Goal { content }),
             PLAN_CONTEXT_FRAGMENT_ID => Some(Self::Plan { content }),
             SKILL_CONTEXT_FRAGMENT_ID => Some(Self::Skill { content }),
+            SKILLS_CONTEXT_FRAGMENT_ID => Some(Self::SkillCatalog {
+                content,
+                scope: fragment.instruction_scope.clone(),
+            }),
             MEMORY_CONTEXT_FRAGMENT_ID => Some(Self::Memory { content }),
             _ => None,
         }
@@ -921,6 +983,13 @@ impl StoredChildInternalContextFragment {
 
     fn to_fragment(&self) -> InternalContextFragment {
         let (id, kind, origin, content, max_tokens) = match self {
+            Self::Date { content } => (
+                DATE_CONTEXT_FRAGMENT_ID,
+                InternalContextKind::Runtime,
+                InternalContextOrigin::System,
+                content,
+                DATE_CONTEXT_MAX_TOKENS,
+            ),
             Self::Runtime { content } => (
                 RUNTIME_CONTEXT_FRAGMENT_ID,
                 InternalContextKind::Runtime,
@@ -956,6 +1025,13 @@ impl StoredChildInternalContextFragment {
                 content,
                 SKILL_CONTEXT_MAX_TOKENS,
             ),
+            Self::SkillCatalog { content, .. } => (
+                SKILLS_CONTEXT_FRAGMENT_ID,
+                InternalContextKind::Skill,
+                InternalContextOrigin::System,
+                content,
+                SKILL_CONTEXT_MAX_TOKENS,
+            ),
             Self::Memory { content } => (
                 MEMORY_CONTEXT_FRAGMENT_ID,
                 InternalContextKind::Memory,
@@ -970,7 +1046,10 @@ impl StoredChildInternalContextFragment {
             origin,
             content: content.clone(),
             max_tokens,
-            instruction_scope: None,
+            instruction_scope: match self {
+                Self::SkillCatalog { scope, .. } => scope.clone(),
+                _ => None,
+            },
         }
     }
 }
@@ -4263,6 +4342,77 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_child_gets_its_fragments_once() {
+        use orca_core::config::folder_trust::{TrustLevel, set_trust};
+        use orca_provider::context::pending_context_message;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(
+            &crate::history::isolated_test_orca_home_subdir("child-cache-context"),
+        );
+        set_trust(cwd.path(), TrustLevel::Trusted).unwrap();
+        let src = cwd.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("AGENTS.md"), "Child scoped runbook").unwrap();
+        let touched = src.join("sample.txt");
+        fs::write(&touched, "fixture").unwrap();
+
+        let mut conversation = Conversation::new();
+        conversation.add_system("original child prompt".into());
+        conversation.add_user("inspect sample".into());
+        conversation.set_today(chrono::NaiveDate::from_ymd_opt(2026, 11, 27).unwrap());
+        conversation.replace_runtime_context(Some("child runtime hint".into()));
+        conversation.replace_skill_catalog(Some("child skill catalog".into()));
+        conversation.replace_memory_context(Some("old child memory".into()));
+        conversation
+            .nested_instructions
+            .pending_touches
+            .push((touched, false));
+        crate::instructions::load_for_cwd(cwd.path())
+            .unwrap()
+            .append_nested_for_touches(&mut conversation, None);
+        conversation
+            .messages
+            .extend(pending_context_message(&conversation));
+        conversation.replace_memory_context(Some("current child memory".into()));
+        conversation.replace_plan_state("current child plan".into());
+        let (snapshot, _) = ChildConversationSnapshot::try_capture_safe(&conversation, 2).unwrap();
+        let snapshot: ChildConversationSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let mut resumed = Conversation::new();
+        resumed.add_system("rebuilt child prompt".into());
+        assert_eq!(snapshot.restore_into(&mut resumed, cwd.path()).unwrap(), 2);
+        resumed.add_user("continue the inspection".into());
+        resumed.messages.extend(pending_context_message(&resumed));
+        let history = resumed
+            .messages
+            .iter()
+            .filter_map(Message::content_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "rebuilt child prompt",
+            "2026-11-27",
+            "child runtime hint",
+            "child skill catalog",
+            "current child memory",
+            "Child scoped runbook",
+        ] {
+            assert_eq!(history.matches(expected).count(), 1, "{expected}");
+        }
+        assert!(
+            !history.contains("old child memory") && !history.contains("original child prompt")
+        );
+        assert!(
+            resumed
+                .internal_context
+                .render()
+                .contains("current child plan")
+        );
+        assert!(pending_context_message(&resumed).is_none());
+    }
+
+    #[test]
     fn a_restored_child_tool_message_notes_the_image_it_lost() {
         let mut conversation = Conversation::new();
         conversation.add_user("capture the screen".to_string());
@@ -4295,7 +4445,7 @@ mod tests {
                 .expect("load snapshot");
         let mut restored = Conversation::new();
         stored
-            .restore_into(&mut restored)
+            .restore_into(&mut restored, Path::new("."))
             .expect("restore snapshot");
 
         let Some(Message::Tool {

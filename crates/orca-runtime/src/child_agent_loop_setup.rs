@@ -122,7 +122,7 @@ pub(crate) fn try_prepare_child_agent_conversation(
         start,
         restored_next_turn: None,
     };
-    let next_turn = restore_child_agent_continuation(&mut conversation, &continuation.start)?;
+    let next_turn = restore_child_agent_continuation(&mut conversation, &continuation.start, cwd)?;
     continuation.restored_next_turn = Some(next_turn);
     tell_child_today(&mut conversation);
     conversation.add_user(request.prompt.clone());
@@ -254,6 +254,7 @@ fn prepare_child_agent_system_conversation(
 fn restore_child_agent_continuation(
     conversation: &mut Conversation,
     start: &ChildAgentContinuationStart,
+    cwd: &Path,
 ) -> Result<u32, AgentContinuationError> {
     AgentContinuationId::parse(start.continuation_id().as_str().to_string())?;
     AgentAttemptId::parse(start.attempt_id().as_str().to_string())?;
@@ -272,7 +273,10 @@ fn restore_child_agent_continuation(
         });
     }
 
-    start.checkpoint().conversation.restore_into(conversation)
+    start
+        .checkpoint()
+        .conversation
+        .restore_into(conversation, cwd)
 }
 
 /// Advances the child loop one turn through the child's budget lease. The
