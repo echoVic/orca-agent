@@ -238,25 +238,7 @@ impl TuiEvent {
         routed: bool,
         cursor: &orca_runtime::surface::SurfaceCursor,
     ) -> Self {
-        if routed
-            && matches!(
-                &self,
-                Self::TurnStarted { .. }
-                    | Self::SessionCompleted { .. }
-                    | Self::MessageDelta(_)
-                    | Self::OpenMessageRestored(_)
-                    | Self::ReasoningDelta(_)
-                    | Self::ProposedPlanDelta(_)
-                    | Self::AssistantResponseCompleted(..)
-                    | Self::AssistantAttemptDiscarded
-                    | Self::SurfaceProjectionSynced(_)
-                    | Self::PlanUpdated { .. }
-                    | Self::ApprovalNeeded { .. }
-                    | Self::PermissionApprovalNeeded { .. }
-                    | Self::UserInputRequested { .. }
-                    | Self::McpElicitationRequested { .. }
-            )
-        {
+        if routed {
             Self::SurfaceDelivery(Box::new((cursor.clone(), self)))
         } else {
             self

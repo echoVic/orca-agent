@@ -1028,6 +1028,48 @@ mod agent_visit {
     }
 
     #[test]
+    fn a_same_id_worker_round_restores_running_without_repeating_the_intro() {
+        let mut state = state();
+        let start = TuiEvent::RuntimeTurnStarted {
+            turn_id: "same".into(),
+        };
+        state.update(start.clone());
+        let count = state.transcript.messages.len();
+        state.set_status(AppStatus::WaitingApproval);
+        state.update(start);
+        assert_eq!(state.status, AppStatus::Running);
+        assert_eq!(state.transcript.messages.len(), count);
+    }
+
+    #[test]
+    fn a_failed_return_read_keeps_delivering_the_childs_events() {
+        use crate::attachment_routing::{AttachmentRouting, accept_attached_tui_event};
+        let parent = crate::protocol::SessionAttachmentId::new(1);
+        let child = parent.next();
+        let routing = std::sync::Arc::new(std::sync::Mutex::new(AttachmentRouting::new(parent)));
+        let (sender, events) = mpsc::unbounded();
+        AttachmentRouting::switch_attachment(&routing, &sender, child, Some(parent), false);
+        let result = crate::hosted_child::snapshot_for_return(&routing, &sender, parent, || {
+            routing.lock().unwrap().route(
+                &sender,
+                child,
+                TuiEvent::MessageDelta("during read".into()),
+            );
+            Err("read failed".into())
+        });
+        assert!(result.is_err());
+        let mut state = state();
+        let delivered = events
+            .try_iter()
+            .filter_map(|event| accept_attached_tui_event(&mut state, event).ok().flatten())
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(delivered.as_slice(), [TuiEvent::MessageDelta(text)] if text == "during read")
+        );
+        assert_eq!(state.active_session_attachment, Some(child));
+    }
+
+    #[test]
     fn completion_between_return_snapshot_and_reset_still_ends_the_row() {
         use crate::attachment_routing::AttachmentRouting;
         with_streaming_main(|thread, snapshot| {
@@ -1212,18 +1254,23 @@ mod agent_visit {
 
     #[test]
     fn the_live_main_clock_uses_its_admitted_task_even_before_reconciliation() {
-        with_streaming_main(|thread, snapshot| {
-            let turn = &snapshot
+        with_streaming_main(|thread, mut snapshot| {
+            let registry = thread.task_registry();
+            let record = registry.create_main_session("main clock".into());
+            registry.mark_running(&record.id).unwrap();
+            let turn = &mut snapshot
                 .foreground_operation
-                .as_ref()
+                .as_mut()
                 .unwrap()
                 .agent_loop_turns[0];
+            turn.admitted_main_task_id =
+                Some(orca_runtime::surface::SurfaceTaskId::try_new(record.id).unwrap());
             let admitted = turn.admitted_main_task_id.as_ref().unwrap();
             assert_ne!(admitted, &turn.task_id);
             assert!(!snapshot.tasks.iter().any(|row| &row.task_id == admitted));
             let started = thread
                 .task_registry()
-                .get(admitted.as_str())
+                .get_cached(admitted.as_str())
                 .unwrap()
                 .started_at_ms
                 .unwrap();

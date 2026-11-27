@@ -513,14 +513,18 @@ async fn call_streaming_async_with_output_budget(
                 };
             }
             if let Some(fixture) = gated_tool {
-                let started =
-                    ProviderStep::MessageDelta("Mock slow tool stream started.".to_string());
+                let text = if fixture.retain_text {
+                    "Mock slow tool stream started.\n"
+                } else {
+                    "Mock slow tool stream started."
+                };
+                let started = ProviderStep::MessageDelta(text.to_owned());
                 on_step(&started);
                 while !fixture.marker.exists() {
                     if !sleep_with_cancel(Duration::from_millis(10), cancel).await {
                         return ProviderResponse {
                             steps: vec![started],
-                            assistant_content: Some("Mock slow tool stream started.".to_string()),
+                            assistant_content: Some(text.to_owned()),
                             assistant_reasoning: None,
                             tool_calls: Vec::new(),
                             usage: None,
@@ -532,8 +536,12 @@ async fn call_streaming_async_with_output_budget(
                 } else {
                     "mock-tool-1"
                 };
-                if let Some(response) = mock_stream_tool_response(started, &fixture.tool_prompt, id)
+                if let Some(mut response) =
+                    mock_stream_tool_response(started, &fixture.tool_prompt, id)
                 {
+                    if fixture.retain_text {
+                        response.assistant_content = Some(text.to_owned());
+                    }
                     return response;
                 }
             }
@@ -875,6 +883,8 @@ struct MockToolRelease {
     marker: std::path::PathBuf,
     tool_prompt: String,
     first_tool_prompt: Option<String>,
+    #[serde(default)]
+    retain_text: bool,
 }
 
 fn mock_stream_tool_release_marker(conversation: &Conversation) -> Option<MockToolRelease> {
@@ -883,7 +893,9 @@ fn mock_stream_tool_release_marker(conversation: &Conversation) -> Option<MockTo
         .unwrap_or("")
         .trim()
         .strip_prefix("mock_stream_tool_release_marker ")?;
-    let fixture: MockToolRelease = serde_json::from_str(payload).ok()?;
+    let mut fixture: MockToolRelease = serde_json::from_str(payload).ok()?;
+    fixture.marker = std::path::PathBuf::from(fixture.marker.to_str()?.trim());
+    fixture.tool_prompt = fixture.tool_prompt.trim().to_owned();
     (!fixture.marker.as_os_str().is_empty() && !fixture.tool_prompt.trim().is_empty())
         .then_some(fixture)
 }

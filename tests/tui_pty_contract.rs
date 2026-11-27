@@ -795,6 +795,21 @@ fn tui_return_from_an_agent_restores_mains_pending_approval() {
 }
 
 #[test]
+fn tui_return_from_an_agent_restores_the_queued_approval() {
+    return_from_marker_held_agent(ReturnScenario::QueuedApproval);
+}
+
+#[test]
+fn tui_return_from_an_agent_orders_queued_text_and_tool() {
+    return_from_marker_held_agent(ReturnScenario::QueuedTool { visit: true });
+}
+
+#[test]
+fn tui_live_main_orders_queued_text_and_tool() {
+    return_from_marker_held_agent(ReturnScenario::QueuedTool { visit: false });
+}
+
+#[test]
 fn tui_ctrl_c_from_a_finished_agent_interrupts_mains_queued_turn() {
     return_from_marker_held_agent(ReturnScenario::Interrupt);
 }
@@ -804,16 +819,25 @@ enum ReturnScenario {
     Queued,
     Interrupt,
     Approval,
+    QueuedApproval,
+    QueuedTool { visit: bool },
 }
 
 fn return_from_marker_held_agent(scenario: ReturnScenario) {
     let interrupt = matches!(scenario, ReturnScenario::Interrupt);
-    let queue_next_turn = matches!(scenario, ReturnScenario::Queued | ReturnScenario::Interrupt);
+    let queue_next_turn = !matches!(scenario, ReturnScenario::Running | ReturnScenario::Approval);
     let approval = matches!(scenario, ReturnScenario::Approval);
+    let queued_approval = matches!(scenario, ReturnScenario::QueuedApproval);
+    let queued_tool = matches!(scenario, ReturnScenario::QueuedTool { .. });
+    let visit = !matches!(scenario, ReturnScenario::QueuedTool { visit: false });
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
     let marker = cwd.path().join("release");
-    let mode = if approval { "suggest" } else { "full-auto" };
+    let mode = if approval || queued_approval {
+        "suggest"
+    } else {
+        "full-auto"
+    };
     std::fs::write(
         home.path().join("config.toml"),
         format!("mode = \"{mode}\"\n"),
@@ -824,8 +848,10 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
         marker.display()
     );
     let ask = cwd.path().join("ask");
-    if approval {
+    if approval || queued_approval || queued_tool {
         std::fs::write(cwd.path().join("witness.txt"), "before").unwrap();
+    }
+    if approval {
         prompt = format!(
             "mock_stream_tool_release_marker {}",
             serde_json::json!({"marker":ask, "toolPrompt":"edit witness.txt :: before => after", "firstToolPrompt":prompt})
@@ -834,7 +860,7 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
     let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), &prompt).unwrap();
     let mut output = Vec::new();
     accept_new_workspace(&mut process, &mut output);
-    if approval {
+    if approval || queued_approval {
         assert_screen_has_text(
             &process,
             &mut output,
@@ -853,34 +879,47 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
     }
     assert_screen_has_text(&process, &mut output, "thinking,", "child has not started");
     if queue_next_turn {
-        let prompt = if interrupt {
-            "mock_stream_delay_ms 30000\r"
+        let prompt = if queued_approval {
+            "edit witness.txt :: before => after\r".to_owned()
+        } else if queued_tool {
+            format!(
+                "mock_stream_tool_release_marker {}\r",
+                serde_json::json!({"marker":ask,"toolPrompt":"read witness.txt", "retainText":true})
+            )
+        } else if interrupt {
+            "mock_stream_delay_ms 30000\r".to_owned()
         } else {
-            "mock_stream_delay_ms 4000\r"
+            "mock_stream_delay_ms 4000\r".to_owned()
         };
         process.write(prompt.as_bytes()).unwrap();
         assert_screen_shows(&process, &mut output, "Queued", "main prompt not queued");
     }
-    let frame = reconstruct_screen(&output);
-    let row = frame
-        .lines()
-        .position(|line| line.contains("mock_stream_release_marker") && !line.contains("subagent"))
-        .unwrap()
-        + 1;
-    process
-        .write(format!("\x1b[<0;6;{row}M\x1b[<0;6;{row}m").as_bytes())
-        .unwrap();
-    assert_screen_has_text(
-        &process,
-        &mut output,
-        "Main is running · Esc return",
-        "did not enter the live child",
-    );
+    if visit {
+        let frame = reconstruct_screen(&output);
+        let row = frame
+            .lines()
+            .position(|line| {
+                line.contains("mock_stream_release_marker") && !line.contains("subagent")
+            })
+            .unwrap()
+            + 1;
+        process
+            .write(format!("\x1b[<0;6;{row}M\x1b[<0;6;{row}m").as_bytes())
+            .unwrap();
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Main is running · Esc return",
+            "did not enter the live child",
+        );
+    }
     if queue_next_turn {
         std::fs::write(&marker, b"").unwrap();
     }
-    if approval {
-        std::fs::write(&ask, b"").unwrap();
+    if approval || queued_approval {
+        if approval {
+            std::fs::write(&ask, b"").unwrap();
+        }
         assert_screen_has_text(
             &process,
             &mut output,
@@ -912,9 +951,59 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
         );
         return;
     }
+    if queued_tool {
+        let prefix = "Mock slow tool stream started.";
+        if visit {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !session_contains(
+                &home.path().join("sessions"),
+                &format!(r#""text":"{prefix}\n""#),
+            ) {
+                assert!(Instant::now() < deadline, "queued tool turn did not stream");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            process.write(b"\x1b").unwrap();
+        }
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            prefix,
+            "missing open text before tool",
+        );
+        std::fs::write(&ask, b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(chunk) = process.receive_output(Duration::from_millis(100)) {
+                output.extend_from_slice(&chunk);
+            }
+            let frame = reconstruct_screen(&output);
+            if let Some((_, after)) = frame.split_once(prefix)
+                && let Some((tool_rows, _)) =
+                    after.split_once("Mock completed after tool execution.")
+                && tool_rows
+                    .lines()
+                    .any(|row| row.contains("✓ read") && row.contains("witness.txt"))
+            {
+                assert_eq!(frame.matches(prefix).count(), 1, "{frame}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "queued text/tool/tail not in order:\n{frame}"
+            );
+        }
+        arm_idle_exit(&mut process, &mut output);
+        let status = process.wait_for_exit(Duration::from_secs(5));
+        process.close_io_and_join();
+        assert_eq!(status.code(), Some(130));
+        return;
+    }
     if queue_next_turn {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !session_contains_delta(&home.path().join("sessions")) {
+        while !session_contains(
+            &home.path().join("sessions"),
+            r#""text":"Mock slow stream started.""#,
+        ) {
             assert!(
                 Instant::now() < deadline,
                 "queued main turn did not stream while visiting"
@@ -1046,16 +1135,14 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
     assert_eq!(status.code(), Some(130));
 }
 
-fn session_contains_delta(path: &std::path::Path) -> bool {
+fn session_contains(path: &std::path::Path, needle: &str) -> bool {
     std::fs::read_dir(path).unwrap().flatten().any(|entry| {
         let path = entry.path();
         if path.is_dir() {
-            session_contains_delta(&path)
+            session_contains(&path, needle)
         } else {
             path.extension().is_some_and(|ext| ext == "jsonl")
-                && std::fs::read_to_string(path)
-                    .unwrap()
-                    .contains(r#""text":"Mock slow stream started.""#)
+                && std::fs::read_to_string(path).unwrap().contains(needle)
         }
     })
 }

@@ -336,8 +336,8 @@ impl AppState {
             TuiEvent::RuntimeTurnStarted { turn_id } => {
                 self.invalidate_recap();
                 self.suppress_background_main_session_output = false;
+                self.enter_running();
                 if self.runtime_turn_id.as_deref() != Some(turn_id.as_str()) {
-                    self.enter_running();
                     // Nobody typed this turn here: it answers the next queued
                     // message, or wakes for agents that finished. Say which,
                     // so its reply reads as a new one.

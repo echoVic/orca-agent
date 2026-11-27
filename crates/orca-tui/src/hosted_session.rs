@@ -36,11 +36,25 @@ use crate::surface_actions::TuiSurfaceActions;
 use crate::surface_projection::{SessionProjectionPresentation, SurfaceProjectionState};
 use crate::transcript_state::ChatMessage;
 
-struct QueueApprovalHandler {
+struct QueueInteractionRoute {
     control: TuiSurfaceTaskControl,
+    thread_id: String,
+    sender: mpsc::Sender<TuiEvent>,
 }
 
-impl RuntimeApprovalHandler for QueueApprovalHandler {
+impl QueueInteractionRoute {
+    fn await_interaction(
+        &self,
+        request_id: String,
+        kind: TuiInteractionKind,
+        event: impl FnOnce(crate::protocol::TuiInteractionKey) -> TuiEvent,
+    ) -> io::Result<TuiInteractionResponse> {
+        self.control
+            .await_queue_interaction(&self.thread_id, &self.sender, request_id, kind, event)
+    }
+}
+
+impl RuntimeApprovalHandler for QueueInteractionRoute {
     fn resolve_interactive(
         &self,
         approval: &orca_core::approval_types::ApprovalRequest,
@@ -51,19 +65,18 @@ impl RuntimeApprovalHandler for QueueApprovalHandler {
             .as_deref()
             .unwrap_or_else(|| request.name.as_str())
             .to_string();
-        let response = self.control.await_queue_interaction(
-            approval.id.clone(),
-            TuiInteractionKind::Approval,
-            |key| TuiEvent::ApprovalNeeded {
-                key,
-                tool,
-                target: approval.target.clone().or_else(|| request.target.clone()),
-                preview: approval
-                    .preview
-                    .clone()
-                    .or_else(|| Some(approval.description.clone())),
-            },
-        )?;
+        let response =
+            self.await_interaction(approval.id.clone(), TuiInteractionKind::Approval, |key| {
+                TuiEvent::ApprovalNeeded {
+                    key,
+                    tool,
+                    target: approval.target.clone().or_else(|| request.target.clone()),
+                    preview: approval
+                        .preview
+                        .clone()
+                        .or_else(|| Some(approval.description.clone())),
+                }
+            })?;
         match response {
             TuiInteractionResponse::Approval(approved) => Ok(ApprovalResolution {
                 id: approval.id.clone(),
@@ -86,26 +99,21 @@ impl RuntimeApprovalHandler for QueueApprovalHandler {
     }
 }
 
-struct QueuePermissionHandler {
-    control: TuiSurfaceTaskControl,
-}
-
-impl RuntimePermissionRequestHandler for QueuePermissionHandler {
+impl RuntimePermissionRequestHandler for QueueInteractionRoute {
     fn request_permissions(
         &self,
         request: &RuntimePermissionRequest,
     ) -> io::Result<RuntimePermissionResponse> {
-        let response = self.control.await_queue_interaction(
-            request.id.clone(),
-            TuiInteractionKind::Permission,
-            |key| TuiEvent::PermissionApprovalNeeded {
-                key,
-                tool: request.id.clone(),
-                target: None,
-                preview: request.reason.clone(),
-                permission_kind: permission_kind(request),
-            },
-        )?;
+        let response =
+            self.await_interaction(request.id.clone(), TuiInteractionKind::Permission, |key| {
+                TuiEvent::PermissionApprovalNeeded {
+                    key,
+                    tool: request.id.clone(),
+                    target: None,
+                    preview: request.reason.clone(),
+                    permission_kind: permission_kind(request),
+                }
+            })?;
         let decision = match response {
             TuiInteractionResponse::Permission(decision) => decision,
             _ => {
@@ -137,43 +145,38 @@ impl RuntimePermissionRequestHandler for QueuePermissionHandler {
     }
 }
 
-struct QueueUserInputHandler {
-    control: TuiSurfaceTaskControl,
-}
-
-impl RuntimeUserInputHandler for QueueUserInputHandler {
+impl RuntimeUserInputHandler for QueueInteractionRoute {
     fn request_user_input(
         &self,
         request: &RuntimeUserInputRequest,
     ) -> io::Result<Option<orca_runtime::lifecycle::RuntimeUserInputResponse>> {
-        let response = self.control.await_queue_interaction(
-            request.id.clone(),
-            TuiInteractionKind::UserInput,
-            |key| TuiEvent::UserInputRequested {
-                key,
-                questionnaire: crate::protocol::TuiUserInputQuestionnaire {
-                    questions: request
-                        .questions
-                        .iter()
-                        .map(|question| crate::protocol::TuiUserInputQuestion {
-                            id: question.id.clone(),
-                            header: question.header.clone(),
-                            question: question.question.clone(),
-                            options: question
-                                .options
-                                .iter()
-                                .map(|option| crate::protocol::TuiUserInputOption {
-                                    label: option.label.clone(),
-                                    description: option.description.clone(),
-                                    preview: option.preview.clone(),
-                                })
-                                .collect(),
-                            multi_select: question.multi_select,
-                        })
-                        .collect(),
-                },
-            },
-        )?;
+        let response =
+            self.await_interaction(request.id.clone(), TuiInteractionKind::UserInput, |key| {
+                TuiEvent::UserInputRequested {
+                    key,
+                    questionnaire: crate::protocol::TuiUserInputQuestionnaire {
+                        questions: request
+                            .questions
+                            .iter()
+                            .map(|question| crate::protocol::TuiUserInputQuestion {
+                                id: question.id.clone(),
+                                header: question.header.clone(),
+                                question: question.question.clone(),
+                                options: question
+                                    .options
+                                    .iter()
+                                    .map(|option| crate::protocol::TuiUserInputOption {
+                                        label: option.label.clone(),
+                                        description: option.description.clone(),
+                                        preview: option.preview.clone(),
+                                    })
+                                    .collect(),
+                                multi_select: question.multi_select,
+                            })
+                            .collect(),
+                    },
+                }
+            })?;
         match response {
             TuiInteractionResponse::UserQuestionnaire(
                 crate::protocol::TuiUserInputResponse::Submitted { answers },
@@ -207,11 +210,7 @@ impl RuntimeUserInputHandler for QueueUserInputHandler {
     }
 }
 
-struct QueueMcpElicitationHandler {
-    control: TuiSurfaceTaskControl,
-}
-
-impl McpElicitationHandler for QueueMcpElicitationHandler {
+impl McpElicitationHandler for QueueInteractionRoute {
     fn handle_elicitation(
         &self,
         request: McpElicitationRequest,
@@ -221,8 +220,7 @@ impl McpElicitationHandler for QueueMcpElicitationHandler {
             McpElicitationMode::Url => TuiMcpElicitationMode::Url,
         };
         let response = self
-            .control
-            .await_queue_interaction(
+            .await_interaction(
                 request.id.clone(),
                 TuiInteractionKind::McpElicitation,
                 |key| TuiEvent::McpElicitationRequested {
@@ -448,21 +446,18 @@ pub(crate) fn announce_runtime_ready(
     // that started with the TUI, should the thread have taken them, are its
     // own: no moment comes between when neither has them.
     control.hand_over_prestart_mcp(thread);
-    thread.set_prompt_queue_interaction_handlers(PromptQueueInteractionHandlers {
-        approval: Some(Arc::new(QueueApprovalHandler {
-            control: control.clone(),
-        })),
-        permission: Some(Arc::new(QueuePermissionHandler {
-            control: control.clone(),
-        })),
-        user_input: Some(Arc::new(QueueUserInputHandler {
-            control: control.clone(),
-        })),
-        mcp_elicitation: Some(Arc::new(QueueMcpElicitationHandler {
-            control: control.clone(),
-        })),
+    let route = Arc::new(QueueInteractionRoute {
+        control: control.clone(),
+        thread_id: thread.thread_id().to_owned(),
+        sender: event_tx.clone(),
     });
-    observe_prompt_queue(thread, event_tx, control.view().is_some());
+    thread.set_prompt_queue_interaction_handlers(PromptQueueInteractionHandlers {
+        approval: Some(route.clone()),
+        permission: Some(route.clone()),
+        user_input: Some(route.clone()),
+        mcp_elicitation: Some(route),
+    });
+    observe_prompt_queue(thread, event_tx, control);
     let _ = event_tx.send(TuiEvent::MentionRuntimeReady(thread.typed_surface()));
     if let Ok(snapshot) = thread.prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::List) {
         let _ = event_tx.send(TuiEvent::PromptQueueUpdated(snapshot));
@@ -518,10 +513,9 @@ pub(crate) fn announce_runtime_ready(
 fn observe_prompt_queue(
     thread: &RuntimeThreadHandle,
     event_tx: &mpsc::Sender<TuiEvent>,
-    routed: bool,
+    control: &TuiSurfaceTaskControl,
 ) {
     let runtime_events = event_tx.clone();
-    let committed = event_tx.clone();
     let raw: Arc<dyn orca_core::event_sink::EventObserver> =
         Arc::new(move |event: &EventEnvelope| {
             if let Some(projected) = runtime_event_to_tui(event) {
@@ -532,44 +526,28 @@ fn observe_prompt_queue(
             }
             Ok(())
         });
-    let supplemental = raw.clone();
-    thread.set_prompt_queue_surface_observer(
-        raw,
-        Arc::new(move |event: &EventEnvelope| match event.event_type {
-            EventType::AssistantReasoningDelta
-            | EventType::AssistantMessageDelta
-            | EventType::ModelResponseCompleted
-            | EventType::SessionCompleted => Ok(()),
-            _ => supplemental.observe(event),
-        }),
-        move |update| {
-            use orca_runtime::runtime_host::QueueSurfaceUpdate;
-            let send = |cursor: &orca_runtime::surface::SurfaceCursor, event: TuiEvent| {
-                let _ = committed.send(event.at_surface_cursor(routed, cursor));
-            };
-            match update {
-                QueueSurfaceUpdate::Assistant(batch, streams) => {
-                    for event in
-                        crate::surface_projection::committed_queue_assistant_events(batch, streams)
-                    {
-                        send(&batch.cursor_after, event);
-                    }
-                }
-                QueueSurfaceUpdate::Terminal(receipt) => {
-                    if let Some(status) =
-                        crate::surface_projection::operation_terminal_status(&receipt.terminal)
-                    {
-                        send(
-                            &receipt.cursor,
-                            TuiEvent::SessionCompleted {
-                                status: status.to_string(),
-                            },
-                        );
-                    }
+    let (send, follows) = std::sync::mpsc::channel();
+    let relay = event_tx.clone();
+    let control = control.clone();
+    let surface = thread.surface();
+    match std::thread::Builder::new()
+        .name("orca-tui-queue-presentation".into())
+        .spawn(move || {
+            for follow in follows {
+                if let Err(error) = crate::surface_client::follow_queue_operation(
+                    follow, &surface, &control, &relay,
+                ) {
+                    let _ = relay.send(TuiEvent::Error(error.to_string()));
                 }
             }
-        },
-    );
+        }) {
+        Ok(_) => thread.set_prompt_queue_surface_observer(raw, send),
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "cannot follow queued operations: {error}"
+            )));
+        }
+    }
 }
 
 pub(crate) fn read_hosted_projection_batch(

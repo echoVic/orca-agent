@@ -519,7 +519,6 @@ pub struct HostedTurnRequest {
     user_input_handler: Option<Arc<dyn RuntimeUserInputHandler + Send + Sync>>,
     mcp_elicitation_handler: Option<Arc<dyn McpElicitationHandler + Send + Sync>>,
     event_observer: Option<Arc<dyn EventObserver>>,
-    queue_presentation: Option<Arc<QueuePresentation>>,
     continuation: Option<RuntimeTurnContinuation>,
     resumes_existing_turn: bool,
     task_id: Option<String>,
@@ -685,7 +684,6 @@ impl HostedTurnRequest {
             user_input_handler: None,
             mcp_elicitation_handler: None,
             event_observer: None,
-            queue_presentation: None,
             continuation: None,
             resumes_existing_turn: false,
             task_id: None,
@@ -3294,26 +3292,16 @@ pub struct RuntimeThreadHandle {
     prompt_queue_surface_attached: Arc<AtomicBool>,
 }
 
-pub enum QueueSurfaceUpdate<'a> {
-    Assistant(
-        &'a surface::SurfaceCommitBatch,
-        &'a [surface::SurfaceAssistantStream],
-    ),
-    Terminal(&'a surface::OperationTerminalAtCursor),
+pub struct QueueSurfaceFollow {
+    pub operation: surface::SurfaceOperationId,
+    pub baseline: surface::SnapshotAtCursor,
+    pub subscription: surface::SurfaceSubscriptionReceiver,
 }
-
-type QueuePresentation = dyn Fn(QueueSurfaceUpdate<'_>) + Send + Sync;
 
 #[derive(Clone)]
 struct QueueObservers {
     raw: Arc<dyn EventObserver>,
-    surface: Option<QueueSurfaceObservers>,
-}
-
-#[derive(Clone)]
-struct QueueSurfaceObservers {
-    supplemental: Arc<dyn EventObserver>,
-    committed: Arc<QueuePresentation>,
+    surface: Option<mpsc::Sender<QueueSurfaceFollow>>,
 }
 
 /// Interaction handlers used when the durable prompt queue starts a legacy
@@ -3624,15 +3612,11 @@ impl RuntimeThreadHandle {
     pub fn set_prompt_queue_surface_observer(
         &self,
         legacy: Arc<dyn EventObserver>,
-        supplemental: Arc<dyn EventObserver>,
-        committed: impl Fn(QueueSurfaceUpdate<'_>) + Send + Sync + 'static,
+        follows: mpsc::Sender<QueueSurfaceFollow>,
     ) {
         self.set_queue_observers(QueueObservers {
             raw: legacy,
-            surface: Some(QueueSurfaceObservers {
-                supplemental,
-                committed: Arc::new(committed),
-            }),
+            surface: Some(follows),
         });
     }
 
@@ -12816,7 +12800,7 @@ struct RuntimeStartedTurn {
     /// The turn's id, when whoever queued the message already named it.
     turn_id: Option<TurnId>,
     observer: Option<Arc<dyn EventObserver>>,
-    surface_observers: Option<QueueSurfaceObservers>,
+    surface_observers: Option<mpsc::Sender<QueueSurfaceFollow>>,
     interaction_handlers: PromptQueueInteractionHandlers,
     /// A delegated child turn carries its root's headless flag, which the
     /// raw start took from `HostedTurnRequest::with_headless_root`.
@@ -12824,10 +12808,9 @@ struct RuntimeStartedTurn {
 }
 
 impl RuntimeStartedTurn {
-    fn apply_on_surface(mut self, mut request: HostedTurnRequest) -> HostedTurnRequest {
-        if let Some(surface) = self.surface_observers.take() {
-            self.observer = Some(surface.supplemental);
-            request.queue_presentation = Some(surface.committed);
+    fn apply_on_surface(mut self, request: HostedTurnRequest) -> HostedTurnRequest {
+        if self.surface_observers.is_some() {
+            self.observer = None;
         }
         self.apply(request)
     }
@@ -17750,9 +17733,12 @@ impl ThreadActor {
         }
         self.last_child_results_wake = Some(Instant::now());
         self.last_child_results_wake_owed = owed;
+        let follows_surface =
+            started.surface_observers.is_some() && self.resident_surface.0.is_some();
         if self
             .start_runtime_turn_on_surface(CHILD_RESULTS_WAKE_PROMPT, &[], started.clone())
             .is_ok()
+            || follows_surface
         {
             return;
         }
@@ -17863,6 +17849,13 @@ impl ThreadActor {
             started.clone(),
         ) {
             Ok(operation_id) => Ok(Ok(operation_id)),
+            Err(error)
+                if started.surface_observers.is_some() && self.resident_surface.0.is_some() =>
+            {
+                Ok(Err(RuntimeHostError::ThreadStartFailed {
+                    message: format!("queued surface admission failed: {error:?}"),
+                }))
+            }
             // The surface could not take the turn: it runs unrecorded there,
             // as on a thread that has none.
             Err(_) => {
@@ -19187,6 +19180,13 @@ impl ThreadActor {
         self.recap_cancellations.clear();
         self.recap_inflight_keys.clear();
         self.seal_resident_surface(subscription_seal_reason);
+        self.handle
+            .prompt_queue_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.handle
+            .set_prompt_queue_interaction_handlers(PromptQueueInteractionHandlers::default());
         if let Some(state) = self.state.as_ref() {
             state
                 .thread
@@ -29337,6 +29337,75 @@ mod tests {
         assert!(after.queued_operations == before.queued_operations);
         assert!(after.operation_history == before.operation_history);
         assert!(after.foreground_operation == before.foreground_operation);
+    }
+
+    #[test]
+    fn queued_surface_follower_receives_the_repaired_final_commit() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().unwrap();
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_owned(), HistoryMode::Record),
+                "queued repair",
+            )
+            .unwrap();
+        let path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap()
+            .path;
+        let (send, follows) = mpsc::channel();
+        let (raw, observed) = mpsc::channel();
+        thread.set_prompt_queue_surface_observer(
+            Arc::new(move |_: &orca_core::event_schema::EventEnvelope| {
+                let _ = raw.send(());
+                Ok(())
+            }),
+            send,
+        );
+        surface::JsonlSurfaceCommitLedger::inject_generation_append_failure_once(path.clone());
+        surface::JsonlSurfaceCommitLedger::inject_terminal_append_failure_once(path);
+        thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text("queued repair"),
+            })
+            .unwrap();
+        let mut follow = follows.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        let mut cursor = follow.baseline.cursor;
+        loop {
+            let Some(surface::SurfaceSubscriptionItem::Batch { batch }) =
+                follow.subscription.recv_timeout(SURFACE_TEST_TIMEOUT)
+            else {
+                panic!("no repaired terminal on queue subscription")
+            };
+            assert_eq!(batch.cursor_before, cursor);
+            cursor = batch.cursor_after.clone();
+            if let Some(record) =
+                batch
+                    .events
+                    .as_slice()
+                    .iter()
+                    .find_map(|event| match &event.event {
+                        surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                            record,
+                        }) if record.operation_id == follow.operation => Some(record),
+                        _ => None,
+                    })
+            {
+                assert!(matches!(
+                    record.terminal,
+                    surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::Persistence,
+                        ..
+                    }
+                ));
+                break;
+            }
+        }
+        host.shutdown().unwrap();
+        assert!(
+            observed.try_iter().next().is_none(),
+            "the repaired typed operation must not also run through the legacy observer"
+        );
     }
 
     #[test]

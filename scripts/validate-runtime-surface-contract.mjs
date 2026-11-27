@@ -1265,7 +1265,8 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     1,
   ],
   ["crates/orca-tui/src/hosted_child.rs:return_to_parent:child_focus.event_bridge.stop", 1],
-  ["crates/orca-tui/src/attachment_routing.rs:switch_attachment_deferred:routing.deferred_parent_events.clear", 1],
+  // Each deferral starts with an empty local Vec; clearing it is not a runtime mutation.
+  ["crates/orca-tui/src/attachment_routing.rs:defer_parent:self.deferred_parent_events.clear", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:pending_terminal_session.activate", 1],
   // The stderr capture's own lifecycle and buffers, not runtime mutations.
   ["crates/orca-tui/src/app.rs:run_tui_inner:stderr_capture.stop", 1],

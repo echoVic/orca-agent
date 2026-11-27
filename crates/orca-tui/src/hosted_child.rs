@@ -827,6 +827,17 @@ fn focus_child(
         );
         return;
     }
+    if let Some(status) = control
+        .pending_queue_interactions(parent_thread.thread_id())
+        .iter()
+        .find_map(crate::attachment_routing::side_parent_status_for_event)
+    {
+        let _ = send_attached_event(
+            root_event_tx,
+            child_attachment,
+            TuiEvent::SideParentStatusChanged(status),
+        );
+    }
     child_bridge.follow_main_catalog(&parent_thread, child_event_tx.clone());
     *focus = Some(HostedChildFocus {
         parent_thread,
@@ -920,8 +931,13 @@ pub(crate) fn snapshot_for_return(
     attachment: SessionAttachmentId,
     read: impl FnOnce() -> Result<SurfaceSnapshot, String>,
 ) -> Result<SurfaceSnapshot, String> {
+    routing
+        .lock()
+        .map_err(|error| error.to_string())?
+        .defer_parent(attachment);
+    let snapshot = read()?;
     AttachmentRouting::switch_attachment_deferred(routing, sender, attachment, None);
-    read()
+    Ok(snapshot)
 }
 
 pub(crate) fn project_returned_main(
@@ -956,7 +972,8 @@ pub(crate) fn project_returned_main(
         send_attached_event(sender, attachment, TuiEvent::PromptQueueUpdated(queue))
             .map_err(|error| error.to_string())?;
     }
-    let requests = register_requested_interactions(snapshot, control);
+    let mut requests = register_requested_interactions(snapshot, control);
+    requests.extend(control.pending_queue_interactions(thread.thread_id()));
     routing
         .lock()
         .map_err(|error| error.to_string())?
@@ -1214,6 +1231,343 @@ pub(crate) mod live_child_for_test {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
+    }
+
+    #[test]
+    fn queued_text_tool_text_and_terminal_follow_one_cursor() {
+        let fixture = ViewOnChild::start();
+        let marker = fixture._home.path().join("release-tool");
+        let events = fixture.enqueue(format!(
+            "mock_stream_tool_release_marker {}",
+            serde_json::json!({"marker":marker,"toolPrompt":"task_list"})
+        ));
+        let mut observed = Vec::new();
+        let mut last = 0;
+        loop {
+            let delivery = events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let (cursor, event) = match delivery {
+                TuiEvent::SurfaceDelivery(pair) => (Some(pair.0.next_seq.get()), pair.1),
+                other => (None, other),
+            };
+            let kind = match event {
+                TuiEvent::MessageDelta(ref text)
+                    if text.contains("Mock slow tool stream started.") =>
+                {
+                    std::fs::write(&marker, "").unwrap();
+                    "prefix"
+                }
+                TuiEvent::ToolRequested { .. } => "tool",
+                TuiEvent::MessageDelta(ref text)
+                    if text.contains("Mock completed after tool execution.") =>
+                {
+                    "tail"
+                }
+                TuiEvent::SessionCompleted { .. } => "terminal",
+                _ => continue,
+            };
+            let cursor =
+                cursor.unwrap_or_else(|| panic!("{kind} did not come from a committed batch"));
+            assert!(cursor >= last);
+            last = cursor;
+            observed.push(kind);
+            if kind == "terminal" {
+                break;
+            }
+        }
+        assert_eq!(observed, ["prefix", "tool", "tail", "terminal"]);
+        fixture.shutdown();
+    }
+
+    #[derive(Clone, Copy)]
+    enum RequestTiming {
+        BeforeVisit,
+        BeforeAdoption,
+        AfterAdoption,
+    }
+
+    fn queued_approval(timing: RequestTiming) {
+        use crate::attachment_routing::AttachmentRouting;
+        let fixture = ViewOnChild::start();
+        let parent = SessionAttachmentId::new(1);
+        let routing = std::sync::Arc::new(std::sync::Mutex::new(AttachmentRouting::new(parent)));
+        let (root, displayed) = crossbeam_channel::unbounded();
+        let visit = || {
+            AttachmentRouting::switch_attachment(
+                &routing,
+                &root,
+                parent.next(),
+                Some(parent),
+                false,
+            )
+        };
+        let marker = fixture._home.path().join("ask");
+        let witness = fixture._home.path().join("witness.txt");
+        std::fs::write(&witness, "before").unwrap();
+        let events = fixture.enqueue(format!(
+            "mock_stream_tool_release_marker {}",
+            serde_json::json!({"marker":marker,"toolPrompt":"edit witness.txt :: before => after"})
+        ));
+        if !matches!(timing, RequestTiming::BeforeVisit) {
+            visit();
+        }
+        if matches!(timing, RequestTiming::AfterAdoption) {
+            fixture.adopt();
+        }
+        std::fs::write(marker, "").unwrap();
+        let request = loop {
+            let event = events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("request on main's relay");
+            if matches!(event, TuiEvent::ApprovalNeeded { .. }) {
+                break event;
+            }
+        };
+        routing
+            .lock()
+            .unwrap()
+            .route(&root, parent, request.clone());
+        let before = displayed.try_iter().collect::<Vec<_>>();
+        if matches!(timing, RequestTiming::BeforeVisit) {
+            assert!(before.iter().any(|event| matches!(event, TuiEvent::Attached(item) if item.attachment == Some(parent) && matches!(item.event, TuiEvent::ApprovalNeeded { .. }))));
+            visit();
+        } else {
+            assert!(before.iter().any(|event| matches!(
+                event,
+                TuiEvent::SideParentStatusChanged(super::SideParentStatus::NeedsApproval)
+            )));
+            assert!(!before.iter().any(|event| matches!(event,TuiEvent::Attached(item) if matches!(item.event,TuiEvent::ApprovalNeeded{..}))));
+        }
+        let snapshot = super::snapshot_for_return(&routing, &root, parent, || {
+            super::read_parent_snapshot(&fixture.parent)
+        })
+        .unwrap();
+        super::project_returned_main(
+            &fixture.parent,
+            &snapshot,
+            parent,
+            &root,
+            &fixture.control,
+            &routing,
+        )
+        .unwrap();
+        AttachmentRouting::release_deferred_parent_events(&routing, &root);
+        routing.lock().unwrap().route(&root, parent, request);
+        let keys: Vec<_> = displayed
+            .try_iter()
+            .filter_map(|event| match event {
+                TuiEvent::Attached(item) => match item.event {
+                    TuiEvent::ApprovalNeeded { key, .. } => Some(key),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 1, "one actionable request after return");
+        assert!(
+            fixture
+                .control
+                .respond_queue_interaction(
+                    &keys[0],
+                    &crate::protocol::TuiInteractionResponse::Approval(false)
+                )
+                .unwrap()
+        );
+        fixture.wait_for(|snapshot| {
+            snapshot
+                .operation_history
+                .iter()
+                .any(|operation| operation.terminal.is_some())
+                .then_some(())
+        });
+        assert_eq!(std::fs::read_to_string(witness).unwrap(), "before");
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn queued_approval_before_visit_is_restored() {
+        queued_approval(RequestTiming::BeforeVisit);
+    }
+    #[test]
+    fn queued_approval_before_adoption_stays_on_main() {
+        queued_approval(RequestTiming::BeforeAdoption);
+    }
+    #[test]
+    fn queued_approval_after_adoption_stays_on_main() {
+        queued_approval(RequestTiming::AfterAdoption);
+    }
+
+    #[test]
+    fn foregrounding_a_queued_background_turn_only_shows_unseen_output() {
+        use orca_runtime::surface::{
+            AttachResult, BackgroundTarget, FreshAttachRequest, MutationReply,
+            SurfaceAttachmentRole, SurfaceCapability, SurfaceRequestId,
+        };
+        let fixture = ViewOnChild::start();
+        let marker = fixture._home.path().join("finish-provider");
+        let events = fixture.enqueue(format!("mock_stream_release_marker {}", marker.display()));
+        let next = || {
+            events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+        };
+        while !matches!(next(),TuiEvent::SurfaceDelivery(item) if matches!(&item.1,TuiEvent::MessageDelta(text) if text.contains("started")))
+        {
+        }
+        let surface = fixture.parent.surface();
+        let AttachResult::FreshAttached { attachment } = surface.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: [
+                SurfaceCapability::ReadSnapshot,
+                SurfaceCapability::ControlBoundOperation,
+            ]
+            .into(),
+            interaction_capabilities: Default::default(),
+        }) else {
+            panic!("control attachment")
+        };
+        let fence = attachment
+            .baseline
+            .snapshot
+            .foreground_operation
+            .as_ref()
+            .unwrap()
+            .generations
+            .last()
+            .unwrap()
+            .fence
+            .clone();
+        assert!(matches!(
+            attachment
+                .client
+                .transfer_background(
+                    SurfaceRequestId::new(),
+                    BackgroundTarget::ActiveGeneration {
+                        fence: fence.clone()
+                    }
+                )
+                .unwrap(),
+            MutationReply::Committed { .. }
+        ));
+        let task = fixture.wait_for(|snapshot| {
+            snapshot
+                .background_operations
+                .iter()
+                .find(|op| op.operation_id == fence.operation_id)?
+                .task_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned())
+        });
+        super::detach_child_surface(&surface, &attachment.client);
+        std::fs::write(marker, "").unwrap();
+        fixture.wait_for(|snapshot| {
+            snapshot
+                .operation_history
+                .iter()
+                .any(|op| op.operation_id == fence.operation_id && op.terminal.is_some())
+                .then_some(())
+        });
+        let (send, shown) = crossbeam_channel::unbounded();
+        crate::surface_client::foreground_task(
+            &fixture.parent.typed_surface(),
+            &task,
+            &fixture.control,
+            &send,
+        )
+        .unwrap();
+        let shown = shown.try_iter().collect::<Vec<_>>();
+        let text = shown
+            .iter()
+            .filter_map(|event| match event {
+                TuiEvent::MessageDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(!text.contains("started"), "{text}");
+        assert_eq!(text.matches("completed.").count(), 1, "{text}");
+        assert_eq!(
+            shown
+                .iter()
+                .filter(
+                    |event| matches!(event,TuiEvent::SessionCompleted{status} if status=="success")
+                )
+                .count(),
+            1
+        );
+        assert!(!events.try_iter().any(|event| matches!(event,TuiEvent::SurfaceDelivery(item) if matches!(item.1,TuiEvent::SessionCompleted{..}))));
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn failed_queued_turn_is_shown_once_after_return() {
+        use crate::attachment_routing::{AttachmentRouting, accept_attached_tui_event};
+        let fixture = ViewOnChild::start();
+        let parent = SessionAttachmentId::new(1);
+        let routing = std::sync::Arc::new(std::sync::Mutex::new(AttachmentRouting::new(parent)));
+        let (root, displayed) = crossbeam_channel::unbounded();
+        AttachmentRouting::switch_attachment(&routing, &root, parent.next(), Some(parent), false);
+        let events = fixture.enqueue("mock_stream_closed_always queued-failure");
+        let mut diagnostic = None;
+        let mut start = None;
+        loop {
+            let event = events
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let terminal = matches!(&event,TuiEvent::SurfaceDelivery(item) if matches!(&item.1,TuiEvent::SessionCompleted{..}));
+            if matches!(&event,TuiEvent::SurfaceDelivery(item) if matches!(item.1,TuiEvent::RuntimeTurnStarted{..}))
+            {
+                start = Some(event.clone());
+            }
+            if matches!(&event,TuiEvent::SurfaceDelivery(item) if matches!(item.1,TuiEvent::Diagnostic(_)))
+            {
+                diagnostic = Some(event.clone());
+            }
+            routing.lock().unwrap().route(&root, parent, event);
+            if terminal {
+                break;
+            }
+        }
+        let diagnostic = diagnostic.expect("committed terminal diagnostic");
+        let title = match &diagnostic {
+            TuiEvent::SurfaceDelivery(item) => match &item.1 {
+                TuiEvent::Diagnostic(diagnostic) => diagnostic.title(),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        let snapshot = super::snapshot_for_return(&routing, &root, parent, || {
+            super::read_parent_snapshot(&fixture.parent)
+        })
+        .unwrap();
+        super::project_returned_main(
+            &fixture.parent,
+            &snapshot,
+            parent,
+            &root,
+            &fixture.control,
+            &routing,
+        )
+        .unwrap();
+        AttachmentRouting::release_deferred_parent_events(&routing, &root);
+        routing.lock().unwrap().route(&root, parent, diagnostic);
+        routing
+            .lock()
+            .unwrap()
+            .route(&root, parent, start.expect("committed logical start"));
+        let (actions, _) = crossbeam_channel::unbounded();
+        let mut state =
+            crate::types::AppState::new(actions, "test".into(), "mock".into(), "/tmp".into());
+        for event in displayed.try_iter() {
+            if let Ok(Some(event)) = accept_attached_tui_event(&mut state, event) {
+                state.update(event);
+            }
+        }
+        let frame = crate::test_support::frame_string(&mut state, 120, 40);
+        assert_eq!(frame.matches(title).count(), 1, "{frame}");
+        assert_eq!(state.status, crate::types::AppStatus::Idle);
+        fixture.shutdown();
     }
 
     fn self_started_main(shutdown: bool) {

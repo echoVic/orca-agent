@@ -75,8 +75,7 @@ struct HostedOperationInner {
     settings_target_thread_id: Option<String>,
     settings_restricted: bool,
     queue_watcher_stop: Option<Arc<AtomicBool>>,
-    queue_interactions:
-        HashMap<TuiInteractionKey, std::sync::mpsc::SyncSender<io::Result<TuiInteractionResponse>>>,
+    queue_interactions: HashMap<TuiInteractionKey, PendingQueueInteraction>,
     /// The MCP servers that started with the TUI, until a thread takes them.
     prestart_mcp: Option<PrestartedMcp>,
     /// Whether those servers wait for first-run setup to be done before
@@ -89,6 +88,13 @@ struct HostedOperationInner {
     /// changes it without waiting for the controller.
     view: Option<crate::hosted_view::HostedView>,
     shutdown: bool,
+}
+
+#[derive(Debug)]
+struct PendingQueueInteraction {
+    thread_id: String,
+    event: TuiEvent,
+    response: std::sync::mpsc::SyncSender<io::Result<TuiInteractionResponse>>,
 }
 
 /// A message submitted to the controller, as the thread handling it knows it.
@@ -878,13 +884,13 @@ impl TuiSurfaceTaskControl {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn bind_prompt_queue_event_sender(&self, event_tx: &Sender<TuiEvent>) {
-        let hosted = self.lock_hosted();
-        *hosted
-            .queue_event_tx
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(event_tx.clone());
+    pub(crate) fn pending_queue_interactions(&self, thread_id: &str) -> Vec<TuiEvent> {
+        self.lock_hosted()
+            .queue_interactions
+            .values()
+            .filter(|pending| pending.thread_id == thread_id)
+            .map(|pending| pending.event.clone())
+            .collect()
     }
 
     pub(crate) fn prompt_queue_event_sender(&self) -> Arc<Mutex<Option<Sender<TuiEvent>>>> {
@@ -893,12 +899,14 @@ impl TuiSurfaceTaskControl {
 
     pub(crate) fn await_queue_interaction(
         &self,
+        thread_id: &str,
+        event_tx: &Sender<TuiEvent>,
         request_id: String,
         kind: TuiInteractionKind,
         event: impl FnOnce(TuiInteractionKey) -> TuiEvent,
     ) -> io::Result<TuiInteractionResponse> {
         let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
-        let (key, event_tx) = {
+        let (key, event) = {
             let mut hosted = self.lock_hosted();
             if hosted.shutdown {
                 return Err(io::Error::new(
@@ -907,21 +915,18 @@ impl TuiSurfaceTaskControl {
                 ));
             }
             let key = TuiInteractionKey::new(self.surface_ids.allocate(), request_id, kind);
-            let event_tx = hosted
-                .queue_event_tx
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "queued runtime interaction channel is not installed",
-                    )
-                })?;
-            hosted.queue_interactions.insert(key.clone(), response_tx);
-            (key, event_tx)
+            let event = event(key.clone());
+            hosted.queue_interactions.insert(
+                key.clone(),
+                PendingQueueInteraction {
+                    thread_id: thread_id.to_owned(),
+                    event: event.clone(),
+                    response: response_tx,
+                },
+            );
+            (key, event)
         };
-        if event_tx.send(event(key.clone())).is_err() {
+        if event_tx.send(event).is_err() {
             self.lock_hosted().queue_interactions.remove(&key);
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -946,7 +951,7 @@ impl TuiSurfaceTaskControl {
         let Some(sender) = self.lock_hosted().queue_interactions.remove(key) else {
             return Ok(false);
         };
-        sender.send(Ok(response.clone())).map_err(|_| {
+        sender.response.send(Ok(response.clone())).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "queued runtime interaction waiter closed",
@@ -961,7 +966,7 @@ impl TuiSurfaceTaskControl {
             hosted
                 .queue_interactions
                 .drain()
-                .map(|(_, sender)| sender)
+                .map(|(_, pending)| pending.response)
                 .collect::<Vec<_>>()
         };
         for sender in waiters {
@@ -2296,10 +2301,11 @@ mod tests {
     fn queued_interaction_round_trip_wakes_runtime_waiter() {
         let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        controller.bind_prompt_queue_event_sender(&event_tx);
         let waiting = controller.clone();
         let waiter = std::thread::spawn(move || {
             waiting.await_queue_interaction(
+                "main",
+                &event_tx,
                 "request-1".to_string(),
                 crate::protocol::TuiInteractionKind::UserInput,
                 |key| crate::protocol::TuiEvent::UserInputRequested {

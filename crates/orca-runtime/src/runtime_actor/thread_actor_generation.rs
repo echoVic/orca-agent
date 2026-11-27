@@ -1194,27 +1194,7 @@ impl ThreadActor {
             }
             None => self.commit_surface_generation_batch_with_retry(fence, &batch),
         }?;
-        self.present_queue_batch(active.filter(|_| active_generation), &batch);
         Ok(())
-    }
-
-    fn present_queue_batch(
-        &self,
-        active: Option<&ActiveOperation>,
-        batch: &surface::SurfaceCommitBatch,
-    ) {
-        if let Some(observer) = active.and_then(|active| active.request.queue_presentation.as_ref())
-        {
-            observer(QueueSurfaceUpdate::Assistant(
-                batch,
-                &self
-                    .resident_surface
-                    .coordinator
-                    .state()
-                    .snapshot()
-                    .assistant_streams,
-            ));
-        }
     }
 
     pub(super) fn commit_surface_subagent_activity(
@@ -2260,7 +2240,6 @@ impl ThreadActor {
         }
         let batch = self.surface_event_batch_with_commit_id(events, None);
         self.commit_surface_generation_batch_with_retry(fence, &batch)?;
-        self.present_queue_batch(Some(active), &batch);
         Ok(())
     }
 
@@ -2307,7 +2286,6 @@ impl ThreadActor {
         }
         let batch = self.surface_event_batch_with_commit_id(events, None);
         self.commit_surface_generation_batch_with_retry(fence, &batch)?;
-        self.present_queue_batch(Some(active), &batch);
         Ok(response)
     }
 

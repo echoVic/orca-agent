@@ -2439,39 +2439,6 @@ fn assistant_delta(channel: AssistantChannel, text: &str) -> TuiEvent {
     }
 }
 
-pub(crate) fn committed_queue_assistant_events(
-    batch: &SurfaceCommitBatch,
-    streams: &[SurfaceAssistantStream],
-) -> Vec<TuiEvent> {
-    let mut events = Vec::new();
-    for envelope in batch.events.as_slice() {
-        match &envelope.event {
-            SurfaceEvent::Assistant(AssistantPatch::Delta {
-                stream_id, text, ..
-            }) => {
-                if let Some(stream) = streams
-                    .iter()
-                    .rev()
-                    .find(|stream| &stream.stream_id == stream_id)
-                {
-                    events.push(assistant_delta(stream.channel, text.as_str()));
-                }
-            }
-            SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted { response }) => {
-                events.push(response_completed_event(response));
-                if let Some(plan) = &response.plan_item {
-                    events.push(TuiEvent::ProposedPlanDelta(plan.text.as_str().to_owned()));
-                }
-            }
-            SurfaceEvent::Assistant(AssistantPatch::StreamDiscarded { .. }) => {
-                events.push(TuiEvent::AssistantAttemptDiscarded)
-            }
-            _ => {}
-        }
-    }
-    events
-}
-
 fn response_completed_event(response: &SurfaceCompletedModelResponse) -> TuiEvent {
     TuiEvent::AssistantResponseCompleted(
         response

@@ -20,6 +20,7 @@ pub(crate) struct AttachmentRouting {
 struct RestoredParent {
     attachment: SessionAttachmentId,
     cursor: orca_runtime::surface::SurfaceCursor,
+    // Kept until the next return; request identities are unique per operation.
     requests: Vec<TuiInteractionKey>,
 }
 
@@ -35,6 +36,7 @@ impl AttachmentRouting {
                 if restored.is_some_and(|parent| {
                     parent.cursor.thread_id == cursor.thread_id
                         && parent.cursor.incarnation == cursor.incarnation
+                        // Hydration delivers at the baseline cursor itself.
                         && cursor.next_seq <= parent.cursor.next_seq
                 }) {
                     return true;
@@ -176,8 +178,14 @@ impl AttachmentRouting {
         }
         routing.active = Some(attachment);
         routing.parent_while_side = parent_while_side;
-        routing.deferred_parent_attachment = Some(attachment);
-        routing.deferred_parent_events.clear();
+        routing.defer_parent(attachment);
+    }
+
+    pub(crate) fn defer_parent(&mut self, attachment: SessionAttachmentId) {
+        if self.deferred_parent_attachment != Some(attachment) {
+            self.deferred_parent_events.clear();
+            self.deferred_parent_attachment = Some(attachment);
+        }
     }
 
     pub(crate) fn release_deferred_parent_events(
@@ -423,7 +431,7 @@ pub(crate) fn send_attached_event(
     })))
 }
 
-fn side_parent_status_for_event(event: &TuiEvent) -> Option<SideParentStatus> {
+pub(crate) fn side_parent_status_for_event(event: &TuiEvent) -> Option<SideParentStatus> {
     match event {
         TuiEvent::TurnStarted { .. } | TuiEvent::RuntimeTurnStarted { .. } => {
             Some(SideParentStatus::Running)

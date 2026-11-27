@@ -2646,10 +2646,11 @@ fn drain_operation_with_boundary(
                 }
             }
         }
-        let mut next_item = subscription.try_recv();
-        if next_item.is_none() && !sealed {
-            next_item = subscription.recv_timeout(Duration::from_millis(25));
-        }
+        let mut next_item = if terminal_seen || sealed {
+            None
+        } else {
+            subscription.recv_timeout(Duration::from_millis(25))
+        };
         while let Some(item) = next_item {
             match item {
                 SurfaceSubscriptionItem::Batch { batch } => {
@@ -2707,12 +2708,17 @@ fn drain_operation_with_boundary(
                 }
                 SurfaceSubscriptionItem::Sealed { .. } => sealed = true,
             }
-            if sealed {
+            if sealed || terminal_seen {
                 break;
             }
             next_item = subscription.try_recv();
         }
-        if let Ok(result) = wait_rx.try_recv() {
+        let receipt = if terminal_seen {
+            wait_rx.recv_timeout(Duration::from_millis(25)).ok()
+        } else {
+            wait_rx.try_recv().ok()
+        };
+        if let Some(result) = receipt {
             match result {
                 Ok(WaitOperationTerminalResult::Terminal { value }) => {
                     if &value.operation_id == operation_id {
@@ -2790,6 +2796,75 @@ fn drain_operation_with_boundary(
     Ok(TuiHostedOperationOutcome::Turn {
         status: status.to_string(),
     })
+}
+
+pub(crate) fn follow_queue_operation(
+    mut follow: orca_runtime::runtime_host::QueueSurfaceFollow,
+    surface: &RuntimeSurfaceHandle,
+    controller: &TuiSurfaceTaskControl,
+    sender: &mpsc::Sender<TuiEvent>,
+) -> io::Result<()> {
+    let mut projection = TuiSurfaceProjection::from_surface_snapshot(&follow.baseline.snapshot);
+    projection.focus_operation(follow.operation.clone());
+    let routed = controller.view().is_some();
+    while !controller.is_shutdown() {
+        let Some(item) = follow.subscription.recv_timeout(Duration::from_millis(25)) else {
+            continue;
+        };
+        let batch = match item {
+            SurfaceSubscriptionItem::Batch { batch } => batch,
+            SurfaceSubscriptionItem::Gap { required } => {
+                return Err(io::Error::other(format!(
+                    "queued operation subscription gap: {:?}",
+                    required.reason
+                )));
+            }
+            SurfaceSubscriptionItem::Sealed { .. } => break,
+        };
+        let events = projection.project_typed_batch(&batch).map_err(|error| {
+            io::Error::other(format!("queued operation projection failed: {error:?}"))
+        })?;
+        if projection.operation_is_runtime_backgrounded(&follow.operation) {
+            spawn_background_presentation(surface, follow.operation, controller, sender.clone())?;
+            break;
+        }
+        let start = batch
+            .events
+            .as_slice()
+            .iter()
+            .find_map(|envelope| match &envelope.event {
+                SurfaceEvent::Operation(OperationPatch::AgentLoopTurnStarted { turn })
+                    if turn.fence.operation_id == follow.operation =>
+                {
+                    Some(&turn.turn_id)
+                }
+                _ => None,
+            });
+        let terminal = batch.events.as_slice().iter().any(|envelope| matches!(&envelope.event, SurfaceEvent::Operation(OperationPatch::Terminal { record }) if record.operation_id == follow.operation));
+        for event in events {
+            let event = match (&event, start) {
+                (TuiEvent::TurnStarted { .. }, Some(id)) => TuiEvent::RuntimeTurnStarted {
+                    turn_id: id.as_str().to_owned(),
+                },
+                _ => event,
+            };
+            if sender
+                .send(event.at_surface_cursor(routed, &batch.cursor_after))
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+        controller.remember_surface_delivery_watermark(
+            follow.operation.clone(),
+            projection.delivery_watermark(&follow.operation),
+        );
+        if terminal {
+            controller.remember_surface_terminal_delivery(follow.operation);
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn spawn_background_presentation(

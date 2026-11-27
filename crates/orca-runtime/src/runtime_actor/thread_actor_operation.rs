@@ -4137,6 +4137,34 @@ impl ThreadActor {
             }
         };
         let operation_id = reserved.operation_id;
+        if let Some(follows) = &runtime_started.surface_observers {
+            let surface = self.handle.surface();
+            let follow = match surface.attach_fresh(surface::FreshAttachRequest {
+                request_id: surface::SurfaceRequestId::new(),
+                role: surface::SurfaceAttachmentRole::Tui,
+                requested_capabilities: BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+                interaction_capabilities: BTreeSet::new(),
+            }) {
+                surface::AttachResult::FreshAttached { attachment } => surface
+                    .claim_subscription(&attachment.subscription)
+                    .map(|subscription| QueueSurfaceFollow {
+                        operation: operation_id.clone(),
+                        baseline: attachment.baseline,
+                        subscription,
+                    }),
+                _ => None,
+            };
+            if !follow.is_some_and(|follow| follows.send(follow).is_ok()) {
+                let _ = self.terminalize_surface_reservation(
+                    operation_id,
+                    surface::ReservationFinalizerReason::AdmissionRejected {
+                        reason: surface::AdmissionRejectionReason::ConfigurationConflict,
+                    },
+                    surface::NotAdmittedReason::ConfigurationConflict,
+                );
+                return Err(UNAVAILABLE);
+            }
+        }
         let prepared = self
             .prepare_surface_admission_from(
                 &origin,
@@ -6686,9 +6714,6 @@ impl ThreadActor {
             );
         }
         self.cache_surface_terminal(value.clone());
-        if let Some(observer) = &active.request.queue_presentation {
-            observer(QueueSurfaceUpdate::Terminal(&value));
-        }
         Ok(Some(value))
     }
 
