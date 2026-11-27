@@ -139,7 +139,7 @@ session、live extension context 或 GoalStore I/O 失败属于控制面错误�
 
 Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 
-- Orca 从受信任的 Git 根目录查找项目的 `.orca/skills` 和 `.agents/skills`。用户级路径为 `$ORCA_HOME/skills`（未设置 `ORCA_HOME` 时用 `~/.orca/skills`）和 `~/.agents/skills`。ID 相同时优先使用项目定义。
+- Orca 从受信任的 Git 根目录查找项目的 `.orca/skills` 和 `.agents/skills`；工作区不在 Git 仓库中时，从受信任的工作区根目录查找。用户级路径为 `$ORCA_HOME/skills`（未设置 `ORCA_HOME` 时用 `~/.orca/skills`）和 `~/.agents/skills`。ID 相同时优先使用项目定义。
 - 模型会收到可用 skill 的 ID 和描述。任务匹配时可调用 `read_skill`，需要完整目录时可调用 `list_skills`。
 - TUI `/skills` 会打开可搜索的 `$` picker；选择后的 `$skill_id` 作为原子 composer token 处理，退格或删除不会留下半个 skill 引用。
 - 提及 `$skill_id` 时，Orca 会将对应的 `SKILL.md` 正文按版本加入对话。后续轮次可以继续使用，直到上下文压缩。
