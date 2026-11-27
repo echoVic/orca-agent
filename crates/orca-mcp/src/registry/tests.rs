@@ -1216,9 +1216,14 @@ fn cancelled_while_the_transport_is_held<T: Send>(
 /// with no content.
 struct CallCountingTransport {
     calls: Arc<AtomicUsize>,
+    generation: u64,
 }
 
 impl McpTransport for CallCountingTransport {
+    fn session_generation(&self) -> u64 {
+        self.generation
+    }
+
     fn initialize(&self) -> Result<Value, String> {
         Ok(serde_json::json!({}))
     }
@@ -1281,6 +1286,7 @@ fn a_cancellable_call_to_a_remote_server_waiting_for_the_transport_returns_when_
         },
         CallCountingTransport {
             calls: Arc::clone(&calls),
+            generation: 0,
         },
     );
 
@@ -1309,6 +1315,35 @@ fn a_cancellable_call_to_a_remote_server_waiting_for_the_transport_returns_when_
 }
 
 #[test]
+fn eager_calls_use_the_current_http_tool_listing() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let client = client_with(
+        McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransportKind::Http,
+            ..Default::default()
+        },
+        CallCountingTransport {
+            calls: calls.clone(),
+            generation: 2,
+        },
+    );
+    let mut tool = McpToolRef {
+        server: "remote".into(),
+        tool: "echo".into(),
+        schema_name: "mcp__remote__echo".into(),
+        session_generation: Some(1),
+    };
+    let call = |tool: &McpToolRef| client.call_tool(tool, serde_json::json!({}), None, None);
+    assert!(call(&tool).unwrap_err().contains("changed its tools"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    tool.session_generation = Some(2);
+    call(&tool).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn a_reconnect_waiting_for_the_transport_returns_when_cancelled() {
     use crate::client::ReconnectFailure;
 
@@ -1319,6 +1354,7 @@ fn a_reconnect_waiting_for_the_transport_returns_when_cancelled() {
         },
         CallCountingTransport {
             calls: Arc::default(),
+            generation: 0,
         },
     );
     let failed = client.lock_transport().expect("its transport").clone();
@@ -3021,6 +3057,9 @@ fn a_failure_on_a_replaced_connection_does_not_mark_the_new_one() {
         [status("docs", McpServerState::Ready)],
         "the new connection's login works"
     );
+    let echo = registry
+        .resolve_tool("mcp__docs__echo")
+        .expect("the echo tool from the new connection");
     registry
         .call_tool(&echo, serde_json::json!({}))
         .expect("the new connection serves the next call");

@@ -161,9 +161,7 @@ impl McpClient {
             should_cancel.unwrap_or(&|| false),
             |transport| {
                 let generation = transport.session_generation();
-                if self.config.tool_loading == McpToolLoading::OnDemand
-                    && generation != 0 && tool.session_generation != Some(generation)
-                {
+                if generation != 0 && tool.session_generation != Some(generation) {
                     return Err(format!("MCP server '{}' changed its tools. Review its current tools and submit the tool call again.", self.server_name));
                 }
                 transport.call_tool_with_elicitation_handler_or_cancel(
