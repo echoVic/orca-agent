@@ -2015,7 +2015,7 @@ impl TaskRegistry {
                 Some(owner),
                 &persistence.root,
                 &crate::task_owner::OwnerStamp {
-                    session: self.session_id.clone(),
+                    session: owner.stamp.session.clone(),
                     id: id.into(),
                 },
             )
@@ -7952,6 +7952,21 @@ mod tests {
                 .task_tree_writes_applied(&root.id, &baseline)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn output_probe_uses_the_physical_session_component() {
+        let home = tempfile::tempdir().unwrap();
+        let open =
+            || TaskRegistry::new_persistent("session:id".into(), home.path().into()).unwrap();
+        let reader = open();
+        let other = open();
+        let stamp = other.owner_stamp().unwrap();
+        assert_eq!(stamp.session, "session_id");
+        let _lock = reader.output_session_lock().unwrap();
+        assert!(reader.output_owner_alive(&stamp.id));
+        drop(other);
+        assert!(!reader.output_owner_alive(&stamp.id));
     }
 
     #[test]
