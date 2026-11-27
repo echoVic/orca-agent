@@ -365,6 +365,13 @@ impl AgentController {
         };
         let thread_id = child.thread_id().to_string();
         let kept_in_process = self.keeps_subagents_in_process();
+        if kept_in_process
+            && let Err(error) = request
+                .task_registry
+                .bind_subagent_thread(&request.agent_id, &thread_id)
+        {
+            tracing::warn!(task_id = %request.agent_id, %thread_id, %error, "could not bind the running subagent's thread");
+        }
         // A child the host keeps is told that it asks nobody.
         let unattended = if kept_in_process {
             crate::child_refusal::UNATTENDED_CHILD_CONTEXT

@@ -34975,6 +34975,51 @@ mod tests {
         host.shutdown().expect("shutdown queued kept subagent host");
     }
 
+    #[test]
+    fn a_running_kept_subagents_record_names_its_thread() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start host");
+        let release = ReleaseMarker(cwd.path().join("release"));
+        let child_prompt = format!("mock_stream_release_marker {}", release.0.display());
+        let (thread, attachment, operation_id, _stops_agents) =
+            start_keeping_parent_turn(&host, cwd.path(), &format!("subagent async {child_prompt}"));
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let agent = kept_agents_under_way(read_snapshot, &[&child_prompt]).remove(0);
+        let thread_id = agent.child_thread_id.expect("running agent's thread");
+        let thread_id = uuid::Uuid::from_bytes(*thread_id.as_bytes()).to_string();
+        let registry = thread.task_registry();
+        let running = registry
+            .get(agent.task_id.as_str())
+            .expect("running record");
+
+        release.release();
+        attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait for parent turn");
+        let ended = registry.get(agent.task_id.as_str()).expect("ended record");
+        host.shutdown().expect("shutdown host");
+
+        assert_eq!(running.status, TaskStatus::Running);
+        assert_eq!(
+            running.subagent_child_thread_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(ended.status, TaskStatus::Completed);
+        assert_eq!(
+            ended.subagent_child_thread_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+    }
+
     /// A person's stop of one agent the TUI keeps on a thread of its process
     /// (its `s` key ends in this command) while the turn that started it runs.
     /// The answer comes at once; the agent ends stopped on its record, in its
