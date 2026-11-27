@@ -15,7 +15,6 @@ mod storage_tests;
 mod types;
 mod writer;
 
-use orca_core::conversation::Conversation;
 pub(crate) use orca_core::history_redaction::redact_sensitive_text;
 
 pub(crate) use assets::HydrateImages;
