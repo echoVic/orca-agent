@@ -17673,7 +17673,7 @@ impl ThreadActor {
                     .thread
                     .session()
                     .task_registry()
-                    .undelivered_root_subagent_result_ids()
+                    .root_subagent_results_that_wake_parent()
             })
             .unwrap_or_default();
         // A wake whose turn left these same results undelivered (the session
@@ -33121,6 +33121,22 @@ mod tests {
         });
     }
 
+    fn remove_owner_stamp_for_legacy_fixture(home: &std::path::Path, session_id: &str, id: &str) {
+        let path = home
+            .join("task-sessions")
+            .join(session_id)
+            .join("tasks.json");
+        let mut records: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let stamp = records[id]
+            .as_object_mut()
+            .unwrap()
+            .remove("registry_owner")
+            .unwrap();
+        assert_eq!(stamp["session"], session_id);
+        std::fs::write(path, serde_json::to_vec(&records).unwrap()).unwrap();
+    }
+
     #[test]
     fn recorded_restart_adopts_and_stops_registry_only_running_main_session_once() {
         let _env = crate::history::lock_test_env();
@@ -33161,7 +33177,10 @@ mod tests {
             let before = registry
                 .get(&legacy.id)
                 .expect("active task before adoption");
+            let stamped = registry.create_main_session("crashed stamped main task".into());
+            registry.mark_running(&stamped.id).unwrap();
             drop(registry);
+            remove_owner_stamp_for_legacy_fixture(home, &session_id, &legacy.id);
 
             let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
                 .expect("start first active-adoption host");
@@ -33174,6 +33193,14 @@ mod tests {
                     "first active adoption",
                 )
                 .expect("resume registry-only active task");
+            let ended = resumed.task_registry().get(&stamped.id).unwrap();
+            assert_eq!(ended.status, TaskStatus::Failed);
+            assert_eq!(
+                ended.error.as_deref(),
+                Some(
+                    "main session interrupted before completion; async task execution is process-local"
+                )
+            );
             let first_snapshot = fresh_surface_attachment_with_capabilities(
                 &resumed.surface(),
                 BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
@@ -33553,6 +33580,7 @@ mod tests {
                 .get(&legacy.id)
                 .expect("active task before failure");
             drop(registry);
+            remove_owner_stamp_for_legacy_fixture(home, &session_id, &legacy.id);
             surface::JsonlSurfaceCommitLedger::inject_active_task_adoption_append_failures(
                 transcript_path.clone(),
                 SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS,
@@ -35023,7 +35051,7 @@ mod tests {
         );
     }
 
-    fn interrupted_agent_with_held_end(lose_end: bool) {
+    fn interrupted_agent_with_held_end(lose_end: bool, terminal_record: bool) {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().unwrap();
         let marker_path = cwd.path().join("release");
@@ -35054,6 +35082,8 @@ mod tests {
                 .is_active()
         );
         if lose_end {
+            let control = registry.get(agent.task_id.as_str()).unwrap().control;
+            control.mark_end_reported();
             registry
                 .fail(agent.task_id.as_str(), "lost terminal receipt".into())
                 .unwrap();
@@ -35084,15 +35114,17 @@ mod tests {
                 &mut seen,
             );
             assert_eq!(seen, (1, 1));
-        } else {
-            std::thread::sleep(SUBAGENT_SETTLE_GRACE + SUBAGENT_RELAY_POLL_INTERVAL * 4);
-            assert_eq!(read().subagents[0], *running);
+            control.reset_simulated_end_report();
             marker.release();
-            let (_, task, shown) =
-                kept_agent_end(&registry, read, &agent.task_id, Duration::from_secs(5));
-            assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
-            assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
-            let mut seen = (0, 0);
+            let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+            while !control.end_reported() {
+                assert!(
+                    Instant::now() < deadline,
+                    "child never finished reporting its own end"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(read().cursor, settled.cursor);
             subagent_terminals_seen(
                 &mut subscription,
                 &agent.task_id,
@@ -35101,19 +35133,50 @@ mod tests {
                 &mut seen,
             );
             assert_eq!(seen, (1, 1));
+            host.shutdown().unwrap();
+        } else {
+            if terminal_record {
+                registry
+                    .stop(agent.task_id.as_str(), "parent interrupted".into())
+                    .unwrap();
+                let ended = registry.get(agent.task_id.as_str()).unwrap();
+                assert!(ended.control.runs_on_its_own_thread() && !ended.control.end_reported());
+            }
+            std::thread::sleep(SUBAGENT_SETTLE_GRACE + SUBAGENT_RELAY_POLL_INTERVAL * 4);
+            let before_release = read().subagents[0].clone();
+            marker.release();
+            let (_, task, shown) =
+                kept_agent_end(&registry, read, &agent.task_id, Duration::from_secs(5));
+            assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+            assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
+            assert!(shown.source.source_sequence > running.source.source_sequence);
+            let mut seen = (0, 0);
+            subagent_terminals_seen(
+                &mut subscription,
+                &agent.task_id,
+                &agent.subagent_id,
+                task.status,
+                &mut seen,
+            );
+            host.shutdown().unwrap();
+            assert_eq!(before_release, *running);
+            assert_eq!(seen, (1, 1));
         }
-        marker.release();
-        host.shutdown().unwrap();
     }
 
     #[test]
     fn an_agent_whose_end_was_lost_is_settled_from_its_record_when_idle() {
-        interrupted_agent_with_held_end(true);
+        interrupted_agent_with_held_end(true, true);
     }
 
     #[test]
     fn a_live_kept_agent_of_an_ended_generation_is_left_alone() {
-        interrupted_agent_with_held_end(false);
+        interrupted_agent_with_held_end(false, false);
+    }
+
+    #[test]
+    fn a_kept_subagent_with_an_ended_record_publishes_its_own_delayed_end() {
+        interrupted_agent_with_held_end(false, true);
     }
 
     #[test]
@@ -35154,15 +35217,19 @@ mod tests {
             )
             .unwrap();
             let raw = &records[&task_id];
-            assert_eq!(raw["status"], "running");
-            assert!(raw["error"].is_null());
+            if phase != "second" {
+                assert_eq!(raw["status"], "running");
+                assert!(raw["error"].is_null());
+            }
             assert_eq!(raw["registry_owner"]["session"], parent);
             assert!(raw["registry_owner"]["id"].is_string());
             assert_eq!(raw["subagent_execution_started"], true);
-            host.handle().keep_subagents_in_process();
+            if phase != "nonkeeping" {
+                host.handle().keep_subagents_in_process();
+            }
             let thread = host
                 .start_thread(
-                    surface_test_config(home, HistoryMode::Resume(parent)),
+                    surface_test_config(home.clone(), HistoryMode::Resume(parent)),
                     "resume after crash",
                 )
                 .unwrap();
@@ -35178,6 +35245,16 @@ mod tests {
                 .iter()
                 .find(|row| row.task_id.as_str() == task_id)
                 .unwrap();
+            if phase == "nonkeeping" {
+                std::thread::sleep(SUBAGENT_RELAY_POLL_INTERVAL * 4);
+                let fresh = fresh_surface_attachment(&thread.surface())
+                    .baseline
+                    .snapshot;
+                assert_eq!(row.status, surface::SurfaceSubagentStatus::Running);
+                assert_eq!(fresh.subagents, snapshot.subagents);
+                host.shutdown().unwrap();
+                return;
+            }
             assert_eq!(row.status, surface::SurfaceSubagentStatus::Failed);
             assert_eq!(row.error.as_ref().unwrap().as_str(), error);
             assert!(
@@ -35186,23 +35263,97 @@ mod tests {
                     .iter()
                     .all(|row| row.status != surface::SurfaceSubagentStatus::Running)
             );
+            let queue = thread
+                .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
+                .unwrap();
+            assert!(!queue.paused && queue.items.is_empty());
+            let (events, observed) = mpsc::channel();
+            thread.set_prompt_queue_event_observer(Arc::new(
+                move |event: &orca_core::event_schema::EventEnvelope| {
+                    let _ = events.send(event.event_type);
+                    Ok(())
+                },
+            ));
+            assert!(
+                matches!(
+                    observed.recv_timeout(SUBAGENT_RELAY_POLL_INTERVAL * 8),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "resume started a turn"
+            );
+            let fresh = fresh_surface_attachment(&thread.surface())
+                .baseline
+                .snapshot;
+            assert!(fresh.foreground_operation.is_none());
+            assert_eq!(fresh.operation_history, snapshot.operation_history);
+            assert_eq!(
+                thread
+                    .task_registry()
+                    .get(&task_id)
+                    .unwrap()
+                    .result_delivery,
+                crate::tasks::ResultDelivery::Pending
+            );
+            if phase == "second" {
+                let path = home.join("person-turn.jsonl");
+                let result = thread
+                    .start_turn(
+                        HostedTurnRequest::new("mock_echo_task_notifications"),
+                        std::fs::File::create(&path).unwrap(),
+                    )
+                    .unwrap()
+                    .wait();
+                assert_eq!(
+                    result.outcome(),
+                    &OperationOutcome::Completed(RunStatus::Success)
+                );
+                let response = std::fs::read_to_string(path).unwrap();
+                let reply: String = response
+                    .lines()
+                    .map(|line| {
+                        serde_json::from_str::<orca_core::event_schema::EventEnvelope>(line)
+                            .unwrap()
+                    })
+                    .filter(|event| {
+                        event.event_type
+                            == orca_core::event_schema::EventType::AssistantMessageDelta
+                    })
+                    .map(|event| event.payload["text"].as_str().unwrap().to_owned())
+                    .collect();
+                assert!(
+                    reply.starts_with("<task-notification>")
+                        && reply.contains(&task_id)
+                        && reply.contains(&error),
+                    "first model call did not receive the failure: {reply:?}"
+                );
+                assert_eq!(
+                    thread
+                        .task_registry()
+                        .get(&task_id)
+                        .unwrap()
+                        .result_delivery,
+                    crate::tasks::ResultDelivery::Delivered
+                );
+            }
             host.shutdown().unwrap();
             return;
         }
-        let home = tempfile::tempdir().unwrap();
-        for phase in ["crash", "resume"] {
-            let status = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "runtime_host::tests::a_resumed_thread_settles_the_agents_it_lost",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(PHASE, phase)
-                .env("ORCA_HOME", home.path())
-                .status()
-                .unwrap();
-            assert!(status.success(), "{phase} child: {status}");
+        for phases in [&["crash", "resume", "second"][..], &["crash", "nonkeeping"]] {
+            let home = tempfile::tempdir().unwrap();
+            for phase in phases {
+                let status = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "runtime_host::tests::a_resumed_thread_settles_the_agents_it_lost",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(PHASE, phase)
+                    .env("ORCA_HOME", home.path())
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "{phase} child: {status}");
+            }
         }
     }
 
@@ -35415,6 +35566,7 @@ mod tests {
             .find(|candidate| candidate.task_id == first.task_id)
             .expect("the first agent's task on the parent's surface");
         assert_eq!(shown_task.error, None, "a stop is not an error");
+        assert_eq!(shown_task.result, None);
         assert!(shown_task.completed_at.is_some());
         let shown = snapshot
             .subagents
@@ -35423,6 +35575,7 @@ mod tests {
             .expect("the first agent on the parent's surface");
         assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
         assert_eq!(shown.error, None, "a stop is not an error");
+        assert_eq!(shown.output, None);
         assert_eq!(
             shown
                 .subagent_activity_history

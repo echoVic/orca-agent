@@ -1780,11 +1780,19 @@ impl AgentContinuationStore {
             )?),
             AgentContinuationStoreBackend::ProcessLocal { .. } => None,
         };
-        self.reconcile_expired_owners_under_session_lock(|_| true)
+        self.reconcile_expired_owners_matching(|_| true)
     }
 
     /// The caller holds the persistent session lock through task projection.
     pub(crate) fn reconcile_expired_owners_under_session_lock(
+        &self,
+        _session_lock: &ExclusiveFileLock,
+        recover: impl Fn(&str) -> bool,
+    ) -> Result<Vec<ContinuationProjection>, AgentContinuationError> {
+        self.reconcile_expired_owners_matching(recover)
+    }
+
+    fn reconcile_expired_owners_matching(
         &self,
         recover: impl Fn(&str) -> bool,
     ) -> Result<Vec<ContinuationProjection>, AgentContinuationError> {
@@ -4072,7 +4080,18 @@ mod tests {
         PreparedContinuation,
         ContinuationLease,
     ) {
-        let registry = TaskRegistry::new(session.to_string());
+        prepare_with_registry(TaskRegistry::new(session.to_string()))
+    }
+
+    fn prepare_with_registry(
+        registry: TaskRegistry,
+    ) -> (
+        TaskRegistry,
+        ChildAgentCoordinator,
+        PreparedContinuation,
+        ContinuationLease,
+    ) {
+        let session = registry.session_id();
         let task = registry.create_subagent_with_parent(
             "continuation test".to_string(),
             Some("general".to_string()),
@@ -4346,6 +4365,39 @@ mod tests {
         assert_eq!(transcript.task_id, prepared.latest_task_id);
         assert_eq!(transcript.checkpoint_revision, 2);
         assert!(transcript.items.is_empty());
+    }
+
+    #[test]
+    fn resume_preserves_an_ineligible_continuation_while_recovering_an_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let session = "continuation-live-owner";
+        let gone = TaskRegistry::new_for_cwd(session.into(), dir.path());
+        let orphan = gone.create_subagent("orphan".into(), None);
+        gone.mark_running(&orphan.id).unwrap();
+        let live = TaskRegistry::attach_for_cwd(session.into(), dir.path());
+        let (_live, coordinator, prepared, lease) = prepare_with_registry(live);
+        drop(gone);
+        let (_, expired) = coordinator
+            .store
+            .mutate_record(&prepared.continuation_id, lease.revision, |record| {
+                record.current_attempt.lease_expires_at_ms = Some(0);
+                Ok(())
+            })
+            .unwrap();
+        let resumed = TaskRegistry::resume_for_cwd(session.into(), dir.path());
+        assert_eq!(
+            resumed.get(&orphan.id).unwrap().status,
+            orca_core::task_types::TaskStatus::Failed
+        );
+        let after = resumed
+            .continuation_store()
+            .unwrap()
+            .load_record(&prepared.continuation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.revision, expired.revision);
+        assert_eq!(after.current_attempt.state, AttemptState::Running);
     }
 
     #[test]

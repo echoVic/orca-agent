@@ -85,6 +85,11 @@ fn settled_subagent_batch(
         subagent.owner,
         surface::SurfaceSubagentOwner::Generation { .. }
     );
+    let person_stopped = kept
+        && record.is_some_and(|record| {
+            record.status == TaskStatus::Stopped
+                && record.result.as_deref() == Some(crate::tasks::SUBAGENT_STOPPED_BY_PERSON)
+        });
     let (task_status, status, activity) =
         match record.map_or(TaskStatus::Failed, |record| record.status) {
             TaskStatus::Completed => (
@@ -107,21 +112,19 @@ fn settled_subagent_batch(
                 surface::SurfaceSubagentTerminalStatus::Cancelled,
                 "cancelled",
             ),
-            TaskStatus::Stopped
-                if kept
-                    && record.and_then(|record| record.result.as_deref())
-                        != Some(crate::tasks::SUBAGENT_STOPPED_BY_PERSON) =>
-            {
-                (
-                    surface::SurfaceTaskStatus::Cancelled,
-                    surface::SurfaceSubagentTerminalStatus::Cancelled,
-                    "cancelled",
-                )
-            }
+            TaskStatus::Stopped if kept && !person_stopped => (
+                surface::SurfaceTaskStatus::Cancelled,
+                surface::SurfaceSubagentTerminalStatus::Cancelled,
+                "cancelled",
+            ),
             TaskStatus::Stopped => (
                 surface::SurfaceTaskStatus::Stopped,
                 surface::SurfaceSubagentTerminalStatus::Cancelled,
-                "stopped",
+                if person_stopped {
+                    "stopped by user"
+                } else {
+                    "stopped"
+                },
             ),
             _ => {
                 return Err(io::Error::new(
@@ -154,6 +157,11 @@ fn settled_subagent_batch(
         None => Some(surface::DisplayText::new(
             "subagent task record is missing; execution remains indeterminate",
         )),
+    };
+    let (output, error) = if person_stopped {
+        (None, error_after_a_persons_stop(error))
+    } else {
+        (output, error)
     };
     let mut activity_history = subagent.subagent_activity_history.clone();
     orca_core::task_types::append_subagent_activity_history(
@@ -2023,7 +2031,7 @@ impl ThreadActor {
         let Some(resident) = self.resident_surface.0.as_ref() else {
             return;
         };
-        if !self.keeps_children_in_process() {
+        if !self.keeps_children_in_process() || registry.persistence_unavailable() {
             return;
         }
         let snapshot = resident.coordinator.state().snapshot();
@@ -2054,19 +2062,15 @@ impl ThreadActor {
             .collect();
         let now = chrono::Utc::now().timestamp_millis();
         for (task, row, previous_owner) in candidates {
+            if !previous_owner && registry.local_subagent_end_pending(task.task_id.as_str()) {
+                continue;
+            }
             let Ok(record) = registry.refresh_task_from_persistence(task.task_id.as_str()) else {
                 continue;
             };
             if record
                 .as_ref()
                 .is_some_and(|record| !record.is_settled_subagent() || record.worker_pid.is_some())
-            {
-                continue;
-            }
-            if record.is_none()
-                && registry.get(task.task_id.as_str()).is_some_and(|local| {
-                    local.control.runs_on_its_own_thread() && !local.control.end_reported()
-                })
             {
                 continue;
             }
@@ -6691,6 +6695,9 @@ mod task_transcript_query_tests {
                 let mut ended = record.clone();
                 ended.status = status;
                 ended.result = result.map(str::to_owned);
+                if expected_task == Task::Stopped {
+                    ended.error = Some(crate::agent_controller::AGENT_CANCELLED.into());
+                }
                 ended
             });
             let events = settled_subagent_batch(
@@ -6701,6 +6708,19 @@ mod task_transcript_query_tests {
                 surface::UnixMillis::new(9),
             )
             .unwrap();
+            if expected_task == Task::Stopped {
+                assert!(matches!(
+                    &events[0].1,
+                    surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                        result: None,
+                        error: None,
+                        ..
+                    })
+                ));
+                assert!(
+                    matches!(&events[1].1, surface::SurfaceEvent::Subagent(surface::SubagentPatch::Settled { output: None, error: None, subagent_activity_history, .. }) if subagent_activity_history.last().unwrap().activity == "stopped by user")
+                );
+            }
             assert!(
                 matches!(&events[0], (surface::SurfaceScope::Thread, surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged { status, .. })) if *status == expected_task)
             );

@@ -994,6 +994,7 @@ pub struct TaskRecord {
     /// marker keeps that delivery exactly once across retries, later turns,
     /// and process restarts.
     pub result_delivery: ResultDelivery,
+    ended_on_resume: bool,
     /// Identity of the result this delivery refers to.
     ///
     /// A child may run several attempts, so "the result was delivered" is only
@@ -1106,6 +1107,7 @@ impl ResultFacts {
                 || self.error != record.error)
         {
             record.result_revision = record.result_revision.saturating_add(1);
+            record.ended_on_resume = false;
             record.delivery_claim_id = None;
             record.delivery_claimed_at_ms = None;
             if record.result_delivery != ResultDelivery::InBand {
@@ -1475,6 +1477,11 @@ impl TaskControl {
     pub(crate) fn end_reported(&self) -> bool {
         self.end_reported.load(Ordering::Acquire)
     }
+
+    #[cfg(test)]
+    pub(crate) fn reset_simulated_end_report(&self) {
+        assert!(self.end_reported.swap(false, Ordering::AcqRel));
+    }
 }
 
 #[derive(Debug)]
@@ -1511,6 +1518,13 @@ struct TaskPersistence {
     session_id: String,
     owner: Option<Arc<crate::task_owner::RegistryOwner>>,
     output: Arc<Mutex<Option<crate::task_output::SharedArchive>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegistryOpen {
+    Fresh,
+    Attach,
+    Resume,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1588,6 +1602,8 @@ struct PersistedTaskRecord {
     error: Option<String>,
     #[serde(default)]
     result_delivery: ResultDelivery,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ended_on_resume: bool,
     #[serde(default)]
     result_revision: u64,
     #[serde(default)]
@@ -1732,23 +1748,20 @@ impl TaskRegistry {
     }
 
     pub fn new_persistent(session_id: String, root: PathBuf) -> io::Result<Self> {
-        Self::open_persistent(session_id, root, true)
+        Self::open_persistent(session_id, root, RegistryOpen::Fresh)
     }
 
+    #[cfg(test)]
     fn new_persistent_attached(session_id: String, root: PathBuf) -> io::Result<Self> {
-        Self::open_persistent(session_id, root, false)
+        Self::open_persistent(session_id, root, RegistryOpen::Attach)
     }
 
-    fn open_persistent(
-        session_id: String,
-        root: PathBuf,
-        recover_interrupted: bool,
-    ) -> io::Result<Self> {
+    fn open_persistent(session_id: String, root: PathBuf, mode: RegistryOpen) -> io::Result<Self> {
         let continuation_store =
             AgentContinuationStore::new_persistent(session_id.clone(), root.clone())
                 .map_err(io::Error::other)?;
         let mut persistence = TaskPersistence::new(root, session_id.clone());
-        let _session_lock = ExclusiveFileLock::acquire(&persistence.session_lock_path(&session_id))
+        let session_lock = ExclusiveFileLock::acquire(&persistence.session_lock_path(&session_id))
             .map_err(io::Error::other)?;
         match crate::task_owner::RegistryOwner::acquire(&persistence.root, &session_id) {
             Ok(owner) => persistence.owner = Some(Arc::new(owner)),
@@ -1765,25 +1778,84 @@ impl TaskRegistry {
             persistence.load_detached_permission_requests_unlocked(&session_id)?;
         validate_detached_permission_map(&detached_permission_requests)
             .map_err(io::Error::other)?;
-        let mut records = persistence.load_session_records_unlocked(&session_id)?;
+        let load = || persistence.load_session_records_unlocked(&session_id);
+        let records = if mode == RegistryOpen::Attach {
+            load()?
+        } else {
+            let recover = || -> io::Result<_> {
+                let mut records = load()?;
+                persistence.recover_interrupted_tasks(
+                    mode,
+                    &session_lock,
+                    &continuation_store,
+                    &typed_provider_outcomes,
+                    &mut records,
+                )?;
+                Ok(records)
+            };
+            match recover() {
+                Err(error) if mode == RegistryOpen::Resume => {
+                    tracing::warn!(%session_id, %error, "task recovery on resume failed; attaching without recovery");
+                    load()?
+                }
+                result => result?,
+            }
+        };
+        if let Some(owner) = &persistence.owner {
+            owner.sweep_locks(&persistence.root);
+        }
+        drop(session_lock);
+        Ok(Self {
+            session_id,
+            owner_id: new_task_lease_owner_id(std::process::id()),
+            inner: Arc::new(Mutex::new(records)),
+            cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
+            typed_provider_outcomes: Arc::new(Mutex::new(typed_provider_outcomes)),
+            continuation_store,
+            detached_bindings: Arc::new(Mutex::new(detached_bindings)),
+            detached_permission_requests: Arc::new(Mutex::new(detached_permission_requests)),
+            detached_permission_signers: Arc::new(Mutex::new(HashMap::new())),
+            detached_binding_registration: Arc::new(Mutex::new(())),
+            persistence: Some(persistence),
+            persistent_open_error: None,
+            recover_persisted_active_tasks: mode == RegistryOpen::Fresh,
+            artifact_storage: Arc::new(TaskArtifactStorage::Recorded),
+            next_sequence: Arc::new(AtomicU64::new(1)),
+            child_budgets: Arc::new(Mutex::new(HashMap::new())),
+            scope_arbiter: Arc::new(crate::execution_scope::ScopeArbiter::new()),
+        })
+    }
+}
+
+impl TaskPersistence {
+    fn recover_interrupted_tasks(
+        &self,
+        mode: RegistryOpen,
+        session_lock: &ExclusiveFileLock,
+        continuation_store: &AgentContinuationStore,
+        typed_provider_outcomes: &HashMap<String, DurableTypedProviderOutcome>,
+        records: &mut HashMap<String, TaskRecord>,
+    ) -> io::Result<()> {
+        let fresh = mode == RegistryOpen::Fresh;
         let mut changed = false;
         let now = now_ms();
         let interrupted: HashSet<_> = records
             .values()
             .filter(|record| {
                 !is_terminal(record.status)
-                    && (recover_interrupted || record.registry_owner.is_some())
-                    && !(record.lease_owner.is_some()
-                        && record.lease_expires_at_ms.is_some_and(|end| end > now))
+                    && (fresh
+                        || (record.registry_owner.is_some()
+                            && !(record.lease_owner.is_some()
+                                && record.lease_expires_at_ms.is_some_and(|end| end > now))))
                     && !typed_provider_outcomes.contains_key(&record.id)
-                    && !persistence.has_live_owner(record)
+                    && !self.has_live_owner(record)
             })
             .map(|record| record.id.clone())
             .collect();
-        if recover_interrupted || !interrupted.is_empty() {
+        if fresh || !interrupted.is_empty() {
             let continuation_projections = continuation_store
-                .reconcile_expired_owners_under_session_lock(|id| {
-                    recover_interrupted || interrupted.contains(id)
+                .reconcile_expired_owners_under_session_lock(session_lock, |id| {
+                    fresh || interrupted.contains(id)
                 })
                 .map_err(io::Error::other)?;
             let reconciled_task_ids = continuation_projections
@@ -1804,6 +1876,7 @@ impl TaskRegistry {
                 {
                     record.blocker = None;
                     record.status = TaskStatus::Failed;
+                    record.ended_on_resume = !fresh;
                     record.completed_at_ms = Some(now_ms());
                     record.worker_pid = None;
                     record.lease_owner = None;
@@ -1823,56 +1896,35 @@ impl TaskRegistry {
                 }
             }
             for task_id in interrupted.difference(&reconciled_task_ids) {
-                if let Some(record) = records.get_mut(task_id) {
-                    changed |= mark_interrupted_if_active(record);
+                if let Some(record) = records.get_mut(task_id)
+                    && mark_interrupted_if_active(record)
+                {
+                    record.ended_on_resume = !fresh && is_terminal(record.status);
+                    changed = true;
                 }
             }
         }
         if changed {
-            persistence.write_session_records_unlocked(&session_id, &records)?;
+            self.write_session_records_unlocked(&self.session_id, records)?;
         }
-        if let Some(owner) = &persistence.owner {
-            owner.sweep_locks(&persistence.root);
-        }
-        drop(_session_lock);
-        Ok(Self {
-            session_id,
-            owner_id: new_task_lease_owner_id(std::process::id()),
-            inner: Arc::new(Mutex::new(records)),
-            cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
-            typed_provider_outcomes: Arc::new(Mutex::new(typed_provider_outcomes)),
-            continuation_store,
-            detached_bindings: Arc::new(Mutex::new(detached_bindings)),
-            detached_permission_requests: Arc::new(Mutex::new(detached_permission_requests)),
-            detached_permission_signers: Arc::new(Mutex::new(HashMap::new())),
-            detached_binding_registration: Arc::new(Mutex::new(())),
-            persistence: Some(persistence),
-            persistent_open_error: None,
-            recover_persisted_active_tasks: recover_interrupted,
-            artifact_storage: Arc::new(TaskArtifactStorage::Recorded),
-            next_sequence: Arc::new(AtomicU64::new(1)),
-            child_budgets: Arc::new(Mutex::new(HashMap::new())),
-            scope_arbiter: Arc::new(crate::execution_scope::ScopeArbiter::new()),
-        })
+        Ok(())
+    }
+}
+
+impl TaskRegistry {
+    pub(crate) fn attach_for_cwd(session_id: String, cwd: &Path) -> Self {
+        Self::for_cwd(session_id, cwd, RegistryOpen::Attach)
     }
 
-    pub(crate) fn attach_for_cwd(session_id: String, cwd: &Path) -> Self {
-        let Some(root) = task_sessions_root() else {
-            let mut registry = Self::new(session_id);
-            registry.artifact_storage = Arc::new(TaskArtifactStorage::Recorded);
-            return registry;
-        };
-        let legacy_root = legacy_project_task_sessions_root(cwd);
-        let _ = migrate_legacy_task_sessions(&legacy_root, &root);
-        Self::new_persistent_attached(session_id.clone(), root).unwrap_or_else(|error| {
-            let mut registry = Self::new(session_id);
-            registry.persistent_open_error = Some(Arc::from(error.to_string()));
-            registry.artifact_storage = Arc::new(TaskArtifactStorage::Recorded);
-            registry
-        })
+    pub(crate) fn resume_for_cwd(session_id: String, cwd: &Path) -> Self {
+        Self::for_cwd(session_id, cwd, RegistryOpen::Resume)
     }
 
     pub fn new_for_cwd(session_id: String, cwd: &Path) -> Self {
+        Self::for_cwd(session_id, cwd, RegistryOpen::Fresh)
+    }
+
+    fn for_cwd(session_id: String, cwd: &Path, mode: RegistryOpen) -> Self {
         let Some(root) = task_sessions_root() else {
             let mut registry = Self::new(session_id);
             registry.artifact_storage = Arc::new(TaskArtifactStorage::Recorded);
@@ -1880,7 +1932,7 @@ impl TaskRegistry {
         };
         let legacy_root = legacy_project_task_sessions_root(cwd);
         let _ = migrate_legacy_task_sessions(&legacy_root, &root);
-        Self::new_persistent(session_id.clone(), root).unwrap_or_else(|error| {
+        Self::open_persistent(session_id.clone(), root, mode).unwrap_or_else(|error| {
             let mut registry = Self::new(session_id);
             registry.persistent_open_error = Some(Arc::from(error.to_string()));
             registry.artifact_storage = Arc::new(TaskArtifactStorage::Recorded);
@@ -3535,6 +3587,7 @@ impl TaskRegistry {
             result: None,
             error: None,
             result_delivery: ResultDelivery::InBand,
+            ended_on_resume: false,
             result_revision: 0,
             delivery_claim_id: None,
             delivery_claimed_at_ms: None,
@@ -3683,6 +3736,7 @@ impl TaskRegistry {
             result: None,
             error: None,
             result_delivery: ResultDelivery::InBand,
+            ended_on_resume: false,
             result_revision: 0,
             delivery_claim_id: None,
             delivery_claimed_at_ms: None,
@@ -3825,6 +3879,7 @@ impl TaskRegistry {
             result: None,
             error: None,
             result_delivery: ResultDelivery::InBand,
+            ended_on_resume: false,
             result_revision: 0,
             delivery_claim_id: None,
             delivery_claimed_at_ms: None,
@@ -3921,6 +3976,7 @@ impl TaskRegistry {
             result: None,
             error: None,
             result_delivery: ResultDelivery::InBand,
+            ended_on_resume: false,
             result_revision: 0,
             delivery_claim_id: None,
             delivery_claimed_at_ms: None,
@@ -4384,17 +4440,9 @@ impl TaskRegistry {
         matches!(result, Ok(true))
     }
 
-    /// Every child task whose result has not been confirmed delivered.
-    ///
-    /// The parent must resolve these before it can claim its own task is done,
-    /// or report them as still outstanding.
-    /// Whether a finished subagent still owes the main conversation its
-    /// result — the ones [`Self::claim_subagent_results_for_parent`] claims
-    /// for the root — read under the lock without claiming or cloning, so an
-    /// idle thread can ask cheaply and often.
-    /// The finished root agents whose results the main conversation has not
-    /// received yet, by task id in a stable order.
-    pub(crate) fn undelivered_root_subagent_result_ids(&self) -> Vec<String> {
+    /// Pending root results that should start a turn, in stable order. A
+    /// result recovered on resume waits for the ordinary turn-boundary drain.
+    pub(crate) fn root_subagent_results_that_wake_parent(&self) -> Vec<String> {
         self.with_tasks(|tasks| {
             let mut ids = tasks
                 .values()
@@ -4402,6 +4450,7 @@ impl TaskRegistry {
                     record.task_type == TaskType::Subagent
                         && is_terminal(record.status)
                         && record.result_delivery == ResultDelivery::Pending
+                        && !record.ended_on_resume
                         && record
                             .parent_task_id
                             .as_deref()
@@ -5769,6 +5818,20 @@ impl TaskRegistry {
         .unwrap_or(true)
     }
 
+    pub(crate) fn local_subagent_end_pending(&self, id: &str) -> bool {
+        self.with_tasks(|tasks| {
+            tasks.get(id).is_some_and(|record| {
+                record.status.is_active()
+                    || (record.control.runs_on_its_own_thread() && !record.control.end_reported())
+            })
+        })
+        .unwrap_or(true)
+    }
+
+    pub(crate) fn persistence_unavailable(&self) -> bool {
+        self.persistent_open_error.is_some()
+    }
+
     pub fn request_stop_tree(&self, root_id: &str) -> Result<Vec<String>, String> {
         self.refresh_session_from_persistence()?;
         let root = self.get(root_id);
@@ -6061,9 +6124,6 @@ impl TaskRegistry {
         &self,
         id: &str,
     ) -> Result<Option<TaskRecord>, String> {
-        if let Some(error) = self.persistent_open_error.as_deref() {
-            return Err(format!("persistent task registry is unavailable: {error}"));
-        }
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(self.get(id));
         };
@@ -6708,6 +6768,7 @@ impl PersistedTaskRecord {
             result: self.result,
             error: self.error,
             result_delivery: self.result_delivery,
+            ended_on_resume: self.ended_on_resume,
             result_revision: self.result_revision,
             delivery_claim_id: self.delivery_claim_id,
             delivery_claimed_at_ms: self.delivery_claimed_at_ms,
@@ -6845,6 +6906,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
             result: record.result.clone(),
             error: record.error.as_deref().map(redact_sensitive_text),
             result_delivery: record.result_delivery,
+            ended_on_resume: record.ended_on_resume,
             result_revision: record.result_revision,
             delivery_claim_id: record.delivery_claim_id.clone(),
             delivery_claimed_at_ms: record.delivery_claimed_at_ms,
@@ -9164,6 +9226,61 @@ mod tests {
     }
 
     #[test]
+    fn degraded_registry_still_admits_children_and_records_applied_writes() {
+        let mut registry = TaskRegistry::new("degraded".into());
+        registry.persistent_open_error = Some(Arc::from("failed to open"));
+        let parent = registry.create_main_session("parent".into());
+        let child = registry.create_subagent_with_parent("child".into(), None, Some(parent.id));
+        registry.record_applied_write(&child.id).unwrap();
+        assert_eq!(registry.get(&child.id).unwrap().applied_file_writes, 1);
+    }
+
+    #[test]
+    fn registry_attach_with_unreadable_continuation_keeps_the_persistent_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_owned();
+        let registry = TaskRegistry::new_persistent("session".into(), root.clone()).unwrap();
+        let task = registry.create_subagent("orphan".into(), None);
+        registry.mark_running(&task.id).unwrap();
+        drop(registry);
+        let index = serde_json::json!({ AgentContinuationId::new().as_str(): "session" });
+        fs::write(root.join("continuation-index.json"), index.to_string()).unwrap();
+        let resumed =
+            TaskRegistry::open_persistent("session".into(), root.clone(), RegistryOpen::Resume)
+                .unwrap();
+        assert!(resumed.persistence.is_some());
+        assert_eq!(resumed.get(&task.id).unwrap().status, TaskStatus::Running);
+        resumed.record_applied_write(&task.id).unwrap();
+        let durable: serde_json::Value = read_json(&root.join("session/tasks.json")).unwrap();
+        assert_eq!(durable[&task.id]["status"], "running");
+        assert_eq!(durable[&task.id]["applied_file_writes"], 1);
+    }
+
+    #[test]
+    fn registry_attach_without_resume_leaves_a_dead_owner_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("session".into(), temp.path().into()).unwrap();
+        let task = registry.create_subagent("orphan".into(), None);
+        registry.mark_running(&task.id).unwrap();
+        drop(registry);
+        let attached =
+            TaskRegistry::new_persistent_attached("session".into(), temp.path().into()).unwrap();
+        assert_eq!(attached.get(&task.id).unwrap().status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn fresh_open_still_recovers_a_dead_owner_with_a_task_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let gone = TaskRegistry::new_persistent("session".into(), temp.path().into()).unwrap();
+        let task = gone.create_subagent("leased".into(), None);
+        gone.mark_running(&task.id).unwrap();
+        gone.acquire_task_lease(&task.id).unwrap();
+        drop(gone);
+        let open = TaskRegistry::new_persistent("session".into(), temp.path().into()).unwrap();
+        assert_eq!(open.get(&task.id).unwrap().status, TaskStatus::Failed);
+    }
+
+    #[test]
     fn registry_attach_recovers_only_stamped_orphans_without_a_lease() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("tasks");
@@ -9176,6 +9293,10 @@ mod tests {
         };
         let hosted = running(&live, "live");
         let orphan = running(&gone, "orphan");
+        let finished = running(&gone, "finished while away");
+        assert!(gone.mark_subagent_result_pending(&orphan));
+        assert!(gone.mark_subagent_result_pending(&finished));
+        gone.complete(&finished, "done".into()).unwrap();
         let leased = running(&gone, "leased");
         let lease = live.acquire_task_lease(&leased).unwrap();
         let legacy = running(&gone, "legacy");
@@ -9186,8 +9307,17 @@ mod tests {
         .unwrap();
         drop(gone);
 
-        let attached = TaskRegistry::new_persistent_attached("session".into(), root).unwrap();
+        let attached =
+            TaskRegistry::open_persistent("session".into(), root, RegistryOpen::Resume).unwrap();
         assert_eq!(attached.get(&orphan).unwrap().status, TaskStatus::Failed);
+        assert_eq!(
+            attached.root_subagent_results_that_wake_parent(),
+            vec![finished]
+        );
+        assert_eq!(
+            attached.get(&orphan).unwrap().result_delivery,
+            ResultDelivery::Pending
+        );
         for task_id in [hosted, legacy, leased.clone()] {
             assert_eq!(attached.get(&task_id).unwrap().status, TaskStatus::Running);
         }
@@ -11177,7 +11307,13 @@ while :; do :; done
                 .is_none()
         );
         unavailable.persistent_open_error = Some(Arc::from("failed to open"));
-        assert!(unavailable.refresh_task_from_persistence("absent").is_err());
+        assert!(unavailable.persistence_unavailable());
+        assert!(
+            unavailable
+                .refresh_task_from_persistence("absent")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

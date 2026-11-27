@@ -15610,6 +15610,111 @@ mod tests {
         )
     }
 
+    #[test]
+    fn actor_permit_settles_only_a_running_agent_of_its_stopped_generation_once() {
+        use super::super::{
+            GenerationPhase, SubagentPatch, SurfaceEvent, SurfaceSubagentOwner,
+            SurfaceSubagentStatus, SurfaceSubagentTerminalStatus, SurfaceTaskStatus, TaskPatch,
+        };
+        let fence = started_operation().generations[0].fence.clone();
+        let owner = SurfaceSubagentOwner::Generation {
+            fence: fence.clone(),
+        };
+        let state = kept_agent_under_generation(GenerationPhase::Stopped, &owner);
+        let settle = |state: &SurfaceReducerState, owner: &SurfaceSubagentOwner, upsert: bool| {
+            let task = state.snapshot().tasks[0].clone();
+            let row = &state.snapshot().subagents[0];
+            let next_revision =
+                super::super::TaskRevision::try_new(task.revision.get() + 1).unwrap();
+            let completed_at = Some(super::super::UnixMillis::new(9));
+            let task_patch = if upsert {
+                TaskPatch::Upserted {
+                    expected_revision: Some(task.revision),
+                    task: super::super::SurfaceTask {
+                        revision: next_revision,
+                        status: SurfaceTaskStatus::Failed,
+                        completed_at,
+                        ..task
+                    },
+                }
+            } else {
+                TaskPatch::StatusChanged {
+                    task_id: task.task_id,
+                    expected_revision: task.revision,
+                    next_revision,
+                    status: SurfaceTaskStatus::Failed,
+                    completed_at,
+                    result: None,
+                    error: None,
+                }
+            };
+            test_batch_with_events(
+                state,
+                vec![
+                    (SurfaceScope::Thread, SurfaceEvent::Task(task_patch)),
+                    (
+                        SurfaceScope::Generation {
+                            fence: fence.clone(),
+                        },
+                        SurfaceEvent::Subagent(SubagentPatch::Settled {
+                            subagent_id: row.subagent_id.clone(),
+                            expected_revision: row.revision,
+                            next_revision: super::super::SubagentRevision::try_new(
+                                row.revision.get() + 1,
+                            )
+                            .unwrap(),
+                            owner: owner.clone(),
+                            status: SurfaceSubagentTerminalStatus::Failed,
+                            output: None,
+                            error: None,
+                            usage: None,
+                            subagent_activity_history: Vec::new(),
+                            continuation: None,
+                        }),
+                    ),
+                ],
+            )
+        };
+        let first = settle(&state, &owner, false);
+        assert!(actor_control_subagent_activity_authorized(&state, &first));
+        for phase in [GenerationPhase::Started, GenerationPhase::Transferred] {
+            let live = kept_agent_under_generation(phase, &owner);
+            assert!(!actor_control_subagent_activity_authorized(
+                &live,
+                &settle(&live, &owner, false)
+            ));
+        }
+        let mut ended = state.snapshot().clone();
+        ended.subagents[0].status = SurfaceSubagentStatus::Cancelled;
+        assert!(!actor_control_subagent_activity_authorized(
+            &SurfaceReducerState::new(ended),
+            &first
+        ));
+        assert!(!actor_control_subagent_activity_authorized(
+            &state,
+            &settle(&state, &owner, true)
+        ));
+        let other = SurfaceSubagentOwner::Generation {
+            fence: super::super::SurfaceOperationFence {
+                generation_id: super::super::SurfaceGenerationId::new(77),
+                ..fence.clone()
+            },
+        };
+        assert!(!actor_control_subagent_activity_authorized(
+            &state,
+            &settle(&state, &other, false)
+        ));
+        let SurfaceReduceResult::Applied { state: after } =
+            reduce_batch(SurfaceReduceMode::Live, &state, &first)
+        else {
+            panic!("first settlement must commit")
+        };
+        assert!(!actor_control_subagent_activity_authorized(
+            &after,
+            &settle(&after, &owner, false)
+        ));
+    }
+
     /// An interrupted turn does not wait for the agents it keeps in the
     /// process, so an agent's end may come after its generation stopped. The
     /// permit takes that end at the generation's own scope, and only there:

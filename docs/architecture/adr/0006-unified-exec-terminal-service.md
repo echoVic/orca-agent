@@ -146,10 +146,21 @@ or stdin is presumed to survive a host restart.
 The older `output/archive.sqlite3` is a read-only fallback. A newer reader
 never creates, probes or holds `output/owner.lock`, changes an old row, or
 writes an automatic cursor there. Its cursor stays in memory; a running row
-whose task is terminal is presented as interrupted. Resuming a session now
-recovers active tasks stamped by a dead registry using the same owner probe
-as a fresh open. Live owners and held execution leases are left alone. An
-older process leaves no stamp: attach leaves its task untouched, so a dead
+whose task is terminal is presented as interrupted.
+
+On session resume the TUI, `orca exec`, the app server and ACP recover active
+tasks stamped by a dead registry using the fresh-open owner probe. This applies
+across task types: shells, monitors, workflows, in-process sync children and
+the crashed turn's `MainSession` record. Where recovery ends such a task,
+`task_list` and `task_output` now tell the model it failed rather than that it
+is running. A recovered child's pending notification does not wake the parent;
+the next ordinary turn delivers it. Normally finished detached children still
+wake the parent. Resume skips live owners and held execution leases. Recovery
+is best-effort: on error it logs the failure and attaches to the persistent
+records without recovery. Detached worker adoption and child-scope restoration
+do not run recovery, including when the parent is live in the same process.
+
+An older process leaves no stamp: attach leaves its task untouched, so a dead
 shell in its archive can still read as `running`. A read-only connection
 cannot roll back a hot journal left by that process; in that case all shells
 in the top-level archive read as “missing or expired”, as for other read

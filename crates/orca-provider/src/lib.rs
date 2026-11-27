@@ -1012,6 +1012,27 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
     let has_tool_results = current_turn_has_tool_results(conversation);
     let prompt = conversation.last_user_message().unwrap_or("");
 
+    if prompt == "mock_echo_task_notifications" {
+        let message = conversation
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::System { content, .. } if content.starts_with("<task-notification>") => {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta(message.clone())],
+            assistant_content: Some(message),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+    }
+
     if conversation.messages.iter().any(|message| {
         matches!(
             message,
