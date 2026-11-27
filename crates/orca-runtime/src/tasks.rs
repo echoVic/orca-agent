@@ -11571,8 +11571,9 @@ while :; do :; done
                 last_tool_boundary,
                 created_at_ms: now_ms(),
                 digest: Sha256Digest::new([0; 32]),
+                full_digest: None,
             };
-            checkpoint.digest = checkpoint.computed_digest().unwrap();
+            checkpoint.seal().unwrap();
             checkpoint
         }
 

@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt, fs, io,
     path::{Path, PathBuf},
@@ -1030,39 +1031,85 @@ pub(crate) struct AgentCheckpoint {
     pub(crate) last_tool_boundary: Option<ToolBoundary>,
     /// Checkpoint creation time in Unix milliseconds.
     pub(crate) created_at_ms: i64,
-    /// SHA-256 digest of the canonical checkpoint payload.
+    /// Digest of the payload in the Orca 0.5.25 format.
     pub(crate) digest: Sha256Digest,
+    /// Digest covering every field written by the current release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) full_digest: Option<Sha256Digest>,
 }
 
 impl AgentCheckpoint {
-    /// Serializes the stable checkpoint digest input without including the digest itself.
-    pub(crate) fn canonical_payload_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+    fn digest_payload(
+        &self,
+        conversation: &ChildConversationSnapshot,
+    ) -> Result<Sha256Digest, AgentContinuationError> {
         serde_json::to_vec(&CanonicalAgentCheckpointPayload {
             schema_version: AGENT_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
             checkpoint_id: &self.checkpoint_id,
             attempt_id: &self.attempt_id,
             sequence: self.sequence,
-            conversation: &self.conversation,
+            conversation,
             turn: self.turn,
             usage: &self.usage,
             last_tool_boundary: self.last_tool_boundary.as_ref(),
             created_at_ms: self.created_at_ms,
         })
+        .map(Sha256Digest::digest)
+        .map_err(|_| persistence_error("serialize checkpoint digest payload"))
     }
 
-    /// Computes the digest required when creating or committing this checkpoint.
-    pub(crate) fn computed_digest(&self) -> Result<Sha256Digest, AgentContinuationError> {
-        self.canonical_payload_bytes()
-            .map(Sha256Digest::digest)
-            .map_err(|_| AgentContinuationError::Persistence {
-                message: "failed to serialize checkpoint digest payload".to_string(),
+    /// Orca 0.5.25 drops these fields when it reads and reserializes a checkpoint.
+    fn legacy_conversation(&self) -> Cow<'_, ChildConversationSnapshot> {
+        let conversation = &self.conversation;
+        if conversation.summary.tool_output_spills.is_empty()
+            && !conversation.messages.iter().any(|message| {
+                matches!(message,
+                StoredChildMessage::Tool { terminal: Some(terminal), .. }
+                if terminal.spill.is_some() || terminal.mcp_tool_load.is_some())
             })
+        {
+            return Cow::Borrowed(conversation);
+        }
+        let mut legacy = conversation.clone();
+        legacy.summary.tool_output_spills.clear();
+        for message in &mut legacy.messages {
+            if let StoredChildMessage::Tool {
+                terminal: Some(terminal),
+                ..
+            } = message
+            {
+                terminal.spill = None;
+                terminal.mcp_tool_load = None;
+            }
+        }
+        Cow::Owned(legacy)
     }
 
-    /// Verifies that the persisted digest matches the canonical checkpoint payload.
+    pub(crate) fn seal(&mut self) -> Result<(), AgentContinuationError> {
+        let legacy = self.legacy_conversation();
+        let full_digest = self.digest_payload(&self.conversation)?;
+        self.digest = match legacy {
+            Cow::Borrowed(_) => full_digest,
+            Cow::Owned(legacy) => self.digest_payload(&legacy)?,
+        };
+        self.full_digest = Some(full_digest);
+        Ok(())
+    }
+
     pub(crate) fn verify_digest(&self) -> Result<(), AgentContinuationError> {
-        if self.computed_digest()? != self.digest {
+        let legacy = self.legacy_conversation();
+        let legacy_digest = self.digest_payload(&legacy)?;
+        if legacy_digest != self.digest {
             return Err(AgentContinuationError::DigestMismatch);
+        }
+        if let Some(expected) = self.full_digest {
+            let actual = match legacy {
+                Cow::Borrowed(_) => legacy_digest,
+                Cow::Owned(_) => self.digest_payload(&self.conversation)?,
+            };
+            if actual != expected {
+                return Err(AgentContinuationError::DigestMismatch);
+            }
         }
         Ok(())
     }
@@ -4150,6 +4197,270 @@ mod tests {
             pub(crate) created_at_ms: i64,
             pub(crate) updated_at_ms: i64,
         }
+
+        #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+        pub(super) struct AgentCheckpoint {
+            pub(crate) checkpoint_id: AgentCheckpointId,
+            pub(crate) attempt_id: AgentAttemptId,
+            #[serde(default)]
+            pub(crate) sequence: u64,
+            pub(crate) conversation: ChildConversationSnapshot,
+            #[serde(default)]
+            pub(crate) turn: u32,
+            #[serde(default)]
+            pub(crate) usage: BudgetUsage,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) last_tool_boundary: Option<ToolBoundary>,
+            pub(crate) created_at_ms: i64,
+            pub(crate) digest: Sha256Digest,
+        }
+
+        #[derive(Serialize)]
+        struct CanonicalAgentCheckpointPayload<'a> {
+            schema_version: u32,
+            checkpoint_id: &'a AgentCheckpointId,
+            attempt_id: &'a AgentAttemptId,
+            sequence: u64,
+            conversation: &'a ChildConversationSnapshot,
+            turn: u32,
+            usage: &'a BudgetUsage,
+            last_tool_boundary: Option<&'a ToolBoundary>,
+            created_at_ms: i64,
+        }
+
+        #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+        pub(super) struct ChildConversationSnapshot {
+            #[serde(default = "default_child_conversation_snapshot_schema_version")]
+            pub(crate) schema_version: u32,
+            #[serde(default)]
+            pub(crate) messages: Vec<StoredChildMessage>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub(crate) rolling_summary: Option<String>,
+            #[serde(default)]
+            pub(crate) summary: StoredChildSummaryState,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            pub(crate) internal_context: Vec<StoredChildInternalContextFragment>,
+            #[serde(default)]
+            pub(crate) next_turn: u32,
+        }
+
+        #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+        pub(super) struct StoredChildSummaryState {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            baseline: Option<String>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            deltas: Vec<String>,
+        }
+
+        #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+        #[serde(rename_all = "snake_case", tag = "role")]
+        pub(super) enum StoredChildMessage {
+            User {
+                content: String,
+                #[serde(default, skip_serializing_if = "Vec::is_empty")]
+                images: Vec<ImageInput>,
+                #[serde(default)]
+                pinned: bool,
+            },
+            Assistant {
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                content: Option<String>,
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                reasoning_content: Option<String>,
+                #[serde(default, skip_serializing_if = "Vec::is_empty")]
+                tool_calls: Vec<RawToolCall>,
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                cut_short: Option<orca_core::conversation::CutShort>,
+                #[serde(default)]
+                pinned: bool,
+            },
+            Tool {
+                tool_call_id: String,
+                content: String,
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                terminal: Option<ToolTerminal>,
+                #[serde(default)]
+                pinned: bool,
+            },
+        }
+
+        #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+        pub struct ToolTerminal {
+            pub status: ToolStatus,
+            pub error: Option<String>,
+            pub exit_code: Option<i32>,
+            pub truncated: bool,
+            #[serde(default = "legacy_success", skip_serializing_if = "legacy_is_success")]
+            pub kind: ToolResultKind,
+            #[serde(
+                default,
+                rename = "terminal_source",
+                skip_serializing_if = "legacy_is_observed"
+            )]
+            pub source: ToolTerminalSource,
+            #[serde(
+                default,
+                rename = "invocation_started",
+                skip_serializing_if = "legacy_is_unknown"
+            )]
+            pub started: ToolInvocationStarted,
+        }
+
+        #[derive(Deserialize)]
+        struct ToolTerminalWire {
+            status: ToolStatus,
+            error: Option<String>,
+            exit_code: Option<i32>,
+            truncated: bool,
+            #[serde(default)]
+            kind: Option<ToolResultKind>,
+            #[serde(default, rename = "terminal_source")]
+            source: ToolTerminalSource,
+            #[serde(default, rename = "invocation_started")]
+            started: ToolInvocationStarted,
+        }
+
+        use orca_core::tool_types::ToolInvocationStarted;
+        fn legacy_success() -> ToolResultKind {
+            ToolResultKind::Success
+        }
+        fn legacy_is_success(kind: &ToolResultKind) -> bool {
+            *kind == ToolResultKind::Success
+        }
+        fn legacy_is_observed(source: &ToolTerminalSource) -> bool {
+            *source == ToolTerminalSource::Observed
+        }
+        fn legacy_is_unknown(started: &ToolInvocationStarted) -> bool {
+            *started == ToolInvocationStarted::Unknown
+        }
+
+        impl<'de> Deserialize<'de> for ToolTerminal {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let wire = ToolTerminalWire::deserialize(deserializer)?;
+                let terminal = orca_core::tool_types::ToolTerminal::try_from_parts(
+                    wire.status,
+                    wire.error,
+                    wire.exit_code,
+                    wire.truncated,
+                    wire.kind,
+                    wire.source,
+                    wire.started,
+                )
+                .map_err(serde::de::Error::custom)?;
+                Ok(Self {
+                    status: terminal.status,
+                    error: terminal.error,
+                    exit_code: terminal.exit_code,
+                    truncated: terminal.truncated,
+                    kind: terminal.kind,
+                    source: terminal.source,
+                    started: terminal.started,
+                })
+            }
+        }
+
+        impl AgentCheckpoint {
+            pub(super) fn verifiable(&self) -> bool {
+                let bytes = serde_json::to_vec(&CanonicalAgentCheckpointPayload {
+                    schema_version: AGENT_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+                    checkpoint_id: &self.checkpoint_id,
+                    attempt_id: &self.attempt_id,
+                    sequence: self.sequence,
+                    conversation: &self.conversation,
+                    turn: self.turn,
+                    usage: &self.usage,
+                    last_tool_boundary: self.last_tool_boundary.as_ref(),
+                    created_at_ms: self.created_at_ms,
+                })
+                .unwrap();
+                Sha256Digest::digest(bytes) == self.digest
+            }
+        }
+    }
+
+    fn checkpoint_with_tool_result(field: &str) -> AgentCheckpoint {
+        use orca_core::tool_types::{
+            McpToolLoad, ToolName, ToolOutputSpill, ToolRequest, ToolResult,
+        };
+        let mut checkpoint = checkpoint(AgentAttemptId::new(), 0, 0);
+        let request = ToolRequest {
+            id: "child-read".into(),
+            name: ToolName::ReadFile,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let mut result = ToolResult::completed(&request, "file evidence".into(), false);
+        if field == "spill" {
+            result.set_spill(
+                ToolOutputSpill::new(std::env::temp_dir(), request.id.clone(), 1024).unwrap(),
+            );
+        } else if field == "mcp_tool_load" {
+            result = result.with_mcp_tool_load(Some(McpToolLoad {
+                server: "fixture".into(),
+                names: ["inspect".into()].into(),
+            }));
+        }
+        let mut conversation = Conversation::new();
+        conversation.add_user("Read evidence".into());
+        conversation.add_assistant(
+            None,
+            None,
+            vec![RawToolCall {
+                id: request.id.clone(),
+                function_name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        conversation.add_tool_result_with_terminal(&result, "file evidence".into());
+        let (snapshot, boundary) =
+            ChildConversationSnapshot::try_capture_safe(&conversation, 1).unwrap();
+        checkpoint.conversation = snapshot;
+        checkpoint.last_tool_boundary = boundary;
+        checkpoint.seal().unwrap();
+        checkpoint
+    }
+
+    #[test]
+    fn v0_5_25_verifies_plain_spill_and_mcp_checkpoints() {
+        let mut rejected = Vec::new();
+        for field in ["plain", "spill", "mcp_tool_load"] {
+            let checkpoint = checkpoint_with_tool_result(field);
+            let bytes = serde_json::to_vec(&checkpoint).unwrap();
+            let older: legacy_v0_5_25::AgentCheckpoint = serde_json::from_slice(&bytes).unwrap();
+            if !older.verifiable() {
+                rejected.push(field);
+            }
+        }
+        assert!(rejected.is_empty(), "0.5.25 rejected {rejected:?}");
+    }
+
+    #[test]
+    fn a_checkpoint_rewritten_by_v0_5_25_still_verifies() {
+        let checkpoint = checkpoint_with_tool_result("plain");
+        let older: legacy_v0_5_25::AgentCheckpoint =
+            serde_json::from_value(serde_json::to_value(checkpoint).unwrap()).unwrap();
+        let restored: AgentCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(&older).unwrap()).unwrap();
+        restored.verify_digest().unwrap();
+    }
+
+    #[test]
+    fn the_full_checkpoint_digest_detects_changed_mcp_fields() {
+        let checkpoint = checkpoint_with_tool_result("mcp_tool_load");
+        checkpoint.verify_digest().unwrap();
+        let mut wire = serde_json::to_value(checkpoint).unwrap();
+        assert!(wire.get("full_digest").is_some());
+        let terminal = &mut wire["conversation"]["messages"][2]["terminal"];
+        assert_eq!(terminal["mcp_tool_load"]["server"], "fixture");
+        terminal["mcp_tool_load"]["server"] = "changed".into();
+        let older: legacy_v0_5_25::AgentCheckpoint = serde_json::from_value(wire.clone()).unwrap();
+        assert!(older.verifiable());
+        let altered: AgentCheckpoint = serde_json::from_value(wire).unwrap();
+        assert!(matches!(
+            altered.verify_digest(),
+            Err(AgentContinuationError::DigestMismatch)
+        ));
     }
 
     fn test_fork_prefix() -> orca_core::conversation::ProviderForkPrefix {
@@ -4430,8 +4741,9 @@ mod tests {
             last_tool_boundary,
             created_at_ms: continuation_now_ms(),
             digest: Sha256Digest::new([0; 32]),
+            full_digest: None,
         };
-        checkpoint.digest = checkpoint.computed_digest().expect("checkpoint digest");
+        checkpoint.seal().expect("checkpoint digest");
         checkpoint
     }
 

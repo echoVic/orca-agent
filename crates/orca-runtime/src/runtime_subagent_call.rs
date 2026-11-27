@@ -2527,8 +2527,9 @@ pub(crate) fn build_checkpoint_observer(
                     last_tool_boundary: captured_boundary,
                     created_at_ms: unix_time_ms(),
                     digest: crate::runtime_surface::Sha256Digest::new([0; 32]),
+                    full_digest: None,
                 };
-                checkpoint.digest = checkpoint.computed_digest()?;
+                checkpoint.seal()?;
                 pending_checkpoint = Some(checkpoint.clone());
                 checkpoint
             };
