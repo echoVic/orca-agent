@@ -797,6 +797,10 @@ impl EventFactory {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the field-based event API"
+    )]
     pub fn goal_continuation_admission(
         &mut self,
         goal_id: &GoalId,

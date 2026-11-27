@@ -155,11 +155,13 @@ fn key_is_in_url_query(prefix: &str) -> bool {
 }
 
 fn unquoted_value_end(bytes: &[u8], mut index: usize, url_query: bool) -> usize {
-    while index < bytes.len()
-        && !bytes[index].is_ascii_whitespace()
-        && !matches!(bytes[index], b',' | b'}' | b']' | b';')
-        && !(url_query && matches!(bytes[index], b'&' | b'#'))
-    {
+    while let Some(&byte) = bytes.get(index) {
+        if byte.is_ascii_whitespace()
+            || matches!(byte, b',' | b'}' | b']' | b';')
+            || (url_query && matches!(byte, b'&' | b'#'))
+        {
+            break;
+        }
         index += 1;
     }
     index
