@@ -2,6 +2,40 @@ use super::*;
 use crate::tasks::TaskRegistry;
 
 #[test]
+fn unavailable_owner_disables_archiving_but_keeps_task_persistence() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    let live = TaskRegistry::new_persistent("live".into(), root.into()).unwrap();
+    let running = live.create_main_session("foreign".into());
+    live.mark_running(&running.id).unwrap();
+    let session = root.join("degraded");
+    std::fs::create_dir(&session).unwrap();
+    std::fs::write(session.join("owners"), b"not a directory").unwrap();
+    let open = || TaskRegistry::new_persistent("degraded".into(), root.into()).unwrap();
+    let tasks = open();
+    assert!(tasks.supports_detached_subagent_relay());
+    assert_eq!(
+        tasks.get(&running.id).unwrap().status,
+        orca_core::task_types::TaskStatus::Running
+    );
+    let task = tasks.create_shell("persist me".into(), "echo".into());
+    tasks.mark_running(&task.id).unwrap();
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(session.join("tasks.json")).unwrap()).unwrap();
+    assert!(persisted[&task.id].get("registry_owner").is_none());
+    let error = TaskOutputStore::for_tasks(&tasks)
+        .register_shell("shell", &task.id, false, false)
+        .unwrap_err();
+    assert!(error.to_string().contains("owner"), "{error}");
+    assert!(!session.join("output").exists());
+    drop(tasks);
+    assert_eq!(
+        open().get(&task.id).unwrap().status,
+        orca_core::task_types::TaskStatus::Failed
+    );
+}
+
+#[test]
 fn legacy_read_ignores_held_owner_lock_and_never_updates_database_or_cursor() {
     let home = tempfile::tempdir().unwrap();
     let tasks = TaskRegistry::new_persistent("legacy".into(), home.path().into()).unwrap();

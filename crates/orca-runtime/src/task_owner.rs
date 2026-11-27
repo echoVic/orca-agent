@@ -45,8 +45,8 @@ impl RegistryOwner {
         Ok(Self { stamp, _lock: lock })
     }
 
-    pub(crate) fn alive(&self, root: &Path, stamp: &OwnerStamp) -> bool {
-        if self.stamp == *stamp
+    pub(crate) fn alive(caller: Option<&Self>, root: &Path, stamp: &OwnerStamp) -> bool {
+        if caller.is_some_and(|owner| owner.stamp == *stamp)
             || !valid_id(&stamp.id)
             || crate::tasks::safe_path_component(&stamp.session) != stamp.session
         {
@@ -86,7 +86,7 @@ impl RegistryOwner {
                 session: self.stamp.session.clone(),
                 id: id.into(),
             };
-            if !self.alive(root, &stamp) {
+            if !Self::alive(Some(self), root, &stamp) {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -103,16 +103,17 @@ mod tests {
         let root = temp.path();
         let caller = RegistryOwner::acquire(root, "caller").unwrap();
         let foreign = RegistryOwner::acquire(root, "foreign").unwrap();
-        assert!(caller.alive(root, &caller.stamp));
+        let alive = |stamp: &OwnerStamp| RegistryOwner::alive(Some(&caller), root, stamp);
+        assert!(alive(&caller.stamp));
         let stamp = foreign.stamp.clone();
-        assert!(caller.alive(root, &stamp));
+        assert!(alive(&stamp));
         drop(foreign);
-        assert!(!caller.alive(root, &stamp));
+        assert!(!alive(&stamp));
         let missing = OwnerStamp {
             session: "missing".into(),
             ..stamp
         };
-        assert!(!caller.alive(root, &missing));
+        assert!(!alive(&missing));
         assert!(!root.join("missing").exists());
     }
 }

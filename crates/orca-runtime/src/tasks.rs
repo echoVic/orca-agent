@@ -1765,11 +1765,12 @@ impl TaskRegistry {
         } else {
             None
         };
-        let owner = Arc::new(crate::task_owner::RegistryOwner::acquire(
-            &persistence.root,
-            &session_id,
-        )?);
-        persistence.owner = Some(owner.clone());
+        match crate::task_owner::RegistryOwner::acquire(&persistence.root, &session_id) {
+            Ok(owner) => persistence.owner = Some(Arc::new(owner)),
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "task registry owner unavailable; continuing without owner stamps or shell archiving");
+            }
+        }
         let persistence = Arc::new(persistence);
         let typed_provider_outcomes =
             persistence.load_typed_provider_outcomes_unlocked(&session_id)?;
@@ -1834,7 +1835,9 @@ impl TaskRegistry {
         if changed {
             persistence.write_session_records_unlocked(&session_id, &records)?;
         }
-        owner.sweep_locks(&persistence.root);
+        if let Some(owner) = &persistence.owner {
+            owner.sweep_locks(&persistence.root);
+        }
         drop(_session_lock);
         Ok(Self {
             session_id,
@@ -1968,7 +1971,7 @@ impl TaskRegistry {
                 let owner = persistence
                     .owner
                     .as_ref()
-                    .ok_or_else(|| io::Error::other("persistent registry has no owner"))?;
+                    .ok_or_else(|| io::Error::other("shell archiving requires a registry owner"))?;
                 Ok(Some(
                     persistence
                         .root
@@ -2008,7 +2011,8 @@ impl TaskRegistry {
     pub(crate) fn output_owner_alive(&self, id: &str) -> bool {
         let persistence = self.persistence.as_ref().expect("persistent output route");
         persistence.owner.as_ref().is_none_or(|owner| {
-            owner.alive(
+            crate::task_owner::RegistryOwner::alive(
+                Some(owner),
                 &persistence.root,
                 &crate::task_owner::OwnerStamp {
                     session: self.session_id.clone(),
@@ -6268,11 +6272,9 @@ impl TaskPersistence {
 
     fn has_live_owner(&self, record: &TaskRecord) -> bool {
         !is_terminal(record.status)
-            && self
-                .owner
-                .as_ref()
-                .zip(record.registry_owner.as_ref())
-                .is_some_and(|(owner, stamp)| owner.alive(&self.root, stamp))
+            && record.registry_owner.as_ref().is_some_and(|stamp| {
+                crate::task_owner::RegistryOwner::alive(self.owner.as_deref(), &self.root, stamp)
+            })
     }
 
     fn write_current_task(&self, record: &TaskRecord) -> io::Result<()> {
