@@ -67,6 +67,7 @@ pub(crate) struct RuntimeNormalToolInvocation {
     pub(crate) git_metadata_write_session:
         Option<Arc<crate::git_write_command::GitMetadataWriteSession>>,
     pub(crate) owner_task_id: Option<String>,
+    pub(crate) steer_handle: Option<crate::lifecycle::ThreadSteerHandle>,
     pub(crate) permission_overlay: TurnPermissionOverlay,
     pub(crate) control: ToolControlSemantics,
 }
@@ -110,6 +111,7 @@ impl RuntimeNormalToolInvocation {
             terminal_service: None,
             git_metadata_write_session: None,
             owner_task_id: None,
+            steer_handle: None,
             permission_overlay,
             control,
         }
@@ -132,6 +134,7 @@ impl RuntimeNormalToolInvocation {
             terminal_service: self.terminal_service.clone(),
             git_metadata_write_session: self.git_metadata_write_session.clone(),
             owner_task_id: self.owner_task_id.clone(),
+            steer_handle: self.steer_handle.clone(),
             permission_overlay: self.permission_overlay.clone(),
             control: self.control,
         };
@@ -1268,6 +1271,7 @@ pub(crate) mod tests {
             terminal_service: None,
             git_metadata_write_session: None,
             owner_task_id: None,
+            steer_handle: None,
             permission_overlay: TurnPermissionOverlay::default(),
             control: ToolControlSemantics {
                 interrupt,

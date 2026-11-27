@@ -4,8 +4,9 @@ import vm from "node:vm";
 
 const scriptPath = process.argv[2];
 const argsJson = process.argv[3] ?? "null";
-const mailboxPath = process.argv[4] ?? null;
-const taskListsPath = process.argv[5] ?? null;
+const mailboxPath = process.argv[4] || null;
+const taskListReplyPath = process.argv[5];
+const maxFrameBytes = Number(process.argv[6]);
 JSON.parse(argsJson);
 
 // The source scan below turns the obvious ways out of a workflow script into a
@@ -41,9 +42,8 @@ let scriptRealm = null;
 const mailboxState = loadMailboxState();
 let messageSeq = mailboxState.nextSeq;
 const messageChannels = new Map(Object.entries(mailboxState.channels));
-const taskListState = loadTaskListState();
-let taskSeq = taskListState.nextTaskSeq;
-const taskLists = new Map(Object.entries(taskListState.lists));
+let taskListCallSeq = 0;
+const taskListWait = new Int32Array(new SharedArrayBuffer(4));
 let stdinClosed = false;
 let workflowTerminal = false;
 
@@ -129,51 +129,30 @@ const HOST_OPERATIONS = {
   },
 
   create_task_list({ name, items }) {
-    const listName = normalizeTaskListName(name);
     if (!Array.isArray(items)) {
       throw new Error("Workflow task list items must be an array");
     }
-
-    const tasks = items.map((item) => {
-      taskSeq += 1;
-      return {
-        id: `workflow-task-${taskSeq}`,
-        status: "pending",
-        value: item ?? null,
-        claimedBy: null,
-        completedBy: null,
-        result: null,
-      };
-    });
-    taskLists.set(listName, tasks);
-    persistTaskListState();
-    return tasks;
+    return callTaskList("create", { name: String(name ?? ""), items });
   },
 
   claim_task({ name, by, phase }) {
-    const tasks = taskLists.get(normalizeTaskListName(name)) ?? [];
-    const task = tasks.find((item) => item.status === "pending");
-    if (!task) {
-      return null;
-    }
-
-    task.status = "running";
-    task.claimedBy = normalizeTaskWorker(by, phase);
-    persistTaskListState();
-    return task;
+    return callTaskList("claim", {
+      name: String(name ?? ""),
+      by: normalizeTaskWorker(by, phase),
+    });
   },
 
   complete_task({ name, taskId, result, by, phase }) {
-    const task = findTask(name, taskId);
-    task.status = "completed";
-    task.completedBy = normalizeTaskWorker(by, phase);
-    task.result = result ?? null;
-    persistTaskListState();
-    return task;
+    return callTaskList("complete", {
+      name: String(name ?? ""),
+      task_id: String(taskId ?? ""),
+      result: result ?? null,
+      by: normalizeTaskWorker(by, phase),
+    });
   },
 
   list_tasks({ name }) {
-    return taskLists.get(normalizeTaskListName(name)) ?? [];
+    return callTaskList("list", { name: String(name ?? "") });
   },
 
   completed({ result }) {
@@ -223,31 +202,9 @@ function normalizeMessageSender(from, phase) {
   return sender.length === 0 ? "workflow" : sender;
 }
 
-function normalizeTaskListName(name) {
-  const listName = String(name ?? "").trim();
-  if (listName.length === 0) {
-    throw new Error("Workflow task list name must be a non-empty string");
-  }
-  return listName;
-}
-
 function normalizeTaskWorker(worker, phase) {
   const workerName = String(worker ?? phase ?? "workflow").trim();
   return workerName.length === 0 ? "workflow" : workerName;
-}
-
-function findTask(name, taskId) {
-  const listName = normalizeTaskListName(name);
-  const id = String(taskId ?? "").trim();
-  if (id.length === 0) {
-    throw new Error("Workflow task id must be a non-empty string");
-  }
-
-  const task = (taskLists.get(listName) ?? []).find((item) => item.id === id);
-  if (!task) {
-    throw new Error(`Workflow task not found: ${id}`);
-  }
-  return task;
 }
 
 function loadMailboxState() {
@@ -271,30 +228,43 @@ function persistMailboxState() {
   });
 }
 
-function loadTaskListState() {
-  if (taskListsPath === null || !existsSync(taskListsPath)) {
-    return { nextTaskSeq: 0, lists: Object.create(null) };
+// Task list calls stay synchronous in scripts. Rust serves them on its frame
+// loop and publishes the reply atomically while the agent-result stream waits.
+function callTaskList(operation, args) {
+  if (taskListReplyPath === undefined) {
+    throw new Error("Workflow task lists require a runner");
   }
-  const state = JSON.parse(readFileSync(taskListsPath, "utf8"));
-  return {
-    nextTaskSeq: Number(state?.nextTaskSeq ?? 0),
-    lists: state?.lists && typeof state.lists === "object" ? state.lists : Object.create(null),
-  };
+  const id = ++taskListCallSeq;
+  const frame = `${JSON.stringify({ task_list_call: { id, request: { operation, ...args } } })}\n`;
+  if (Buffer.byteLength(frame) > maxFrameBytes) {
+    throw new Error(`Workflow task list request exceeds ${maxFrameBytes} bytes`);
+  }
+  writeFileSync(1, frame);
+  const deadline = performance.now() + 30_000;
+  while (performance.now() < deadline) {
+    let reply;
+    try {
+      reply = JSON.parse(readFileSync(taskListReplyPath, "utf8"));
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw error;
+      }
+    }
+    if (reply?.id === id) {
+      if (typeof reply.error === "string") {
+        throw new Error(reply.error);
+      }
+      return reply.value;
+    }
+    Atomics.wait(taskListWait, 0, 0, 5);
+  }
+  // The runner may still be writing the answer. End the workflow so a script
+  // cannot unknowingly repeat a claim whose answer has been delayed.
+  HOST_OPERATIONS.failed({ error: "Workflow task list request timed out" });
+  process.exit(1);
 }
 
-function persistTaskListState() {
-  if (taskListsPath === null) {
-    return;
-  }
-  writeJsonAtomic(taskListsPath, {
-    nextTaskSeq: taskSeq,
-    lists: Object.fromEntries(taskLists),
-  });
-}
-
-// Replaces `path` in one step. The directory is the launcher's to make, and
-// the name written first is one it knows: this process may be allowed to
-// write these two names and no others.
+// Replaces the mailbox in one step using the temporary name the launcher allows.
 function writeJsonAtomic(path, value) {
   const tempPath = `${path}.host-tmp`;
   writeFileSync(tempPath, JSON.stringify(value, null, 2));

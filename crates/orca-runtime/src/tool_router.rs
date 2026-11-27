@@ -55,6 +55,7 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) emit_deltas: bool,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) cancel: &'a CancelToken,
+    pub(crate) steer_handle: Option<&'a crate::lifecycle::ThreadSteerHandle>,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
@@ -164,6 +165,7 @@ impl<'a> RuntimeToolRouter<'a> {
             emit_deltas,
             cost_tracker,
             cancel,
+            steer_handle,
             task_registry,
             background_workflows,
             workflow_ipc,
@@ -488,6 +490,7 @@ impl<'a> RuntimeToolRouter<'a> {
                 .with_git_metadata_write_session(git_metadata_write_session)
                 .with_owner(root_task_id);
                 invocation.prepared_patch = prepared_patch;
+                invocation.steer_handle = steer_handle.cloned();
                 let output = {
                     // A piece that could not be recorded is dropped: the tool
                     // goes on, and its result is recorded as always.
@@ -757,6 +760,7 @@ mod tests {
                     emit_deltas: false,
                     cost_tracker: &mut cost,
                     cancel: &cancel,
+                    steer_handle: None,
                     task_registry: &tasks,
                     background_workflows: &mut workflows,
                     workflow_ipc: None,
@@ -888,6 +892,7 @@ mod tests {
                     emit_deltas: false,
                     cost_tracker: &mut cost,
                     cancel: &cancel,
+                    steer_handle: None,
                     task_registry: &tasks,
                     background_workflows: &mut workflows,
                     workflow_ipc: None,
@@ -1018,6 +1023,7 @@ mod tests {
                 emit_deltas: false,
                 cost_tracker: &mut cost,
                 cancel: &cancel,
+                steer_handle: None,
                 task_registry: &tasks,
                 background_workflows: &mut workflows,
                 workflow_ipc: None,

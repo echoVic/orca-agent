@@ -90,6 +90,7 @@ pub(crate) struct ToolExecutionContext<'a> {
     hooks: Option<&'a HookRunner>,
     cost_tracker: Option<&'a mut CostTracker>,
     cancel: Option<&'a CancelToken>,
+    steer_handle: Option<&'a crate::lifecycle::ThreadSteerHandle>,
     task_registry: Option<&'a TaskRegistry>,
     background_workflows: Option<&'a mut Vec<BackgroundWorkflowRun>>,
     workflow_ipc: Option<&'a WorkflowIpcContext>,
@@ -330,6 +331,7 @@ impl<'a> ToolExecutionContext<'a> {
             hooks: None,
             cost_tracker: None,
             cancel: None,
+            steer_handle: None,
             task_registry: None,
             background_workflows: None,
             workflow_ipc: None,
@@ -357,6 +359,14 @@ impl<'a> ToolExecutionContext<'a> {
         child_budget: Option<orca_core::budget::BudgetSpec>,
     ) -> Self {
         self.child_budget = child_budget;
+        self
+    }
+
+    pub(crate) fn with_steer_handle(
+        mut self,
+        steer_handle: Option<&'a crate::lifecycle::ThreadSteerHandle>,
+    ) -> Self {
+        self.steer_handle = steer_handle;
         self
     }
 
@@ -1033,6 +1043,7 @@ impl ToolExecutionActor {
             hooks,
             cost_tracker,
             cancel,
+            steer_handle,
             task_registry,
             background_workflows,
             workflow_ipc,
@@ -1430,6 +1441,7 @@ impl ToolExecutionActor {
                 emit_deltas,
                 cost_tracker,
                 cancel,
+                steer_handle,
                 task_registry,
                 background_workflows,
                 workflow_ipc,
