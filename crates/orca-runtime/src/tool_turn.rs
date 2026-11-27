@@ -167,6 +167,7 @@ pub(crate) struct RuntimeNormalToolTurnServices<'a> {
 
 pub(crate) struct RuntimeNormalToolTurnRuntime<'a> {
     pub(crate) cancel: &'a CancelToken,
+    pub(crate) steer_handle: Option<&'a crate::lifecycle::ThreadSteerHandle>,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
     pub(crate) workflow_lifecycle_ingress: Option<&'a dyn RuntimeWorkflowLifecycleIngress>,
@@ -1087,6 +1088,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             },
             runtime: RuntimeNormalToolTurnRuntime {
                 cancel,
+                steer_handle: step_snapshot.turn_context.steer_handle,
                 task_registry,
                 workflow_ipc,
                 workflow_lifecycle_ingress,
@@ -1502,6 +1504,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
     } = services;
     let RuntimeNormalToolTurnRuntime {
         cancel,
+        steer_handle,
         task_registry,
         workflow_ipc,
         workflow_lifecycle_ingress,
@@ -1554,6 +1557,7 @@ pub(crate) fn run_normal_tool_turn<W: io::Write>(
         .with_goal_mode(goal_mode)
         .with_headless(headless)
         .with_root_task_id(root_task_id)
+        .with_steer_handle(steer_handle)
         .with_child_budget(child_budget)
         .with_services(instructions, memory, mcp_registry, hooks)
         .with_runtime(
@@ -2930,6 +2934,7 @@ mod tests {
             },
             runtime: RuntimeNormalToolTurnRuntime {
                 cancel: &cancel,
+                steer_handle: None,
                 task_registry: &task_registry,
                 workflow_ipc: None,
                 workflow_lifecycle_ingress: None,
@@ -3079,6 +3084,7 @@ mod tests {
             },
             runtime: RuntimeNormalToolTurnRuntime {
                 cancel: &cancel,
+                steer_handle: None,
                 task_registry: &task_registry,
                 workflow_ipc: None,
                 workflow_lifecycle_ingress: None,
@@ -3404,6 +3410,7 @@ mod tests {
             },
             runtime: RuntimeNormalToolTurnRuntime {
                 cancel: &cancel,
+                steer_handle: None,
                 task_registry: &task_registry,
                 workflow_ipc: None,
                 workflow_lifecycle_ingress: None,
@@ -4799,6 +4806,7 @@ mod tests {
             },
             runtime: RuntimeNormalToolTurnRuntime {
                 cancel: &cancel,
+                steer_handle: None,
                 task_registry: &task_registry,
                 workflow_ipc: None,
                 workflow_lifecycle_ingress: None,

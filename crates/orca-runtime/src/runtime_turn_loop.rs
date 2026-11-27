@@ -640,6 +640,11 @@ fn settle_children_before_return<W: io::Write>(
             let scope = registry.execution_scope(&input.policy.config.subagents.limits);
             while !live_children()?.is_empty() {
                 if input.loop_state.runtime.cancel.is_cancelled()
+                    || input
+                        .request
+                        .turn_context
+                        .steer_handle
+                        .is_some_and(ThreadSteerHandle::has_pending)
                     || input.operation.sync_wall_time()?.is_err()
                 {
                     break;
@@ -717,6 +722,13 @@ fn park_pending_task_wait<W: io::Write>(
                 Some("target_reached_terminal")
             } else if changed {
                 Some("state_changed")
+            } else if input
+                .request
+                .turn_context
+                .steer_handle
+                .is_some_and(ThreadSteerHandle::has_pending)
+            {
+                Some("steer_pending")
             } else if now >= wait.deadline_at_ms {
                 Some("wait_elapsed")
             } else {

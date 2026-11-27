@@ -717,7 +717,19 @@ fn wait_for_tasks(
         terminal_only,
         any,
         max_output_bytes,
-        || context.cancel.is_cancelled(),
+        || {
+            if context.cancel.is_cancelled() {
+                Some("wait_cancelled")
+            } else if invocation
+                .steer_handle
+                .as_ref()
+                .is_some_and(crate::lifecycle::ThreadSteerHandle::has_pending)
+            {
+                Some("steer_pending")
+            } else {
+                None
+            }
+        },
     ) {
         Ok(result) => result,
         Err(error) => return ToolResult::invalid_input(&invocation.request, error),
@@ -833,7 +845,7 @@ fn observe_until(
     terminal_only: bool,
     any: bool,
     max_output_bytes: usize,
-    should_cancel: impl Fn() -> bool,
+    interruption: impl Fn() -> Option<&'static str>,
 ) -> Result<(Vec<TaskObservation>, &'static str), String> {
     let deadline = Instant::now() + wait;
     let mut observations = observe_once(invocation, task_ids, max_output_bytes)?;
@@ -855,12 +867,8 @@ fn observe_until(
             Some("target_reached_terminal")
         } else if !terminal_only && changed {
             Some("state_changed")
-        } else if should_cancel() {
-            Some("wait_cancelled")
-        } else if Instant::now() >= deadline {
-            Some("wait_elapsed")
         } else {
-            None
+            interruption().or_else(|| (Instant::now() >= deadline).then_some("wait_elapsed"))
         };
         if let Some(reason) = reason {
             return Ok((observations, reason));
@@ -1345,7 +1353,7 @@ mod tests {
             true,
             false,
             2048,
-            || false,
+            || None,
         )
         .unwrap();
         assert_eq!(reason, "target_reached_terminal");
@@ -1367,7 +1375,7 @@ mod tests {
             false,
             false,
             2048,
-            || false,
+            || None,
         )
         .unwrap();
         assert_eq!(reason, "wait_elapsed");

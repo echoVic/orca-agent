@@ -3522,9 +3522,9 @@ while IFS= read -r line; do
         serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]})
     }
 
-    fn serve_scripted_provider<const N: usize>(
+    fn serve_scripted_provider(
         config: &mut RunConfig,
-        responses: [serde_json::Value; N],
+        responses: impl IntoIterator<Item = serde_json::Value>,
     ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
@@ -3532,6 +3532,7 @@ while IFS= read -r line; do
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
+        let responses = responses.into_iter().collect::<Vec<_>>();
         let provider = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let mut received = Vec::new();
@@ -3579,6 +3580,154 @@ while IFS= read -r line; do
         config.api_key = Some("test-only".into());
         config.base_url = Some(format!("http://{address}"));
         provider
+    }
+
+    fn assert_steer_reaches_waiting_parent(use_task_wait: bool, inputs: &[&'static str]) {
+        use orca_core::event_schema::{EventEnvelope, EventType};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut thread = RuntimeThread::start(&config, "wait for a child").unwrap();
+        let registry = thread.session().task_registry().clone();
+        let root = registry.create_main_session("root".into());
+        let child = registry.create_subagent_with_parent(
+            "long-running child".into(),
+            None,
+            Some(root.id.clone()),
+        );
+        registry.mark_running(&child.id).unwrap();
+        let waits = (0..inputs.len()).map(|index| {
+            if use_task_wait {
+                let mut response =
+                    scripted_tool_call("task_wait", serde_json::json!({"task_ids": [&child.id]}));
+                response["choices"][0]["delta"]["tool_calls"][0]["id"] =
+                    serde_json::json!(format!("wait-{index}"));
+                response
+            } else {
+                scripted_reply()
+            }
+        });
+        let provider = serve_scripted_provider(&mut config, waits.chain([scripted_reply()]));
+        let steer = ThreadSteerHandle::default();
+        let (responses, observed) = std::sync::mpsc::channel();
+        let child_finished_before_answer = std::thread::scope(|scope| {
+            let worker_steer = steer.clone();
+            let worker_registry = registry.clone();
+            let child_id = child.id.clone();
+            let worker = scope.spawn(move || {
+                observed.recv_timeout(Duration::from_secs(5)).unwrap();
+                let mut timed_out = false;
+                for &text in inputs {
+                    // Give the parent time to enter the wait after each response.
+                    std::thread::sleep(Duration::from_millis(150));
+                    assert!(worker_steer.push(text));
+                    if observed.recv_timeout(Duration::from_secs(3)).is_err() {
+                        timed_out = true;
+                        break;
+                    }
+                }
+                worker_registry
+                    .complete(&child_id, "child done".into())
+                    .unwrap();
+                timed_out
+            });
+            let response_count = AtomicUsize::new(0);
+            let last_response = inputs.len();
+            let request = ThreadTurnRequest::new("wait for a child")
+                .with_root_task_id(root.id)
+                .with_steer_handle(steer.clone())
+                .with_event_observer(Arc::new(move |event: &EventEnvelope| {
+                    if event.event_type == EventType::ModelResponseCompleted {
+                        let count = response_count.fetch_add(1, Ordering::Relaxed);
+                        let _ = responses.send(());
+                        if count == last_response {
+                            // Finish the fixture child before this reply settles.
+                            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                            while registry.get(&child.id).unwrap().status.is_active() {
+                                assert!(std::time::Instant::now() < deadline);
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                        }
+                    }
+                    Ok(())
+                }));
+            let result = thread.run_request(&config, &request, io::sink());
+            let timed_out = worker.join().unwrap();
+            assert_eq!(result.unwrap(), RunStatus::Success);
+            timed_out
+        });
+        let received = provider.join().unwrap();
+        for (index, request) in received.iter().enumerate().skip(1) {
+            let user_inputs = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .filter_map(|message| message["content"].as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                user_inputs,
+                [&["wait for a child"][..], &inputs[..index]].concat()
+            );
+        }
+        assert!(
+            !child_finished_before_answer,
+            "the parent answered only after the child finished"
+        );
+    }
+
+    #[test]
+    fn a_steer_during_task_wait_is_answered_before_the_child_finishes() {
+        assert_steer_reaches_waiting_parent(true, &["answer this while the child runs"]);
+    }
+
+    #[test]
+    fn a_steer_during_the_end_of_turn_child_wait_is_answered() {
+        assert_steer_reaches_waiting_parent(false, &["answer this while the child runs"]);
+    }
+
+    #[test]
+    fn two_steers_during_a_wait_are_answered_in_order() {
+        assert_steer_reaches_waiting_parent(true, &["first steer", "second steer"]);
+    }
+
+    #[test]
+    fn a_steer_outside_a_wait_is_unchanged() {
+        use orca_core::event_schema::{EventEnvelope, EventType};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        let provider = serve_scripted_provider(&mut config, [scripted_reply(), scripted_reply()]);
+        let mut thread = RuntimeThread::start(&config, "reply without waiting").unwrap();
+        let steer = ThreadSteerHandle::default();
+        let replies = AtomicUsize::new(0);
+        let request = ThreadTurnRequest::new("reply without waiting")
+            .with_steer_handle(steer.clone())
+            .with_event_observer(Arc::new(move |event: &EventEnvelope| {
+                if event.event_type == EventType::ModelResponseCompleted
+                    && replies.fetch_add(1, Ordering::Relaxed) == 0
+                {
+                    assert!(steer.push("one more thing"));
+                }
+                Ok(())
+            }));
+        assert_eq!(
+            thread.run_request(&config, &request, io::sink()).unwrap(),
+            RunStatus::Success
+        );
+        let received = provider.join().unwrap();
+        assert!(
+            received[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "user" && message["content"] == "one more thing"
+                })
+        );
     }
 
     #[test]
@@ -5765,6 +5914,7 @@ while IFS= read -r line; do
                 emit_deltas: true,
                 cost_tracker: &mut cost_tracker,
                 cancel: &cancel,
+                steer_handle: None,
                 task_registry: &task_registry,
                 background_workflows: &mut background_workflows,
                 workflow_ipc: None,
@@ -5840,6 +5990,7 @@ while IFS= read -r line; do
                     emit_deltas: false,
                     cost_tracker: &mut cost_tracker,
                     cancel: &cancel,
+                    steer_handle: None,
                     task_registry: &task_registry,
                     background_workflows: &mut background_workflows,
                     workflow_ipc: None,
