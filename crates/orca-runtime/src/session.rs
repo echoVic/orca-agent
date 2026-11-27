@@ -2011,10 +2011,8 @@ mod tests {
                     );
                 }
                 let transcript = history::load_session("latest").unwrap();
-                let resumed = crate::thread_store::resume_conversation(
-                    &transcript,
-                    "system prompt".to_string(),
-                );
+                let resumed =
+                    crate::history::resume_conversation(&transcript, "system prompt".to_string());
                 assert_eq!(reminders(&resumed), [THIRD]);
                 assert!(matches!(resumed.messages.as_slice(),
                     [.., Message::Tool { content: output, .. }, Message::System { content, pinned: false }]

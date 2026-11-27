@@ -1192,6 +1192,7 @@ mod tests {
         let mut service_usage = Vec::new();
         let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
             cwd: cwd.path(),
+            spill_directory: None,
             events: &mut events,
             sink: &mut sink,
             tool_requests: &requests,

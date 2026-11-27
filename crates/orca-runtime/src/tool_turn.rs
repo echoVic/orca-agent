@@ -555,7 +555,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                             tool_policy,
                             subagent_type,
                             mcp_registry,
-                            &config.external_tools,
+                            config,
                         )
                         .is_none()
                     },
