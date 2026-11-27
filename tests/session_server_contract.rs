@@ -5974,9 +5974,8 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
 
 // Two hosts on one ORCA_HOME (an IDE and a CLI server, two windows): each
 // `--mode server` keeps its shell tasks in the one fixed task session
-// "server-shell", whose output archive the first server holds while it runs.
+// "server-shell", with each host owning its live commands and their output.
 #[test]
-#[ignore = "known product bug, not fixed: two servers on one ORCA_HOME share the \"server-shell\" task session, so the second cannot run command/exec (\"task output archive owner: another process already owns the lock\"); see between-C-report.md, \"Product bug found, not fixed: two servers on one home\""]
 fn server_mode_two_servers_on_one_home_each_run_command_exec() {
     if host_refuses_restricted_shells() {
         return;
@@ -6037,6 +6036,21 @@ fn server_mode_two_servers_on_one_home_each_run_command_exec() {
     }
     first.expect_event("first-cmd", "command_exec_started");
     wait_for_path(&started_marker);
+    let store = home.path().join("task-sessions/server-shell/tasks.json");
+    let records = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(&store).expect("read server-shell tasks")).unwrap()
+    };
+    let snapshot = records();
+    let running = snapshot
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(_, task)| task["status"] == "running")
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    let [first_id] = running.as_slice() else {
+        panic!("expected exactly one running command: {snapshot}")
+    };
 
     // A second server on the same home runs a command of its own.
     let mut second = spawn_server(second_workspace.path());
@@ -6067,6 +6081,11 @@ fn server_mode_two_servers_on_one_home_each_run_command_exec() {
         "a second server on the home could not run a command while the first ran one: {second_result}"
     );
     assert_eq!(second_result["stdout"], "second-ok");
+    assert_eq!(
+        records()[*first_id]["status"],
+        "running",
+        "the second server rewrote the first server's running record"
+    );
 
     // And the first server's command still completes for its own client.
     std::fs::write(&release_marker, "release").expect("write release marker");

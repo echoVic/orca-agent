@@ -1510,6 +1510,7 @@ struct TaskPersistence {
     root: PathBuf,
     session_id: String,
     owner: Option<Arc<crate::task_owner::RegistryOwner>>,
+    output: Arc<Mutex<Option<crate::task_output::SharedArchive>>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1963,7 +1964,19 @@ impl TaskRegistry {
             ));
         }
         match &self.persistence {
-            Some(persistence) => Ok(Some(persistence.root.join(&self.session_id).join("output"))),
+            Some(persistence) => {
+                let owner = persistence
+                    .owner
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("persistent registry has no owner"))?;
+                Ok(Some(
+                    persistence
+                        .root
+                        .join(&self.session_id)
+                        .join("output/owners")
+                        .join(&owner.stamp.id),
+                ))
+            }
             None if self.is_process_local() => Ok(None),
             None => Err(io::Error::other(
                 "persistent task output root is unavailable",
@@ -1976,6 +1989,42 @@ impl TaskRegistry {
             return Err(format!("persistent task registry is unavailable: {error}"));
         }
         Ok(self.continuation_store.clone())
+    }
+
+    pub(crate) fn own_archive(&self) -> &Mutex<Option<crate::task_output::SharedArchive>> {
+        &self
+            .persistence
+            .as_ref()
+            .expect("persistent output route")
+            .output
+    }
+
+    pub(crate) fn output_session_lock(&self) -> io::Result<ExclusiveFileLock> {
+        let persistence = self.persistence.as_ref().expect("persistent output route");
+        ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
+            .map_err(io::Error::other)
+    }
+
+    pub(crate) fn output_owner_alive(&self, id: &str) -> bool {
+        let persistence = self.persistence.as_ref().expect("persistent output route");
+        persistence.owner.as_ref().is_none_or(|owner| {
+            owner.alive(
+                &persistence.root,
+                &crate::task_owner::OwnerStamp {
+                    session: self.session_id.clone(),
+                    id: id.into(),
+                },
+            )
+        })
+    }
+
+    pub(crate) fn output_records_unlocked(&self) -> io::Result<HashMap<String, (u64, bool)>> {
+        let persistence = self.persistence.as_ref().expect("persistent output route");
+        let (records, _) = persistence.read_session_records(&self.session_id)?;
+        Ok(records
+            .into_iter()
+            .map(|(id, record)| (id, (record.sequence, is_terminal(record.status))))
+            .collect())
     }
 
     /// Registers an actor-issued capability for a detached subagent attempt.
@@ -6213,6 +6262,7 @@ impl TaskPersistence {
             root,
             session_id,
             owner: None,
+            output: Arc::default(),
         }
     }
 

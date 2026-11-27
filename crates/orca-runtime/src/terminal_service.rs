@@ -2684,11 +2684,10 @@ mod tests {
             io::ErrorKind::InvalidInput,
         );
         drop(service);
-        let reopened_registry = TaskRegistry::new_persistent(
-            registry.session_id().to_string(),
-            temp.path().join("tasks"),
-        )
-        .unwrap();
+        let session_id = registry.session_id().to_string();
+        drop(registry);
+        let reopened_registry =
+            TaskRegistry::new_persistent(session_id, temp.path().join("tasks")).unwrap();
         let reopened = TerminalService::new(reopened_registry);
         assert_eq!(first, explicit_page(&reopened, &started.session_id, 0, 2));
         assert!(
@@ -2786,28 +2785,30 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let registry =
             TaskRegistry::new_persistent("recover".to_string(), temp.path().join("tasks")).unwrap();
+        let task = registry.create_shell("recovered".into(), "echo".into());
+        registry.mark_running(&task.id).unwrap();
+        let database = registry
+            .output_storage_root()
+            .unwrap()
+            .unwrap()
+            .join("archive.sqlite3");
         {
             let store = crate::task_output::TaskOutputStore::for_tasks(&registry);
             store
-                .register_shell("shell-recovered", "task-recovered", false, false)
+                .register_shell("shell-recovered", &task.id, false, false)
                 .unwrap();
-            store
-                .append_stdout("task-recovered", "before-restart")
-                .unwrap();
+            store.append_stdout(&task.id, "before-restart").unwrap();
         }
-        let service = TerminalService::new(registry.clone());
+        drop(registry);
+        let service = TerminalService::new(
+            TaskRegistry::new_persistent("recover".into(), temp.path().join("tasks")).unwrap(),
+        );
         let page = explicit_page(&service, "shell-recovered", 0, 99);
         assert_eq!(page.status, "interrupted");
         assert_eq!(page.termination, "interrupted");
         assert!(page.eof);
         assert_eq!(page.output, "before-restart");
         assert_eq!(page.exit_code, None);
-        let database = registry
-            .output_storage_root()
-            .unwrap()
-            .unwrap()
-            .join("archive.sqlite3");
-        #[cfg(unix)]
         {
             std::fs::remove_file(database).unwrap();
             assert!(
@@ -2821,14 +2822,6 @@ mod tests {
                         || false
                     )
                     .is_err()
-            );
-        }
-        #[cfg(windows)]
-        {
-            assert!(std::fs::remove_file(database).is_err());
-            assert_eq!(
-                explicit_page(&service, "shell-recovered", 0, 99).output,
-                "before-restart"
             );
         }
     }

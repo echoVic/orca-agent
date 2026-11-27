@@ -2,11 +2,15 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 
+#[cfg(test)]
+mod owner_tests;
 mod persistence;
+mod routing;
 pub(crate) use persistence::ArchivedShell;
 use persistence::OutputArchive;
-
+pub(crate) use persistence::SharedArchive;
 pub(crate) use persistence::{check_components, prepare_directory};
+
 pub const DEFAULT_TASK_OUTPUT_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RETAINED_CHUNKS: usize = 32 * 1024;
 
@@ -41,6 +45,7 @@ struct TaskOutputStoreInner {
     max_retained_bytes: usize,
     buffers: HashMap<String, TaskOutputBuffer>,
     archive: Option<Arc<Mutex<OutputArchive>>>,
+    route: Option<routing::ArchiveRoute>,
     archive_error: Option<String>,
 }
 
@@ -68,6 +73,7 @@ impl TaskOutputStore {
                 max_retained_bytes,
                 buffers: HashMap::new(),
                 archive: None,
+                route: None,
                 archive_error: None,
             })),
         }
@@ -75,13 +81,12 @@ impl TaskOutputStore {
 
     pub(crate) fn for_tasks(tasks: &crate::tasks::TaskRegistry) -> Self {
         let store = Self::new();
-        let archive = tasks.output_storage_root().and_then(|root| {
-            root.map(|root| OutputArchive::open(&root, tasks.session_id()))
-                .transpose()
-        });
+        let route = tasks
+            .output_storage_root()
+            .map(|root| root.map(|root| routing::ArchiveRoute::new(tasks.clone(), root)));
         let mut inner = store.inner.lock().expect("task output store poisoned");
-        match archive {
-            Ok(archive) => inner.archive = archive,
+        match route {
+            Ok(route) => inner.route = route,
             Err(error) => inner.archive_error = Some(error.to_string()),
         }
         drop(inner);
@@ -97,6 +102,11 @@ impl TaskOutputStore {
     ) -> io::Result<()> {
         let mut inner = self.inner.lock().expect("task output store poisoned");
         inner.check_archive()?;
+        if inner.archive.is_none()
+            && let Some(route) = &inner.route
+        {
+            inner.archive = Some(route.open_writer()?);
+        }
         if let Some(archive) = &inner.archive {
             archive.lock().expect("output archive poisoned").register(
                 shell_id,
@@ -112,16 +122,14 @@ impl TaskOutputStore {
     pub(crate) fn archived_shell(&self, shell_id: &str) -> io::Result<ArchivedShell> {
         let inner = self.inner.lock().expect("task output store poisoned");
         inner.check_archive()?;
-        let archive = inner.archive.as_ref().ok_or_else(|| {
+        let route = inner.route.clone().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 "no persistent output archive for this session",
             )
         })?;
-        archive
-            .lock()
-            .expect("output archive poisoned")
-            .shell(shell_id)
+        drop(inner);
+        route.shell(shell_id)
     }
 
     pub(crate) fn finish_shell(
@@ -132,7 +140,7 @@ impl TaskOutputStore {
     ) -> io::Result<()> {
         let inner = self.inner.lock().expect("task output store poisoned");
         inner.check_archive()?;
-        if let Some(archive) = &inner.archive {
+        if let Some(archive) = inner.active_writer()? {
             archive
                 .lock()
                 .expect("output archive poisoned")
@@ -144,13 +152,9 @@ impl TaskOutputStore {
     pub(crate) fn set_cursor(&self, shell_id: &str, cursor: usize) -> io::Result<()> {
         let inner = self.inner.lock().expect("task output store poisoned");
         inner.check_archive()?;
-        if let Some(archive) = &inner.archive {
-            archive
-                .lock()
-                .expect("output archive poisoned")
-                .set_cursor(shell_id, cursor)?;
-        }
-        Ok(())
+        let route = inner.route.clone();
+        drop(inner);
+        route.map_or(Ok(()), |route| route.set_cursor(shell_id, cursor))
     }
 
     pub fn append_stdout(&self, task_id: &str, content: &str) -> io::Result<()> {
@@ -189,12 +193,9 @@ impl TaskOutputStore {
     ) -> io::Result<TaskOutputRead> {
         let inner = self.inner.lock().expect("task output store poisoned");
         inner.check_archive()?;
-        if let Some(archive) = &inner.archive {
-            return archive.lock().expect("output archive poisoned").read(
-                task_id,
-                from_offset,
-                max_bytes,
-            );
+        if let Some(route) = inner.route.clone() {
+            drop(inner);
+            return route.find(|archive, _| archive.read(task_id, from_offset, max_bytes));
         }
         inner.read_cached(task_id, from_offset, max_bytes)
     }
@@ -217,9 +218,9 @@ impl TaskOutputStore {
     pub fn tail(&self, task_id: &str, max_bytes: usize) -> io::Result<TaskOutputRead> {
         let inner = self.inner.lock().expect("task output store poisoned");
         inner.check_archive()?;
-        if let Some(archive) = &inner.archive {
-            let archive = archive.lock().expect("output archive poisoned");
-            return archive.tail(task_id, max_bytes);
+        if let Some(route) = inner.route.clone() {
+            drop(inner);
+            return route.find(|archive, _| archive.tail(task_id, max_bytes));
         }
         let Some(buffer) = inner.buffers.get(task_id) else {
             return Ok(TaskOutputRead::empty(0));
@@ -236,7 +237,7 @@ impl TaskOutputStore {
         }
         let mut inner = self.inner.lock().expect("task output store poisoned");
         inner.check_archive()?;
-        if let Some(archive) = inner.archive.clone()
+        if let Some(archive) = inner.active_writer()?
             && let Err(error) = archive
                 .lock()
                 .expect("output archive poisoned")
@@ -254,7 +255,7 @@ impl TaskOutputStore {
             buffer.trim_to_budget(max_retained_bytes);
             remaining = &remaining[end..];
         }
-        if inner.archive.is_some() {
+        if inner.route.is_some() {
             let retained = inner
                 .buffers
                 .values()
@@ -295,6 +296,16 @@ impl TaskOutputStore {
 }
 
 impl TaskOutputStoreInner {
+    fn active_writer(&self) -> io::Result<Option<SharedArchive>> {
+        if let Some(writer) = &self.archive {
+            return Ok(Some(writer.clone()));
+        }
+        self.route
+            .as_ref()
+            .map(|route| route.writer().ok_or_else(persistence::missing))
+            .transpose()
+    }
+
     fn check_archive(&self) -> io::Result<()> {
         if let Some(error) = &self.archive_error {
             return Err(io::Error::other(error.clone()));
