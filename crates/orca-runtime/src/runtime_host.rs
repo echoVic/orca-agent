@@ -31231,18 +31231,14 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start durable provider outcome recovery host");
         let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id));
-        #[cfg(unix)]
-        let config = if mode == "approval-mcp" {
-            RunConfig {
-                mcp_servers: vec![slow_mcp_server("slow", cwd.path(), Some(2))],
-                ..config
-            }
-        } else {
-            config
-        };
         let thread = if mode == "approval-mcp" {
             #[cfg(unix)]
             {
+                let (server, hold) = held_mcp_server("slow", cwd.path());
+                let config = RunConfig {
+                    mcp_servers: vec![server],
+                    ..config
+                };
                 let other = host
                     .start_thread(
                         surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
@@ -31262,15 +31258,19 @@ mod tests {
                     assert!(Instant::now() < deadline, "slow MCP never started");
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                let started = Instant::now();
                 host.handle()
                     .resolve_live_thread(other.thread_id())
                     .unwrap();
+                fs::remove_file(hold).expect("release initialize after the supervisor replies");
+                let recovered = recovering.join().unwrap();
                 assert!(
-                    started.elapsed() < Duration::from_millis(300),
-                    "MCP recovery blocked the host supervisor"
+                    recovered
+                        .mcp_registry()
+                        .resolve_tool("mcp__slow__wait")
+                        .is_some(),
+                    "the supervisor must reply before the held initialize times out"
                 );
-                recovering.join().unwrap()
+                recovered
             }
             #[cfg(not(unix))]
             unreachable!("MCP recovery fixture requires Unix");
@@ -46719,18 +46719,7 @@ done
         surface: &surface::RuntimeSurfaceHandle,
         ready: impl Fn(&surface::SurfaceMcpCatalogSnapshot) -> bool,
     ) -> surface::SurfaceMcpCatalogSnapshot {
-        wait_for_mcp_catalog_within(surface, SURFACE_TEST_TIMEOUT, ready)
-    }
-
-    /// The MCP catalog of a fresh attachment, once `ready` accepts it, which
-    /// must happen within `timeout`.
-    #[cfg(unix)]
-    fn wait_for_mcp_catalog_within(
-        surface: &surface::RuntimeSurfaceHandle,
-        timeout: Duration,
-        ready: impl Fn(&surface::SurfaceMcpCatalogSnapshot) -> bool,
-    ) -> surface::SurfaceMcpCatalogSnapshot {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
         loop {
             let catalog = fresh_surface_attachment_with_capabilities(
                 surface,
@@ -47470,6 +47459,7 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       : > "$0.initializing"
       if [ "$delay" != never ]; then
+        while [ -f "$0.held" ]; do sleep 0.05; done
         sleep "$delay"
         printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"slow","version":"1"}}}}}}\n' "$id"
       fi
@@ -47501,6 +47491,17 @@ done
     }
 
     #[cfg(unix)]
+    fn held_mcp_server(
+        name: &str,
+        dir: &std::path::Path,
+    ) -> (orca_core::mcp_types::McpServerConfig, PathBuf) {
+        let server = slow_mcp_server(name, dir, Some(0));
+        let hold = catalog_mcp_server_dir(name, dir).join("server.sh.held");
+        fs::write(&hold, []).expect("hold initialize until the test releases it");
+        (server, hold)
+    }
+
+    #[cfg(unix)]
     #[test]
     fn thread_start_does_not_wait_for_servers() {
         let _env = crate::history::lock_test_env();
@@ -47508,20 +47509,14 @@ done
         let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
-        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), Some(2))];
+        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), None)];
         let host = RuntimeHost::start().expect("start runtime host");
 
-        let started = Instant::now();
         let thread = host
             .handle()
             .start_thread(config, "mcp start")
             .expect("start the thread");
 
-        let took = started.elapsed();
-        assert!(
-            took < Duration::from_secs(1),
-            "the thread start took {took:?}"
-        );
         assert!(
             thread.mcp_registry().is_starting(),
             "the server is still connecting"
@@ -47537,7 +47532,8 @@ done
         let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
-        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), Some(2))];
+        let (server, hold) = held_mcp_server("slow", cwd.path());
+        config.mcp_servers = vec![server];
         let host = RuntimeHost::start().expect("start runtime host");
         let thread = host
             .handle()
@@ -47545,7 +47541,6 @@ done
             .expect("start the thread");
         let surface = thread.surface();
 
-        // Nothing is asked of the thread: the catalog follows the server.
         wait_for_mcp_catalog(&surface, |catalog| {
             catalog.servers
                 == [catalog_server(
@@ -47553,7 +47548,10 @@ done
                     surface::SurfaceMcpServerStatus::Starting,
                 )]
         });
-        let catalog = wait_for_mcp_catalog_within(&surface, Duration::from_secs(3), |catalog| {
+        // Only the server is released. No turn or reconnect can publish Ready
+        // for the idle thread; its registry wake must update the snapshot.
+        fs::remove_file(hold).expect("release initialize after observing Starting");
+        let catalog = wait_for_mcp_catalog(&surface, |catalog| {
             catalog.servers
                 == [catalog_server(
                     "slow",
