@@ -1994,23 +1994,27 @@ impl TaskRegistry {
         Ok(self.continuation_store.clone())
     }
 
-    pub(crate) fn own_archive(&self) -> &Mutex<Option<crate::task_output::SharedArchive>> {
-        &self
-            .persistence
-            .as_ref()
-            .expect("persistent output route")
-            .output
+    fn output_persistence(&self) -> io::Result<&TaskPersistence> {
+        self.persistence
+            .as_deref()
+            .ok_or_else(|| io::Error::other("task registry has no persistent output route"))
+    }
+
+    pub(crate) fn own_archive(
+        &self,
+    ) -> io::Result<&Mutex<Option<crate::task_output::SharedArchive>>> {
+        Ok(&self.output_persistence()?.output)
     }
 
     pub(crate) fn output_session_lock(&self) -> io::Result<ExclusiveFileLock> {
-        let persistence = self.persistence.as_ref().expect("persistent output route");
+        let persistence = self.output_persistence()?;
         ExclusiveFileLock::acquire(&persistence.session_lock_path(&self.session_id))
             .map_err(io::Error::other)
     }
 
-    pub(crate) fn output_owner_alive(&self, id: &str) -> bool {
-        let persistence = self.persistence.as_ref().expect("persistent output route");
-        persistence.owner.as_ref().is_none_or(|owner| {
+    pub(crate) fn output_owner_alive(&self, id: &str) -> io::Result<bool> {
+        let persistence = self.output_persistence()?;
+        Ok(persistence.owner.as_ref().is_none_or(|owner| {
             crate::task_owner::RegistryOwner::alive(
                 Some(owner),
                 &persistence.root,
@@ -2019,11 +2023,11 @@ impl TaskRegistry {
                     id: id.into(),
                 },
             )
-        })
+        }))
     }
 
     pub(crate) fn output_records_unlocked(&self) -> io::Result<HashMap<String, (u64, bool)>> {
-        let persistence = self.persistence.as_ref().expect("persistent output route");
+        let persistence = self.output_persistence()?;
         let (records, _) = persistence.read_session_records(&self.session_id)?;
         Ok(records
             .into_iter()
@@ -7966,9 +7970,9 @@ mod tests {
         let stamp = other.owner_stamp().unwrap();
         assert_eq!(stamp.session, "session_id");
         let _lock = reader.output_session_lock().unwrap();
-        assert!(reader.output_owner_alive(&stamp.id));
+        assert!(reader.output_owner_alive(&stamp.id).unwrap());
         drop(other);
-        assert!(!reader.output_owner_alive(&stamp.id));
+        assert!(!reader.output_owner_alive(&stamp.id).unwrap());
     }
 
     #[test]
@@ -7978,6 +7982,15 @@ mod tests {
         assert_eq!(safe_path_component(""), "_");
         assert_eq!(safe_path_component("session-01.v3"), "session-01.v3");
         assert_eq!(safe_path_component("../outside"), ".._outside");
+    }
+
+    #[test]
+    fn process_local_registry_has_no_persistent_output_route() {
+        let tasks = TaskRegistry::new("local".into());
+        assert!(tasks.own_archive().is_err());
+        assert!(tasks.output_session_lock().is_err());
+        assert!(tasks.output_owner_alive("owner").is_err());
+        assert!(tasks.output_records_unlocked().is_err());
     }
 
     #[test]

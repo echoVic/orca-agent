@@ -37,12 +37,13 @@ impl ArchiveRoute {
         }
     }
 
-    pub(super) fn writer(&self) -> Option<SharedArchive> {
-        self.tasks
-            .own_archive()
+    pub(super) fn writer(&self) -> io::Result<Option<SharedArchive>> {
+        Ok(self
+            .tasks
+            .own_archive()?
             .lock()
             .expect("registry archive poisoned")
-            .clone()
+            .clone())
     }
 
     fn siblings(&self) -> &Path {
@@ -78,7 +79,7 @@ impl ArchiveRoute {
         let _lock = self.tasks.output_session_lock()?;
         let mut writer = self
             .tasks
-            .own_archive()
+            .own_archive()?
             .lock()
             .expect("registry archive poisoned");
         if let Some(writer) = writer.as_ref() {
@@ -99,7 +100,7 @@ impl ArchiveRoute {
         }
         let records = self.tasks.output_records_unlocked()?;
         for (id, path) in entries {
-            if self.tasks.output_owner_alive(id) {
+            if self.tasks.output_owner_alive(id)? {
                 continue;
             }
             if OutputArchive::remove_empty_directory(path).unwrap_or(false) {
@@ -155,7 +156,7 @@ impl ArchiveRoute {
         &self,
         mut read: impl FnMut(&OutputArchive, bool) -> io::Result<T>,
     ) -> io::Result<T> {
-        let own = self.writer();
+        let own = self.writer()?;
         if let Some(own) = own {
             let result = read(&own.lock().expect("output archive poisoned"), false);
             if !matches!(&result, Err(error) if error.kind() == io::ErrorKind::NotFound) {
@@ -172,7 +173,6 @@ impl ArchiveRoute {
                 }
             }
         }
-        entries.retain(|(id, _)| !self.tasks.output_owner_alive(id));
         entries.sort_by_cached_key(|(_, path)| {
             std::cmp::Reverse(
                 fs::symlink_metadata(path)
@@ -180,7 +180,10 @@ impl ArchiveRoute {
                     .ok(),
             )
         });
-        for (_, path) in entries {
+        for (id, path) in entries {
+            if self.tasks.output_owner_alive(&id)? {
+                continue;
+            }
             if let Ok(archive) = OutputArchive::existing(&path, self.tasks.session_id(), false) {
                 let result = read(&archive, false);
                 if !matches!(&result, Err(error) if error.kind() == io::ErrorKind::NotFound) {

@@ -302,7 +302,7 @@ impl TaskOutputStoreInner {
         }
         self.route
             .as_ref()
-            .map(|route| route.writer().ok_or_else(persistence::missing))
+            .map(|route| route.writer()?.ok_or_else(persistence::missing))
             .transpose()
     }
 
