@@ -3598,57 +3598,46 @@ while IFS= read -r line; do
             Some(root.id.clone()),
         );
         registry.mark_running(&child.id).unwrap();
-        let waits = (0..inputs.len()).map(|index| {
-            if use_task_wait {
-                let mut response =
-                    scripted_tool_call("task_wait", serde_json::json!({"task_ids": [&child.id]}));
-                response["choices"][0]["delta"]["tool_calls"][0]["id"] =
-                    serde_json::json!(format!("wait-{index}"));
-                response
-            } else {
-                scripted_reply()
-            }
-        });
-        let provider = serve_scripted_provider(&mut config, waits.chain([scripted_reply()]));
+        let first_response = if use_task_wait {
+            scripted_tool_call("task_wait", serde_json::json!({"task_ids": [&child.id]}))
+        } else {
+            scripted_reply()
+        };
+        let provider = serve_scripted_provider(&mut config, [first_response, scripted_reply()]);
         let steer = ThreadSteerHandle::default();
+        let (entered, wait_entered) = std::sync::mpsc::sync_channel(1);
+        let (resume, wait_resume) = std::sync::mpsc::channel();
+        steer.probe_next_wait(entered, wait_resume);
         let (responses, observed) = std::sync::mpsc::channel();
         let child_finished_before_answer = std::thread::scope(|scope| {
             let worker_steer = steer.clone();
             let worker_registry = registry.clone();
             let child_id = child.id.clone();
             let worker = scope.spawn(move || {
-                observed.recv_timeout(Duration::from_secs(5)).unwrap();
-                let mut timed_out = false;
+                wait_entered.recv_timeout(Duration::from_secs(5)).unwrap();
                 for &text in inputs {
-                    // Give the parent time to enter the wait after each response.
-                    std::thread::sleep(Duration::from_millis(150));
                     assert!(worker_steer.push(text));
-                    if observed.recv_timeout(Duration::from_secs(3)).is_err() {
-                        timed_out = true;
-                        break;
-                    }
                 }
+                resume.send(()).unwrap();
+                let timed_out = observed.recv_timeout(Duration::from_secs(3)).is_err();
                 worker_registry
                     .complete(&child_id, "child done".into())
                     .unwrap();
                 timed_out
             });
             let response_count = AtomicUsize::new(0);
-            let last_response = inputs.len();
             let request = ThreadTurnRequest::new("wait for a child")
                 .with_root_task_id(root.id)
                 .with_steer_handle(steer.clone())
                 .with_event_observer(Arc::new(move |event: &EventEnvelope| {
-                    if event.event_type == EventType::ModelResponseCompleted {
-                        let count = response_count.fetch_add(1, Ordering::Relaxed);
+                    if event.event_type == EventType::ModelResponseCompleted
+                        && response_count.fetch_add(1, Ordering::Relaxed) == 1
+                    {
                         let _ = responses.send(());
-                        if count == last_response {
-                            // Finish the fixture child before this reply settles.
-                            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                            while registry.get(&child.id).unwrap().status.is_active() {
-                                assert!(std::time::Instant::now() < deadline);
-                                std::thread::sleep(Duration::from_millis(5));
-                            }
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        while registry.get(&child.id).unwrap().status.is_active() {
+                            assert!(std::time::Instant::now() < deadline);
+                            std::thread::sleep(Duration::from_millis(5));
                         }
                     }
                     Ok(())
@@ -3659,18 +3648,29 @@ while IFS= read -r line; do
             timed_out
         });
         let received = provider.join().unwrap();
-        for (index, request) in received.iter().enumerate().skip(1) {
-            let user_inputs = request["messages"]
-                .as_array()
-                .unwrap()
+        let messages = received[1]["messages"].as_array().unwrap();
+        let user_inputs = messages
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(user_inputs, [&["wait for a child"][..], inputs].concat());
+        if use_task_wait {
+            let result = messages
                 .iter()
-                .filter(|message| message["role"] == "user")
-                .filter_map(|message| message["content"].as_str())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                user_inputs,
-                [&["wait for a child"][..], &inputs[..index]].concat()
-            );
+                .position(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"] == "shell-test"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("steer_pending"))
+                })
+                .expect("wait result must settle before steering");
+            let first_steer = messages
+                .iter()
+                .position(|message| message["role"] == "user" && message["content"] == inputs[0])
+                .unwrap();
+            assert!(result < first_steer);
         }
         assert!(
             !child_finished_before_answer,
@@ -3782,21 +3782,23 @@ while IFS= read -r line; do
             );
         });
         let received = provider.join().unwrap();
-        assert!(
-            received[1]["messages"]
-                .to_string()
-                .contains("first child done")
-        );
-        assert!(
-            !received[1]["messages"]
-                .to_string()
-                .contains("second child done")
-        );
-        assert!(
-            received[2]["messages"]
-                .to_string()
-                .contains("second child done")
-        );
+        let notice_count = |request: &serde_json::Value, text: &str| {
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message["role"] == "system"
+                        && message["content"].as_str().is_some_and(|content| {
+                            content.starts_with("<task-notification>") && content.contains(text)
+                        })
+                })
+                .count()
+        };
+        assert_eq!(notice_count(&received[1], "first child done"), 1);
+        assert_eq!(notice_count(&received[1], "second child done"), 0);
+        assert_eq!(notice_count(&received[2], "first child done"), 1);
+        assert_eq!(notice_count(&received[2], "second child done"), 1);
     }
 
     #[test]
