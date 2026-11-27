@@ -632,21 +632,29 @@ fn pending_context_message_with_counter(
     conversation: &Conversation,
     counter: &impl TokenCounter,
 ) -> Option<Message> {
+    let inherited = conversation.fork_prefix.iter().flat_map(|prefix| {
+        prefix
+            .system_messages
+            .iter()
+            .map(|message| &message.context_fragments)
+    });
+    let local = conversation
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::System {
+                context_fragments, ..
+            } => Some(context_fragments),
+            _ => None,
+        });
     let mut previous = BTreeMap::new();
-    for message in &conversation.messages {
-        if let Message::System {
-            context_fragments, ..
-        } = message
-        {
-            for change in context_fragments {
-                match change.digest {
-                    Some(digest) => {
-                        previous.insert(change.id.as_str(), digest);
-                    }
-                    None => {
-                        previous.remove(change.id.as_str());
-                    }
-                }
+    for change in inherited.chain(local).flatten() {
+        match change.digest {
+            Some(digest) => {
+                previous.insert(change.id.as_str(), digest);
+            }
+            None => {
+                previous.remove(change.id.as_str());
             }
         }
     }

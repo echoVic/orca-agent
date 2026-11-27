@@ -4554,6 +4554,7 @@ mod tests {
             ],
             tools: vec![],
             estimated_tokens: 15,
+            system_messages: vec![],
         }
     }
 

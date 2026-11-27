@@ -1,8 +1,8 @@
 use std::io::{self, Write};
 
 use orca_core::conversation::{
-    CapturedProviderMessage, CapturedProviderRequest, Conversation, Message, ProviderForkPrefix,
-    SummaryState, normalize_tool_boundaries,
+    CapturedProviderMessage, CapturedProviderRequest, Conversation, ForkSystemMessage, Message,
+    ProviderForkPrefix, SummaryState, normalize_tool_boundaries,
 };
 use orca_core::model::{ModelRouteContext, ModelSelection, PRO_MODEL, accepts_tool_images};
 use orca_core::subagent_types::SubagentType;
@@ -144,18 +144,35 @@ pub(crate) fn record(
     // needs the active prompt's boundary in the actual lowered request.
     let mut normalized = conversation.messages.clone();
     normalize_tool_boundaries(&mut normalized);
-    let fork_cut = conversation
-        .provider_fork_cut(&normalized)
-        .map(|cut| cut + summary_count)
-        .and_then(|cut| {
-            if recovery_edit.is_some_and(|edited| edited < cut) {
-                Err("request recovery rewrote the earlier parent history")
-            } else if cut > messages.len() {
-                Err("the parent request ended before the fork boundary")
-            } else {
-                Ok(cut)
+    let history_cut = conversation.provider_fork_cut(&normalized);
+    let fork_cut = history_cut.map(|cut| cut + summary_count).and_then(|cut| {
+        if recovery_edit.is_some_and(|edited| edited < cut) {
+            Err("request recovery rewrote the earlier parent history")
+        } else if cut > messages.len() {
+            Err("the parent request ended before the fork boundary")
+        } else {
+            Ok(cut)
+        }
+    });
+    let mut fork_system_messages = Vec::new();
+    if let (Ok(cut), Ok(_)) = (history_cut, fork_cut) {
+        let leading = normalized
+            .iter()
+            .take_while(|message| message.is_leading_system())
+            .count();
+        for (index, message) in normalized[..cut].iter().enumerate() {
+            if let Message::System {
+                context_fragments, ..
+            } = message
+                && !context_fragments.is_empty()
+            {
+                fork_system_messages.push(ForkSystemMessage {
+                    index: index + if index >= leading { summary_count } else { 0 },
+                    context_fragments: context_fragments.clone(),
+                });
             }
-        });
+        }
+    }
     let capture_end = (source_messages.len() + summary_count).max(fork_cut.unwrap_or(0));
     let Some(messages) = messages.get(..capture_end) else {
         return;
@@ -182,6 +199,7 @@ pub(crate) fn record(
             tools: tools.to_vec(),
             fork_cut,
             fork_turn_id: conversation.provider_turn_id().map(str::to_owned),
+            fork_system_messages,
         });
     }
 }
@@ -264,9 +282,26 @@ pub(crate) fn fork(conversation: &Conversation) -> Result<ProviderForkPrefix, &'
         .messages
         .get(..request.fork_cut?)
         .ok_or("the captured request ended before the fork boundary")?;
-    let (mut messages, inherited_tokens) = conversation.fork_prefix.as_ref().map_or_else(
-        || (Vec::new(), 0),
-        |prefix| (prefix.messages.clone(), prefix.estimated_tokens),
+    let (mut messages, mut system_messages, inherited_tokens) =
+        conversation.fork_prefix.as_ref().map_or_else(
+            || (Vec::new(), Vec::new(), 0),
+            |prefix| {
+                (
+                    prefix.messages.clone(),
+                    prefix.system_messages.clone(),
+                    prefix.estimated_tokens,
+                )
+            },
+        );
+    system_messages.extend(
+        request
+            .fork_system_messages
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                message.index += messages.len();
+                message
+            }),
     );
     messages.extend(captured.iter().map(|message| message.json.get().to_owned()));
     Ok(ProviderForkPrefix {
@@ -275,6 +310,7 @@ pub(crate) fn fork(conversation: &Conversation) -> Result<ProviderForkPrefix, &'
         reasoning_effort: request.reasoning_effort,
         messages,
         tools: request.tools.clone(),
+        system_messages,
         estimated_tokens: inherited_tokens
             + captured
                 .iter()

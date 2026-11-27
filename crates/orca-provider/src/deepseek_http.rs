@@ -1740,6 +1740,7 @@ done
             messages: vec![],
             tools: captured.clone(),
             estimated_tokens: 0,
+            system_messages: vec![],
         }));
         let mut config = ProviderConfig {
             api_key: None,
@@ -2921,6 +2922,57 @@ done
         conv.add_user("read the records".into());
         conv.replace_memory_context(Some("first fact".into()));
         conv
+    }
+
+    #[test]
+    fn a_fork_child_appends_only_changed_fragments() {
+        use orca_core::model::PRO_MODEL;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 27).unwrap();
+        let mut parent = context_conversation();
+        parent.set_today(today);
+        prepare_context(&mut parent);
+        parent.add_assistant(Some("completed report".into()), None, vec![]);
+        parent.add_user("start a child".into());
+        parent.start_provider_turn("fork-parent-turn");
+        let outbound = conversation_to_api_messages(&parent);
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: Some(PRO_MODEL.into()),
+            reasoning_effort: orca_core::config::ReasoningEffort::High,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: vec![],
+            max_output_tokens: None,
+        };
+        replay_prefix::record(&parent, &config, PRO_MODEL, &outbound, None, &[]);
+
+        let mut child = Conversation::new();
+        child.fork_prefix = Some(Arc::new(captured_fork_prefix(&parent).unwrap()));
+        child.add_user("update the report".into());
+        child.set_today(today);
+        child.replace_memory_context(Some("second fact".into()));
+        let messages = serde_json::to_value(chat_messages(&child).unwrap()).unwrap();
+        let messages = messages.as_array().unwrap();
+        let contents: Vec<_> = messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(
+            contents
+                .iter()
+                .filter(|text| text.contains("Current date context"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            contents.last().copied(),
+            Some(
+                "Current memory context (this replaces any earlier version):\n[Relevant memory]\nsecond fact"
+            )
+        );
+        prepare_context(&mut child);
+        assert!(pending_context_message(&child).is_none());
     }
 
     #[test]

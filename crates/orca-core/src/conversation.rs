@@ -649,6 +649,7 @@ pub struct CapturedProviderRequest {
     pub tools: Vec<serde_json::Value>,
     pub fork_cut: Result<usize, &'static str>,
     pub fork_turn_id: Option<String>,
+    pub fork_system_messages: Vec<ForkSystemMessage>,
 }
 
 pub struct CapturedProviderMessage {
@@ -656,6 +657,13 @@ pub struct CapturedProviderMessage {
     pub estimated_tokens: usize,
     pub has_images: bool,
     pub has_tool_images: bool,
+}
+
+/// Context metadata for a system message at a position in the captured wire prefix.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ForkSystemMessage {
+    pub index: usize,
+    pub context_fragments: Vec<ContextFragmentChange>,
 }
 
 /// A child sends this independently of its own transcript and checkpoints.
@@ -668,6 +676,8 @@ pub struct ProviderForkPrefix {
     pub messages: Vec<String>,
     pub tools: Vec<serde_json::Value>,
     pub estimated_tokens: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_messages: Vec<ForkSystemMessage>,
 }
 
 impl fmt::Debug for ProviderForkPrefix {
