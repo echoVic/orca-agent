@@ -1569,6 +1569,8 @@ struct PersistedProviderResponse {
     attempt_usage: Option<PersistedAttemptUsage>,
     #[serde(default)]
     identity: Option<ModelResponseIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut_short: Option<orca_core::conversation::CutShort>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -6661,6 +6663,7 @@ impl PersistedProviderResponse {
         if let Some(attempt) = self.attempt_usage {
             runtime_response.attempt_usage = attempt.usage;
         }
+        runtime_response.cut_short = self.cut_short;
         runtime_response
     }
 }
@@ -6684,6 +6687,7 @@ impl From<&RuntimeModelResponse> for PersistedProviderResponse {
                 },
             ),
             identity: Some(response.identity.clone()),
+            cut_short: response.cut_short,
         }
     }
 }
@@ -8788,6 +8792,7 @@ mod tests {
             usage: None,
             attempt_usage: None,
             identity: None,
+            cut_short: None,
         }
         .into_runtime_response_with_migration_identity();
 

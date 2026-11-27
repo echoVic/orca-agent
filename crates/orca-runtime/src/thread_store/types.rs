@@ -540,6 +540,8 @@ pub(crate) enum StoredMessage {
         content: Option<String>,
         reasoning_content: Option<String>,
         tool_calls: Vec<RawToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cut_short: Option<orca_core::conversation::CutShort>,
         #[serde(default)]
         pinned: bool,
     },
@@ -708,6 +710,8 @@ enum StoredMessageWire {
         reasoning_content: Option<String>,
         tool_calls: Vec<RawToolCall>,
         #[serde(default)]
+        cut_short: Option<orca_core::conversation::CutShort>,
+        #[serde(default)]
         pinned: bool,
     },
     Tool {
@@ -742,11 +746,13 @@ impl<'de> Deserialize<'de> for StoredMessage {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             } => Ok(Self::Assistant {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             }),
             StoredMessageWire::Tool {
@@ -789,11 +795,13 @@ impl From<&Message> for StoredMessage {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             } => Self::Assistant {
                 content: content.clone(),
                 reasoning_content: reasoning_content.clone(),
                 tool_calls: tool_calls.clone(),
+                cut_short: *cut_short,
                 pinned: *pinned,
             },
             Message::Tool {
@@ -830,11 +838,13 @@ impl From<StoredMessage> for Message {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             } => Self::Assistant {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             },
             StoredMessage::Tool {

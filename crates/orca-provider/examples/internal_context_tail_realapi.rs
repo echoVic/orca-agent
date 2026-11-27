@@ -133,6 +133,7 @@ fn main() {
         std::process::exit(1);
     }
     history.messages.push(Message::Assistant {
+        cut_short: None,
         content: first.assistant_content.clone(),
         reasoning_content: first.assistant_reasoning.clone(),
         tool_calls: first.tool_calls.clone(),

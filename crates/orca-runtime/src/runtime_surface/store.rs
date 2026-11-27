@@ -1794,7 +1794,7 @@ impl StoredSurfaceEventV1 {
                 Self::Operation(StoredOperationPatchV1::from_live(patch)?)
             }
             SurfaceEvent::Item(patch) => Self::Item(patch.clone()),
-            SurfaceEvent::Assistant(patch) => Self::Assistant(patch.clone()),
+            SurfaceEvent::Assistant(patch) => Self::Assistant(patch.for_v1_event().into_owned()),
             SurfaceEvent::Tool(patch) => Self::Tool(patch.clone()),
             SurfaceEvent::Plan(snapshot) => Self::Plan(snapshot.clone()),
             SurfaceEvent::Usage(snapshot) => Self::Usage(snapshot.clone()),
@@ -1842,6 +1842,9 @@ struct StoredSurfaceEventEnvelopeV1 {
     commit_class: CommitClass,
     scope: StoredScopeV1,
     event: StoredSurfaceEventV1,
+    // Keep this outside the event so older readers compute the same digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut_short: Option<orca_core::conversation::CutShort>,
 }
 
 impl StoredSurfaceEventEnvelopeV1 {
@@ -1852,6 +1855,12 @@ impl StoredSurfaceEventEnvelopeV1 {
             commit_class: envelope.commit_class.clone(),
             scope: StoredScopeV1::from_live(&envelope.scope)?,
             event: StoredSurfaceEventV1::from_live(&envelope.event)?,
+            cut_short: match &envelope.event {
+                SurfaceEvent::Assistant(AssistantPatch::ResponseKept { reason, .. }) => {
+                    Some(*reason)
+                }
+                _ => None,
+            },
         })
     }
 
@@ -1899,14 +1908,21 @@ impl StoredSurfaceCommitBatchV1 {
         if self.version != 1 {
             return Err(SurfaceLedgerError::AppendFailed);
         }
+        let mut cutoffs = Vec::new();
         let events = NonEmptyVec::try_new(
             self.events
                 .into_iter()
-                .map(StoredSurfaceEventEnvelopeV1::into_live)
+                .enumerate()
+                .map(|(index, event)| {
+                    if let Some(reason) = event.cut_short {
+                        cutoffs.push((index, reason));
+                    }
+                    event.into_live()
+                })
                 .collect(),
         )
         .map_err(|_| SurfaceLedgerError::AppendFailed)?;
-        let batch = SurfaceCommitBatch {
+        let mut batch = SurfaceCommitBatch {
             cursor_before: self.cursor_before,
             cursor_after: self.cursor_after,
             commit_class: self.commit_class,
@@ -1919,11 +1935,21 @@ impl StoredSurfaceCommitBatchV1 {
                 event_count,
                 batch_digest,
                 ..
-            } if event_count == batch.event_count && batch_digest == batch.batch_digest => {
-                Ok(batch)
-            }
-            _ => Err(SurfaceLedgerError::AppendFailed),
+            } if event_count == batch.event_count && batch_digest == batch.batch_digest => {}
+            _ => return Err(SurfaceLedgerError::AppendFailed),
         }
+        for (index, reason) in cutoffs {
+            let event = &mut batch.events.as_mut_slice()[index].event;
+            let SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted { response }) = event
+            else {
+                return Err(SurfaceLedgerError::AppendFailed);
+            };
+            *event = SurfaceEvent::Assistant(AssistantPatch::ResponseKept {
+                response: response.clone(),
+                reason,
+            });
+        }
+        Ok(batch)
     }
 }
 

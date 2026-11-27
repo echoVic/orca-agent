@@ -1817,6 +1817,7 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
             Message::Assistant {
                 content,
                 reasoning_content: _,
+                cut_short,
                 tool_calls,
                 pinned,
             } => {
@@ -1830,6 +1831,7 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
                 Message::Assistant {
                     content: new_content,
                     reasoning_content: None,
+                    cut_short: *cut_short,
                     tool_calls: tool_calls
                         .iter()
                         .map(|call| {
@@ -4697,6 +4699,7 @@ mod tests {
         let messages = vec![
             Message::user(user.clone()),
             Message::Assistant {
+                cut_short: None,
                 content: Some(assistant.clone()),
                 reasoning_content: None,
                 tool_calls: vec![],
@@ -4738,6 +4741,7 @@ mod tests {
             .join("\n");
         assert!(huge_assistant.len() > SUMMARY_HUGE_BYTES);
         let messages = vec![Message::Assistant {
+            cut_short: None,
             content: Some(huge_assistant.clone()),
             reasoning_content: None,
             tool_calls: vec![],
@@ -4754,6 +4758,7 @@ mod tests {
     #[test]
     fn render_summary_delta_omits_assistant_reasoning_content() {
         let messages = vec![Message::Assistant {
+            cut_short: None,
             content: Some("final answer to preserve".to_string()),
             reasoning_content: Some("private chain of thought should not persist".to_string()),
             tool_calls: vec![],

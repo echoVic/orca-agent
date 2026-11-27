@@ -2079,6 +2079,7 @@ impl AppState {
             | ChatMessage::Assistant(_)
             | ChatMessage::ProposedPlan(_) => turn_ended || !is_last,
             ChatMessage::AssistantChunk { .. }
+            | ChatMessage::AssistantCutShort(_)
             | ChatMessage::User(_)
             | ChatMessage::Image(_)
             | ChatMessage::Diagnostic(_)

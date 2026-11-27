@@ -2283,6 +2283,7 @@ SurfaceItem =
       id: SurfaceItemId,
       turn_id: SurfaceTurnId,
       text: DisplayText,
+      cut_short: Option<CutShort>,
       pinned: bool,
     }
   | AssistantReasoning {
@@ -2296,6 +2297,7 @@ SurfaceItem =
       id: SurfaceItemId,
       turn_id: SurfaceTurnId,
       text: DisplayText,
+      cut_short: Option<CutShort>,
       pinned: bool,
     }
   | ToolResultMessage {
@@ -2388,6 +2390,8 @@ AssistantDiscardReason =
   | RuntimeRestart
   | ProjectionRepair
 
+CutShort = Interrupted | OutputLimit
+
 AssistantPatch =
   StreamOpened {
     stream: SurfaceAssistantStream,
@@ -2400,6 +2404,10 @@ AssistantPatch =
   | ResponseCompleted {
       response: SurfaceCompletedModelResponse,
     }
+  | ResponseKept {
+      response: SurfaceCompletedModelResponse,
+      reason: CutShort,
+    }
   | StreamDiscarded {
       stream_id: SurfaceStreamId,
       reason: AssistantDiscardReason,
@@ -2407,10 +2415,17 @@ AssistantPatch =
 ```
 
 `Delta.offset` MUST equal the stream's `next_offset`; the reducer appends and
-advances it by the UTF-8 byte length. `ResponseCompleted` is the durable
-completed-model fact. It closes matching streams and is the only constructor for
-ProviderResponse AssistantMessage/Reasoning/Plan items; `ItemPatch::Added` may
-not independently create those variants. Each declared tool call requires
+advances it by the UTF-8 byte length. `ResponseKept` closes matching streams
+using the completion rules and records the cutoff reason on the assistant
+message or its sole visible plan. A kept response carries visible text and an
+empty tool-call list. Its durable V1 event and event digest use
+`ResponseCompleted`, which Orca 0.5.23 understands. The stored event envelope
+has an optional `cut_short` field outside the digest. Replay validates the V1
+batch, then restores `ResponseKept` from that field. The semantic
+`model.response.completed` payload also carries optional `cut_short` alongside
+the response identity. These two patches
+construct ProviderResponse AssistantMessage/Reasoning/Plan items. `ItemPatch::Added`
+cannot create those variants independently. Each declared tool call requires
 exactly one `ToolPatch::Requested` in the same batch with the same response id,
 turn, tool-call id, name, raw arguments, and digest. ResponseCompleted itself
 does not create a tool view; ToolPatch::Requested is that sole constructor.

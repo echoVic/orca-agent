@@ -95,7 +95,10 @@ A running turn shows an activity line above the input:
  ↳ then run the whole test suite
 ~~~
 
-- `Esc` (or `Ctrl+G`) interrupts the turn.
+- `Esc` (or `Ctrl+G`) interrupts the turn. If the reply already shows text,
+  Orca keeps what it received and adds `(interrupted)`. If the reply reaches
+  the model's output limit, Orca keeps it with `(stopped at the output limit)`.
+  You can ask Orca to continue, including after you reopen the session.
 - Before its first model request, a turn waits for any MCP server still
   connecting, so the model is offered its tools; the activity line says
   `connecting MCP servers` meanwhile, and `Esc` interrupts the wait with the

@@ -3572,7 +3572,9 @@ fn leading_blank(previous: Option<&ChatMessage>, message: &ChatMessage) -> bool 
                 | ChatMessage::Reasoning { .. }
                 | ChatMessage::User(_)
         ),
-        ChatMessage::Reasoning { .. } | ChatMessage::Image(_) => false,
+        ChatMessage::Reasoning { .. }
+        | ChatMessage::Image(_)
+        | ChatMessage::AssistantCutShort(_) => false,
     }
 }
 
@@ -3814,6 +3816,16 @@ fn append_message_lines(
                 &TuiDiagnostic::from_message(DiagnosticContext::Runtime, text),
                 theme,
             );
+        }
+        ChatMessage::AssistantCutShort(reason) => {
+            let marker = match reason {
+                orca_core::conversation::CutShort::Interrupted => "(interrupted)",
+                orca_core::conversation::CutShort::OutputLimit => "(stopped at the output limit)",
+            };
+            lines.push(Line::from(vec![
+                Span::raw(GUTTER_CONTINUATION),
+                Span::styled(marker, theme.dim_style()),
+            ]));
         }
         ChatMessage::Diagnostic(diagnostic) => {
             append_diagnostic_lines(lines, diagnostic, theme);

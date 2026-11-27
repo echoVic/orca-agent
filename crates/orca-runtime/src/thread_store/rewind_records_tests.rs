@@ -81,6 +81,7 @@ impl Fixture {
     fn append_assistant(&mut self, content: &str) -> String {
         self.writer
             .append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some(content.to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),

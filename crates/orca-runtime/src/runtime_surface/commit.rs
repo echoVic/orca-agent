@@ -9228,9 +9228,10 @@ fn provider_background_stop_authorized(
             super::SurfaceEvent::Assistant(
                 super::AssistantPatch::Delta { .. } | super::AssistantPatch::StreamDiscarded { .. },
             ) if completed_response.is_none() => {}
-            super::SurfaceEvent::Assistant(super::AssistantPatch::ResponseCompleted {
-                response,
-            }) if completed_response.is_none() => {
+            super::SurfaceEvent::Assistant(
+                super::AssistantPatch::ResponseCompleted { response }
+                | super::AssistantPatch::ResponseKept { response, .. },
+            ) if completed_response.is_none() => {
                 completed_response = Some(response);
             }
             super::SurfaceEvent::Tool(super::ToolPatch::Requested { request })
@@ -10491,7 +10492,11 @@ fn actor_provider_background_control_authorized(
         && background.task_id.as_ref() == Some(task_id)
         && task.task_type == super::SurfaceTaskType::MainSession
         && task.parent_operation.as_ref() == Some(operation_id)
-        && (task.background_fence.as_ref() == Some(background_fence) || foreground_claimed_denial)
+        && (task.background_fence.as_ref() == Some(background_fence)
+            || (task.status == super::SurfaceTaskStatus::Running
+                && !task.backgrounded
+                && task.background_fence.is_none())
+            || foreground_claimed_denial)
         && task.workflow_run_id.is_none()
         && task.revision == *expected_revision
         && expected_revision.get().checked_add(1) == Some(next_revision.get())
@@ -16781,6 +16786,7 @@ mod tests {
                 origin: super::super::SurfaceItemOrigin::UserInput,
             },
             super::super::SurfaceItem::AssistantMessage {
+                cut_short: None,
                 id: retained_message_id.clone(),
                 turn_id: retained_turn_id.clone(),
                 text: super::super::DisplayText::new("retained assistant"),
@@ -16798,6 +16804,7 @@ mod tests {
                 turn_id: retained_turn_id,
                 text: super::super::DisplayText::new("retained plan"),
                 message_offset: None,
+                cut_short: None,
                 pinned: false,
             },
         ]);

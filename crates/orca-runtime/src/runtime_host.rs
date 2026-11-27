@@ -75,7 +75,7 @@ use crate::runtime_actor::commit::{
     SurfaceCommitEffect, SurfaceCommitResolution, SurfaceCommitRetryKey,
 };
 use crate::runtime_actor::generation_context::{
-    GenerationContextController, build_background_provider_response_events,
+    GenerationContextController, build_background_provider_response_events, published_reply_prefix,
     records_request_action_and_target, rename_tool_calls_held_by_earlier_responses,
 };
 use crate::runtime_actor::goal::{
@@ -1939,6 +1939,36 @@ impl surface::RuntimeProviderResponseIngress for RuntimeSurfaceProviderResponseI
         )
         .map_err(surface_semantic_ingress_send_error)?;
         Ok(())
+    }
+
+    fn publish_provider_steps(
+        &self,
+        identity: &ModelResponseIdentity,
+        steps: &[ProviderStep],
+    ) -> io::Result<()> {
+        loop {
+            let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+            send_thread_command_retrying_full(
+                &self.command_tx,
+                ThreadCommand::SurfaceCommitProviderStep {
+                    fence: self.fence.clone(),
+                    identity: identity.clone(),
+                    steps: steps.to_vec(),
+                    reply: Some(reply_tx),
+                },
+            )
+            .map_err(surface_semantic_ingress_send_error)?;
+            let result = reply_rx
+                .recv()
+                .map_err(|_| surface_semantic_ingress_ack_error())?;
+            if matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock) {
+                // Let the actor settle the earlier commit before publishing
+                // and acknowledging this batch's delivered text.
+                thread::sleep(SURFACE_CAPABILITY_LOSS_RETRY_INTERVAL);
+                continue;
+            }
+            return result;
+        }
     }
 
     fn commit_tool_results(&self, results: &[orca_core::tool_types::ToolResult]) -> io::Result<()> {
@@ -8023,13 +8053,142 @@ fn reconcile_durable_workflow_outcomes_on_start(
     }
 }
 
+fn interrupted_background_provider_reply(
+    snapshot: &surface::SurfaceSnapshot,
+    fence: &surface::SurfaceOperationFence,
+    response: Option<&crate::model_response::RuntimeModelResponse>,
+) -> Option<crate::model_response::RuntimeModelResponse> {
+    let response = response?;
+    let partial = published_reply_prefix(
+        snapshot,
+        fence,
+        &response.identity,
+        response
+            .response
+            .assistant_content
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    crate::provider_turn::cut_short_response(
+        partial,
+        &response.identity,
+        orca_core::conversation::CutShort::Interrupted,
+    )
+}
+
+fn journal_kept_background_provider_reply(
+    writer: Option<&crate::history::SessionWriter>,
+    events: &mut EventFactory,
+    response: Option<&crate::model_response::RuntimeModelResponse>,
+) -> Result<Option<orca_core::conversation::Message>, RuntimeHostError> {
+    if let Some(writer) = writer
+        && let Some(response) = response.filter(|response| response.cut_short.is_some())
+        && !writer.has_conversation_item(response.identity.item_ids.agent_message_item_id())
+    {
+        let completed = response.completed();
+        observe_event(None, events.model_response_completed(&completed)).map_err(|error| {
+            RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to record the kept background reply: {error}"),
+            }
+        })?;
+        return Ok(Some(completed.assistant_message()));
+    }
+    Ok(None)
+}
+
+fn projected_kept_background_reply(
+    snapshot: &surface::SurfaceSnapshot,
+    identity: &ModelResponseIdentity,
+) -> Option<crate::model_response::RuntimeModelResponse> {
+    use orca_core::proposed_plan::{PROPOSED_PLAN_CLOSE, PROPOSED_PLAN_OPEN};
+    let mut partial = orca_core::provider_types::PartialReply {
+        content: String::new(),
+        reasoning: None,
+    };
+    let mut cutoff = None;
+    let mut plan = None;
+    for item in &snapshot.items {
+        match item {
+            surface::SurfaceItem::AssistantMessage {
+                id,
+                text,
+                cut_short,
+                ..
+            } if id == identity.item_ids.agent_message_item_id() => {
+                partial.content = text.as_str().to_owned();
+                cutoff = cutoff.or(*cut_short);
+            }
+            surface::SurfaceItem::AssistantReasoning { id, content, .. }
+                if id == &identity.item_ids.reasoning_item_id =>
+            {
+                partial.reasoning = Some(content.as_str().to_owned());
+            }
+            surface::SurfaceItem::AssistantPlan {
+                id,
+                text,
+                message_offset,
+                cut_short,
+                ..
+            } if id == &identity.item_ids.plan_item_id => {
+                plan = Some((text, *message_offset));
+                cutoff = cutoff.or(*cut_short);
+            }
+            _ => {}
+        }
+    }
+    if let Some((plan, offset)) = plan {
+        let offset = offset
+            .and_then(|offset| usize::try_from(offset.get()).ok())
+            .filter(|offset| partial.content.is_char_boundary(*offset))
+            .unwrap_or(partial.content.len());
+        partial.content.insert_str(
+            offset,
+            &format!(
+                "{PROPOSED_PLAN_OPEN}\n{}{PROPOSED_PLAN_CLOSE}",
+                plan.as_str()
+            ),
+        );
+    }
+    crate::provider_turn::cut_short_response(partial, identity, cutoff?)
+}
+
 fn reconcile_durable_provider_outcomes_on_start(
-    thread: &RuntimeThread,
+    thread: &mut RuntimeThread,
     config: &RunConfig,
     coordinator: &mut surface::RuntimeCommitCoordinator<'static, surface::JsonlSurfaceCommitLedger>,
     host_incarnation: &surface::HostIncarnation,
 ) -> Result<(), RuntimeHostError> {
-    let task_registry = thread.session().task_registry();
+    let task_registry = thread.session().task_registry().clone();
+    let mut events = thread.event_factory();
+    let history_writer = thread
+        .session()
+        .event_publication_store()
+        .map(|(_, writer)| writer);
+    // The surface can finish a prepared completion during cold recovery.
+    // Its kept reply still needs a transcript entry if the actor stopped
+    // after the checkpoint and before journaling it.
+    let snapshot = coordinator.state().snapshot();
+    for task in &snapshot.tasks {
+        let Some(response) = task_registry
+            .typed_provider_outcome(task.task_id.as_str())
+            .and_then(|outcome| outcome.response)
+        else {
+            continue;
+        };
+        let kept = projected_kept_background_reply(snapshot, &response.identity);
+        if let Some(message) = journal_kept_background_provider_reply(
+            history_writer.as_ref(),
+            &mut events,
+            kept.as_ref(),
+        )? {
+            thread
+                .session_mut()
+                .conversation_mut()
+                .messages
+                .push(message);
+        }
+    }
+    let mcp_registry = thread.session().mcp_registry().clone();
     let registry = std::cell::OnceCell::new();
     loop {
         let snapshot = coordinator.state().snapshot().clone();
@@ -8085,10 +8244,25 @@ fn reconcile_durable_provider_outcomes_on_start(
         };
         let registry = registry.get_or_init(|| {
             orca_tools::registry::tool_registry_with_mcp_and_external(
-                Some(thread.session().mcp_registry()),
+                Some(&mcp_registry),
                 &config.external_tools,
             )
         });
+        let operation_id = operation.operation_id.clone();
+        let committed_user_cancel = matches!(
+            &operation.pending_control,
+            Some(surface::PendingControlIntent::Terminalize {
+                operation_id: control_operation,
+                cause: surface::TerminalizationCause::UserCancel,
+            }) if control_operation == &operation_id
+        );
+        if committed_user_cancel || outcome.status == TaskStatus::Cancelled {
+            outcome.response = interrupted_background_provider_reply(
+                &snapshot,
+                &background_fence.operation_fence,
+                outcome.response.as_ref(),
+            );
+        }
         // Recorded before the completion named its tool calls: name them the
         // way the completion commits (or committed) them.
         if let Some(response) = outcome.response.as_mut() {
@@ -8098,8 +8272,7 @@ fn reconcile_durable_provider_outcomes_on_start(
                 }
             })?;
         }
-        let operation_id = operation.operation_id.clone();
-        if outcome.status == TaskStatus::ApprovalRequired {
+        if outcome.status == TaskStatus::ApprovalRequired && !committed_user_cancel {
             if matches!(
                 operation.phase,
                 surface::OperationPhase::Suspended {
@@ -8276,13 +8449,6 @@ fn reconcile_durable_provider_outcomes_on_start(
                 })?;
             continue;
         }
-        let committed_user_cancel = matches!(
-            &operation.pending_control,
-            Some(surface::PendingControlIntent::Terminalize {
-                operation_id: control_operation,
-                cause: surface::TerminalizationCause::UserCancel,
-            }) if control_operation == &operation_id
-        );
         let usage = surface_usage_totals(outcome.usage.unwrap_or_default());
         let failure_message =
             surface::SafeDiagnosticText::try_new("background provider failed before projection")
@@ -8458,6 +8624,17 @@ fn reconcile_durable_provider_outcomes_on_start(
                     "failed to project durable provider completion during recovery: {error:?}"
                 ),
             })?;
+        if let Some(message) = journal_kept_background_provider_reply(
+            history_writer.as_ref(),
+            &mut events,
+            outcome.response.as_ref(),
+        )? {
+            thread
+                .session_mut()
+                .conversation_mut()
+                .messages
+                .push(message);
+        }
         let terminal_batch = runtime_surface_event_batch(
             coordinator.state().snapshot(),
             vec![(
@@ -14892,6 +15069,7 @@ struct PendingSurfaceBackgroundTransfer {
 
 struct ActiveGeneration {
     context: GenerationContext,
+    user_interrupted: bool,
     tool_images: orca_core::tool_images::RetainedToolImages,
     cancel: CancelToken,
     join: JoinHandle<OperationTaskResult>,
@@ -14971,6 +15149,7 @@ struct TypedProviderBackground {
     task_id: surface::SurfaceTaskId,
     task_registry: TaskRegistry,
     external_tools: Vec<orca_core::external_config::ExternalToolConfig>,
+    reply_journal: Option<(Arc<EventFactory>, crate::history::SessionWriter)>,
     outcome: Arc<Mutex<Option<TypedProviderBackgroundOutcome>>>,
 }
 
@@ -15049,6 +15228,7 @@ struct PendingTypedProviderCompletion {
     finalize_intent_id: surface::SurfaceFinalizeIntentId,
     terminal_commit_id: surface::SurfaceCommitId,
     completion_batch: surface::SurfaceCommitBatch,
+    kept_response: Option<crate::model_response::RuntimeModelResponse>,
     terminal: surface::OperationTerminal,
     usage: surface::UsageTotals,
     terminal_batch: Option<surface::SurfaceCommitBatch>,
@@ -18579,10 +18759,35 @@ impl ThreadActor {
                                     self.active = Some(active);
                                     continue;
                                 }
-                                command_rx.close();
                                 active.generation.cancel.cancel();
+                                // The interrupted generation still needs its actor to
+                                // acknowledge the reply before it can finish.
+                                let generation_result = loop {
+                                    let command = tokio::select! {
+                                        biased;
+                                        result = &mut active.generation.join => break result,
+                                        command = command_rx.recv() => command,
+                                    };
+                                    match command {
+                                        Some(ThreadCommand::SurfaceCommitProviderResponse {
+                                            fence, response, reply,
+                                        }) if active.surface_operation.as_ref() == Some(&fence) => {
+                                            let result = self.commit_surface_provider_response(
+                                                &mut active, fence, &response,
+                                            );
+                                            let _ = reply.send(result);
+                                        }
+                                        Some(ThreadCommand::ShutdownThread { reply, .. }) => {
+                                            if let Some(reply) = reply {
+                                                let _ = reply.send(ThreadShutdownAck::Retry);
+                                            }
+                                        }
+                                        Some(command) => Self::reject_thread_command_unavailable(command),
+                                        None => break (&mut active.generation.join).await,
+                                    }
+                                };
+                                command_rx.close();
                                 Self::drain_closed_thread_commands(&mut command_rx);
-                                let generation_result = (&mut active.generation.join).await;
                                 let finish_result =
                                     self.finish_generation(active, generation_result, false);
                                 let background_shutdown =
@@ -21429,6 +21634,7 @@ impl ThreadActor {
                     InterruptOperationResult::AlreadyRequested { generation }
                 } else {
                     self.pause_prompt_queue_for_interrupt();
+                    active.generation.user_interrupted = true;
                     Self::cancel_active_task_tree(active);
                     InterruptOperationResult::Requested { generation }
                 };
@@ -21436,6 +21642,7 @@ impl ThreadActor {
             }
             ThreadCommand::InterruptActive { reply } => {
                 self.pause_prompt_queue_for_interrupt();
+                active.generation.user_interrupted = true;
                 Self::cancel_active_task_tree(active);
                 let _ = reply.send(Ok(()));
             }
@@ -21792,6 +21999,7 @@ impl ThreadActor {
         });
         ActiveGeneration {
             context,
+            user_interrupted: false,
             tool_images,
             cancel,
             join,
@@ -21842,7 +22050,7 @@ impl ThreadActor {
 
         let mut result = result.expect("provider-suspended result was matched");
         let GenerationTaskOutcome::Executed(ThreadOperationOutcome::ProviderSuspended {
-            suspension,
+            mut suspension,
             ..
         }) = result.outcome
         else {
@@ -21865,6 +22073,12 @@ impl ThreadActor {
                 .send(Err(surface::SurfaceClientCommandError::Unauthorized));
             return self.finish_generation(active, Ok(result), false);
         }
+        suspension.delivered = published_reply_prefix(
+            self.resident_surface.coordinator.state().snapshot(),
+            &fence,
+            suspension.identity(),
+            &suspension.delivered.content,
+        );
         let task_id = active.main_session_task_id.clone().ok_or_else(|| {
             RuntimeHostError::ThreadStartFailed {
                 message: "typed background transfer lacks a main-session task".to_string(),
@@ -21995,6 +22209,12 @@ impl ThreadActor {
             );
         }
         self.usage_ledger.add(pending.usage_delta);
+        let reply_journal = pending
+            .state
+            .thread
+            .session()
+            .event_publication_store()
+            .map(|(_, writer)| (Arc::new(pending.state.events.fork()), writer));
         self.spawn_provider_background_task(
             &pending.active,
             &mut pending.state,
@@ -22004,6 +22224,7 @@ impl ThreadActor {
                 task_id: pending.surface_task_id,
                 task_registry: pending.task_registry.clone(),
                 external_tools: pending.active.config.external_tools.clone(),
+                reply_journal,
                 outcome: Arc::new(Mutex::new(None)),
             }),
         )
@@ -23810,7 +24031,7 @@ fn run_provider_background_task(
     let mut status = RunStatus::Failed;
     let mut error = None;
 
-    if cancelled {
+    if cancelled || cancel.is_cancelled() || context.task_registry.is_cancelled(&context.task_id) {
         status = RunStatus::Cancelled;
     } else if disconnected {
         error = Some("provider stream ended without a response".to_string());
@@ -23822,6 +24043,21 @@ fn run_provider_background_task(
         } else {
             status = RunStatus::Success;
         }
+    }
+
+    let was_cancelled = status == RunStatus::Cancelled;
+    if status == RunStatus::Failed
+        && let Some(response) = response.as_mut()
+        && let Some(partial) = response
+            .response
+            .error()
+            .and_then(|error| error.partial_reply.clone())
+        && crate::provider_turn::partial_reply_has_visible_text(&partial.content)
+    {
+        response.response.assistant_content = Some(partial.content);
+        response.response.assistant_reasoning = partial.reasoning;
+        response.response.tool_calls.clear();
+        response.cut_short = Some(orca_core::conversation::CutShort::OutputLimit);
     }
 
     // The suspended operation settles against its authoritative journal:
@@ -23855,6 +24091,34 @@ fn run_provider_background_task(
         }
     }
 
+    if was_cancelled && context.surface_outcome.is_some() {
+        let response = response.get_or_insert_with(|| {
+            crate::model_response::RuntimeModelResponse::from_parts(
+                ProviderResponse {
+                    steps: Vec::new(),
+                    assistant_content: None,
+                    assistant_reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+                context.response_identity.clone(),
+            )
+        });
+        if response.response.assistant_content.is_none() {
+            response.response.assistant_content = response
+                .response
+                .error()
+                .and_then(|error| error.partial_reply.as_ref())
+                .map(|partial| partial.content.clone())
+                .or(Some(suspension.delivered.content));
+        }
+    } else if was_cancelled {
+        response = crate::provider_turn::cut_short_response(
+            suspension.delivered,
+            &context.response_identity,
+            orca_core::conversation::CutShort::Interrupted,
+        );
+    }
     if let Some(surface_outcome) = context.surface_outcome {
         let completed_at_ms = chrono::Utc::now().timestamp_millis();
         let outcome = TypedProviderBackgroundOutcome {
@@ -23873,6 +24137,14 @@ fn run_provider_background_task(
             durable_typed_provider_outcome(&outcome),
         );
         return;
+    }
+
+    if let Some(response) = &response
+        && response.cut_short.is_some()
+        && let Err(error) =
+            observe_event(None, events.model_response_completed(&response.completed()))
+    {
+        tracing::warn!(%error, "failed to record the cut-short background reply");
     }
 
     if let Some(usage) = usage {
@@ -30546,7 +30818,7 @@ mod tests {
         let surface = thread.surface();
         let attachment = fresh_surface_attachment(&surface);
         let prompt = match mode {
-            "completed" => {
+            "completed" | "cancelled-ready" => {
                 "mock_stream_delay_ms 100 test_provider_completion_notify_delay_ms=30000"
             }
             "approval" | "approval-reused-id" | "approval-mcp" => {
@@ -30594,6 +30866,9 @@ mod tests {
         else {
             panic!("durable provider outcome operation was queued");
         };
+        if mode == "cancelled-ready" {
+            wait_for_background_cancel_race_prefix(&surface, &first_generation);
+        }
         let _ = committed_surface_value(
             attachment
                 .client
@@ -30630,7 +30905,7 @@ mod tests {
             .task_id
             .clone()
             .expect("durable provider outcome owns a task");
-        let expected_status = if mode == "completed" {
+        let expected_status = if matches!(mode, "completed" | "cancelled-ready") {
             TaskStatus::Completed
         } else {
             TaskStatus::ApprovalRequired
@@ -30646,6 +30921,18 @@ mod tests {
                 "provider outcome did not become durable before crash"
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+        if mode == "cancelled-ready" {
+            let cancelled = committed_surface_value(
+                attachment
+                    .client
+                    .cancel_operation(surface_request_id(), reserved.operation_id.clone())
+                    .expect("cancel ready durable provider outcome"),
+            );
+            assert!(matches!(
+                cancelled,
+                surface::CancelOperationOutput::Accepted { .. }
+            ));
         }
         #[cfg(unix)]
         if mode == "approval-mcp" {
@@ -30882,6 +31169,16 @@ mod tests {
             .find(|task| task.task_id == task_id)
             .expect("durable provider outcome task remains projected");
         match mode {
+            "cancelled-ready" => {
+                assert!(matches!(
+                    operation.terminal.as_ref().map(|record| &record.terminal),
+                    Some(surface::OperationTerminal::Cancelled {
+                        reason: surface::CancelReason::User,
+                    })
+                ));
+                assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+                assert_background_cancel_race_reply(&snapshot, &thread);
+            }
             "completed" => {
                 assert!(snapshot.background_operations.is_empty());
                 assert!(matches!(
@@ -31170,6 +31467,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         for mode in [
             "completed",
+            "cancelled-ready",
             "approval",
             "approval-finalizing",
             "approval-resolved",
@@ -31409,6 +31707,800 @@ mod tests {
             surface::RespondInteractionDisposition::AlreadyResolved { .. }
         ));
         host.shutdown().expect("shutdown approval retry host");
+    }
+
+    #[test]
+    fn a_cancelled_reply_with_text_is_kept() {
+        assert_kept_reply(
+            KeptReplyFixture::Mock("mock_stream_delay_ms 30000"),
+            1,
+            Some(("Mock slow stream started.", None, "interrupted")),
+        );
+    }
+
+    #[test]
+    fn kept_a_cancel_mid_tool_call_keeps_only_the_text() {
+        assert_kept_reply(
+            KeptReplyFixture::DeepSeek {
+                partial_tool: true,
+                length: false,
+            },
+            1,
+            Some(("First point.", Some("Thinking"), "interrupted")),
+        );
+    }
+
+    #[test]
+    fn kept_a_cancel_with_reasoning_only_is_discarded() {
+        assert_kept_reply(
+            KeptReplyFixture::Mock("mock_stream_usage_delay_ms 30000"),
+            1,
+            None,
+        );
+    }
+
+    #[test]
+    fn kept_a_double_cancel_keeps_the_reply_once() {
+        assert_cancel_while_second_delta_is_pending(true);
+    }
+
+    #[test]
+    fn a_reply_at_the_output_limit_is_kept_and_the_turn_still_fails() {
+        assert_kept_reply(
+            KeptReplyFixture::DeepSeek {
+                partial_tool: true,
+                length: true,
+            },
+            0,
+            Some(("First point", Some("Thinking"), "output_limit")),
+        );
+    }
+
+    #[test]
+    fn a_background_turn_cancelled_after_text_keeps_it() {
+        assert_kept_reply(
+            KeptReplyFixture::BackgroundCancelled,
+            1,
+            Some(("First point.", Some("Thinking"), "interrupted")),
+        );
+    }
+
+    #[test]
+    fn a_foregrounded_background_turn_keeps_text_published_after_handoff() {
+        assert_kept_reply(
+            KeptReplyFixture::ForegroundedBackgroundCancelled,
+            1,
+            Some((
+                "First point. Second point.",
+                Some("Thinking"),
+                "interrupted",
+            )),
+        );
+    }
+
+    #[test]
+    fn a_cancel_between_delta_batches_keeps_the_published_prefix() {
+        assert_cancel_while_second_delta_is_pending(false);
+    }
+
+    fn assert_cancel_while_second_delta_is_pending(cancel_twice: bool) {
+        #[derive(Debug)]
+        struct HoldSecondBatch {
+            reached: mpsc::SyncSender<bool>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl surface::RuntimeProviderResponseIngress for HoldSecondBatch {
+            fn commit_response(&self, _: &mut RuntimeModelResponse) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn commit_provider_step(
+                &self,
+                _: &ModelResponseIdentity,
+                step: &ProviderStep,
+            ) -> io::Result<()> {
+                if let ProviderStep::MessageDelta(text) = step {
+                    let second = text.ends_with("completed.");
+                    self.reached.send(second).unwrap();
+                    if second {
+                        self.release
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(SURFACE_TEST_TIMEOUT)
+                            .unwrap();
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "turn was cancelled",
+                        ));
+                    }
+                }
+                Ok(())
+            }
+
+            fn commit_tool_results(&self, _: &[ToolResult]) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let cwd = tempfile::tempdir().unwrap();
+        let marker = cwd.path().join("send-second-delta");
+        let host = RuntimeHost::start().unwrap();
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "cancel between batches",
+            )
+            .unwrap();
+        let (reached, batches) = mpsc::sync_channel(1);
+        let (resume, release) = mpsc::channel();
+        let ingress = Arc::new(HoldSecondBatch {
+            reached,
+            release: Mutex::new(release),
+        });
+        let operation = thread
+            .start_turn(
+                HostedTurnRequest::new(format!("mock_stream_release_marker {}", marker.display()))
+                    .with_generation_handlers(move |_, _| {
+                        HostedGenerationHandlers::default()
+                            .with_provider_response_ingress(ingress.clone())
+                    }),
+                io::sink(),
+            )
+            .unwrap();
+        assert!(!batches.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap());
+        std::fs::write(&marker, "").unwrap();
+        assert!(batches.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap());
+        assert!(matches!(
+            operation.interrupt().unwrap(),
+            InterruptOperationResult::Requested { .. }
+        ));
+        if cancel_twice {
+            assert!(matches!(
+                operation.interrupt().unwrap(),
+                InterruptOperationResult::AlreadyRequested { .. }
+            ));
+        }
+        resume.send(()).unwrap();
+        let terminal = operation.wait_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        assert_eq!(
+            terminal.outcome(),
+            &OperationOutcome::Completed(RunStatus::Cancelled)
+        );
+        let transcript = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap();
+        let replies: Vec<_> = transcript
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant {
+                    content, cut_short, ..
+                } => Some((content.as_deref(), *cut_short)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            [(
+                Some("Mock release-marker stream started."),
+                Some(orca_core::conversation::CutShort::Interrupted)
+            )]
+        );
+        assert_eq!(
+            transcript
+                .semantic_events
+                .iter()
+                .filter(|event| event.payload.get("cut_short").is_some())
+                .count(),
+            1
+        );
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_background_reply_at_the_output_limit_is_kept() {
+        assert_kept_reply(
+            KeptReplyFixture::BackgroundAtLimit,
+            0,
+            Some(("First point", Some("Thinking"), "output_limit")),
+        );
+    }
+
+    #[test]
+    fn kept_reply_records_are_readable_by_the_v0_5_23_schema() {
+        assert_kept_reply_with_transcript(
+            KeptReplyFixture::Mock("mock_stream_delay_ms 30000"),
+            1,
+            Some(("Mock slow stream started.", None, "interrupted")),
+            |path| assert_v0_5_23_can_read_kept_reply(path, "Mock slow stream started.", None),
+        );
+        assert_kept_reply_with_transcript(
+            KeptReplyFixture::DeepSeek {
+                partial_tool: true,
+                length: true,
+            },
+            0,
+            Some(("First point", Some("Thinking"), "output_limit")),
+            |path| assert_v0_5_23_can_read_kept_reply(path, "First point", Some("Thinking")),
+        );
+    }
+
+    fn assert_v0_5_23_can_read_kept_reply(
+        path: &std::path::Path,
+        expected_text: &str,
+        expected_reasoning: Option<&str>,
+    ) {
+        use serde::{Deserialize, Serialize};
+        use surface::Sha256Digest;
+
+        // v0.5.23 (11d90cee) wire and canonical digest schemas for the
+        // foreground completion records exercised by these fixtures.
+        #[derive(Deserialize, Serialize)]
+        struct PreviousSurfaceCompletedModelResponse {
+            response_id: surface::UuidV7,
+            turn_id: surface::SurfaceTurnId,
+            message_item: Option<surface::SurfaceAssistantMessageItem>,
+            reasoning_item: Option<surface::SurfaceAssistantReasoningItem>,
+            plan_item: Option<surface::SurfaceAssistantPlanItem>,
+            tool_calls: Vec<surface::SurfaceRawToolCall>,
+        }
+
+        #[derive(Deserialize, Serialize)]
+        enum PreviousAssistantPatch {
+            StreamOpened {
+                stream: surface::SurfaceAssistantStream,
+            },
+            Delta {
+                stream_id: surface::SurfaceStreamId,
+                offset: surface::ByteOffset,
+                text: surface::DisplayText,
+            },
+            ResponseCompleted {
+                response: PreviousSurfaceCompletedModelResponse,
+            },
+            StreamDiscarded {
+                stream_id: surface::SurfaceStreamId,
+                reason: surface::AssistantDiscardReason,
+            },
+        }
+
+        #[derive(Deserialize)]
+        struct PreviousCompletedModelResponse {
+            identity: orca_core::thread_item_projection::ModelResponseIdentity,
+            assistant_content: Option<String>,
+            assistant_reasoning: Option<String>,
+            tool_calls: Vec<orca_core::conversation::RawToolCall>,
+        }
+
+        #[derive(Deserialize, Serialize)]
+        enum PreviousSurfaceEvent {
+            Assistant(PreviousAssistantPatch),
+            Context(surface::SurfaceContextSnapshot),
+        }
+
+        #[derive(Deserialize, Serialize)]
+        enum PreviousScope {
+            Generation {
+                fence: surface::SurfaceOperationFence,
+            },
+        }
+
+        #[derive(Deserialize)]
+        struct PreviousEnvelope {
+            scope: PreviousScope,
+            event: PreviousSurfaceEvent,
+        }
+
+        #[derive(Deserialize)]
+        struct PreviousBatch {
+            version: u8,
+            commit_class: surface::CommitClass,
+            event_count: u32,
+            batch_digest: Sha256Digest,
+            events: Vec<PreviousEnvelope>,
+        }
+
+        #[derive(Serialize)]
+        struct PreviousCanonicalEventDigest<'a> {
+            version: u8,
+            scope: &'a PreviousScope,
+            event: &'a PreviousSurfaceEvent,
+        }
+
+        #[derive(Serialize)]
+        struct PreviousCanonicalBatchDigest<'a> {
+            version: u8,
+            event_digests: &'a [Sha256Digest],
+            event_count: u32,
+            commit_class: &'a surface::CommitClass,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum PreviousSemanticEvent {
+            #[serde(rename = "model.response.completed")]
+            ModelResponseCompleted {
+                payload: PreviousCompletedModelResponse,
+            },
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum PreviousRecord {
+            #[serde(rename = "event.semantic")]
+            SemanticEvent { event: PreviousSemanticEvent },
+            #[serde(rename = "runtime.surface_commit.prepared")]
+            SurfaceCommitPrepared {
+                event_count: u32,
+                batch_digest: Vec<u8>,
+                batch: PreviousBatch,
+            },
+        }
+
+        let mut previous_completion = None;
+        let mut previous_response = None;
+        for line in std::fs::read_to_string(path).unwrap().lines() {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            let is_completion_batch = record["batch"]["events"].as_array().is_some_and(|events| {
+                events.iter().any(|envelope| {
+                    let assistant = &envelope["event"]["Assistant"];
+                    envelope.get("cut_short").is_some()
+                        || assistant.get("ResponseCompleted").is_some()
+                        || assistant.get("ResponseKept").is_some()
+                })
+            });
+            if record["event"]["type"] != "model.response.completed" && !is_completion_batch {
+                continue;
+            }
+
+            match serde_json::from_str::<PreviousRecord>(line)
+                .expect("v0.5.23 must decode the persisted completion record")
+            {
+                PreviousRecord::SemanticEvent {
+                    event: PreviousSemanticEvent::ModelResponseCompleted { payload },
+                } => {
+                    assert!(record["event"]["payload"]["cut_short"].is_string());
+                    assert_eq!(payload.assistant_content.as_deref(), Some(expected_text));
+                    assert_eq!(payload.assistant_reasoning.as_deref(), expected_reasoning);
+                    assert!(payload.tool_calls.is_empty());
+                    assert!(previous_completion.replace(payload.identity).is_none());
+                }
+                PreviousRecord::SurfaceCommitPrepared {
+                    event_count,
+                    batch_digest,
+                    batch,
+                } => {
+                    assert_eq!(batch.version, 1);
+                    assert_eq!(batch.events.len(), event_count as usize);
+                    assert_eq!(batch.event_count, event_count);
+                    assert_eq!(batch.batch_digest.as_bytes().as_slice(), batch_digest);
+
+                    let event_digests: Vec<_> = batch
+                        .events
+                        .iter()
+                        .map(|envelope| {
+                            let canonical = PreviousCanonicalEventDigest {
+                                version: 1,
+                                scope: &envelope.scope,
+                                event: &envelope.event,
+                            };
+                            Sha256Digest::digest(serde_json::to_vec(&canonical).unwrap())
+                        })
+                        .collect();
+                    let canonical = PreviousCanonicalBatchDigest {
+                        version: 1,
+                        event_digests: &event_digests,
+                        event_count,
+                        commit_class: &batch.commit_class,
+                    };
+                    assert_eq!(
+                        Sha256Digest::digest(serde_json::to_vec(&canonical).unwrap()),
+                        batch.batch_digest,
+                        "v0.5.23 must reproduce the persisted completion batch digest"
+                    );
+                    let mut responses =
+                        batch
+                            .events
+                            .into_iter()
+                            .filter_map(|envelope| match envelope.event {
+                                PreviousSurfaceEvent::Assistant(
+                                    PreviousAssistantPatch::ResponseCompleted { response },
+                                ) => Some(response),
+                                _ => None,
+                            });
+                    let response = responses.next().expect("v0.5.23 surface completion");
+                    assert!(responses.next().is_none());
+                    assert!(previous_response.replace(response).is_none());
+                }
+            }
+        }
+        let identity = previous_completion.expect("v0.5.23 semantic completion");
+        let response = previous_response.expect("v0.5.23 surface completion");
+        let item = response
+            .message_item
+            .expect("v0.5.23 assistant message item");
+        assert_eq!(item.text.as_str(), expected_text);
+        assert_eq!(
+            response
+                .reasoning_item
+                .as_ref()
+                .map(|item| item.content.as_str()),
+            expected_reasoning,
+        );
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            serde_json::to_value(item.id).unwrap(),
+            serde_json::to_value(identity.item_ids.conversation_item_id).unwrap(),
+        );
+    }
+
+    #[test]
+    fn an_empty_plan_at_the_output_limit_fails_as_before() {
+        assert_kept_reply(KeptReplyFixture::EmptyPlanAtLimit, 0, None);
+    }
+
+    #[test]
+    fn a_cancelled_reply_keeps_only_the_text_published_before_a_pending_plan() {
+        assert_kept_reply(
+            KeptReplyFixture::PendingPlanOnCancel,
+            1,
+            Some(("First point.", Some("Thinking"), "interrupted")),
+        );
+    }
+
+    enum KeptReplyFixture {
+        Mock(&'static str),
+        DeepSeek { partial_tool: bool, length: bool },
+        BackgroundAtLimit,
+        BackgroundCancelled,
+        ForegroundedBackgroundCancelled,
+        EmptyPlanAtLimit,
+        PendingPlanOnCancel,
+    }
+
+    fn assert_kept_reply(
+        fixture: KeptReplyFixture,
+        cancels: usize,
+        kept: Option<(&str, Option<&str>, &str)>,
+    ) {
+        assert_kept_reply_with_transcript(fixture, cancels, kept, |_| {});
+    }
+
+    fn assert_kept_reply_with_transcript(
+        fixture: KeptReplyFixture,
+        cancels: usize,
+        kept: Option<(&str, Option<&str>, &str)>,
+        check_transcript: impl FnOnce(&std::path::Path),
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        let (release, hold) = mpsc::channel();
+        let foreground = matches!(fixture, KeptReplyFixture::ForegroundedBackgroundCancelled);
+        let background = matches!(
+            fixture,
+            KeptReplyFixture::BackgroundAtLimit | KeptReplyFixture::BackgroundCancelled
+        ) || foreground;
+        let (prompt, server) = match fixture {
+            KeptReplyFixture::Mock(prompt) => (prompt, None),
+            KeptReplyFixture::DeepSeek { .. }
+            | KeptReplyFixture::BackgroundAtLimit
+            | KeptReplyFixture::BackgroundCancelled
+            | KeptReplyFixture::ForegroundedBackgroundCancelled
+            | KeptReplyFixture::EmptyPlanAtLimit
+            | KeptReplyFixture::PendingPlanOnCancel => {
+                let (partial_tool, length) = match fixture {
+                    KeptReplyFixture::DeepSeek {
+                        partial_tool,
+                        length,
+                    } => (partial_tool, length),
+                    KeptReplyFixture::BackgroundAtLimit => (true, true),
+                    KeptReplyFixture::EmptyPlanAtLimit => (false, true),
+                    _ => (true, false),
+                };
+                let text = match fixture {
+                    KeptReplyFixture::EmptyPlanAtLimit => "<proposed_plan></proposed_plan>",
+                    KeptReplyFixture::PendingPlanOnCancel => "First point.<proposed_plan>pending",
+                    _ if length => "First point",
+                    _ => "First point.",
+                };
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                config.provider = ProviderKind::DeepSeek;
+                config.api_key = Some("test-only".into());
+                config.base_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+                let server = std::thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream.set_read_timeout(Some(SURFACE_TEST_TIMEOUT)).unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let read = stream.read(&mut chunk).unwrap();
+                        assert!(read > 0);
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap();
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    let mut body = String::from(
+                        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Thinking\"},\"finish_reason\":null}]}\n\n",
+                    );
+                    if partial_tool {
+                        body.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"task_list\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\n");
+                    }
+                    body.push_str(&format!(
+                        "data: {}\n\n",
+                        serde_json::json!({
+                            "choices": [{ "delta": { "content": text }, "finish_reason": null }]
+                        })
+                    ));
+                    if length && !background {
+                        body.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n");
+                    }
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}").unwrap();
+                    if !length || background {
+                        let _ = hold.recv_timeout(SURFACE_TEST_TIMEOUT);
+                    }
+                    if foreground {
+                        stream.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\" Second point.\"},\"finish_reason\":null}]}\n\n").unwrap();
+                        let _ = hold.recv_timeout(SURFACE_TEST_TIMEOUT);
+                    }
+                    if background && length {
+                        stream.write_all(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n").unwrap();
+                    }
+                });
+                ("Explain in detail", Some(server))
+            }
+        };
+        let host = RuntimeHost::start().unwrap();
+        let thread = host.start_thread(config, "cut short reply").unwrap();
+        let surface = thread.surface();
+        let attachment = if foreground {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([
+                    surface::SurfaceCapability::ReadSnapshot,
+                    surface::SurfaceCapability::SubmitOperation,
+                    surface::SurfaceCapability::ControlBoundOperation,
+                    surface::SurfaceCapability::ManageTask,
+                ]),
+            )
+        } else {
+            fresh_surface_attachment(&surface)
+        };
+        let (operation_id, fence) = admit_surface_turn(&surface, &attachment, prompt);
+        let snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        if cancels > 0 || background {
+            let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+            let channel = if kept.is_some() {
+                surface::AssistantChannel::Message
+            } else {
+                surface::AssistantChannel::Reasoning
+            };
+            while !snapshot().assistant_streams.iter().any(|stream| {
+                stream.fence == fence
+                    && stream.channel == channel
+                    && !stream.text.as_str().is_empty()
+            }) {
+                assert!(Instant::now() < deadline, "provider stream never arrived");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if background {
+                committed_surface_value(
+                    attachment
+                        .client
+                        .transfer_background(
+                            surface_request_id(),
+                            surface::BackgroundTarget::ActiveGeneration {
+                                fence: fence.clone(),
+                            },
+                        )
+                        .unwrap(),
+                );
+                if cancels == 0 {
+                    release.send(()).unwrap();
+                }
+            }
+            if foreground {
+                let task = snapshot()
+                    .tasks
+                    .iter()
+                    .find(|task| task.parent_operation.as_ref() == Some(&operation_id))
+                    .cloned()
+                    .expect("transferred task");
+                committed_surface_value(
+                    attachment
+                        .client
+                        .task_control(
+                            surface_request_id(),
+                            surface::TaskControlAction::Foreground {
+                                fence: surface::SurfaceTaskFence {
+                                    task_id: task.task_id,
+                                    task_revision: task.revision,
+                                    background_owner: task.background_fence,
+                                },
+                            },
+                        )
+                        .unwrap(),
+                );
+                release.send(()).unwrap();
+                while !snapshot().assistant_streams.iter().any(|stream| {
+                    stream.fence == fence && stream.text.as_str() == "First point. Second point."
+                }) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "foregrounded delta never arrived"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            for n in 0..cancels {
+                if foreground {
+                    let task = snapshot()
+                        .tasks
+                        .iter()
+                        .find(|task| task.parent_operation.as_ref() == Some(&operation_id))
+                        .cloned()
+                        .expect("foregrounded task");
+                    committed_surface_value(
+                        attachment
+                            .client
+                            .task_control(
+                                surface_request_id(),
+                                surface::TaskControlAction::Stop {
+                                    fence: surface::SurfaceTaskFence {
+                                        task_id: task.task_id,
+                                        task_revision: task.revision,
+                                        background_owner: task.background_fence,
+                                    },
+                                },
+                            )
+                            .unwrap(),
+                    );
+                    continue;
+                }
+                let result = attachment
+                    .client
+                    .cancel_operation(surface_request_id(), operation_id.clone());
+                if n == 0 {
+                    assert!(matches!(
+                        committed_surface_value(result.unwrap()),
+                        surface::CancelOperationOutput::Accepted { .. }
+                    ));
+                }
+            }
+        }
+        let surface::WaitOperationTerminalResult::Terminal { value } = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .unwrap()
+        else {
+            panic!("turn reached no terminal");
+        };
+        let _ = release.send(());
+        if let Some(server) = server {
+            server.join().unwrap();
+        }
+        if cancels > 0 {
+            assert!(matches!(
+                value.terminal,
+                surface::OperationTerminal::Cancelled {
+                    reason: surface::CancelReason::User
+                }
+            ));
+        } else {
+            let surface::OperationTerminal::Failed { class, message } = value.terminal else {
+                panic!("unexpected terminal: {:?}", value.terminal);
+            };
+            assert_eq!(
+                class,
+                if background {
+                    surface::FailureClass::RuntimeInvariant
+                } else {
+                    surface::FailureClass::Provider
+                }
+            );
+            assert_eq!(
+                message.as_str(),
+                if background {
+                    "background provider failed"
+                } else {
+                    "DeepSeek provider error: Response truncated: model hit max_tokens limit (finish_reason=length); ask the model to continue in smaller chunks"
+                }
+            );
+        }
+        let snapshot = snapshot();
+        assert!(snapshot.tools.is_empty());
+        let transcript = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap();
+        let assistant: Vec<_> = transcript
+            .messages
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant { .. }))
+            .collect();
+        if let Some((text, reasoning, reason)) = kept {
+            assert_eq!(assistant.len(), 1);
+            let Message::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                ..
+            } = assistant[0]
+            else {
+                unreachable!()
+            };
+            assert_eq!(content.as_deref(), Some(text));
+            assert_eq!(reasoning_content.as_deref(), reasoning);
+            assert!(tool_calls.is_empty());
+            let event = transcript
+                .semantic_events
+                .iter()
+                .find(|event| event.payload["assistant_content"] == text)
+                .expect("durable assistant response");
+            assert_eq!(event.payload["cut_short"], reason);
+        } else {
+            assert!(assistant.is_empty());
+            assert!(
+                snapshot
+                    .assistant_streams
+                    .iter()
+                    .filter(|stream| stream.fence == fence)
+                    .all(|stream| stream.state == surface::SurfaceAssistantStreamState::Discarded)
+            );
+        }
+        let thread_id = thread.thread_id().to_string();
+        thread.shutdown().unwrap();
+        host.shutdown().unwrap();
+        check_transcript(&transcript.path);
+
+        if let Some((expected_text, _, expected_reason)) = kept {
+            let resumed_host = RuntimeHost::start().unwrap();
+            let resumed = resumed_host
+                .start_thread(
+                    surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id)),
+                    "resume cut short reply",
+                )
+                .unwrap();
+            let snapshot = fresh_surface_attachment(&resumed.surface())
+                .baseline
+                .snapshot;
+            let kept_items = snapshot
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    surface::SurfaceItem::AssistantMessage {
+                        text,
+                        cut_short: Some(reason),
+                        ..
+                    } => Some((text.as_str(), *reason)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let reason = serde_json::from_value(serde_json::json!(expected_reason)).unwrap();
+            assert_eq!(kept_items, [(expected_text, reason)]);
+            resumed_host.shutdown().unwrap();
+        }
     }
 
     #[test]
@@ -31909,7 +33001,8 @@ mod tests {
         );
         assert!(matches!(
             second_transfer,
-            surface::TransferBackgroundOutput::HandedOff { .. }
+            surface::TransferBackgroundOutput::HandedOff { background_fence, .. }
+                if background_fence.operation_fence.operation_id == second.operation_id
         ));
 
         let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
@@ -32015,6 +33108,7 @@ mod tests {
         else {
             panic!("provider cancel race operation was queued");
         };
+        wait_for_background_cancel_race_prefix(&surface, &first_generation);
         let _ = committed_surface_value(
             attachment
                 .client
@@ -32026,7 +33120,25 @@ mod tests {
                 )
                 .expect("transfer provider cancel race operation"),
         );
-        std::thread::sleep(Duration::from_millis(200));
+        let task_id = fresh_surface_attachment(&surface)
+            .baseline
+            .snapshot
+            .background_operations[0]
+            .task_id
+            .clone()
+            .expect("transferred task");
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        while thread
+            .task_registry()
+            .typed_provider_outcome(task_id.as_str())
+            .is_none_or(|outcome| outcome.status != TaskStatus::Completed)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "provider outcome did not become durable"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let cancelled = committed_surface_value(
             attachment
                 .client
@@ -32067,7 +33179,75 @@ mod tests {
             .find(|task| task.parent_operation.as_ref() == Some(&reserved.operation_id))
             .expect("cancelled provider task remains projected");
         assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+        assert_background_cancel_race_reply(&snapshot, &thread);
         host.shutdown().expect("shutdown provider cancel race host");
+    }
+
+    fn wait_for_background_cancel_race_prefix(
+        surface: &surface::RuntimeSurfaceHandle,
+        fence: &surface::SurfaceOperationFence,
+    ) {
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            if snapshot.assistant_streams.iter().any(|stream| {
+                &stream.fence == fence && stream.text.as_str() == "Mock slow stream started."
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "provider prefix did not arrive");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_background_cancel_race_reply(
+        snapshot: &surface::SurfaceSnapshot,
+        thread: &RuntimeThreadHandle,
+    ) {
+        let replies: Vec<_> = snapshot
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                surface::SurfaceItem::AssistantMessage {
+                    text, cut_short, ..
+                } => Some((text.as_str(), *cut_short)),
+                _ => None,
+            })
+            .collect();
+        let expected = [(
+            "Mock slow stream started.",
+            Some(orca_core::conversation::CutShort::Interrupted),
+        )];
+        assert_eq!(replies, expected);
+        let transcript = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap();
+        let replies: Vec<_> = transcript
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant {
+                    content: Some(text),
+                    cut_short,
+                    ..
+                } => Some((text.as_str(), *cut_short)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, expected);
+        assert_eq!(
+            transcript
+                .semantic_events
+                .iter()
+                .filter(|event| event.payload["cut_short"] == "interrupted")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -38452,6 +39632,259 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_preserves_an_acknowledged_interrupted_reply_on_restart() {
+        use orca_core::conversation::CutShort;
+
+        #[derive(Clone, Debug)]
+        struct InterruptedReplyExecutor {
+            published: SyncSender<()>,
+            finish_reply: Arc<Mutex<Receiver<()>>>,
+        }
+
+        #[derive(Debug)]
+        struct GatedReplyIngress {
+            ingress: Arc<dyn surface::RuntimeProviderResponseIngress>,
+            gate: InterruptedReplyExecutor,
+        }
+
+        impl surface::RuntimeProviderResponseIngress for GatedReplyIngress {
+            fn commit_response(&self, response: &mut RuntimeModelResponse) -> io::Result<()> {
+                self.ingress.commit_response(response)
+            }
+
+            fn commit_provider_step(
+                &self,
+                identity: &ModelResponseIdentity,
+                step: &ProviderStep,
+            ) -> io::Result<()> {
+                self.ingress.commit_provider_step(identity, step)
+            }
+
+            fn publish_provider_steps(
+                &self,
+                identity: &ModelResponseIdentity,
+                steps: &[ProviderStep],
+            ) -> io::Result<()> {
+                self.ingress.publish_provider_steps(identity, steps)?;
+                if steps
+                    .iter()
+                    .any(|step| matches!(step, ProviderStep::MessageDelta(_)))
+                {
+                    self.gate.published.send(()).unwrap();
+                    self.gate
+                        .finish_reply
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(SURFACE_TEST_TIMEOUT)
+                        .unwrap();
+                }
+                Ok(())
+            }
+
+            fn commit_tool_results(&self, results: &[ToolResult]) -> io::Result<()> {
+                self.ingress.commit_tool_results(results)
+            }
+        }
+
+        impl ThreadOperationExecutor for InterruptedReplyExecutor {
+            fn run_turn(
+                &self,
+                thread: &mut RuntimeThread,
+                request: &HostedTurnRequest,
+                generation: &GenerationContext,
+                events: &mut EventFactory,
+                writer: &mut (dyn io::Write + Send),
+                cancel: &CancelToken,
+            ) -> io::Result<ThreadOperationOutcome> {
+                let mut generation = generation.clone();
+                let ingress = generation
+                    .handlers
+                    .provider_response_ingress
+                    .take()
+                    .unwrap();
+                generation.handlers.provider_response_ingress = Some(Arc::new(GatedReplyIngress {
+                    ingress,
+                    gate: self.clone(),
+                }));
+                LegacyThreadOperationExecutor.run_turn(
+                    thread,
+                    request,
+                    &generation,
+                    events,
+                    writer,
+                    cancel,
+                )
+            }
+        }
+
+        for reason in [
+            surface::SurfaceShutdownReason::HostShutdown,
+            surface::SurfaceShutdownReason::ThreadClose,
+        ] {
+            let cwd = tempfile::tempdir().unwrap();
+            let (published_tx, published_rx) = mpsc::sync_channel(1);
+            let (finish_tx, finish_rx) = mpsc::channel();
+            let host = RuntimeHost::start_with_executor(Arc::new(InterruptedReplyExecutor {
+                published: published_tx,
+                finish_reply: Arc::new(Mutex::new(finish_rx)),
+            }))
+            .unwrap();
+            let thread = host
+                .start_thread(
+                    surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                    "interrupt and shut down",
+                )
+                .unwrap();
+            let connection =
+                surface::SurfaceConnectionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .unwrap();
+            let jsonl = thread.jsonl_surface_for_connection(connection).unwrap();
+            let surface::AttachResult::FreshAttached { attachment } =
+                jsonl.attach_fresh(surface::FreshAttachRequest {
+                    request_id: surface_request_id(),
+                    role: surface::SurfaceAttachmentRole::Jsonl,
+                    requested_capabilities: BTreeSet::from([
+                        surface::SurfaceCapability::ReadSnapshot,
+                        surface::SurfaceCapability::SubmitOperation,
+                        surface::SurfaceCapability::ControlBoundOperation,
+                    ]),
+                    interaction_capabilities: BTreeSet::new(),
+                })
+            else {
+                panic!("attach JSONL client");
+            };
+            let legacy_turn_id =
+                surface::LegacyTurnId(surface::DisplayText::new(TurnId::new().to_string()));
+            let mut intent = surface_user_turn_intent(
+                &attachment.baseline.snapshot,
+                "mock_stream_delay_ms 30000",
+            );
+            intent.correlation = surface::OperationIngressCorrelation::JsonlThreadTurn {
+                rpc_id_digest: surface_sha256(b"interrupt-then-shutdown"),
+                legacy_turn_id: legacy_turn_id.clone(),
+            };
+            let reserved = committed_surface_value(
+                attachment
+                    .client
+                    .reserve_operation(surface_request_id(), intent)
+                    .unwrap(),
+            );
+            let _admitted = committed_surface_value(
+                attachment
+                    .client
+                    .admit_reserved(
+                        surface_request_id(),
+                        reserved.operation_id,
+                        reserved.lease.lease_id,
+                    )
+                    .unwrap(),
+            );
+            published_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+            assert!(
+                fresh_surface_attachment(&thread.surface())
+                    .baseline
+                    .snapshot
+                    .assistant_streams
+                    .iter()
+                    .any(|stream| stream.text.as_str() == "Mock slow stream started.")
+            );
+            let interrupted = host
+                .handle()
+                .control_jsonl_turn(
+                    attachment.client.clone(),
+                    surface_request_id(),
+                    Some(attachment.client.thread_id().clone()),
+                    legacy_turn_id,
+                    surface::JsonlTurnControlAction::Interrupt,
+                )
+                .unwrap();
+            assert!(matches!(
+                interrupted,
+                surface::JsonlTurnControlResult::Resolved {
+                    mutation: surface::MutationReply::Committed { value, .. },
+                } if value.echo.status == surface::JsonlResolvedTurnControlStatus::Interrupted
+            ));
+            let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+            thread
+                .command_tx
+                .blocking_send(ThreadCommand::ShutdownThread {
+                    reply: Some(shutdown_tx),
+                    reason,
+                })
+                .unwrap();
+            // Wait for shutdown to stop accepting ordinary work before the
+            // generation submits the final response.
+            let (probe_tx, probe_rx) = mpsc::sync_channel(1);
+            if thread
+                .command_tx
+                .blocking_send(ThreadCommand::ReadState { reply: probe_tx })
+                .is_ok()
+            {
+                assert!(matches!(
+                    probe_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+                    Err(RuntimeHostError::ThreadUnavailable)
+                ));
+            }
+            finish_tx.send(()).unwrap();
+            assert!(matches!(
+                shutdown_rx.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap(),
+                ThreadShutdownAck::Complete
+            ));
+            host.shutdown().unwrap();
+
+            let transcript = SessionStore::new()
+                .load_session(thread.thread_id())
+                .unwrap();
+            let replies = transcript
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Assistant {
+                        content, cut_short, ..
+                    } => Some((content.as_deref(), *cut_short)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                replies,
+                [(
+                    Some("Mock slow stream started."),
+                    Some(CutShort::Interrupted)
+                )]
+            );
+
+            let resumed_host = RuntimeHost::start().unwrap();
+            let resumed = resumed_host
+                .start_thread(
+                    surface_test_config(
+                        cwd.path().to_path_buf(),
+                        HistoryMode::Resume(thread.thread_id().to_string()),
+                    ),
+                    "restart after interrupt",
+                )
+                .unwrap();
+            let snapshot = fresh_surface_attachment(&resumed.surface())
+                .baseline
+                .snapshot;
+            let replies = snapshot
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    surface::SurfaceItem::AssistantMessage {
+                        text, cut_short, ..
+                    } => Some((text.as_str(), *cut_short)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                replies,
+                [("Mock slow stream started.", Some(CutShort::Interrupted))]
+            );
+            resumed_host.shutdown().unwrap();
+        }
+    }
+
+    #[test]
     fn host_shutdown_dispatches_to_later_actor_before_blocked_actor_ack() {
         let cwd = tempfile::tempdir().unwrap();
         let (entered_tx, entered_rx) = mpsc::sync_channel(2);
@@ -43249,12 +44682,24 @@ mod tests {
                 input: crate::prompt_queue::PromptQueueInput::text("queued after interrupt"),
             })
             .expect("queue prompt after interruptible prompt");
+        let surface = thread.surface();
+        let snapshot = || fresh_surface_attachment(&surface).baseline.snapshot;
         let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
         loop {
             let snapshot = thread
                 .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
                 .expect("read running queue");
-            if snapshot.running_item().is_some() {
+            if snapshot.running_item().is_some()
+                && fresh_surface_attachment(&surface)
+                    .baseline
+                    .snapshot
+                    .assistant_streams
+                    .iter()
+                    .any(|stream| {
+                        stream.channel == surface::AssistantChannel::Message
+                            && !stream.text.as_str().is_empty()
+                    })
+            {
                 break;
             }
             assert!(Instant::now() < deadline, "queue dispatch did not start");
@@ -43276,6 +44721,10 @@ mod tests {
             assert!(Instant::now() < deadline, "queue dispatch did not pause");
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(snapshot().items.iter().any(|item| matches!(item,
+            surface::SurfaceItem::AssistantMessage { text, cut_short: Some(orca_core::conversation::CutShort::Interrupted), .. }
+            if text.as_str() == "Mock slow stream started."
+        )));
         host.shutdown().expect("shutdown queue interrupt host");
     }
 
@@ -43288,7 +44737,16 @@ mod tests {
     }
 
     impl surface::RuntimeProviderResponseIngress for TerminalizingProviderResponseIngress {
-        fn commit_response(&self, _response: &mut RuntimeModelResponse) -> io::Result<()> {
+        fn commit_response(&self, response: &mut RuntimeModelResponse) -> io::Result<()> {
+            if response.cut_short.is_some() {
+                return Ok(());
+            }
+            response
+                .response
+                .assistant_content
+                .as_mut()
+                .unwrap()
+                .push_str(" unpublished suffix");
             self.cancel.cancel();
             Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -43315,17 +44773,19 @@ mod tests {
         let host = RuntimeHost::start().expect("start runtime host");
         let thread = host
             .start_thread(
-                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
                 "terminalization race",
             )
             .expect("start thread");
         let operation = thread
             .start_turn(
-                HostedTurnRequest::new("hello").with_generation_handlers(|_, cancel| {
-                    HostedGenerationHandlers::default().with_provider_response_ingress(Arc::new(
-                        TerminalizingProviderResponseIngress { cancel },
-                    ))
-                }),
+                HostedTurnRequest::new("mock_stream_delay_ms 5").with_generation_handlers(
+                    |_, cancel| {
+                        HostedGenerationHandlers::default().with_provider_response_ingress(
+                            Arc::new(TerminalizingProviderResponseIngress { cancel }),
+                        )
+                    },
+                ),
                 io::sink(),
             )
             .expect("start turn");
@@ -43338,6 +44798,21 @@ mod tests {
             &OperationOutcome::Completed(RunStatus::Cancelled),
             "a response the actor refused because the turn was being cancelled is that cancellation"
         );
+        let transcript = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap();
+        let replies: Vec<_> = transcript
+            .messages
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant { .. }))
+            .collect();
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert!(matches!(replies[0], Message::Assistant {
+            content: Some(text),
+            cut_short: Some(orca_core::conversation::CutShort::Interrupted),
+            tool_calls,
+            ..
+        } if text == "Mock slow stream started.Mock slow stream completed." && tool_calls.is_empty()));
         host.shutdown().expect("shutdown host");
     }
 

@@ -46,6 +46,7 @@ fn unmatched_tool_started_restores_as_indeterminate_and_never_replays() {
     let mut messages = vec![
         Message::user("deploy".to_string()),
         Message::Assistant {
+            cut_short: None,
             content: None,
             reasoning_content: None,
             tool_calls: vec![RawToolCall {

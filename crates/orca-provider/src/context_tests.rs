@@ -493,6 +493,7 @@ fn pressure_keeps_the_anchor_when_normalization_repairs_earlier_history() {
     conversation.messages.insert(
         3,
         Message::Assistant {
+            cut_short: None,
             content: None,
             reasoning_content: None,
             tool_calls: vec![RawToolCall {

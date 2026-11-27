@@ -497,7 +497,7 @@ fn canonical_task_patch_v1(patch: &TaskPatch) -> CanonicalTaskPatchV1<'_> {
 enum CanonicalEventV1<'a> {
     Operation(CanonicalOperationPatchV1<'a>),
     Item(&'a ItemPatch),
-    Assistant(&'a AssistantPatch),
+    Assistant(std::borrow::Cow<'a, AssistantPatch>),
     Tool(&'a ToolPatch),
     Plan(&'a SurfacePlanSnapshot),
     Usage(&'a SurfaceUsageSnapshot),
@@ -519,7 +519,7 @@ fn canonical_event_v1(event: &SurfaceEvent) -> CanonicalEventV1<'_> {
             CanonicalEventV1::Operation(canonical_operation_patch_v1(patch))
         }
         SurfaceEvent::Item(patch) => CanonicalEventV1::Item(patch),
-        SurfaceEvent::Assistant(patch) => CanonicalEventV1::Assistant(patch),
+        SurfaceEvent::Assistant(patch) => CanonicalEventV1::Assistant(patch.for_v1_event()),
         SurfaceEvent::Tool(patch) => CanonicalEventV1::Tool(patch),
         SurfaceEvent::Plan(snapshot) => CanonicalEventV1::Plan(snapshot),
         SurfaceEvent::Usage(snapshot) => CanonicalEventV1::Usage(snapshot),
@@ -4092,6 +4092,7 @@ fn apply_item_patch(
                     turn_id,
                     text,
                     pinned,
+                    cut_short: None,
                 } => batch.events.as_slice().iter().any(|event| {
                     matches!(
                         &event.event,
@@ -4103,6 +4104,9 @@ fn apply_item_patch(
                                     && value.pinned == *pinned)
                     )
                 }),
+                SurfaceItem::AssistantMessage {
+                    cut_short: Some(_), ..
+                } => false,
                 SurfaceItem::AssistantReasoning {
                     id,
                     turn_id,
@@ -4127,6 +4131,7 @@ fn apply_item_patch(
                     text,
                     message_offset,
                     pinned,
+                    cut_short: None,
                 } => batch.events.as_slice().iter().any(|event| {
                     matches!(
                         &event.event,
@@ -4139,6 +4144,9 @@ fn apply_item_patch(
                                     && value.pinned == *pinned)
                     )
                 }),
+                SurfaceItem::AssistantPlan {
+                    cut_short: Some(_), ..
+                } => false,
                 SurfaceItem::ToolResultMessage {
                     turn_id,
                     tool_call_id,
@@ -4395,7 +4403,22 @@ fn apply_assistant_patch(
             stream.next_offset = ByteOffset::new(offset.get() + text.as_str().len() as u64);
             Ok(())
         }
-        AssistantPatch::ResponseCompleted { response } => {
+        AssistantPatch::ResponseCompleted { response }
+        | AssistantPatch::ResponseKept { response, .. } => {
+            let cut_short = match patch {
+                AssistantPatch::ResponseKept { reason, .. } => Some(*reason),
+                _ => None,
+            };
+            if cut_short.is_some()
+                && (!response.tool_calls.is_empty()
+                    || (response.message_item.is_none() && response.plan_item.is_none()))
+            {
+                return Err(event_error(
+                    envelope,
+                    SurfaceReducerErrorCode::IllegalTransition,
+                    "a kept assistant response needs visible text and no tool calls",
+                ));
+            }
             let fence =
                 generation_fence_for_turn(snapshot, &response.turn_id).ok_or_else(|| {
                     event_error(
@@ -4456,6 +4479,7 @@ fn apply_assistant_patch(
                         id: item.id.clone(),
                         turn_id: item.turn_id.clone(),
                         text: item.text.clone(),
+                        cut_short,
                         pinned: item.pinned,
                     }),
                 response
@@ -4476,6 +4500,7 @@ fn apply_assistant_patch(
                         turn_id: item.turn_id.clone(),
                         text: item.text.clone(),
                         message_offset: item.message_offset,
+                        cut_short: cut_short.filter(|_| response.message_item.is_none()),
                         pinned: item.pinned,
                     }),
             ];
