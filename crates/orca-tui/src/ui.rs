@@ -2779,9 +2779,7 @@ fn workflow_metadata_row_count(task: &BackgroundTaskSummary) -> u16 {
             .as_deref()
             .map(task_detail_line_count)
             .unwrap_or_default() as u16
-        + task
-            .error
-            .as_deref()
+        + visible_task_error(task)
             .map(task_detail_line_count)
             .unwrap_or_default() as u16
 }
@@ -2836,7 +2834,7 @@ fn workflow_metadata_rows<'a>(task: &BackgroundTaskSummary, theme: &Theme) -> Ve
             Style::default().fg(theme.text),
         ));
     }
-    if let Some(error) = &task.error {
+    if let Some(error) = visible_task_error(task) {
         rows.extend(task_detail_text_rows(
             "error",
             error,
@@ -2849,6 +2847,12 @@ fn workflow_metadata_rows<'a>(task: &BackgroundTaskSummary, theme: &Theme) -> Ve
 
 fn task_detail_line_count(text: &str) -> usize {
     text.lines().count().max(1).min(TASK_DETAIL_MAX_LINES)
+}
+
+fn visible_task_error(task: &BackgroundTaskSummary) -> Option<&str> {
+    task.error
+        .as_deref()
+        .filter(|_| task.task_type != TaskType::Subagent || task.status != TaskStatus::Cancelled)
 }
 
 fn task_detail_text_rows<'a>(
@@ -4447,9 +4451,11 @@ fn task_status_color(status: TaskStatus, theme: &Theme) -> Color {
     match status {
         TaskStatus::Running | TaskStatus::Stopping => theme.warning,
         TaskStatus::Completed => theme.success,
-        TaskStatus::Failed | TaskStatus::Blocked | TaskStatus::Cancelled => theme.error,
+        TaskStatus::Failed | TaskStatus::Blocked => theme.error,
         TaskStatus::ApprovalRequired => theme.warning,
-        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Stopped => theme.muted,
+        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Stopped | TaskStatus::Cancelled => {
+            theme.muted
+        }
     }
 }
 
@@ -14088,6 +14094,27 @@ mod tests {
         assert!(spinning(&running_panel), "a running agent has a spinner");
 
         let ended_panel = panel(kept(TaskStatus::Cancelled));
+        assert_eq!(
+            task_status_color(TaskStatus::Cancelled, &theme),
+            theme.muted
+        );
+        assert!(!ended_panel.contains("agent cancelled"), "{ended_panel}");
+        let failed = kept(TaskStatus::Failed);
+        let cancelled = kept(TaskStatus::Cancelled);
+        assert!(
+            workflow_metadata_rows(&failed, &theme)
+                .iter()
+                .any(|row| row.to_string().contains("error agent cancelled"))
+        );
+        assert!(
+            !workflow_metadata_rows(&cancelled, &theme)
+                .iter()
+                .any(|row| row.to_string().contains("agent cancelled"))
+        );
+        assert_eq!(
+            workflow_metadata_row_count(&failed),
+            workflow_metadata_row_count(&cancelled) + 1
+        );
         assert!(ended_panel.contains("1 task · 0 active"));
         assert!(ended_panel.contains("kept agent · cancelled"));
         assert!(!ended_panel.contains("thinking"));
