@@ -1630,7 +1630,9 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
                 redact_stored_message(message);
             }
             for version in &mut record.nested_instructions {
-                redact_string_in_place(&mut version.content);
+                if redact_string_in_place(&mut version.content) {
+                    version.identity.digest.clear();
+                }
             }
             if let Some(summary) = &mut record.rolling_summary {
                 redact_string_in_place(summary);
@@ -1708,18 +1710,31 @@ fn redact_stored_message(message: &mut StoredMessage) {
         StoredMessage::System {
             content,
             system_prompt,
+            context_fragments,
+            nested_instruction,
             ..
         } => {
-            redact_string_in_place(content);
+            let redacted = redact_sensitive_text(content);
+            let changed = redacted != *content;
+            if changed {
+                redact_fragment_metadata(content, &redacted, context_fragments);
+                *content = redacted;
+                if let Some(identity) = nested_instruction {
+                    identity.digest.clear();
+                }
+            }
             if let Some(record) = system_prompt {
+                record.redacted |= changed;
                 for section in &mut record.sections {
                     if let Some(text) = &mut section.text {
-                        redact_string_in_place(text);
+                        record.redacted |= redact_string_in_place(text);
                     }
                 }
             }
         }
-        StoredMessage::User { content, .. } => redact_string_in_place(content),
+        StoredMessage::User { content, .. } => {
+            redact_string_in_place(content);
+        }
         StoredMessage::Tool {
             content, terminal, ..
         } => {
@@ -1754,9 +1769,49 @@ fn redact_stored_message(message: &mut StoredMessage) {
     }
 }
 
+fn redact_fragment_metadata(
+    original: &str,
+    redacted: &str,
+    changes: &mut [orca_core::conversation::ContextFragmentChange],
+) {
+    let mut reconstructed = String::new();
+    let mut cursor = 0;
+    for change in changes.iter_mut() {
+        let Some(span) = change.span.clone() else {
+            break;
+        };
+        let Some(separator) = original.get(cursor..span.start) else {
+            break;
+        };
+        let Some(text) = original.get(span.clone()) else {
+            break;
+        };
+        reconstructed.push_str(separator);
+        let start = reconstructed.len();
+        let stored = redact_sensitive_text(text);
+        reconstructed.push_str(&stored);
+        change.span = Some(start..reconstructed.len());
+        if stored != text {
+            change.redacted = true;
+            change.digest = None;
+        }
+        cursor = span.end;
+    }
+    // A redaction can extend across fragments, invalidating individual spans.
+    if cursor != original.len() || reconstructed != redacted {
+        for change in changes {
+            change.span = None;
+            change.redacted = true;
+            change.digest = None;
+        }
+    }
+}
+
 fn redact_json_value(value: &mut serde_json::Value) {
     match value {
-        serde_json::Value::String(text) => redact_string_in_place(text),
+        serde_json::Value::String(text) => {
+            redact_string_in_place(text);
+        }
         serde_json::Value::Array(values) => {
             for value in values {
                 redact_json_value(value);
@@ -1771,8 +1826,13 @@ fn redact_json_value(value: &mut serde_json::Value) {
     }
 }
 
-fn redact_string_in_place(value: &mut String) {
-    *value = redact_sensitive_text(value);
+fn redact_string_in_place(value: &mut String) -> bool {
+    let redacted = redact_sensitive_text(value);
+    if redacted == *value {
+        return false;
+    }
+    *value = redacted;
+    true
 }
 
 pub(crate) fn acquire_file_lock(path: &Path) -> io::Result<ExclusiveFileLock> {

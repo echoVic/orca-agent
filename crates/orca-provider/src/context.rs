@@ -669,7 +669,6 @@ fn pending_context_message_with_counter(
     let mut content = String::new();
     let mut changes = Vec::new();
     for (id, text, instruction_scope) in current {
-        let text = orca_core::history_redaction::redact_sensitive_text(&text);
         let digest = Sha256::digest(text.as_bytes()).into();
         if previous.remove(id.as_str()) == Some(digest) {
             continue;
@@ -677,6 +676,7 @@ fn pending_context_message_with_counter(
         if !content.is_empty() {
             content.push_str("\n\n");
         }
+        let start = content.len();
         writeln!(
             content,
             "Current {id} context (this replaces any earlier version):"
@@ -686,6 +686,8 @@ fn pending_context_message_with_counter(
         changes.push(ContextFragmentChange {
             id,
             digest: Some(digest),
+            span: Some(start..content.len()),
+            redacted: false,
             instruction_scope,
         });
     }
@@ -693,10 +695,13 @@ fn pending_context_message_with_counter(
         if !content.is_empty() {
             content.push_str("\n\n");
         }
+        let start = content.len();
         write!(content, "The {id} context no longer applies.").unwrap();
         changes.push(ContextFragmentChange {
             id: id.to_string(),
             digest: None,
+            span: Some(start..content.len()),
+            redacted: false,
             instruction_scope: None,
         });
     }

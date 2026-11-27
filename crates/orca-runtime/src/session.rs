@@ -1635,6 +1635,106 @@ mod tests {
     }
 
     #[test]
+    fn redaction_does_not_change_the_sent_prompt_or_fragments() {
+        with_orca_home(|home| {
+            let cwd = tempdir().unwrap();
+            std::fs::write(home.join("AGENTS.md"), "Token: required").unwrap();
+            let (path, prompt, transcript) = record_prompt_session(cwd.path());
+            let mut session = Conversation::new();
+            session.replace_runtime_context(Some("retained runtime hint".into()));
+            session.replace_memory_context(Some("Token: optional".into()));
+            let batch = orca_provider::context::pending_context_message(&session).unwrap();
+            assert!(prompt.contains("Token: required"));
+            assert!(batch.content_str().unwrap().contains("Token: optional"));
+            let mut writer = SessionWriter::append_to_existing(path.clone()).unwrap();
+            writer.append_message(&batch).unwrap();
+            drop(writer);
+            let raw = std::fs::read_to_string(path).unwrap();
+            assert!(raw.contains("Token: <redacted>"));
+            assert!(!raw.contains("Token: required") && !raw.contains("Token: optional"));
+            let transcript = history::load_session(&transcript.meta.session_id).unwrap();
+            let Message::System {
+                context_fragments, ..
+            } = transcript.messages.last().unwrap()
+            else {
+                panic!("expected saved context batch")
+            };
+            assert!(
+                context_fragments
+                    .iter()
+                    .find(|change| change.id == "memory")
+                    .unwrap()
+                    .digest
+                    .is_none()
+            );
+            assert!(
+                context_fragments
+                    .iter()
+                    .find(|change| change.id == "runtime")
+                    .unwrap()
+                    .digest
+                    .is_some()
+            );
+            let mut resumed = history::resume_conversation(&transcript, prompt);
+            resumed.replace_runtime_context(Some("retained runtime hint".into()));
+            resumed.replace_memory_context(Some("Token: optional".into()));
+            let pending = orca_provider::context::pending_context_message(&resumed).unwrap();
+            assert!(pending.content_str().unwrap().contains("Token: optional"));
+            assert!(
+                !pending
+                    .content_str()
+                    .unwrap()
+                    .contains("retained runtime hint")
+            );
+            assert!(resumed.messages.iter().all(|message| {
+                !message
+                    .content_str()
+                    .unwrap_or_default()
+                    .contains("Token: <redacted>")
+            }));
+            resumed.messages.push(pending);
+            assert!(orca_provider::context::pending_context_message(&resumed).is_none());
+        });
+    }
+
+    #[test]
+    fn a_change_hidden_by_redaction_is_still_delivered() {
+        let mut conversation = Conversation::new();
+        conversation.replace_memory_context(Some("Token: required".into()));
+        conversation
+            .messages
+            .extend(orca_provider::context::pending_context_message(
+                &conversation,
+            ));
+        conversation.replace_memory_context(Some("Token: optional".into()));
+        let update = orca_provider::context::pending_context_message(&conversation)
+            .expect("changed fragment");
+        assert!(update.content_str().unwrap().contains("Token: optional"));
+        conversation.messages.push(update);
+        assert!(orca_provider::context::pending_context_message(&conversation).is_none());
+    }
+
+    #[test]
+    fn a_redacted_section_resumes_by_rebuilding() {
+        with_orca_home(|home| {
+            let cwd = tempdir().unwrap();
+            let source = home.join("AGENTS.md");
+            std::fs::write(&source, "Token: required").unwrap();
+            let (_, _, transcript) = record_prompt_session(cwd.path());
+            std::fs::write(source, "Token: optional").unwrap();
+            let id = transcript.meta.session_id.clone();
+            let session = reopen_prompt_session(cwd.path(), HistoryMode::Resume(id), transcript);
+            assert!(
+                session.conversation.messages[0]
+                    .content_str()
+                    .unwrap()
+                    .contains("Token: optional")
+            );
+            assert!(prompt_section_notices(&session).is_empty());
+        });
+    }
+
+    #[test]
     fn a_removed_section_appends_the_no_longer_applies_note() {
         with_orca_home(|orca_home| {
             let cwd = tempdir().unwrap();

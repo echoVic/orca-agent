@@ -218,11 +218,15 @@ pub enum CutShort {
 }
 
 /// Identity of a rendered fragment in a system message. A missing digest
-/// records a removal. The digest survives transcript text redaction.
+/// records a removal, or a delivery whose saved text was redacted.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextFragmentChange {
     pub id: String,
     pub digest: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<std::ops::Range<usize>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction_scope: Option<InstructionScope>,
 }
@@ -245,6 +249,8 @@ pub struct SystemPromptSection {
 pub struct SystemPromptRecord {
     pub sections: Vec<SystemPromptSection>,
     pub update: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redacted: bool,
 }
 
 #[derive(Clone, Debug)]

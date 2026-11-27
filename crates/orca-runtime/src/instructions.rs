@@ -527,21 +527,35 @@ pub(crate) fn restore_nested_state(
         .written_sources
         .extend(written_sources.iter().cloned());
     let home = orca_core::home::orca_home();
-    for version in versions.iter().filter(|version| {
-        version.identity.workspace == cwd
-            && home.as_deref().is_some_and(|home| {
-                trusted_source(&cwd, &version.identity.source, home)
-                    && read_nested_source(&cwd.join(&version.identity.source)).is_ok()
-            })
-    }) {
+    for version in versions
+        .iter()
+        .filter(|version| version.identity.workspace == cwd)
+    {
+        let source = &version.identity.source;
+        if !home
+            .as_deref()
+            .is_some_and(|home| trusted_source(&cwd, source, home))
+        {
+            continue;
+        }
+        let path = cwd.join(source);
+        let Ok((content, digest, shortened)) = read_nested_source(&path) else {
+            continue;
+        };
+        let mut version = version.clone();
+        if version.identity.digest.is_empty() {
+            version.content = content;
+            version.identity.digest = digest;
+            version.identity.shortened = shortened;
+        }
         conversation
             .nested_instructions
             .written_sources
-            .remove(&cwd.join(&version.identity.source));
+            .remove(&path);
         conversation
             .nested_instructions
             .versions
-            .insert(version.identity.source.clone(), version.clone());
+            .insert(source.clone(), version);
     }
     render_effective_chain(conversation, &cwd, orca_core::home::orca_home().as_deref());
 }
@@ -1027,10 +1041,7 @@ mod tests {
             );
             let id = writer.session_id().unwrap();
             let transcript = crate::history::load_session(&id).unwrap();
-            assert_eq!(
-                transcript.nested_instructions[0].identity.digest,
-                orca_core::hex::lower(&Sha256::digest(rule))
-            );
+            assert!(transcript.nested_instructions[0].identity.digest.is_empty());
             assert_eq!(
                 transcript.nested_instructions[0].identity.workspace,
                 cwd.canonicalize().unwrap()
@@ -1106,7 +1117,7 @@ mod tests {
                 cwd,
                 "src/two.txt",
             );
-            assert!(before.contains("Keep this rule. api_key=&lt;redacted&gt;"));
+            assert!(before.contains(rule));
             assert_eq!(nested_messages(&resumed), [before.as_str()]);
             for conversation in [&outcome.after, &snapshot.conversation, &resumed] {
                 assert!(conversation.messages.iter().any(|message| matches!(

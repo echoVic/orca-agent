@@ -299,29 +299,30 @@ pub(crate) fn resume_conversation_in_cwd(
     let mut loaded_sources = HashMap::new();
     let prompt_sources_are_loaded = |message: &Message| {
         message.system_prompt_record().is_none_or(|record| {
-            record.sections.iter().all(|section| {
-                if section.name != "project instructions" || section.text.is_none() {
-                    return true;
-                }
-                let Some(scope) = &section.instruction_scope else {
-                    return false;
-                };
-                scope.sources.is_empty()
-                    || ((scope.cwd == active_cwd
-                        || orca_core::config::folder_trust::is_trusted(active_cwd))
-                        && {
-                            let loaded =
-                                loaded_sources.entry(scope.cwd.clone()).or_insert_with(|| {
-                                    crate::instructions::load_for_cwd_or_default(&scope.cwd)
-                                        .scope(&scope.cwd)
-                                        .sources
-                                });
-                            scope
-                                .sources
-                                .iter()
-                                .all(|source| loaded.binary_search(source).is_ok())
-                        })
-            })
+            !record.redacted
+                && record.sections.iter().all(|section| {
+                    if section.name != "project instructions" || section.text.is_none() {
+                        return true;
+                    }
+                    let Some(scope) = &section.instruction_scope else {
+                        return false;
+                    };
+                    scope.sources.is_empty()
+                        || ((scope.cwd == active_cwd
+                            || orca_core::config::folder_trust::is_trusted(active_cwd))
+                            && {
+                                let loaded =
+                                    loaded_sources.entry(scope.cwd.clone()).or_insert_with(|| {
+                                        crate::instructions::load_for_cwd_or_default(&scope.cwd)
+                                            .scope(&scope.cwd)
+                                            .sources
+                                    });
+                                scope
+                                    .sources
+                                    .iter()
+                                    .all(|source| loaded.binary_search(source).is_ok())
+                            })
+                })
         })
     };
     let instruction_messages_can_replay = restored.iter().all(|message| {
@@ -354,8 +355,26 @@ pub(crate) fn resume_conversation_in_cwd(
         &transcript.written_instruction_sources,
     );
     let replay_prompt_updates = recorded_prompt.is_some();
+    let last_redactions = restored
+        .iter()
+        .enumerate()
+        .flat_map(|(index, message)| {
+            let changes = match message {
+                Message::System {
+                    context_fragments, ..
+                } => context_fragments.as_slice(),
+                _ => &[],
+            };
+            changes
+                .iter()
+                .filter(|change| change.redacted)
+                .map(move |change| (change.id.clone(), index))
+        })
+        .collect::<HashMap<_, _>>();
     let mut restored_messages = restored
         .into_iter()
+        .enumerate()
+        .filter_map(|(index, message)| restore_fragment_batch(message, index, &last_redactions))
         // Keep delivered context in its original position when its sources still apply.
         .filter(|message| {
             if message.is_context_fragment_batch() {
@@ -416,6 +435,43 @@ pub(crate) fn resume_conversation_in_cwd(
     conversation
 }
 
+fn restore_fragment_batch(
+    message: Message,
+    index: usize,
+    last_redactions: &HashMap<String, usize>,
+) -> Option<Message> {
+    let Message::System {
+        content,
+        context_fragments,
+        ..
+    } = &message
+    else {
+        return Some(message);
+    };
+    let keep = |change: &orca_core::conversation::ContextFragmentChange| {
+        last_redactions
+            .get(&change.id)
+            .is_none_or(|redacted_at| *redacted_at < index)
+    };
+    if context_fragments.iter().all(keep) {
+        return Some(message);
+    }
+    let mut restored = String::new();
+    let mut changes = Vec::new();
+    for change in context_fragments.iter().filter(|change| keep(change)) {
+        let text = content.get(change.span.clone()?)?;
+        if !restored.is_empty() {
+            restored.push_str("\n\n");
+        }
+        let start = restored.len();
+        restored.push_str(text);
+        let mut change = change.clone();
+        change.span = Some(start..restored.len());
+        changes.push(change);
+    }
+    (!changes.is_empty()).then(|| Message::context_fragment_batch(restored, changes))
+}
+
 fn instruction_fragments_can_replay(message: &Message, cwd: &Path) -> bool {
     let Message::System {
         context_fragments, ..
@@ -426,11 +482,15 @@ fn instruction_fragments_can_replay(message: &Message, cwd: &Path) -> bool {
     context_fragments
         .iter()
         .all(|change| match change.id.as_str() {
-            crate::instructions::NESTED_CONTEXT if change.digest.is_some() => change
-                .instruction_scope
-                .as_ref()
-                .is_some_and(|scope| crate::instructions::nested_scope_is_loaded(scope, cwd)),
-            orca_core::conversation::SKILLS_CONTEXT_FRAGMENT_ID if change.digest.is_some() => {
+            crate::instructions::NESTED_CONTEXT if change.digest.is_some() || change.redacted => {
+                change
+                    .instruction_scope
+                    .as_ref()
+                    .is_some_and(|scope| crate::instructions::nested_scope_is_loaded(scope, cwd))
+            }
+            orca_core::conversation::SKILLS_CONTEXT_FRAGMENT_ID
+                if change.digest.is_some() || change.redacted =>
+            {
                 change
                     .instruction_scope
                     .as_ref()

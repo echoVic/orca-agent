@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use orca_core::conversation::{InstructionScope, Message, SystemPromptRecord, SystemPromptSection};
-use orca_core::history_redaction::redact_sensitive_text;
 use orca_platform::shell::{ShellKind, ShellResolver, ShellSpec};
 
 #[derive(Default)]
@@ -33,19 +32,13 @@ impl SystemPrompt {
             .collect()
     }
 
-    pub(crate) fn into_message(mut self) -> Message {
-        for text in self
-            .sections
-            .iter_mut()
-            .filter_map(|section| section.text.as_mut())
-        {
-            *text = redact_sensitive_text(text);
-        }
+    pub(crate) fn into_message(self) -> Message {
         Message::system_with_prompt_record(
             self.render(),
             SystemPromptRecord {
                 sections: self.sections,
                 update: false,
+                redacted: false,
             },
         )
     }
@@ -101,6 +94,7 @@ pub(crate) fn section_updates(history: &[Message], current: &Message) -> Vec<Mes
                 SystemPromptRecord {
                     sections: vec![section],
                     update: true,
+                    redacted: false,
                 },
             )
         })
