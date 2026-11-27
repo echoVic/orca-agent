@@ -10,7 +10,7 @@ use orca_tools::skills;
 
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
-use crate::system_prompt::build_system_prompt_for_tools as build_base_system_prompt_for_tools;
+use crate::system_prompt::{SystemPrompt, build_system_prompt_sections};
 
 const PLAN_MODE_INSTRUCTIONS: &str = r#"## Plan Mode
 You are in read-only planning mode. Your job is to investigate the request and produce an implementation-ready plan for user approval before any execution begins.
@@ -72,8 +72,8 @@ pub fn build_agent_system_prompt_for_tools(
         None,
         DelegationPolicy::default(),
         allowed_tools,
-        None,
     )
+    .render()
 }
 
 /// Builds the agent system prompt with the delegation policy that actually
@@ -101,8 +101,8 @@ pub fn build_agent_system_prompt_with_goal(
         active_goal,
         delegation,
         role_tools.as_deref(),
-        None,
     )
+    .render()
 }
 
 pub(crate) fn build_agent_system_prompt_for_config(
@@ -114,6 +114,27 @@ pub(crate) fn build_agent_system_prompt_for_config(
     memory: Option<&MemoryBlock>,
     allowed_tools: Option<&[String]>,
 ) -> String {
+    build_agent_system_prompt_sections(
+        cwd,
+        config,
+        subagent_depth,
+        subagent_type,
+        instructions,
+        memory,
+        allowed_tools,
+    )
+    .render()
+}
+
+pub(crate) fn build_agent_system_prompt_sections(
+    cwd: &Path,
+    config: &RunConfig,
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    instructions: Option<&ProjectInstructions>,
+    memory: Option<&MemoryBlock>,
+    allowed_tools: Option<&[String]>,
+) -> SystemPrompt {
     let role_tools = inferred_role_tools(subagent_depth, subagent_type);
     let allowed_tools = allowed_tools
         .or_else(|| {
@@ -137,11 +158,9 @@ pub(crate) fn build_agent_system_prompt_for_config(
             .delegation
             .for_child(subagent_depth, config.subagents.max_depth),
         allowed_tools,
-        Some(config),
     );
     if let Some(definition) = &config.subagents.effective_definition {
-        prompt.push_str("\n\n");
-        prompt.push_str(&definition.system_prompt);
+        prompt.push("custom agent", format!("\n\n{}", definition.system_prompt));
     }
     prompt
 }
@@ -157,38 +176,30 @@ fn build_agent_system_prompt_with_goal_and_tools(
     active_goal: Option<&ThreadGoal>,
     delegation: DelegationPolicy,
     allowed_tools: Option<&[String]>,
-    config: Option<&RunConfig>,
-) -> String {
-    let mut prompt = if let Some(config) = config {
-        crate::system_prompt::build_system_prompt_for_config(
-            cwd,
-            config,
-            subagent_depth,
-            allowed_tools,
-        )
-    } else {
-        build_base_system_prompt_for_tools(cwd, allowed_tools)
-    };
+) -> SystemPrompt {
+    let mut prompt = build_system_prompt_sections(cwd, allowed_tools);
     if let Some(block) = memory.and_then(MemoryBlock::to_system_prompt_block) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&block);
+        prompt.push("memory", format!("\n\n{block}"));
     }
     if let Some(block) = instructions.and_then(ProjectInstructions::to_system_prompt_block) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&block);
+        prompt.push("project instructions", format!("\n\n{block}"));
     }
     if subagent_depth == 0 {
-        prompt.push_str(&format_subagent_guidance(delegation));
+        prompt.push("delegation", format_subagent_guidance(delegation));
     } else {
-        prompt.push_str(&format_child_agent_contract(subagent_type, delegation));
+        prompt.push(
+            "agent role",
+            format_child_agent_contract(subagent_type, delegation),
+        );
     }
     if approval_mode == ApprovalMode::Plan {
-        prompt.push_str("\n\n");
-        prompt.push_str(PLAN_MODE_INSTRUCTIONS);
+        prompt.push("plan mode", format!("\n\n{PLAN_MODE_INSTRUCTIONS}"));
     }
     if let Some(goal) = active_goal {
-        prompt.push_str("\n\n");
-        prompt.push_str(&format_goal_mode_instructions(goal));
+        prompt.push(
+            "goal mode",
+            format!("\n\n{}", format_goal_mode_instructions(goal)),
+        );
     }
     prompt
 }

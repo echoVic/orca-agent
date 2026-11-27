@@ -291,12 +291,21 @@ pub(crate) fn resume_conversation_in_cwd(
     system_prompt: String,
     active_cwd: &Path,
 ) -> Conversation {
+    let recorded_prompt = transcript.messages.first().filter(|message| {
+        message
+            .system_prompt_record()
+            .is_some_and(|record| !record.update && !record.sections.is_empty())
+    });
     let mut conversation = Conversation::new();
     conversation.repeat_tool_streak = transcript
         .repeat_tool_streak
         .clone()
         .or_else(|| crate::session::repeat_tool_streak_from_history(&transcript.messages));
-    conversation.add_system(system_prompt);
+    conversation.messages.push(
+        recorded_prompt
+            .cloned()
+            .unwrap_or_else(|| Message::system(system_prompt)),
+    );
     crate::instructions::restore_nested_state(
         &mut conversation,
         Path::new(&transcript.meta.cwd),
@@ -310,11 +319,11 @@ pub(crate) fn resume_conversation_in_cwd(
         &transcript.summaries,
     )
     .into_iter()
-    // The old system prompt and ephemeral system context are rebuilt. Context
-    // batches, truncation markers, delivered notices and mentioned skills
-    // stay in their original places until compaction.
+    // The leading prompt is already installed. Keep delivered context,
+    // instruction updates, truncation markers, notices and mentioned skills
+    // in their original places until compaction.
     .filter(|message| {
-        if message.is_context_fragment_batch() {
+        if message.is_context_fragment_batch() || message.is_system_prompt_update() {
             return true;
         }
         if let Some(replay) = crate::skill_context::should_replay_mention(message, active_cwd) {

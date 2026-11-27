@@ -225,12 +225,25 @@ pub struct ContextFragmentChange {
     pub digest: Option<[u8; 32]>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SystemPromptSection {
+    pub name: String,
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SystemPromptRecord {
+    pub sections: Vec<SystemPromptSection>,
+    pub update: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum Message {
     System {
         content: String,
         pinned: bool,
         context_fragments: Vec<ContextFragmentChange>,
+        system_prompt: Option<Box<SystemPromptRecord>>,
     },
     User {
         content: String,
@@ -259,6 +272,7 @@ impl Message {
             content,
             pinned: false,
             context_fragments: Vec::new(),
+            system_prompt: None,
         }
     }
 
@@ -267,6 +281,7 @@ impl Message {
             content,
             pinned: false,
             context_fragments: changes,
+            system_prompt: None,
         }
     }
 
@@ -274,8 +289,31 @@ impl Message {
         matches!(self, Self::System { context_fragments, .. } if !context_fragments.is_empty())
     }
 
+    pub fn system_with_prompt_record(content: String, record: SystemPromptRecord) -> Self {
+        Self::System {
+            content,
+            pinned: false,
+            context_fragments: Vec::new(),
+            system_prompt: Some(Box::new(record)),
+        }
+    }
+
+    pub fn system_prompt_record(&self) -> Option<&SystemPromptRecord> {
+        match self {
+            Self::System { system_prompt, .. } => system_prompt.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn is_system_prompt_update(&self) -> bool {
+        self.system_prompt_record()
+            .is_some_and(|record| record.update)
+    }
+
     pub fn is_leading_system(&self) -> bool {
-        matches!(self, Self::System { pinned: false, .. }) && !self.is_context_fragment_batch()
+        matches!(self, Self::System { pinned: false, .. })
+            && !self.is_context_fragment_batch()
+            && !self.is_system_prompt_update()
     }
 
     pub fn pinned_system(content: String) -> Self {
@@ -283,6 +321,7 @@ impl Message {
             content,
             pinned: true,
             context_fragments: Vec::new(),
+            system_prompt: None,
         }
     }
 
@@ -628,6 +667,8 @@ pub struct NestedInstructionState {
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub internal_context: InternalContext,
+    /// Latest assembled system prompt, adopted only with a new compacted prefix.
+    pub compaction_system_prompt: Option<Message>,
     /// Repeated tool calls since the latest user prompt, retained across
     /// compaction so reminders do not restart with the visible history tail.
     pub repeat_tool_streak: Option<RepeatToolStreak>,
@@ -662,6 +703,7 @@ impl Clone for Conversation {
         Self {
             messages: self.messages.clone(),
             internal_context: self.internal_context.clone(),
+            compaction_system_prompt: self.compaction_system_prompt.clone(),
             repeat_tool_streak: self.repeat_tool_streak.clone(),
             mcp_instructions: self.mcp_instructions.clone(),
             mcp_catalogs: self.mcp_catalogs.clone(),
@@ -684,6 +726,7 @@ impl Conversation {
         Self {
             messages: Vec::new(),
             internal_context: InternalContext::default(),
+            compaction_system_prompt: None,
             repeat_tool_streak: None,
             mcp_instructions: Vec::new(),
             mcp_catalogs: Vec::new(),

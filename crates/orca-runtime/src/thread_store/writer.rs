@@ -1705,9 +1705,21 @@ fn add_usage_totals(totals: &mut UsageTotals, usage: UsageTotals) {
 
 fn redact_stored_message(message: &mut StoredMessage) {
     match message {
-        StoredMessage::System { content, .. } | StoredMessage::User { content, .. } => {
-            redact_string_in_place(content)
+        StoredMessage::System {
+            content,
+            system_prompt,
+            ..
+        } => {
+            redact_string_in_place(content);
+            if let Some(record) = system_prompt {
+                for section in &mut record.sections {
+                    if let Some(text) = &mut section.text {
+                        redact_string_in_place(text);
+                    }
+                }
+            }
         }
+        StoredMessage::User { content, .. } => redact_string_in_place(content),
         StoredMessage::Tool {
             content, terminal, ..
         } => {
@@ -2000,6 +2012,7 @@ impl SessionWriter {
             pinned: false,
             nested_instruction: Some(Box::new(version.identity.clone())),
             context_fragments: Vec::new(),
+            system_prompt: None,
         };
         let record = match &self.turn_id {
             Some(turn) => StoredConversationRecord::identified(
