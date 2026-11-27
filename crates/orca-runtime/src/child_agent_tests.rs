@@ -2249,30 +2249,33 @@ enum RecordedHistory {
     Interrupted,
 }
 
-fn run_recorded_fork(
-    context: Option<&str>,
-    history: RecordedHistory,
-    attempt_write: bool,
-) -> (Vec<Vec<u8>>, ChildAgentResult) {
-    use orca_core::conversation::Conversation;
-    use orca_provider::tool_schema::ProviderToolDefinition;
+fn recorded_provider(
+    replies: Vec<serde_json::Value>,
+) -> (String, std::thread::JoinHandle<Vec<Vec<u8>>>) {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    let cwd = tempfile::tempdir().unwrap();
-    let orca_home = tempfile::tempdir().unwrap();
-    let _home = crate::history::redirect_test_orca_home(orca_home.path());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut config = config(Some(PRO_MODEL));
-    config.provider = ProviderKind::DeepSeek;
-    config.approval_mode = ApprovalMode::FullAuto;
-    config.api_key = Some("local-fixture".into());
-    config.base_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         let mut bodies = Vec::new();
-        for index in 0..2 {
-            let (mut socket, _) = listener.accept().unwrap();
+        for delta in replies {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return bodies;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("provider accept failed: {error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -2291,18 +2294,10 @@ fn run_recorded_fork(
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             bodies.push(body);
-            let (delta, finish) = if index == 1 && attempt_write {
-                (
-                    serde_json::json!({"reasoning_content":"try a write", "tool_calls":[{
-                        "index":0,"id":"child-write","function":{"name":"write_file", "arguments":"{\"file_path\":\"fork-write.txt\",\"content\":\"unexpected\"}"}
-                    }]}),
-                    "tool_calls",
-                )
+            let finish = if delta.get("tool_calls").is_some() {
+                "tool_calls"
             } else {
-                (
-                    serde_json::json!({"content": if index == 0 { "parent response" } else { "child report" }}),
-                    "stop",
-                )
+                "stop"
             };
             let chunk = serde_json::json!({"choices":[{"delta":delta,"finish_reason":finish}]});
             let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
@@ -2310,6 +2305,45 @@ fn run_recorded_fork(
         }
         bodies
     });
+    (base_url, server)
+}
+
+fn run_recorded_fork(
+    context: Option<&str>,
+    history: RecordedHistory,
+    attempt_write: bool,
+) -> (Vec<Vec<u8>>, ChildAgentResult) {
+    let mut replies = Vec::new();
+    if attempt_write {
+        replies.push(serde_json::json!({"reasoning_content":"try a write", "tool_calls":[{
+            "index":0,"id":"child-write","function":{"name":"write_file", "arguments":"{\"file_path\":\"fork-write.txt\",\"content\":\"unexpected\"}"}
+        }]}));
+    }
+    run_recorded_fork_with(context, history, replies, |_, _| {})
+}
+
+fn run_recorded_fork_with(
+    context: Option<&str>,
+    history: RecordedHistory,
+    mut child_replies: Vec<serde_json::Value>,
+    configure: impl FnOnce(&std::path::Path, &mut RunConfig),
+) -> (Vec<Vec<u8>>, ChildAgentResult) {
+    use orca_core::conversation::Conversation;
+    use orca_provider::tool_schema::ProviderToolDefinition;
+
+    let cwd = tempfile::tempdir().unwrap();
+    let orca_home = tempfile::tempdir().unwrap();
+    let _home = crate::history::redirect_test_orca_home(orca_home.path());
+    let mut replies = vec![serde_json::json!({"content": "parent response"})];
+    replies.append(&mut child_replies);
+    replies.push(serde_json::json!({"content": "child report"}));
+    let (base_url, server) = recorded_provider(replies);
+    let mut config = config(Some(PRO_MODEL));
+    config.provider = ProviderKind::DeepSeek;
+    config.approval_mode = ApprovalMode::FullAuto;
+    config.api_key = Some("local-fixture".into());
+    config.base_url = Some(base_url);
+    configure(cwd.path(), &mut config);
     let completed = history != RecordedHistory::Empty;
     let mut parent = Conversation::new();
     parent.add_system("Recorded parent system prompt".into());
@@ -2527,14 +2561,42 @@ fn a_fork_childs_role_limits_are_enforced_at_execution() {
             .iter()
             .any(|tool| tool["function"]["name"] == "write_file")
     );
+    assert_eq!(result.status, RunStatus::Success, "{:?}", result.error);
+    let continued: serde_json::Value = serde_json::from_slice(&bodies[2]).unwrap();
     assert!(
-        result
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("disallows tool 'write_file'")
+        continued
+            .to_string()
+            .contains("role 'explorer' tool policy disallows tool 'write_file'")
     );
-    assert_eq!(result.status, RunStatus::Failed);
+    assert_eq!(continued["tools"], first["tools"]);
+    assert_eq!(result.final_message.as_deref(), Some("child report"));
+}
+
+#[test]
+fn a_fork_childs_final_report_request_sends_no_tools() {
+    let (bodies, result) = run_recorded_fork_with(
+        Some("fork"),
+        RecordedHistory::Ordinary,
+        vec![
+            serde_json::json!({"reasoning_content":"read the evidence", "tool_calls":[{
+                "index":0,"id":"child-read","function":{"name":"read_file", "arguments":"{\"path\":\"evidence.txt\"}"}
+            }]}),
+        ],
+        |cwd, config| {
+            std::fs::write(cwd.join("evidence.txt"), "child evidence").unwrap();
+            config.subagents.max_investigation_tool_calls = 1;
+        },
+    );
+    assert_eq!(result.status, RunStatus::Success, "{:?}", result.error);
+    let report: serde_json::Value = serde_json::from_slice(&bodies[2]).unwrap();
+    assert!(
+        report
+            .to_string()
+            .contains("Read-only investigation finalization")
+    );
+    assert!(report.to_string().contains("child evidence"));
+    assert_eq!(report["tools"], serde_json::json!([]));
+    assert!(report.to_string().contains("parent completed report"));
 }
 
 #[test]

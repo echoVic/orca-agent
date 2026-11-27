@@ -2,6 +2,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use orca_core::cancel::CancelToken;
@@ -860,9 +861,13 @@ async fn request_chat_streaming_with_budget(
         StreamingRequest::Auxiliary {
             conversation,
             max_tokens,
-            ..
+            accept_truncated_partial,
         } => (
-            ChatMessages::Conversation(conversation_to_api_messages(conversation)),
+            if accept_truncated_partial {
+                chat_messages(conversation).map_err(|error| error.to_string())?
+            } else {
+                ChatMessages::Conversation(conversation_to_api_messages(conversation))
+            },
             Vec::new(),
             max_tokens,
         ),
@@ -1357,10 +1362,48 @@ pub(crate) fn deepseek_conversation_tools(
     conversation: &Conversation,
     config: &ProviderConfig,
 ) -> Vec<Value> {
-    conversation.fork_prefix.as_ref().map_or_else(
-        || deepseek_primary_request_tools(config),
-        |prefix| prefix.tools.clone(),
-    )
+    let Some(prefix) = &conversation.fork_prefix else {
+        return deepseek_primary_request_tools(config);
+    };
+    if config.tools_override.as_ref().is_some_and(Vec::is_empty) {
+        return Vec::new();
+    }
+    let mut tools = prefix.tools.clone();
+    let Some(registry) = &config.mcp_registry else {
+        return tools;
+    };
+    let on_demand: HashSet<_> = registry
+        .on_demand_loaders()
+        .into_iter()
+        .map(|(server, _)| server)
+        .collect();
+    if on_demand.is_empty() {
+        return tools;
+    }
+    let captured: HashSet<_> = tools
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    let added: Vec<_> = config
+        .tools_override
+        .iter()
+        .flatten()
+        .filter(|definition| {
+            !captured.contains(definition.name.as_str())
+                && orca_core::mcp_types::mcp_tool_server(&definition.name)
+                    .is_some_and(|server| on_demand.contains(server))
+                && registry.resolve_agent_tool(&definition.name).is_some()
+        })
+        .cloned()
+        .collect();
+    if !added.is_empty() {
+        let added = cap_tools_for_deepseek(deepseek_tools_schema(&added));
+        limit_tools_by_name(&mut tools, DEEPSEEK_MAX_TOOLS - added.len(), |tool| {
+            tool["function"]["name"].as_str().unwrap_or_default()
+        });
+        tools.extend(added);
+    }
+    tools
 }
 
 pub(crate) fn deepseek_plain_request_tools(config: &ProviderConfig) -> Vec<Value> {
@@ -1643,6 +1686,74 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fork_child_sees_mcp_tools_it_loads() {
+        use crate::tool_schema::ProviderToolDefinition;
+        use orca_core::conversation::ProviderForkPrefix;
+        use orca_core::mcp_types::{McpServerConfig, McpToolLoading};
+
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("mcp-fixture.sh");
+        std::fs::write(&script, r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"catalog","version":"1"}}}' ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"lookup","inputSchema":{"type":"object"}}]}}' ;;
+  esac
+done
+"#).unwrap();
+        let registry = orca_mcp::initialize_registry(
+            &[McpServerConfig {
+                name: "catalog".into(),
+                command: Some("/bin/sh".into()),
+                args: vec![script.to_string_lossy().into_owned()],
+                tool_loading: McpToolLoading::OnDemand,
+                ..Default::default()
+            }],
+            None,
+        );
+        assert!(registry.wait_for_startup(&|| false));
+        let registry = registry.with_tool_scope(Default::default());
+        let definition = |name: &str| ProviderToolDefinition {
+            name: name.into(),
+            description: name.into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            strict_capable: false,
+        };
+        let loader = definition("mcp__catalog__load_tools");
+        let lookup = definition("mcp__catalog__lookup");
+        let captured = deepseek_tools_schema(&[definition("write_file"), loader.clone()]);
+        let mut child = Conversation::new();
+        child.fork_prefix = Some(Arc::new(ProviderForkPrefix {
+            model: "deepseek-v4-pro".into(),
+            endpoint: DEFAULT_BASE_URL.into(),
+            reasoning_effort: orca_core::config::ReasoningEffort::High,
+            messages: vec![],
+            tools: captured.clone(),
+            estimated_tokens: 0,
+        }));
+        let mut config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: orca_core::config::ReasoningEffort::High,
+            tools_override: Some(vec![loader.clone()]),
+            mcp_registry: Some(registry.clone()),
+            external_tools: vec![],
+            max_output_tokens: None,
+        };
+        assert_eq!(deepseek_conversation_tools(&child, &config), captured);
+
+        registry.load_tools("catalog", &["lookup".into()]).unwrap();
+        config.tools_override = Some(vec![loader, lookup.clone()]);
+        let mut expected = captured;
+        expected.extend(deepseek_tools_schema(&[lookup]));
+        assert_eq!(deepseek_conversation_tools(&child, &config), expected);
+    }
 
     fn summary_redirect_fixture() -> (
         Conversation,
