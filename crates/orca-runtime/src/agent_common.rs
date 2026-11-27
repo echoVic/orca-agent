@@ -236,9 +236,9 @@ pub fn format_subagent_guidance(delegation: DelegationPolicy) -> String {
 - Keep single-file work, small lookups, coupled edits, and user input local.
 - Continue non-overlapping work. Integrate exact evidence, including missing-file errors; do not repeat searches/reread cited files unless verifying a concrete inconsistency.
 - If only child results remain, end your reply. Orca resumes the turn as results arrive.
-- Launch once per named branch. Integrate results of any status and all questions. Replace only for explicit exhaustive completion or a new independently scoped blocking question.
-- Stop when briefing costs exceed remaining work. Treat capacity as a limit.
-See `subagent` for roles, limits, and reports."#
+- One launch per named branch. Integrate all results and questions. Replace only for explicit exhaustive completion or a new independently bounded blocking question.
+- Stop when briefing costs exceed remaining work. Capacity is a ceiling, not a target/quota.
+Roles, tool ceilings, reports: see `subagent`."#
     )
 }
 
@@ -590,7 +590,7 @@ mod tests {
             "verifying a concrete inconsistency",
             "including missing-file errors",
             "One launch per named branch",
-            "complete/partial/failed/uncertain",
+            "Integrate all results and questions",
             "explicit exhaustive completion",
             "new independently bounded blocking question",
         ] {
