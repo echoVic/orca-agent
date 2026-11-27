@@ -29,6 +29,8 @@ pub(crate) struct NetworkReadScheduling<'a> {
 pub(crate) struct RuntimeToolDispatchScheduler<'a> {
     config: &'a RunConfig,
     subagent_depth: u32,
+    parallel_limit: Option<usize>,
+    network_sequential: bool,
 }
 
 impl<'a> RuntimeToolDispatchScheduler<'a> {
@@ -36,7 +38,19 @@ impl<'a> RuntimeToolDispatchScheduler<'a> {
         Self {
             config,
             subagent_depth,
+            parallel_limit: None,
+            network_sequential: !config.budget.to_spec().is_unlimited(),
         }
+    }
+
+    pub(crate) fn with_parallel_limit(mut self, parallel_limit: Option<usize>) -> Self {
+        self.parallel_limit = parallel_limit;
+        self
+    }
+
+    pub(crate) fn with_network_sequential(mut self, network_sequential: bool) -> Self {
+        self.network_sequential = network_sequential;
+        self
     }
 
     pub(crate) fn next_dispatch<'requests>(
@@ -54,28 +68,44 @@ impl<'a> RuntimeToolDispatchScheduler<'a> {
             return Some(RuntimeToolDispatch::SubagentBatch(window));
         }
 
-        let max_parallel = self.config.tools.max_read_parallel;
+        let max_parallel = self
+            .parallel_limit
+            .map_or(self.config.tools.max_read_parallel, |limit| {
+                self.config.tools.max_read_parallel.min(limit.max(1))
+            });
         if let Some(network) = network {
             let window = sampling_state.tool_dispatch_window(tool_requests, |requests, start| {
-                if start < *network.sequential_until || max_parallel <= 1 {
+                if self.network_sequential || start < *network.sequential_until || max_parallel <= 1 {
                     return start;
                 }
-                start
-                    + requests[start..]
-                        .iter()
-                        .take(max_parallel)
-                        .take_while(|request| {
-                            (should_run_readonly_batch(max_parallel, request)
-                                || is_network_read(request))
-                                && (network.tool_allowed)(request)
-                        })
-                        .count()
+                let mut count = 0;
+                let mut same_document_target = None;
+                for request in requests[start..].iter().take(max_parallel) {
+                    if !((should_run_readonly_batch(max_parallel, request)
+                        || is_network_read(request))
+                        && (network.tool_allowed)(request))
+                    {
+                        break;
+                    }
+                    if request.name == ToolName::ReadDocument {
+                        if let Some(target) = &same_document_target {
+                            if request.target.as_ref() == Some(target) {
+                                break;
+                            }
+                        } else {
+                            same_document_target = request.target.clone();
+                        }
+                    }
+                    count += 1;
+                }
+                start + count
             });
             let start = window.end_index() - window.tool_requests().len();
             if start < *network.sequential_until {
                 return Some(RuntimeToolDispatch::Normal(current));
             }
-            if window.tool_requests().len() > 1
+            if !self.network_sequential
+                && window.tool_requests().len() > 1
                 && window.tool_requests().iter().any(is_network_read)
             {
                 if !sampling_state.permission_overlay.strict_auto_review()
@@ -360,6 +390,86 @@ mod tests {
 
         assert!(matches!(dispatch, RuntimeToolDispatch::ReadonlyBatch(_)));
         assert_eq!(ids(&dispatch), vec!["read-a", "read-b"]);
+    }
+
+    #[test]
+    fn scheduler_serializes_billed_network_reads_when_the_operation_has_a_budget() {
+        let mut config = config();
+        config.budget.max_cost_usd_micros = Some(1_000);
+        let fetch = |id: &str| ToolRequest {
+            raw_arguments: Some(json!({"url": "https://example.com/"}).to_string()),
+            ..request(id, ToolName::WebFetch, ActionKind::Network)
+        };
+        let requests = [fetch("first"), fetch("second")];
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
+            .next_dispatch(
+                &RuntimeSamplingRequestState::new(),
+                &requests,
+                Some(NetworkReadScheduling {
+                    policy: &policy,
+                    mcp_registry: &McpRegistry::default(),
+                    sequential_until: &mut 0,
+                    tool_allowed: &|_| true,
+                }),
+            )
+            .expect("dispatch");
+
+        assert!(matches!(dispatch, RuntimeToolDispatch::Normal(request) if request.id == "first"));
+    }
+
+    #[test]
+    fn scheduler_limits_a_parallel_window_to_remaining_tool_call_allowance() {
+        let config = config();
+        let fetch = |id: &str| ToolRequest {
+            raw_arguments: Some(json!({"url": "https://example.com/"}).to_string()),
+            ..request(id, ToolName::WebFetch, ActionKind::Network)
+        };
+        let requests = [fetch("first"), fetch("second")];
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
+            .with_parallel_limit(Some(1))
+            .next_dispatch(
+                &RuntimeSamplingRequestState::new(),
+                &requests,
+                Some(NetworkReadScheduling {
+                    policy: &policy,
+                    mcp_registry: &McpRegistry::default(),
+                    sequential_until: &mut 0,
+                    tool_allowed: &|_| true,
+                }),
+            )
+            .expect("dispatch");
+
+        assert!(matches!(dispatch, RuntimeToolDispatch::Normal(request) if request.id == "first"));
+    }
+
+    #[test]
+    fn scheduler_serializes_same_document_reads() {
+        let config = config();
+        let read = |id: &str, offset: u64| ToolRequest {
+            raw_arguments: Some(json!({"path": "paper.pdf", "offset": offset}).to_string()),
+            ..ToolRequest {
+                target: Some("paper.pdf".to_string()),
+                ..request(id, ToolName::ReadDocument, ActionKind::Read)
+            }
+        };
+        let requests = [read("first", 0), read("second", 100)];
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
+            .next_dispatch(
+                &RuntimeSamplingRequestState::new(),
+                &requests,
+                Some(NetworkReadScheduling {
+                    policy: &policy,
+                    mcp_registry: &McpRegistry::default(),
+                    sequential_until: &mut 0,
+                    tool_allowed: &|_| true,
+                }),
+            )
+            .expect("dispatch");
+
+        assert!(matches!(dispatch, RuntimeToolDispatch::Normal(request) if request.id == "first"));
     }
 
     #[test]

@@ -530,7 +530,24 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             });
         }
 
+        let remaining_tool_calls = operation.as_ref().and_then(|operation| {
+            operation
+                .controller
+                .spec()
+                .max_tool_calls
+                .map(|limit| {
+                    usize::try_from(
+                        limit.saturating_sub(operation.controller.usage().tool_calls),
+                    )
+                    .unwrap_or(usize::MAX)
+                })
+        });
+        let operation_has_budget = operation
+            .as_ref()
+            .is_some_and(|operation| !operation.controller.spec().is_unlimited());
         let Some(dispatch) = RuntimeToolDispatchScheduler::new(config, subagent_depth)
+            .with_parallel_limit(remaining_tool_calls)
+            .with_network_sequential(operation_has_budget)
             .next_dispatch(
                 sampling_state,
                 tool_requests,
