@@ -661,7 +661,7 @@ impl EventFactory {
             "id": result.id,
             "name": result.name,
             "status": result.status,
-            "output": result.output,
+            "output": result.output_preview(),
             "error": result.error,
             "exit_code": result.exit_code,
             "truncated": result.truncated,

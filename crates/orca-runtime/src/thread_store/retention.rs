@@ -9,6 +9,99 @@ use serde::Serialize;
 
 use super::{assets, local, session_index, writer};
 
+const PENDING_SUFFIX: &str = ".pending-delete";
+
+fn pending_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(PENDING_SUFFIX);
+    name.into()
+}
+
+pub(super) fn original_path(pending: &Path) -> Option<PathBuf> {
+    let name = pending
+        .file_name()?
+        .to_str()?
+        .strip_suffix(PENDING_SUFFIX)?;
+    Some(pending.with_file_name(name))
+}
+
+pub(super) fn find_pending_delete(selector: &str) -> io::Result<Option<PathBuf>> {
+    let mut matches = Vec::new();
+    for root in [local::sessions_dir(), local::archive_dir()] {
+        if root.exists() {
+            local::collect_pending_deletions(&root, &mut |pending| {
+                let Some(path) = original_path(pending) else {
+                    return;
+                };
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(selector))
+                    || local::storage_identity_for_path(&path) == selector
+                    || writer::read_session_meta(pending)
+                        .is_ok_and(|meta| meta.session_id == selector)
+                {
+                    matches.push(path);
+                }
+            })?;
+        }
+    }
+    Ok(matches
+        .into_iter()
+        .max_by(|a, b| a.file_name().cmp(&b.file_name())))
+}
+
+/// Called while holding the original transcript's owner and append locks.
+pub(super) fn finish_delete(path: &Path) -> io::Result<()> {
+    let pending = pending_path(path);
+    match fs::symlink_metadata(&pending) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            orca_platform::fs::move_file_for_cleanup(path, &pending)?;
+        }
+        Err(error) => return Err(error),
+        Ok(metadata) if !metadata.file_type().is_file() || path.exists() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "pending session path already exists",
+            ));
+        }
+        Ok(_) => {
+            #[cfg(unix)]
+            fs::File::open(pending.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+        }
+    }
+    let _ = session_index::remove_path(path);
+    assets::remove_directory(path)?;
+    let spill = super::spill::directory_for_transcript(&pending);
+    super::spill::remove(spill.as_deref())?;
+    fs::remove_file(pending)
+}
+
+fn pending_bytes(path: &Path) -> u64 {
+    let pending = pending_path(path);
+    // Cleanup may have reached only part of a sidecar directory.
+    let regular_bytes = |dir: &Path| {
+        if !fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+            return 0;
+        }
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::symlink_metadata(entry.path()).ok())
+            .filter(|meta| meta.is_file())
+            .fold(0u64, |total, meta| total.saturating_add(meta.len()))
+    };
+    fs::symlink_metadata(&pending)
+        .map_or(0, |meta| meta.len())
+        .saturating_add(regular_bytes(&assets::directory(path)))
+        .saturating_add(
+            super::spill::directory_for_transcript(&pending)
+                .as_deref()
+                .map_or(0, regular_bytes),
+        )
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SessionRetentionPolicy {
     /// Target disk usage across active and archived transcripts plus images.
@@ -89,7 +182,10 @@ fn session_bytes(path: &Path) -> io::Result<u64> {
     if !metadata.file_type().is_file() {
         return Err(io::Error::other("retention requires a regular transcript"));
     }
-    let mut bytes = metadata.len();
+    let spill = super::spill::directory_for_transcript(path);
+    let mut bytes = metadata
+        .len()
+        .saturating_add(super::spill::size(spill.as_deref())?);
     let root = assets::directory(path);
     match fs::symlink_metadata(&root) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(bytes),
@@ -142,12 +238,27 @@ pub fn retain_sessions(
         ));
     }
     let mut entries = Vec::new();
+    let mut pending = Vec::new();
     for root in [local::sessions_dir(), local::archive_dir()] {
         if root.exists() {
             local::collect_session_files(&root, &mut |path| entries.push(path.to_path_buf()))?;
+            local::collect_pending_deletions(&root, &mut |path| {
+                pending.extend(original_path(path))
+            })?;
         }
     }
     let mut bytes_before = 0u64;
+    let mut candidates = Vec::new();
+    for path in pending {
+        let bytes = pending_bytes(&path);
+        bytes_before = bytes_before.saturating_add(bytes);
+        candidates.push(SessionRetentionCandidate {
+            modified_at: fs::metadata(pending_path(&path))?.modified()?.into(),
+            path,
+            bytes,
+        });
+    }
+    let pending_count = candidates.len();
     let mut archived = Vec::new();
     for path in entries {
         let bytes = session_bytes(&path)?;
@@ -162,8 +273,9 @@ pub fn retain_sessions(
     }
     archived.sort_by(|a, b| a.modified_at.cmp(&b.modified_at).then(a.path.cmp(&b.path)));
     let now = Utc::now();
-    let mut projected_bytes = bytes_before;
-    let mut candidates = Vec::new();
+    let mut projected_bytes = candidates
+        .iter()
+        .fold(bytes_before, |total, item| total.saturating_sub(item.bytes));
     for entry in archived {
         let expired = policy.older_than_days.is_some_and(|days| {
             now.signed_duration_since(entry.modified_at)
@@ -190,7 +302,8 @@ pub fn retain_sessions(
         applied: apply,
     };
     if apply {
-        for candidate in &report.candidates {
+        for (index, candidate) in report.candidates.iter().enumerate() {
+            let resuming = index < pending_count;
             // Same lease used by the hosted runtime; acquiring it here prevents
             // a concurrent resume from racing the retention decision.
             let Ok(_owner) = acquire_idle_owner(&candidate.path) else {
@@ -198,20 +311,33 @@ pub fn retain_sessions(
                 continue;
             };
             let _append = writer::acquire_file_lock(&candidate.path)
-                .map_err(|error| retention_error(&report, &candidate.path, false, error))?;
-            let unchanged = fs::metadata(&candidate.path)
-                .and_then(|meta| meta.modified())
-                .is_ok_and(|time| DateTime::<Utc>::from(time) == candidate.modified_at)
-                && session_bytes(&candidate.path).ok() == Some(candidate.bytes);
+                .map_err(|error| retention_error(&report, &candidate.path, resuming, error))?;
+            let unchanged = if resuming {
+                pending_path(&candidate.path).is_file()
+            } else {
+                fs::metadata(&candidate.path)
+                    .and_then(|meta| meta.modified())
+                    .is_ok_and(|time| DateTime::<Utc>::from(time) == candidate.modified_at)
+                    && session_bytes(&candidate.path).ok() == Some(candidate.bytes)
+            };
             if !unchanged {
                 report.skipped.push(candidate.path.clone());
                 continue;
             }
-            fs::remove_file(&candidate.path)
-                .map_err(|error| retention_error(&report, &candidate.path, false, error))?;
-            assets::remove_directory(&candidate.path)
-                .map_err(|error| retention_error(&report, &candidate.path, true, error))?;
-            let _ = session_index::remove_path(&candidate.path);
+            if let Err(error) = finish_delete(&candidate.path) {
+                let removed = !candidate.path.exists();
+                let failed_path = candidate.path.clone();
+                if removed {
+                    report.bytes_after = report
+                        .bytes_after
+                        .saturating_sub(candidate.bytes)
+                        .saturating_add(pending_bytes(&failed_path));
+                }
+                report.quota_satisfied = policy
+                    .max_bytes
+                    .is_none_or(|limit| report.bytes_after <= limit);
+                return Err(retention_error(&report, &failed_path, removed, error));
+            }
             report.bytes_after = report.bytes_after.saturating_sub(candidate.bytes);
             report.deleted.push(candidate.path.clone());
         }

@@ -14,7 +14,6 @@ use orca_core::conversation::{Message, SummaryState, is_internal_image_analysis}
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventEnvelope, EventPublicationStore, EventType};
 use orca_core::plan_types::{PlanItem, PlanStatus};
-use orca_core::redaction::redact_sensitive_text;
 use orca_core::thread_identity::{ConversationItemId, TurnId};
 use orca_core::thread_item_projection::CompletedModelResponse;
 use orca_core::tool_images::{
@@ -30,6 +29,7 @@ use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 
 use super::assets::{self, HydrateImages};
 use super::reader::{INDEX_BUDGET, SessionRecords, iter_records};
+use super::redact_sensitive_text;
 #[cfg(not(test))]
 use super::session_index;
 use super::types::{
@@ -105,6 +105,13 @@ pub(crate) fn read_manual_compaction_snapshot(
         conversation.messages = record.messages.into_iter().map(Message::from).collect();
         conversation.rolling_summary = record.rolling_summary;
         conversation.summary = record.summary_state;
+        conversation.nested_instructions.versions = record
+            .nested_instructions
+            .into_iter()
+            .map(|version| (version.identity.source.clone(), version))
+            .collect();
+        conversation.nested_instructions.written_sources =
+            record.written_instruction_sources.into_iter().collect();
         ManualCompactionDurableSnapshot {
             operation_id: record.operation_id,
             strategy: record.strategy,
@@ -1406,11 +1413,29 @@ pub(crate) fn transcript_from_records(
     let mut completion_error = None;
     let mut next_event_seq = 0;
     let mut semantic_events = Vec::new();
+    let mut nested_instructions = BTreeMap::new();
+    let mut written_instruction_sources = Vec::new();
 
     for record in records {
         match record? {
             SessionRecord::Meta(m) => meta = Some(m),
             SessionRecord::Message { message, .. } => {
+                if let StoredMessage::System {
+                    content,
+                    nested_instruction: Some(identity),
+                    ..
+                } = &message
+                {
+                    written_instruction_sources
+                        .retain(|path| path != &identity.workspace.join(&identity.source));
+                    nested_instructions.insert(
+                        identity.source.clone(),
+                        orca_core::conversation::NestedInstructionVersion {
+                            identity: *identity.clone(),
+                            content: content.clone(),
+                        },
+                    );
+                }
                 messages.push(message.into());
             }
             SessionRecord::Completed { status, error, .. } => {
@@ -1429,6 +1454,10 @@ pub(crate) fn transcript_from_records(
             SessionRecord::ContextSummary(record) => summaries.push(record),
             SessionRecord::ManualCompactionSnapshot(record) => {
                 let after_messages = record.messages.len();
+                written_instruction_sources = record.written_instruction_sources;
+                for version in record.nested_instructions {
+                    nested_instructions.insert(version.identity.source.clone(), version);
+                }
                 messages = record.messages.into_iter().map(Message::from).collect();
                 compactions.clear();
                 summaries.clear();
@@ -1523,6 +1552,8 @@ pub(crate) fn transcript_from_records(
         next_event_seq,
         semantic_events,
         path: path.to_path_buf(),
+        nested_instructions: nested_instructions.into_values().collect(),
+        written_instruction_sources,
     })
 }
 
@@ -1595,6 +1626,9 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
         SessionRecord::ManualCompactionSnapshot(record) => {
             for message in &mut record.messages {
                 redact_stored_message(message);
+            }
+            for version in &mut record.nested_instructions {
+                redact_string_in_place(&mut version.content);
             }
             if let Some(summary) = &mut record.rolling_summary {
                 redact_string_in_place(summary);
@@ -1675,7 +1709,14 @@ fn redact_stored_message(message: &mut StoredMessage) {
         StoredMessage::Tool {
             content, terminal, ..
         } => {
-            redact_string_in_place(content);
+            if let Some(spill) = terminal
+                .terminal_ref()
+                .and_then(|terminal| terminal.spill.as_deref())
+            {
+                *content = spill.render(&redact_sensitive_text(spill.preview(content)));
+            } else {
+                redact_string_in_place(content);
+            }
             if let Some(error) = terminal.error_mut() {
                 redact_string_in_place(error);
             }
@@ -1944,6 +1985,26 @@ impl SessionWriter {
                     "conversation message append requires an active turn identity",
                 ));
             }
+        };
+        self.append_conversation_record(record)
+    }
+
+    pub(crate) fn append_nested_instruction(
+        &mut self,
+        version: &orca_core::conversation::NestedInstructionVersion,
+    ) -> io::Result<()> {
+        let message = StoredMessage::System {
+            content: version.content.clone(),
+            pinned: false,
+            nested_instruction: Some(Box::new(version.identity.clone())),
+        };
+        let record = match &self.turn_id {
+            Some(turn) => StoredConversationRecord::identified(
+                ConversationItemId::new(),
+                turn.clone(),
+                message,
+            ),
+            None => StoredConversationRecord::legacy(message),
         };
         self.append_conversation_record(record)
     }
@@ -2282,6 +2343,22 @@ impl SessionWriter {
             messages: messages.iter().map(StoredMessage::from).collect(),
             rolling_summary: conversation.rolling_summary.clone(),
             summary_state: conversation.summary.clone(),
+            nested_instructions: conversation
+                .nested_instructions
+                .versions
+                .values()
+                .cloned()
+                .collect(),
+            written_instruction_sources: {
+                let mut sources = conversation
+                    .nested_instructions
+                    .written_sources
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                sources.sort();
+                sources
+            },
         });
         let result = write_durable_record(&self.path, &record);
         #[cfg(test)]
@@ -2907,6 +2984,7 @@ mod tests {
         compacted.summary = orca_core::conversation::SummaryState {
             baseline: Some("baseline".to_string()),
             deltas: vec!["delta".to_string()],
+            ..Default::default()
         };
         let identity = crate::session::ManualCompactionPersistenceIdentity {
             operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
@@ -3308,9 +3386,10 @@ mod tests {
             redact_sensitive_text("db.password=hunter2"),
             "db.password=<redacted>"
         );
+        let redacted = redact_sensitive_text(r#"{"refresh_token": "abc"}"#);
         assert_eq!(
-            redact_sensitive_text(r#"{"refresh_token": "abc"}"#),
-            r#"{"refresh_token": "<redacted>"}"#
+            serde_json::from_str::<serde_json::Value>(&redacted).unwrap(),
+            serde_json::json!({"refresh_token": "<redacted>"})
         );
     }
 

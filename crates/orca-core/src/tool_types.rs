@@ -1,10 +1,95 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::approval_types::ActionKind;
 use crate::conversation::ImageInput;
+
+const SPILL_NOTICE_PREFIX: &str = " bytes omitted. The full result is saved at ";
+const SPILL_NOTICE_SUFFIX: &str =
+    "; read it with read_file using unit=bytes, offset and limit, or search it with grep.]";
+
+pub fn tool_output_spill_notice(omitted: usize, path: &str) -> String {
+    format!("[{omitted}{SPILL_NOTICE_PREFIX}{path}{SPILL_NOTICE_SUFFIX}")
+}
+
+/// A saved result belongs to one session directory and one invocation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolOutputSpill {
+    directory: PathBuf,
+    tool_call_id: String,
+    omitted_bytes: usize,
+}
+
+impl ToolOutputSpill {
+    pub fn new(directory: PathBuf, tool_call_id: String, omitted_bytes: usize) -> Option<Self> {
+        directory.is_absolute().then_some(Self {
+            directory,
+            tool_call_id,
+            omitted_bytes,
+        })
+    }
+
+    pub fn belongs_to(&self, directory: &std::path::Path, tool_call_id: &str) -> bool {
+        self.belongs_to_directory(directory) && self.matches_call(tool_call_id)
+    }
+
+    pub fn belongs_to_directory(&self, directory: &std::path::Path) -> bool {
+        self.directory == directory
+    }
+
+    pub fn matches_call(&self, tool_call_id: &str) -> bool {
+        self.tool_call_id == tool_call_id
+    }
+
+    pub fn path(&self) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let id = &self.tool_call_id;
+        let name = if !id.is_empty()
+            && id.len() <= 120
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            && orca_platform::fs::PathIdentity::windows(&format!("C:\\{id}.txt")).is_ok()
+        {
+            id.clone()
+        } else {
+            crate::hex::lower(&Sha256::digest(id.as_bytes()))
+        };
+        self.directory.join(format!("{name}.txt"))
+    }
+
+    pub fn notice(&self) -> String {
+        tool_output_spill_notice(self.omitted_bytes, &self.path().display().to_string())
+    }
+
+    /// Remove only the exact notice rendered from this structured reference.
+    pub fn preview<'a>(&self, content: &'a str) -> &'a str {
+        content
+            .strip_suffix(&format!("\n\n{}", self.notice()))
+            .unwrap_or(content)
+    }
+
+    pub fn render(&self, preview: &str) -> String {
+        format!("{preview}\n\n{}", self.notice())
+    }
+
+    pub fn unavailable(&self, preview: &str, reason: &str) -> String {
+        format!(
+            "{preview}\n\n[{} bytes omitted. {reason}]",
+            self.omitted_bytes
+        )
+    }
+
+    pub fn in_directory(&self, directory: PathBuf) -> Self {
+        Self {
+            directory,
+            ..self.clone()
+        }
+    }
+}
 
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
@@ -677,6 +762,8 @@ pub struct ToolTerminal {
         skip_serializing_if = "ToolInvocationStarted::is_unknown"
     )]
     pub started: ToolInvocationStarted,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spill: Option<Box<ToolOutputSpill>>,
 }
 
 impl ToolTerminal {
@@ -704,6 +791,7 @@ impl ToolTerminal {
             kind,
             source,
             started,
+            spill: None,
         })
     }
 
@@ -741,6 +829,8 @@ struct ToolTerminalWire {
     source: ToolTerminalSource,
     #[serde(default, rename = "invocation_started")]
     started: ToolInvocationStarted,
+    #[serde(default)]
+    spill: Option<Box<ToolOutputSpill>>,
 }
 
 impl<'de> Deserialize<'de> for ToolTerminal {
@@ -758,6 +848,10 @@ impl<'de> Deserialize<'de> for ToolTerminal {
             wire.source,
             wire.started,
         )
+        .map(|mut terminal| {
+            terminal.spill = wire.spill;
+            terminal
+        })
         .map_err(serde::de::Error::custom)
     }
 }
@@ -811,6 +905,8 @@ pub struct ToolResult {
     pub images: Vec<ImageInput>,
     #[serde(skip)]
     pub file_change_preview: Option<Arc<FileChangePreview>>,
+    #[serde(skip)]
+    pub touched_file: Option<PathBuf>,
     /// What the tool wrote for the person watching while it ran, when that
     /// is to be kept with the conversation. It is never sent to the model.
     /// Only `run_script` sets it, to the lines that say what its calls did.
@@ -861,6 +957,23 @@ impl ToolResult {
         self.terminal.truncated = truncated;
     }
 
+    /// A preview for event and display records. Saved-result locations are
+    /// rendered from the reference on the model-facing conversation item.
+    pub fn output_preview(&self) -> Option<&str> {
+        self.output.as_deref().map(|output| {
+            self.spill
+                .as_ref()
+                .filter(|spill| spill.matches_call(&self.id))
+                .map_or(output, |spill| spill.preview(output))
+        })
+    }
+
+    pub fn set_spill(&mut self, spill: ToolOutputSpill) {
+        debug_assert!(spill.matches_call(&self.id));
+        self.terminal.spill = Some(Box::new(spill));
+        self.set_truncated(true);
+    }
+
     /// A tool call that started work which is still running.
     ///
     /// This is deliberately not `completed`: the side effect has not
@@ -882,6 +995,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -904,6 +1018,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -941,6 +1056,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -996,6 +1112,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1018,6 +1135,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1040,6 +1158,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1075,6 +1194,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
@@ -1121,10 +1241,16 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
+            touched_file: None,
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
             observed_shell_completions: Vec::new(),
         }
+    }
+
+    pub fn with_touched_file(mut self, path: PathBuf) -> Self {
+        self.touched_file = Some(path);
+        self
     }
 
     pub fn with_file_change_preview(mut self, preview: FileChangePreview) -> Self {
@@ -1515,6 +1641,7 @@ mod tests {
             kind: ToolResultKind::Indeterminate,
             source: ToolTerminalSource::CompatibilityRepair,
             started: ToolInvocationStarted::Unknown,
+            spill: None,
         };
 
         let value = serde_json::to_value(terminal).unwrap();
@@ -1549,6 +1676,7 @@ mod tests {
                 kind: ToolResultKind::Cancelled,
                 source: ToolTerminalSource::Observed,
                 started: ToolInvocationStarted::Yes,
+                spill: None,
             }
         );
 

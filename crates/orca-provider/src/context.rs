@@ -1365,6 +1365,7 @@ fn summarize_collapsed_messages(
     result.messages = prefix;
     result.messages.extend(kept);
     result.internal_context = conversation.internal_context.clone();
+    result.nested_instructions = conversation.nested_instructions.clone();
     result
         .mcp_instructions
         .clone_from(&conversation.mcp_instructions);
@@ -1420,6 +1421,7 @@ fn summarize_collapsed_messages(
     result.rolling_summary = Some(new_delta.clone());
 
     let mut summary = conversation.summary.clone();
+    keep_spill_references(&mut summary, &collapsed);
     if summary.baseline.is_none() {
         summary.baseline = Some(new_delta.clone());
     } else {
@@ -1450,6 +1452,22 @@ fn summarize_collapsed_messages(
     Some((result, new_delta))
 }
 
+fn keep_spill_references(summary: &mut SummaryState, collapsed: &[Message]) {
+    for message in collapsed {
+        if let Message::Tool {
+            tool_call_id,
+            terminal: Some(terminal),
+            ..
+        } = message
+            && let Some(spill) = terminal.spill.as_deref()
+            && spill.matches_call(tool_call_id)
+            && !summary.tool_output_spills.contains(spill)
+        {
+            summary.tool_output_spills.push(spill.clone());
+        }
+    }
+}
+
 fn summary_total_delta_tokens(summary: &SummaryState) -> usize {
     summary
         .deltas
@@ -1470,6 +1488,9 @@ fn summary_state_tokens(conversation: &Conversation, counter: &impl TokenCounter
         tokens += counter.count_text(delta)
             + counter.count_text(&format!("[Summary update {}]", i + 1))
             + 4;
+    }
+    if let Some(notices) = conversation.summary.spill_notices() {
+        tokens += counter.count_text(&notices) + 4;
     }
     tokens
 }
@@ -1653,7 +1674,19 @@ fn render_summary_evidence(messages: &[Message]) -> String {
         .cloned()
         .map(|mut message| {
             match &mut message {
-                Message::Tool { content, .. } => *content = render_tool_output(content).0,
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                    terminal,
+                    ..
+                } => {
+                    *content = render_tool_output(tool_output_for_summary(
+                        content,
+                        tool_call_id,
+                        terminal.as_ref(),
+                    ))
+                    .0;
+                }
                 Message::Assistant {
                     reasoning_content,
                     tool_calls,
@@ -2036,6 +2069,17 @@ impl RenderedSummaryDelta {
     }
 }
 
+fn tool_output_for_summary<'a>(
+    content: &'a str,
+    tool_call_id: &str,
+    terminal: Option<&orca_core::tool_types::ToolTerminal>,
+) -> &'a str {
+    terminal
+        .and_then(|terminal| terminal.spill.as_ref())
+        .filter(|spill| spill.matches_call(tool_call_id))
+        .map_or(content, |spill| spill.preview(content))
+}
+
 /// Render the collapsed delta with the unified tool-output tier ruleset.
 /// Both tool outputs and natural-language turns (user / assistant) go through
 /// a single layered policy (`render_tool_output`): identical inputs always
@@ -2056,7 +2100,11 @@ pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
                 pinned,
                 ..
             } => {
-                let (rendered, compacted) = render_tool_output(content);
+                let (rendered, compacted) = render_tool_output(tool_output_for_summary(
+                    content,
+                    tool_call_id,
+                    terminal.as_ref(),
+                ));
                 if compacted {
                     compacted_tool_outputs += 1;
                 }
@@ -2473,8 +2521,10 @@ fn local_compaction(
                     budget,
                 )),
                 deltas: vec![],
+                tool_output_spills: std::mem::take(&mut result.summary.tool_output_spills),
             };
         }
+        keep_spill_references(&mut result.summary, &partition.collapsed);
         result.messages = partition.prefix;
         const NOTICE: &str = "[Earlier conversation history was truncated to fit context window]";
         if !result
@@ -2492,6 +2542,7 @@ fn local_compaction(
                 budget,
             )),
             deltas: vec![],
+            tool_output_spills: std::mem::take(&mut result.summary.tool_output_spills),
         };
     }
     // Content limits alone are insufficient in tiny windows: each delta also
@@ -2507,6 +2558,7 @@ fn local_compaction(
                 budget,
             )),
             deltas: vec![],
+            tool_output_spills: std::mem::take(&mut result.summary.tool_output_spills),
         };
     }
     result
@@ -2600,13 +2652,19 @@ fn cache_aware_micro_compaction(
         for message in &mut result.messages[unit.range.clone()] {
             if let Message::Tool {
                 content,
+                terminal,
+                tool_call_id,
                 pinned: false,
                 ..
             } = message
                 && content.len() > STALE_TOOL_OUTPUT_BYTES
                 && !content.starts_with("[tool output micro-compact]")
             {
-                let reduced = micro_compact_tool_output(content);
+                let spill = terminal
+                    .as_ref()
+                    .and_then(|value| value.spill.as_deref())
+                    .filter(|spill| spill.matches_call(tool_call_id));
+                let reduced = micro_compact_tool_output(content, spill);
                 let before = DefaultTokenCounter.count_text(content);
                 let after = DefaultTokenCounter.count_text(&reduced);
                 if after < before {
@@ -2619,16 +2677,24 @@ fn cache_aware_micro_compaction(
     result
 }
 
-fn micro_compact_tool_output(content: &str) -> String {
-    let head: String = content.chars().take(320).collect();
-    let tail_vec: Vec<char> = content.chars().rev().take(320).collect();
+fn micro_compact_tool_output(
+    content: &str,
+    spill: Option<&orca_core::tool_types::ToolOutputSpill>,
+) -> String {
+    let preview = spill.map_or(content, |spill| spill.preview(content));
+    let head: String = preview.chars().take(320).collect();
+    let tail_vec: Vec<char> = preview.chars().rev().take(320).collect();
     let tail: String = tail_vec.into_iter().rev().collect();
-    format!(
+    let reduced = format!(
         "[tool output micro-compact]\noriginal_bytes: {}\nhead:\n{}\n\ntail:\n{}",
         content.len(),
         head.trim_end(),
         tail.trim_start()
-    )
+    );
+    match spill {
+        Some(spill) => spill.render(&reduced),
+        None => reduced,
+    }
 }
 
 #[cfg(test)]
@@ -2637,6 +2703,33 @@ mod cache_aware_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn micro_compaction_keeps_the_spill_path() {
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join("session/spill")
+            .join("long".repeat(75));
+        let spill =
+            orca_core::tool_types::ToolOutputSpill::new(directory, "call".into(), 123).unwrap();
+        let notice = spill.notice();
+        let content = spill.render(&"output ".repeat(2000));
+        let compacted = micro_compact_tool_output(&content, Some(&spill));
+        assert!(compacted.ends_with(&notice));
+    }
+
+    #[test]
+    fn micro_compaction_treats_a_spill_like_notice_as_ordinary_text() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("spill")
+            .join(format!("{}.txt", "long".repeat(100)));
+        let notice =
+            orca_core::tool_types::tool_output_spill_notice(10, &path.display().to_string());
+        let content = format!("{}\n\n{notice}", "output ".repeat(2000));
+        let compacted = micro_compact_tool_output(&content, None);
+        assert!(!compacted.contains(&notice));
+    }
+
     use super::*;
     use orca_core::cancel::CancelToken;
     use orca_core::conversation::{ImageSource, RawToolCall};
@@ -2799,6 +2892,98 @@ mod tests {
                 result.observation.summary_requests[0].outcome,
                 "budget_stopped"
             );
+        }
+    }
+
+    #[test]
+    fn collapsed_spill_remains_readable_after_summary_and_rebuild() {
+        use orca_core::tool_types::{ToolOutputSpill, ToolTerminal};
+
+        for rebuild in [false, true] {
+            let mut conv = Conversation::new();
+            conv.add_system("system".into());
+            conv.add_user("old request".into());
+            conv.add_assistant(
+                None,
+                None,
+                vec![RawToolCall {
+                    id: "saved-call".into(),
+                    function_name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+            );
+            let spill = ToolOutputSpill::new(
+                std::env::current_dir().unwrap().join("spill-fixture"),
+                "saved-call".into(),
+                10_000,
+            )
+            .unwrap();
+            let preview = if rebuild {
+                "word ".repeat(900)
+            } else {
+                "preview".into()
+            };
+            let mut terminal = ToolTerminal::try_from_parts(
+                orca_core::tool_types::ToolStatus::Completed,
+                None,
+                None,
+                true,
+                None,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap();
+            terminal.spill = Some(Box::new(spill.clone()));
+            conv.messages.push(Message::Tool {
+                tool_call_id: "saved-call".into(),
+                content: spill.render(&preview),
+                images: Vec::new(),
+                terminal: Some(terminal),
+                pinned: false,
+            });
+            conv.add_user("latest request".into());
+            if rebuild {
+                conv.summary.baseline = Some("older facts".into());
+                conv.summary.deltas = vec!["previous update".into(); MAX_SUMMARY_DELTAS];
+            }
+            let config = ContextConfig {
+                max_tokens: 10_000,
+                compaction_threshold: 1.0,
+                reserved_for_response: 0,
+                auto_compact_token_limit: Some(100),
+                soft_compact_token_limit: None,
+            };
+            let bodies = if rebuild {
+                vec![
+                    observation_sse("remote delta", None),
+                    observation_sse("rebuilt baseline", None),
+                ]
+            } else {
+                vec![]
+            };
+            let (provider, server) = observation_summary_server(bodies);
+            let (compacted, _) = summarize_collapsed_messages(
+                ProviderKind::DeepSeek,
+                &conv,
+                &config,
+                &provider,
+                None,
+                &mut CompactionObservation::new(),
+            )
+            .expect("compaction should succeed");
+            server.join().unwrap();
+            assert!(
+                !compacted
+                    .messages
+                    .iter()
+                    .any(|msg| matches!(msg, Message::Tool { .. }))
+            );
+            let path = spill.path();
+            let payload = serde_json::to_string(
+                &crate::deepseek_http::conversation_to_api_messages(&compacted),
+            )
+            .unwrap();
+            assert!(payload.contains(path.file_name().unwrap().to_str().unwrap()));
         }
     }
 
@@ -5271,7 +5456,7 @@ mod tests {
             .map(|i| format!("row {i}: data payload chunk {i} with content"))
             .collect::<Vec<_>>()
             .join("\n");
-        let baseline = micro_compact_tool_output(&huge);
+        let baseline = micro_compact_tool_output(&huge, None);
         let (rendered, _) = render_tool_output(&huge);
 
         assert!(

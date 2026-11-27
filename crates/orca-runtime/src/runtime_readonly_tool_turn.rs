@@ -22,6 +22,7 @@ use crate::tool_invocation::{
 use crate::tool_turn::{ToolTurnOutcome, record_root_task_output_truncation};
 
 pub(crate) struct RuntimeReadonlyBatchContext<'a, W: io::Write> {
+    pub(crate) spill_directory: Option<&'a Path>,
     pub(crate) cwd: &'a Path,
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
@@ -82,6 +83,7 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
     context: RuntimeReadonlyBatchContext<'_, W>,
 ) -> io::Result<RuntimeReadonlyBatchExecution> {
     let RuntimeReadonlyBatchContext {
+        spill_directory,
         cwd,
         events,
         sink,
@@ -170,6 +172,7 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
                 .iter()
                 .cloned()
                 .map(|request| RuntimeReadonlyToolInvocation {
+                    spill_directory: spill_directory.map(Path::to_path_buf),
                     request,
                     cwd: cwd.to_path_buf(),
                     mcp_registry: mcp_registry.clone(),
@@ -312,6 +315,7 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
         root_task_id,
     } = services;
     let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+        spill_directory: task_registry.and_then(TaskRegistry::spill_directory),
         cwd,
         events,
         sink,
@@ -402,6 +406,7 @@ mod tests {
         let mut events = EventFactory::new("readonly-target".to_string());
         let mut bytes = Vec::new();
         let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+            spill_directory: None,
             cwd: cwd.path(),
             events: &mut events,
             sink: &mut EventSink::new(&mut bytes, OutputFormat::Jsonl),
@@ -493,6 +498,7 @@ mod tests {
         let hooks = HookRunner::default();
 
         let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+            spill_directory: None,
             cwd: Path::new("."),
             events: &mut events,
             sink: &mut sink,
@@ -774,6 +780,7 @@ mod tests {
             }
             let mut sink = EventSink::new(writer, generation.config().output_format);
             let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+                spill_directory: None,
                 cwd: generation
                     .config()
                     .cwd
@@ -922,6 +929,7 @@ mod tests {
             let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
             let hooks = HookRunner::default();
             let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+                spill_directory: None,
                 cwd: Path::new("."),
                 events: &mut events,
                 sink: &mut sink,

@@ -101,6 +101,16 @@ pub fn execute_or_cancel(
     deepseek: Option<&DeepSeekWebAccess>,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
+    execute_in_session(request, max_bytes, deepseek, None, should_cancel)
+}
+
+pub(crate) fn execute_in_session(
+    request: &ToolRequest,
+    max_bytes: usize,
+    deepseek: Option<&DeepSeekWebAccess>,
+    spill_dir: Option<&std::path::Path>,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let args = match parse_args(request) {
         Ok(args) => args,
         Err(error) => return ToolResult::failed(request, error, None),
@@ -141,8 +151,10 @@ pub fn execute_or_cancel(
                 deepseek_searches: output.deepseek_searches,
                 ..ToolServiceUsage::default()
             };
-            let (text, truncated) = truncate_output(output.text, max_bytes);
-            ToolResult::completed(request, text, truncated).with_service_usage(usage)
+            crate::spill::completed_text(request, output.text, spill_dir, |text| {
+                truncate_output(text, max_bytes)
+            })
+            .with_service_usage(usage)
         }
         Err(SearchError::Cancelled) => {
             ToolResult::cancelled(request, "web search was cancelled", None)

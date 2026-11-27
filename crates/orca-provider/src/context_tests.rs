@@ -67,7 +67,7 @@ fn cache_aware_reduction_preserves_more_prefix_than_eager_micro_ab() {
     let mut eager = before.clone();
     for message in &mut eager.messages {
         if let Message::Tool { content, .. } = message {
-            *content = micro_compact_tool_output(content);
+            *content = micro_compact_tool_output(content, None);
         }
     }
     let result = compact_with_summary(ProviderKind::DeepSeek, &before, &config, &provider);
@@ -467,7 +467,7 @@ fn calibrated_micro_compaction_stops_once_the_scaled_estimate_is_under_target() 
             _ => None,
         })
         .unwrap();
-    *last_output = micro_compact_tool_output(last_output);
+    *last_output = micro_compact_tool_output(last_output, None);
     let saving = estimated - wire_equivalent_tokens(&shortened, &provider);
     // The micro target (9/10 of the soft line) sits halfway between two and
     // three shortened outputs on the provider's scale.

@@ -453,7 +453,13 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 pub fn format_tool_result_for_model(result: &ToolResult) -> String {
     match (&result.output, &result.error) {
         (Some(output), _) => {
-            if result.truncated {
+            if let Some(spill) = result
+                .spill
+                .as_ref()
+                .filter(|spill| spill.matches_call(&result.id))
+            {
+                spill.render(spill.preview(output))
+            } else if result.truncated {
                 format!("{output}\n[output truncated]")
             } else {
                 output.clone()
@@ -479,6 +485,52 @@ pub fn requires_approval(action: ActionKind) -> bool {
 mod tests {
     use super::*;
     use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus};
+    use orca_core::tool_types::{ToolName, ToolRequest};
+
+    #[test]
+    fn spill_like_tool_text_keeps_the_truncation_notice() {
+        let request = ToolRequest {
+            id: "ordinary".into(),
+            name: ToolName::WebFetch,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let path = std::env::current_dir().unwrap().join("spill/ordinary.txt");
+        let notice =
+            orca_core::tool_types::tool_output_spill_notice(10, &path.display().to_string());
+        let output = format!("head\n\n{notice}");
+        let result = ToolResult::completed(&request, output.clone(), true);
+        assert_eq!(
+            format_tool_result_for_model(&result),
+            format!("{output}\n[output truncated]")
+        );
+    }
+
+    #[test]
+    fn a_spilled_result_ends_with_the_file_notice() {
+        let request = ToolRequest {
+            id: "spill".into(),
+            name: ToolName::WebFetch,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let path = std::env::temp_dir().join("spill").join("spill.txt");
+        let notice =
+            orca_core::tool_types::tool_output_spill_notice(10, &path.display().to_string());
+        let output = format!("head\n\ntail\n\n{notice}");
+        let mut result = ToolResult::completed(&request, "head\n\ntail".into(), true);
+        result.set_spill(
+            orca_core::tool_types::ToolOutputSpill::new(
+                path.parent().unwrap().to_owned(),
+                request.id.clone(),
+                10,
+            )
+            .unwrap(),
+        );
+        assert_eq!(format_tool_result_for_model(&result), output);
+    }
 
     #[test]
     fn computer_actions_require_approval() {

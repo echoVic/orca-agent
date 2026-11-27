@@ -2571,6 +2571,7 @@ name = "orca-platform"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "tempfile",
@@ -2675,6 +2676,7 @@ dependencies = [
  "sha2 0.11.0",
  "similar",
  "tempfile",
+ "tiktoken-rs",
  "tokio",
  "toml 1.1.7+spec-1.1.0",
  "url",

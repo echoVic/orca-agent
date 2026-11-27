@@ -175,7 +175,7 @@ fn read_utf8_reader_with_limit(
     String::from_utf8(bytes).map_err(|_| FileAdmissionError::InvalidUtf8)
 }
 
-fn stream_utf8_reader<T, F>(
+pub(crate) fn stream_utf8_reader<T, F>(
     mut reader: impl Read,
     declared_bytes: u64,
     mut value: T,

@@ -67,6 +67,7 @@ pub trait Tool: Send + Sync {
 
 pub struct ToolContext<'a> {
     pub cwd: &'a Path,
+    spill_dir: Option<&'a Path>,
     pub output_truncation: ToolOutputTruncation,
     /// How long an external tool may run; `None` sets no limit.
     pub shell_timeout: Option<Duration>,
@@ -85,6 +86,7 @@ impl<'a> ToolContext<'a> {
     pub fn new(cwd: &'a Path) -> Self {
         Self {
             cwd,
+            spill_dir: None,
             output_truncation: ToolOutputTruncation::bytes(MAX_TOOL_OUTPUT_BYTES),
             shell_timeout: Some(Duration::from_secs(120)),
             additional_working_directories: Vec::new(),
@@ -94,6 +96,11 @@ impl<'a> ToolContext<'a> {
             execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             deepseek_web: None,
         }
+    }
+
+    pub fn with_spill_directory(mut self, directory: Option<&'a Path>) -> Self {
+        self.spill_dir = directory;
+        self
     }
 
     pub fn with_deepseek_web(mut self, deepseek_web: Option<DeepSeekWebAccess>) -> Self {
@@ -253,7 +260,11 @@ impl ToolRegistry {
                 format!("tool arguments failed schema validation: {error}"),
             );
         }
-        resolved.tool.execute(request, ctx)
+        let mut result = resolved.tool.execute(request, ctx);
+        if crate::tool_uses_mcp_registry(&resolved.spec.name) {
+            crate::spill::shorten_result(&mut result, ctx.spill_dir);
+        }
+        result
     }
 }
 
@@ -490,12 +501,17 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "offset": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "1-based line number to start reading from. Use for large files."
+                        "description": "1-based line or byte."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Number of lines to read. Use with offset for large files."
+                        "description": "Line or byte count."
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["bytes"],
+                        "description": "Lines unless set for a saved result's absolute path."
                     }
                 },
                 "required": ["path"],
@@ -2051,11 +2067,13 @@ impl Tool for BuiltinTool {
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
         match self.executor {
-            BuiltinExecutor::ReadFile => {
-                read_file::execute_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
-                    ctx.is_cancelled()
-                })
-            }
+            BuiltinExecutor::ReadFile => read_file::execute_in_session(
+                request,
+                ctx.cwd,
+                ctx.max_output_bytes(),
+                ctx.spill_dir,
+                || ctx.is_cancelled(),
+            ),
             BuiltinExecutor::ReadDocument => read_document::execute_or_cancel(
                 request,
                 ctx.cwd,
@@ -2071,11 +2089,13 @@ impl Tool for BuiltinTool {
                     ctx.is_cancelled()
                 })
             }
-            BuiltinExecutor::Grep => {
-                grep::execute_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
-                    ctx.is_cancelled()
-                })
-            }
+            BuiltinExecutor::Grep => grep::execute_in_session(
+                request,
+                ctx.cwd,
+                ctx.max_output_bytes(),
+                ctx.spill_dir,
+                || ctx.is_cancelled(),
+            ),
             // `bash` is the single command entry point and is always executed
             // by the runtime-owned terminal service, which owns process
             // identity, lifetime, and output retention. This arm is the
@@ -2112,16 +2132,18 @@ impl Tool for BuiltinTool {
                     ctx.is_cancelled()
                 })
             }
-            BuiltinExecutor::WebSearch => web_search::execute_or_cancel(
+            BuiltinExecutor::WebSearch => web_search::execute_in_session(
                 request,
                 ctx.max_output_bytes(),
                 ctx.deepseek_web.as_ref(),
+                ctx.spill_dir,
                 || ctx.is_cancelled(),
             ),
-            BuiltinExecutor::WebFetch => web_fetch::execute_or_cancel(
+            BuiltinExecutor::WebFetch => web_fetch::execute_in_session(
                 request,
                 ctx.max_output_bytes(),
                 ctx.deepseek_web.as_ref(),
+                ctx.spill_dir,
                 || ctx.is_cancelled(),
             ),
             BuiltinExecutor::Subagent => ToolResult::failed(
@@ -2549,13 +2571,14 @@ impl Tool for ExternalTool {
     }
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
-        external::execute_external_tool_with_policy_or_cancel_with_profile(
+        external::execute_in_session(
             &self.tool,
             request,
             ctx.cwd,
             ctx.output_truncation,
             ctx.shell_timeout,
             ctx.execution_profile,
+            ctx.spill_dir,
             || ctx.is_cancelled(),
         )
     }
@@ -2567,6 +2590,301 @@ pub fn tool_name_from_schema_name(name: &str) -> Option<ToolName> {
 
 #[cfg(test)]
 mod tests {
+    fn spill_session_context<'a>(workspace: &'a Path, spill: &'a Path) -> ToolContext<'a> {
+        ToolContext::new(workspace).with_spill_directory(Some(spill))
+    }
+
+    fn spill_request(id: &str, name: ToolName, args: Value) -> ToolRequest {
+        ToolRequest {
+            id: id.to_owned(),
+            name,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(args.to_string()),
+        }
+    }
+
+    fn mcp_spill_result(ctx: ToolContext<'_>, text: &str) -> ToolResult {
+        use orca_core::mcp_types::{McpResource, McpResourceContent, ReadResourceResult};
+        let uri = "memo://orca/result";
+        let server = "notes";
+        let mcp = McpRegistry::from_static_resources_for_test(
+            vec![McpResource {
+                server: server.into(),
+                uri: uri.into(),
+                name: "Result".into(),
+                description: None,
+                mime_type: None,
+            }],
+            std::collections::HashMap::from([(
+                (server.into(), uri.into()),
+                ReadResourceResult {
+                    contents: vec![McpResourceContent {
+                        uri: uri.into(),
+                        mime_type: None,
+                        text: Some(text.into()),
+                        blob: None,
+                    }],
+                },
+            )]),
+        );
+        default_tool_registry().execute(
+            &spill_request(
+                "mcp-result",
+                ToolName::ReadMcpResource,
+                json!({"server": server, "uri": uri}),
+            ),
+            &ctx.with_mcp(&mcp),
+        )
+    }
+
+    #[test]
+    fn a_large_mcp_result_is_saved_and_pointed_to() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = tempfile::tempdir().unwrap();
+        let spill = session.path().join("spill");
+        let text = format!("FIRST\n{}\nLAST", " hello".repeat(34_000));
+        let original = mcp_spill_result(ToolContext::new(cwd.path()), &text)
+            .output
+            .unwrap();
+        let result = mcp_spill_result(spill_session_context(cwd.path(), &spill), &text);
+        let output = result.output.unwrap();
+        let file = spill.join("mcp-result.txt");
+        assert!(file.is_file());
+        let (preview, notice) = output.rsplit_once("\n\n").unwrap();
+        let (head, tail) = preview.split_once("\n\n").unwrap();
+        assert!(head.contains("FIRST"));
+        assert!(tail.contains("LAST"));
+        assert_eq!(
+            notice,
+            format!(
+                "[{} bytes omitted. The full result is saved at {}; read it with read_file using unit=bytes, offset and limit, or search it with grep.]",
+                original.len() - head.len() - tail.len(),
+                file.display()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn a_storage_failure_keeps_the_original_result() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = tempfile::tempdir().unwrap();
+        let blocked = session.path().join("blocked");
+        std::fs::write(&blocked, "occupied").unwrap();
+        let text = " word".repeat(13_000);
+        let normal = mcp_spill_result(ToolContext::new(cwd.path()), &text);
+        let failed = mcp_spill_result(
+            spill_session_context(cwd.path(), &blocked.join("spill")),
+            &text,
+        );
+        assert_eq!(failed.output, normal.output);
+        assert_eq!(failed.truncated, normal.truncated);
+        let stored = mcp_spill_result(
+            spill_session_context(cwd.path(), &session.path().join("spill")),
+            &text,
+        );
+        assert!(stored.truncated);
+    }
+
+    fn spill_read(name: ToolName, args: Value, cwd: &Path, spill: &Path) -> ToolResult {
+        default_tool_registry().execute(
+            &spill_request("read", name, args),
+            &spill_session_context(cwd, spill),
+        )
+    }
+
+    #[test]
+    fn read_file_reads_a_spill_file_with_offset_and_limit() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let file = spill.path().join("call.txt");
+        std::fs::write(&file, "first\nsecond\nthird\n").unwrap();
+        let result = spill_read(
+            ToolName::ReadFile,
+            json!({"path": file, "offset": 2, "limit": 1}),
+            cwd.path(),
+            spill.path(),
+        );
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let output = result.output.unwrap();
+        assert!(
+            output.contains("2: second") && !output.contains("first") && !output.contains("third")
+        );
+    }
+
+    #[test]
+    fn grep_searches_a_spill_file() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let file = spill.path().join("call.txt");
+        std::fs::write(&file, "alpha\nneedle\nomega\n").unwrap();
+        let result = spill_read(
+            ToolName::Grep,
+            json!({"path": file, "pattern": "needle"}),
+            cwd.path(),
+            spill.path(),
+        );
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        assert!(result.output.unwrap().contains("2:needle"));
+    }
+
+    #[test]
+    fn grep_matches_beyond_the_start_of_a_long_spill_line() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let file = spill.path().join("call.txt");
+        std::fs::write(
+            &file,
+            format!("{}needle{}", "x".repeat(100_000), "y".repeat(100_000)),
+        )
+        .unwrap();
+        let result = spill_read(
+            ToolName::Grep,
+            json!({"path": file, "pattern": "needle"}),
+            cwd.path(),
+            spill.path(),
+        );
+        assert_ne!(
+            result.kind,
+            orca_core::tool_types::ToolResultKind::NoMatches
+        );
+        assert_eq!(result.status, ToolStatus::Completed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_spill_dir_is_refused() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let link = spill.path().join("link.txt");
+        let regular = spill.path().join("regular.txt");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        std::fs::write(&regular, "needle").unwrap();
+        for (name, refused_args, allowed_args) in [
+            (
+                ToolName::ReadFile,
+                json!({"path": link}),
+                json!({"path": regular}),
+            ),
+            (
+                ToolName::Grep,
+                json!({"path": link, "pattern": "needle"}),
+                json!({"path": regular, "pattern": "needle"}),
+            ),
+        ] {
+            let refused = spill_read(name.clone(), refused_args, cwd.path(), spill.path());
+            assert_eq!(refused.status, ToolStatus::Failed, "{refused:?}");
+            assert!(
+                refused
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("escapes workspace")
+            );
+            let allowed = spill_read(name, allowed_args, cwd.path(), spill.path());
+            assert_eq!(allowed.status, ToolStatus::Completed, "{allowed:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_reads_and_writes_refuse_a_linked_ancestor() {
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        let outside_spill = outside.join("session/spill");
+        std::fs::create_dir_all(&outside_spill).unwrap();
+        std::fs::write(outside_spill.join("call.txt"), "needle").unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        let spill = alias.join("session/spill");
+        let file = spill.join("call.txt");
+        for (name, args) in [
+            (ToolName::ReadFile, json!({"path": file})),
+            (ToolName::Grep, json!({"path": file, "pattern": "needle"})),
+        ] {
+            let result = spill_read(name, args, cwd.path(), &spill);
+            assert_eq!(result.status, ToolStatus::Failed, "{result:?}");
+        }
+        mcp_spill_result(
+            spill_session_context(cwd.path(), &spill),
+            &" hello".repeat(34_000),
+        );
+        assert!(!outside_spill.join("mcp-result.txt").exists());
+    }
+
+    #[test]
+    fn spill_saves_the_history_redacted_result() {
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let spill = root.path().join("spill");
+        let words = " hello".repeat(10_000);
+        let value = "fixture-value";
+        let text = format!("{words}\napi_key={value}\n{words}");
+        mcp_spill_result(spill_session_context(cwd.path(), &spill), &text);
+        let saved = std::fs::read_to_string(spill.join("mcp-result.txt")).unwrap();
+        let resource: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert!(
+            resource["contents"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\napi_key=<redacted>\n")
+        );
+        assert!(!saved.contains(value));
+    }
+
+    #[test]
+    fn read_file_pages_a_single_long_spill_line_by_byte() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let file = spill.path().join("call.txt");
+        std::fs::write(
+            &file,
+            format!("{}needle{}", "x".repeat(100_000), "y".repeat(100_000)),
+        )
+        .unwrap();
+        let schema = default_tool_registry()
+            .get("read_file")
+            .unwrap()
+            .spec()
+            .input_schema
+            .clone();
+        let result = spill_read(
+            ToolName::ReadFile,
+            json!({"path": file, "offset": 100001, "limit": 6, "unit": "bytes"}),
+            cwd.path(),
+            spill.path(),
+        );
+        assert_eq!(result.output.as_deref(), Some("needle"));
+        assert_eq!(schema["properties"]["unit"]["enum"], json!(["bytes"]));
+        assert_eq!(schema["required"], json!(["path"]));
+    }
+
+    #[test]
+    fn the_threshold_is_exclusive() {
+        let session = tempfile::tempdir().unwrap();
+        let spill = session.path().join("spill");
+        let request = spill_request("threshold", ToolName::WebFetch, json!({}));
+        let completed = |words| {
+            let text = " hello".repeat(words);
+            crate::spill::completed_text(&request, text, Some(&spill), |text| (text, false))
+        };
+        assert!(!completed(12_500).truncated);
+        assert!(!spill.exists());
+        assert!(completed(12_501).truncated);
+        assert!(spill.join("threshold.txt").is_file());
+    }
+
     #[test]
     fn computer_description_keeps_named_apps_in_the_gui_and_stays_short() {
         let registry = default_tool_registry();

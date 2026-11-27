@@ -36,3 +36,17 @@ Orca tries a hierarchical summary on Flash, then local truncation.
 For a task that needs a precise earlier fact, include the file path, test name,
 or session boundary in the next prompt rather than relying on an implicit
 context guess.
+
+## Large tool results
+
+In a recorded session, Orca saves a completed MCP, external tool, `web_fetch`,
+or `web_search` text result when it exceeds an estimated 12,500 tokens. The
+model gets the beginning and end of the result and a path to the full text.
+It can call `read_file` with `offset` and `limit` or run `grep` on that path.
+Those tools can read saved results belonging to the current session.
+
+The files live under `$ORCA_HOME/session-results/<session-id>/spill/` with
+owner-only permissions on Unix. The path stays in the result during
+micro-compaction, and deleting the session removes its files. If Orca cannot
+save the text, the tool returns its usual output. Shell tasks, `read_file`,
+`grep`, `glob`, and `task_read_output` use their existing output limits or paging.

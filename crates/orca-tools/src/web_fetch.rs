@@ -56,6 +56,16 @@ pub fn execute_or_cancel(
     deepseek: Option<&DeepSeekWebAccess>,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
+    execute_in_session(request, max_bytes, deepseek, None, should_cancel)
+}
+
+pub(crate) fn execute_in_session(
+    request: &ToolRequest,
+    max_bytes: usize,
+    deepseek: Option<&DeepSeekWebAccess>,
+    spill_dir: Option<&std::path::Path>,
+    should_cancel: impl Fn() -> bool,
+) -> ToolResult {
     let args = match parse_args(request) {
         Ok(a) => a,
         Err(e) => return ToolResult::failed(request, e, None),
@@ -82,16 +92,13 @@ pub fn execute_or_cancel(
     let outcome = rt.block_on(fetch_page(&args, deepseek, &should_cancel));
 
     match outcome {
-        Ok(fetched) => {
-            let usage = ToolServiceUsage {
-                deepseek_fetches: fetched.deepseek_fetches,
-                ..ToolServiceUsage::default()
-            };
-            let text = render(fetched, args.prompt.as_deref());
-            let effective_max = max_bytes.min(MAX_OUTPUT_CHARS);
-            let (output, truncated) = truncate_output(text, effective_max);
-            ToolResult::completed(request, output, truncated).with_service_usage(usage)
-        }
+        Ok(fetched) => finish_result(
+            request,
+            fetched,
+            args.prompt.as_deref(),
+            max_bytes,
+            spill_dir,
+        ),
         Err(FetchError::Cancelled) => {
             ToolResult::cancelled(request, "web fetch was cancelled", None)
         }
@@ -99,6 +106,23 @@ pub fn execute_or_cancel(
             ToolResult::failed(request, message, None)
         }
     }
+}
+
+fn finish_result(
+    request: &ToolRequest,
+    fetched: Fetched,
+    prompt: Option<&str>,
+    max_bytes: usize,
+    spill_dir: Option<&std::path::Path>,
+) -> ToolResult {
+    let usage = ToolServiceUsage {
+        deepseek_fetches: fetched.deepseek_fetches,
+        ..ToolServiceUsage::default()
+    };
+    crate::spill::completed_text(request, render(fetched, prompt), spill_dir, |text| {
+        truncate_output(text, max_bytes.min(MAX_OUTPUT_CHARS))
+    })
+    .with_service_usage(usage)
 }
 
 // ── argument schema ────────────────────────────────────────────────────────────
@@ -724,6 +748,41 @@ fn apply_prompt_filter(text: &str, prompt: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_web_fetch_result_is_saved() {
+        let text = format!("# First\n\n{}\n\nLast", " hello".repeat(20_000));
+        let fixture = crate::test_http::serve(vec![(200, page_json("A", &text))]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+        let fetched = block_on(finish_with_deepseek(
+            PAGE_URL,
+            Ok(LocalPage {
+                text: String::new(),
+                readable: false,
+            }),
+            Some(&access),
+            &|| false,
+        ))
+        .unwrap();
+        let expected = format!("{}\n\n{}", fetched.note.as_deref().unwrap(), fetched.text);
+        let session = tempfile::tempdir().unwrap();
+        let spill = session.path().join("spill");
+        let file = spill.join("fetch.txt");
+        let request = ToolRequest {
+            id: "fetch".into(),
+            name: orca_core::tool_types::ToolName::WebFetch,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let result = finish_result(&request, fetched, None, 8192, Some(&spill));
+        assert_eq!(result.service_usage.deepseek_fetches, 1);
+        let preview = result.output.unwrap();
+        assert!(file.is_file());
+        assert!(preview.contains("# First") && preview.contains("Last"));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), expected);
+        fixture.requests();
+    }
 
     #[test]
     fn normalise_url_upgrades_http_to_https() {

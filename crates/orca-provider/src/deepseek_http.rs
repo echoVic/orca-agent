@@ -1553,6 +1553,16 @@ fn inject_summary_messages(summary: &SummaryState, messages: &mut Vec<ApiMessage
         });
         preamble = "";
     }
+    if let Some(notices) = summary.spill_notices() {
+        messages.push(ApiMessage {
+            role: "system".to_string(),
+            content: Some(notices),
+            images: Vec::new(),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
 }
 
 #[cfg(test)]

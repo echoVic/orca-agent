@@ -463,6 +463,7 @@ impl RuntimeProviderTurnStep {
             sink,
             mut history_writer,
         } = input.io;
+        crate::instructions::refresh_nested_instructions(conversation, input.turn_context.cwd);
         let cwd_display = input.turn_context.cwd.display().to_string();
         let emit_deltas = input.turn_context.emit_deltas;
         let pre_model_outcome = match input.actor.run_pre_model_hook_with_cancel(
@@ -1124,7 +1125,8 @@ impl RuntimeProviderResponseStep {
         }
 
         let tool_requests = tool_requests_from_provider_steps(&response.steps);
-        match run_tool_turns(RuntimeToolTurnsContext {
+        let instructions = step_snapshot.capabilities().instructions;
+        let outcome = run_tool_turns(RuntimeToolTurnsContext {
             step_context,
             sampling_state,
             operation: Some(operation),
@@ -1142,7 +1144,9 @@ impl RuntimeProviderResponseStep {
                 workflow_child_executor,
                 batch_child_executor,
             },
-        })? {
+        });
+        instructions.append_nested_for_touches(conversation, history_writer);
+        match outcome? {
             ToolTurnOutcome::Continue => Ok(RuntimeProviderResponseOutcome::Continue),
             ToolTurnOutcome::Return {
                 status,

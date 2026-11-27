@@ -97,18 +97,31 @@ pub(crate) fn execute_runtime_normal_tool(
         _ => {}
     }
 
-    orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_profile(
+    let cancelled = || context.cancel.is_cancelled();
+    let ctx = orca_tools::ToolContext::new(&invocation.cwd)
+        .with_output_truncation(invocation.output_truncation)
+        .with_shell_timeout(Some(Duration::from_secs(
+            invocation.effective_shell_timeout_secs(),
+        )))
+        .with_additional_working_directories(invocation.additional_roots.iter().cloned())
+        .with_execution_profile(invocation.config.execution_profile)
+        .with_deepseek_web(deepseek_web_access(&invocation.config))
+        .with_spill_directory(
+            invocation
+                .task_registry
+                .as_ref()
+                .and_then(crate::tasks::TaskRegistry::spill_directory),
+        )
+        .with_cancel(&cancelled);
+    let ctx = match context.mcp_elicitation_handler {
+        Some(handler) => ctx.with_mcp_elicitation_handler(handler),
+        None => ctx,
+    };
+    orca_tools::execute_in_context(
         &invocation.request,
-        &invocation.cwd,
-        &invocation.additional_roots,
         &invocation.mcp_registry,
         &invocation.external_tools,
-        invocation.output_truncation,
-        invocation.effective_shell_timeout_secs(),
-        context.mcp_elicitation_handler,
-        invocation.config.execution_profile,
-        deepseek_web_access(&invocation.config),
-        || context.cancel.is_cancelled(),
+        ctx,
     )
 }
 

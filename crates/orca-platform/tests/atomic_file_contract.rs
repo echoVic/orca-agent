@@ -133,6 +133,18 @@ fn replacement_preserves_existing_unix_permissions() {
     assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
 }
 
+#[test]
+fn private_records_can_be_saved_updated_and_removed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("private.json");
+    for contents in [br#"{"login":true}"#.as_slice(), br#"{}"#] {
+        atomic_write_private(&path, contents, AtomicWritePolicy::NoFollow).expect("save record");
+        assert_eq!(std::fs::read(&path).expect("read record"), contents);
+    }
+    std::fs::remove_file(&path).expect("remove record");
+    assert_no_temp_artifacts(temp.path());
+}
+
 #[cfg(unix)]
 #[test]
 fn a_private_write_leaves_the_file_readable_by_its_owner_only() {

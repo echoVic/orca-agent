@@ -25,6 +25,7 @@ pub mod report_blocker;
 pub mod sandbox;
 pub mod schema;
 pub mod skills;
+mod spill;
 #[cfg(test)]
 mod test_http;
 pub mod update_goal;
@@ -169,43 +170,37 @@ pub fn execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_pro
     // until it exits or is cancelled, like a shell command.
     let shell_timeout =
         (shell_timeout_secs > 0).then(|| std::time::Duration::from_secs(shell_timeout_secs));
-    let should_cancel = &should_cancel as &dyn Fn() -> bool;
-    if !tool_uses_mcp_registry(&request.name) {
-        if external_tools.is_empty() {
-            let reg = registry::default_tool_registry();
-            let ctx = registry::ToolContext::new(cwd)
-                .with_output_truncation(output_truncation)
-                .with_shell_timeout(shell_timeout)
-                .with_additional_working_directories(additional_roots.iter().cloned())
-                .with_execution_profile(execution_profile)
-                .with_deepseek_web(deepseek_web)
-                .with_cancel(should_cancel);
-            return reg.execute(request, &ctx);
-        }
-        let reg = registry::tool_registry_with_mcp_and_external(None, external_tools);
-        let ctx = registry::ToolContext::new(cwd)
-            .with_output_truncation(output_truncation)
-            .with_shell_timeout(shell_timeout)
-            .with_additional_working_directories(additional_roots.iter().cloned())
-            .with_execution_profile(execution_profile)
-            .with_deepseek_web(deepseek_web)
-            .with_cancel(should_cancel);
-        return reg.execute(request, &ctx);
-    }
-
-    let reg = registry::tool_registry_with_mcp_and_external(Some(mcp_registry), external_tools);
-    let mut ctx = registry::ToolContext::new(cwd)
+    let ctx = ToolContext::new(cwd)
         .with_output_truncation(output_truncation)
         .with_shell_timeout(shell_timeout)
         .with_additional_working_directories(additional_roots.iter().cloned())
         .with_execution_profile(execution_profile)
-        .with_mcp(mcp_registry)
         .with_deepseek_web(deepseek_web)
-        .with_cancel(should_cancel);
-    if let Some(handler) = mcp_elicitation_handler {
-        ctx = ctx.with_mcp_elicitation_handler(handler);
+        .with_cancel(&should_cancel);
+    let ctx = match mcp_elicitation_handler {
+        Some(handler) => ctx.with_mcp_elicitation_handler(handler),
+        None => ctx,
+    };
+    execute_in_context(request, mcp_registry, external_tools, ctx)
+}
+
+pub fn execute_in_context<'a>(
+    request: &ToolRequest,
+    mcp_registry: &'a McpRegistry,
+    external_tools: &[ExternalToolConfig],
+    ctx: ToolContext<'a>,
+) -> ToolResult {
+    let uses_mcp = tool_uses_mcp_registry(&request.name);
+    if !uses_mcp && external_tools.is_empty() {
+        return registry::default_tool_registry().execute(request, &ctx);
     }
-    reg.execute(request, &ctx)
+    let mcp = uses_mcp.then_some(mcp_registry);
+    let ctx = if uses_mcp {
+        ctx.with_mcp(mcp_registry)
+    } else {
+        ctx
+    };
+    registry::tool_registry_with_mcp_and_external(mcp, external_tools).execute(request, &ctx)
 }
 
 fn tool_uses_mcp_registry(name: &ToolName) -> bool {

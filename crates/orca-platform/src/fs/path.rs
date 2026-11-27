@@ -70,6 +70,11 @@ impl PathIdentity {
                 .all(|(candidate, expected)| candidate.key == expected.key)
     }
 
+    #[cfg(windows)]
+    pub(super) fn is_direct_parent_of(&self, child: &Self) -> bool {
+        child.components.len() == self.components.len() + 1 && child.is_within(self)
+    }
+
     pub fn storage_key(&self) -> String {
         let mut key = match &self.prefix {
             WindowsPrefix::Drive { key, .. } => format!("drive:{key}"),
@@ -153,7 +158,7 @@ impl PathPolicy {
 
     #[cfg(windows)]
     pub fn open_no_follow(self, path: &Path) -> Result<VerifiedPath, PlatformError> {
-        windows::open_no_follow(path, self, windows::DEFAULT_ACCESS_MODE)
+        self.open_no_follow_with_access(path, windows::DEFAULT_ACCESS_MODE)
     }
 
     #[cfg(windows)]
@@ -162,7 +167,16 @@ impl PathPolicy {
         path: &Path,
         access_mode: u32,
     ) -> Result<VerifiedPath, PlatformError> {
-        windows::open_no_follow(path, self, access_mode)
+        self.open_no_follow_shared(path, access_mode, windows::DEFAULT_SHARE_MODE)
+    }
+    #[cfg(windows)]
+    pub(super) fn open_no_follow_shared(
+        self,
+        path: &Path,
+        access_mode: u32,
+        share_mode: u32,
+    ) -> Result<VerifiedPath, PlatformError> {
+        windows::open_no_follow(path, self, access_mode, share_mode)
     }
 }
 
@@ -445,11 +459,14 @@ mod windows {
     use super::*;
 
     pub(super) const DEFAULT_ACCESS_MODE: u32 = FILE_READ_ATTRIBUTES;
+    pub(super) const DEFAULT_SHARE_MODE: u32 =
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
     pub(super) fn open_no_follow(
         path: &Path,
         policy: PathPolicy,
         access_mode: u32,
+        share_mode: u32,
     ) -> Result<VerifiedPath, PlatformError> {
         let text = path
             .to_str()
@@ -461,7 +478,7 @@ mod windows {
 
         let file = std::fs::OpenOptions::new()
             .access_mode(access_mode)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .share_mode(share_mode)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .map_err(|error| {

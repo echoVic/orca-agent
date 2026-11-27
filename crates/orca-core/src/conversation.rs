@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -334,6 +335,7 @@ pub enum InternalContextKind {
     Goal,
     Plan,
     Skill,
+    ProjectInstructions,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -440,11 +442,27 @@ impl InternalContext {
 pub struct SummaryState {
     pub baseline: Option<String>,
     pub deltas: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_output_spills: Vec<crate::tool_types::ToolOutputSpill>,
 }
 
 impl SummaryState {
     pub fn is_empty(&self) -> bool {
-        self.baseline.is_none() && self.deltas.is_empty()
+        self.baseline.is_none() && self.deltas.is_empty() && self.tool_output_spills.is_empty()
+    }
+
+    pub fn spill_notices(&self) -> Option<String> {
+        if self.tool_output_spills.is_empty() {
+            return None;
+        }
+        let mut notices = String::from(
+            "[Saved results from earlier tool calls. Read a path with read_file or search it with grep.]",
+        );
+        for spill in &self.tool_output_spills {
+            notices.push('\n');
+            notices.push_str(&spill.path().to_string_lossy());
+        }
+        Some(notices)
     }
 
     pub fn latest_rolling(&self) -> Option<&str> {
@@ -462,6 +480,9 @@ impl SummaryState {
         }
         for delta in &self.deltas {
             total += counter.count(delta);
+        }
+        if let Some(notices) = self.spill_notices() {
+            total += counter.count(&notices);
         }
         total
     }
@@ -515,6 +536,28 @@ impl fmt::Debug for ProviderRequestCapture {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NestedInstructionSource {
+    pub workspace: PathBuf,
+    pub source: PathBuf,
+    pub digest: String,
+    pub updated: bool,
+    pub shortened: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NestedInstructionVersion {
+    pub identity: NestedInstructionSource,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NestedInstructionState {
+    pub pending_touches: Vec<(PathBuf, bool)>,
+    pub written_sources: HashSet<PathBuf>,
+    pub versions: std::collections::BTreeMap<PathBuf, NestedInstructionVersion>,
+}
+
 #[derive(Debug)]
 pub struct Conversation {
     pub messages: Vec<Message>,
@@ -532,6 +575,7 @@ pub struct Conversation {
     pub compaction_hold: Option<usize>,
     retained_tool_images: Option<RetainedToolImages>,
     provider_request_capture: ProviderRequestCapture,
+    pub nested_instructions: NestedInstructionState,
 }
 
 // Prompt snapshots and inherited conversations must not publish into the
@@ -551,6 +595,7 @@ impl Clone for Conversation {
                 latest: Arc::new(Mutex::new(self.last_provider_request())),
                 prepared_source: None,
             },
+            nested_instructions: self.nested_instructions.clone(),
         }
     }
 }
@@ -567,6 +612,7 @@ impl Conversation {
             compaction_hold: None,
             retained_tool_images: None,
             provider_request_capture: ProviderRequestCapture::default(),
+            nested_instructions: NestedInstructionState::default(),
         }
     }
 
@@ -607,6 +653,7 @@ impl Conversation {
     /// Adopt a compacted conversation while preserving its running read view.
     pub fn adopt(&mut self, mut replacement: Self) {
         replacement.retained_tool_images = self.retained_tool_images.take();
+        replacement.nested_instructions = std::mem::take(&mut self.nested_instructions);
         *self = replacement;
         self.refresh_retained_tool_images();
     }
