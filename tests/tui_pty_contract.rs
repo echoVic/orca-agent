@@ -691,6 +691,141 @@ fn tui_tasks_workspace_stops_one_subagent_without_terminal_spam() {
 }
 
 #[test]
+fn tui_esc_closes_agents_before_returning_from_the_running_child() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n").unwrap();
+    let marker = cwd.path().join("release-agents");
+    let prompt = format!(
+        "subagent async_then_sync mock_stream_release_marker {}",
+        marker.display()
+    );
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), &prompt).unwrap();
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    let dock = wait_for_screen(
+        &process,
+        &mut output,
+        |frame| {
+            frame.contains("Agents 2 active")
+                && frame.contains(" sync child · running")
+                && frame.matches("thinking, turn 1").count() == 2
+        },
+        "both children must be running in the dock",
+    );
+    let row = dock
+        .lines()
+        .position(|line| line.contains(" sync child · running"))
+        .unwrap()
+        + 1;
+    process
+        .write(format!("\x1b[<0;6;{row}M\x1b[<0;6;{row}m").as_bytes())
+        .unwrap();
+    let child_text = |frame: &str| {
+        user_lines_showing(frame, "mock_stream_release_marker") == 1
+            && user_lines_showing(frame, "subagent async_then_sync") == 0
+    };
+    wait_for_screen(
+        &process,
+        &mut output,
+        |frame| child_text(frame) && frame.contains("Main is running · Esc return"),
+        "did not visit the sync child's own conversation",
+    );
+    process.write(b"/agents\r").unwrap();
+    let sibling_selected = |frame: &str| {
+        frame.lines().any(|line| {
+            line.starts_with('│') && line.contains('›') && line.contains("async child · running")
+        })
+    };
+    let panel = wait_for_screen(
+        &process,
+        &mut output,
+        |frame| {
+            frame.contains("Tasks Workspace")
+                && frame.contains("s stop")
+                && frame.contains("Focus ")
+                && frame.contains("async child · running")
+                && frame.contains(" sync child · running")
+        },
+        "child did not open the agents panel",
+    );
+    if !sibling_selected(&panel) {
+        let rows: Vec<_> = panel
+            .lines()
+            .filter(|line| line.starts_with('│') && line.contains("child · running"))
+            .collect();
+        let async_index = rows
+            .iter()
+            .position(|row| row.contains("async child"))
+            .unwrap();
+        let selected = rows.iter().position(|row| row.contains('›')).unwrap();
+        process
+            .write(if async_index < selected {
+                b"\x1b[A"
+            } else {
+                b"\x1b[B"
+            })
+            .unwrap();
+        wait_for_screen(
+            &process,
+            &mut output,
+            sibling_selected,
+            "sibling was not selected",
+        );
+    }
+    process.write(b"s").unwrap();
+    wait_for_screen(
+        &process,
+        &mut output,
+        |frame| {
+            frame.contains("Tasks Workspace")
+                && frame.contains("async child · stopped")
+                && frame.contains(" sync child · running")
+        },
+        "s did not stop only the sibling",
+    );
+    process.write(b"\x1b").unwrap();
+    let child = wait_for_screen(
+        &process,
+        &mut output,
+        |frame| {
+            !frame.contains("Tasks Workspace")
+                && child_text(frame)
+                && frame.contains("Main is running · Esc return")
+                && frame.contains("Stopping \"async child\".")
+        },
+        "first Esc must reveal the child and its stop notice",
+    );
+    assert_eq!(
+        child.matches("Stopping \"async child\".").count(),
+        1,
+        "{child}"
+    );
+    process.write(b"\x1b").unwrap();
+    let main = wait_for_screen(
+        &process,
+        &mut output,
+        |frame| {
+            !frame.contains("Esc return")
+                && user_lines_showing(frame, "subagent async_then_sync") == 1
+                && frame.contains("Running ")
+                && frame.contains("Esc interrupt")
+                && frame.contains("Agents 1 active")
+        },
+        "second Esc must restore running main",
+    );
+    assert!(
+        !main.contains("Task cancelled") && !main.contains("Agent cancelled"),
+        "{main}"
+    );
+    std::fs::write(marker, b"release").unwrap();
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130));
+}
+
+#[test]
 fn tui_docks_an_agent_that_a_queued_message_starts() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");

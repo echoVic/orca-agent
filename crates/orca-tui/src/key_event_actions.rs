@@ -139,6 +139,369 @@ mod tests {
         .unwrap();
     }
 
+    struct ChildKeys {
+        state: AppState,
+        actions: mpsc::Receiver<UserAction>,
+        sender: mpsc::Sender<UserAction>,
+        textarea: TextArea<'static>,
+        vim: VimState,
+    }
+
+    impl ChildKeys {
+        fn new() -> Self {
+            let (sender, actions) = mpsc::unbounded();
+            let mut state =
+                AppState::new(sender.clone(), "test".into(), "mock".into(), "/tmp".into());
+            state.update(crate::protocol::TuiEvent::ChildFocusChanged {
+                task_id: Some("child".into()),
+            });
+            Self {
+                state,
+                actions,
+                sender,
+                textarea: TextArea::default(),
+                vim: VimState::new(false),
+            }
+        }
+
+        fn esc(&mut self) {
+            press_esc(
+                &mut self.state,
+                &mut test_run_config(),
+                &self.sender,
+                &mut self.textarea,
+                &mut self.vim,
+                &Theme::named(orca_core::config::ThemeName::Dark),
+            );
+        }
+
+        fn still_on_child(&self) {
+            assert_eq!(self.state.conversation_target().task_id(), Some("child"));
+            assert!(
+                self.actions.is_empty(),
+                "a dismissal must not also navigate or interrupt"
+            );
+        }
+
+        fn expect_return(&mut self) {
+            self.esc();
+            assert!(matches!(
+                self.actions.try_recv(),
+                Ok(UserAction::ReturnToParentThread)
+            ));
+            assert!(self.actions.is_empty());
+        }
+    }
+
+    #[track_caller]
+    fn dismiss_child_layer(
+        open: impl FnOnce(&mut AppState),
+        closed: impl FnOnce(&AppState) -> bool,
+    ) {
+        let mut child = ChildKeys::new();
+        open(&mut child.state);
+        child.esc();
+        assert!(closed(&child.state), "first Esc did not close the layer");
+        child.still_on_child();
+        child.expect_return();
+    }
+
+    #[test]
+    fn focused_child_esc_closes_agents_before_returning() {
+        dismiss_child_layer(
+            |state| {
+                state.enter_running();
+                state.show_agents();
+            },
+            |state| {
+                state.panel_mode == PanelMode::Conversation && state.status == AppStatus::Running
+            },
+        );
+    }
+
+    #[test]
+    fn focused_child_esc_collapses_the_visible_dock_before_returning() {
+        dismiss_child_layer(
+            |state| {
+                state.enter_running();
+                state.toggle_tasks_dock();
+                assert!(state.tasks_dock_visible());
+            },
+            |state| !state.tasks_dock_expanded && state.status == AppStatus::Running,
+        );
+    }
+
+    #[test]
+    fn focused_child_esc_dismisses_the_transcript_layers_one_at_a_time() {
+        let mut child = ChildKeys::new();
+        child.state.viewport.selection =
+            Some(TranscriptSelection::begin(SelectionPos { row: 0, col: 0 }));
+        child.state.show_shortcuts = true;
+        child.state.open_transcript_search();
+        assert!(child.state.transcript.search.open);
+        child.esc();
+        assert!(!child.state.transcript.search.open && child.state.show_shortcuts);
+        child.still_on_child();
+        child.esc();
+        assert!(!child.state.show_shortcuts && child.state.viewport.selection.is_some());
+        child.still_on_child();
+        child.esc();
+        assert!(child.state.viewport.selection.is_none());
+        child.still_on_child();
+        child.expect_return();
+
+        let mut child = ChildKeys::new();
+        child.state.show_agents();
+        child
+            .state
+            .begin_task_transcript_request(crate::protocol::TaskTranscriptRequest {
+                task_id: "child".into(),
+                expected_revision: 4,
+            });
+        child.esc();
+        assert!(
+            child.state.task_transcript().is_none() && child.state.panel_mode == PanelMode::Agents
+        );
+        child.still_on_child();
+        child.esc();
+        assert_eq!(child.state.panel_mode, PanelMode::Conversation);
+        child.still_on_child();
+        child.expect_return();
+    }
+
+    #[test]
+    fn focused_child_esc_closes_workspace_and_settings_layers() {
+        use crate::types::{
+            ConfigDialog, FullAccessConfirmation, McpDialog, PlanApprovalDialog, RewindState,
+        };
+        dismiss_child_layer(AppState::show_workflows, |state| {
+            state.panel_mode == PanelMode::Conversation
+        });
+        dismiss_child_layer(
+            |state| {
+                state.full_access_confirmation = Some(FullAccessConfirmation {
+                    selected: 1,
+                    model: None,
+                    reasoning_effort: None,
+                })
+            },
+            |state| state.full_access_confirmation.is_none(),
+        );
+        dismiss_child_layer(
+            |state| {
+                state.config_dialog = Some(ConfigDialog {
+                    selected: 0,
+                    model: "mock".into(),
+                    reasoning_effort: state.reasoning_effort,
+                    approval_mode: state.approval_mode,
+                })
+            },
+            |state| state.config_dialog.is_none(),
+        );
+        dismiss_child_layer(
+            |state| {
+                state.mcp_dialog = Some(McpDialog {
+                    selected: 0,
+                    showing_details: false,
+                })
+            },
+            |state| state.mcp_dialog.is_none(),
+        );
+        dismiss_child_layer(
+            |state| {
+                state.plan_approval_dialog = Some(PlanApprovalDialog {
+                    plan: "a plan".into(),
+                    selected: 0,
+                })
+            },
+            |state| state.plan_approval_dialog.is_none(),
+        );
+        dismiss_child_layer(
+            |state| state.recovery_prompt_visible = true,
+            |state| !state.recovery_prompt_visible,
+        );
+        dismiss_child_layer(
+            |state| state.status = AppStatus::SessionPicker,
+            |state| state.status == AppStatus::Idle,
+        );
+        dismiss_child_layer(
+            |state| state.rewind = Some(RewindState::new(Vec::new())),
+            |state| state.rewind.is_none(),
+        );
+    }
+
+    #[test]
+    fn focused_child_esc_dismisses_composer_popups_but_keeps_the_draft_and_vim_mode() {
+        use crate::types::{RecapState, SlashMenu, SubMenu};
+        for sub_menu in [
+            None,
+            Some(SubMenu {
+                title: "/mode".into(),
+                items: vec!["suggest".into()],
+                selected: 0,
+                context: None,
+            }),
+        ] {
+            dismiss_child_layer(
+                |state| {
+                    state.slash_menu = Some(SlashMenu {
+                        items: Vec::new(),
+                        selected: 0,
+                        sub_menu,
+                    })
+                },
+                |state| state.slash_menu.is_none(),
+            );
+        }
+        for status in [
+            AppStatus::Idle,
+            AppStatus::Running,
+            AppStatus::WaitingUserInput,
+        ] {
+            dismiss_child_layer(
+                |state| {
+                    state.status = status;
+                    state.mention.phase = Some(orca_file_search::SearchPhase::Scanning);
+                },
+                |state| state.mention.phase.is_none(),
+            );
+            dismiss_child_layer(
+                |state| {
+                    state.status = status;
+                    state.mention.candidates =
+                        vec![orca_runtime::mentions::MentionCandidate::from_file_match(
+                            &orca_file_search::SearchMatch {
+                                root: "/workspace".into(),
+                                path: "note.txt".into(),
+                                kind: orca_file_search::MatchKind::File,
+                                score: 1,
+                                indices: vec![0],
+                            },
+                        )];
+                },
+                |state| state.mention.candidates.is_empty(),
+            );
+        }
+        dismiss_child_layer(
+            |state| {
+                let attachment = crate::protocol::SessionAttachmentId::new(1);
+                let cursor = crate::surface_projection::test_surface_cursor(2);
+                state.active_session_attachment = Some(attachment);
+                state.recap = RecapState::Ready {
+                    attachment,
+                    source: orca_runtime::recap::RecapSourceFence {
+                        cursor: cursor.clone(),
+                        marker: orca_runtime::recap::RecapContentMarker {
+                            thread_id: cursor.thread_id,
+                            incarnation: cursor.incarnation,
+                            completed_user_operations: 3,
+                            evidence_digest: orca_runtime::surface::Sha256Digest::digest("recap"),
+                        },
+                    },
+                    text: "recap".into(),
+                    usage: orca_runtime::recap::RecapUsage::Cached,
+                    detail_open: true,
+                };
+                assert!(state.recap_detail_open());
+            },
+            |state| !state.recap_detail_open(),
+        );
+        for mode in [crate::vim::VimMode::Insert, crate::vim::VimMode::Normal] {
+            let mut child = ChildKeys::new();
+            child.vim = VimState::new(true);
+            child.vim.mode = mode;
+            child.textarea.insert_str("keep this draft");
+            child.vim.seed_pending_count_for_test();
+            child.expect_return();
+            assert!(!child.vim.has_pending_command_for_test());
+            assert_eq!(child.vim.mode, mode);
+            assert_eq!(child.textarea.lines(), ["keep this draft"]);
+        }
+    }
+
+    #[test]
+    fn focused_child_esc_closes_the_image_viewer() {
+        use image::ImageEncoder as _;
+        dismiss_child_layer(
+            |state| {
+                let mut png = Vec::new();
+                image::codecs::png::PngEncoder::new(&mut png)
+                    .write_image(&[0, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+                    .unwrap();
+                state.image_viewer = Some(
+                    crate::image_preview::ImageViewerState::open(
+                        crate::composer_images::TuiImage {
+                            label: "pixel".into(),
+                            media_type: "image/png".into(),
+                            encoded: Some(png.into()),
+                            width: 1,
+                            height: 1,
+                            source_name: None,
+                        },
+                    )
+                    .unwrap(),
+                );
+            },
+            |state| state.image_viewer.is_none(),
+        );
+    }
+
+    #[test]
+    fn focused_child_esc_responds_to_the_questionnaire_before_returning() {
+        let mut child = ChildKeys::new();
+        child.state.status = AppStatus::WaitingUserInput;
+        child.state.interaction.pending_input = Some(crate::protocol::PendingTuiInput::UserInput(
+            TuiInteractionKey::new(
+                OperationIdAllocator::new().allocate(),
+                "ask",
+                TuiInteractionKind::UserInput,
+            ),
+        ));
+        child.state.user_input_dialog = Some(
+            crate::user_input_dialog::UserInputDialog::from_legacy("Which?", vec!["One".into()]),
+        );
+        child.esc();
+        assert!(child.state.user_input_dialog.is_none());
+        assert!(matches!(
+            child.actions.try_recv(),
+            Ok(UserAction::RespondToInteraction {
+                response: TuiInteractionResponse::UserQuestionnaire(
+                    crate::protocol::TuiUserInputResponse::Cancelled
+                ),
+                ..
+            })
+        ));
+        child.still_on_child();
+        child.expect_return();
+    }
+
+    #[test]
+    fn focused_child_esc_denies_approval_then_returns_without_interrupting() {
+        let mut child = ChildKeys::new();
+        child
+            .state
+            .update(crate::protocol::TuiEvent::ApprovalNeeded {
+                key: TuiInteractionKey::new(
+                    OperationIdAllocator::new().allocate(),
+                    "approval",
+                    TuiInteractionKind::Approval,
+                ),
+                tool: "read".into(),
+                target: None,
+                preview: None,
+            });
+        child.esc();
+        assert!(matches!(
+            child.actions.try_recv(),
+            Ok(UserAction::RespondToInteraction {
+                response: TuiInteractionResponse::Approval(false),
+                ..
+            })
+        ));
+        child.still_on_child();
+        child.expect_return();
+    }
+
     fn state_with_search_matches() -> AppState {
         let (tx, _rx) = mpsc::unbounded();
         let mut state = AppState::new(
@@ -1514,6 +1877,48 @@ mod tests {
     }
 }
 
+fn dismiss_conversation_layer(state: &mut AppState) -> bool {
+    let panel_can_close = matches!(
+        state.status,
+        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
+    );
+    if state.show_shortcuts {
+        state.show_shortcuts = false;
+    } else if state.viewport.selection.is_some() {
+        state.invalidate_selection();
+    } else if panel_can_close
+        && state.panel_mode == PanelMode::Agents
+        && state.task_transcript().is_some()
+    {
+        state.clear_task_transcript();
+    } else if state.tasks_dock_visible() {
+        state.collapse_tasks_dock();
+    } else if panel_can_close
+        && matches!(state.panel_mode, PanelMode::Workflows | PanelMode::Agents)
+    {
+        state.show_conversation();
+    } else {
+        return false;
+    }
+    true
+}
+
+fn status_layer_owns_escape(state: &AppState) -> bool {
+    let mention_open = !state.mention.candidates.is_empty() || state.mention.phase.is_some();
+    state.rewind.is_some()
+        || match state.status {
+            AppStatus::Setup | AppStatus::SessionPicker | AppStatus::WaitingApproval => true,
+            AppStatus::Idle | AppStatus::WaitingUserInput => {
+                (state.status == AppStatus::Idle && state.recovery_prompt_visible)
+                    || state.slash_menu.is_some()
+                    || mention_open
+                    || state.recap_detail_open()
+            }
+            AppStatus::Running => state.panel_mode == PanelMode::Conversation && mention_open,
+            AppStatus::Compacting => false,
+        }
+}
+
 /// # Esc precedence
 ///
 /// Esc is resolved by a two-stage pipeline: this function (preflight) runs
@@ -1524,55 +1929,13 @@ mod tests {
 /// same keypress. **A new Esc meaning is a new row in the stack below, not
 /// a new branch dropped in wherever seems convenient.**
 ///
-/// At the level the spec asks for, Esc has six cases:
-///
-///   1. something is open on top of the conversation -> close only the
-///      topmost one
-///   2. the turn is Running or Compacting             -> interrupt it
-///   3. Idle, and the composer has a draft             -> clear the draft
-///   4. Idle, and the composer is empty                -> backtrack
-///   5. the session picker is open                     -> return to the
-///      conversation
-///   6. Idle, and an MCP prompt run in this conversation is still
-///      expanding -> cancel it, the latest first, before 3 and 4
-///
-/// Case 1's "topmost" is itself an ordered stack spanning both stages. In
-/// source order:
-///
-/// Preflight (this function):
-///   1. the image viewer (`composer_image_actions::handle_image_viewer_key`)
-///   2. full-access confirmation pending (deferred to status)
-///   3. a focused child thread -> `ReturnToParentThread`, UNLESS a tool or
-///      permission approval is pending (`AppStatus::WaitingApproval`) — the
-///      approval is what is on screen asking for a decision, so it gets Esc
-///      before navigation does. Without this carve-out the branch below
-///      would claim Esc first and the approval's deny (case 14) would never
-///      run; see `esc_prefers_a_pending_approval_over_returning_to_a_focused_parent`.
-///   4. plan approval / config dialog / `/mcp` panel / user-input dialog
-///      pending (each deferred to status)
-///   5. transcript search open
-///   6. the shortcuts help overlay (`show_shortcuts`)
-///   7. an active transcript selection
-///   8. a task-transcript checkpoint view (Agents panel)
-///   9. the tasks dock, if visible (`tasks_dock_visible()`)
-///   10. the Workflows/Agents panel
-///
-/// Status (`handle_status_key`, only once preflight returns `Unhandled`):
-///   11. setup / session-picker phases (case 5: returns to the conversation)
-///   12. full-access confirmation
-///   13. a pending approval (`WaitingApproval`) -> Esc denies (see case 3
-///       above for why a focused child does not shadow this)
-///   14. plan approval
-///   15. the recovery prompt
-///   16. the config dialog, then the `/mcp` panel
-///   17. the questionnaire (user-input dialog) -> backs out one step at a
-///       time
-///   18. the mention popup / slash menu (inside Idle handling)
-///   19. Idle: case 6 (cancel an MCP prompt still expanding; the draft
-///       stays), else case 3 (clear a non-empty draft) or case 4
-///       (backtrack)
-///   20. Running/Compacting: case 2 (interrupt). An MCP prompt still
-///       expanding runs on; once the turn has stopped, Esc cancels it.
+/// Both views share the same layers: image viewer first, then modal dialogs
+/// (handled by status), otherwise search, help, selection, task checkpoint,
+/// visible dock and workspace panel. Status owns setup/picker, approvals,
+/// recovery, config/MCP, rewind, questionnaire and composer popups/recap.
+/// Only a clear focused child returns to main. It leaves the draft and Vim
+/// mode alone. On main the normal editor, interrupt, expanding-prompt and
+/// backtrack bindings still apply.
 pub(crate) fn handle_key_event_preflight<F>(
     key: KeyEvent,
     state: &mut AppState,
@@ -1599,22 +1962,26 @@ where
         return Ok(KeyEventFlow::Unhandled);
     }
 
-    // A focused child owns Esc as the return-to-parent action, UNLESS a
-    // tool/permission approval is pending (`AppStatus::WaitingApproval`):
-    // that dialog is what is on screen asking for a decision, so it must
-    // get Esc before navigation does (see the precedence table above).
-    // Standing aside here lets the key fall through to `Unhandled`, where
-    // `handle_status_key`'s `WaitingApproval` arm denies it. Otherwise,
-    // handle it before the global cancel binding so returning does not
-    // interrupt the child turn.
-    if key.code == KeyCode::Esc
-        && key.modifiers.is_empty()
-        && state.status != AppStatus::WaitingApproval
-        && state.conversation_target().task_id().is_some()
-    {
-        vim_state.cancel_pending_command();
-        let _ = action_tx.send(UserAction::ReturnToParentThread);
-        return Ok(KeyEventFlow::Continue);
+    let modal = state.plan_approval_dialog.is_some()
+        || state.config_dialog.is_some()
+        || state.mcp_dialog.is_some()
+        || state.user_input_dialog.is_some();
+    if key.code == KeyCode::Esc && !modal {
+        if handle_transcript_search_key(key, state) == SearchKeyFlow::Handled
+            || dismiss_conversation_layer(state)
+        {
+            vim_state.cancel_pending_command();
+            return Ok(KeyEventFlow::Continue);
+        }
+        if key.modifiers.is_empty()
+            && state.conversation_target().task_id().is_some()
+            && !status_layer_owns_escape(state)
+        {
+            vim_state.cancel_pending_command();
+            let _ = action_tx.send(UserAction::ReturnToParentThread);
+            return Ok(KeyEventFlow::Continue);
+        }
+        return Ok(KeyEventFlow::Unhandled);
     }
 
     if let Some(ShortcutAction::Global(GlobalShortcut::Cancel)) =
@@ -1632,17 +1999,7 @@ where
         };
     }
 
-    if state.plan_approval_dialog.is_some() {
-        vim_state.cancel_pending_command();
-        return Ok(KeyEventFlow::Unhandled);
-    }
-
-    if state.config_dialog.is_some() || state.mcp_dialog.is_some() {
-        vim_state.cancel_pending_command();
-        return Ok(KeyEventFlow::Unhandled);
-    }
-
-    if state.user_input_dialog.is_some() {
+    if modal {
         vim_state.cancel_pending_command();
         return Ok(KeyEventFlow::Unhandled);
     }
@@ -1676,12 +2033,6 @@ where
         };
     }
 
-    if state.show_shortcuts && key.code == KeyCode::Esc {
-        vim_state.cancel_pending_command();
-        state.show_shortcuts = false;
-        return Ok(KeyEventFlow::Continue);
-    }
-
     if state.show_shortcuts && key.modifiers.is_empty() {
         let step = match key.code {
             KeyCode::Up => Some(-1),
@@ -1695,14 +2046,6 @@ where
             state.shortcuts_scroll = state.shortcuts_scroll.saturating_add_signed(step).min(max);
             return Ok(KeyEventFlow::Continue);
         }
-    }
-
-    // Esc dismisses an active mouse selection before any other Esc meaning
-    // (cancel turn, close panel); a second Esc then does the usual thing.
-    if key.code == KeyCode::Esc && state.viewport.selection.is_some() {
-        vim_state.cancel_pending_command();
-        state.invalidate_selection();
-        return Ok(KeyEventFlow::Continue);
     }
 
     if !composer_has_text
@@ -1767,43 +2110,6 @@ where
         } else {
             cycle_approval_mode(state, action_tx);
         }
-        return Ok(KeyEventFlow::Continue);
-    }
-
-    if matches!(
-        state.status,
-        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
-    ) && state.panel_mode == PanelMode::Agents
-        && state.task_transcript().is_some()
-        && key.code == KeyCode::Esc
-    {
-        vim_state.cancel_pending_command();
-        state.clear_task_transcript();
-        return Ok(KeyEventFlow::Continue);
-    }
-
-    // The tasks dock is the more transient layer: collapse it on its own
-    // before falling through to the full Workflows/Agents panel close below,
-    // so a dock expanded on top of an open panel takes one Esc at a time.
-    // `tasks_dock_visible()` (not the raw `tasks_dock_expanded` flag) is the
-    // check: the dock can be toggled on and then covered by `/workflows`
-    // without ever being cleared, and an Esc that lands on an invisible
-    // dock must fall through to whatever is actually on screen instead of
-    // silently consuming the keypress.
-    if state.tasks_dock_visible() && key.code == KeyCode::Esc {
-        vim_state.cancel_pending_command();
-        state.collapse_tasks_dock();
-        return Ok(KeyEventFlow::Continue);
-    }
-
-    if matches!(
-        state.status,
-        AppStatus::Idle | AppStatus::Running | AppStatus::WaitingUserInput
-    ) && matches!(state.panel_mode, PanelMode::Workflows | PanelMode::Agents)
-        && key.code == KeyCode::Esc
-    {
-        vim_state.cancel_pending_command();
-        state.show_conversation();
         return Ok(KeyEventFlow::Continue);
     }
 
