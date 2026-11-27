@@ -18,9 +18,10 @@ pub struct McpCatalogEntry {
     pub description: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpTransportKind {
+    #[default]
     Stdio,
     /// Streamable HTTP, or the legacy HTTP+SSE transport of protocol
     /// 2024-11-05 when the server turns the `initialize` POST away with 400,
@@ -28,12 +29,6 @@ pub enum McpTransportKind {
     Sse,
     /// Streamable HTTP.
     Http,
-}
-
-impl Default for McpTransportKind {
-    fn default() -> Self {
-        Self::Stdio
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

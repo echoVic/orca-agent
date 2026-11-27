@@ -89,10 +89,10 @@ pub fn is_internal_image_analysis(content: &str) -> bool {
             .get("description")
             .is_some_and(|value| value.is_string())
         || !record.get("query").is_some_and(|value| value.is_string())
-        || !record
+        || record
             .get("image_count")
             .and_then(|value| value.as_u64())
-            .is_some_and(|count| count > 0)
+            .is_none_or(|count| count == 0)
     {
         return false;
     }
@@ -692,7 +692,7 @@ pub struct NestedInstructionState {
     pub versions: std::collections::BTreeMap<PathBuf, NestedInstructionVersion>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub internal_context: InternalContext,
@@ -752,21 +752,7 @@ impl Clone for Conversation {
 
 impl Conversation {
     pub fn new() -> Self {
-        Self {
-            messages: Vec::new(),
-            internal_context: InternalContext::default(),
-            compaction_system_prompt: None,
-            repeat_tool_streak: None,
-            mcp_instructions: Vec::new(),
-            mcp_catalogs: Vec::new(),
-            rolling_summary: None,
-            summary: SummaryState::default(),
-            usage_anchor: None,
-            compaction_hold: None,
-            retained_tool_images: None,
-            provider_request_capture: ProviderRequestCapture::default(),
-            nested_instructions: NestedInstructionState::default(),
-        }
+        Self::default()
     }
 
     pub fn last_provider_request(&self) -> Option<Arc<CapturedProviderRequest>> {

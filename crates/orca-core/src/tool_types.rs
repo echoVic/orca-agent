@@ -324,6 +324,10 @@ impl ToolName {
         }
     }
 
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "Preserve the optional tool-name parser API"
+    )]
     pub fn from_str(value: &str) -> Option<Self> {
         if value.starts_with("mcp__") {
             return Some(Self::Mcp(value.to_string()));
@@ -525,11 +529,10 @@ impl CapabilitySet {
             ActionKind::Computer
         } else if self.contains(ToolCapability::ShellExecute) {
             ActionKind::Shell
-        } else if self.contains(ToolCapability::FsWrite) {
-            ActionKind::Write
-        } else if self.contains(ToolCapability::TaskControl) {
-            ActionKind::Write
-        } else if self.contains(ToolCapability::PermissionRequest) {
+        } else if self.contains(ToolCapability::FsWrite)
+            || self.contains(ToolCapability::TaskControl)
+            || self.contains(ToolCapability::PermissionRequest)
+        {
             ActionKind::Write
         } else if self.contains(ToolCapability::NetworkSearch) {
             ActionKind::Network
@@ -598,9 +601,10 @@ pub struct ToolControlSemantics {
     pub replay: ReplaySemantics,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultKind {
+    #[default]
     Success,
     /// Started but not terminated; distinct from both success and failure.
     Running,
@@ -634,12 +638,6 @@ impl ToolResultKind {
             Self::Cancelled => ToolStatus::Cancelled,
             Self::Indeterminate => ToolStatus::Indeterminate,
         }
-    }
-}
-
-impl Default for ToolResultKind {
-    fn default() -> Self {
-        Self::Success
     }
 }
 
@@ -735,9 +733,10 @@ impl FileChangePreview {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolTerminalSource {
+    #[default]
     Observed,
     CompatibilityRepair,
 }
@@ -748,29 +747,18 @@ impl ToolTerminalSource {
     }
 }
 
-impl Default for ToolTerminalSource {
-    fn default() -> Self {
-        Self::Observed
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolInvocationStarted {
     Yes,
     No,
+    #[default]
     Unknown,
 }
 
 impl ToolInvocationStarted {
     fn is_unknown(&self) -> bool {
         *self == Self::Unknown
-    }
-}
-
-impl Default for ToolInvocationStarted {
-    fn default() -> Self {
-        Self::Unknown
     }
 }
 
@@ -1471,7 +1459,7 @@ fn truncate_output_tokens(output: String, max_tokens: usize) -> (String, bool) {
 }
 
 fn approx_tool_tokens(text: &str) -> usize {
-    text.split_whitespace().count().max((text.len() + 3) / 4)
+    text.split_whitespace().count().max(text.len().div_ceil(4))
 }
 
 fn approx_bytes_for_tokens(tokens: usize) -> usize {
