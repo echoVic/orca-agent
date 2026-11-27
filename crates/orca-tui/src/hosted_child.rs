@@ -1090,6 +1090,7 @@ fn saved_or_checkpoint(
 
 fn sole_task_binding(parent: &RuntimeThreadHandle, task_id: &str, child_id: &str) -> bool {
     let registry = parent.task_registry();
+    // An unavailable capacity means the registry snapshot could not be read; list masks that error.
     if registry.session_id() != parent.thread_id()
         || !registry
             .execution_scope(&Default::default())
