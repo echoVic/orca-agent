@@ -172,7 +172,7 @@ pub(crate) fn bootstrap_agent_conversation(
     prompt: &str,
 ) -> Conversation {
     let mut conversation = if let Some(resumed) = resumed {
-        let mut conv = crate::thread_store::resume_conversation(resumed, system_prompt);
+        let mut conv = crate::history::resume_conversation_in_cwd(resumed, system_prompt, cwd);
         conv.strip_legacy_pinned_volatile();
         conv.strip_legacy_summary_messages();
         conv.unpin_delivered_notices();
@@ -188,8 +188,10 @@ pub(crate) fn bootstrap_agent_conversation(
     {
         conversation.replace_runtime_context(Some(INTERRUPTED_RESUME_HINT.to_string()));
     }
-    conversation.replace_skill_context(agent_common::explicit_skill_context(cwd, prompt));
+    crate::skill_context::refresh_catalog(&mut conversation, cwd);
     conversation.add_user(prompt.to_string());
+    crate::skill_context::append_mentions(&mut conversation, None, cwd, prompt)
+        .expect("appending skill context without a writer cannot fail");
     conversation
 }
 
@@ -321,7 +323,8 @@ impl InteractiveSession {
                     Some(t) => t,
                     None => store.load_session(selector)?,
                 };
-                let mut conv = store.resume_conversation(&transcript, system_prompt);
+                let mut conv =
+                    crate::history::resume_conversation_in_cwd(&transcript, system_prompt, &cwd);
                 conv.strip_legacy_pinned_volatile();
                 conv.strip_legacy_summary_messages();
                 conv.unpin_delivered_notices();
@@ -341,7 +344,8 @@ impl InteractiveSession {
                 // calls) are not replayed to the model.
                 let transcript =
                     crate::thread_store::truncate_transcript_at_boundary(&transcript, resume_at)?;
-                let mut conv = store.resume_conversation(&transcript, system_prompt);
+                let mut conv =
+                    crate::history::resume_conversation_in_cwd(&transcript, system_prompt, &cwd);
                 conv.strip_legacy_pinned_volatile();
                 conv.strip_legacy_summary_messages();
                 conv.unpin_delivered_notices();
@@ -457,6 +461,8 @@ impl InteractiveSession {
                 writer
             }
         };
+
+        let mcp_registry = crate::mcp_startup::restore_tool_scope(mcp_registry, &conversation);
 
         let process_local_tasks = session_id.is_none() && runtime_thread_id.is_some();
         let task_session_id = session_id

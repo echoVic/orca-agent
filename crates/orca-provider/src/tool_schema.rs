@@ -24,7 +24,16 @@ pub fn limit_tool_definitions_by_source(
     max: usize,
     is_mcp: impl Fn(&str) -> Option<bool>,
 ) -> Vec<String> {
-    limit_tools(definitions, max, |tool| &tool.name, is_mcp)
+    limit_tool_definitions_with_loaders(definitions, max, is_mcp, |_| false)
+}
+
+pub fn limit_tool_definitions_with_loaders(
+    definitions: &mut Vec<ProviderToolDefinition>,
+    max: usize,
+    is_mcp: impl Fn(&str) -> Option<bool>,
+    is_loader: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    limit_tools(definitions, max, |tool| &tool.name, is_mcp, is_loader)
 }
 
 pub(crate) fn limit_tools_by_name<T>(
@@ -32,7 +41,7 @@ pub(crate) fn limit_tools_by_name<T>(
     max: usize,
     name: impl Fn(&T) -> &str,
 ) -> Vec<String> {
-    limit_tools(tools, max, name, |_| None)
+    limit_tools(tools, max, name, |_| None, |_| false)
 }
 
 fn limit_tools<T>(
@@ -40,16 +49,21 @@ fn limit_tools<T>(
     max: usize,
     name: impl Fn(&T) -> &str,
     is_mcp: impl Fn(&str) -> Option<bool>,
+    is_loader: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     if tools.len() <= max {
         return Vec::new();
     }
     let mut ranked = tools.iter().map(&name).enumerate().collect::<Vec<_>>();
     ranked.sort_by_cached_key(|&(_, name)| {
-        (
-            is_mcp(name).unwrap_or_else(|| name.starts_with("mcp__")),
-            name,
-        )
+        let priority = if !is_mcp(name).unwrap_or_else(|| name.starts_with("mcp__")) {
+            0
+        } else if is_loader(name) {
+            1
+        } else {
+            2
+        };
+        (priority, name)
     });
     let mut keep = vec![true; tools.len()];
     let mut removed = Vec::with_capacity(tools.len() - max);

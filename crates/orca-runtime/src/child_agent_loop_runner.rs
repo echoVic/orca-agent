@@ -248,6 +248,7 @@ where
             }
         }
 
+        setup.refresh_mcp(config, context.request, context.cwd);
         let compaction_config = child_compaction_config(config, lease, context.child_cost_tracker);
         let prepared = prepare_child_agent_request_with_cost(
             &compaction_config,
@@ -550,6 +551,7 @@ where
             }
         }
 
+        setup.refresh_mcp(config, context.request, context.cwd);
         let before = context.child_cost_tracker.totals();
         let compaction_config = child_compaction_config(config, lease, context.child_cost_tracker);
         let prepared = prepare_child_agent_request_with_cost(

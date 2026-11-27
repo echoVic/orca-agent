@@ -89,6 +89,7 @@ pub mod runtime_state;
 mod runtime_steer;
 mod runtime_subagent_call;
 mod shell_readiness;
+mod skill_context;
 pub mod subagent_event_relay;
 pub mod task_view;
 mod terminal_service;

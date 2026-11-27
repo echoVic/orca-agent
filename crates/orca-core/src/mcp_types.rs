@@ -5,6 +5,19 @@ use serde_json::{Value, json};
 
 use crate::capability::CapabilitySet;
 
+#[derive(Clone, Debug)]
+pub struct McpToolCatalog {
+    pub server: String,
+    pub loader: String,
+    pub entries: Vec<McpCatalogEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct McpCatalogEntry {
+    pub name: String,
+    pub description: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpTransportKind {
@@ -20,6 +33,20 @@ pub enum McpTransportKind {
 impl Default for McpTransportKind {
     fn default() -> Self {
         Self::Stdio
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpToolLoading {
+    #[default]
+    Eager,
+    OnDemand,
+}
+
+impl McpToolLoading {
+    fn is_eager(&self) -> bool {
+        *self == Self::Eager
     }
 }
 
@@ -46,6 +73,8 @@ pub struct McpServerConfig {
     pub startup_timeout_ms: Option<u64>,
     #[serde(default)]
     pub tool_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "McpToolLoading::is_eager")]
+    pub tool_loading: McpToolLoading,
     /// Name of the environment variable holding a bearer token for HTTP/SSE
     /// auth. Read at connect time; never stored in the config file itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,6 +172,8 @@ pub struct McpToolRef {
     pub server: String,
     pub tool: String,
     pub schema_name: String,
+    #[serde(skip)]
+    pub session_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

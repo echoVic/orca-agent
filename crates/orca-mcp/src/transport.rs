@@ -72,6 +72,11 @@ pub trait McpElicitationHandler {
 }
 
 pub trait McpTransport: Send + Sync {
+    /// Changes when a transport replaces its session in place.
+    fn session_generation(&self) -> u64 {
+        0
+    }
+
     fn capability_receipt(&self) -> Option<CapabilityReceipt> {
         None
     }

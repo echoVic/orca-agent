@@ -738,6 +738,12 @@ impl Default for ToolInvocationStarted {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpToolLoad {
+    pub server: String,
+    pub names: std::collections::BTreeSet<String>,
+}
+
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ToolTerminal {
@@ -764,6 +770,8 @@ pub struct ToolTerminal {
     pub started: ToolInvocationStarted,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spill: Option<Box<ToolOutputSpill>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tool_load: Option<McpToolLoad>,
 }
 
 impl ToolTerminal {
@@ -792,6 +800,7 @@ impl ToolTerminal {
             source,
             started,
             spill: None,
+            mcp_tool_load: None,
         })
     }
 
@@ -831,6 +840,7 @@ struct ToolTerminalWire {
     started: ToolInvocationStarted,
     #[serde(default)]
     spill: Option<Box<ToolOutputSpill>>,
+    mcp_tool_load: Option<McpToolLoad>,
 }
 
 impl<'de> Deserialize<'de> for ToolTerminal {
@@ -850,6 +860,7 @@ impl<'de> Deserialize<'de> for ToolTerminal {
         )
         .map(|mut terminal| {
             terminal.spill = wire.spill;
+            terminal.mcp_tool_load = wire.mcp_tool_load;
             terminal
         })
         .map_err(serde::de::Error::custom)
@@ -1268,6 +1279,11 @@ impl ToolResult {
         self
     }
 
+    pub fn with_mcp_tool_load(mut self, load: Option<McpToolLoad>) -> Self {
+        self.terminal.mcp_tool_load = load;
+        self
+    }
+
     pub fn with_terminal_source(mut self, source: ToolTerminalSource) -> Self {
         self.terminal.source = source;
         self
@@ -1642,6 +1658,7 @@ mod tests {
             source: ToolTerminalSource::CompatibilityRepair,
             started: ToolInvocationStarted::Unknown,
             spill: None,
+            mcp_tool_load: None,
         };
 
         let value = serde_json::to_value(terminal).unwrap();
@@ -1649,6 +1666,7 @@ mod tests {
         assert_eq!(value["kind"], "indeterminate");
         assert_eq!(value["terminal_source"], "compatibility_repair");
         assert!(value.get("started").is_none());
+        assert!(value.get("mcp_tool_load").is_none());
         assert_eq!(
             serde_json::to_value(InterruptSemantics::CooperativeCancel).unwrap(),
             "cooperative_cancel"
@@ -1677,6 +1695,7 @@ mod tests {
                 source: ToolTerminalSource::Observed,
                 started: ToolInvocationStarted::Yes,
                 spill: None,
+                mcp_tool_load: None,
             }
         );
 

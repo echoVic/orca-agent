@@ -291,6 +291,7 @@ impl RuntimeTurnLoopStep {
             agent_controller,
         )?;
         let mut summary_provider_config = None;
+
         loop {
             park_pending_task_wait(&mut input)?;
             deliver_loop_notices(&mut input, true)?;
@@ -358,8 +359,39 @@ impl RuntimeTurnLoopStep {
                     summary_provider_config = Some(provider_config);
                 }
             }
+            let refreshed_provider =
+                if !summary_due && input.deps.mcp_registry.agent_tools_can_change_during_turn() {
+                    let turn = &input.request.turn_context;
+                    let services = input.loop_state.runtime.extensions.extension_context();
+                    crate::mcp_startup::refresh_request_instructions(
+                        input.prepared_conversation.parts_mut().0,
+                        input.deps.mcp_registry,
+                    );
+                    let mut provider = crate::tool_invocation::provider_config_for_agent_loop(
+                        input.policy.config,
+                        turn.cwd,
+                        turn.subagent_depth,
+                        turn.subagent_type,
+                        input
+                            .loop_state
+                            .tool_policy(input.policy.tool_policy)
+                            .with_workflow_ipc(input.workflow.workflow_ipc.is_some()),
+                        input.deps.mcp_registry,
+                        services.stores().thread_store(),
+                    );
+                    provider
+                        .model
+                        .clone_from(&input.provider_context.provider_config.model);
+                    Some(provider)
+                } else {
+                    None
+                };
             match self.iteration_step.run(
-                input.iteration_input(summary_provider_config.as_ref()),
+                input.iteration_input(
+                    summary_provider_config
+                        .as_ref()
+                        .or(refreshed_provider.as_ref()),
+                ),
                 executors.workflow_child_executor,
                 executors.batch_child_executor,
             )? {

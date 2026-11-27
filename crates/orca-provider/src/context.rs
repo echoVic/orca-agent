@@ -594,6 +594,7 @@ fn internal_context_tokens_with_counter(
     [
         render_internal_context_with_counter(conversation, counter),
         render_mcp_instructions_with_counter(conversation, counter),
+        render_mcp_catalogs_with_counter(conversation, counter),
     ]
     .into_iter()
     .flatten()
@@ -689,7 +690,77 @@ fn render_mcp_instructions_with_counter(
     (message.len() > MCP_INSTRUCTIONS_PREAMBLE.len()).then_some(message)
 }
 
-fn truncate_text_to_token_limit(
+const MCP_CATALOG_OPEN: &str = "MCP tool metadata. Use each server's loader to make a listed tool available.\n<mcp_tool_catalog>\n";
+const MCP_CATALOG_CLOSE: &str = "</mcp_tool_catalog>";
+const MCP_CATALOG_SHORTENED: &str = "\n[MCP catalog shortened. Call the server's load_tools with {\"names\":[]} for its full list.]";
+
+pub(crate) fn render_mcp_catalogs(conversation: &Conversation) -> Option<String> {
+    render_mcp_catalogs_with_counter(conversation, &DefaultTokenCounter)
+}
+
+fn render_mcp_catalogs_with_counter(
+    conversation: &Conversation,
+    counter: &impl TokenCounter,
+) -> Option<String> {
+    if conversation.mcp_catalogs.is_empty() {
+        return None;
+    }
+    // Reserve every loader heading before spending tokens on descriptions.
+    let mut sections = conversation
+        .mcp_catalogs
+        .iter()
+        .map(|catalog| {
+            format!(
+                r#"{{"server":{},"loader":{},"tools":["#,
+                catalog_json(&catalog.server),
+                catalog_json(&catalog.loader)
+            )
+        })
+        .collect::<Vec<_>>();
+    let minimum = assemble_mcp_catalog(&sections, true);
+    let budget = MCP_CONTEXT_MAX_TOKENS.max(counter.count_text(&minimum));
+    let mut shortened = false;
+    for (index, catalog) in conversation.mcp_catalogs.iter().enumerate() {
+        for (entry_index, entry) in catalog.entries.iter().enumerate() {
+            let previous_end = sections[index].len();
+            if entry_index > 0 {
+                sections[index].push(',');
+            }
+            sections[index].push_str(&catalog_json(entry));
+            if counter.count_text(&assemble_mcp_catalog(&sections, true)) > budget {
+                sections[index].truncate(previous_end);
+                shortened = true;
+                break;
+            }
+        }
+    }
+    Some(assemble_mcp_catalog(&sections, shortened))
+}
+
+fn assemble_mcp_catalog(sections: &[String], shortened: bool) -> String {
+    let mut text = String::from(MCP_CATALOG_OPEN);
+    for section in sections {
+        text.push_str(section);
+        text.push_str("]}\n");
+    }
+    text.push_str(MCP_CATALOG_CLOSE);
+    if shortened {
+        text.push_str(MCP_CATALOG_SHORTENED);
+    }
+    text
+}
+
+fn catalog_json(value: &impl serde::Serialize) -> String {
+    serde_json::to_string(value)
+        .expect("MCP catalog metadata is serializable")
+        .replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+pub fn truncate_text_to_token_limit(
     text: &str,
     max_tokens: usize,
     counter: &impl TokenCounter,
@@ -1369,6 +1440,7 @@ fn summarize_collapsed_messages(
     result
         .mcp_instructions
         .clone_from(&conversation.mcp_instructions);
+    result.mcp_catalogs.clone_from(&conversation.mcp_catalogs);
     result
         .summary
         .tool_output_spills
@@ -5080,6 +5152,24 @@ mod tests {
         );
         assert_eq!(messages[4].content.as_deref(), Some("hello"));
         assert_eq!(messages.len(), 5);
+    }
+
+    #[test]
+    fn no_skills_means_no_catalog_and_unchanged_request_bytes() {
+        let mut conv = Conversation::new();
+        conv.add_system("system prompt".into());
+        conv.add_user("hello".into());
+        let bytes = |conv: &Conversation| {
+            serde_json::to_vec(&crate::deepseek_http::conversation_to_api_messages(conv)).unwrap()
+        };
+        let before = bytes(&conv);
+        conv.replace_skill_catalog(None);
+        assert!(
+            conv.internal_context
+                .get(orca_core::conversation::SKILLS_CONTEXT_FRAGMENT_ID)
+                .is_none()
+        );
+        assert_eq!(bytes(&conv), before);
     }
 
     #[test]

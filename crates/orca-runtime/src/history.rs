@@ -283,6 +283,14 @@ impl JsonlThreadStore {
 }
 
 pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String) -> Conversation {
+    resume_conversation_in_cwd(transcript, system_prompt, Path::new(&transcript.meta.cwd))
+}
+
+pub(crate) fn resume_conversation_in_cwd(
+    transcript: &SessionTranscript,
+    system_prompt: String,
+    active_cwd: &Path,
+) -> Conversation {
     let mut conversation = Conversation::new();
     conversation.add_system(system_prompt);
     crate::instructions::restore_nested_state(
@@ -299,9 +307,12 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
     )
     .into_iter()
     // The old system prompt and ephemeral system context are rebuilt rather
-    // than restored. The truncation marker and delivered notices are
-    // conversation content; a notice stays until compaction summarizes it.
+    // than restored. The truncation marker, delivered notices and mentioned
+    // skills are conversation content and stay until compaction.
     .filter(|message| {
+        if let Some(replay) = crate::skill_context::should_replay_mention(message, active_cwd) {
+            return replay;
+        }
         !matches!(
             message,
             Message::System {

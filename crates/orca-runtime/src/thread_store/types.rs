@@ -17,7 +17,7 @@ use orca_core::plan_types::PlanItem;
 use orca_core::thread_identity::{ConversationItemId, TurnId};
 use orca_core::thread_item_projection::{CompletedModelItem, CompletedModelResponse};
 use orca_core::tool_types::{
-    ToolInvocationStarted, ToolOutputSpill, ToolResultKind, ToolStatus, ToolTerminal,
+    McpToolLoad, ToolInvocationStarted, ToolOutputSpill, ToolResultKind, ToolStatus, ToolTerminal,
     ToolTerminalSource,
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -615,6 +615,8 @@ struct StoredToolTerminalWire {
     invocation_started: Option<ToolInvocationStarted>,
     #[serde(default)]
     spill: Option<Box<ToolOutputSpill>>,
+    #[serde(default)]
+    mcp_tool_load: Option<McpToolLoad>,
 }
 
 impl StoredToolTerminalWire {
@@ -631,6 +633,7 @@ impl StoredToolTerminalWire {
             )
             .map(|mut terminal| {
                 terminal.spill = self.spill;
+                terminal.mcp_tool_load = self.mcp_tool_load;
                 Some(terminal)
             });
         }
@@ -638,6 +641,7 @@ impl StoredToolTerminalWire {
             || self.terminal_source.is_some()
             || self.invocation_started.is_some()
             || self.spill.is_some()
+            || self.mcp_tool_load.is_some()
         {
             return Err(
                 "stored tool terminal kind/source/start metadata requires status".to_string(),
@@ -669,6 +673,7 @@ pub(crate) fn validate_stored_tool_terminal_fields(message: &Value) -> Option<Re
         "terminal_source",
         "invocation_started",
         "spill",
+        "mcp_tool_load",
     ];
     let object = message.as_object()?;
     if !fields.iter().any(|field| object.contains_key(*field)) {
@@ -709,6 +714,9 @@ impl Serialize for StoredToolTerminal {
             }
             if terminal.started != ToolInvocationStarted::Unknown {
                 map.serialize_entry("invocation_started", &terminal.started)?;
+            }
+            if let Some(load) = &terminal.mcp_tool_load {
+                map.serialize_entry("mcp_tool_load", load)?;
             }
         }
         map.end()

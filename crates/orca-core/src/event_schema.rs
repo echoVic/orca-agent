@@ -434,6 +434,10 @@ impl EventFactory {
         }
     }
 
+    pub fn has_publication_store(&self) -> bool {
+        self.publication.store.is_some()
+    }
+
     pub fn run_id(&self) -> &str {
         &self.run_id
     }

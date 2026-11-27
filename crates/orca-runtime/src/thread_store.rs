@@ -66,13 +66,6 @@ pub(crate) use writer::{
     write_prompt_queue_snapshot,
 };
 
-pub(crate) fn resume_conversation(
-    transcript: &SessionTranscript,
-    system_prompt: String,
-) -> Conversation {
-    crate::history::resume_conversation(transcript, system_prompt)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

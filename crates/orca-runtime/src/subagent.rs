@@ -122,8 +122,12 @@ pub(crate) fn discover_agents(config: &RunConfig, cwd: &Path, mcp: &McpRegistry)
         &config.external_tools,
     );
     let tools = registry
-        .model_visible_tools()
-        .filter(|tool| tool.name() != "computer")
+        .iter()
+        .filter(|tool| {
+            (tool.spec().exposure.is_model_visible()
+                || tool.spec().exposure == orca_core::tool_types::ToolExposure::Deferred)
+                && tool.name() != "computer"
+        })
         .flat_map(|tool| {
             std::iter::once(tool.name().to_string()).chain(
                 tool.spec()

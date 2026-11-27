@@ -10,7 +10,7 @@ use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
 use orca_provider::tool_schema::{
-    DEEPSEEK_MAX_TOOLS, ProviderToolDefinition, limit_tool_definitions_by_source,
+    DEEPSEEK_MAX_TOOLS, ProviderToolDefinition, limit_tool_definitions_with_loaders,
 };
 use orca_tools::schema::{ToolPolicy, canonical_tool_definitions, normalize_tool_request};
 
@@ -220,12 +220,55 @@ pub(crate) fn provider_config_for_agent_loop(
         {
             tools.retain(|tool| tool.name != "computer");
         }
+        let is_mcp = |name: &str| {
+            registry
+                .get(name)
+                .map(|tool| matches!(tool.spec().name, ToolName::Mcp(_)))
+        };
+        let loaders: HashSet<_> = mcp_registry
+            .on_demand_loaders()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
         if config.provider == orca_core::config::ProviderKind::DeepSeek {
-            let dropped = limit_tool_definitions_by_source(tools, DEEPSEEK_MAX_TOOLS, |name| {
-                registry
-                    .get(name)
-                    .map(|tool| matches!(tool.spec().name, ToolName::Mcp(_)))
-            });
+            let priority_count = tools
+                .iter()
+                .filter(|tool| is_mcp(&tool.name) != Some(true) || loaders.contains(&tool.name))
+                .count();
+            if !loaders.is_empty() {
+                let allowed = if let Some(names) = tool_policy.allowed_tools() {
+                    Some(
+                        names
+                            .iter()
+                            .filter_map(|name| {
+                                registry
+                                    .resolve(name)
+                                    .map(|tool| tool.tool.name().to_string())
+                            })
+                            .collect(),
+                    )
+                } else if subagent_depth > 0 {
+                    Some(
+                        subagent_type
+                            .allowed_tools()
+                            .iter()
+                            .filter_map(|name| {
+                                registry
+                                    .resolve(name)
+                                    .map(|tool| tool.tool.name().to_string())
+                            })
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+                mcp_registry
+                    .set_tool_budget(DEEPSEEK_MAX_TOOLS.saturating_sub(priority_count), allowed);
+            }
+            let dropped =
+                limit_tool_definitions_with_loaders(tools, DEEPSEEK_MAX_TOOLS, is_mcp, |name| {
+                    loaders.contains(name)
+                });
             if let Some(warnings) =
                 session_tools.get::<std::sync::Arc<crate::mcp_startup::McpStartupWarnings>>()
             {

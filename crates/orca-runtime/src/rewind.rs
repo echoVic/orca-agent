@@ -1059,8 +1059,11 @@ pub(crate) fn apply_rewind(
                         u32::try_from(split.before.compactions.len()).unwrap_or(u32::MAX);
                     kept_summaries =
                         u32::try_from(split.before.summaries.len()).unwrap_or(u32::MAX);
-                    let mut conversation =
-                        crate::history::resume_conversation(&split.before, system_prompt);
+                    let mut conversation = crate::history::resume_conversation_in_cwd(
+                        &split.before,
+                        system_prompt,
+                        &rewind_cwd(config),
+                    );
                     conversation
                         .messages
                         .push(Message::pinned_system(range.summary.clone()));
@@ -1100,7 +1103,11 @@ pub(crate) fn apply_rewind(
             // Rebuild the conversation from the truncated transcript so the
             // system prompt and compaction replay match a fresh resume.
             let system_prompt = current_system_prompt(session);
-            let conversation = crate::history::resume_conversation(&cut.transcript, system_prompt);
+            let conversation = crate::history::resume_conversation_in_cwd(
+                &cut.transcript,
+                system_prompt,
+                &rewind_cwd(config),
+            );
             session.replace_conversation(conversation);
             if cut.kept_summaries == 0 {
                 session.conversation_mut().clear_summary_state();

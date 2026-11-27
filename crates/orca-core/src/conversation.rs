@@ -6,8 +6,11 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::approval_types::ActionKind;
+use crate::mcp_types::McpToolCatalog;
 use crate::tool_images::{MAX_REQUEST_TOOL_IMAGES, RetainedToolImages, keep_newest_tool_images};
-use crate::tool_types::{ToolName, ToolRequest, ToolResult, ToolTerminal, ToolTerminalSource};
+use crate::tool_types::{
+    ToolName, ToolRequest, ToolResult, ToolStatus, ToolTerminal, ToolTerminalSource,
+};
 
 /// The single conversation attachment target used by interactive surfaces.
 /// Keeping the target typed prevents parent, child and sibling navigation from
@@ -284,8 +287,16 @@ impl Message {
         match self {
             Self::System { pinned, .. }
             | Self::User { pinned, .. }
-            | Self::Assistant { pinned, .. }
-            | Self::Tool { pinned, .. } => *pinned,
+            | Self::Assistant { pinned, .. } => *pinned,
+            // Keep the matching call and receipt so the next session can restore its tools.
+            Self::Tool {
+                pinned, terminal, ..
+            } => {
+                *pinned
+                    || terminal.as_ref().is_some_and(|terminal| {
+                        terminal.status == ToolStatus::Completed && terminal.mcp_tool_load.is_some()
+                    })
+            }
         }
     }
 
@@ -313,6 +324,7 @@ pub const MODE_CONTEXT_FRAGMENT_ID: &str = "mode";
 pub const GOAL_CONTEXT_FRAGMENT_ID: &str = "goal";
 pub const PLAN_CONTEXT_FRAGMENT_ID: &str = "plan";
 pub const SKILL_CONTEXT_FRAGMENT_ID: &str = "skill";
+pub const SKILLS_CONTEXT_FRAGMENT_ID: &str = "skills";
 pub const MEMORY_CONTEXT_FRAGMENT_ID: &str = "memory";
 /// Today's date. It rides in the internal context rather than the system
 /// prompt, so the system prompt and the history stay the same across days.
@@ -324,6 +336,25 @@ pub const MODE_CONTEXT_MAX_TOKENS: usize = 2_048;
 pub const GOAL_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const PLAN_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const SKILL_CONTEXT_MAX_TOKENS: usize = 4_096;
+pub const SKILL_INVOCATION_PREFIX: &str = "[Mentioned skill invocation ";
+
+/// Distinguishes submitted prompts from internal user-role messages in history.
+pub fn is_rewindable_user_prompt(content: &str, images: &[ImageInput], pinned: bool) -> bool {
+    if !images.is_empty() {
+        return true;
+    }
+    let skill_invocation = pinned
+        && content
+            .strip_prefix(SKILL_INVOCATION_PREFIX)
+            .and_then(|rest| rest.split_once("]\n"))
+            .and_then(|(header, _)| header.split_once(' '))
+            .is_some_and(|(version, root)| {
+                version.len() == 64
+                    && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && serde_json::from_str::<Option<String>>(root).is_ok()
+            });
+    !is_internal_image_analysis(content) && !skill_invocation
+}
 pub const MEMORY_CONTEXT_MAX_TOKENS: usize = 3_072;
 pub const MCP_CONTEXT_MAX_TOKENS: usize = 4_096;
 
@@ -564,6 +595,7 @@ pub struct Conversation {
     pub internal_context: InternalContext,
     /// Per-server guidance for the current tool set, sent in its own request message.
     pub mcp_instructions: Vec<(String, String)>,
+    pub mcp_catalogs: Vec<McpToolCatalog>,
     pub rolling_summary: Option<String>,
     pub summary: SummaryState,
     /// Not persisted: a resumed conversation measures from a full estimate
@@ -586,6 +618,7 @@ impl Clone for Conversation {
             messages: self.messages.clone(),
             internal_context: self.internal_context.clone(),
             mcp_instructions: self.mcp_instructions.clone(),
+            mcp_catalogs: self.mcp_catalogs.clone(),
             rolling_summary: self.rolling_summary.clone(),
             summary: self.summary.clone(),
             usage_anchor: self.usage_anchor,
@@ -606,6 +639,7 @@ impl Conversation {
             messages: Vec::new(),
             internal_context: InternalContext::default(),
             mcp_instructions: Vec::new(),
+            mcp_catalogs: Vec::new(),
             rolling_summary: None,
             summary: SummaryState::default(),
             usage_anchor: None,
@@ -741,6 +775,16 @@ impl Conversation {
             content
                 .filter(|text| !text.trim().is_empty())
                 .map(|text| format!("[Skill context]\n{text}")),
+            SKILL_CONTEXT_MAX_TOKENS,
+        );
+    }
+
+    pub fn replace_skill_catalog(&mut self, content: Option<String>) {
+        self.replace_internal_context(
+            SKILLS_CONTEXT_FRAGMENT_ID,
+            InternalContextKind::Skill,
+            InternalContextOrigin::System,
+            content,
             SKILL_CONTEXT_MAX_TOKENS,
         );
     }
@@ -910,8 +954,8 @@ impl Conversation {
         let mut index = None;
         for (position, message) in self.messages.iter().enumerate() {
             if matches!(message,
-                Message::User { content, images, .. }
-                    if !images.is_empty() || !is_internal_image_analysis(content))
+                Message::User { content, images, pinned }
+                    if is_rewindable_user_prompt(content, images, *pinned))
             {
                 if seen == ordinal {
                     index = Some(position);
@@ -1371,6 +1415,27 @@ mod tests {
             Message::Tool { terminal: Some(terminal), .. }
                 if terminal == result.terminal()
         ));
+    }
+
+    #[test]
+    fn mcp_tool_load_receipt_is_pinned_for_compaction_and_resume() {
+        let request = ToolRequest {
+            id: "load_1".to_string(),
+            name: ToolName::Mcp("mcp__catalog__load_tools".to_string()),
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"names":["lookup"]}"#.to_string()),
+        };
+        let result = ToolResult::completed(&request, "loaded".to_string(), false)
+            .with_mcp_tool_load(Some(crate::tool_types::McpToolLoad {
+                server: "catalog".to_string(),
+                names: ["lookup".to_string()].into_iter().collect(),
+            }));
+        let mut conversation = Conversation::new();
+
+        conversation.add_tool_result_with_terminal(&result, "loaded".to_string());
+
+        assert!(conversation.messages[0].is_pinned());
     }
 
     #[test]
@@ -2287,5 +2352,21 @@ mod tests {
         // An anchor over no messages measures nothing.
         conv.record_usage_anchor(1_000, 900, 0);
         assert!(conv.valid_usage_anchor().is_none());
+    }
+
+    #[test]
+    fn rewind_skips_generated_skill_invocations_but_keeps_pinned_prompts() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("$review:permissions".to_string());
+        conversation.messages.push(Message::pinned_user(format!(
+            "{SKILL_INVOCATION_PREFIX}{} null]\nexpanded skill",
+            "a".repeat(64),
+        )));
+        conversation.add_user_pinned("Continue".to_string());
+
+        assert_eq!(
+            conversation.truncate_before_user_ordinal(1).as_deref(),
+            Some("Continue")
+        );
     }
 }
