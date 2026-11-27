@@ -1842,6 +1842,7 @@ fn stale_attachment_events_do_not_mutate_switched_session() {
     .unwrap();
     for event in [
         TuiEvent::HistoryLoaded {
+            agent_lines: Default::default(),
             messages: vec![ChatMessage::Assistant("transcript-b".to_string())],
             plan: None,
             label: "loaded-b".to_string(),
@@ -1901,6 +1902,7 @@ fn stale_attachment_events_do_not_mutate_switched_session() {
     };
     for event in [
         TuiEvent::HistoryLoaded {
+            agent_lines: Default::default(),
             messages: vec![ChatMessage::Assistant("stale-transcript-a".to_string())],
             plan: None,
             label: "stale-loaded-a".to_string(),

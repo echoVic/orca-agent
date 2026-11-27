@@ -106,6 +106,7 @@ mod status_key_actions;
 mod stderr_capture;
 mod stdio_guard;
 mod streaming_markdown;
+mod subagent_lines;
 mod submitted_turn;
 mod surface_actions;
 #[cfg(test)]

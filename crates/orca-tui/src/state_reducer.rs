@@ -365,10 +365,13 @@ impl AppState {
                 self.surface_metrics.apply_acp_metrics(metrics);
             }
             TuiEvent::HistoryLoaded {
+                agent_lines,
                 messages,
                 plan,
                 label,
             } => {
+                self.announced_subagent_batches = agent_lines.batches;
+                self.announced_subagent_terminals = agent_lines.terminals;
                 self.replace_messages(messages);
                 self.settle_restored_command_rows();
                 if let Some(plan) = plan {
@@ -1535,22 +1538,13 @@ impl AppState {
             .cloned()
             .collect::<Vec<_>>();
         for task in &tasks {
-            let batch_key = task
-                .subagent_batch_id
-                .clone()
-                .unwrap_or_else(|| task.id.clone());
-            if (task.status.is_active() || task.status.requires_attention())
-                && self.announced_subagent_batches.insert(batch_key)
-            {
+            let batch_key = crate::subagent_lines::batch_key(task).to_owned();
+            if self.announced_subagent_batches.insert(batch_key) {
                 self.finish_assistant_stream();
-                let batch_size = task.subagent_batch_size.unwrap_or(1).max(1);
-                let noun = if batch_size == 1 {
-                    "agent"
-                } else {
-                    "agents in parallel"
-                };
                 self.push_message(ChatMessage::System {
-                    text: format!("Delegating to {batch_size} {noun}"),
+                    text: crate::subagent_lines::delegating_line(
+                        task.subagent_batch_size.unwrap_or(1) as usize,
+                    ),
                     expanded: false,
                 });
             }

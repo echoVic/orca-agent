@@ -503,6 +503,7 @@ pub enum TuiEvent {
         requested_schema_json: Option<String>,
     },
     HistoryLoaded {
+        agent_lines: crate::subagent_lines::AnnouncedAgentLines,
         messages: Vec<ChatMessage>,
         plan: Option<(Option<String>, Vec<PlanItem>)>,
         label: String,

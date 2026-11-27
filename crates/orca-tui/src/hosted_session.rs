@@ -571,21 +571,37 @@ pub(crate) fn dispatch_queue_follows(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum HistoryTarget {
+    Main,
+    Other,
+}
+
 pub(crate) fn read_hosted_projection_batch(
     thread: &RuntimeThreadHandle,
+    target: HistoryTarget,
 ) -> Result<(SurfaceProjectionState, HostedConversation), String> {
     TuiSurfaceActions::new(thread.typed_surface())
         .read_snapshot()
-        .map(|snapshot| hosted_projection_batch_from_snapshot(thread, &snapshot))
+        .map(|snapshot| hosted_projection_batch_from_snapshot(thread, &snapshot, target))
         .map_err(|error| error.to_string())
 }
 
 pub(crate) fn hosted_projection_batch_from_snapshot(
     thread: &RuntimeThreadHandle,
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
+    target: HistoryTarget,
 ) -> (SurfaceProjectionState, HostedConversation) {
     let projection = SurfaceProjectionState::from_surface_snapshot(snapshot);
-    let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(snapshot);
+    let mut messages = match target {
+        HistoryTarget::Main => {
+            crate::surface_projection::history_messages_from_surface_snapshot(snapshot)
+        }
+        HistoryTarget::Other => crate::surface_projection::history_messages_from_surface_items(
+            &snapshot.items,
+            &snapshot.tools,
+        ),
+    };
     if let Some(session_id) = thread.session_id()
         && let Ok(transcript) = load_saved_history_fallback(session_id)
     {
@@ -594,13 +610,16 @@ pub(crate) fn hosted_projection_batch_from_snapshot(
     if let Some(message) = crate::surface_projection::latest_terminal_message(snapshot) {
         messages.push(message);
     }
-    (
-        projection,
-        HostedConversation::from_snapshot(snapshot, messages),
-    )
+    let mut conversation = HostedConversation::from_snapshot(snapshot, messages);
+    if matches!(target, HistoryTarget::Main) {
+        conversation.agent_lines =
+            crate::subagent_lines::AnnouncedAgentLines::from_tasks(&projection.workflow_tasks);
+    }
+    (projection, conversation)
 }
 
 pub(crate) struct HostedConversation {
+    pub(crate) agent_lines: crate::subagent_lines::AnnouncedAgentLines,
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) plan: Option<(Option<String>, Vec<PlanItem>)>,
 }
@@ -613,13 +632,19 @@ impl HostedConversation {
         Self {
             messages,
             plan: snapshot_plan(snapshot),
+            agent_lines: Default::default(),
         }
     }
 
     pub(crate) fn into_event(self, label: Option<&str>) -> TuiEvent {
-        let Self { messages, plan } = self;
+        let Self {
+            messages,
+            plan,
+            agent_lines,
+        } = self;
         match label {
             Some(label) => TuiEvent::HistoryLoaded {
+                agent_lines,
                 messages,
                 plan: None,
                 label: label.to_owned(),
@@ -712,8 +737,12 @@ pub(crate) fn emit_typed_history_snapshot(
     } else {
         "Resumed saved conversation."
     };
+    let projection = SurfaceProjectionState::from_surface_snapshot(&snapshot);
     event_tx
         .send(TuiEvent::HistoryLoaded {
+            agent_lines: crate::subagent_lines::AnnouncedAgentLines::from_tasks(
+                &projection.workflow_tasks,
+            ),
             messages,
             plan,
             label: label.to_string(),
@@ -722,9 +751,8 @@ pub(crate) fn emit_typed_history_snapshot(
     event_tx
         .send(TuiEvent::SurfaceProjectionSynced(Box::new(
             match session_presentation {
-                Some(presentation) => SurfaceProjectionState::from_surface_snapshot(&snapshot)
-                    .with_session_presentation(presentation),
-                None => SurfaceProjectionState::from_surface_snapshot(&snapshot),
+                Some(presentation) => projection.with_session_presentation(presentation),
+                None => projection,
             },
         )))
         .map_err(|error| error.to_string())?;
@@ -806,6 +834,7 @@ pub(crate) fn looks_like_uuid_session_id(value: &str) -> bool {
 
 pub(crate) fn emit_empty_history_snapshot(event_tx: &mpsc::Sender<TuiEvent>, label: &str) {
     let _ = event_tx.send(TuiEvent::HistoryLoaded {
+        agent_lines: Default::default(),
         messages: Vec::new(),
         plan: None,
         label: label.to_string(),
@@ -1240,6 +1269,7 @@ mod tests {
                 messages,
                 plan: None,
                 label,
+                ..
             }) if messages.is_empty() && label == "Unable to restore saved conversation."
         ));
     }
@@ -1269,6 +1299,7 @@ mod tests {
         project_hosted_thread_attached(
             projection,
             HostedConversation {
+                agent_lines: Default::default(),
                 messages: vec![ChatMessage::User("hello".to_string())],
                 plan: None,
             },

@@ -1208,6 +1208,7 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
         );
     } else {
         assert!(frame.contains("Agents 1 active"), "{frame}");
+        assert_eq!(frame.matches("Delegating to 1 agent").count(), 1, "{frame}");
         std::fs::write(&marker, b"").unwrap();
     }
     arm_idle_exit(&mut process, &mut output);
@@ -1412,6 +1413,49 @@ fn tui_bracketed_image_path_paste_materializes_an_atomic_attachment() {
     let status = process.wait_for_exit(Duration::from_secs(5));
     process.close_io_and_join();
     assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
+fn tui_resume_shows_what_the_agents_did() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n").unwrap();
+    let prompt = "subagent batch async mock_stream_delay_ms 500";
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), prompt).unwrap();
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    let ended = "Agent completed: mock_stream_delay_ms 500";
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while reconstruct_screen(&output).matches(ended).count() < 2 {
+        assert!(Instant::now() < deadline, "{}", reconstruct_screen(&output));
+        if let Some(chunk) = process.receive_output(Duration::from_millis(100)) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+    arm_idle_exit(&mut process, &mut output);
+    assert_eq!(
+        process.wait_for_exit(Duration::from_secs(5)).code(),
+        Some(130)
+    );
+    process.close_io_and_join();
+    let mut resumed =
+        PtyProcess::spawn_resumed_without_prompt(home.path(), cwd.path(), "latest").unwrap();
+    let mut output = Vec::new();
+    assert_screen_has_text(
+        &resumed,
+        &mut output,
+        "Resumed saved conversation.",
+        "main was not resumed",
+    );
+    let frame = reconstruct_screen(&output);
+    assert_eq!(frame.matches("Delegating to 1 agent").count(), 2, "{frame}");
+    assert_eq!(frame.matches(ended).count(), 2, "{frame}");
+    arm_idle_exit(&mut resumed, &mut output);
+    assert_eq!(
+        resumed.wait_for_exit(Duration::from_secs(5)).code(),
+        Some(130)
+    );
+    resumed.close_io_and_join();
 }
 
 #[test]

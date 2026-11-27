@@ -5008,8 +5008,11 @@ mod tests {
         let snapshot = crate::surface_actions::TuiSurfaceActions::new(thread.typed_surface())
             .read_snapshot()
             .expect("snapshot after the denial");
-        let (_, conversation) =
-            crate::hosted_session::hosted_projection_batch_from_snapshot(&thread, &snapshot);
+        let (_, conversation) = crate::hosted_session::hosted_projection_batch_from_snapshot(
+            &thread,
+            &snapshot,
+            crate::hosted_session::HistoryTarget::Main,
+        );
         let messages = conversation.messages;
         assert!(
             matches!(

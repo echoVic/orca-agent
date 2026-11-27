@@ -491,6 +491,7 @@ mod tests {
             attached(
                 stale,
                 TuiEvent::HistoryLoaded {
+                    agent_lines: Default::default(),
                     messages: vec![ChatMessage::Assistant("stale".to_string())],
                     plan: None,
                     label: "stale history".to_string(),
@@ -514,6 +515,7 @@ mod tests {
             attached(
                 active,
                 TuiEvent::HistoryLoaded {
+                    agent_lines: Default::default(),
                     messages: vec![ChatMessage::Assistant("hydrated".to_string())],
                     plan: None,
                     label: "loaded history".to_string(),
@@ -551,6 +553,7 @@ mod tests {
             attached(
                 active,
                 TuiEvent::HistoryLoaded {
+                    agent_lines: Default::default(),
                     messages: vec![ChatMessage::Assistant("hydrated again".to_string())],
                     plan: None,
                     label: "loaded again".to_string(),
@@ -901,6 +904,7 @@ mod tests {
 
     fn history_loaded(history: Option<&str>, label: &str) -> TuiEvent {
         TuiEvent::HistoryLoaded {
+            agent_lines: Default::default(),
             messages: history
                 .map(|text| ChatMessage::Assistant(text.to_string()))
                 .into_iter()

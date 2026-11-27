@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crossterm::event::KeyCode;
-use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
+use orca_core::task_types::{BackgroundTaskSummary, TaskType};
 
 use crate::agent_workspace::AgentWorkspaceRow;
 use crate::protocol::{PendingWorkflowNotification, TaskTranscriptRequest, UserAction};
@@ -537,7 +537,6 @@ impl AppState {
     }
 
     pub(crate) fn apply_workflow_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
-        let previous = self.workflow_panel.tasks().to_vec();
         // Only update the parent snapshot when Main is focused. While a child
         // is attached the background_workflow_tasks holds the parent baseline
         // used by apply_surface_projection_state for dock merging; overwriting
@@ -569,8 +568,10 @@ impl AppState {
         let selected_task_id = self.selected_workflow_task().map(|task| task.id.clone());
         self.workflow_panel.replace_tasks(tasks);
         self.agent_workspace.reconcile(self.workflow_panel.tasks());
-        self.sync_subagent_transcript_messages();
-        self.emit_subagent_terminal_notices(&previous);
+        if self.conversation_target().task_id().is_none() && !self.side_conversation_visible {
+            self.sync_subagent_transcript_messages();
+            self.emit_subagent_terminal_notices();
+        }
         self.refresh_open_task_transcript();
         if should_reveal_background_approval {
             // A background approval must surface without stealing the
@@ -608,42 +609,16 @@ impl AppState {
         self.learn_command_ends_from_tasks();
     }
 
-    fn emit_subagent_terminal_notices(&mut self, previous: &[BackgroundTaskSummary]) {
+    fn emit_subagent_terminal_notices(&mut self) {
         let notices = self
             .workflow_tasks()
             .iter()
             .filter(|task| task.task_type == TaskType::Subagent)
             .filter_map(|task| {
-                let old = previous.iter().find(|old| old.id == task.id)?;
-                if old.status == task.status
-                    || !matches!(
-                        task.status,
-                        TaskStatus::Completed
-                            | TaskStatus::Failed
-                            | TaskStatus::Blocked
-                            | TaskStatus::Cancelled
-                    )
-                {
-                    return None;
-                }
                 if self.announced_subagent_terminals.contains(&task.id) {
                     return None;
                 }
-                let name = task.name.as_deref().unwrap_or(task.description.as_str());
-                Some((
-                    task.id.clone(),
-                    match task.status {
-                        TaskStatus::Completed => format!("Agent completed: {name}"),
-                        TaskStatus::Blocked => {
-                            format!("Agent blocked: {}", task.error.as_deref().unwrap_or(name))
-                        }
-                        TaskStatus::Failed => {
-                            format!("Agent failed: {}", task.error.as_deref().unwrap_or(name))
-                        }
-                        TaskStatus::Cancelled => format!("Agent cancelled: {name}"),
-                        _ => unreachable!(),
-                    },
-                ))
+                Some((task.id.clone(), crate::subagent_lines::ended(task)?))
             })
             .collect::<Vec<_>>();
         for (id, notice) in notices {

@@ -22,7 +22,8 @@ use crate::attachment_routing::{
     AttachmentRouting, send_attached_event, spawn_attached_event_sender_with_routing,
 };
 use crate::hosted_session::{
-    HostedConversation, hosted_projection_batch_from_snapshot, project_hosted_thread_attached,
+    HistoryTarget, HostedConversation, hosted_projection_batch_from_snapshot,
+    project_hosted_thread_attached,
 };
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::protocol::{SessionAttachmentId, TuiEvent};
@@ -133,7 +134,7 @@ impl HostedChildEventBridge {
         let client = attachment.client.clone();
         let snapshot = attachment.baseline.snapshot.clone();
         let (initial_projection, conversation) =
-            hosted_projection_batch_from_snapshot(thread, &snapshot);
+            hosted_projection_batch_from_snapshot(thread, &snapshot, HistoryTarget::Other);
         let mut projection = agent.projection(&snapshot);
         let operation_id = snapshot
             .foreground_operation
@@ -506,7 +507,10 @@ fn recover_child_surface(
         .filter(|operation| operation.terminal.is_none())
         .map(|operation| operation.operation_id.clone());
     let projection_state = SurfaceProjectionState::from_surface_snapshot(&snapshot);
-    let messages = crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
+    let messages = crate::surface_projection::history_messages_from_surface_items(
+        &snapshot.items,
+        &snapshot.tools,
+    );
     if let Some(previous) = operation_id.take() {
         control.clear_focused_child_surface(&previous);
     }
@@ -950,7 +954,8 @@ pub(crate) fn project_returned_main(
     control: &TuiSurfaceTaskControl,
     routing: &Arc<Mutex<AttachmentRouting>>,
 ) -> Result<(), String> {
-    let (projection, conversation) = hosted_projection_batch_from_snapshot(thread, snapshot);
+    let (projection, conversation) =
+        hosted_projection_batch_from_snapshot(thread, snapshot, HistoryTarget::Main);
     project_hosted_thread_attached(projection, conversation, None, attachment, sender)?;
     if let Some(generation) = snapshot
         .foreground_operation
@@ -1407,8 +1412,11 @@ pub(crate) mod live_child_for_test {
         if matches!(timing, RequestTiming::BeforeVisit) {
             assert!(before.iter().any(|event| matches!(event, TuiEvent::Attached(item) if item.attachment == Some(parent) && matches!(&item.event, TuiEvent::SurfaceDelivery(delivery) if matches!(delivery.1, TuiEvent::ApprovalNeeded { .. })))));
             visit();
-            let (projection, conversation) =
-                crate::hosted_session::read_hosted_projection_batch(&fixture.child).unwrap();
+            let (projection, conversation) = crate::hosted_session::read_hosted_projection_batch(
+                &fixture.child,
+                super::HistoryTarget::Other,
+            )
+            .unwrap();
             super::project_hosted_child_attached(
                 "child".into(),
                 &super::read_parent_snapshot(&fixture.parent).unwrap(),
@@ -3010,6 +3018,7 @@ pub(crate) mod tests {
             &snapshot_with_child(1, 5),
             projection,
             super::HostedConversation {
+                agent_lines: Default::default(),
                 messages: Vec::new(),
                 plan: None,
             },

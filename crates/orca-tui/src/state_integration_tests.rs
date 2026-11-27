@@ -560,6 +560,7 @@ fn history_loaded_replaces_legacy_prefix_and_freezes_snapshot() {
     state.push_message(ChatMessage::User("legacy".to_string()));
 
     state.update(TuiEvent::HistoryLoaded {
+        agent_lines: Default::default(),
         messages: vec![
             ChatMessage::User("restored".to_string()),
             ChatMessage::Assistant("answer".to_string()),
@@ -828,7 +829,10 @@ mod agent_visit {
             SurfaceProjectionState::from_surface_snapshot(child),
             crate::hosted_session::HostedConversation::from_snapshot(
                 child,
-                crate::surface_projection::history_messages_from_surface_snapshot(child),
+                crate::surface_projection::history_messages_from_surface_items(
+                    &child.items,
+                    &child.tools,
+                ),
             ),
             crate::protocol::SessionAttachmentId::new(2),
             &sender,
@@ -873,6 +877,108 @@ mod agent_visit {
 
     fn assert_no_label(state: &AppState) {
         assert!(!state.transcript.messages.iter().any(|message| matches!(message, ChatMessage::System { text, .. } if text == "Inherited conversation context.")));
+    }
+
+    fn agent_notes(state: &AppState) -> Vec<&str> {
+        state
+            .transcript
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::System { text, .. }
+                    if text.starts_with("Delegating to") || text.starts_with("Agent ") =>
+                {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn snapshot_update(state: &mut AppState, main: &SurfaceSnapshot) {
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState::from_surface_snapshot(main),
+        )));
+    }
+
+    #[test]
+    fn an_agent_that_ends_on_screen_adds_nothing_to_its_own_conversation() {
+        let mut state = state();
+        let mut main = parent_of_child();
+        snapshot_update(&mut state, &main);
+        let mut child = main.clone();
+        child.tasks.clear();
+        child.subagents.clear();
+        focus(&mut state, "child", &main, &child);
+        main.tasks[0].status = orca_runtime::surface::SurfaceTaskStatus::Completed;
+        state.update(TuiEvent::BackgroundTasksUpdated(
+            crate::surface_projection::workflow_task_summaries(&main),
+        ));
+        assert!(agent_notes(&state).is_empty(), "{:?}", agent_notes(&state));
+    }
+
+    #[test]
+    fn the_return_to_main_shows_what_its_agents_did_while_away() {
+        with_streaming_main(|thread, mut main| {
+            let fixture = parent_of_child();
+            main.tasks.extend(fixture.tasks.clone());
+            main.subagents.extend(fixture.subagents.clone());
+            let mut state = state();
+            focus(&mut state, "child", &main, &fixture);
+            main.tasks.last_mut().unwrap().status =
+                orca_runtime::surface::SurfaceTaskStatus::Completed;
+            return_to_main(&mut state, thread, &main);
+            assert_eq!(
+                agent_notes(&state),
+                ["Delegating to 1 agent", "Agent completed: child"]
+            );
+            assert_eq!(state.status, AppStatus::Running);
+        });
+    }
+
+    #[test]
+    fn a_stopped_agent_is_announced_in_main() {
+        use orca_runtime::surface::{SequenceNumber, SurfaceTaskStatus, TaskRevision};
+        let mut main = parent_of_child();
+        let mut state = state();
+        state.set_status(AppStatus::Running);
+        snapshot_update(&mut state, &main);
+        main.cursor.next_seq = SequenceNumber::new(2);
+        main.tasks[0].revision = TaskRevision::try_new(2).unwrap();
+        main.tasks[0].status = SurfaceTaskStatus::Stopped;
+        snapshot_update(&mut state, &main);
+        assert_eq!(
+            agent_notes(&state),
+            ["Delegating to 1 agent", "Agent stopped: child"]
+        );
+        assert_eq!(state.status, AppStatus::Running);
+        state.update(TuiEvent::ConversationReprojected {
+            messages: crate::surface_projection::history_messages_from_surface_snapshot(&main),
+            plan: None,
+        });
+        assert_eq!(
+            agent_notes(&state),
+            ["Delegating to 1 agent", "Agent stopped: child"]
+        );
+        assert_eq!(state.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn a_rebuild_does_not_repeat_a_line() {
+        with_streaming_main(|thread, _| {
+            let mut main = parent_of_child();
+            main.tasks[0].status = orca_runtime::surface::SurfaceTaskStatus::Completed;
+            let mut state = state();
+            for _ in 0..2 {
+                focus(&mut state, "child", &main, &main);
+                return_to_main(&mut state, thread, &main);
+                snapshot_update(&mut state, &main);
+                assert_eq!(
+                    agent_notes(&state),
+                    ["Delegating to 1 agent", "Agent completed: child"]
+                );
+            }
+        });
     }
 
     #[test]
@@ -1562,6 +1668,7 @@ mod agent_visit {
         crate::hosted_session::project_hosted_thread_attached(
             SurfaceProjectionState::from_surface_snapshot(&parent_of_child()),
             crate::hosted_session::HostedConversation {
+                agent_lines: Default::default(),
                 messages: vec![],
                 plan: None,
             },
@@ -3183,6 +3290,7 @@ fn recovery_projection_is_not_overwritten_by_lifecycle_events() {
     assert_eq!(state.recoverable_operation_id(), Some(&operation_id));
 
     state.update(TuiEvent::HistoryLoaded {
+        agent_lines: Default::default(),
         messages: Vec::new(),
         plan: None,
         label: "Resumed saved conversation.".to_string(),

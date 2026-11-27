@@ -706,7 +706,24 @@ impl AppState {
 pub(crate) fn history_messages_from_surface_snapshot(
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
 ) -> Vec<crate::transcript_state::ChatMessage> {
-    history_messages_from_surface_items(&snapshot.items, &snapshot.tools)
+    let mut start = 0;
+    let mut messages = Vec::new();
+    for (boundary, text) in crate::subagent_lines::positioned_lines(snapshot) {
+        messages.extend(history_messages_from_surface_items(
+            &snapshot.items[start..boundary],
+            &snapshot.tools,
+        ));
+        messages.push(crate::transcript_state::ChatMessage::System {
+            text,
+            expanded: false,
+        });
+        start = boundary;
+    }
+    messages.extend(history_messages_from_surface_items(
+        &snapshot.items[start..],
+        &snapshot.tools,
+    ));
+    messages
 }
 
 #[cfg(test)]
@@ -730,7 +747,7 @@ pub(crate) fn test_surface_cursor(next_seq: u64) -> SurfaceCursor {
     }
 }
 
-fn history_messages_from_surface_items(
+pub(crate) fn history_messages_from_surface_items(
     items: &[SurfaceItem],
     tools: &[orca_runtime::surface::SurfaceToolView],
 ) -> Vec<crate::transcript_state::ChatMessage> {
@@ -1874,12 +1891,10 @@ pub(crate) fn workflow_task_summaries(
         .tasks
         .iter()
         .map(|task| {
-            let subagent = task.subagent_id.as_ref().and_then(|subagent_id| {
-                snapshot
-                    .subagents
-                    .iter()
-                    .find(|subagent| &subagent.subagent_id == subagent_id)
-            });
+            let subagent = snapshot
+                .subagents
+                .iter()
+                .find(|subagent| subagent.task_id == task.task_id);
             let workflow = task.workflow_run_id.as_ref().and_then(|run_id| {
                 snapshot
                     .workflows
@@ -1985,7 +2000,8 @@ pub(crate) fn workflow_task_summaries(
                         .as_ref()
                         .map(|thread_id| uuid::Uuid::from_bytes(*thread_id.as_bytes()).to_string())
                 }),
-                subagent_batch_id: subagent.map(|subagent| subagent.batch_id.as_str().to_string()),
+                subagent_batch_id: subagent
+                    .map(|subagent| crate::subagent_lines::batch_identity(task, subagent)),
                 subagent_batch_size: subagent.map(|subagent| subagent.batch_size),
                 subagent_turn: subagent.and_then(|subagent| subagent.turn),
                 last_activity_at_ms: subagent
@@ -2715,6 +2731,107 @@ mod tests {
                 closed: false,
             },
         }
+    }
+
+    #[test]
+    fn a_batch_of_two_has_one_launch_and_two_positioned_ends() {
+        use crate::transcript_state::ChatMessage;
+        use orca_runtime::surface::{
+            SurfaceItemId, SurfaceSubagentId, SurfaceTaskId, SurfaceTaskType, SurfaceTurnId,
+        };
+        crate::hosted_child::tests::with_streaming_main(|_, mut snapshot| {
+            let first = snapshot.foreground_operation.take().unwrap();
+            let mut second = first.clone();
+            second.operation_id = SurfaceOperationId::try_from_bytes(uuid_v7_bytes(43)).unwrap();
+            let turn_one = first.agent_loop_turns[0].turn_id.clone();
+            let turn_two = SurfaceTurnId::new();
+            let root_one = first.agent_loop_turns[0]
+                .admitted_main_task_id
+                .clone()
+                .unwrap();
+            let root_two = SurfaceTaskId::try_new("admitted-second").unwrap();
+            second.initial_logical_turn_id = Some(turn_two.clone());
+            second.generations[0].logical_turn_id = turn_two.clone();
+            second.agent_loop_turns[0].turn_id = turn_two.clone();
+            second.agent_loop_turns[0].fence.operation_id = second.operation_id.clone();
+            second.agent_loop_turns[0].admitted_main_task_id = Some(root_two.clone());
+            assert_ne!(root_one, first.agent_loop_turns[0].task_id);
+            assert_ne!(root_two, second.agent_loop_turns[0].task_id);
+            snapshot.items = [(turn_one, "first"), (turn_two, "second")]
+                .into_iter()
+                .map(|(turn_id, text)| SurfaceItem::AssistantMessage {
+                    id: SurfaceItemId::new(),
+                    turn_id,
+                    text: DisplayText::new(text),
+                    pinned: false,
+                })
+                .collect();
+            let template = crate::hosted_child::tests::snapshot_with_child(1, 5);
+            snapshot.tasks = [(root_one, 10), (root_two, 20)]
+                .map(|(id, time)| {
+                    let mut task = template.tasks[0].clone();
+                    task.task_id = id;
+                    task.task_type = SurfaceTaskType::MainSession;
+                    task.subagent_id = None;
+                    task.started_at = Some(UnixMillis::new(time));
+                    task
+                })
+                .into();
+            for (name, status, ended) in [
+                ("scout", SurfaceTaskStatus::Completed, 15),
+                ("writer", SurfaceTaskStatus::Stopped, 25),
+            ] {
+                let mut task = template.tasks[0].clone();
+                task.task_id = SurfaceTaskId::try_new(name).unwrap();
+                task.subagent_id = Some(SurfaceSubagentId::try_new(name).unwrap());
+                task.description = DisplayText::new(name);
+                task.started_at = Some(UnixMillis::new(12));
+                task.completed_at = Some(UnixMillis::new(ended));
+                task.status = status;
+                task.parent_operation = Some(first.operation_id.clone());
+                let mut agent = template.subagents[0].clone();
+                agent.subagent_id = task.subagent_id.clone().unwrap();
+                agent.task_id = task.task_id.clone();
+                agent.batch_size = 2;
+                snapshot.tasks.push(task);
+                snapshot.subagents.push(agent);
+            }
+            snapshot.operation_history = vec![first, second];
+            let lines = |messages: Vec<ChatMessage>| {
+                messages
+                    .into_iter()
+                    .filter_map(|message| match message {
+                        ChatMessage::Assistant(text) | ChatMessage::System { text, .. } => {
+                            Some(text)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let launch = "Delegating to 2 agents in parallel";
+            let completed = "Agent completed: scout";
+            let stopped = "Agent stopped: writer";
+            assert_eq!(
+                lines(history_messages_from_surface_snapshot(&snapshot)),
+                ["first", launch, completed, "second", stopped]
+            );
+            let (sender, _) = crossbeam_channel::unbounded();
+            let mut state = AppState::new(sender, "test".into(), "mock".into(), "/tmp".into());
+            state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+                SurfaceProjectionState::from_surface_snapshot(&snapshot),
+            )));
+            assert_eq!(
+                lines(state.transcript.messages.clone()),
+                [launch, completed, stopped]
+            );
+            snapshot
+                .tasks
+                .retain(|task| task.task_type != SurfaceTaskType::MainSession);
+            assert_eq!(
+                lines(history_messages_from_surface_snapshot(&snapshot)),
+                ["first", launch, completed, stopped, "second"]
+            );
+        });
     }
 
     fn goal_projection_goal() -> SurfaceGoal {
