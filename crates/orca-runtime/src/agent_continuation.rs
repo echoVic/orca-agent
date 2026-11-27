@@ -2603,12 +2603,14 @@ fn read_record(
         .map_err(|_| corrupt_record("continuation record does not match its schema"))?;
     validate_record(&record, Some(continuation_id), Some(parent_session_id))?;
     let association = read_fork_child(&fork_child_path(root, parent_session_id, continuation_id))?;
-    if record.fork_prefix_ref.is_some() && record.fork_prefix_ref != association {
+    if let (Some(inline), Some(associated)) = (record.fork_prefix_ref, association)
+        && inline != associated
+    {
         return Err(corrupt_record(
             "fork prefix association does not match its continuation",
         ));
     }
-    record.fork_prefix_ref = association;
+    record.fork_prefix_ref = record.fork_prefix_ref.or(association);
     Ok(record)
 }
 
@@ -4889,6 +4891,78 @@ mod tests {
                     .as_ref()
                     .map(|prefix| prefix.messages.as_slice()),
                 Some(test_fork_prefix().messages.as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_fork_association_uses_the_inline_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let child = create_test_fork(&registry);
+        let association = fork_child_path(root.path(), "parent", &child.continuation_id);
+        fs::remove_file(&association).unwrap();
+
+        let coordinator = ChildAgentCoordinator::new(registry).unwrap();
+        let restored = coordinator
+            .prepared(child.continuation_id.as_str())
+            .unwrap();
+        assert_eq!(restored.fork_prefix, child.fork_prefix);
+
+        let other_digest = Sha256Digest::digest(b"another prefix");
+        write_json_pretty(&association, &other_digest, "write test association").unwrap();
+        assert_eq!(
+            coordinator
+                .prepared(child.continuation_id.as_str())
+                .unwrap_err(),
+            corrupt_record("fork prefix association does not match its continuation")
+        );
+    }
+
+    #[test]
+    fn a_broken_fork_prefix_does_not_block_other_tasks() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let broken = create_test_fork(&registry);
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let other = coordinator
+            .create(test_continuation_input(&registry))
+            .unwrap();
+        let digest = coordinator
+            .store
+            .load_record(&broken.continuation_id)
+            .unwrap()
+            .unwrap()
+            .fork_prefix_ref
+            .unwrap();
+        let prefix_path = fork_prefix_path(root.path(), "parent", digest);
+        fs::remove_file(&prefix_path).unwrap();
+        drop(coordinator);
+        drop(registry);
+
+        for problem in [
+            "referenced fork prefix is missing",
+            "fork prefix digest mismatch",
+        ] {
+            if problem == "fork prefix digest mismatch" {
+                fs::write(&prefix_path, b"corrupt history").unwrap();
+                fs::remove_file(fork_child_path(
+                    root.path(),
+                    "parent",
+                    &broken.continuation_id,
+                ))
+                .unwrap();
+            }
+            let reopened =
+                TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+            assert!(reopened.get(&other.latest_task_id).is_some());
+            let coordinator = ChildAgentCoordinator::new(reopened).unwrap();
+            assert!(coordinator.prepared(other.continuation_id.as_str()).is_ok());
+            assert_eq!(
+                coordinator
+                    .validate_resume_admission(broken.continuation_id.as_str(), None, None)
+                    .unwrap_err(),
+                corrupt_record(problem)
             );
         }
     }
