@@ -36,6 +36,41 @@
 - **A cancelled agent is not an error:** its row is drawn in the muted colour of a stopped one and carries no error line.
 - **The word that ends an agent's activity history** follows its status in every host (`completed`, `failed`, `cancelled`, `blocked`); today it is always `completed`.
 
+## Amendments after Task 1 (2026-11-27, the controller's)
+
+Task 1 ran at `d22a4710`, after the between-stages work B-E: owner stamps on task records, and recovery that skips live owners. Its report is `.superpowers/sdd/2026-11-26-live-subagent-conversations-stage-2/task-1-report.md` (A1–A9). Where these amendments differ from a task's text below, they win.
+
+- **Task 3: the premise changes.**
+  - **What A9a found.** After `kill -9` and `--resume latest`, the agent's registry record is still `running`, with no error. Resume opens the registry with `attach_for_cwd`, which runs no recovery (`session.rs:454`, `tasks.rs:1738`, `:1868`), so `mark_interrupted_if_active` never runs.
+  - **Ruling: attach runs owner-aware recovery for records whose owner stamp names a dead owner.** It uses B-E's session-qualified stamp and its non-blocking liveness probe, with the same rule as open-time recovery.
+    - Owner-less records stay untouched on attach, as today (B-E ruling Q3).
+    - Records with a live owner, or a held lease, are left alone exactly as open-time recovery leaves them.
+    - Make it its own commit inside Task 3: `fix(runtime): a resume ends the running records of owners that are gone`.
+    - Add a registry-level test: attach fails a dead owner's running record and leaves a live owner's alone.
+    - Say whether this changes what a reader of a dead owner's shell sees after a resume. Update ADR 0006's residuals to match.
+  - **Then** `settle_stranded_kept_subagents` settles the row from the record, which has now ended.
+  - **The test** `a_resumed_thread_settles_the_agents_it_lost` starts from the real state: a host dropped without settling, leaving a `running` record stamped by an owner that is gone, followed by an actual resume. It does not start from a seeded `Failed` record.
+  - Cost if wrong: a record whose owner's lock probe wrongly reads "dead" (`flock` on NFS) is failed on resume, as open-time recovery already does today.
+- **Task 4: cover both returns A8 found.**
+  - (a) The agent still runs: on return, main's running row and `Delegating to N agents` are missing.
+  - (b) A queued main turn started during the visit: the running row is back but its streamed text is not, although it is on disk.
+  - **`started_at_ms`.** Take it from main's admitted task, not from `terminal.committed_at`, which reads 0 (A5). A5 also shows that the timed main tasks can be missing from the live surface until a resume reconciles them. So test what the live surface actually holds, and say which source the live path uses when the task is not there.
+- **Task 6.**
+  - Join reopened main tasks by `agent_loop_turns[].admitted_main_task_id`, not by `task_id` (A5).
+  - Place a line by its owning operation where an item's time is unknown.
+  - The mock's "two agents in one response" records two batches of one, not one batch of two. A batch of two needs a fixture that builds one.
+- **Task 7: as planned.** A3: the saved child session holds its final reply both before quit and after a resume. So the checkpoint fallback is only for a load that fails, as written.
+- **Task 8.**
+  - **The draft guard.** A6 explains "Shift+Down marks no row": dock cycling is off while the composer holds text (`key_event_actions.rs:1708`).
+    - If Shift+↑↓ does something in a composer with text, keep the guard, and say what it does. Behaviour 1 then reads "with an empty composer, a press always marks a row", and a test pins that a draft leaves the dock alone.
+    - If Shift+↑↓ does nothing there, drop the guard.
+  - **Either way, an open marks the agent on screen.** A6 shows an open starts from no mark.
+  - **A7.** Main's natural completion waits for its kept agents. Behaviour 2 is therefore the "pin the reason" case: a test that the parent's turn does not end while its kept agents run, and nothing built.
+- **Task 10.**
+  - The overlap the mock cannot make goes into Task 10's real-terminal run: main's still-open stream on screen, a visit to a live agent, then return. Task 4's tests do not stand in for it.
+  - The gate also re-checks a crash and resume against the registry file, not only against the dock.
+- **Tasks 2, 5 and 9: as planned.**
+
 ## File Structure
 
 | File | Responsibility in this plan |
