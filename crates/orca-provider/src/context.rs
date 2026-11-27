@@ -1856,6 +1856,7 @@ fn partition_for_compaction(
 fn render_summary_evidence(messages: &[Message]) -> String {
     let messages = messages
         .iter()
+        .filter(|message| is_summary_evidence(message))
         .cloned()
         .map(|mut message| {
             match &mut message {
@@ -2273,10 +2274,12 @@ fn tool_output_for_summary<'a>(
 /// Small content stays verbatim, so summary fidelity for normal turns is
 /// preserved.
 pub fn render_summary_delta(collapsed: &[Message]) -> RenderedSummaryDelta {
-    let original_text = format_messages(collapsed);
-    let mut compacted_tool_outputs = 0usize;
-    let rendered_messages: Vec<Message> = collapsed
+    let evidence = collapsed
         .iter()
+        .filter(|message| is_summary_evidence(message));
+    let original_text = format_messages(evidence.clone());
+    let mut compacted_tool_outputs = 0usize;
+    let rendered_messages: Vec<Message> = evidence
         .map(|message| match message {
             Message::Tool {
                 tool_call_id,
@@ -2588,7 +2591,11 @@ fn format_summary_usage_telemetry(
     )
 }
 
-fn format_messages(messages: &[Message]) -> String {
+fn is_summary_evidence(message: &Message) -> bool {
+    !message.is_context_fragment_batch() && !message.is_system_prompt_update()
+}
+
+fn format_messages<'a>(messages: impl IntoIterator<Item = &'a Message>) -> String {
     let mut output = String::new();
     for message in messages {
         match message {
