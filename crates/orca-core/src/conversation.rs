@@ -316,6 +316,7 @@ pub const MODE_CONTEXT_MAX_TOKENS: usize = 2_048;
 pub const GOAL_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const PLAN_CONTEXT_MAX_TOKENS: usize = 4_096;
 pub const SKILL_CONTEXT_MAX_TOKENS: usize = 4_096;
+const SKILL_INVOCATION_PREFIX: &str = "[Mentioned skill invocation ";
 pub const MEMORY_CONTEXT_MAX_TOKENS: usize = 3_072;
 pub const MCP_CONTEXT_MAX_TOKENS: usize = 4_096;
 
@@ -806,7 +807,8 @@ impl Conversation {
         for (position, message) in self.messages.iter().enumerate() {
             if matches!(message,
                 Message::User { content, images, .. }
-                    if !images.is_empty() || !is_internal_image_analysis(content))
+                    if (!images.is_empty() || !is_internal_image_analysis(content))
+                        && !content.starts_with(SKILL_INVOCATION_PREFIX))
             {
                 if seen == ordinal {
                     index = Some(position);
@@ -2174,5 +2176,17 @@ mod tests {
         // An anchor over no messages measures nothing.
         conv.record_usage_anchor(1_000, 900, 0);
         assert!(conv.valid_usage_anchor().is_none());
+    }
+
+    #[test]
+    fn rewind_skips_generated_skill_invocations_but_keeps_pinned_prompts() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("$review:permissions".to_string());
+        conversation.messages.push(Message::pinned_user(
+            "[Mentioned skill invocation abc /project]\nexpanded skill".to_string(),
+        ));
+        conversation.add_user("Continue".to_string());
+
+        assert_eq!(conversation.truncate_before_user_ordinal(1).as_deref(), Some("Continue"));
     }
 }
