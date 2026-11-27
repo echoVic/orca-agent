@@ -65,7 +65,7 @@ impl<'a> RuntimeToolDispatchScheduler<'a> {
 
         if should_run_subagent_batch(self.config, current, self.subagent_depth) {
             let window = sampling_state.tool_dispatch_window(tool_requests, |requests, start| {
-                collect_subagent_batch(self.config, requests, start)
+                self.limit_window_end(start, collect_subagent_batch(self.config, requests, start))
             });
             return Some(RuntimeToolDispatch::SubagentBatch(window));
         }
@@ -126,12 +126,20 @@ impl<'a> RuntimeToolDispatchScheduler<'a> {
 
         if should_run_readonly_batch(max_parallel, current) {
             let window = sampling_state.tool_dispatch_window(tool_requests, |requests, start| {
-                collect_readonly_batch(self.config.tools.max_read_parallel, requests, start)
+                self.limit_window_end(
+                    start,
+                    collect_readonly_batch(self.config.tools.max_read_parallel, requests, start),
+                )
             });
             return Some(RuntimeToolDispatch::ReadonlyBatch(window));
         }
 
         Some(RuntimeToolDispatch::Normal(current))
+    }
+
+    fn limit_window_end(&self, start: usize, end: usize) -> usize {
+        self.parallel_limit
+            .map_or(end, |limit| end.min(start.saturating_add(limit.max(1))))
     }
 
     fn allows_without_asking(
@@ -491,6 +499,38 @@ mod tests {
         assert!(
             matches!(dispatch, RuntimeToolDispatch::Normal(request) if request.id == "last-allowed")
         );
+    }
+
+    #[test]
+    fn subagent_batch_fits_the_remaining_tool_call_allowance() {
+        let config = config();
+        let mut operation = crate::operation_context::OperationContext::for_tests(
+            orca_core::budget::BudgetSpec {
+                max_tool_calls: Some(3),
+                ..Default::default()
+            },
+            "subagent-call-allowance",
+        );
+        operation
+            .admit_tool_call("turn", "used-1", "web_fetch")
+            .unwrap()
+            .unwrap();
+        operation
+            .admit_tool_call("turn", "used-2", "web_fetch")
+            .unwrap()
+            .unwrap();
+        let requests = [
+            subagent_request("last-allowed"),
+            subagent_request("must-wait"),
+        ];
+        let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
+            .with_parallel_limit(crate::tool_turn::remaining_tool_call_allowance(Some(
+                &operation,
+            )))
+            .next_dispatch(&RuntimeSamplingRequestState::new(), &requests, None)
+            .expect("dispatch");
+
+        assert_eq!(ids(&dispatch), ["last-allowed"]);
     }
 
     #[test]
