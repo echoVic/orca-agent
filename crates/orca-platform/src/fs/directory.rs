@@ -195,7 +195,7 @@ mod platform {
         }
 
         pub(super) fn create_file(&self, name: &OsStr) -> io::Result<File> {
-            self.open(name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)
+            self.open(name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL)
         }
 
         pub(super) fn remove_file(&self, name: &OsStr, file: &File) -> io::Result<()> {
@@ -357,6 +357,7 @@ mod platform {
         pub(super) fn create_file(&self, name: &OsStr) -> io::Result<File> {
             use std::os::windows::fs::OpenOptionsExt;
             std::fs::OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create_new(true)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)

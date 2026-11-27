@@ -867,11 +867,11 @@ fn commit(
             ));
             result.file_effects = effects;
             let mut diff = patch_diff(&plan.ops[..index]);
-            if let Some(target) = changed {
+            if let Some((target, file)) = changed {
                 if let Some(output) = &mut result.output {
                     output.push_str(&format!("\nPartially written: {}", target.label));
                 }
-                diff.push_str(&op.partial_preview(target));
+                diff.push_str(&op.partial_preview(target, &file));
                 diff = truncate_output(diff, MAX_DIFF_OUTPUT_BYTES).0;
             }
             return if diff.is_empty() {
@@ -952,17 +952,21 @@ impl PlannedOp {
                     .verify_existing(&parent, FileAccess::Delete, before)?;
                 let permissions = file.metadata()?.permissions();
                 let destination = dest.parent_for_write(plan, created, effects)?;
-                create_file(&destination, dest, text, effects)?
-                    .set_permissions(permissions)
-                    .map_err(|error| WriteFailure::after_write(error, dest))?;
-                self.target
+                let destination_file =
+                    create_file(&destination, dest, text, Some(permissions), effects)?;
+                if let Err(error) = self
+                    .target
                     .verify_contents(&file, before)
                     .and_then(|()| parent.remove_file(self.target.file_name(), &file))
-                    .map_err(|error| WriteFailure::after_write(error, dest))?;
+                {
+                    return Err(WriteFailure::after_write(error, dest, destination_file));
+                }
                 effects.push(FileEffect::Deleted(self.target.relative.clone()));
                 Ok(())
             }
-            (_, None, Some(text)) => create_file(&parent, &self.target, text, effects).map(|_| ()),
+            (_, None, Some(text)) => {
+                create_file(&parent, &self.target, text, None, effects).map(|_| ())
+            }
             (_, Some(before), Some(text)) => {
                 let mut file = self
                     .target
@@ -973,20 +977,16 @@ impl PlannedOp {
                 effects.push(FileEffect::Written(self.target.relative.clone()));
                 file.seek(SeekFrom::Start(0))
                     .and_then(|_| file.write_all(text.as_bytes()))
-                    .map_err(|error| WriteFailure::after_write(error, &self.target))
+                    .map_err(|error| WriteFailure::after_write(error, &self.target, file))
             }
             _ => unreachable!("validated patch operation"),
         }
     }
 
-    fn partial_preview(&self, target: &PlannedTarget) -> String {
-        let after = target
-            .path
-            .parent()
-            .ok_or_else(stale_path)
-            .and_then(VerifiedDirectory::open)
-            .and_then(|directory| directory.open_file(target.file_name(), FileAccess::Read))
-            .and_then(|file| read_opened(&file, &|| false));
+    fn partial_preview(&self, target: &PlannedTarget, mut file: &fs::File) -> String {
+        let after = file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| read_opened(file, &|| false));
         let Ok(after) = after else {
             return format!("[Diff preview unavailable for {}]\n", target.label);
         };
@@ -1052,7 +1052,7 @@ fn render_preview(
 
 struct WriteFailure<'a> {
     error: io::Error,
-    changed: Option<&'a PlannedTarget>,
+    changed: Option<(&'a PlannedTarget, fs::File)>,
 }
 
 impl From<io::Error> for WriteFailure<'_> {
@@ -1065,10 +1065,10 @@ impl From<io::Error> for WriteFailure<'_> {
 }
 
 impl<'a> WriteFailure<'a> {
-    fn after_write(error: io::Error, target: &'a PlannedTarget) -> Self {
+    fn after_write(error: io::Error, target: &'a PlannedTarget, file: fs::File) -> Self {
         Self {
             error,
-            changed: Some(target),
+            changed: Some((target, file)),
         }
     }
 }
@@ -1077,12 +1077,26 @@ fn create_file<'a>(
     directory: &VerifiedDirectory,
     target: &'a PlannedTarget,
     text: &str,
+    permissions: Option<fs::Permissions>,
     effects: &mut Vec<FileEffect>,
 ) -> Result<fs::File, WriteFailure<'a>> {
     let mut file = directory.create_file(target.file_name())?;
     effects.push(FileEffect::Written(target.relative.clone()));
-    file.write_all(text.as_bytes())
-        .map_err(|error| WriteFailure::after_write(error, target))?;
+    #[cfg(unix)]
+    if let Some(permissions) = permissions.as_ref()
+        && let Err(error) = file.set_permissions(permissions.clone())
+    {
+        return Err(WriteFailure::after_write(error, target, file));
+    }
+    if let Err(error) = file.write_all(text.as_bytes()) {
+        return Err(WriteFailure::after_write(error, target, file));
+    }
+    #[cfg(windows)]
+    if let Some(permissions) = permissions
+        && let Err(error) = file.set_permissions(permissions)
+    {
+        return Err(WriteFailure::after_write(error, target, file));
+    }
     Ok(file)
 }
 
@@ -1092,6 +1106,71 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_preview_uses_the_written_file_after_an_editor_save() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a");
+        fs::write(&path, "before\n").unwrap();
+        let patch = plan("*** Update File: a\n@@\n-before\n+after", dir.path()).unwrap();
+        let op = &patch.ops[0];
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        (&file).write_all(b"partly").unwrap();
+        let editor = dir.path().join("editor-save");
+        fs::write(&editor, "editor text\n").unwrap();
+        fs::rename(editor, path).unwrap();
+        let preview = op.partial_preview(&op.target, &file);
+        assert!(preview.contains("+partly"), "{preview}");
+        assert!(!preview.contains("editor text"), "{preview}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_sets_destination_mode_before_a_failed_write() {
+        use std::os::unix::fs::PermissionsExt;
+        const FIXTURE: &str = "ORCA_PATCH_MODE_FIXTURE";
+        if let Some(path) = std::env::var_os(FIXTURE) {
+            let result = crate::registry::tool_registry_for_session(None, &[], true).execute(
+                &request("*** Update File: source\n*** Move to: dest"),
+                &crate::ToolContext::new(Path::new(&path)),
+            );
+            assert_eq!(result.status, orca_core::tool_types::ToolStatus::Failed);
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        fs::write(&source, "private\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "umask 022 && trap '' XFSZ && ulimit -f 0 && exec \"$@\"",
+                "sh",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "apply_patch::tests::a_move_sets_destination_mode_before_a_failed_write",
+            ])
+            .env(FIXTURE, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let destination = fs::metadata(dir.path().join("dest")).unwrap();
+        assert_eq!(destination.len(), 0);
+        assert_eq!(destination.permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read_to_string(source).unwrap(), "private\n");
+    }
 
     #[test]
     fn eof_deletion_preserves_the_last_retained_line_ending() {
