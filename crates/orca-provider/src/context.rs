@@ -1311,9 +1311,6 @@ fn compact_with_summary_observed(
     );
     if count(&micro_compacted) <= micro_target {
         let mut conversation = micro_compacted;
-        if count(&conversation) < count(&normalized) {
-            refresh_compacted_context(&mut conversation);
-        }
         conversation.clear_usage_anchor();
         return (conversation, CompactionKind::LocalTruncation);
     }
@@ -2676,7 +2673,6 @@ pub fn compact_with_counter(
     );
     if conversation_tokens_with_counter(&micro, counter) <= target {
         let mut micro = micro;
-        refresh_compacted_context(&mut micro);
         micro.clear_usage_anchor();
         return micro;
     }
@@ -4241,6 +4237,67 @@ mod tests {
                 if content.contains("[tool output micro-compact]")
                     && !content.contains(&"line\n".repeat(100))
         ));
+    }
+
+    #[test]
+    fn micro_compaction_keeps_the_first_fragment_batch() {
+        let config = ContextConfig {
+            max_tokens: 500,
+            compaction_threshold: 1.0,
+            reserved_for_response: 0,
+            auto_compact_token_limit: None,
+            soft_compact_token_limit: None,
+        };
+        let mut conversation = Conversation::new();
+        conversation.add_system("stable prompt".into());
+        conversation.add_user("inspect the logs".into());
+        conversation.replace_runtime_context(Some("stable date and runtime notes".into()));
+        conversation.replace_skill_catalog(Some("stable skills".into()));
+        conversation
+            .messages
+            .extend(pending_context_message(&conversation));
+        conversation.add_assistant(
+            None,
+            Some("read the output".into()),
+            vec![RawToolCall {
+                id: "read-1".into(),
+                function_name: "read_file".into(),
+                arguments: r#"{"path":"large.log"}"#.into(),
+            }],
+        );
+        conversation.add_tool_result("read-1".into(), "line\n".repeat(500));
+        conversation.add_user("continue the review".into());
+
+        let mut compacted = compact(&conversation, &config);
+        compacted
+            .messages
+            .extend(pending_context_message(&compacted));
+        let before = crate::deepseek_http::conversation_to_api_messages(&conversation);
+        let after = crate::deepseek_http::conversation_to_api_messages(&compacted);
+        let first_difference = before
+            .iter()
+            .zip(&after)
+            .find(|(before, after)| {
+                serde_json::to_vec(before).unwrap() != serde_json::to_vec(after).unwrap()
+            })
+            .expect("the compacted request must differ");
+        assert_eq!(first_difference.1.tool_call_id.as_deref(), Some("read-1"));
+        assert!(
+            first_difference
+                .1
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("[tool output micro-compact]")
+        );
+        assert_eq!(
+            compacted
+                .messages
+                .iter()
+                .filter(|message| message.is_context_fragment_batch())
+                .count(),
+            1
+        );
     }
 
     #[test]
