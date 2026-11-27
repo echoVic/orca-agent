@@ -5989,7 +5989,10 @@ impl TaskRegistry {
         .map_err(|_| "task registry lock poisoned".to_string())?
     }
 
-    fn refresh_task_from_persistence(&self, id: &str) -> Result<Option<TaskRecord>, String> {
+    pub(crate) fn refresh_task_from_persistence(
+        &self,
+        id: &str,
+    ) -> Result<Option<TaskRecord>, String> {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(self.get(id));
         };

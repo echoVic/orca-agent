@@ -1556,13 +1556,29 @@ fn wait_for_async_subagent_adoption(
     cwd: &Path,
     agent_id: &str,
 ) -> Result<TaskRegistry, String> {
+    wait_for_adoption(
+        agent_id,
+        || TaskRegistry::attach_for_cwd(task_session_id.to_string(), cwd),
+        std::thread::sleep,
+    )
+}
+
+fn wait_for_adoption(
+    agent_id: &str,
+    attach: impl FnOnce() -> TaskRegistry,
+    mut wait: impl FnMut(Duration),
+) -> Result<TaskRegistry, String> {
     let pid = std::process::id();
     let deadline = Instant::now() + Duration::from_secs(5);
+    let registry = attach();
     loop {
-        let registry = TaskRegistry::attach_for_cwd(task_session_id.to_string(), cwd);
-        let record = registry.get(agent_id).ok_or_else(|| {
-            format!("async subagent task '{agent_id}' disappeared before adoption")
-        })?;
+        let record = registry
+            .refresh_task_from_persistence(agent_id)
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                format!("async subagent task '{agent_id}' disappeared before adoption")
+            })?;
         if record.worker_pid == Some(pid) {
             return Ok(registry);
         }
@@ -1591,7 +1607,7 @@ fn wait_for_async_subagent_adoption(
                 "async subagent worker was not adopted before the startup deadline"
             ));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        wait(Duration::from_millis(10));
     }
 }
 
@@ -1920,6 +1936,46 @@ mod result_text_tests {
         assert_eq!(async_subagent_result_text(&wrapped), "the report");
         assert_eq!(async_subagent_result_text("plain text"), "plain text");
         assert_eq!(async_subagent_result_text("{\"other\":1}"), "{\"other\":1}");
+    }
+}
+
+#[cfg(test)]
+mod adoption_tests {
+    use super::*;
+
+    #[test]
+    fn one_attachment_observes_adoption_after_multiple_polls() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let session = "delayed-adoption";
+        let parent = TaskRegistry::new_for_cwd(session.into(), cwd.path());
+        let task = parent.create_subagent("delayed worker".into(), None);
+        let mut opens = 0;
+        let mut waits = 0;
+        let worker = wait_for_adoption(
+            &task.id,
+            || {
+                opens += 1;
+                TaskRegistry::attach_for_cwd(session.into(), cwd.path())
+            },
+            |_| {
+                waits += 1;
+                assert!(waits <= 2, "worker did not refresh its cached record");
+                if waits == 2 {
+                    parent
+                        .mark_worker_spawned(&task.id, std::process::id())
+                        .unwrap();
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            worker.get(&task.id).unwrap().worker_pid,
+            Some(std::process::id())
+        );
+        assert_eq!(waits, 2);
+        assert_eq!(opens, 1);
     }
 }
 
