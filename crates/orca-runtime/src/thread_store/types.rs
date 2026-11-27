@@ -164,6 +164,7 @@ impl SessionSummary {
 pub struct SessionTranscript {
     pub meta: SessionMeta,
     pub messages: Vec<Message>,
+    pub repeat_tool_streak: Option<orca_core::conversation::RepeatToolStreak>,
     pub compactions: Vec<CompactionRecord>,
     pub summaries: Vec<ContextSummaryRecord>,
     pub usage: Option<UsageTotals>,
@@ -185,6 +186,8 @@ pub(crate) struct ManualCompactionSnapshotRecord {
     pub messages: Vec<StoredMessage>,
     pub rolling_summary: Option<String>,
     pub summary_state: orca_core::conversation::SummaryState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_tool_streak: Option<orca_core::conversation::RepeatToolStreak>,
 }
 
 #[derive(Clone, Debug)]

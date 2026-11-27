@@ -284,6 +284,10 @@ impl JsonlThreadStore {
 
 pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String) -> Conversation {
     let mut conversation = Conversation::new();
+    conversation.repeat_tool_streak = transcript
+        .repeat_tool_streak
+        .clone()
+        .or_else(|| crate::session::repeat_tool_streak_from_history(&transcript.messages));
     conversation.add_system(system_prompt);
     let mut restored_messages = replay_compactions_for_resume(
         &transcript.messages,
@@ -875,6 +879,11 @@ mod tests {
             );
             compacted.add_system_pinned("[Hook context]\nretained".to_string());
             compacted.add_user("tail".to_string());
+            compacted.repeat_tool_streak = Some(orca_core::conversation::RepeatToolStreak {
+                tool_name: "read_file".to_string(),
+                arguments: r#"{"path":"a"}"#.to_string(),
+                count: 4,
+            });
             writer.append_manual_compaction_snapshot(
                 &identity,
                 5,
@@ -883,7 +892,21 @@ mod tests {
             )?;
 
             let transcript = load_session("latest")?;
+            assert_eq!(
+                transcript
+                    .repeat_tool_streak
+                    .as_ref()
+                    .map(|streak| streak.count),
+                Some(4)
+            );
             let resumed = resume_conversation(&transcript, "fresh system".to_string());
+            assert_eq!(
+                resumed
+                    .repeat_tool_streak
+                    .as_ref()
+                    .map(|streak| streak.count),
+                Some(4)
+            );
             assert!(matches!(
                 resumed.messages.as_slice(),
                 [
@@ -1051,6 +1074,7 @@ mod tests {
                 },
                 Message::user("second".to_string()),
             ],
+            repeat_tool_streak: None,
             compactions: Vec::new(),
             summaries: Vec::new(),
             usage: None,

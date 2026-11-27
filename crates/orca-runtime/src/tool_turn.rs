@@ -530,24 +530,15 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             });
         }
 
-        let remaining_tool_calls = operation.as_ref().and_then(|operation| {
-            operation
-                .controller
-                .spec()
-                .max_tool_calls
-                .map(|limit| {
-                    usize::try_from(
-                        limit.saturating_sub(operation.controller.usage().tool_calls),
-                    )
-                    .unwrap_or(usize::MAX)
-                })
-        });
+        let remaining_tool_calls = remaining_tool_call_allowance(operation.as_deref());
         let operation_has_budget = operation
             .as_ref()
             .is_some_and(|operation| !operation.controller.spec().is_unlimited());
         let Some(dispatch) = RuntimeToolDispatchScheduler::new(config, subagent_depth)
             .with_parallel_limit(remaining_tool_calls)
-            .with_network_sequential(operation_has_budget)
+            .with_network_sequential(
+                operation_has_budget || !config.budget.to_spec().is_unlimited(),
+            )
             .next_dispatch(
                 sampling_state,
                 tool_requests,
@@ -924,6 +915,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
                     max_parallel: config.tools.max_read_parallel,
                     network: has_network_reads.then_some(RuntimeNetworkBatchContext {
                         config,
+                        policy,
                         permission_overlay: &sampling_state.permission_overlay,
                         service_usage: &mut service_usage,
                     }),
@@ -1372,6 +1364,15 @@ pub(crate) fn run_tool_turns<W: io::Write>(
     }
 
     Ok(ToolTurnOutcome::Continue)
+}
+
+pub(crate) fn remaining_tool_call_allowance(operation: Option<&OperationContext>) -> Option<usize> {
+    operation.and_then(|operation| {
+        operation.controller.spec().max_tool_calls.map(|limit| {
+            usize::try_from(limit.saturating_sub(operation.controller.usage().tool_calls))
+                .unwrap_or(usize::MAX)
+        })
+    })
 }
 
 /// Settles a child budget lease exactly once: the child's consumed usage

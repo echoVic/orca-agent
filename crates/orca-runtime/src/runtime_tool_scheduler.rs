@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use orca_approval::ApprovalPolicy;
 use orca_core::approval_types::ApprovalDecision;
 use orca_core::config::RunConfig;
@@ -75,11 +77,12 @@ impl<'a> RuntimeToolDispatchScheduler<'a> {
             });
         if let Some(network) = network {
             let window = sampling_state.tool_dispatch_window(tool_requests, |requests, start| {
-                if self.network_sequential || start < *network.sequential_until || max_parallel <= 1 {
+                if self.network_sequential || start < *network.sequential_until || max_parallel <= 1
+                {
                     return start;
                 }
                 let mut count = 0;
-                let mut same_document_target = None;
+                let mut document_targets = HashSet::new();
                 for request in requests[start..].iter().take(max_parallel) {
                     if !((should_run_readonly_batch(max_parallel, request)
                         || is_network_read(request))
@@ -88,12 +91,12 @@ impl<'a> RuntimeToolDispatchScheduler<'a> {
                         break;
                     }
                     if request.name == ToolName::ReadDocument {
-                        if let Some(target) = &same_document_target {
-                            if request.target.as_ref() == Some(target) {
-                                break;
-                            }
-                        } else {
-                            same_document_target = request.target.clone();
+                        if request
+                            .target
+                            .as_ref()
+                            .is_some_and(|target| !document_targets.insert(target.clone()))
+                        {
+                            break;
                         }
                     }
                     count += 1;
@@ -442,6 +445,52 @@ mod tests {
             .expect("dispatch");
 
         assert!(matches!(dispatch, RuntimeToolDispatch::Normal(request) if request.id == "first"));
+    }
+
+    #[test]
+    fn operation_admission_leaves_the_last_network_call_available_for_dispatch() {
+        let mut config = config();
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut operation = crate::operation_context::OperationContext::for_tests(
+            orca_core::budget::BudgetSpec {
+                max_tool_calls: Some(3),
+                ..Default::default()
+            },
+            "network-call-allowance",
+        );
+        operation
+            .admit_tool_call("turn", "used-1", "web_fetch")
+            .unwrap()
+            .unwrap();
+        operation
+            .admit_tool_call("turn", "used-2", "web_fetch")
+            .unwrap()
+            .unwrap();
+        let fetch = |id: &str| ToolRequest {
+            raw_arguments: Some(json!({"url": "https://example.com/"}).to_string()),
+            ..request(id, ToolName::WebFetch, ActionKind::Network)
+        };
+        let requests = [fetch("last-allowed"), fetch("must-wait")];
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
+            .with_parallel_limit(crate::tool_turn::remaining_tool_call_allowance(Some(
+                &operation,
+            )))
+            .next_dispatch(
+                &RuntimeSamplingRequestState::new(),
+                &requests,
+                Some(NetworkReadScheduling {
+                    policy: &policy,
+                    mcp_registry: &McpRegistry::default(),
+                    sequential_until: &mut 0,
+                    tool_allowed: &|_| true,
+                }),
+            )
+            .expect("dispatch");
+
+        assert!(
+            matches!(dispatch, RuntimeToolDispatch::Normal(request) if request.id == "last-allowed")
+        );
     }
 
     #[test]

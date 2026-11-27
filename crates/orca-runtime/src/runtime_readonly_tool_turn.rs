@@ -1,6 +1,7 @@
 use std::io;
 use std::path::Path;
 
+use orca_core::approval_types::ApprovalDecision;
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
 use orca_core::conversation::Conversation;
@@ -12,6 +13,7 @@ use orca_core::tool_types::{
 };
 use orca_mcp::McpRegistry;
 
+use crate::agent_common;
 use crate::hooks::{HookContext, HookRunError, HookRunner};
 use crate::runtime_permission::TurnPermissionOverlay;
 use crate::runtime_surface::RuntimeProviderResponseIngress;
@@ -45,6 +47,7 @@ pub(crate) struct RuntimeReadonlyBatchContext<'a, W: io::Write> {
 
 pub(crate) struct RuntimeNetworkBatchContext<'a> {
     pub(crate) config: &'a RunConfig,
+    pub(crate) policy: &'a orca_approval::ApprovalPolicy,
     pub(crate) permission_overlay: &'a TurnPermissionOverlay,
     pub(crate) service_usage: &'a mut Vec<(String, ToolServiceUsage)>,
 }
@@ -122,17 +125,12 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
         external_tools,
     );
     for (idx, tool_request) in tool_requests.iter().enumerate() {
-        if emit_deltas {
-            retain_first_event_error(
-                &mut event_error,
-                sink.emit(
-                    crate::lifecycle::RuntimeTaskActor::tool_call_requested_event_with_registry_for(
-                        events,
-                        tool_request,
-                        &event_registry,
-                    ),
-                ),
-            );
+        if event_error.is_some() {
+            early_results[idx] = Some(ToolResult::cancelled_before_start(
+                tool_request,
+                "an earlier read-only admission could not be delivered",
+            ));
+            continue;
         }
         if cancel.is_cancelled() {
             early_results[idx] = Some(ToolResult::cancelled_before_start(
@@ -148,6 +146,96 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
             mcp_registry,
             external_tools,
         );
+        if network.is_some()
+            && let Err(error) = crate::tool_invocation::validate_tool_invocation_with_external(
+                &invocation,
+                mcp_registry,
+                external_tools,
+            )
+        {
+            if emit_deltas {
+                retain_first_event_error(
+                    &mut event_error,
+                    sink.emit(
+                        crate::lifecycle::RuntimeTaskActor::tool_call_requested_event_with_registry_for(
+                            events,
+                            tool_request,
+                            &event_registry,
+                        ),
+                    ),
+                );
+            }
+            early_results[idx] = Some(error.into_result());
+            continue;
+        }
+        if let Some(network_context) = network.as_ref()
+            && let Some(approval) =
+                crate::tool_invocation::approval_request_for_invocation(&invocation)
+            && agent_common::requires_approval(approval.action)
+        {
+            let resolution = network_context.policy.resolve_for_tool(
+                &approval,
+                invocation.effective.name.as_str(),
+                approval
+                    .target
+                    .as_deref()
+                    .or(tool_request.target.as_deref()),
+            );
+            if emit_deltas {
+                retain_first_event_error(
+                    &mut event_error,
+                    sink.emit(events.approval_requested(&approval)),
+                );
+                retain_first_event_error(
+                    &mut event_error,
+                    sink.emit(events.approval_resolved(&resolution)),
+                );
+            }
+            if event_error.is_some() {
+                early_results[idx] = Some(ToolResult::failed_before_start(
+                    tool_request,
+                    "tool dispatch stopped because approval events could not be delivered",
+                    None,
+                ));
+                continue;
+            }
+            if resolution.decision != ApprovalDecision::Allow {
+                early_results[idx] = Some(ToolResult::denied(tool_request, resolution.reason));
+                if emit_deltas {
+                    retain_first_event_error(
+                        &mut event_error,
+                        sink.emit(
+                            crate::lifecycle::RuntimeTaskActor::tool_call_requested_event_with_registry_for(
+                                events,
+                                tool_request,
+                                &event_registry,
+                            ),
+                        ),
+                    );
+                }
+                continue;
+            }
+        }
+        if emit_deltas {
+            retain_first_event_error(
+                &mut event_error,
+                sink.emit(
+                    crate::lifecycle::RuntimeTaskActor::tool_call_requested_event_with_registry_for(
+                        events,
+                        tool_request,
+                        &event_registry,
+                    ),
+                ),
+            );
+        }
+        if event_error.is_some() {
+            early_results[idx] = Some(ToolResult::failed_before_start(
+                tool_request,
+                "tool dispatch stopped because its requested event could not be delivered",
+                None,
+            ));
+            continue;
+        }
         match hooks.run_with_cancel_result(
             HookEvent::PreToolUse,
             HookContext {
@@ -270,7 +358,7 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
                 &mut event_error,
                 sink.emit(events.tool_call_completed(result)),
             );
-            if let Err(error) = hooks.run(
+            if let Err(error) = hooks.run_with_cancel_result(
                 HookEvent::PostToolUse,
                 HookContext {
                     cwd: &cwd.display().to_string(),
@@ -281,10 +369,16 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
                     after_messages: None,
                     usage: None,
                 },
+                cancel,
             ) {
                 retain_first_event_error(
                     &mut event_error,
-                    sink.emit(events.error(&format!("post_tool_use hook failed: {error}"))),
+                    match error {
+                        HookRunError::Cancelled(_) => Ok(()),
+                        HookRunError::Failed(error) => {
+                            sink.emit(events.error(&format!("post_tool_use hook failed: {error}")))
+                        }
+                    },
                 );
             }
         }
@@ -1052,6 +1146,78 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, ToolStatus::Cancelled);
         assert_eq!(results[0].terminal().started, ToolInvocationStarted::Yes);
+    }
+
+    #[test]
+    fn network_batch_validates_and_resolves_approval_before_pre_hooks() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut config = host_test_config(cwd.path().to_path_buf());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let requests = [
+            ToolRequest {
+                id: "invalid-fetch".to_string(),
+                name: ToolName::WebFetch,
+                action: ActionKind::Network,
+                target: None,
+                raw_arguments: Some("{}".to_string()),
+            },
+            ToolRequest {
+                id: "valid-fetch".to_string(),
+                name: ToolName::WebFetch,
+                action: ActionKind::Network,
+                target: Some("https://example.com/".to_string()),
+                raw_arguments: Some(json!({"url": "https://example.com/"}).to_string()),
+            },
+        ];
+        let hooks = HookRunner::new(vec![orca_core::hook_types::HookConfig {
+            event: HookEvent::PreToolUse,
+            command: "exit 1".to_string(),
+            tool: Some("web_fetch".to_string()),
+        }]);
+        let cancel = CancelToken::new();
+        let mut events = EventFactory::new("network-admission-order".to_string());
+        let mut bytes = Vec::new();
+        let mut sink = EventSink::new(&mut bytes, OutputFormat::Jsonl);
+        let permission_overlay = TurnPermissionOverlay::default();
+        let mut service_usage = Vec::new();
+        let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
+            cwd: cwd.path(),
+            events: &mut events,
+            sink: &mut sink,
+            tool_requests: &requests,
+            emit_deltas: true,
+            mcp_registry: &McpRegistry::default(),
+            hooks: &hooks,
+            cancel: &cancel,
+            output_truncation: ToolOutputTruncation::default(),
+            max_parallel: 2,
+            network: Some(RuntimeNetworkBatchContext {
+                config: &config,
+                policy: &policy,
+                permission_overlay: &permission_overlay,
+                service_usage: &mut service_usage,
+            }),
+            provider_response_ingress: None,
+        })
+        .expect("execute network batch");
+
+        assert!(
+            execution.results[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("schema validation"))
+        );
+        assert!(
+            execution.results[1]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("pre_tool_use hook blocked"))
+        );
+        drop(sink);
+        let events = String::from_utf8(bytes).expect("event output");
+        assert!(events.contains("approval.requested"));
+        assert!(events.contains("approval.resolved"));
     }
 
     #[test]

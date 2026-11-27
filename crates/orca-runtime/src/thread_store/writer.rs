@@ -1394,6 +1394,7 @@ pub(crate) fn transcript_from_records(
 ) -> io::Result<SessionTranscript> {
     let mut meta = None;
     let mut messages = Vec::new();
+    let mut repeat_tool_streak: Option<orca_core::conversation::RepeatToolStreak> = None;
     let mut compactions = Vec::new();
     let mut summaries = Vec::new();
     let mut usage_baseline = UsageTotals::default();
@@ -1430,6 +1431,7 @@ pub(crate) fn transcript_from_records(
             SessionRecord::ManualCompactionSnapshot(record) => {
                 let after_messages = record.messages.len();
                 messages = record.messages.into_iter().map(Message::from).collect();
+                repeat_tool_streak = record.repeat_tool_streak;
                 compactions.clear();
                 summaries.clear();
                 if record.rolling_summary.is_some() || !record.summary_state.is_empty() {
@@ -1514,6 +1516,7 @@ pub(crate) fn transcript_from_records(
     Ok(SessionTranscript {
         meta,
         messages,
+        repeat_tool_streak,
         compactions,
         summaries,
         usage,
@@ -2282,6 +2285,7 @@ impl SessionWriter {
             messages: messages.iter().map(StoredMessage::from).collect(),
             rolling_summary: conversation.rolling_summary.clone(),
             summary_state: conversation.summary.clone(),
+            repeat_tool_streak: conversation.repeat_tool_streak.clone(),
         });
         let result = write_durable_record(&self.path, &record);
         #[cfg(test)]

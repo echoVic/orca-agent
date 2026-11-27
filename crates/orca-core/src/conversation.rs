@@ -494,6 +494,9 @@ pub struct UsageAnchor {
 pub struct Conversation {
     pub messages: Vec<Message>,
     pub internal_context: InternalContext,
+    /// Repeated tool calls since the latest user prompt, retained across
+    /// compaction so reminders do not restart with the visible history tail.
+    pub repeat_tool_streak: Option<RepeatToolStreak>,
     /// Per-server guidance for the current tool set, sent in its own request message.
     pub mcp_instructions: Vec<(String, String)>,
     pub rolling_summary: Option<String>,
@@ -508,6 +511,13 @@ pub struct Conversation {
     retained_tool_images: Option<RetainedToolImages>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepeatToolStreak {
+    pub tool_name: String,
+    pub arguments: String,
+    pub count: u32,
+}
+
 // Prompt snapshots and inherited conversations must not publish into the
 // running conversation's read view.
 impl Clone for Conversation {
@@ -515,6 +525,7 @@ impl Clone for Conversation {
         Self {
             messages: self.messages.clone(),
             internal_context: self.internal_context.clone(),
+            repeat_tool_streak: self.repeat_tool_streak.clone(),
             mcp_instructions: self.mcp_instructions.clone(),
             rolling_summary: self.rolling_summary.clone(),
             summary: self.summary.clone(),
@@ -530,6 +541,7 @@ impl Conversation {
         Self {
             messages: Vec::new(),
             internal_context: InternalContext::default(),
+            repeat_tool_streak: None,
             mcp_instructions: Vec::new(),
             rolling_summary: None,
             summary: SummaryState::default(),
@@ -551,6 +563,7 @@ impl Conversation {
     /// Adopt a compacted conversation while preserving its running read view.
     pub fn adopt(&mut self, mut replacement: Self) {
         replacement.retained_tool_images = self.retained_tool_images.take();
+        replacement.repeat_tool_streak = self.repeat_tool_streak.take();
         *self = replacement;
         self.refresh_retained_tool_images();
     }
@@ -716,15 +729,18 @@ impl Conversation {
     }
 
     pub fn add_user(&mut self, content: String) {
+        self.repeat_tool_streak = None;
         self.messages.push(Message::user(content));
     }
 
     pub fn add_user_with_images(&mut self, content: String, images: Vec<ImageInput>) {
+        self.repeat_tool_streak = None;
         self.messages
             .push(Message::user_with_images(content, images));
     }
 
     pub fn add_user_pinned(&mut self, content: String) {
+        self.repeat_tool_streak = None;
         self.messages.push(Message::pinned_user(content));
     }
 
