@@ -22,6 +22,7 @@ use crate::resolve_workspace_path;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_OPERATIONS: usize = 100;
 const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_LINE_TABLE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MATCH_WORK: usize = 256 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -585,10 +586,24 @@ fn apply_hunks(
     if hunks.is_empty() {
         return Ok(original.to_owned());
     }
-    let source: Vec<_> = original.lines().collect();
-    let mut result = Vec::new();
+    let source_count = original.lines().count();
+    let add_count = hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .filter(|line| matches!(line, HunkLine::Add(_)))
+        .count();
+    let max_hunk_lines = hunks.iter().map(|hunk| hunk.lines.len()).max().unwrap_or(0);
+    let result_capacity = source_count + add_count;
+    if (source_count + result_capacity + max_hunk_lines) * size_of::<&str>() > MAX_LINE_TABLE_BYTES
+    {
+        return Err("patch line tables exceed the working memory limit".into());
+    }
+    let mut source = Vec::with_capacity(source_count);
+    source.extend(original.lines());
+    let mut result = Vec::with_capacity(result_capacity);
     let mut cursor = 0;
-    let mut trailing_blank_insertion = false;
+    let original_terminated = original.ends_with('\n');
+    let mut trailing_newline = false;
     for (index, hunk) in hunks.iter().enumerate() {
         let start = if let Some(hint) = &hunk.context_hint {
             find_match(&source, cursor, &[hint.as_str()], false, budget)
@@ -597,14 +612,11 @@ fn apply_hunks(
         } else {
             cursor
         };
-        let old: Vec<_> = hunk
-            .lines
-            .iter()
-            .filter_map(|line| match line {
-                HunkLine::Context(text) | HunkLine::Remove(text) => Some(text.as_str()),
-                HunkLine::Add(_) => None,
-            })
-            .collect();
+        let mut old = Vec::with_capacity(hunk.lines.len());
+        old.extend(hunk.lines.iter().filter_map(|line| match line {
+            HunkLine::Context(text) | HunkLine::Remove(text) => Some(text.as_str()),
+            HunkLine::Add(_) => None,
+        }));
         let offset = if old.is_empty() {
             if hunk.end_of_file || hunk.context_hint.is_none() {
                 source.len()
@@ -616,26 +628,30 @@ fn apply_hunks(
                 .map_err(|reason| format!("hunk {}: {reason}", index + 1))?
         };
         if cursor < offset {
-            trailing_blank_insertion = false;
+            trailing_newline = offset < source.len() || original_terminated;
             result.extend_from_slice(&source[cursor..offset]);
         }
         cursor = offset;
         for line in &hunk.lines {
             match line {
                 HunkLine::Context(_) => {
-                    trailing_blank_insertion = false;
                     result.push(source[cursor]);
                     cursor += 1;
+                    trailing_newline = cursor < source.len() || original_terminated;
                 }
                 HunkLine::Remove(_) => cursor += 1,
                 HunkLine::Add(text) => {
-                    trailing_blank_insertion = text.is_empty();
+                    trailing_newline =
+                        text.is_empty() || original.is_empty() || original_terminated;
                     result.push(text);
                 }
             }
         }
     }
     result.extend_from_slice(&source[cursor..]);
+    if cursor < source.len() {
+        trailing_newline = original_terminated;
+    }
     let newline_count = original.bytes().filter(|byte| *byte == b'\n').count();
     let ending = if original.match_indices("\r\n").count() > newline_count / 2 {
         "\r\n"
@@ -643,11 +659,7 @@ fn apply_hunks(
         "\n"
     };
     let mut updated = result.join(ending);
-    if !result.is_empty()
-        && (original.is_empty()
-            || original.ends_with('\n')
-            || (cursor == source.len() && trailing_blank_insertion))
-    {
+    if trailing_newline {
         updated.push_str(ending);
     }
     Ok(updated)
@@ -1080,6 +1092,29 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn eof_deletion_preserves_the_last_retained_line_ending() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a"), "keep\n\ntail").unwrap();
+        let patch = plan("*** Update File: a\n@@\n-tail\n*** End of File", dir.path()).unwrap();
+        assert_eq!(patch.ops[0].after.as_deref(), Some("keep\n\n"));
+    }
+
+    #[test]
+    fn dense_source_lines_are_checked_against_the_working_memory_budget() {
+        let dir = TempDir::new().unwrap();
+        let mut source = "\n".repeat(2 * 1024 * 1024 + 1);
+        source.push_str("tail\n");
+        fs::write(dir.path().join("a"), source).unwrap();
+        let Err(error) = plan(
+            "*** Update File: a\n@@\n-tail\n+changed\n*** End of File",
+            dir.path(),
+        ) else {
+            panic!("the dense patch should exceed the working memory limit");
+        };
+        assert!(error.to_string().contains("working memory"), "{error}");
+    }
 
     fn request(body: &str) -> orca_core::tool_types::ToolRequest {
         use orca_core::{
