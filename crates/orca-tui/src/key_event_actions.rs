@@ -1929,13 +1929,59 @@ fn status_layer_owns_escape(state: &AppState) -> bool {
 /// same keypress. **A new Esc meaning is a new row in the stack below, not
 /// a new branch dropped in wherever seems convenient.**
 ///
-/// Both views share the same layers: image viewer first, then modal dialogs
-/// (handled by status), otherwise search, help, selection, task checkpoint,
-/// visible dock and workspace panel. Status owns setup/picker, approvals,
-/// recovery, config/MCP, rewind, questionnaire and composer popups/recap.
-/// Only a clear focused child returns to main. It leaves the draft and Vim
-/// mode alone. On main the normal editor, interrupt, expanding-prompt and
-/// backtrack bindings still apply.
+/// The six cases for bare Esc are:
+///
+/// 1. Something is open over the conversation: dismiss only its top layer.
+/// 2. The turn is Running or Compacting: interrupt it.
+/// 3. Idle with a draft: clear the draft.
+/// 4. Idle with an empty composer: backtrack.
+/// 5. In the session picker: back out to the conversation, one level at a time.
+/// 6. Idle with an MCP prompt still expanding: cancel the latest expansion
+///    before clearing the draft or backtracking.
+///
+/// The same layers apply in an agent's view. A clean Esc there returns to
+/// main instead of interrupting either turn or acting on the composer. It
+/// cancels a pending Vim command but keeps the draft and the Vim mode.
+///
+/// Preflight, in order:
+///
+/// 1. Close the image viewer (`focused_child_esc_closes_the_image_viewer`).
+/// 2. Defer full-access confirmation to status.
+/// 3. Defer plan approval, config, MCP and the questionnaire to status.
+/// 4. Close transcript search.
+/// 5. Close shortcuts help (`esc_precedence_help_overlay_closes_before_it_can_clear_a_selection`).
+/// 6. Clear the mouse selection (`esc_precedence_selection_clears_before_it_can_backtrack`).
+/// 7. Close the task checkpoint within Agents, leaving the panel open
+///    (`escape_returns_from_agent_transcript_before_closing_workspace`,
+///    `focused_child_esc_dismisses_the_transcript_layers_one_at_a_time`).
+/// 8. Collapse the dock only if visible (`focused_child_esc_collapses_the_visible_dock_before_returning`).
+/// 9. Close the Workflows or Agents panel (`focused_child_esc_closes_agents_before_returning`).
+///    Rows 7 and 9 apply in Idle, Running and WaitingUserInput.
+/// 10. Return from a focused child unless `status_layer_owns_escape`. In
+///     particular, a pending approval is not a return: see
+///     `esc_prefers_a_pending_approval_over_returning_to_a_focused_parent`.
+///
+/// Status, only when preflight yields the key:
+///
+/// 11. Setup handles its current step; the session picker backs out one level.
+/// 12. Dismiss full-access confirmation.
+/// 13. Deny the pending approval (`focused_child_esc_denies_approval_then_returns_without_interrupting`).
+/// 14. Dismiss idle plan approval, staying in plan mode.
+/// 15. Hide the idle recovery prompt.
+/// 16. Handle config, then MCP, then the current rewind phase
+///     (`focused_child_esc_closes_workspace_and_settings_layers`).
+/// 17. Back out of the current questionnaire step or cancel it
+///     (`focused_child_esc_responds_to_the_questionnaire_before_returning`).
+/// 18. In Idle (or WaitingUserInput without a questionnaire), dismiss the
+///     slash menu, mention popup or recap detail in that order. Running also
+///     handles the mention popup before the editor in Conversation
+///     (`focused_child_esc_dismisses_composer_popups_but_keeps_the_draft_and_vim_mode`).
+/// 19. On main, the editor keeps its bindings. In Idle, cancel an expanding
+///     MCP prompt first, otherwise clear a draft or backtrack (cases 6, 3, 4;
+///     `esc_cancels_a_running_prompt_before_it_clears_the_draft`).
+/// 20. Interrupt a running or compacting turn (case 2;
+///     `esc_precedence_interrupts_a_running_turn`). An expanding MCP prompt
+///     runs on until the turn stops and Esc can cancel the expansion.
 pub(crate) fn handle_key_event_preflight<F>(
     key: KeyEvent,
     state: &mut AppState,
