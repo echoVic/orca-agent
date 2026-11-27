@@ -969,7 +969,7 @@ pub struct ToolResult {
     #[serde(skip)]
     pub file_change_preview: Option<Arc<FileChangePreview>>,
     #[serde(skip)]
-    pub touched_file: Option<PathBuf>,
+    pub touched_files: Vec<PathBuf>,
     #[serde(skip)]
     pub file_effects: Vec<FileEffect>,
     /// What the tool wrote for the person watching while it ran, when that
@@ -1060,7 +1060,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
-            touched_file: None,
+            touched_files: Vec::new(),
             file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
@@ -1084,7 +1084,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
-            touched_file: None,
+            touched_files: Vec::new(),
             file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
@@ -1123,7 +1123,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
-            touched_file: None,
+            touched_files: Vec::new(),
             file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
@@ -1180,7 +1180,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
-            touched_file: None,
+            touched_files: Vec::new(),
             file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
@@ -1204,7 +1204,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
-            touched_file: None,
+            touched_files: Vec::new(),
             file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
@@ -1228,7 +1228,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
-            touched_file: None,
+            touched_files: Vec::new(),
             file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
@@ -1265,7 +1265,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
-            touched_file: None,
+            touched_files: Vec::new(),
             file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
@@ -1313,7 +1313,7 @@ impl ToolResult {
             ),
             images: Vec::new(),
             file_change_preview: None,
-            touched_file: None,
+            touched_files: Vec::new(),
             file_effects: Vec::new(),
             streamed_output: None,
             service_usage: ToolServiceUsage::default(),
@@ -1322,7 +1322,7 @@ impl ToolResult {
     }
 
     pub fn with_touched_file(mut self, path: PathBuf) -> Self {
-        self.touched_file = Some(path);
+        self.touched_files.push(path);
         self
     }
 

@@ -487,6 +487,34 @@ pub(crate) fn refresh_nested_instructions(conversation: &mut Conversation, cwd: 
     render_effective_chain(conversation, &cwd, orca_core::home::orca_home().as_deref());
 }
 
+pub(crate) fn queue_tool_touches(
+    conversation: &mut Conversation,
+    result: &orca_core::tool_types::ToolResult,
+) {
+    use orca_core::tool_types::ToolName;
+
+    let modified = matches!(
+        result.name,
+        ToolName::WriteFile | ToolName::Edit | ToolName::ApplyPatch
+    );
+    let touches = &mut conversation.nested_instructions.pending_touches;
+    let start = touches.len();
+    touches.extend(
+        result
+            .touched_files
+            .iter()
+            .cloned()
+            .map(|path| (path, modified)),
+    );
+    if result.name == ToolName::ApplyPatch {
+        // Treat the patch as one touch when it changes its own instructions.
+        touches[start..].sort_by_key(|(path, _)| {
+            path.file_name()
+                .is_some_and(|name| name == INSTRUCTIONS_FILE)
+        });
+    }
+}
+
 impl ProjectInstructions {
     pub(crate) fn append_nested_for_touches(
         &self,
@@ -504,7 +532,13 @@ impl ProjectInstructions {
         let touches = touches
             .into_iter()
             .filter_map(|(path, modified)| {
-                let path = path.canonicalize().ok()?;
+                let path = match path.canonicalize() {
+                    Ok(path) => path,
+                    Err(error) if modified && error.kind() == io::ErrorKind::NotFound => {
+                        path.parent()?.canonicalize().ok()?.join(path.file_name()?)
+                    }
+                    Err(_) => return None,
+                };
                 if !path.starts_with(root) {
                     return None;
                 }
@@ -1093,6 +1127,46 @@ mod tests {
                 "<project-instructions>\n# Updated instructions for src/ from src/AGENTS.md:\nWritten rule\n</project-instructions>"
             ]
         );
+    }
+
+    #[test]
+    fn a_patch_discovers_nested_instructions_and_defers_its_own_write() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
+
+        let (project, _home, instructions) = nested_project();
+        fs::write(project.path().join("src/AGENTS.md"), "Existing rule").unwrap();
+        let request = ToolRequest {
+            id: "patch-nested".into(),
+            name: ToolName::ApplyPatch,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(serde_json::json!({
+                "input": "*** Begin Patch\n*** Delete File: src/one.txt\n*** Add File: lib/AGENTS.md\n+Written rule\n*** Add File: lib/new.txt\n+fixture\n*** End Patch"
+            }).to_string()),
+        };
+        let result = orca_tools::apply_patch::prepare(&request, project.path(), || false)
+            .unwrap()
+            .commit(&request, || false);
+        assert_eq!(result.status, ToolStatus::Completed);
+        let mut conversation = Conversation::new();
+        crate::session::record_tool_result_for_agent(&mut conversation, None, &result, false)
+            .unwrap();
+        instructions.append_nested_for_touches(&mut conversation, None);
+        let rendered = nested_messages(&conversation).join("\n");
+        assert!(rendered.contains("Existing rule"));
+        assert!(!rendered.contains("Written rule"));
+
+        touch(
+            &instructions,
+            &mut conversation,
+            None,
+            project.path(),
+            "lib/new.txt",
+        );
+        let rendered = nested_messages(&conversation).join("\n");
+        assert!(rendered.contains("Updated instructions for lib/ from lib/AGENTS.md"));
+        assert_eq!(rendered.matches("Written rule").count(), 1);
     }
 
     #[test]

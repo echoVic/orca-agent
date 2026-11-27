@@ -817,7 +817,16 @@ impl PreparedPatch {
     }
 
     pub fn commit(&self, request: &ToolRequest, should_cancel: impl Fn() -> bool) -> ToolResult {
-        commit(request, self, &should_cancel)
+        let mut result = commit(request, self, &should_cancel);
+        result.touched_files = result
+            .file_effects
+            .iter()
+            .filter_map(|effect| match effect {
+                FileEffect::Written(path) | FileEffect::Deleted(path) => Some(self.root.join(path)),
+                FileEffect::CreatedDirectory(_) => None,
+            })
+            .collect();
+        result
     }
 }
 

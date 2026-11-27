@@ -114,13 +114,7 @@ pub(crate) fn record_tool_result_for_agent(
         pinned: false,
     };
     conversation.add_tool_result_with_terminal(result, result_content);
-    if let Some(path) = &result.touched_file {
-        let modified = matches!(result.name, ToolName::WriteFile | ToolName::Edit);
-        conversation
-            .nested_instructions
-            .pending_touches
-            .push((path.clone(), modified));
-    }
+    crate::instructions::queue_tool_touches(conversation, result);
     let reminders = settled_repeat_tool_reminders(conversation);
     let reminder_messages = reminders
         .iter()
