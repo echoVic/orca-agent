@@ -19,6 +19,13 @@ pub struct RuntimeModelResponse {
     pub(crate) attempt_usage: Option<Usage>,
     pub identity: ModelResponseIdentity,
     pub observation: Option<ProviderResponseObservation>,
+    pub(crate) background_patch: Option<BackgroundPatchContext>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct BackgroundPatchContext {
+    pub enabled: bool,
+    pub fingerprint: Option<[u8; 32]>,
 }
 
 impl RuntimeModelResponse {
@@ -32,6 +39,7 @@ impl RuntimeModelResponse {
             response,
             identity,
             observation: None,
+            background_patch: None,
         }
     }
 

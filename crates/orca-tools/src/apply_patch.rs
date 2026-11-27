@@ -184,14 +184,14 @@ fn parse_hunk<'a>(
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct PreparedPatch {
     root: PathBuf,
     root_identity: FileIdentity,
     ops: Vec<PlannedOp>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct PlannedTarget {
     pub(crate) path: PathBuf,
     pub(crate) label: String,
@@ -203,7 +203,7 @@ pub(crate) struct PlannedTarget {
     identity: Option<FileIdentity>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct PlannedOp {
     pub(crate) target: PlannedTarget,
     pub(crate) move_to: Option<PlannedTarget>,
@@ -780,6 +780,26 @@ impl PreparedPatch {
                         .then_some(target.requested_relative.as_str()),
                 )
             })
+    }
+
+    pub fn approval_fingerprint(&self) -> Option<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+
+        struct HashWriter(Sha256);
+        impl Write for HashWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = HashWriter(Sha256::new());
+        serde_json::to_writer(&mut writer, self).ok()?;
+        Some(writer.0.finalize().into())
     }
 
     pub fn pre_images(&self) -> impl Iterator<Item = (&str, Option<(&str, Option<u32>)>)> {

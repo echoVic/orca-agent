@@ -273,6 +273,12 @@ impl ThreadActor {
             task_id: task_id.clone(),
             usage_ledger: self.usage_ledger.clone(),
             response_identity: suspension.identity().clone(),
+            cwd: active
+                .config
+                .cwd
+                .clone()
+                .unwrap_or(std::env::current_dir()?),
+            apply_patch: active.config.tools.apply_patch,
             surface_outcome,
             surface_provider_ingress,
         };

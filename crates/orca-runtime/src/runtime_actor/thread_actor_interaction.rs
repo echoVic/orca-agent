@@ -1290,7 +1290,7 @@ impl ThreadActor {
             // it must exist and match the executing turn's first definition.
             let name = request.name.as_str();
             let can_restore_tool_definition = !(name == "apply_patch"
-                && active.config.tools.apply_patch)
+                && (active.config.tools.apply_patch || self.config.tools.apply_patch))
                 && self.handle.mcp_registry.resolve_tool(name).is_none()
                 && (orca_tools::registry::default_tool_registry()
                     .resolve(name)

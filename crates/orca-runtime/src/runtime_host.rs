@@ -893,7 +893,11 @@ impl HostedTurnRequest {
         Ok(())
     }
 
-    fn prepare_background_continuation(&mut self, registry: &TaskRegistry) -> Result<(), String> {
+    fn prepare_background_continuation(
+        &mut self,
+        registry: &TaskRegistry,
+        config: &mut RunConfig,
+    ) -> Result<(), String> {
         let HostedOperationKind::BackgroundContinuation { task_id } = &self.operation_kind else {
             return Ok(());
         };
@@ -905,6 +909,9 @@ impl HostedTurnRequest {
                     )
                 })?;
         self.turn_id = continuation.response.identity.turn_id.clone();
+        if let Some(patch) = continuation.response.background_patch {
+            config.tools.apply_patch = patch.enabled;
+        }
         self.usage_credit = registry
             .get(task_id)
             .and_then(|task| task.usage)
@@ -8030,7 +8037,6 @@ fn reconcile_durable_provider_outcomes_on_start(
     host_incarnation: &surface::HostIncarnation,
 ) -> Result<(), RuntimeHostError> {
     let task_registry = thread.session().task_registry();
-    let registry = std::cell::OnceCell::new();
     loop {
         let snapshot = coordinator.state().snapshot().clone();
         let durable = snapshot.tasks.iter().find_map(|task| {
@@ -8083,13 +8089,16 @@ fn reconcile_durable_provider_outcomes_on_start(
         let Some((task, background_fence, operation, mut outcome)) = durable else {
             return Ok(());
         };
-        let registry = registry.get_or_init(|| {
-            orca_tools::registry::tool_registry_for_session(
-                Some(thread.session().mcp_registry()),
-                &config.external_tools,
-                config.tools.apply_patch,
-            )
-        });
+        let apply_patch = outcome
+            .response
+            .as_ref()
+            .and_then(|response| response.background_patch)
+            .map_or(config.tools.apply_patch, |patch| patch.enabled);
+        let registry = &orca_tools::registry::tool_registry_for_session(
+            Some(thread.session().mcp_registry()),
+            &config.external_tools,
+            apply_patch,
+        );
         // Recorded before the completion named its tool calls: name them the
         // way the completion commits (or committed) them.
         if let Some(response) = outcome.response.as_mut() {
@@ -15132,6 +15141,8 @@ struct ProviderBackgroundTaskContext {
     task_id: String,
     usage_ledger: RuntimeUsageLedger,
     response_identity: ModelResponseIdentity,
+    cwd: PathBuf,
+    apply_patch: bool,
     surface_outcome: Option<Arc<Mutex<Option<TypedProviderBackgroundOutcome>>>>,
     surface_provider_ingress: Option<Arc<dyn surface::RuntimeProviderResponseIngress>>,
 }
@@ -19947,7 +19958,7 @@ impl ThreadActor {
                 let initial_generation = GenerationFence::initial(operation_id);
                 let completion = OperationCompletion::new();
                 let mut request = *request;
-                let config = config
+                let mut config = config
                     .map(|config| *config)
                     .unwrap_or_else(|| self.config.clone());
                 if request.operation_kind() == &HostedOperationKind::GoalRun {
@@ -20002,9 +20013,10 @@ impl ThreadActor {
                 } else {
                     None
                 };
-                if let Err(error) =
-                    request.prepare_background_continuation(state.thread.session().task_registry())
-                {
+                if let Err(error) = request.prepare_background_continuation(
+                    state.thread.session().task_registry(),
+                    &mut config,
+                ) {
                     self.state = Some(state);
                     let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed { message: error }));
                     return;
@@ -23856,6 +23868,39 @@ fn run_provider_background_task(
                 ));
             }
         }
+    }
+
+    if status == RunStatus::ApprovalRequired
+        && let Some(response) = &mut response
+    {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::{ToolName, ToolRequest};
+
+        response.background_patch = Some(crate::model_response::BackgroundPatchContext {
+            enabled: context.apply_patch,
+            fingerprint: context
+                .apply_patch
+                .then(|| {
+                    let call =
+                        crate::tasks::pending_tool_call_from_provider_response(&response.response)?;
+                    if call.name != "apply_patch" {
+                        return None;
+                    }
+                    let request = ToolRequest {
+                        id: call.id,
+                        name: ToolName::ApplyPatch,
+                        action: ActionKind::Write,
+                        target: call.target,
+                        raw_arguments: Some(call.arguments),
+                    };
+                    orca_tools::apply_patch::prepare(&request, &context.cwd, || {
+                        cancel.is_cancelled()
+                    })
+                    .ok()?
+                    .approval_fingerprint()
+                })
+                .flatten(),
+        });
     }
 
     if let Some(surface_outcome) = context.surface_outcome {
@@ -42203,7 +42248,7 @@ mod tests {
             .expect("mark task backgrounded");
 
         let response_turn_id = TurnId::new();
-        let response = RuntimeModelResponse::new(
+        let mut response = RuntimeModelResponse::new(
             ProviderResponse {
                 steps: vec![ProviderStep::ToolCall(ToolRequest {
                     id: "tool-1".to_string(),
@@ -42219,6 +42264,10 @@ mod tests {
             },
             response_turn_id.clone(),
         );
+        response.background_patch = Some(crate::model_response::BackgroundPatchContext {
+            enabled: true,
+            fingerprint: Some([17; 32]),
+        });
         registry
             .approval_required_for_pending_provider_response(
                 &task.id,
@@ -42237,11 +42286,15 @@ mod tests {
         );
         assert_ne!(request.turn_id(), &response_turn_id);
 
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled);
+        assert!(!config.tools.apply_patch);
         request
-            .prepare_background_continuation(&registry)
+            .prepare_background_continuation(&registry, &mut config)
             .expect("prepare continuation");
 
         assert_eq!(request.turn_id(), &response_turn_id);
+        assert!(config.tools.apply_patch);
         assert_eq!(
             request
                 .continuation

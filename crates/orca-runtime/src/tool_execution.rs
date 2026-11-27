@@ -1561,7 +1561,12 @@ impl ToolExecutionActor {
                 .flat_map(|patch| patch.approval_targets())
                 .collect();
             let approval_decision = RuntimeToolApprovalPolicy::new(policy, permission_overlay)
-                .resolve_with_targets(approval.clone(), &invocation.effective, &targets);
+                .resolve_with_targets(
+                    approval.clone(),
+                    &invocation.effective,
+                    &targets,
+                    prepared_patch,
+                );
             if matches!(approval_decision, RuntimeApprovalDecision::Ask(_))
                 && let Some(patch) = prepared_patch
             {

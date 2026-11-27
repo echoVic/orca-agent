@@ -52,7 +52,7 @@ impl<'a> RuntimeToolApprovalPolicy<'a> {
         approval: ApprovalRequest,
         request: &ToolRequest,
     ) -> RuntimeApprovalDecision {
-        self.resolve_with_targets(approval, request, &[])
+        self.resolve_with_targets(approval, request, &[], None)
     }
 
     pub(crate) fn resolve_with_targets(
@@ -60,6 +60,7 @@ impl<'a> RuntimeToolApprovalPolicy<'a> {
         approval: ApprovalRequest,
         request: &ToolRequest,
         targets: &[&str],
+        prepared_patch: Option<&orca_tools::apply_patch::PreparedPatch>,
     ) -> RuntimeApprovalDecision {
         let preapproved = self
             .permission_overlay
@@ -82,6 +83,19 @@ impl<'a> RuntimeToolApprovalPolicy<'a> {
         let target = approval.target.clone().or_else(|| request.target.clone());
         let decision =
             resolve_for_request(self.policy, &approval, targets, &tool, target.as_deref());
+        if preapproved && decision.decision != ApprovalDecision::Deny {
+            let approved = self.permission_overlay.preapproved_patch_fingerprint.take();
+            if approved.is_some()
+                && approved == prepared_patch.and_then(|patch| patch.approval_fingerprint())
+            {
+                return RuntimeApprovalDecision::Allowed(ApprovalResolution {
+                    id: approval.id,
+                    decision: ApprovalDecision::Allow,
+                    reason: "approved background continuation".to_string(),
+                });
+            }
+            return RuntimeApprovalDecision::Ask(approval);
+        }
         if self.permission_overlay.strict_auto_review()
             && decision.decision == ApprovalDecision::Allow
         {
@@ -187,6 +201,53 @@ mod tests {
             other => panic!("preapproved request should be allowed, got {other:?}"),
         }
         assert!(!overlay.consume_preapproved_tool_call_id("shell-1"));
+    }
+
+    #[test]
+    fn an_approved_patch_with_multiple_targets_can_continue() {
+        use orca_core::approval_rules::{PermissionRule, PermissionRules};
+        use orca_core::approval_types::Decision;
+
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("one.txt"), "before\n").unwrap();
+        let (mut approval, mut request) = shell_approval_and_request();
+        approval.action = ActionKind::Write;
+        approval.tool = Some("apply_patch".into());
+        request.action = ActionKind::Write;
+        request.name = ToolName::ApplyPatch;
+        request.raw_arguments = Some(serde_json::json!({"input": "*** Begin Patch\n*** Delete File: one.txt\n*** Add File: two.txt\n+new\n*** End Patch"}).to_string());
+        let approved = orca_tools::apply_patch::prepare(&request, cwd.path(), || false).unwrap();
+        let policy = ApprovalPolicy::new(ApprovalMode::Suggest);
+        let denying =
+            ApprovalPolicy::new(ApprovalMode::Suggest).with_permission_rules(PermissionRules {
+                rules: vec![PermissionRule::new(
+                    "apply_patch",
+                    "two.txt",
+                    Decision::Deny,
+                )],
+            });
+        std::fs::write(cwd.path().join("one.txt"), "edited\n").unwrap();
+        let edited = orca_tools::apply_patch::prepare(&request, cwd.path(), || false).unwrap();
+        for (policy, patch, expected) in [
+            (&policy, &approved, ApprovalDecision::Allow),
+            (&policy, &edited, ApprovalDecision::Ask),
+            (&denying, &approved, ApprovalDecision::Deny),
+        ] {
+            let mut overlay = TurnPermissionOverlay::default();
+            overlay.set_preapproved_tool_call_id(Some(request.id.clone()));
+            overlay.preapproved_patch_fingerprint = Some(approved.approval_fingerprint().unwrap());
+            let targets: Vec<_> = patch.approval_targets().collect();
+            let decision = RuntimeToolApprovalPolicy::new(policy, &mut overlay)
+                .resolve_with_targets(approval.clone(), &request, &targets, Some(patch));
+            let actual = match decision {
+                RuntimeApprovalDecision::Allowed(_) => ApprovalDecision::Allow,
+                RuntimeApprovalDecision::Ask(_) => ApprovalDecision::Ask,
+                RuntimeApprovalDecision::Denied { .. } => ApprovalDecision::Deny,
+                other => panic!("unexpected decision {other:?}"),
+            };
+            assert_eq!(actual, expected);
+            assert!(!overlay.consume_preapproved_tool_call_id(&request.id));
+        }
     }
 
     #[test]

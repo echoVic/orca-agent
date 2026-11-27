@@ -1569,6 +1569,8 @@ struct PersistedProviderResponse {
     attempt_usage: Option<PersistedAttemptUsage>,
     #[serde(default)]
     identity: Option<ModelResponseIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    background_patch: Option<crate::model_response::BackgroundPatchContext>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -6661,6 +6663,7 @@ impl PersistedProviderResponse {
         if let Some(attempt) = self.attempt_usage {
             runtime_response.attempt_usage = attempt.usage;
         }
+        runtime_response.background_patch = self.background_patch;
         runtime_response
     }
 }
@@ -6684,6 +6687,7 @@ impl From<&RuntimeModelResponse> for PersistedProviderResponse {
                 },
             ),
             identity: Some(response.identity.clone()),
+            background_patch: response.background_patch,
         }
     }
 }
@@ -7177,7 +7181,7 @@ fn active_main_session_adoption_eligible(record: &TaskRecord) -> bool {
         && record.error.is_none()
 }
 
-fn pending_tool_call_from_provider_response(
+pub(crate) fn pending_tool_call_from_provider_response(
     response: &ProviderResponse,
 ) -> Option<PendingToolCallSummary> {
     response
@@ -8788,6 +8792,7 @@ mod tests {
             usage: None,
             attempt_usage: None,
             identity: None,
+            background_patch: None,
         }
         .into_runtime_response_with_migration_identity();
 

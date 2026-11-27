@@ -6,7 +6,7 @@ use std::path::{Component, Path};
 use crate::PlatformError;
 
 /// Identity obtained from an open filesystem handle.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize)]
 pub struct FileIdentity(u64, u64);
 
 #[derive(Clone, Copy, Debug)]
