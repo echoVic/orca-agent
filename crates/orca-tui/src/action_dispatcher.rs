@@ -486,7 +486,7 @@ fn route_action(
             let main_sender = controller.view().map(|view| view.main_sender());
             let projection_tx = main_sender.as_ref().unwrap_or(event_tx);
             match controller.stop_background_task(&task_id, projection_tx) {
-                Ok(Some(projection)) => {
+                Ok(Some((projection, disposition))) => {
                     let label = crate::background_tasks::task_notice_label(
                         &projection.workflow_tasks,
                         &task_id,
@@ -496,7 +496,7 @@ fn route_action(
                     if !deliver_dispatcher_outcome(
                         event_tx,
                         &mut pending.event,
-                        TuiEvent::Notice(format!("Stopping {label}.")),
+                        TuiEvent::Notice(disposition.notice(&label)),
                     ) {
                         return false;
                     }

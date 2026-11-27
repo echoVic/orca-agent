@@ -386,7 +386,7 @@ impl TuiSurfaceActions {
         task_id: &str,
         control: &TuiSurfaceTaskControl,
         event_tx: &mpsc::Sender<TuiEvent>,
-    ) -> Result<SurfaceProjectionState, crate::surface_client::TaskStopError> {
+    ) -> Result<crate::surface_client::TaskStopResult, crate::surface_client::TaskStopError> {
         crate::surface_client::stop_task(&self.thread, task_id, control, event_tx)
     }
 

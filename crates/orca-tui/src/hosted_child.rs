@@ -3747,6 +3747,18 @@ pub(crate) mod live_child_for_test {
                     )
             })
         });
+        actions
+            .send(crate::protocol::UserAction::StopTask {
+                task_id: task.task_id.as_str().into(),
+            })
+            .unwrap();
+        let notice = screen
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            matches!(notice,TuiEvent::Notice(ref text) if text==&format!("{label} had already finished.")),
+            "{notice:?}"
+        );
         fixture.shutdown();
     }
 

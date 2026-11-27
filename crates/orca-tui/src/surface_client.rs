@@ -742,6 +742,23 @@ enum SubagentStopTry {
     AlreadyEnded,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TaskStopDisposition {
+    Stopping,
+    AlreadyEnded,
+}
+
+impl TaskStopDisposition {
+    pub(crate) fn notice(&self, label: &str) -> String {
+        match self {
+            Self::Stopping => format!("Stopping {label}."),
+            Self::AlreadyEnded => format!("{label} had already finished."),
+        }
+    }
+}
+
+pub(crate) type TaskStopResult = (SurfaceProjectionState, TaskStopDisposition);
+
 /// Makes tries at stopping a subagent, each by `try_stop`, until one is
 /// not refused as stale, at most `SUBAGENT_STOP_TRIES`. Any other refusal
 /// is `try_stop`'s `Err` and ends the tries as it is. `label` names the
@@ -749,10 +766,11 @@ enum SubagentStopTry {
 fn stop_subagent_until_not_stale(
     label: impl FnOnce() -> String,
     mut try_stop: impl FnMut() -> Result<SubagentStopTry, String>,
-) -> Result<(), TaskStopError> {
+) -> Result<TaskStopDisposition, TaskStopError> {
     for _ in 0..SUBAGENT_STOP_TRIES {
         match try_stop()? {
-            SubagentStopTry::Taken | SubagentStopTry::AlreadyEnded => return Ok(()),
+            SubagentStopTry::Taken => return Ok(TaskStopDisposition::Stopping),
+            SubagentStopTry::AlreadyEnded => return Ok(TaskStopDisposition::AlreadyEnded),
             SubagentStopTry::Stale => {}
         }
     }
@@ -807,7 +825,7 @@ pub(crate) fn stop_task(
     task_id: &str,
     controller: &TuiSurfaceTaskControl,
     event_tx: &mpsc::Sender<TuiEvent>,
-) -> Result<SurfaceProjectionState, TaskStopError> {
+) -> Result<TaskStopResult, TaskStopError> {
     let surface = thread.surface();
     let attachment = attach_for_task_stop(&surface)?;
     let Some(task) = attachment
@@ -881,9 +899,19 @@ pub(crate) fn stop_task(
             guard.terminal_observed();
         }
         let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
-        return Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot));
+        return Ok((
+            SurfaceProjectionState::from_surface_snapshot(&snapshot),
+            TaskStopDisposition::Stopping,
+        ));
     }
     if task.task_type == orca_runtime::surface::SurfaceTaskType::Subagent {
+        if task_has_ended(task.status) {
+            detach(&surface, &attachment.client);
+            return Ok((
+                SurfaceProjectionState::from_surface_snapshot(&attachment.baseline.snapshot),
+                TaskStopDisposition::AlreadyEnded,
+            ));
+        }
         // An agent's row moves on with every step the agent takes, so a stop
         // sent with the row as it was read can be refused as stale: each try
         // after the first reads the task again, from a fresh attachment.
@@ -893,7 +921,7 @@ pub(crate) fn stop_task(
                 SurfaceProjectionState::from_surface_snapshot(&attachment.baseline.snapshot);
             crate::background_tasks::task_notice_label(&projection.workflow_tasks, task_id)
         };
-        stop_subagent_until_not_stale(label, || {
+        let disposition = stop_subagent_until_not_stale(label, || {
             let again;
             let (client, fence) = match first.take() {
                 Some(first) => first,
@@ -934,7 +962,10 @@ pub(crate) fn stop_task(
             }
         })?;
         let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
-        return Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot));
+        return Ok((
+            SurfaceProjectionState::from_surface_snapshot(&snapshot),
+            disposition,
+        ));
     }
     if task.task_type != orca_runtime::surface::SurfaceTaskType::Workflow
         && task.workflow_run_id.is_none()
@@ -981,7 +1012,10 @@ pub(crate) fn stop_task(
     }
 
     let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
-    Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot))
+    Ok((
+        SurfaceProjectionState::from_surface_snapshot(&snapshot),
+        TaskStopDisposition::Stopping,
+    ))
 }
 
 /// Whether a task in this status is over: a stop of it has nothing left to
@@ -4745,7 +4779,7 @@ mod tests {
     /// try; a try past the script is a failure of the test.
     fn stop_with_replies(
         replies: Vec<Result<SubagentStopTry, String>>,
-    ) -> (Result<(), TaskStopError>, usize) {
+    ) -> (Result<TaskStopDisposition, TaskStopError>, usize) {
         let mut replies = replies.into_iter();
         let mut tries = 0;
         let result = stop_subagent_until_not_stale(
@@ -4765,7 +4799,7 @@ mod tests {
         // had already bound the agent's thread, refused it as stale.
         let (result, tries) =
             stop_with_replies(vec![Ok(SubagentStopTry::Stale), Ok(SubagentStopTry::Taken)]);
-        assert_eq!(result, Ok(()));
+        assert_eq!(result, Ok(TaskStopDisposition::Stopping));
         assert_eq!(tries, 2, "the stop is sent once more, and taken");
     }
 
@@ -4796,7 +4830,7 @@ mod tests {
             Ok(SubagentStopTry::Stale),
             Ok(SubagentStopTry::AlreadyEnded),
         ]);
-        assert_eq!(result, Ok(()), "no error for an agent that has ended");
+        assert_eq!(result, Ok(TaskStopDisposition::AlreadyEnded));
         assert_eq!(tries, 2, "and nothing is sent once it has");
     }
 
@@ -4879,8 +4913,10 @@ mod tests {
         };
 
         let controller = TuiSurfaceTaskControl::isolated_for_test();
-        let projection = stop_task(&thread.typed_surface(), &task_id, &controller, &event_tx)
-            .expect("typed workflow stop");
+        let (projection, disposition) =
+            stop_task(&thread.typed_surface(), &task_id, &controller, &event_tx)
+                .expect("typed workflow stop");
+        assert_eq!(disposition, TaskStopDisposition::Stopping);
         assert!(
             projection.workflow_tasks.iter().any(|task| {
                 task.id == task_id

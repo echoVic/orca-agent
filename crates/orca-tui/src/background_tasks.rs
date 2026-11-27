@@ -96,10 +96,10 @@ fn stop_task_for_tui(
     let main_sender = control.view().map(|view| view.main_sender());
     let projection_tx = main_sender.as_ref().unwrap_or(event_tx);
     match actions.stop_task(task_id, control, projection_tx) {
-        Ok(projection) => {
+        Ok((projection, disposition)) => {
             let label = task_notice_label(&projection.workflow_tasks, task_id);
             let _ = projection_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
-            let _ = event_tx.send(TuiEvent::Notice(format!("Stopping {label}.")));
+            let _ = event_tx.send(TuiEvent::Notice(disposition.notice(&label)));
             true
         }
         Err(error) => {

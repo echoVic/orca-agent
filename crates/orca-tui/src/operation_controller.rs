@@ -15,7 +15,7 @@ use crate::process_interrupt::ProcessInterruptHandle;
 use crate::protocol::{
     SubmitToken, TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse,
 };
-use crate::surface_projection::{SurfaceProjectionState, TuiStreamDeliveryWatermark};
+use crate::surface_projection::TuiStreamDeliveryWatermark;
 
 /// Presentation-side correlation for a typed runtime surface operation.
 ///
@@ -379,7 +379,8 @@ impl TuiSurfaceTaskControl {
         &self,
         task_id: &str,
         event_tx: &Sender<TuiEvent>,
-    ) -> Result<Option<SurfaceProjectionState>, crate::surface_client::TaskStopError> {
+    ) -> Result<Option<crate::surface_client::TaskStopResult>, crate::surface_client::TaskStopError>
+    {
         let runtime = self.main_runtime();
         let Some(runtime) = runtime else {
             return Ok(None);
