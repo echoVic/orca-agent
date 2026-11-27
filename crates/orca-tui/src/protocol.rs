@@ -606,6 +606,7 @@ pub enum TuiEvent {
     /// thread has taken them: once a thread's catalog is in view, it is the
     /// one `/mcp` shows.
     McpCatalogPrestart(crate::surface_projection::McpCatalogView),
+    MainMcpCatalogWhileVisiting(crate::surface_projection::McpCatalogView),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

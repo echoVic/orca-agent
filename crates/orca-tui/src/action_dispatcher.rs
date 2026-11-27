@@ -259,6 +259,19 @@ fn route_action(
         }
         return true;
     }
+    if matches!(
+        action,
+        UserAction::SetModel(_) | UserAction::GoalPause | UserAction::StopTask { .. }
+    ) && let Some(reason) = controller
+        .view()
+        .and_then(|view| view.command_refusal(&action))
+    {
+        return deliver_dispatcher_outcome(
+            event_tx,
+            &mut pending.event,
+            TuiEvent::OperationRejected(reason.to_string()),
+        );
+    }
     match action {
         UserAction::SetModel(encoded) => {
             let encoded = controller.stamp_settings_action(encoded);
@@ -450,14 +463,16 @@ fn route_action(
             }
         },
         UserAction::StopTask { task_id } => {
-            match controller.stop_background_task(&task_id, event_tx) {
+            let main_sender = controller.view().map(|view| view.main_sender());
+            let projection_tx = main_sender.as_ref().unwrap_or(event_tx);
+            match controller.stop_background_task(&task_id, projection_tx) {
                 Ok(Some(projection)) => {
                     let label = crate::background_tasks::task_notice_label(
                         &projection.workflow_tasks,
                         &task_id,
                     );
-                    let _ =
-                        event_tx.try_send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
+                    let _ = projection_tx
+                        .try_send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
                     if !deliver_dispatcher_outcome(
                         event_tx,
                         &mut pending.event,

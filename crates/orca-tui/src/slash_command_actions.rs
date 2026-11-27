@@ -44,7 +44,7 @@ fn request_recap(state: &mut AppState, action_tx: &mpsc::Sender<UserAction>) {
     }
 }
 
-/// `/mcp`: the panel of the MCP servers of the thread in view, or, before
+/// `/mcp`: the panel of main's MCP servers when visiting an agent, or, before
 /// the first message, of those that started with the TUI. An attached
 /// daemon session's servers are the daemon's, which this TUI cannot reach.
 fn open_mcp_panel(config: &RunConfig, state: &mut AppState) {
@@ -53,7 +53,9 @@ fn open_mcp_panel(config: &RunConfig, state: &mut AppState) {
             text: "MCP management is not available in an attached daemon session: run 'orca mcp login <name>' on this machine, then 'orca attach new' for a daemon session that uses the login; this session uses it once the daemon restarts and you reattach.".to_string(),
             expanded: false,
         });
-    } else if state.status != AppStatus::Idle {
+    } else if !(state.status == AppStatus::Idle
+        || (state.status == AppStatus::Running && state.conversation_target().task_id().is_some()))
+    {
         state.push_message(ChatMessage::Error(
             "finish or cancel the current work before managing MCP servers".to_string(),
         ));

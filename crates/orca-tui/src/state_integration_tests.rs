@@ -807,6 +807,86 @@ mod agent_visit {
     }
 
     #[test]
+    fn an_agents_mcp_panel_keeps_mains_catalog_after_child_updates() {
+        use orca_runtime::surface::{NonEmptyText, SurfaceMcpServer, SurfaceMcpServerStatus};
+        let server = |name| SurfaceMcpServer {
+            name: NonEmptyText::try_new(name).unwrap(),
+            status: SurfaceMcpServerStatus::Disabled,
+            prompts_error: None,
+        };
+        let mut main = parent_of_child();
+        main.mcp_catalog.servers.push(server("main_archive"));
+        let mut child = snapshot_with_child(1, 2);
+        child.mcp_catalog.servers.push(server("child_archive"));
+        let mut state = state();
+        focus(&mut state, "child", &main, &child);
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState::from_surface_snapshot(&child),
+        )));
+        let mut config = crate::test_support::test_run_config();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(config.clone()));
+        let actions = state.event_tx.clone();
+        for status in [AppStatus::Idle, AppStatus::Running] {
+            state.set_status(status);
+            crate::slash_command_actions::handle_slash_command(
+                "/mcp",
+                &mut config,
+                &shared,
+                &mut state,
+                &actions,
+            );
+            let frame = crate::test_support::frame_string(&mut state, 120, 40);
+            assert!(
+                frame.contains("main_archive") && !frame.contains("child_archive"),
+                "{frame}"
+            );
+            state.mcp_dialog = None;
+        }
+    }
+
+    #[test]
+    fn a_rebuilt_agent_view_uses_mains_status_for_quit_and_signals() {
+        use crate::global_actions::{handle_global_shortcut, quit_on_termination_signal};
+        use crate::shortcuts::GlobalShortcut;
+        use orca_runtime::termination_signals::TerminationSignal;
+        with_streaming_main(|_, main| {
+            let mut state = state();
+            let (send, actions) = mpsc::unbounded();
+            focus(&mut state, "child", &main, &parent_of_child());
+            assert_eq!(state.status, AppStatus::Idle);
+            assert_eq!(state.main_behind_child, Some(SideParentStatus::Running));
+            assert!(
+                crate::test_support::frame_string(&mut state, 120, 40).contains("Main is running")
+            );
+            for signal in [TerminationSignal::Terminate, TerminationSignal::Hangup] {
+                assert_eq!(
+                    quit_on_termination_signal(signal, &mut state, &send),
+                    signal.exit_code()
+                );
+                assert!(matches!(actions.try_recv(), Ok(UserAction::Interrupt)));
+                assert!(matches!(actions.try_recv(), Ok(UserAction::Cancel)));
+            }
+            for status in [
+                SideParentStatus::NeedsApproval,
+                SideParentStatus::NeedsInput,
+            ] {
+                state.update(TuiEvent::SideParentStatusChanged(status));
+                handle_global_shortcut(GlobalShortcut::Cancel, &mut state, &send, || Ok(()))
+                    .unwrap();
+                assert!(matches!(actions.try_recv(), Ok(UserAction::Interrupt)));
+                assert!(state.last_ctrl_c.is_none());
+            }
+            state.update(TuiEvent::SideParentStatusChanged(SideParentStatus::Idle));
+            handle_global_shortcut(GlobalShortcut::Cancel, &mut state, &send, || Ok(())).unwrap();
+            assert!(actions.try_recv().is_err());
+            assert!(
+                crate::test_support::frame_string(&mut state, 120, 40)
+                    .contains("Press Ctrl+C again to quit")
+            );
+        });
+    }
+
+    #[test]
     fn returning_from_an_agent_keeps_a_running_main_running() {
         with_streaming_main(|thread, mut snapshot| {
             let mut state = state();

@@ -40,7 +40,6 @@ use crate::protocol::{
 };
 use crate::slash_command_actions::decode_settings_intent;
 use crate::submitted_turn::SubmittedTurn;
-use crate::surface_client;
 use crate::surface_projection::SurfaceProjectionState;
 
 const IDLE_SURFACE_PROJECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -442,42 +441,10 @@ pub(crate) fn hosted_tui_controller_loop(
         while let Ok(completed_request_id) = recap_completion_rx.try_recv() {
             clear_completed_recap_request(&mut active_recap_request_id, completed_request_id);
         }
-        let side_disallowed = (side_parent.is_some() || on_child || view.has_focus())
-            && matches!(
-                &action,
-                Ok(UserAction::NewSession
-                    | UserAction::ForkCurrentSession { .. }
-                    | UserAction::RenameCurrentSession { .. }
-                    | UserAction::ResumeSavedSession { .. }
-                    | UserAction::ForkSavedSession { .. }
-                    | UserAction::RenameSavedSession { .. }
-                    | UserAction::ArchiveSavedSession { .. }
-                    | UserAction::DeleteSavedSession { .. }
-                    | UserAction::SetModel(_)
-                    | UserAction::Remember { .. }
-                    | UserAction::Compact
-                    | UserAction::GoalShow
-                    | UserAction::GoalSet(_)
-                    | UserAction::GoalEdit(_)
-                    | UserAction::GoalClear
-                    | UserAction::GoalPause
-                    | UserAction::GoalResume
-                    | UserAction::RunWorkflow { .. }
-                    | UserAction::StopTask { .. }
-                    | UserAction::ResumeTask { .. }
-                    | UserAction::RetryTask { .. }
-                    | UserAction::FollowUpTask { .. }
-                    | UserAction::ListRewindCheckpoints
-                    | UserAction::RewindToCheckpoint { .. }
-                    | UserAction::Backtrack)
-            );
-        if side_disallowed {
-            let _ = event_tx.send(TuiEvent::OperationRejected(
-                "this command is unavailable in a side conversation; return to main first"
-                    .to_string(),
-            ));
-            // The dispatcher may have armed a turn for this action; it will
-            // not start one.
+        if let Some(reason) = action.as_ref().ok().and_then(|action| {
+            restricted_command(action, side_parent.is_some(), on_child || view.has_focus())
+        }) {
+            let _ = event_tx.send(TuiEvent::OperationRejected(reason.to_string()));
             control.cancel_surface_activation_if_idle();
             continue;
         }
@@ -1111,9 +1078,10 @@ pub(crate) fn hosted_tui_controller_loop(
                 );
             }
             Ok(UserAction::StopTask { task_id }) => {
+                let main = control.main_runtime();
                 handle_hosted_task_action(
                     HostedTaskAction::Stop { task_id },
-                    thread.as_ref(),
+                    main.as_ref(),
                     &control,
                     &event_tx,
                 );
@@ -1164,16 +1132,11 @@ pub(crate) fn hosted_tui_controller_loop(
                 });
             }
             Ok(UserAction::ReadTaskTranscript(request)) => {
-                let result = thread
-                    .as_ref()
-                    .map(|thread| {
-                        surface_client::read_task_transcript(&thread.typed_surface(), &request)
-                    })
-                    .unwrap_or_else(|| {
-                        TaskTranscriptResult::unavailable(
-                            "cannot read task transcript before a session exists",
-                        )
-                    });
+                let result = control.read_task_transcript(&request).unwrap_or_else(|| {
+                    TaskTranscriptResult::unavailable(
+                        "cannot read task transcript before a session exists",
+                    )
+                });
                 let _ = event_tx.send(TuiEvent::TaskTranscriptResult { request, result });
             }
             Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
@@ -1263,11 +1226,8 @@ pub(crate) fn hosted_tui_controller_loop(
 
     // The agents this TUI started run on its threads and end with it: stop
     // them so their tasks are recorded as stopped, not left as running.
-    // The turn under way is not stopped here: a quit from main's view sent
-    // its interrupt before this cancel, and that stop also reaches the
-    // agents still waiting for capacity, which have no thread to be asked.
-    // (From an agent's view while main runs, the keys do not send that
-    // interrupt yet; main's turn then ends with the controller's shutdown.)
+    // The controller's shutdown already interrupts main, including a turn
+    // its thread started from the queue while a child was on screen.
     // An attached session never runs this loop. The wait lets an agent that takes a few seconds to end report its
     // end to the conversation before that conversation's thread ends.
     let _ = host.stop_kept_subagents(Duration::from_secs(5));
@@ -1284,6 +1244,49 @@ pub(crate) fn hosted_tui_controller_loop(
     // them as it ends.
     control.close_prestart_mcp();
     control.release_runtime_thread();
+}
+
+pub(crate) fn restricted_command(
+    action: &UserAction,
+    side: bool,
+    child: bool,
+) -> Option<&'static str> {
+    if !side && !child {
+        return None;
+    }
+    let restricted = (side && matches!(action, UserAction::StopTask { .. }))
+        || matches!(
+            action,
+            UserAction::NewSession
+                | UserAction::ForkCurrentSession { .. }
+                | UserAction::RenameCurrentSession { .. }
+                | UserAction::ResumeSavedSession { .. }
+                | UserAction::ForkSavedSession { .. }
+                | UserAction::RenameSavedSession { .. }
+                | UserAction::ArchiveSavedSession { .. }
+                | UserAction::DeleteSavedSession { .. }
+                | UserAction::SetModel(_)
+                | UserAction::Remember { .. }
+                | UserAction::Compact
+                | UserAction::GoalShow
+                | UserAction::GoalSet(_)
+                | UserAction::GoalEdit(_)
+                | UserAction::GoalClear
+                | UserAction::GoalPause
+                | UserAction::GoalResume
+                | UserAction::RunWorkflow { .. }
+                | UserAction::ResumeTask { .. }
+                | UserAction::RetryTask { .. }
+                | UserAction::FollowUpTask { .. }
+                | UserAction::ListRewindCheckpoints
+                | UserAction::RewindToCheckpoint { .. }
+                | UserAction::Backtrack
+        );
+    restricted.then_some(if side {
+        "this command is unavailable in a side conversation; return to main first"
+    } else {
+        "this command is unavailable in an agent's conversation; return to main first"
+    })
 }
 
 #[cfg(test)]
@@ -1318,6 +1321,28 @@ mod tests {
                 return event;
             }
         }
+    }
+
+    #[test]
+    fn a_refused_command_in_an_agents_view_says_so_in_its_own_words() {
+        let side = Some("this command is unavailable in a side conversation; return to main first");
+        let child =
+            Some("this command is unavailable in an agent's conversation; return to main first");
+        for action in [
+            UserAction::NewSession,
+            UserAction::Compact,
+            UserAction::GoalPause,
+            UserAction::SetModel("mock".into()),
+            UserAction::ListRewindCheckpoints,
+        ] {
+            assert_eq!(super::restricted_command(&action, true, false), side);
+            assert_eq!(super::restricted_command(&action, false, true), child);
+        }
+        let stop = UserAction::StopTask {
+            task_id: "main-task".into(),
+        };
+        assert_eq!(super::restricted_command(&stop, true, false), side);
+        assert_eq!(super::restricted_command(&stop, false, true), None);
     }
 
     #[test]

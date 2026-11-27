@@ -4044,6 +4044,12 @@ impl RuntimeThreadHandle {
     /// surface operation. This command gives the queue owner the same bounded
     /// cancellation path without guessing the private active operation id.
     pub fn interrupt_active(&self) -> Result<(), RuntimeHostError> {
+        self.interrupt_active_with_completion().map(|_| ())
+    }
+
+    pub fn interrupt_active_with_completion(
+        &self,
+    ) -> Result<Option<OperationCompletion>, RuntimeHostError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.try_send(ThreadCommand::InterruptActive { reply: reply_tx })?;
         receive_reply(reply_rx, "runtime thread")?
@@ -5692,7 +5698,7 @@ enum ThreadCommand {
         reply: SyncSender<Result<InterruptOperationResult, RuntimeHostError>>,
     },
     InterruptActive {
-        reply: SyncSender<Result<(), RuntimeHostError>>,
+        reply: SyncSender<Result<Option<OperationCompletion>, RuntimeHostError>>,
     },
     PauseGoalRun {
         operation_id: OperationId,
@@ -20549,7 +20555,7 @@ impl ThreadActor {
                 }));
             }
             ThreadCommand::InterruptActive { reply } => {
-                let _ = reply.send(Ok(()));
+                let _ = reply.send(Ok(None));
             }
             ThreadCommand::PauseGoalRun {
                 operation_id,
@@ -21892,7 +21898,7 @@ impl ThreadActor {
             ThreadCommand::InterruptActive { reply } => {
                 self.pause_prompt_queue_for_interrupt();
                 Self::cancel_active_task_tree(active);
-                let _ = reply.send(Ok(()));
+                let _ = reply.send(Ok(Some(active.completion.clone())));
             }
             ThreadCommand::PauseGoalRun {
                 operation_id,

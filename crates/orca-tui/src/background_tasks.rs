@@ -93,10 +93,12 @@ fn stop_task_for_tui(
         ));
         return false;
     };
-    match actions.stop_task(task_id, control, event_tx) {
+    let main_sender = control.view().map(|view| view.main_sender());
+    let projection_tx = main_sender.as_ref().unwrap_or(event_tx);
+    match actions.stop_task(task_id, control, projection_tx) {
         Ok(projection) => {
             let label = task_notice_label(&projection.workflow_tasks, task_id);
-            let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
+            let _ = projection_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
             let _ = event_tx.send(TuiEvent::Notice(format!("Stopping {label}.")));
             true
         }

@@ -251,6 +251,47 @@ impl HostedView {
         self.lock().focus.is_some()
     }
 
+    pub(crate) fn main_runtime(
+        &self,
+        control: &TuiSurfaceTaskControl,
+    ) -> Option<RuntimeThreadHandle> {
+        let inner = self.lock();
+        if let Some(focus) = &inner.focus {
+            return Some(focus.parent_thread.clone());
+        }
+        if inner.adopted.is_some() {
+            return inner.main.thread.clone();
+        }
+        if inner.side_active {
+            return control.runtime_thread();
+        }
+        inner
+            .main
+            .thread
+            .clone()
+            .or_else(|| control.runtime_thread())
+    }
+
+    pub(crate) fn main_sender(&self) -> mpsc::Sender<TuiEvent> {
+        let inner = self.lock();
+        inner.focus.as_ref().map_or_else(
+            || inner.main.event_tx.clone(),
+            |focus| focus.parent_event_tx.clone(),
+        )
+    }
+
+    pub(crate) fn command_refusal(
+        &self,
+        action: &crate::protocol::UserAction,
+    ) -> Option<&'static str> {
+        let inner = self.lock();
+        crate::hosted_controller::restricted_command(
+            action,
+            inner.side_active && inner.focus.is_none(),
+            inner.focus.is_some(),
+        )
+    }
+
     /// Puts a child on screen without going through a focus action.
     #[cfg(test)]
     pub(crate) fn show_child_for_test(&self, focus: HostedChildFocus) {

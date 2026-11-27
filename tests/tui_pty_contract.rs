@@ -794,14 +794,21 @@ fn tui_return_from_an_agent_restores_mains_pending_approval() {
     return_from_marker_held_agent(ReturnScenario::Approval);
 }
 
+#[test]
+fn tui_ctrl_c_from_a_finished_agent_interrupts_mains_queued_turn() {
+    return_from_marker_held_agent(ReturnScenario::Interrupt);
+}
+
 enum ReturnScenario {
     Running,
     Queued,
+    Interrupt,
     Approval,
 }
 
 fn return_from_marker_held_agent(scenario: ReturnScenario) {
-    let queue_next_turn = matches!(scenario, ReturnScenario::Queued);
+    let interrupt = matches!(scenario, ReturnScenario::Interrupt);
+    let queue_next_turn = matches!(scenario, ReturnScenario::Queued | ReturnScenario::Interrupt);
     let approval = matches!(scenario, ReturnScenario::Approval);
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
@@ -846,7 +853,12 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
     }
     assert_screen_has_text(&process, &mut output, "thinking,", "child has not started");
     if queue_next_turn {
-        process.write(b"mock_stream_delay_ms 4000\r").unwrap();
+        let prompt = if interrupt {
+            "mock_stream_delay_ms 30000\r"
+        } else {
+            "mock_stream_delay_ms 4000\r"
+        };
+        process.write(prompt.as_bytes()).unwrap();
         assert_screen_shows(&process, &mut output, "Queued", "main prompt not queued");
     }
     let frame = reconstruct_screen(&output);
@@ -909,6 +921,62 @@ fn return_from_marker_held_agent(scenario: ReturnScenario) {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+    if interrupt {
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Main is running · Esc return",
+            "queued main is not running behind the finished child",
+        );
+        process.drain_output(&mut output);
+        let queued_record = std::fs::read_dir(home.path().join("operations"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension().is_some_and(|ext| ext == "jsonl")
+                    && std::fs::read_to_string(path).is_ok_and(|record| {
+                        record.contains(r#""type":"turn_started""#)
+                            && !record.contains(r#""type":"operation_terminal""#)
+                    })
+            })
+            .expect("the queued turn is the remaining open operation");
+        process.write(b"\x03").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Some(chunk) = process.receive_output(Duration::from_millis(100)) {
+                output.extend_from_slice(&chunk);
+            }
+            let frame = reconstruct_screen(&output);
+            assert!(!frame.contains("Press Ctrl+C again"), "{frame}");
+            if std::fs::read_to_string(&queued_record)
+                .unwrap()
+                .contains(r#""terminal":{"cancelled""#)
+                && !frame.contains("Main is running")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{frame}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        process.write(b"\x1b").unwrap();
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Task cancelled",
+            "Esc did not rebuild the interrupted main turn",
+        );
+        let frame = reconstruct_screen(&output);
+        assert!(
+            !frame.contains("Esc interrupt") && !frame.contains("Mock slow stream completed."),
+            "{frame}"
+        );
+        arm_idle_exit(&mut process, &mut output);
+        let status = process.wait_for_exit(Duration::from_secs(5));
+        process.close_io_and_join();
+        assert_eq!(status.code(), Some(130));
+        return;
     }
     process.write(b"\x1b").unwrap();
     assert_screen_has_text(

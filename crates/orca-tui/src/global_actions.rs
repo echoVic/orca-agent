@@ -7,7 +7,7 @@ use orca_runtime::termination_signals::TerminationSignal;
 use crate::protocol::UserAction;
 use crate::shortcuts::GlobalShortcut;
 use crate::transcript_state::ChatMessage;
-use crate::types::{AppState, AppStatus};
+use crate::types::{AppState, AppStatus, SideParentStatus};
 
 pub(crate) enum GlobalShortcutFlow {
     Continue,
@@ -29,13 +29,7 @@ where
                 let _ = action_tx.send(UserAction::CloseSideConversation);
                 return Ok(GlobalShortcutFlow::Continue);
             }
-            if matches!(
-                state.status,
-                AppStatus::Running
-                    | AppStatus::Compacting
-                    | AppStatus::WaitingApproval
-                    | AppStatus::WaitingUserInput
-            ) {
+            if turn_running(state) {
                 let _ = action_tx.send(UserAction::Interrupt);
                 state.request_runtime_queue_pause();
                 state.suspend_queued_follow_up_autosend();
@@ -111,14 +105,7 @@ pub(crate) fn quit_on_termination_signal(
     state: &mut AppState,
     action_tx: &mpsc::Sender<UserAction>,
 ) -> i32 {
-    let turn_running = matches!(
-        state.status,
-        AppStatus::Running
-            | AppStatus::Compacting
-            | AppStatus::WaitingApproval
-            | AppStatus::WaitingUserInput
-    );
-    if turn_running && !state.attached_session {
+    if turn_running(state) && !state.attached_session {
         let _ = action_tx.send(UserAction::Interrupt);
         state.request_runtime_queue_pause();
         state.suspend_queued_follow_up_autosend();
@@ -128,6 +115,24 @@ pub(crate) fn quit_on_termination_signal(
     }
     let _ = action_tx.send(UserAction::Cancel);
     signal.exit_code()
+}
+
+fn turn_running(state: &AppState) -> bool {
+    matches!(
+        state.status,
+        AppStatus::Running
+            | AppStatus::Compacting
+            | AppStatus::WaitingApproval
+            | AppStatus::WaitingUserInput
+    ) || (state.conversation_target().task_id().is_some()
+        && matches!(
+            state.main_behind_child,
+            Some(
+                SideParentStatus::Running
+                    | SideParentStatus::NeedsApproval
+                    | SideParentStatus::NeedsInput
+            )
+        ))
 }
 
 #[cfg(test)]

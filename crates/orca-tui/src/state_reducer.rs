@@ -994,6 +994,12 @@ impl AppState {
                     self.mcp_catalog = catalog;
                 }
             }
+            TuiEvent::MainMcpCatalogWhileVisiting(catalog) => {
+                if self.conversation_target().task_id().is_some() {
+                    self.mcp_catalog = catalog;
+                    self.surface_mcp_catalog_applied = true;
+                }
+            }
             TuiEvent::McpLoginUrl { server, url } => {
                 if let Some(crate::types::McpActionInFlight::LoggingIn {
                     authorization_url, ..
@@ -1513,13 +1519,13 @@ impl AppState {
             );
         } else {
             self.focused_workflow_tasks.clear();
+            self.mcp_catalog.clone_from(&projection.mcp_catalog);
+            self.surface_mcp_catalog_applied = true;
         }
         self.surface_session = surface_session;
         self.surface_operation = surface_operation;
         self.surface_workflow_tasks = surface_workflow_tasks;
         self.surface_metrics.apply_projection(&projection);
-        self.mcp_catalog.clone_from(&projection.mcp_catalog);
-        self.surface_mcp_catalog_applied = true;
         let goal_effect = self.surface_goal.apply_projection(&projection);
         self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
         match operation_apply {
