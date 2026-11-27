@@ -54,6 +54,23 @@ pub(crate) fn section_updates(
     current: &Message,
     resume_boundary: Option<&str>,
 ) -> Vec<Message> {
+    section_updates_filtered(history, current, resume_boundary, |_| true)
+}
+
+pub(crate) fn section_updates_matching(
+    history: &[Message],
+    current: &Message,
+    include: impl Fn(&str) -> bool,
+) -> Vec<Message> {
+    section_updates_filtered(history, current, None, include)
+}
+
+fn section_updates_filtered(
+    history: &[Message],
+    current: &Message,
+    resume_boundary: Option<&str>,
+    include: impl Fn(&str) -> bool,
+) -> Vec<Message> {
     let Some(record) = history.first().and_then(Message::system_prompt_record) else {
         return Vec::new();
     };
@@ -68,7 +85,11 @@ pub(crate) fn section_updates(
             .filter_map(Message::system_prompt_record)
             .filter(|record| record.update),
     ) {
-        for section in &record.sections {
+        for section in record
+            .sections
+            .iter()
+            .filter(|section| include(&section.name))
+        {
             if let Some(text) = section.text.as_deref() {
                 previous.insert(section.name.as_str(), text);
             } else {
@@ -79,6 +100,7 @@ pub(crate) fn section_updates(
     let changes = current
         .sections
         .iter()
+        .filter(|section| include(&section.name))
         .filter(|section| previous.remove(section.name.as_str()) != section.text.as_deref())
         .cloned()
         .collect::<Vec<_>>();

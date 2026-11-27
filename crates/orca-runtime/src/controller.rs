@@ -3017,7 +3017,7 @@ mod tests {
             }
             let one_shot = crate::session::bootstrap_agent_conversation(
                 Some(&transcript),
-                "System".into(),
+                Message::system("System".into()),
                 &nested,
                 "Continue",
             );

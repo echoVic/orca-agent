@@ -10,7 +10,8 @@ use uuid::Uuid;
 use crate::thread_store::sessions_dir;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{
-    Conversation, Message, SummaryState, is_delivered_notice, normalize_tool_boundaries,
+    Conversation, Message, SummaryState, SystemPromptRecord, is_delivered_notice,
+    normalize_tool_boundaries,
 };
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
@@ -299,31 +300,7 @@ pub(crate) fn resume_conversation_in_cwd(
     let mut loaded_sources = HashMap::new();
     let prompt_sources_are_loaded = |message: &Message| {
         message.system_prompt_record().is_none_or(|record| {
-            record.version == orca_core::conversation::SYSTEM_PROMPT_RECORD_VERSION
-                && !record.redacted
-                && record.sections.iter().all(|section| {
-                    if section.name != "project instructions" || section.text.is_none() {
-                        return true;
-                    }
-                    let Some(scope) = &section.instruction_scope else {
-                        return false;
-                    };
-                    scope.sources.is_empty()
-                        || ((scope.cwd == active_cwd
-                            || orca_core::config::folder_trust::is_trusted(active_cwd))
-                            && {
-                                let loaded =
-                                    loaded_sources.entry(scope.cwd.clone()).or_insert_with(|| {
-                                        crate::instructions::load_for_cwd_or_default(&scope.cwd)
-                                            .scope(&scope.cwd)
-                                            .sources
-                                    });
-                                scope
-                                    .sources
-                                    .iter()
-                                    .all(|source| loaded.binary_search(source).is_ok())
-                            })
-                })
+            !record.redacted && prompt_sources_can_replay(record, active_cwd, &mut loaded_sources)
         })
     };
     let instruction_messages_can_replay = restored.iter().all(|message| {
@@ -436,7 +413,37 @@ pub(crate) fn resume_conversation_in_cwd(
     conversation
 }
 
-fn leading_prompt_matches_sections(
+pub(crate) fn prompt_sources_can_replay(
+    record: &SystemPromptRecord,
+    active_cwd: &Path,
+    loaded_sources: &mut HashMap<PathBuf, Vec<PathBuf>>,
+) -> bool {
+    record.version == orca_core::conversation::SYSTEM_PROMPT_RECORD_VERSION
+        && record.sections.iter().all(|section| {
+            if section.name != "project instructions" || section.text.is_none() {
+                return true;
+            }
+            let Some(scope) = &section.instruction_scope else {
+                return false;
+            };
+            scope.sources.is_empty()
+                || ((scope.cwd == active_cwd
+                    || orca_core::config::folder_trust::is_trusted(active_cwd))
+                    && {
+                        let loaded = loaded_sources.entry(scope.cwd.clone()).or_insert_with(|| {
+                            crate::instructions::load_for_cwd_or_default(&scope.cwd)
+                                .scope(&scope.cwd)
+                                .sources
+                        });
+                        scope
+                            .sources
+                            .iter()
+                            .all(|source| loaded.binary_search(source).is_ok())
+                    })
+        })
+}
+
+pub(crate) fn leading_prompt_matches_sections(
     message: &Message,
     record: &orca_core::conversation::SystemPromptRecord,
 ) -> bool {
@@ -496,7 +503,7 @@ fn restore_fragment_batch(
     (!changes.is_empty()).then(|| Message::context_fragment_batch(restored, changes))
 }
 
-fn instruction_fragments_can_replay(message: &Message, cwd: &Path) -> bool {
+pub(crate) fn instruction_fragments_can_replay(message: &Message, cwd: &Path) -> bool {
     let Message::System {
         context_fragments, ..
     } = message

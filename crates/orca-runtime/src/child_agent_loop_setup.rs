@@ -2,7 +2,7 @@ use std::path::Path;
 
 use orca_approval::ApprovalPolicy;
 use orca_core::config::RunConfig;
-use orca_core::conversation::Conversation;
+use orca_core::conversation::{Conversation, Message};
 use orca_core::event_schema::RunStatus;
 use orca_core::subagent_types::SubagentType;
 
@@ -125,6 +125,7 @@ pub(crate) fn try_prepare_child_agent_conversation(
     let next_turn = restore_child_agent_continuation(&mut conversation, &continuation.start, cwd)?;
     continuation.restored_next_turn = Some(next_turn);
     tell_child_today(&mut conversation);
+    crate::fork_context::refresh_prompt_sections(&mut conversation);
     conversation.add_user(request.prompt.clone());
     let turn = next_turn
         .checked_sub(1)
@@ -253,11 +254,18 @@ fn prepare_child_agent_system_conversation(
     memory: &MemoryBlock,
 ) -> Conversation {
     let mut conversation = Conversation::new();
-    if let Some(prefix) = &request.fork_prefix {
-        conversation.fork_prefix = Some(prefix.clone());
-        return conversation;
-    }
-    let system_prompt = agent_common::build_agent_system_prompt_for_config(
+    let refreshed_instructions;
+    let instructions = if let Some(prefix) = &request.fork_prefix {
+        if crate::fork_context::sources_can_replay(prefix, cwd) {
+            conversation.fork_prefix = Some(prefix.clone());
+            return conversation;
+        }
+        refreshed_instructions = crate::instructions::load_for_cwd_or_default(cwd);
+        &refreshed_instructions
+    } else {
+        instructions
+    };
+    let system_prompt = agent_common::build_agent_system_prompt_sections(
         cwd,
         config,
         request.depth,
@@ -266,7 +274,12 @@ fn prepare_child_agent_system_conversation(
         Some(memory),
         request.allowed_tools.as_deref(),
     );
-    conversation.add_system(system_prompt);
+    conversation.messages.push(system_prompt.into_message());
+    if request.fork_prefix.is_some() {
+        conversation.messages.push(Message::pinned_system(
+            "Fork history was skipped because inherited instruction sources no longer apply. Continuing with the child's own history and a rebuilt prompt.".into(),
+        ));
+    }
     conversation
 }
 

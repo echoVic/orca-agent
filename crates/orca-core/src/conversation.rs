@@ -663,7 +663,10 @@ pub struct CapturedProviderMessage {
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ForkSystemMessage {
     pub index: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_fragments: Vec<ContextFragmentChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<Box<SystemPromptRecord>>,
 }
 
 /// A child sends this independently of its own transcript and checkpoints.

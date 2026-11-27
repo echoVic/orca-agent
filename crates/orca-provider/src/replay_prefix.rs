@@ -162,13 +162,16 @@ pub(crate) fn record(
             .count();
         for (index, message) in normalized[..cut].iter().enumerate() {
             if let Message::System {
-                context_fragments, ..
+                context_fragments,
+                system_prompt,
+                ..
             } = message
-                && !context_fragments.is_empty()
+                && (!context_fragments.is_empty() || system_prompt.is_some())
             {
                 fork_system_messages.push(ForkSystemMessage {
                     index: index + if index >= leading { summary_count } else { 0 },
                     context_fragments: context_fragments.clone(),
+                    system_prompt: system_prompt.clone(),
                 });
             }
         }

@@ -357,12 +357,16 @@ pub(crate) fn record_assistant_response_for_agent<W: io::Write>(
 
 pub(crate) fn bootstrap_agent_conversation(
     resumed: Option<&SessionTranscript>,
-    system_prompt: String,
+    system_prompt: Message,
     cwd: &Path,
     prompt: &str,
 ) -> Conversation {
     let mut conversation = if let Some(resumed) = resumed {
-        let mut conv = crate::history::resume_conversation_in_cwd(resumed, system_prompt, cwd);
+        let mut conv = crate::history::resume_conversation_in_cwd(
+            resumed,
+            system_prompt.content_str().unwrap_or_default().to_owned(),
+            cwd,
+        );
         conv.strip_legacy_pinned_volatile();
         conv.strip_legacy_summary_messages();
         conv.unpin_delivered_notices();
@@ -370,7 +374,7 @@ pub(crate) fn bootstrap_agent_conversation(
         conv
     } else {
         let mut conversation = Conversation::new();
-        conversation.add_system(system_prompt);
+        conversation.messages.push(system_prompt);
         conversation
     };
     if resumed.and_then(|transcript| transcript.completion_status.as_deref()) == Some("interrupted")
@@ -395,7 +399,7 @@ pub(crate) fn bootstrap_agent_conversation_for_loop(
     memory: &MemoryBlock,
     allowed_tools: Option<&[String]>,
 ) -> Conversation {
-    let system_prompt = agent_common::build_agent_system_prompt_for_config(
+    let system_prompt = agent_common::build_agent_system_prompt_sections(
         cwd,
         config,
         subagent_depth,
@@ -404,7 +408,7 @@ pub(crate) fn bootstrap_agent_conversation_for_loop(
         Some(memory),
         allowed_tools,
     );
-    bootstrap_agent_conversation(None, system_prompt, cwd, prompt)
+    bootstrap_agent_conversation(None, system_prompt.into_message(), cwd, prompt)
 }
 
 pub(crate) fn record_plan_state_for_agent(
@@ -546,12 +550,7 @@ impl InteractiveSession {
             }
             HistoryMode::Record | HistoryMode::Disabled => {
                 let mut conversation = Conversation::new();
-                let prompt = if matches!(config.history_mode, HistoryMode::Record) {
-                    current_prompt.clone()
-                } else {
-                    Message::system(system_prompt)
-                };
-                conversation.messages.push(prompt);
+                conversation.messages.push(current_prompt.clone());
                 (conversation, None)
             }
         };
@@ -2994,7 +2993,7 @@ mod tests {
 
             let conversation = bootstrap_agent_conversation(
                 Some(&transcript),
-                "sys".to_string(),
+                Message::system("sys".into()),
                 home,
                 "continue",
             );
@@ -3018,8 +3017,12 @@ mod tests {
             writer.complete("interrupted").expect("complete");
             let transcript = history::load_session("latest").expect("transcript");
 
-            let conversation =
-                bootstrap_agent_conversation(Some(&transcript), "sys".to_string(), home, "/exit");
+            let conversation = bootstrap_agent_conversation(
+                Some(&transcript),
+                Message::system("sys".into()),
+                home,
+                "/exit",
+            );
 
             assert!(
                 !conversation

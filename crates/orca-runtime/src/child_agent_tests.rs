@@ -2553,20 +2553,40 @@ fn the_in_flight_turn_is_not_inherited() {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForkResumeChange {
+    None,
+    InstructionsChanged,
+    TrustRevoked,
+}
+
 #[test]
-fn a_dispatched_fork_inherits_completed_history_after_queueing_and_resume() {
+fn a_resumed_fork_child_keeps_its_prefix() {
+    assert_dispatched_fork_resume(ForkResumeChange::None);
+    assert_dispatched_fork_resume(ForkResumeChange::InstructionsChanged);
+}
+
+#[test]
+fn a_fork_child_drops_inherited_instructions_whose_trust_was_revoked() {
+    assert_dispatched_fork_resume(ForkResumeChange::TrustRevoked);
+}
+
+fn assert_dispatched_fork_resume(change: ForkResumeChange) {
     use crate::lifecycle::{AgentLoopContext, AgentLoopOutcome};
     use crate::runtime_conversation_bootstrap::AgentConversationContext;
     use crate::tasks::TaskRegistry;
     use crate::tool_invocation::AgentToolPolicyContext;
+    use orca_core::config::folder_trust::{TrustLevel, set_trust};
     use orca_core::conversation::Conversation;
     use orca_core::task_types::TaskStatus;
     use serde_json::{Value, json};
 
     let cwd = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let _home = crate::history::redirect_test_orca_home(home.path());
     std::fs::write(cwd.path().join("sibling.txt"), "active sibling evidence").unwrap();
+    let instruction_path = cwd.path().join("AGENTS.md");
+    std::fs::write(&instruction_path, "Follow the original workspace runbook.").unwrap();
+    set_trust(cwd.path(), TrustLevel::Trusted).unwrap();
     let registry =
         TaskRegistry::new_persistent("fork-dispatch".into(), home.path().join("task-sessions"))
             .unwrap();
@@ -2647,7 +2667,19 @@ fn a_dispatched_fork_inherits_completed_history_after_queueing_and_resume() {
     config.subagents.limits.max_running = 1;
 
     let mut conversation = Conversation::new();
-    conversation.add_system("production parent instructions".into());
+    let parent_instructions = crate::instructions::load_for_cwd(cwd.path()).unwrap();
+    conversation.messages.push(
+        crate::agent_common::build_agent_system_prompt_sections(
+            cwd.path(),
+            &config,
+            0,
+            &SubagentType::General,
+            Some(&parent_instructions),
+            None,
+            None,
+        )
+        .into_message(),
+    );
     let mut run_turn = |prompt: &str, expected: &str| {
         conversation.add_user(prompt.into());
         let outcome = crate::agent_loop::run_agent_loop(
@@ -2684,6 +2716,15 @@ fn a_dispatched_fork_inherits_completed_history_after_queueing_and_resume() {
         "Active parent turn: dispatch the fork.",
         "integrated the fork report",
     );
+    match change {
+        ForkResumeChange::None => {}
+        ForkResumeChange::InstructionsChanged => {
+            std::fs::write(&instruction_path, "Follow the updated workspace runbook.").unwrap();
+        }
+        ForkResumeChange::TrustRevoked => {
+            set_trust(cwd.path(), TrustLevel::Untrusted).unwrap();
+        }
+    }
     run_turn("Resume the fork.", "parent resume report");
 
     let bodies = server.join().unwrap();
@@ -2696,9 +2737,35 @@ fn a_dispatched_fork_inherits_completed_history_after_queueing_and_resume() {
     for index in [3, 6] {
         let child = recorded_wire_messages(&bodies[index]);
         let body = std::str::from_utf8(&bodies[index]).unwrap();
-        assert!(body.contains("completed parent evidence"));
-        for (parent, inherited) in parent[..cut].iter().zip(&child[..cut]) {
-            assert_eq!(parent.get(), inherited.get());
+        if index == 6 && change == ForkResumeChange::TrustRevoked {
+            assert!(!body.contains("completed parent evidence"));
+            assert!(!body.contains("Follow the original workspace runbook."));
+            assert!(body.contains("inherited instruction sources no longer apply"));
+            assert!(child[0].get().contains("read-only"));
+        } else {
+            assert!(body.contains("completed parent evidence"));
+            assert!(body.contains("Follow the original workspace runbook."));
+            for (parent, inherited) in parent[..cut].iter().zip(&child[..cut]) {
+                assert_eq!(parent.get(), inherited.get());
+            }
+        }
+        let updates: Vec<_> = child
+            .iter()
+            .filter(|message| {
+                message
+                    .get()
+                    .contains("instructions changed; they now read")
+            })
+            .collect();
+        if index == 6 && change == ForkResumeChange::InstructionsChanged {
+            assert_eq!(updates.len(), 1);
+            assert!(
+                updates[0]
+                    .get()
+                    .contains("Follow the updated workspace runbook.")
+            );
+        } else {
+            assert!(updates.is_empty());
         }
         for marker in [
             "Active parent turn",

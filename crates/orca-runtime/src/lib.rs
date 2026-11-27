@@ -40,6 +40,7 @@ pub mod execution_broker;
 pub mod execution_journal;
 pub mod execution_scope;
 pub mod extension;
+mod fork_context;
 pub(crate) mod git_write_command;
 pub mod goal_actor;
 pub mod goal_store;

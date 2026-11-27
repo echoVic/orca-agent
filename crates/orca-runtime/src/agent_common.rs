@@ -105,6 +105,7 @@ pub fn build_agent_system_prompt_with_goal(
     .render()
 }
 
+#[cfg(test)]
 pub(crate) fn build_agent_system_prompt_for_config(
     cwd: &Path,
     config: &RunConfig,
