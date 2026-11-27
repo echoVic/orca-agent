@@ -299,17 +299,18 @@ fn hosted_tui_subagent_views_have_no_registry_input() {
 fn subagent_runtime_events_are_not_a_parallel_tui_projection() {
     let mapper = balanced_block(HOSTED_SESSION, "fn runtime_event_to_tui");
     let reducer = balanced_block(TUI_STATE_REDUCER, "pub fn update");
-    let projection = balanced_block(
-        TUI_STATE_REDUCER,
-        "pub(crate) fn apply_surface_projection_state",
+    let projection = balanced_block(TUI_STATE_REDUCER, "fn apply_surface_projection_state(");
+    let synced = balanced_block(reducer, "TuiEvent::SurfaceProjectionSynced(projection) =>");
+    let accepted = balanced_block(
+        synced,
+        "if self.apply_surface_projection_state(*projection)",
     );
 
     assert!(mapper.contains(
         "EventType::SubagentStarted | EventType::SubagentProgress | EventType::SubagentCompleted"
     ));
-    assert!(reducer.contains("TuiEvent::SurfaceProjectionSynced(projection)"));
-    assert!(reducer.contains("self.apply_surface_projection_state(*projection)"));
-    assert!(projection.contains("self.apply_workflow_tasks_update"));
+    assert!(accepted.contains("self.announce_visible_agent_lines()"));
+    assert!(projection.contains("self.update_workflow_panel(projection.workflow_tasks"));
 }
 
 #[test]
