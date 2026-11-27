@@ -783,7 +783,15 @@ impl TuiSurfaceTaskControl {
     pub(crate) fn shutdown(&self) {
         // The MCP servers no thread took stop, with no lock held.
         self.close_prestart_mcp();
-        let main = self.main_or_side_runtime();
+        let main = self.main_runtime();
+        let side = self
+            .view()
+            .filter(|view| view.side_active())
+            .and_then(|_| self.runtime_thread())
+            .filter(|side| {
+                main.as_ref()
+                    .is_none_or(|main| main.thread_id() != side.thread_id())
+            });
         let _transition = self
             .hosted
             .surface_presentation_transition
@@ -793,15 +801,27 @@ impl TuiSurfaceTaskControl {
             return;
         }
         self.lock_hosted().queue_interactions_closed = true;
-        if let Some(runtime) = &main {
+        for runtime in main.iter().chain(&side) {
             Self::pause_running_queue(runtime);
         }
         self.cancel_queue_interactions();
         self.process_interrupt.force_kill();
         let surface_cancelled = cancel_surface_if_active(&mut self.lock_hosted());
-        if !surface_cancelled && let Ok(Some(completion)) = self.interrupt_runtime_turn(main, true)
-        {
-            let _ = completion.wait_timeout(Duration::from_secs(5));
+        if side.is_some() || !surface_cancelled {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let completions: Vec<_> = main
+                .into_iter()
+                .chain(side)
+                .filter_map(|runtime| {
+                    self.interrupt_runtime_turn(Some(runtime), true)
+                        .ok()
+                        .flatten()
+                })
+                .collect();
+            for completion in completions {
+                let _ = completion
+                    .wait_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+            }
         }
         let surface_presentation_tasks = {
             let mut hosted = self.lock_hosted();

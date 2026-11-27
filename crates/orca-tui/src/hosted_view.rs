@@ -444,6 +444,102 @@ mod tests {
     }
 
     #[test]
+    fn term_on_a_side_interrupts_its_turn_and_the_hidden_queued_main() {
+        use orca_runtime::{
+            prompt_queue::{PromptQueueAction, PromptQueueInput},
+            surface::{CancelReason, OperationTerminal},
+        };
+        let home = crate::test_support::isolate_orca_home();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().into());
+        config.history_mode = orca_core::config::HistoryMode::Record;
+        let (view, control, _, host) = view_for_test();
+        control.bind_view(view.clone());
+        let main = host.start_thread(config.clone(), "main").unwrap();
+        config.history_mode = orca_core::config::HistoryMode::Disabled;
+        let side = host
+            .handle()
+            .start_side_thread(&main, config, "side")
+            .unwrap();
+        let (mut sender, _events) = crossbeam_channel::unbounded();
+        let mut attachment = id(1);
+        view.adopt(&mut Some(main.clone()), &mut sender, &mut attachment, false);
+        let start = |runtime: &orca_runtime::runtime_host::RuntimeThreadHandle, sender: &_| {
+            crate::hosted_session::announce_runtime_ready(runtime, sender, &control);
+            runtime
+                .prompt_queue(PromptQueueAction::Add {
+                    input: PromptQueueInput::text("mock_stream_delay_ms 30000"),
+                })
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let snapshot =
+                    crate::surface_client::read_snapshot(&runtime.typed_surface()).unwrap();
+                if !snapshot.assistant_streams.is_empty() {
+                    break snapshot.foreground_operation.unwrap().operation_id;
+                }
+                assert!(std::time::Instant::now() < deadline, "turn never streamed");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let main_op = start(&main, &sender);
+        view.set_side_active(true);
+        view.adopt(&mut Some(side.clone()), &mut sender, &mut attachment, true);
+        let side_op = start(&side, &sender);
+        let (actions, keys) = crossbeam_channel::unbounded();
+        let mut state = crate::types::AppState::new(
+            actions.clone(),
+            "test".into(),
+            "mock".into(),
+            "/tmp".into(),
+        );
+        state.update(crate::protocol::TuiEvent::SideConversationChanged {
+            active: true,
+            available: true,
+            parent_thread_id: main.thread_id().into(),
+            parent_title: "main".into(),
+            parent_status: crate::types::SideParentStatus::Running,
+        });
+        state.set_status(crate::types::AppStatus::Running);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            crate::global_actions::quit_on_termination_signal(
+                orca_runtime::termination_signals::TerminationSignal::Terminate,
+                &mut state,
+                &actions
+            ),
+            143
+        );
+        for action in keys.try_iter() {
+            match action {
+                crate::protocol::UserAction::Interrupt => {
+                    control.interrupt_current().unwrap();
+                }
+                crate::protocol::UserAction::Cancel => control.shutdown(),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        for (thread, op) in [(&main, main_op), (&side, side_op)] {
+            let snapshot = crate::surface_client::read_snapshot(&thread.typed_surface()).unwrap();
+            let end = snapshot
+                .operation_history
+                .into_iter()
+                .chain(snapshot.foreground_operation)
+                .find(|candidate| candidate.operation_id == op)
+                .unwrap()
+                .terminal;
+            assert!(
+                matches!(end,Some(record) if record.terminal==OperationTerminal::Cancelled{reason:CancelReason::User}),
+                "{} did not cancel before teardown",
+                thread.thread_id()
+            );
+        }
+        control.unbind_view();
+        host.shutdown().unwrap();
+    }
+
+    #[test]
     fn main_runtime_stays_main_in_a_side_conversation() {
         let home = crate::test_support::isolate_orca_home();
         let mut config = crate::test_support::test_run_config();
