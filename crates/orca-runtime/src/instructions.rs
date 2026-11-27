@@ -871,6 +871,7 @@ mod tests {
     #[test]
     fn nested_instructions_dedup_across_redaction_and_a_manual_snapshot() {
         use orca_core::config::{HistoryMode, ModelRuntimeConfig, ProviderKind, RunConfig};
+        use orca_core::conversation::CutShort;
         let (project, home, instructions) = nested_project();
         let cwd = project.path();
         let rule = "Keep this rule. api_key=sample-value";
@@ -934,6 +935,15 @@ mod tests {
                 .append_message(&Message::user("retained tail".into()))
                 .unwrap();
             conversation.add_user("retained tail".into());
+            let kept_reply = Message::Assistant {
+                content: Some("kept reply".into()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                cut_short: Some(CutShort::OutputLimit),
+                pinned: false,
+            };
+            writer.append_message(&kept_reply).unwrap();
+            conversation.messages.push(kept_reply);
             *session.conversation_mut() = conversation;
             let identity = crate::session::ManualCompactionPersistenceIdentity {
                 operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
@@ -976,6 +986,16 @@ mod tests {
             );
             assert!(before.contains("Keep this rule. api_key=&lt;redacted&gt;"));
             assert_eq!(nested_messages(&resumed), [before.as_str()]);
+            for conversation in [&outcome.after, &snapshot.conversation, &resumed] {
+                assert!(conversation.messages.iter().any(|message| matches!(
+                    message,
+                    Message::Assistant {
+                        content: Some(content),
+                        cut_short: Some(CutShort::OutputLimit),
+                        ..
+                    } if content == "kept reply"
+                )));
+            }
             assert_eq!(
                 crate::history::load_session(&id).unwrap().messages.len(),
                 count
@@ -1355,6 +1375,7 @@ mod tests {
                         function_name: "write_file".into(),
                         arguments,
                     }],
+                    cut_short: None,
                     pinned: false,
                 })
                 .unwrap();

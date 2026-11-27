@@ -1279,6 +1279,8 @@ mod tests {
 
     #[test]
     fn a_fork_keeps_its_own_copy_of_inherited_large_tool_results() {
+        use orca_core::conversation::CutShort;
+
         with_orca_home(|home| {
             let cwd = tempdir().unwrap();
             let mut parent =
@@ -1299,6 +1301,7 @@ mod tests {
                         function_name: "web_fetch".into(),
                         arguments: "{}".into(),
                     }],
+                    cut_short: None,
                     pinned: false,
                 })
                 .unwrap();
@@ -1337,6 +1340,15 @@ mod tests {
                     payload: event.payload,
                 })
                 .unwrap();
+            parent
+                .append_message(&Message::Assistant {
+                    content: Some("kept reply".into()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    cut_short: Some(CutShort::Interrupted),
+                    pinned: false,
+                })
+                .unwrap();
             drop(parent);
             let store = crate::thread_store::JsonlThreadStore::new();
             let exported = home.join("portable-spill.jsonl");
@@ -1357,6 +1369,14 @@ mod tests {
                     .content_str()
                     .is_some_and(|text| text.contains(&fork_file.display().to_string()))
             }));
+            assert!(fork.conversation().messages.iter().any(|message| matches!(
+                message,
+                Message::Assistant {
+                    content: Some(content),
+                    cut_short: Some(CutShort::Interrupted),
+                    ..
+                } if content == "kept reply"
+            )));
             history::delete_session(&parent_id).unwrap();
             assert_eq!(std::fs::read_to_string(fork_file).unwrap(), "full page");
         });
