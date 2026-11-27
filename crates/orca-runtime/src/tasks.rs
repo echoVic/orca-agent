@@ -5579,6 +5579,7 @@ impl TaskRegistry {
                 return Ok((None, false));
             };
 
+            record.registry_owner = self.owner_stamp();
             record.blocker = None;
             record.status = TaskStatus::Running;
             if record.started_at_ms.is_none() {
@@ -5939,6 +5940,7 @@ impl TaskRegistry {
                 return Err(task_state_error("request_resume", record.status));
             }
 
+            record.registry_owner = self.owner_stamp();
             record.blocker = None;
             record.status = TaskStatus::Running;
             if record.started_at_ms.is_none() {

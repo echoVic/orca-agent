@@ -10,6 +10,28 @@ fn open(root: &Path, session: &str) -> TaskRegistry {
 }
 
 #[test]
+fn resumed_task_is_protected_by_the_resuming_registry() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let creator = open(root, "creator");
+    let runner = open(root, "runner");
+    let task = creator.create_main_session("paused task".into());
+    creator.mark_running(&task.id).unwrap();
+    creator.request_pause(&task.id).unwrap();
+    drop(creator);
+    runner.request_resume(&task.id).unwrap();
+    assert_eq!(
+        open(root, "creator").get(&task.id).unwrap().status,
+        TaskStatus::Running
+    );
+    drop(runner);
+    assert_eq!(
+        open(root, "creator").get(&task.id).unwrap().status,
+        TaskStatus::Failed
+    );
+}
+
+#[test]
 fn cross_session_runner_protects_both_running_transitions_until_it_dies() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
