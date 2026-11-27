@@ -231,13 +231,14 @@ pub fn format_subagent_guidance(delegation: DelegationPolicy) -> String {
 
 {permission}
 - {exploration_rule}
-- Scope children to one subsystem or call chain and a few entry files, not repo-wide audits. Give each user-named independent branch its own child when capacity allows; do not bundle unrelated branches to reduce count.
+- Limit children to one subsystem or call chain and a few entry files, and do not bundle unrelated branches. Give each user-named independent branch its own child as capacity allows.
 - {context_rule}
-- Keep single-file work, small lookups, coupled changes, and live user input local.
+- Keep single-file work, small lookups, coupled edits, and user input local.
 - Continue non-overlapping work. Integrate exact evidence, including missing-file errors; do not repeat searches/reread cited files unless verifying a concrete inconsistency.
-- One launch per named branch: integrate complete/partial/failed/uncertain results and questions. Replace only for explicit exhaustive completion or a new independently bounded blocking question.
-- Stay in scope; stop when briefing costs exceed remaining work. Capacity is a ceiling, not a target/quota.
-Roles, tool ceilings, reports: see `subagent`."#
+- If only child results remain, end your reply. Orca resumes the turn as results arrive.
+- One launch per named branch. Integrate complete/partial/failed/uncertain results and questions. Replace only for explicit exhaustive completion or a new independently bounded blocking question.
+- Stop when briefing costs exceed remaining work. Capacity is a ceiling, not a target/quota.
+See `subagent` for roles, limits, and reports."#
     )
 }
 
@@ -550,6 +551,15 @@ mod tests {
             .unwrap();
         assert!(schema.contains("Only for a downstream machine"));
         assert!(schema.contains("omit for ordinary human-readable evidence reports"));
+    }
+
+    #[test]
+    fn delegation_guidance_allows_ending_a_reply_while_subagents_run() {
+        for policy in [DelegationPolicy::Adaptive, DelegationPolicy::Explicit] {
+            let guidance = format_subagent_guidance(policy);
+            assert!(guidance.contains("If only child results remain, end your reply"));
+            assert!(guidance.contains("Orca resumes the turn as results arrive"));
+        }
     }
 
     #[test]

@@ -3731,6 +3731,75 @@ while IFS= read -r line; do
     }
 
     #[test]
+    fn an_ended_reply_receives_each_child_result_as_it_arrives() {
+        use orca_core::event_schema::{EventEnvelope, EventType};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = config(SubagentConfig::default());
+        config.cwd = Some(cwd.path().into());
+        let mut thread = RuntimeThread::start(&config, "collect child results").unwrap();
+        let registry = thread.session().task_registry().clone();
+        let root = registry.create_main_session("root".into());
+        let [first, second] = ["first result", "second result"].map(|label| {
+            let child =
+                registry.create_subagent_with_parent(label.into(), None, Some(root.id.clone()));
+            registry.mark_running(&child.id).unwrap();
+            registry.mark_subagent_result_pending(&child.id);
+            child.id
+        });
+        let provider = serve_scripted_provider(
+            &mut config,
+            std::array::from_fn::<_, 3, _>(|_| scripted_reply()),
+        );
+        let (responses, observed) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                observed.recv_timeout(Duration::from_secs(5)).unwrap();
+                registry
+                    .complete(&first, "first child done".into())
+                    .unwrap();
+                let resumed = observed.recv_timeout(Duration::from_secs(2)).is_ok();
+                registry
+                    .complete(&second, "second child done".into())
+                    .unwrap();
+                resumed
+            });
+            let request = ThreadTurnRequest::new("collect child results")
+                .with_root_task_id(root.id)
+                .with_event_observer(Arc::new(move |event: &EventEnvelope| {
+                    if event.event_type == EventType::ModelResponseCompleted {
+                        let _ = responses.send(());
+                    }
+                    Ok(())
+                }));
+            assert_eq!(
+                thread.run_request(&config, &request, io::sink()).unwrap(),
+                RunStatus::Success
+            );
+            assert!(
+                worker.join().unwrap(),
+                "the first result waited for the second child"
+            );
+        });
+        let received = provider.join().unwrap();
+        assert!(
+            received[1]["messages"]
+                .to_string()
+                .contains("first child done")
+        );
+        assert!(
+            !received[1]["messages"]
+                .to_string()
+                .contains("second child done")
+        );
+        assert!(
+            received[2]["messages"]
+                .to_string()
+                .contains("second child done")
+        );
+    }
+
+    #[test]
     fn a_completion_during_a_turn_reaches_the_next_model_request() {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = config(SubagentConfig::default());

@@ -588,13 +588,14 @@ fn settle_children_before_return<W: io::Write>(
         .turn_context
         .task_id
         .as_deref()
-        .or(input.request.turn_context.root_task_id);
+        .or(input.request.turn_context.root_task_id)
+        .map(str::to_owned);
     let live_children = || -> io::Result<Vec<String>> {
         let records = registry.records_snapshot().map_err(io::Error::other)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         if let Some(task) = records.iter().find(|task| {
             task.task_type == orca_core::task_types::TaskType::Subagent
-                && task.parent_task_id.as_deref() == owner
+                && task.parent_task_id.as_deref() == owner.as_deref()
                 // An in-flight tool also fences replay until its checkpoint.
                 // Wait for its live worker before judging the terminal receipt.
                 && child_execution_is_indeterminate(task, now_ms)
@@ -609,12 +610,16 @@ fn settle_children_before_return<W: io::Write>(
             .filter(|task| {
                 task.task_type == orca_core::task_types::TaskType::Subagent
                     && task.status.is_active()
-                    && task.parent_task_id.as_deref() == owner
+                    && task.parent_task_id.as_deref() == owner.as_deref()
             })
             .map(|task| task.id.clone())
             .collect())
     };
     let children = live_children()?;
+    if deliver_loop_notices(input, false)? {
+        input.operation.refresh_child_budgets()?;
+        return Ok(true);
+    }
     let waited = !children.is_empty();
     if waited {
         if let Some(id) = input.request.turn_context.task_id.as_deref() {
@@ -625,7 +630,7 @@ fn settle_children_before_return<W: io::Write>(
                         tool_call_id: format!("finish-children:{id}"),
                         task_ids: children,
                         deadline_at_ms: i64::MAX,
-                        any: false,
+                        any: true,
                         state_change: false,
                         baseline: Vec::new(),
                         result: None,
@@ -638,7 +643,11 @@ fn settle_children_before_return<W: io::Write>(
             // The root holds no child execution lease. Keeping its operation
             // alive also keeps the durable parent fence valid for queued work.
             let scope = registry.execution_scope(&input.policy.config.subagents.limits);
-            while !live_children()?.is_empty() {
+            loop {
+                let still_live = live_children()?;
+                if children.iter().any(|id| !still_live.contains(id)) {
+                    break;
+                }
                 if input.loop_state.runtime.cancel.is_cancelled()
                     || input
                         .request
