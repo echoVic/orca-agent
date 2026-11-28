@@ -379,23 +379,6 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             return 1;
         }
     };
-    let prepared = match coordinator.prepared(&agent_id) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let mut message = continuation_error("failed to load async continuation", &error);
-            let worktree = finish_async_worker_worktree(worktree, owns_worktree);
-            append_worktree_outcome(&mut message, worktree.as_ref());
-            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
-            return 1;
-        }
-    };
-    if let Err(error) = restore_worker_agent(&mut config, &request, &prepared) {
-        let worktree = finish_async_worker_worktree(worktree, owns_worktree);
-        let mut error = error;
-        append_worktree_outcome(&mut error, worktree.as_ref());
-        let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, None);
-        return 1;
-    }
     let detached_binding = match task_registry.detached_subagent_binding(&agent_id) {
         Ok(Some(binding)) => binding,
         Ok(None) => {
@@ -419,6 +402,33 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             message.to_string(),
             None,
         );
+        return 1;
+    }
+    let prepared = match coordinator.prepared(&agent_id) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let mut message = continuation_error("failed to load async continuation", &error);
+            let worktree = finish_async_worker_worktree(worktree, owns_worktree);
+            append_worktree_outcome(&mut message, worktree.as_ref());
+            let message = match coordinator.fail_unstarted_worker(
+                &agent_id,
+                &detached_binding.attempt_id,
+                message.clone(),
+            ) {
+                Ok(projection) => append_projection_footer(message, Some(&projection)),
+                Err(error) => {
+                    format!("{message}\n\nfailed to commit async continuation terminal: {error}")
+                }
+            };
+            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
+            return 1;
+        }
+    };
+    if let Err(error) = restore_worker_agent(&mut config, &request, &prepared) {
+        let worktree = finish_async_worker_worktree(worktree, owns_worktree);
+        let mut error = error;
+        append_worktree_outcome(&mut error, worktree.as_ref());
+        let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, None);
         return 1;
     }
     let continuation_lease = match coordinator
@@ -1943,6 +1953,160 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolRequest, ToolStatus};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_worker_that_finds_damaged_history_leaves_the_child_resumable() {
+        use crate::child_agent_types::ChildAgentCheckpointObservation;
+        use crate::runtime_surface::{
+            Sha256Digest, SurfaceGenerationId, SurfaceOperationId, SurfaceThreadId,
+            ThreadOwnerEpoch,
+        };
+        use orca_core::conversation::{Conversation, ProviderForkPrefix};
+        use orca_core::task_types::TaskStatus;
+
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let session = uuid::Uuid::now_v7();
+        let registry = TaskRegistry::new_for_cwd(session.to_string(), cwd.path());
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let store = registry.continuation_store().unwrap();
+        let prefix = ProviderForkPrefix {
+            model: orca_core::model::PRO_MODEL.into(),
+            endpoint: "https://api.deepseek.com".into(),
+            reasoning_effort: ReasoningEffort::High,
+            messages: vec![r#"{"role":"user","content":"Earlier parent evidence"}"#.into()],
+            tools: vec![],
+            estimated_tokens: 10,
+            system_messages: vec![],
+            redacted: false,
+        };
+        let digest = store.store_fork_prefix(prefix.clone()).unwrap();
+        let initial_task = registry.create_subagent("Inspect".into(), Some("general".into()));
+        let child = coordinator
+            .create_with_fork(
+                CreateContinuationInput {
+                    continuation_id: None,
+                    parent_task_id: None,
+                    task_id: initial_task.id,
+                    prompt_id: AgentPromptId::new(),
+                    compatibility: ContinuationCompatibility {
+                        subagent_type: "general".into(),
+                        frozen_agent: None,
+                        model: Some(prefix.model.clone()),
+                        isolation: SubagentIsolation::None,
+                        effective_cwd: cwd.path().display().to_string(),
+                        worktree: None,
+                        compatibility_hash: Sha256Digest::new([5; 32]),
+                    },
+                },
+                Some(digest),
+            )
+            .unwrap();
+        let lease = coordinator.acquire(&child).unwrap();
+        let (observer, revision) =
+            build_checkpoint_observer(coordinator.clone(), lease.clone(), &child);
+        let mut conversation = Conversation::new();
+        conversation.add_user("Inspect the evidence.".into());
+        conversation.add_assistant(Some("Initial report.".into()), None, vec![]);
+        observer
+            .checkpoint(ChildAgentCheckpointObservation {
+                conversation: &conversation,
+                turn: 1,
+                usage: Default::default(),
+                last_tool_boundary: None,
+            })
+            .unwrap();
+        coordinator
+            .commit_terminal(
+                &lease,
+                *revision.lock().unwrap(),
+                AgentTerminal::Completed { result: None },
+            )
+            .unwrap();
+
+        let resume = || {
+            let task = registry.create_subagent("Continue".into(), Some("general".into()));
+            coordinator.prepare_resume(ResumeContinuationInput {
+                selector: child.continuation_id.to_string(),
+                parent_task_id: None,
+                task_id: task.id,
+                prompt_id: AgentPromptId::new(),
+                compatibility: child.compatibility.clone(),
+            })
+        };
+        let prepared = resume().unwrap();
+        let task_id = &prepared.latest_task_id;
+        let binding = registry
+            .register_detached_subagent_binding(
+                task_id,
+                task_id,
+                prepared.attempt_id.clone(),
+                TaskRevision::try_new(1).unwrap(),
+                Some(SurfaceOperationFence {
+                    thread_id: SurfaceThreadId::try_from_bytes(*session.as_bytes()).unwrap(),
+                    thread_owner_epoch: ThreadOwnerEpoch::new(1),
+                    operation_id: SurfaceOperationId::try_from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    )
+                    .unwrap(),
+                    generation_id: SurfaceGenerationId::new(1),
+                }),
+            )
+            .unwrap();
+        registry
+            .mark_worker_spawned(task_id, std::process::id())
+            .unwrap();
+        let prefix_dir = home
+            .path()
+            .join("task-sessions")
+            .join(session.to_string())
+            .join("fork-prefixes");
+        let mut entries = std::fs::read_dir(prefix_dir).unwrap();
+        std::fs::remove_file(entries.next().unwrap().unwrap().path()).unwrap();
+        assert!(entries.next().is_none());
+
+        let request = subagent::create_subagent_request(&ToolRequest {
+            id: "resume-damaged-fork".into(),
+            name: ToolName::Subagent,
+            action: ActionKind::Agent,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({"resume_from": child.continuation_id}).to_string(),
+            ),
+        });
+        let code = run_async_subagent_worker_with_executor(AsyncSubagentWorkerContext {
+            input: AsyncSubagentWorkerInput {
+                config: async_test_config(cwd.path().to_path_buf()),
+                cwd: cwd.path().to_path_buf(),
+                child_cwd: cwd.path().to_path_buf(),
+                task_session_id: session.to_string(),
+                agent_id: task_id.clone(),
+                request,
+                child_depth: 1,
+                worktree: None,
+                permission_response_public_key: binding.permission_response_public_key,
+                child_turn_id: TurnId::new(),
+                activity_start_precommitted: true,
+            },
+            child_executor: |_, _, _, _| panic!("child ran without its saved history"),
+        });
+        assert_eq!(code, 1);
+        let task = registry.settled_subagent_record(task_id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(
+            task.error
+                .unwrap()
+                .contains("referenced fork prefix is missing")
+        );
+        assert_eq!(store.store_fork_prefix(prefix).unwrap(), digest);
+
+        let retried = resume().expect("the repaired fork can be resumed");
+        assert_ne!(retried.attempt_id, prepared.attempt_id);
+        assert_eq!(retried.checkpoint, prepared.checkpoint);
+        assert_eq!(retried.fork_prefix, prepared.fork_prefix);
+        coordinator.acquire(&retried).unwrap();
+    }
 
     #[test]
     fn custom_agent_detached_worker_process_entry() {

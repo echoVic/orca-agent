@@ -3546,6 +3546,37 @@ impl ChildAgentCoordinator {
         Ok(ContinuationProjection::from(&committed))
     }
 
+    /// Settles a worker that could not load its saved history, using its
+    /// detached launch binding and the current record revision.
+    pub(crate) fn fail_unstarted_worker(
+        &self,
+        task_id: &str,
+        attempt_id: &AgentAttemptId,
+        error: String,
+    ) -> Result<ContinuationProjection, AgentContinuationError> {
+        let continuation_id = self.resolve_selector(task_id)?;
+        let record = self
+            .store
+            .load_record(&continuation_id)?
+            .ok_or(AgentContinuationError::NotFound)?;
+        if record.latest_task_id != task_id {
+            return Err(AgentContinuationError::TaskBindingMismatch {
+                expected: record.latest_task_id,
+                actual: task_id.to_owned(),
+            });
+        }
+        if &record.current_attempt.attempt_id != attempt_id {
+            return Err(AgentContinuationError::AttemptMismatch {
+                expected: record.current_attempt.attempt_id,
+                actual: attempt_id.clone(),
+            });
+        }
+        self.commit_prepared_terminal(
+            &PreparedContinuation::from(&record),
+            AgentTerminal::Failed { error },
+        )
+    }
+
     /// Renews a live attempt lease under the same identity, epoch, and revision
     /// fence used by checkpoint and terminal commits. The returned projection
     /// carries the next revision that the owner must use for its next write.
