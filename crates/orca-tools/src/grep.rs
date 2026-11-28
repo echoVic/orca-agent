@@ -11,7 +11,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use memchr::memchr;
-use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
+use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind};
 use orca_platform::fs::{DirectoryEntryKind, VerifiedDirectory};
 use rayon::prelude::*;
 use regex::bytes::Regex;
@@ -516,7 +516,6 @@ fn search_file(
         page.total_lines,
         page.lines.len(),
         page.retained_bytes,
-        page.selection_truncated,
         page.skipped_lines,
     );
     let mut reader = BufReader::with_capacity(32 * 1024, file);
@@ -550,13 +549,7 @@ fn search_file(
     let binary_match =
         explicit && matches!(read, Ok(ScanEnd::Binary)) && page.total_lines > saved.0;
     if !matches!(read, Ok(ScanEnd::Text)) {
-        (
-            page.total_lines,
-            _,
-            page.retained_bytes,
-            page.selection_truncated,
-            page.skipped_lines,
-        ) = saved;
+        (page.total_lines, _, page.retained_bytes, page.skipped_lines) = saved;
         page.lines.truncate(saved.1);
     }
     if binary_match {
@@ -736,7 +729,10 @@ fn render_search(
     let (mut output, truncated) = if no_matches {
         ("(no matches)".to_string(), false)
     } else {
-        collector.render(max_bytes)
+        match collector.render(max_bytes) {
+            Ok(page) => page,
+            Err(error) => return ToolResult::failed(request, error, None),
+        }
     };
     if skipped_lines > 0 {
         output.push_str(&format!(
@@ -779,7 +775,6 @@ struct GrepPageCollector {
     retained_bytes: usize,
     retained_budget: usize,
     lines: Vec<StoredLine>,
-    selection_truncated: bool,
     skipped_lines: usize,
 }
 
@@ -797,7 +792,6 @@ impl GrepPageCollector {
             retained_bytes: 0,
             retained_budget,
             lines: Vec::new(),
-            selection_truncated: false,
             skipped_lines: 0,
         }
     }
@@ -841,7 +835,6 @@ impl GrepPageCollector {
     fn retain(&mut self, line: StoredLine) {
         let separator = usize::from(!self.lines.is_empty());
         if self.retained_bytes.saturating_add(separator) >= self.retained_budget {
-            self.selection_truncated = true;
             return;
         }
         self.retained_bytes += separator + line.text.len();
@@ -854,61 +847,55 @@ impl GrepPageCollector {
             .limit
             .saturating_sub(self.total_lines)
             .min(page.total_lines);
-        self.selection_truncated |= selected > page.lines.len();
         self.total_lines = self.total_lines.saturating_add(page.total_lines);
         self.skipped_lines += page.skipped_lines;
         for line in page.lines.into_iter().take(selected) {
             self.retain(line);
         }
     }
-    fn render(self, max_bytes: usize) -> (String, bool) {
-        let next_offset = (self.total_lines.saturating_sub(self.offset) > self.limit)
-            .then_some(self.offset.saturating_add(self.limit));
-        let notice = next_offset.map(|next_offset| {
-            if self.offset == 0 {
-                format!(
-                    "[Showing first {} results; use offset={next_offset} to continue]",
-                    self.limit
-                )
-            } else {
-                let end = next_offset.min(self.total_lines);
-                format!(
-                    "[Showing results {}-{end} of {}; use offset={next_offset} to continue]",
-                    self.offset + 1,
-                    self.total_lines
-                )
+    fn render(mut self, max_bytes: usize) -> Result<(String, bool), &'static str> {
+        let remaining = self.total_lines.saturating_sub(self.offset);
+        if remaining == 0 {
+            return Ok((String::new(), false));
+        }
+        let notice = loop {
+            let shown = self.lines.len();
+            if shown == 0 {
+                return Err("grep output budget is too small to show a result");
             }
-        });
-        let available = max_bytes.saturating_sub(notice.as_ref().map_or(0, |text| text.len() + 1));
-        let mut output = String::new();
-        let mut truncated = self.selection_truncated;
+            let notice = (shown < remaining).then(|| {
+                let next_offset = self.offset + shown;
+                if self.offset == 0 {
+                    format!("[Showing first {shown} results; use offset={next_offset} to continue]")
+                } else {
+                    format!(
+                        "[Showing results {}-{next_offset} of {}; use offset={next_offset} to continue]",
+                        self.offset + 1,
+                        self.total_lines,
+                    )
+                }
+            });
+            let notice_bytes = notice.as_ref().map_or(0, |text| text.len() + 1);
+            if self.retained_bytes.saturating_add(notice_bytes) <= max_bytes {
+                break notice;
+            }
+            let removed = self.lines.pop().expect("there is a record to remove");
+            self.retained_bytes -= removed.text.len() + usize::from(!self.lines.is_empty());
+        };
+        let truncated = self.lines.len() < remaining.min(self.limit)
+            || self.lines.iter().any(|line| line.truncated);
+        let mut output = String::with_capacity(self.retained_bytes);
         for line in self.lines {
-            let separator = usize::from(!output.is_empty());
-            let remaining = available.saturating_sub(output.len() + separator);
-            if remaining == 0 {
-                truncated = true;
-                break;
-            }
-            let (text, shortened) = truncate_output(line.text, remaining);
             if !output.is_empty() {
                 output.push('\n');
             }
-            output.push_str(&text);
-            truncated |= line.truncated || shortened;
-            if shortened {
-                break;
-            }
+            output.push_str(&line.text);
         }
         if let Some(notice) = notice {
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            let (notice, shortened) =
-                truncate_output(notice, max_bytes.saturating_sub(output.len()));
-            truncated |= shortened;
+            output.push('\n');
             output.push_str(&notice);
         }
-        (output, truncated)
+        Ok((output, truncated))
     }
 }
 
@@ -1016,14 +1003,58 @@ mod tests {
     }
 
     #[test]
-    fn grep_compacts_records_once_across_chunk_and_batch_boundaries() {
+    fn grep_continues_at_the_first_match_cut_by_the_byte_budget() {
+        let workspace = crate::workspace_tempdir().unwrap();
+        let cwd = workspace.path();
+        fs::write(
+            cwd.join("notes.txt"),
+            "needle 1\nneedle 2\nneedle 3\nneedle 4\n",
+        )
+        .unwrap();
+        let first = execute(
+            &grep_request(r#"{"pattern":"needle","path":"notes.txt","head_limit":3}"#),
+            cwd,
+            80,
+        );
+        assert_eq!(
+            first.output.as_deref(),
+            Some("notes.txt:1:needle 1\n[Showing first 1 results; use offset=1 to continue]"),
+        );
+        let second = execute(
+            &grep_request(r#"{"pattern":"needle","path":"notes.txt","offset":1}"#),
+            cwd,
+            80,
+        );
+        assert_eq!(
+            second.output.as_deref(),
+            Some("notes.txt:2:needle 2\nnotes.txt:3:needle 3\nnotes.txt:4:needle 4"),
+        );
+    }
+
+    #[test]
+    fn grep_reports_a_budget_too_small_to_show_a_match() {
+        let workspace = crate::workspace_tempdir().unwrap();
+        fs::write(workspace.path().join("notes.txt"), "needle\n").unwrap();
+        let result = execute(
+            &grep_request(r#"{"pattern":"needle"}"#),
+            workspace.path(),
+            8,
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some("grep output budget is too small to show a result")
+        );
+    }
+
+    #[test]
+    fn grep_paginates_without_skipping_matches_across_chunk_and_batch_boundaries() {
         for boundary in [16, 128] {
             let workspace = crate::workspace_tempdir().unwrap();
-            let first = format!("needle{}", "a".repeat(47));
+            let first = "needle first";
             let second = format!("needle{}", "b".repeat(120));
             for index in 0..=boundary {
                 let content = match index {
-                    0 => first.as_str(),
+                    0 => first,
                     index if index == boundary => second.as_str(),
                     _ => "miss",
                 };
@@ -1031,11 +1062,16 @@ mod tests {
             }
             let request = grep_request(r#"{"pattern":"needle","head_limit":2}"#);
             let result = execute(&request, workspace.path(), 100);
-            let expected = format!(
-                "000.txt:1:{first}\n{boundary:03}.txt:1:needle{}",
-                "b".repeat(20)
+            assert_eq!(
+                result.output.as_deref(),
+                Some("000.txt:1:needle first\n[Showing first 1 results; use offset=1 to continue]"),
             );
-            assert_eq!(result.output.as_deref(), Some(expected.as_str()));
+            let next = grep_request(r#"{"pattern":"needle","offset":1}"#);
+            let next_page = execute(&next, workspace.path(), 200);
+            assert_eq!(
+                next_page.output.as_deref(),
+                Some(format!("{boundary:03}.txt:1:{second}").as_str()),
+            );
         }
     }
 
