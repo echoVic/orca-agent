@@ -1343,10 +1343,12 @@ fn render_session_picker(frame: &mut Frame, state: &mut AppState, theme: &Theme)
                     )
                 };
                 if session.health != StoredSessionHealth::Healthy {
-                    line.spans.push(Span::styled(
-                        format!("  [{:?}]", session.health),
-                        Style::default().fg(theme.error),
-                    ));
+                    let label = match session.health {
+                        StoredSessionHealth::NewerVersion => "  [Newer version]".to_string(),
+                        health => format!("  [{health:?}]"),
+                    };
+                    line.spans
+                        .push(Span::styled(label, Style::default().fg(theme.error)));
                 }
                 lines.push(line);
 
@@ -3576,7 +3578,9 @@ fn leading_blank(previous: Option<&ChatMessage>, message: &ChatMessage) -> bool 
                 | ChatMessage::Reasoning { .. }
                 | ChatMessage::User(_)
         ),
-        ChatMessage::Reasoning { .. } | ChatMessage::Image(_) => false,
+        ChatMessage::Reasoning { .. }
+        | ChatMessage::Image(_)
+        | ChatMessage::AssistantCutShort(_) => false,
     }
 }
 
@@ -3704,7 +3708,8 @@ fn append_message_lines(
         } => {
             let neutral_completed =
                 status == "completed" && matches!(kind.as_deref(), Some("empty" | "no_matches"));
-            let is_edit = diff.is_some() || matches!(name.as_str(), "edit" | "write_file");
+            let is_edit =
+                diff.is_some() || matches!(name.as_str(), "edit" | "write_file" | "apply_patch");
             let icon = match status.as_str() {
                 "completed" if is_edit => "✎",
                 "completed" => "✓",
@@ -3818,6 +3823,16 @@ fn append_message_lines(
                 &TuiDiagnostic::from_message(DiagnosticContext::Runtime, text),
                 theme,
             );
+        }
+        ChatMessage::AssistantCutShort(reason) => {
+            let marker = match reason {
+                orca_core::conversation::CutShort::Interrupted => "(interrupted)",
+                orca_core::conversation::CutShort::OutputLimit => "(stopped at the output limit)",
+            };
+            lines.push(Line::from(vec![
+                Span::raw(GUTTER_CONTINUATION),
+                Span::styled(marker, theme.dim_style()),
+            ]));
         }
         ChatMessage::Diagnostic(diagnostic) => {
             append_diagnostic_lines(lines, diagnostic, theme);
@@ -5289,6 +5304,27 @@ fn workspace_status_spans(
 }
 
 fn status_line(state: &AppState, theme: &Theme, width: usize) -> Line<'static> {
+    if let Some(retry) = state
+        .provider_retry
+        .as_ref()
+        .or_else(|| state.workflow_provider_retries.values().next_back())
+    {
+        let reason: String = retry
+            .reason
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        let status = format!(
+            " Retrying in {}s (attempt {} of {}): {reason}",
+            retry.delay_ms.div_ceil(1000),
+            retry.attempt,
+            retry.max_attempts
+        );
+        return Line::from(Span::styled(
+            crate::display_text::truncate_to_display_width(&status, width),
+            Style::default().fg(theme.warning),
+        ));
+    }
     let separator = " · ";
     // Left zone: mode chip (or side-conversation label) plus vim mode.
     let mut left: Vec<Span<'static>> = vec![Span::raw(" ")];
@@ -10356,6 +10392,41 @@ mod tests {
     }
 
     #[test]
+    fn apply_patch_renders_the_diff_and_status_of_a_partial_result() {
+        use orca_core::approval_types::ActionKind;
+        use orca_core::tool_types::{ToolName, ToolRequest};
+        let workspace = tempfile::tempdir().unwrap();
+        let request = ToolRequest {
+            id: "patch".into(),
+            name: ToolName::ApplyPatch,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(serde_json::json!({"input": "*** Begin Patch\n*** Add File: first.txt\n+hello\n*** Add File: second.txt\n+world\n*** Add File: last.txt\n+later\n*** End Patch"}).to_string()),
+        };
+        let patch = orca_tools::apply_patch::prepare(&request, workspace.path(), || false).unwrap();
+        std::fs::write(workspace.path().join("second.txt"), "existing\n").unwrap();
+        let result = patch.commit(&request, || false);
+        let message = ChatMessage::ToolCall {
+            id: result.id.clone(),
+            name: result.name.as_str().into(),
+            target: None,
+            status: "failed".into(),
+            output: result.output.clone(),
+            diff: result
+                .file_change_preview
+                .as_ref()
+                .map(|preview| preview.display_text()),
+            kind: None,
+            expanded: true,
+        };
+        let text = message_text(None, &message).join("\n");
+        assert!(text.contains("Failed: second.txt"), "{text}");
+        assert!(text.contains("Not attempted: last.txt"), "{text}");
+        assert!(text.contains("+++ b/first.txt"), "{text}");
+        assert!(!text.contains("+++ b/second.txt"), "{text}");
+    }
+
+    #[test]
     fn blocked_terminal_diagnostics_render_question_on_its_own_line() {
         let terminal = orca_runtime::surface::OperationTerminal::Blocked {
             blocker: orca_core::goal_runtime::BlockerSummary {
@@ -12823,6 +12894,67 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn a_cancel_during_backoff_clears_the_retry_status() {
+        let mut state = test_state();
+        let retry = orca_core::provider_types::ProviderRetry {
+            attempt: 1,
+            max_attempts: 5,
+            delay_ms: 1_500,
+            kind: orca_core::provider_types::ProviderErrorKind::Server,
+            reason: "provider is busy".into(),
+        };
+        state.update(crate::protocol::TuiEvent::ProviderRetry(Some(
+            retry.clone(),
+        )));
+        assert!(
+            status_text(&state, 120).contains("Retrying in 2s (attempt 1 of 5): provider is busy")
+        );
+        state.update(crate::protocol::TuiEvent::ProviderRetry(None));
+        assert!(!status_text(&state, 120).contains("Retrying"));
+        state.update(crate::protocol::TuiEvent::ProviderRetry(Some(retry)));
+        state.update(crate::protocol::TuiEvent::SessionCompleted {
+            status: "cancelled".into(),
+        });
+        assert!(!status_text(&state, 120).contains("Retrying"));
+    }
+
+    #[test]
+    fn workflow_retry_display_survives_launch_and_other_operations_finishing() {
+        use orca_core::provider_types::{ProviderErrorKind, ProviderRetry};
+        use orca_runtime::surface::SurfaceOperationId;
+        let mut state = test_state();
+        let first = SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let second = SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let retry = |reason: &str| ProviderRetry {
+            attempt: 1,
+            max_attempts: 5,
+            delay_ms: 1000,
+            kind: ProviderErrorKind::Server,
+            reason: reason.to_owned(),
+        };
+        let workflow =
+            |id: &SurfaceOperationId, retry| crate::protocol::TuiEvent::WorkflowProviderRetry {
+                operation_id: id.clone(),
+                retry,
+            };
+        state.update(workflow(&first, Some(retry("first workflow"))));
+        state.update(crate::protocol::TuiEvent::SessionCompleted {
+            status: "success".into(),
+        });
+        assert!(status_text(&state, 120).contains("first workflow"));
+        state.update(workflow(&second, Some(retry("second workflow"))));
+        state.update(crate::protocol::TuiEvent::ProviderRetry(Some(retry(
+            "foreground",
+        ))));
+        state.update(workflow(&second, None));
+        assert!(status_text(&state, 120).contains("foreground"));
+        state.update(crate::protocol::TuiEvent::ProviderRetry(None));
+        assert!(status_text(&state, 120).contains("first workflow"));
+        state.update(workflow(&first, None));
+        assert!(!status_text(&state, 120).contains("Retrying"));
     }
 
     #[test]

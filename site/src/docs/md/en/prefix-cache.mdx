@@ -19,6 +19,20 @@ Custom-agent definitions are fixed at the session's first turn. Later edits in
 `.orca/agents/` or the user agent directory do not change the catalog or
 instructions used by that session; start a new session to use the edit.
 
+## Context across requests and restarts
+
+Orca records a context update when its text changes. The date, working mode,
+goal, skills, recalled memory, and on-demand MCP catalog can then be reused as
+part of the history on later DeepSeek requests. The current plan stays at the
+end of each request.
+
+Resuming or forking a recorded session reuses its original system prompt.
+Orca appends a notice for every section whose text differs or was removed. A
+worktree fork can report both the working directory and the paths named in the
+project instructions. Orca rebuilds the prompt when instruction sources stop
+applying or the recorded prompt cannot be replayed. Compaction can fold the
+updated sections into a new leading prompt.
+
 ## Observe provider-reported usage
 
 When the provider returns cache-token usage, Orca includes it in
@@ -51,8 +65,9 @@ mean the task should be replayed.
 
 ## Compaction
 
-Context compaction changes the material sent on later turns and can therefore
-change cache behavior. Observe context.compaction.started and
-context.compacted in a JSONL stream when diagnosing a shift. Those events
-describe prompt management; the recorded conversation and terminal tool events
-remain the source of truth for recovery.
+Deep compaction's checkpoint request replays the existing prefix on the same
+model. Most of the replayed input can be billed at cache-hit rates when the
+prefix is still cached. Look for `purpose: "replay"` under
+`context.compacted.payload.observation.summary_requests` to see the provider's
+reported cache tokens for that request. Once Orca installs the checkpoint, the
+next ordinary turn starts from a changed prefix. See [Context and Compaction](#context-window).

@@ -7,8 +7,9 @@ use serde_json::Value;
 
 use crate::connection_stop::McpConnectionStop;
 use crate::legacy_sse::MCP_SSE_EVENT_STREAM_CLOSED;
+use crate::registry::{McpToolListing, list_transport_tools};
 use crate::transport::{self, McpElicitationHandler, McpTransport};
-use orca_core::mcp_types::{McpServerConfig, McpTransportKind};
+use orca_core::mcp_types::{McpServerConfig, McpToolLoading, McpToolRef, McpTransportKind};
 
 // `McpCallOutput` lives with the registry that returns it. This keeps its old
 // path, `orca_mcp::client::McpCallOutput`, which `orca-tools` names.
@@ -20,6 +21,8 @@ pub(crate) struct McpClient {
     /// Where a reconnect looks for a stored OAuth login.
     pub(crate) credentials_path: Option<PathBuf>,
     pub(crate) capabilities: McpServerCapabilities,
+    pub(crate) instructions: Mutex<Option<String>>,
+    pub(crate) reconnected_tools: Mutex<Option<McpToolListing>>,
     /// Stops its server, through whichever transport it has.
     pub(crate) stop: Arc<McpConnectionStop>,
     /// Why a reconnect of a stdio server failed, unless one has connected
@@ -36,6 +39,14 @@ pub(crate) struct McpClient {
 pub(crate) struct McpServerCapabilities {
     pub(crate) resources: bool,
     pub(crate) prompts: bool,
+}
+
+pub(crate) fn instructions_from_initialize_result(value: &Value) -> Option<String> {
+    value
+        .get("instructions")?
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_owned)
 }
 
 impl McpServerCapabilities {
@@ -115,31 +126,50 @@ pub(crate) enum ReconnectFailure {
     Failed(String),
 }
 
+struct ReconnectedServer {
+    transport: Arc<dyn McpTransport>,
+    instructions: Option<String>,
+    tools: Option<McpToolListing>,
+}
+
 impl McpClient {
+    pub(crate) fn instructions(&self) -> Option<String> {
+        self.instructions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn withdraw_instructions(&self) {
+        self.instructions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+
     /// Calls the tool `name`. A failed call is never sent again, but a
     /// failure that stopped the server connects it again first, as
     /// [`Self::request`] does, so that the next call can go through.
     pub(crate) fn call_tool(
         &self,
-        name: &str,
+        tool: &McpToolRef,
         arguments: Value,
         elicitation_handler: Option<&dyn McpElicitationHandler>,
         should_cancel: Option<&dyn Fn() -> bool>,
     ) -> Result<Value, String> {
         self.request_or_cancel(
             should_cancel.unwrap_or(&|| false),
-            |transport| match should_cancel {
-                Some(should_cancel) => transport.call_tool_with_elicitation_handler_or_cancel(
-                    name,
+            |transport| {
+                let generation = transport.session_generation();
+                if generation != 0 && tool.session_generation != Some(generation) {
+                    return Err(format!("MCP server '{}' changed its tools. Review its current tools and submit the tool call again.", self.server_name));
+                }
+                transport.call_tool_with_elicitation_handler_or_cancel(
+                    &tool.tool,
                     arguments,
                     elicitation_handler,
-                    should_cancel,
-                ),
-                None => transport.call_tool_with_elicitation_handler(
-                    name,
-                    arguments,
-                    elicitation_handler,
-                ),
+                    should_cancel.unwrap_or(&|| false),
+                )
             },
         )
         .map_err(|error| error.to_string())
@@ -222,12 +252,30 @@ impl McpClient {
             if should_cancel() {
                 return Err(McpRequestError::Cancelled);
             }
+            let generation = transport.session_generation();
             let result = request(transport.as_ref());
+            if transport.session_generation() != generation {
+                let tools = list_transport_tools(
+                    &self.config,
+                    &self.server_name,
+                    transport.as_ref(),
+                    &|| false,
+                )
+                .unwrap_or_else(|error| McpToolListing::unavailable(&self.server_name, error));
+                *self
+                    .reconnected_tools
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(tools);
+            }
             // The transport the request failed on, and whether it closed
             // itself.
-            let failed = result
-                .is_err()
-                .then(|| (Arc::clone(&*transport), transport.is_closed()));
+            let failed = result.is_err().then(|| {
+                let closed = transport.is_closed();
+                if closed {
+                    self.withdraw_instructions();
+                }
+                (Arc::clone(&*transport), closed)
+            });
             (result, failed)
         };
         match (result, failed) {
@@ -345,11 +393,13 @@ impl McpClient {
             if !Arc::ptr_eq(&current, failed) {
                 return Ok(Reconnected::AlreadyReplaced);
             }
+            self.withdraw_instructions();
             current.terminate();
             let began = Instant::now();
-            *current = self
+            let connected = self
                 .connect(&config, should_cancel)
                 .map_err(|error| failure(Some(began), error))?;
+            self.replace_connection(&mut current, connected);
         } else {
             if !Arc::ptr_eq(
                 &*self
@@ -360,7 +410,7 @@ impl McpClient {
                 return Ok(Reconnected::AlreadyReplaced);
             }
             let began = Instant::now();
-            let transport = self
+            let connected = self
                 .connect(&config, should_cancel)
                 .map_err(|error| failure(Some(began), error))?;
             let mut current = self
@@ -369,9 +419,32 @@ impl McpClient {
             if !Arc::ptr_eq(&current, failed) {
                 return Ok(Reconnected::AlreadyReplaced);
             }
-            *current = transport;
+            self.replace_connection(&mut current, connected);
         }
         Ok(Reconnected::Replaced)
+    }
+
+    fn replace_connection(
+        &self,
+        current: &mut Arc<dyn McpTransport>,
+        connected: ReconnectedServer,
+    ) {
+        *current = connected.transport;
+        *self
+            .instructions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = connected.instructions;
+        *self
+            .reconnected_tools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = connected.tools;
+    }
+
+    pub(crate) fn take_reconnected_tools(&self) -> Option<McpToolListing> {
+        self.reconnected_tools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// Keeps the stdio reconnect failure record in step with `outcome`:
@@ -409,13 +482,29 @@ impl McpClient {
         &self,
         config: &McpServerConfig,
         should_cancel: &dyn Fn() -> bool,
-    ) -> Result<Arc<dyn McpTransport>, String> {
+    ) -> Result<ReconnectedServer, String> {
         let transport = self.stop.start(&self.server_name, || {
             transport::connect_with_credentials(config, self.credentials_path.clone())
         })?;
-        transport.initialize_or_cancel(should_cancel)?;
-        let _ = transport.list_tools_or_cancel(None, should_cancel)?;
-        Ok(transport)
+        let initialize_result = transport.initialize_or_cancel(should_cancel)?;
+        let tools = if config.tool_loading == McpToolLoading::OnDemand
+            || transport.session_generation() != 0
+        {
+            Some(list_transport_tools(
+                config,
+                &self.server_name,
+                transport.as_ref(),
+                should_cancel,
+            )?)
+        } else {
+            let _ = transport.list_tools_or_cancel(None, should_cancel)?;
+            None
+        };
+        Ok(ReconnectedServer {
+            transport,
+            instructions: instructions_from_initialize_result(&initialize_result),
+            tools,
+        })
     }
 
     pub(crate) fn lock_transport(&self) -> Result<MutexGuard<'_, Arc<dyn McpTransport>>, String> {

@@ -197,6 +197,33 @@ question, and an MCP server's request for input is declined. The subagent is
 told at its start to say in its reply what it could not do, so the main
 agent, which can ask, may do it.
 
+### Starting from parent history
+
+`context` accepts `fresh` (the default) or `fork`. A fresh child starts with its
+own system prompt and a standalone brief. Use `"context": "fork"` when the
+child needs evidence from earlier turns of the parent conversation.
+
+A fork starts with the parent's DeepSeek system prompt, ordered tools, and
+completed history. Orca excludes the current turn and appends the task and
+role instructions as a user message. The child sends only changes to context
+fragments that the inherited history already contains. The parent's plan,
+MCP instructions, and request-only context after the cut stay with the parent. The child uses the
+parent's model and reasoning effort, so omit `model`. The inherited catalog
+can show tools outside the child's role. Orca returns the role's refusal to
+the child so it can continue. The child's transcript and result begin with
+its own task.
+
+If Orca has no completed parent turn or cannot recover its request prefix, it
+starts a fresh child and includes a note. A fork requires a compatible parent
+DeepSeek model and endpoint. Use `resume_from` by itself to continue an existing
+child. Sibling forks in the same session share one saved copy of the prefix.
+Orca keeps a private, redacted copy for queued launches and resumption. A
+child started in the parent's process uses the original captured request. If
+an inherited instruction source loses trust, the child continues from its own
+history with a rebuilt prompt. In Orca
+0.5.25, a fork child resumes from its own transcript without the inherited
+history. A newer build can restore the saved prefix again after upgrading.
+
 ## Scheduling And Capacity
 
 Direct, nested, Workflow, hosted, continued, and recovered children share one
@@ -219,6 +246,11 @@ bounds work waiting to start; `max_live_tasks` bounds all non-terminal
 descendants, including parents that released their execution lease while
 waiting for children. A waiting parent must re-enter the fair queue before it
 can continue.
+
+A steer from the user ends the parent's `task_wait` or end-of-turn child wait
+so the parent can handle it on the next model step. The parent can wait again
+afterward. When only child results remain, the parent can end its reply and
+Orca resumes the turn as those results arrive.
 
 The retired `max_parallel` key is ignored. Use `delegation = "off"` to disable
 new child submission.

@@ -35,6 +35,52 @@ mod windows_shell_prompt_contract_tests {
         assert!(bash.tool.description().contains("resolved host shell"));
         assert!(!bash.tool.description().contains("via sh -c"));
     }
+
+    #[test]
+    fn the_bash_description_has_the_guidance_and_no_stray_spaces() {
+        let registry = default_tool_registry();
+        let description = registry.get("bash").unwrap().description();
+        assert!(description.contains("system from process start"));
+        assert!(!description.contains("  "));
+        for guidance in [
+            "Each call starts a fresh shell",
+            "`workdir` instead of `cd`",
+            "A sandbox block is a policy decision",
+            "report it or ask",
+            "do not retry another way",
+            "${VAR:?}",
+            "delete or overwrite paths",
+        ] {
+            assert!(description.contains(guidance), "missing {guidance}");
+        }
+    }
+
+    #[test]
+    fn the_edit_description_says_to_read_first() {
+        let registry = default_tool_registry();
+        let description = registry.get("edit").unwrap().description();
+        assert!(description.contains("Read the file first"));
+        assert!(description.contains("unless you just created or edited it in this session"));
+    }
+
+    #[test]
+    fn the_read_file_description_prefers_it_over_shell() {
+        let registry = default_tool_registry();
+        let description = registry.get("read_file").unwrap().description();
+        assert!(
+            description.contains("Use this instead of `cat`, `head`, `tail` or `sed` through bash")
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn apply_patch_catalog_describes_partial_commit_results() {
+    let registry = tool_registry_for_session(None, &[], true);
+    let tool = registry.resolve("apply_patch").expect("apply_patch tool");
+    let description = tool.tool.description();
+    assert!(description.contains("preflight"));
+    assert!(description.contains("Written") && description.contains("Partially written"));
 }
 
 #[allow(dead_code)]
@@ -67,6 +113,7 @@ pub trait Tool: Send + Sync {
 
 pub struct ToolContext<'a> {
     pub cwd: &'a Path,
+    spill_dir: Option<&'a Path>,
     pub output_truncation: ToolOutputTruncation,
     /// How long an external tool may run; `None` sets no limit.
     pub shell_timeout: Option<Duration>,
@@ -85,6 +132,7 @@ impl<'a> ToolContext<'a> {
     pub fn new(cwd: &'a Path) -> Self {
         Self {
             cwd,
+            spill_dir: None,
             output_truncation: ToolOutputTruncation::bytes(MAX_TOOL_OUTPUT_BYTES),
             shell_timeout: Some(Duration::from_secs(120)),
             additional_working_directories: Vec::new(),
@@ -94,6 +142,11 @@ impl<'a> ToolContext<'a> {
             execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             deepseek_web: None,
         }
+    }
+
+    pub fn with_spill_directory(mut self, directory: Option<&'a Path>) -> Self {
+        self.spill_dir = directory;
+        self
     }
 
     pub fn with_deepseek_web(mut self, deepseek_web: Option<DeepSeekWebAccess>) -> Self {
@@ -212,7 +265,7 @@ impl ToolRegistry {
             return Some(ResolvedTool {
                 tool,
                 spec: tool.spec(),
-                requested_name: ToolName::from_str(name)?,
+                requested_name: tool.spec().name.clone(),
             });
         }
         let idx = self.aliases.get(name)?;
@@ -253,7 +306,11 @@ impl ToolRegistry {
                 format!("tool arguments failed schema validation: {error}"),
             );
         }
-        resolved.tool.execute(request, ctx)
+        let mut result = resolved.tool.execute(request, ctx);
+        if crate::tool_uses_mcp_registry(&resolved.spec.name) {
+            crate::spill::shorten_result(&mut result, ctx.spill_dir);
+        }
+        result
     }
 }
 
@@ -450,7 +507,7 @@ fn value_type(value: &Value) -> &'static str {
 
 static DEFAULT_REGISTRY: LazyLock<ToolRegistry> = LazyLock::new(|| {
     let mut registry = ToolRegistry::new();
-    register_builtin_tools(&mut registry);
+    register_builtin_tools(&mut registry, false);
     registry
 });
 
@@ -462,24 +519,39 @@ pub fn tool_registry_with_mcp_and_external(
     mcp_registry: Option<&McpRegistry>,
     external_tools: &[ExternalToolConfig],
 ) -> ToolRegistry {
+    tool_registry_for_session(mcp_registry, external_tools, false)
+}
+
+pub fn tool_registry_for_session(
+    mcp_registry: Option<&McpRegistry>,
+    external_tools: &[ExternalToolConfig],
+    apply_patch: bool,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    register_builtin_tools(&mut registry);
+    register_builtin_tools(&mut registry, apply_patch);
     for tool in external_tools {
         registry.register(ExternalTool::new(tool.clone()));
     }
     if let Some(mcp_registry) = mcp_registry {
-        for tool in mcp_registry.tools() {
-            registry.register(McpProxyTool::new(tool));
+        for (server, name) in mcp_registry.on_demand_loaders() {
+            registry.register(McpLoadTools::new(server, name));
+        }
+        for (tool, deferred) in mcp_registry.agent_tools() {
+            let mut proxy = McpProxyTool::new(tool);
+            if deferred {
+                proxy.spec.exposure = ToolExposure::Deferred;
+            }
+            registry.register(proxy);
         }
     }
     registry
 }
 
-fn register_builtin_tools(registry: &mut ToolRegistry) {
+fn register_builtin_tools(registry: &mut ToolRegistry, apply_patch: bool) {
     registry.register(BuiltinTool::new(
         safe_local_read_builtin_spec(
             "read_file",
-            "Read the contents of a file at the given path relative to workspace root.",
+            "Read a file relative to the workspace root. Use this instead of `cat`, `head`, `tail` or `sed` through bash.",
             json!({
                 "type": "object",
                 "properties": {
@@ -490,12 +562,17 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                     "offset": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "1-based line number to start reading from. Use for large files."
+                        "description": "1-based line or byte."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Number of lines to read. Use with offset for large files."
+                        "description": "Line or byte count."
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["bytes"],
+                        "description": "Lines unless set for a saved result's absolute path."
                     }
                 },
                 "required": ["path"],
@@ -610,12 +687,13 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         cooperative_builtin_spec(
             "bash",
-            "Start one shell command. The command is owned by the runtime task system from              process start: this call waits at most `yield_time_ms` and then returns, and a \
-             command that is still running keeps running. Use `task_read_output` to read more, \
-             `task_send_input` to type into a pty, `task_wait` to block on completion, and \
-             `task_stop` to stop it. The command runs in the resolved host shell named in the \
-             environment section, so use that shell's syntax rather than assuming a POSIX \
-             shell from the tool name. This is the only command entry point.",
+            "Start a command in the resolved host shell named in the environment. Use its syntax. \
+             The command is owned by the runtime task system from process start and can outlast `yield_time_ms`. \
+             Use `task_read_output` for more output, `task_send_input` for pty input, `task_wait` to wait, \
+             and `task_stop` to stop. This is the only command entry point. \
+             Each call starts a fresh shell. Set `workdir` instead of `cd`. \
+             A sandbox block is a policy decision. If blocked, report it or ask, and do not retry another way. \
+             In POSIX shells, guard variables with `${VAR:?}` when commands delete or overwrite paths built from them.",
             json!({
                 "type": "object",
                 "properties": {
@@ -668,7 +746,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "edit",
-            "Edit a file by replacing exact text. The old_text must match exactly one location in the file.",
+            "Replace exact text. `old_text` must match once. Read the file first unless you just created or edited it in this session.",
             json!({
                 "type": "object",
                 "properties": {
@@ -694,6 +772,24 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         ),
         BuiltinExecutor::Edit,
     ));
+    if apply_patch {
+        let mut spec = conservative_builtin_spec(
+            "apply_patch",
+            "Apply a patch to one or more workspace files. A preflight error leaves the workspace unchanged. A commit error can leave changes listed under Written or Partially written. Use *** Add File, *** Delete File or *** Update File headers. Updates use @@ hunks with context lines prefixed by a space, removals by -, and additions by +. An update can include *** Move to immediately after its header. Example:\n*** Begin Patch\n*** Add File: notes.txt\n+Hello\n*** End Patch",
+            json!({
+                "type": "object",
+                "properties": { "input": { "type": "string" } },
+                "required": ["input"],
+                "additionalProperties": false
+            }),
+            CapabilitySet::filesystem_write(),
+            ToolExposure::Direct,
+            RendererHint::Write,
+            false,
+        );
+        spec.name = ToolName::ApplyPatch;
+        registry.register(BuiltinTool::new(spec, BuiltinExecutor::ApplyPatch));
+    }
     registry.register(BuiltinTool::new(
         conservative_builtin_spec(
             "write_file",
@@ -877,6 +973,12 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
                             "deepseek-v4-pro"
                         ],
                         "description": "Override: auto routes, flash favors speed, pro deep reasoning."
+                    },
+                    "context": {
+                        "type": "string",
+                        "enum": ["fresh", "fork"],
+                        "default": "fresh",
+                        "description": "Fork reuses completed parent history and its model. Fresh uses a standalone brief."
                     },
                     "isolation": {
                         "type": "string",
@@ -2051,11 +2153,13 @@ impl Tool for BuiltinTool {
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
         match self.executor {
-            BuiltinExecutor::ReadFile => {
-                read_file::execute_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
-                    ctx.is_cancelled()
-                })
-            }
+            BuiltinExecutor::ReadFile => read_file::execute_in_session(
+                request,
+                ctx.cwd,
+                ctx.max_output_bytes(),
+                ctx.spill_dir,
+                || ctx.is_cancelled(),
+            ),
             BuiltinExecutor::ReadDocument => read_document::execute_or_cancel(
                 request,
                 ctx.cwd,
@@ -2071,11 +2175,13 @@ impl Tool for BuiltinTool {
                     ctx.is_cancelled()
                 })
             }
-            BuiltinExecutor::Grep => {
-                grep::execute_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
-                    ctx.is_cancelled()
-                })
-            }
+            BuiltinExecutor::Grep => grep::execute_in_session(
+                request,
+                ctx.cwd,
+                ctx.max_output_bytes(),
+                ctx.spill_dir,
+                || ctx.is_cancelled(),
+            ),
             // `bash` is the single command entry point and is always executed
             // by the runtime-owned terminal service, which owns process
             // identity, lifetime, and output retention. This arm is the
@@ -2106,22 +2212,27 @@ impl Tool for BuiltinTool {
             BuiltinExecutor::Edit => {
                 edit::execute_or_cancel(request, ctx.cwd, || ctx.is_cancelled())
             }
+            BuiltinExecutor::ApplyPatch => {
+                crate::apply_patch::execute(request, ctx.cwd, || ctx.is_cancelled())
+            }
             BuiltinExecutor::WriteFile => write_file::execute(request, ctx.cwd),
             BuiltinExecutor::GitStatus => {
                 git::status_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
                     ctx.is_cancelled()
                 })
             }
-            BuiltinExecutor::WebSearch => web_search::execute_or_cancel(
+            BuiltinExecutor::WebSearch => web_search::execute_in_session(
                 request,
                 ctx.max_output_bytes(),
                 ctx.deepseek_web.as_ref(),
+                ctx.spill_dir,
                 || ctx.is_cancelled(),
             ),
-            BuiltinExecutor::WebFetch => web_fetch::execute_or_cancel(
+            BuiltinExecutor::WebFetch => web_fetch::execute_in_session(
                 request,
                 ctx.max_output_bytes(),
                 ctx.deepseek_web.as_ref(),
+                ctx.spill_dir,
                 || ctx.is_cancelled(),
             ),
             BuiltinExecutor::Subagent => ToolResult::failed(
@@ -2209,6 +2320,7 @@ enum BuiltinExecutor {
     TaskWait,
     SubagentMessage,
     Edit,
+    ApplyPatch,
     WriteFile,
     GitStatus,
     RunScript,
@@ -2395,6 +2507,70 @@ fn parse_json_arguments(request: &ToolRequest) -> Result<Value, String> {
         .map(|value| value.unwrap_or_else(|| json!({})))
 }
 
+struct McpLoadTools {
+    server: String,
+    spec: ToolSpec,
+}
+
+impl McpLoadTools {
+    fn new(server: String, name: String) -> Self {
+        let spec = ToolSpec {
+            name: ToolName::Mcp(name),
+            aliases: Vec::new(),
+            description: format!(
+                "Load tools from MCP server '{server}' by name. Pass an empty names array to list valid names. Loaded tools are available on the next model request."
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"names": {"type": "array", "items": {"type": "string"}}},
+                "required": ["names"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            capabilities: CapabilitySet::new(Vec::new()),
+            exposure: ToolExposure::Direct,
+            result_semantics: ResultSemantics::Standard,
+            interrupt_semantics: InterruptSemantics::WaitForTerminal,
+            replay_semantics: ReplaySemantics::SafeToRetry,
+            renderer: RendererHint::State,
+            concurrent_safe: false,
+        };
+        Self { server, spec }
+    }
+}
+
+impl Tool for McpLoadTools {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn is_concurrent_safe(&self, _request: &ToolRequest) -> bool {
+        false
+    }
+
+    fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
+        #[derive(serde::Deserialize)]
+        struct Arguments {
+            names: Vec<String>,
+        }
+        let Some(registry) = ctx.mcp_registry else {
+            return ToolResult::failed(request, "MCP registry is not initialized", None);
+        };
+        let args = match serde_json::from_str::<Arguments>(
+            request.raw_arguments.as_deref().unwrap_or("{}"),
+        ) {
+            Ok(args) => args,
+            Err(error) => return ToolResult::invalid_input(request, error.to_string()),
+        };
+        match registry.load_tools(&self.server, &args.names) {
+            Ok((output, load)) => {
+                ToolResult::completed(request, output, false).with_mcp_tool_load(load)
+            }
+            Err(error) => ToolResult::failed(request, error, None),
+        }
+    }
+}
+
 struct McpProxyTool {
     tool: McpTool,
     spec: ToolSpec,
@@ -2442,13 +2618,27 @@ impl Tool for McpProxyTool {
         let Some(registry) = ctx.mcp_registry else {
             return ToolResult::failed(request, "MCP registry is not initialized", None);
         };
-        let Some(tool_ref) = registry.resolve_tool(&self.tool.schema_name) else {
+        let Some(tool_ref) = registry.resolve_agent_tool_for_definition(&self.tool) else {
             return ToolResult::failed(
                 request,
                 format!("unknown MCP tool: {}", self.tool.schema_name),
                 None,
             );
         };
+        if tool_ref.session_generation.is_some()
+            && request.action
+                != if self.tool.read_only {
+                    ActionKind::Read
+                } else {
+                    ActionKind::Write
+                }
+        {
+            return ToolResult::failed(
+                request,
+                "MCP tool permissions changed. Review the tool and submit the call again.",
+                None,
+            );
+        }
         let arguments = match request
             .raw_arguments
             .as_deref()
@@ -2549,13 +2739,14 @@ impl Tool for ExternalTool {
     }
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
-        external::execute_external_tool_with_policy_or_cancel_with_profile(
+        external::execute_in_session(
             &self.tool,
             request,
             ctx.cwd,
             ctx.output_truncation,
             ctx.shell_timeout,
             ctx.execution_profile,
+            ctx.spill_dir,
             || ctx.is_cancelled(),
         )
     }
@@ -2567,6 +2758,301 @@ pub fn tool_name_from_schema_name(name: &str) -> Option<ToolName> {
 
 #[cfg(test)]
 mod tests {
+    fn spill_session_context<'a>(workspace: &'a Path, spill: &'a Path) -> ToolContext<'a> {
+        ToolContext::new(workspace).with_spill_directory(Some(spill))
+    }
+
+    fn spill_request(id: &str, name: ToolName, args: Value) -> ToolRequest {
+        ToolRequest {
+            id: id.to_owned(),
+            name,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(args.to_string()),
+        }
+    }
+
+    fn mcp_spill_result(ctx: ToolContext<'_>, text: &str) -> ToolResult {
+        use orca_core::mcp_types::{McpResource, McpResourceContent, ReadResourceResult};
+        let uri = "memo://orca/result";
+        let server = "notes";
+        let mcp = McpRegistry::from_static_resources_for_test(
+            vec![McpResource {
+                server: server.into(),
+                uri: uri.into(),
+                name: "Result".into(),
+                description: None,
+                mime_type: None,
+            }],
+            std::collections::HashMap::from([(
+                (server.into(), uri.into()),
+                ReadResourceResult {
+                    contents: vec![McpResourceContent {
+                        uri: uri.into(),
+                        mime_type: None,
+                        text: Some(text.into()),
+                        blob: None,
+                    }],
+                },
+            )]),
+        );
+        default_tool_registry().execute(
+            &spill_request(
+                "mcp-result",
+                ToolName::ReadMcpResource,
+                json!({"server": server, "uri": uri}),
+            ),
+            &ctx.with_mcp(&mcp),
+        )
+    }
+
+    #[test]
+    fn a_large_mcp_result_is_saved_and_pointed_to() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = tempfile::tempdir().unwrap();
+        let spill = session.path().join("spill");
+        let text = format!("FIRST\n{}\nLAST", " hello".repeat(34_000));
+        let original = mcp_spill_result(ToolContext::new(cwd.path()), &text)
+            .output
+            .unwrap();
+        let result = mcp_spill_result(spill_session_context(cwd.path(), &spill), &text);
+        let output = result.output.unwrap();
+        let file = spill.join("mcp-result.txt");
+        assert!(file.is_file());
+        let (preview, notice) = output.rsplit_once("\n\n").unwrap();
+        let (head, tail) = preview.split_once("\n\n").unwrap();
+        assert!(head.contains("FIRST"));
+        assert!(tail.contains("LAST"));
+        assert_eq!(
+            notice,
+            format!(
+                "[{} bytes omitted. The full result is saved at {}; read it with read_file using unit=bytes, offset and limit, or search it with grep.]",
+                original.len() - head.len() - tail.len(),
+                file.display()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn a_storage_failure_keeps_the_original_result() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = tempfile::tempdir().unwrap();
+        let blocked = session.path().join("blocked");
+        std::fs::write(&blocked, "occupied").unwrap();
+        let text = " word".repeat(13_000);
+        let normal = mcp_spill_result(ToolContext::new(cwd.path()), &text);
+        let failed = mcp_spill_result(
+            spill_session_context(cwd.path(), &blocked.join("spill")),
+            &text,
+        );
+        assert_eq!(failed.output, normal.output);
+        assert_eq!(failed.truncated, normal.truncated);
+        let stored = mcp_spill_result(
+            spill_session_context(cwd.path(), &session.path().join("spill")),
+            &text,
+        );
+        assert!(stored.truncated);
+    }
+
+    fn spill_read(name: ToolName, args: Value, cwd: &Path, spill: &Path) -> ToolResult {
+        default_tool_registry().execute(
+            &spill_request("read", name, args),
+            &spill_session_context(cwd, spill),
+        )
+    }
+
+    #[test]
+    fn read_file_reads_a_spill_file_with_offset_and_limit() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let file = spill.path().join("call.txt");
+        std::fs::write(&file, "first\nsecond\nthird\n").unwrap();
+        let result = spill_read(
+            ToolName::ReadFile,
+            json!({"path": file, "offset": 2, "limit": 1}),
+            cwd.path(),
+            spill.path(),
+        );
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        let output = result.output.unwrap();
+        assert!(
+            output.contains("2: second") && !output.contains("first") && !output.contains("third")
+        );
+    }
+
+    #[test]
+    fn grep_searches_a_spill_file() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let file = spill.path().join("call.txt");
+        std::fs::write(&file, "alpha\nneedle\nomega\n").unwrap();
+        let result = spill_read(
+            ToolName::Grep,
+            json!({"path": file, "pattern": "needle"}),
+            cwd.path(),
+            spill.path(),
+        );
+        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+        assert!(result.output.unwrap().contains("2:needle"));
+    }
+
+    #[test]
+    fn grep_matches_beyond_the_start_of_a_long_spill_line() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let file = spill.path().join("call.txt");
+        std::fs::write(
+            &file,
+            format!("{}needle{}", "x".repeat(100_000), "y".repeat(100_000)),
+        )
+        .unwrap();
+        let result = spill_read(
+            ToolName::Grep,
+            json!({"path": file, "pattern": "needle"}),
+            cwd.path(),
+            spill.path(),
+        );
+        assert_ne!(
+            result.kind,
+            orca_core::tool_types::ToolResultKind::NoMatches
+        );
+        assert_eq!(result.status, ToolStatus::Completed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_spill_dir_is_refused() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let link = spill.path().join("link.txt");
+        let regular = spill.path().join("regular.txt");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        std::fs::write(&regular, "needle").unwrap();
+        for (name, refused_args, allowed_args) in [
+            (
+                ToolName::ReadFile,
+                json!({"path": link}),
+                json!({"path": regular}),
+            ),
+            (
+                ToolName::Grep,
+                json!({"path": link, "pattern": "needle"}),
+                json!({"path": regular, "pattern": "needle"}),
+            ),
+        ] {
+            let refused = spill_read(name.clone(), refused_args, cwd.path(), spill.path());
+            assert_eq!(refused.status, ToolStatus::Failed, "{refused:?}");
+            assert!(
+                refused
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("escapes workspace")
+            );
+            let allowed = spill_read(name, allowed_args, cwd.path(), spill.path());
+            assert_eq!(allowed.status, ToolStatus::Completed, "{allowed:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_reads_and_writes_refuse_a_linked_ancestor() {
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        let outside_spill = outside.join("session/spill");
+        std::fs::create_dir_all(&outside_spill).unwrap();
+        std::fs::write(outside_spill.join("call.txt"), "needle").unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        let spill = alias.join("session/spill");
+        let file = spill.join("call.txt");
+        for (name, args) in [
+            (ToolName::ReadFile, json!({"path": file})),
+            (ToolName::Grep, json!({"path": file, "pattern": "needle"})),
+        ] {
+            let result = spill_read(name, args, cwd.path(), &spill);
+            assert_eq!(result.status, ToolStatus::Failed, "{result:?}");
+        }
+        mcp_spill_result(
+            spill_session_context(cwd.path(), &spill),
+            &" hello".repeat(34_000),
+        );
+        assert!(!outside_spill.join("mcp-result.txt").exists());
+    }
+
+    #[test]
+    fn spill_saves_the_history_redacted_result() {
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let spill = root.path().join("spill");
+        let words = " hello".repeat(10_000);
+        let value = "fixture-value";
+        let text = format!("{words}\napi_key={value}\n{words}");
+        mcp_spill_result(spill_session_context(cwd.path(), &spill), &text);
+        let saved = std::fs::read_to_string(spill.join("mcp-result.txt")).unwrap();
+        let resource: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert!(
+            resource["contents"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\napi_key=<redacted>\n")
+        );
+        assert!(!saved.contains(value));
+    }
+
+    #[test]
+    fn read_file_pages_a_single_long_spill_line_by_byte() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spill = tempfile::tempdir().unwrap();
+        let file = spill.path().join("call.txt");
+        std::fs::write(
+            &file,
+            format!("{}needle{}", "x".repeat(100_000), "y".repeat(100_000)),
+        )
+        .unwrap();
+        let schema = default_tool_registry()
+            .get("read_file")
+            .unwrap()
+            .spec()
+            .input_schema
+            .clone();
+        let result = spill_read(
+            ToolName::ReadFile,
+            json!({"path": file, "offset": 100001, "limit": 6, "unit": "bytes"}),
+            cwd.path(),
+            spill.path(),
+        );
+        assert_eq!(result.output.as_deref(), Some("needle"));
+        assert_eq!(schema["properties"]["unit"]["enum"], json!(["bytes"]));
+        assert_eq!(schema["required"], json!(["path"]));
+    }
+
+    #[test]
+    fn the_threshold_is_exclusive() {
+        let session = tempfile::tempdir().unwrap();
+        let spill = session.path().join("spill");
+        let request = spill_request("threshold", ToolName::WebFetch, json!({}));
+        let completed = |words| {
+            let text = " hello".repeat(words);
+            crate::spill::completed_text(&request, text, Some(&spill), |text| (text, false))
+        };
+        assert!(!completed(12_500).truncated);
+        assert!(!spill.exists());
+        assert!(completed(12_501).truncated);
+        assert!(spill.join("threshold.txt").is_file());
+    }
+
     #[test]
     fn computer_description_keeps_named_apps_in_the_gui_and_stays_short() {
         let registry = default_tool_registry();

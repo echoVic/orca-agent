@@ -120,16 +120,23 @@ impl TaskOutputStore {
     }
 
     pub(crate) fn archived_shell(&self, shell_id: &str) -> io::Result<ArchivedShell> {
+        self.archive_route()?.shell(shell_id)
+    }
+
+    pub(crate) fn archived_shell_id(&self, task_id: &str) -> io::Result<String> {
+        self.archive_route()?
+            .find(|archive, _| archive.finished_shell_id(task_id))
+    }
+
+    fn archive_route(&self) -> io::Result<routing::ArchiveRoute> {
         let inner = self.inner.lock().expect("task output store poisoned");
         inner.check_archive()?;
-        let route = inner.route.clone().ok_or_else(|| {
+        inner.route.clone().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 "no persistent output archive for this session",
             )
-        })?;
-        drop(inner);
-        route.shell(shell_id)
+        })
     }
 
     pub(crate) fn finish_shell(

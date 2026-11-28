@@ -7032,6 +7032,121 @@ enabled = true
     }
 
     #[test]
+    fn jsonl_interrupt_keeps_the_published_reply() {
+        with_orca_home(|home| {
+            let mut config = test_run_config();
+            config.cwd = Some(home.to_path_buf());
+            config.history_mode = HistoryMode::Record;
+            let server_config = ServerConfig { run_config: config };
+            let mut state = ServerState::default();
+            let writer = Arc::new(Mutex::new(Vec::new()));
+            handle_line(
+                &server_config,
+                &mut state,
+                r#"{"id":"thread","method":"thread/start","params":{}}"#,
+                Arc::clone(&writer),
+            )
+            .unwrap();
+            let started = wait_for_event(&writer, Duration::from_secs(2), |event| {
+                event["event"] == "thread_started"
+            })
+            .unwrap();
+            let thread_id = started["threadId"].as_str().unwrap();
+            handle_line(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"turn","method":"turn/start","params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"mock_stream_delay_ms 30000"}}]}}}}"#
+                ),
+                Arc::clone(&writer),
+            )
+            .unwrap();
+            let started = wait_for_event(&writer, Duration::from_secs(2), |event| {
+                event["id"] == "turn" && event["event"] == "turn_started"
+            })
+            .unwrap();
+            let turn_id = started["turnId"].as_str().unwrap();
+            let surface = state.threads.jsonl_surface(thread_id).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let crate::surface::AttachResult::FreshAttached { attachment } = surface
+                    .attach_fresh(crate::surface::FreshAttachRequest {
+                        request_id: crate::surface::SurfaceRequestId::new(),
+                        role: crate::surface::SurfaceAttachmentRole::Jsonl,
+                        requested_capabilities: std::collections::BTreeSet::from([
+                            crate::surface::SurfaceCapability::ReadSnapshot,
+                        ]),
+                        interaction_capabilities: Default::default(),
+                    })
+                else {
+                    panic!("attach reply reader");
+                };
+                let published =
+                    attachment
+                        .baseline
+                        .snapshot
+                        .assistant_streams
+                        .iter()
+                        .any(|stream| {
+                            stream.channel == crate::surface::AssistantChannel::Message
+                                && stream.text.as_str() == "Mock slow stream started."
+                        });
+                surface.detach(
+                    &attachment.client,
+                    crate::surface::DetachRequest {
+                        request_id: crate::surface::SurfaceRequestId::new(),
+                    },
+                );
+                if published {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "reply text never published"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            handle_line(
+                &server_config,
+                &mut state,
+                &format!(
+                    r#"{{"id":"interrupt","method":"turn/interrupt","params":{{"threadId":"{thread_id}","turnId":"{turn_id}"}}}}"#
+                ),
+                Arc::clone(&writer),
+            )
+            .unwrap();
+            state.join_active_turns();
+
+            let events = parse_jsonl(&writer.lock().unwrap());
+            assert!(
+                events.iter().any(|event| {
+                    event["id"] == "turn"
+                        && event["event"] == "turn_completed"
+                        && event["status"] == "cancelled"
+                }),
+                "{events:?}"
+            );
+            let transcript = crate::thread_store::SessionStore::new()
+                .load_session(thread_id)
+                .unwrap();
+            let replies: Vec<_> = transcript
+                .messages
+                .iter()
+                .filter(|message| matches!(message, Message::Assistant { .. }))
+                .collect();
+            assert!(
+                matches!(replies.as_slice(), [Message::Assistant {
+                content: Some(text),
+                cut_short: Some(orca_core::conversation::CutShort::Interrupted),
+                tool_calls,
+                ..
+            }] if text == "Mock slow stream started." && tool_calls.is_empty()),
+                "{replies:?}"
+            );
+        });
+    }
+
+    #[test]
     fn stateless_submit_user_input_response_resumes_one_shot_turn() {
         with_orca_home(|home| {
             let mut config = test_run_config();
@@ -7952,6 +8067,7 @@ enabled = true
                         pinned: false,
                     },
                     Message::Assistant {
+                        cut_short: None,
                         content: Some("server projected assistant".to_string()),
                         reasoning_content: None,
                         tool_calls: Vec::new(),
@@ -7968,6 +8084,7 @@ enabled = true
                         pinned: false,
                     },
                     Message::Assistant {
+                        cut_short: None,
                         content: Some("server projected second assistant".to_string()),
                         reasoning_content: None,
                         tool_calls: Vec::new(),

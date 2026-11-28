@@ -7,7 +7,7 @@ resolver = "3"
 serde = { version = "1.0.228", features = ["derive"] }
 # Digests over re-serialized payloads (child relay envelopes, surface batches)
 # need every f64 to parse back to the exact value it was written from.
-serde_json = { version = "1.0.145", features = ["float_roundtrip"] }
+serde_json = { version = "1.0.145", features = ["float_roundtrip", "raw_value"] }
 clap = { version = "4.5.50", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "v7"] }
@@ -66,7 +66,7 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 
 [package]
 name = "orca-agent"
-version = "0.5.23"
+version = "0.5.26"
 edition = "2024"
 description = "Orca Agent: a DeepSeek-native terminal coding agent"
 license = "MIT"

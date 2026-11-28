@@ -133,6 +133,7 @@ fn main() {
         std::process::exit(1);
     }
     history.messages.push(Message::Assistant {
+        cut_short: None,
         content: first.assistant_content.clone(),
         reasoning_content: first.assistant_reasoning.clone(),
         tool_calls: first.tool_calls.clone(),
@@ -151,13 +152,9 @@ fn main() {
 
     let ahead = |version| {
         let mut conversation = history.clone();
-        conversation.messages.insert(
-            1,
-            Message::System {
-                content: plan(version),
-                pinned: false,
-            },
-        );
+        conversation
+            .messages
+            .insert(1, Message::system(plan(version)));
         conversation
     };
     send(&ahead(3), &config, "context ahead, plan 3");

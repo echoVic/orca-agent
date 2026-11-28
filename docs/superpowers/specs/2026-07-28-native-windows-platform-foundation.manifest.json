@@ -30,6 +30,12 @@
   ],
   "foundation_exceptions": [
     [
+      "apply-patch-unix-path-and-fixtures",
+      "crates/orca-tools/src/apply_patch.rs",
+      "unix_std_api",
+      5
+    ],
+    [
       "computer-use-nonblocking-stdin",
       "crates/orca-computer-use/src/driver_input.rs",
       "unix_libc_process",
@@ -145,6 +151,20 @@
     ]
   ],
   "deferred_boundaries": [
+    [
+      "fork-history-owner-only-mode-fixture",
+      "crates/orca-runtime/src/agent_continuation.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "tool-execution-patch-alias-fixture",
+      "crates/orca-runtime/src/tool_execution.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
     [
       "computer-use-live-macos-process-cleanup",
       "crates/orca-computer-use/tests/live_macos.rs",
@@ -505,6 +525,20 @@
     [
       "tools-test-unix-fixture",
       "crates/orca-tools/src/lib.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "tools-registry-spill-test-unix-fixture",
+      "crates/orca-tools/src/registry.rs",
+      "unix_std_api",
+      3,
+      "windows-test-portability"
+    ],
+    [
+      "tools-grep-test-unix-fixture",
+      "crates/orca-tools/src/grep.rs",
       "unix_std_api",
       1,
       "windows-test-portability"

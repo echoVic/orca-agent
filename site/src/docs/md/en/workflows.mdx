@@ -46,6 +46,13 @@ The same task controls apply to workflow children and direct subagents:
 `task_stop`. The retired `subagent_status` tool and model-facing sync/async mode
 are not part of the current protocol.
 
+## Task lists
+
+Concurrent task-list updates are preserved. A running task can only be
+completed by its claimant. Child-agent claims survive checkpointed retries
+and are released when the child exits for good. A task-list request over
+1 MiB throws an error the workflow script can catch.
+
 ## Observe and recover
 
 ~~~bash

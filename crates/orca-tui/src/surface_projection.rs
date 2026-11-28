@@ -815,6 +815,21 @@ pub(crate) fn history_messages_from_surface_items(
                     messages.push(message);
                 }
             }
+            for item in replies.into_iter().chain(plans) {
+                if let SurfaceItem::AssistantMessage {
+                    cut_short: Some(reason),
+                    ..
+                }
+                | SurfaceItem::AssistantPlan {
+                    cut_short: Some(reason),
+                    ..
+                } = item
+                {
+                    messages.push(crate::transcript_state::ChatMessage::AssistantCutShort(
+                        *reason,
+                    ));
+                }
+            }
         }
     }
     messages
@@ -1431,6 +1446,16 @@ impl TuiSurfaceProjection {
         Ok(projected)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn project_provider_retry(
+        &self,
+        operation_id: &SurfaceOperationId,
+        retry: Option<orca_core::provider_types::ProviderRetry>,
+    ) -> Option<TuiEvent> {
+        (self.focused_operation.as_ref() == Some(operation_id))
+            .then_some(TuiEvent::ProviderRetry(retry))
+    }
+
     pub(crate) fn focus_operation(&mut self, operation_id: SurfaceOperationId) {
         self.focused_operation = Some(operation_id);
     }
@@ -1513,7 +1538,10 @@ impl TuiSurfaceProjection {
                         stream.state = SurfaceAssistantStreamState::Discarded;
                     }
                 }
-                SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted { response }) => {
+                SurfaceEvent::Assistant(
+                    AssistantPatch::ResponseCompleted { response }
+                    | AssistantPatch::ResponseKept { response, .. },
+                ) => {
                     let discarded_attempt = projected
                         .iter()
                         .any(|event| matches!(event, TuiEvent::AssistantAttemptDiscarded));
@@ -1537,6 +1565,12 @@ impl TuiSurfaceProjection {
                             projected
                                 .push(TuiEvent::ProposedPlanDelta(plan.text.as_str().to_string()));
                         }
+                    }
+                    if let SurfaceEvent::Assistant(AssistantPatch::ResponseKept {
+                        reason, ..
+                    }) = &envelope.event
+                    {
+                        projected.push(TuiEvent::AssistantReplyKept(*reason));
                     }
                 }
                 SurfaceEvent::Tool(ToolPatch::Requested { request }) => {
@@ -2327,7 +2361,9 @@ fn surface_thread_id_text(thread_id: &orca_runtime::surface::SurfaceThreadId) ->
 /// A tool row's diff and kind from the file change its result recorded.
 fn file_change_diff(file_change: Option<&SurfaceFileChange>) -> (Option<String>, Option<String>) {
     match file_change {
-        Some(SurfaceFileChange::UnifiedDiff { text, .. }) => (
+        Some(
+            SurfaceFileChange::UnifiedDiff { text, .. } | SurfaceFileChange::Patch { text, .. },
+        ) => (
             Some(text.as_str().to_string()),
             Some("file_change".to_string()),
         ),
@@ -2764,6 +2800,7 @@ mod tests {
                     turn_id,
                     text: DisplayText::new(text),
                     pinned: false,
+                    cut_short: None,
                 })
                 .collect();
             let template = crate::hosted_child::tests::snapshot_with_child(1, 5);
@@ -2848,6 +2885,7 @@ mod tests {
                 turn_id,
                 text: DisplayText::new(text),
                 pinned: false,
+                cut_short: None,
             };
             let root = |task_id, start| {
                 let mut task = template.tasks[0].clone();
@@ -4073,6 +4111,7 @@ mod tests {
         use crate::transcript_state::ChatMessage;
         let turn_id = SurfaceTurnId::new();
         let message = |text: &str| SurfaceItem::AssistantMessage {
+            cut_short: None,
             id: SurfaceItemId::new(),
             turn_id: turn_id.clone(),
             text: DisplayText::new(text),
@@ -4083,6 +4122,7 @@ mod tests {
             turn_id: turn_id.clone(),
             text: DisplayText::new("# Plan\n- inspect\n"),
             message_offset: offset.map(orca_runtime::surface::ByteOffset::new),
+            cut_short: None,
             pinned: false,
         };
 
@@ -4161,6 +4201,7 @@ mod tests {
     fn a_later_responses_reasoning_stays_below_the_reply_before_it() {
         let turn_id = SurfaceTurnId::new();
         let reply = |text: &str| SurfaceItem::AssistantMessage {
+            cut_short: None,
             id: SurfaceItemId::new(),
             turn_id: turn_id.clone(),
             text: DisplayText::new(text),
@@ -4230,6 +4271,7 @@ mod tests {
                 origin: orca_runtime::surface::SurfaceItemOrigin::RuntimeContext,
             },
             SurfaceItem::AssistantMessage {
+                cut_short: None,
                 id: SurfaceItemId::new(),
                 turn_id: turn_id.clone(),
                 text: DisplayText::new("answer"),
@@ -4247,6 +4289,7 @@ mod tests {
                 turn_id,
                 text: DisplayText::new("plan"),
                 message_offset: None,
+                cut_short: None,
                 pinned: false,
             },
         ];
@@ -4310,6 +4353,130 @@ mod tests {
             Err(SurfaceProjectionError::UnknownAssistantStream { stream_id: observed })
                 if observed == stream_id
         ));
+    }
+
+    #[test]
+    fn an_interrupted_reply_stays_on_screen() {
+        assert_kept_reply_frame(
+            orca_core::conversation::CutShort::Interrupted,
+            "(interrupted)",
+        );
+    }
+
+    #[test]
+    fn a_reply_stopped_at_the_output_limit_stays_on_screen() {
+        assert_kept_reply_frame(
+            orca_core::conversation::CutShort::OutputLimit,
+            "(stopped at the output limit)",
+        );
+    }
+
+    fn assert_kept_reply_frame(reason: orca_core::conversation::CutShort, marker: &str) {
+        let before = cursor(0, 1);
+        let fence = operation_fence(12);
+        let turn_id = SurfaceTurnId::new();
+        let item_id = SurfaceItemId::new();
+        let stream = SurfaceAssistantStream {
+            stream_id: SurfaceStreamId::try_from_bytes(uuid_v7_bytes(14)).unwrap(),
+            fence: fence.clone(),
+            turn_id: turn_id.clone(),
+            item_id: item_id.clone(),
+            channel: AssistantChannel::Message,
+            next_offset: ByteOffset::new(6),
+            text: DisplayText::new("answer"),
+            state: SurfaceAssistantStreamState::Open,
+        };
+        let mut event = response_completed_event_envelope(
+            &fence,
+            &turn_id,
+            None,
+            Some((item_id, "answer")),
+            12,
+        );
+        let SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted { response }) = event.event
+        else {
+            unreachable!()
+        };
+        event.event = SurfaceEvent::Assistant(AssistantPatch::ResponseKept { response, reason });
+        let batch = commit_batch_with_events(before.clone(), cursor(1, 2), vec![event], 17);
+        let mut projection = TuiSurfaceProjection::from_snapshot(before, &[stream]);
+        let mut state = kept_reply_test_state();
+        state.update(TuiEvent::MessageDelta("answer".to_string()));
+        for event in projection.reduce_typed_batch(&batch).unwrap() {
+            state.update(event);
+        }
+        assert_kept_lines(&mut state, marker);
+    }
+
+    #[test]
+    fn a_kept_reply_survives_resume() {
+        let mut snapshot = goal_projection_snapshot();
+        snapshot.items = vec![SurfaceItem::AssistantMessage {
+            id: SurfaceItemId::new(),
+            turn_id: SurfaceTurnId::new(),
+            text: DisplayText::new("answer"),
+            cut_short: Some(orca_core::conversation::CutShort::Interrupted),
+            pinned: false,
+        }];
+        let recorded = serde_json::to_vec(&snapshot.items).unwrap();
+        snapshot.items = serde_json::from_slice(&recorded).unwrap();
+        let mut state = kept_reply_test_state();
+        for message in history_messages_from_surface_snapshot(&snapshot) {
+            state.push_message(message);
+        }
+        assert_kept_lines(&mut state, "(interrupted)");
+    }
+
+    #[test]
+    fn a_kept_plan_only_reply_survives_resume() {
+        let mut snapshot = goal_projection_snapshot();
+        snapshot.items = serde_json::from_value(serde_json::json!([{"AssistantPlan": {
+            "id": SurfaceItemId::new(), "turn_id": SurfaceTurnId::new(), "text": "answer", "cut_short": "interrupted", "pinned": false
+        }}])).unwrap();
+        let mut state = kept_reply_test_state();
+        for message in history_messages_from_surface_snapshot(&snapshot) {
+            state.push_message(message);
+        }
+        assert_kept_lines(&mut state, "(interrupted)");
+    }
+
+    fn kept_reply_test_state() -> AppState {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        AppState::new(
+            tx,
+            "test".into(),
+            "mock".into(),
+            std::env::temp_dir().display().to_string(),
+        )
+    }
+
+    fn assert_kept_lines(state: &mut AppState, marker: &str) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+        let theme = crate::theme::Theme::named(orca_core::config::ThemeName::Dark);
+        terminal
+            .draw(|frame| crate::ui::render_live_messages(frame, frame.area(), state, &theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content
+            .chunks(60)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let answer = text
+            .iter()
+            .position(|line| line.contains("answer"))
+            .expect("visible answer");
+        let cutoff = text
+            .iter()
+            .position(|line| line.contains(marker))
+            .unwrap_or_else(|| panic!("missing {marker} in {text:?}"));
+        assert!(cutoff > answer);
+        let column = text[cutoff].find(marker).unwrap();
+        assert_eq!(
+            buffer[(column as u16, cutoff as u16)].fg,
+            theme.dim_style().fg.unwrap()
+        );
     }
 
     #[test]
@@ -5205,6 +5372,7 @@ mod tests {
             assistant_stream_order: vec![message.stream_id.clone(), plan.stream_id.clone()],
             completed_items: vec![
                 SurfaceItem::AssistantMessage {
+                    cut_short: None,
                     id: message_id.clone(),
                     turn_id: turn_id.clone(),
                     text: DisplayText::new(reply),
@@ -5215,6 +5383,7 @@ mod tests {
                     turn_id: turn_id.clone(),
                     text: DisplayText::new(plan_text),
                     message_offset: Some(ByteOffset::new("Preface\n".len() as u64)),
+                    cut_short: None,
                     pinned: false,
                 },
             ],
@@ -5302,6 +5471,7 @@ mod tests {
             assistant_streams: BTreeMap::from([(stream_id.clone(), stream)]),
             assistant_stream_order: vec![stream_id],
             completed_items: vec![SurfaceItem::AssistantMessage {
+                cut_short: None,
                 id: item_id,
                 turn_id: turn_id.clone(),
                 text: DisplayText::new("corrected full response"),

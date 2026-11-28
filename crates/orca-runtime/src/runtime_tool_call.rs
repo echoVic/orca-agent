@@ -42,14 +42,17 @@ const NORMAL_TOOL_ADMISSION_STARTED: u8 = 1;
 const NORMAL_TOOL_ADMISSION_CANCELLED: u8 = 2;
 
 pub(crate) struct RuntimeReadonlyToolInvocation {
+    pub(crate) spill_directory: Option<PathBuf>,
     pub(crate) request: ToolRequest,
     pub(crate) cwd: PathBuf,
     pub(crate) mcp_registry: McpRegistry,
     pub(crate) output_truncation: ToolOutputTruncation,
+    pub(crate) network_read: Option<Box<RuntimeNormalToolInvocation>>,
 }
 
 pub(crate) struct RuntimeNormalToolInvocation {
     pub(crate) request: ToolRequest,
+    pub(crate) prepared_patch: Option<Arc<orca_tools::apply_patch::PreparedPatch>>,
     pub(crate) config: RunConfig,
     pub(crate) cwd: PathBuf,
     pub(crate) additional_roots: Vec<PathBuf>,
@@ -65,6 +68,7 @@ pub(crate) struct RuntimeNormalToolInvocation {
     pub(crate) git_metadata_write_session:
         Option<Arc<crate::git_write_command::GitMetadataWriteSession>>,
     pub(crate) owner_task_id: Option<String>,
+    pub(crate) steer_handle: Option<crate::lifecycle::ThreadSteerHandle>,
     pub(crate) permission_overlay: TurnPermissionOverlay,
     pub(crate) control: ToolControlSemantics,
 }
@@ -83,9 +87,10 @@ impl RuntimeNormalToolInvocation {
         task_registry: Option<&TaskRegistry>,
         permission_overlay: TurnPermissionOverlay,
     ) -> Self {
-        let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+        let registry = orca_tools::registry::tool_registry_for_session(
             Some(mcp_registry),
             external_tools,
+            config.tools.apply_patch,
         );
         let control = registry
             .control_semantics(&request.name)
@@ -95,6 +100,7 @@ impl RuntimeNormalToolInvocation {
             });
         Self {
             request: request.clone(),
+            prepared_patch: None,
             config: config.clone(),
             cwd: cwd.to_path_buf(),
             additional_roots: additional_roots.to_vec(),
@@ -106,6 +112,7 @@ impl RuntimeNormalToolInvocation {
             terminal_service: None,
             git_metadata_write_session: None,
             owner_task_id: None,
+            steer_handle: None,
             permission_overlay,
             control,
         }
@@ -116,6 +123,7 @@ impl RuntimeNormalToolInvocation {
     pub(crate) fn clone_for_request(&self, request: &ToolRequest) -> RuntimeNormalToolInvocation {
         let mut clone = RuntimeNormalToolInvocation {
             request: request.clone(),
+            prepared_patch: None,
             config: self.config.clone(),
             cwd: self.cwd.clone(),
             additional_roots: self.additional_roots.clone(),
@@ -127,6 +135,7 @@ impl RuntimeNormalToolInvocation {
             terminal_service: self.terminal_service.clone(),
             git_metadata_write_session: self.git_metadata_write_session.clone(),
             owner_task_id: self.owner_task_id.clone(),
+            steer_handle: self.steer_handle.clone(),
             permission_overlay: self.permission_overlay.clone(),
             control: self.control,
         };
@@ -356,7 +365,9 @@ trait RuntimeReadonlyToolExecutor: Send + Sync {
     ) -> ToolResult;
 }
 
-struct DefaultRuntimeReadonlyToolExecutor;
+struct DefaultRuntimeReadonlyToolExecutor {
+    normal_handler: Arc<dyn RuntimeNormalToolHandler>,
+}
 
 impl RuntimeReadonlyToolExecutor for DefaultRuntimeReadonlyToolExecutor {
     fn execute(
@@ -364,21 +375,26 @@ impl RuntimeReadonlyToolExecutor for DefaultRuntimeReadonlyToolExecutor {
         invocation: &RuntimeReadonlyToolInvocation,
         cancel: &CancelToken,
     ) -> ToolResult {
-        orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_profile(
-            &invocation.request,
-            &invocation.cwd,
-            &[],
-            &invocation.mcp_registry,
-            &[],
-            invocation.output_truncation,
-            READONLY_TOOL_TIMEOUT_SECS,
-            None,
-            orca_core::capability::ExecutionProfile::ReadOnly,
-            // web_search, web_fetch and read_document are not concurrent-safe,
-            // so they never reach this batch and need no DeepSeek access here.
-            None,
-            || cancel.is_cancelled(),
-        )
+        if let Some(network_read) = &invocation.network_read {
+            return self.normal_handler.execute(
+                network_read,
+                &mut RuntimeNormalToolWorkerContext {
+                    cancel,
+                    permission_handler: None,
+                    mcp_elicitation_handler: None,
+                    output_handler: None,
+                    permission_overlay: &mut network_read.permission_overlay.clone(),
+                },
+            );
+        }
+        let cancelled = || cancel.is_cancelled();
+        let ctx = orca_tools::ToolContext::new(&invocation.cwd)
+            .with_output_truncation(invocation.output_truncation)
+            .with_shell_timeout(Some(Duration::from_secs(READONLY_TOOL_TIMEOUT_SECS)))
+            .with_execution_profile(orca_core::capability::ExecutionProfile::ReadOnly)
+            .with_spill_directory(invocation.spill_directory.as_deref())
+            .with_cancel(&cancelled);
+        orca_tools::execute_in_context(&invocation.request, &invocation.mcp_registry, &[], ctx)
     }
 }
 
@@ -422,11 +438,15 @@ pub(crate) struct RuntimeToolCallRuntime {
 
 impl RuntimeToolCallRuntime {
     pub(crate) fn for_current_execution() -> io::Result<Self> {
+        let normal_handler = default_normal_handler();
+        let executor = Arc::new(DefaultRuntimeReadonlyToolExecutor {
+            normal_handler: Arc::clone(&normal_handler),
+        });
         match Handle::try_current() {
             Ok(handle) => Ok(Self {
                 handle: Some(handle),
-                executor: Arc::new(DefaultRuntimeReadonlyToolExecutor),
-                normal_handler: Arc::new(DefaultRuntimeNormalToolHandler),
+                executor,
+                normal_handler,
                 _owned_runtime: None,
             }),
             Err(_) => {
@@ -442,8 +462,8 @@ impl RuntimeToolCallRuntime {
                 );
                 Ok(Self {
                     handle: Some(runtime.handle().clone()),
-                    executor: Arc::new(DefaultRuntimeReadonlyToolExecutor),
-                    normal_handler: Arc::new(DefaultRuntimeNormalToolHandler),
+                    executor,
+                    normal_handler,
                     _owned_runtime: Some(runtime),
                 })
             }
@@ -451,10 +471,13 @@ impl RuntimeToolCallRuntime {
     }
 
     pub(crate) fn for_normal_execution() -> Self {
+        let normal_handler = default_normal_handler();
         Self {
             handle: None,
-            executor: Arc::new(DefaultRuntimeReadonlyToolExecutor),
-            normal_handler: default_normal_handler(),
+            executor: Arc::new(DefaultRuntimeReadonlyToolExecutor {
+                normal_handler: Arc::clone(&normal_handler),
+            }),
+            normal_handler,
             _owned_runtime: None,
         }
     }
@@ -1232,6 +1255,7 @@ pub(crate) mod tests {
 
     fn invocation(id: &str) -> RuntimeReadonlyToolInvocation {
         RuntimeReadonlyToolInvocation {
+            spill_directory: None,
             request: ToolRequest {
                 id: id.to_string(),
                 name: ToolName::ReadFile,
@@ -1242,6 +1266,7 @@ pub(crate) mod tests {
             cwd: PathBuf::from("."),
             mcp_registry: McpRegistry::default(),
             output_truncation: ToolOutputTruncation::default(),
+            network_read: None,
         }
     }
 
@@ -1257,6 +1282,7 @@ pub(crate) mod tests {
                 target: Some("printf test".to_string()),
                 raw_arguments: None,
             },
+            prepared_patch: None,
             config: test_config(),
             cwd: PathBuf::from("."),
             additional_roots: Vec::new(),
@@ -1268,6 +1294,7 @@ pub(crate) mod tests {
             terminal_service: None,
             git_metadata_write_session: None,
             owner_task_id: None,
+            steer_handle: None,
             permission_overlay: TurnPermissionOverlay::default(),
             control: ToolControlSemantics {
                 interrupt,

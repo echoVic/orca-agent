@@ -1,7 +1,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use orca_core::provider_types::ProviderStep;
+use orca_core::provider_types::{PartialReply, ProviderStep};
 use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_provider::{ProviderStreamEvent, ProviderStreamingCall};
 
@@ -31,6 +31,7 @@ pub struct RuntimeProviderSuspension {
     model: Option<String>,
     identity: ModelResponseIdentity,
     operation: Option<SuspendedOperationHandle>,
+    pub(crate) delivered: PartialReply,
 }
 
 impl RuntimeProviderSuspension {
@@ -38,12 +39,14 @@ impl RuntimeProviderSuspension {
         stream: ProviderStreamingCall,
         model: Option<String>,
         identity: ModelResponseIdentity,
+        delivered: PartialReply,
     ) -> Self {
         Self {
             stream,
             model,
             identity,
             operation: None,
+            delivered,
         }
     }
 
@@ -65,9 +68,11 @@ impl RuntimeProviderSuspension {
                 delivery.step().clone(),
             )),
             ProviderStreamEvent::Completed(response) => {
-                Ok(RuntimeProviderSuspensionEvent::Completed(
-                    RuntimeModelResponse::from_parts(response, self.identity.clone()),
-                ))
+                let attempt_usage = self.stream.attempt_usage(&response);
+                let mut response =
+                    RuntimeModelResponse::from_parts(response, self.identity.clone());
+                response.attempt_usage = attempt_usage;
+                Ok(RuntimeProviderSuspensionEvent::Completed(response))
             }
         }
     }

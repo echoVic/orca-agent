@@ -187,6 +187,7 @@ pub struct ShellSessionOutput {
     pub exit_code: Option<i32>,
     pub status: TaskStatus,
     pub termination: ShellSessionTermination,
+    pub(crate) exited_at: Option<Instant>,
     pub requested_terminal: ShellTerminalMode,
     pub effective_terminal: ShellTerminalMode,
 }
@@ -223,6 +224,7 @@ struct ShellSession {
     command: String,
     description: String,
     child: ShellChild,
+    exited_at: Option<Instant>,
     process_job: ProcessJob,
     stdin: ShellInput,
     output_store: TaskOutputStore,
@@ -491,6 +493,7 @@ impl RuntimeShellSessionManager {
                 self.sessions.insert(
                     id.clone(),
                     ShellSession {
+                        exited_at: None,
                         tasks,
                         task_id: task.id.clone(),
                         command: command.command.clone(),
@@ -622,6 +625,7 @@ impl RuntimeShellSessionManager {
             self.sessions.insert(
                 id.clone(),
                 ShellSession {
+                    exited_at: None,
                     tasks,
                     task_id: task.id.clone(),
                     command: command.command.clone(),
@@ -693,10 +697,11 @@ impl RuntimeShellSessionManager {
     }
 
     pub fn list(&mut self) -> Vec<ShellSessionSnapshot> {
+        let observed_at = Instant::now();
         self.sessions
             .iter_mut()
             .map(|(id, session)| {
-                let status = match session.try_wait() {
+                let status = match session.try_wait_at(observed_at) {
                     Ok(Some(status)) if status.success() => TaskStatus::Completed,
                     Ok(Some(_)) => TaskStatus::Failed,
                     Ok(None) | Err(_) => TaskStatus::Running,
@@ -712,6 +717,11 @@ impl RuntimeShellSessionManager {
                 }
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_exited_for_test(&mut self, id: &str) -> io::Result<bool> {
+        Ok(self.session_mut(id)?.poll_exit_status()?.is_some())
     }
 
     pub fn reap_completed(&mut self) -> io::Result<Vec<ShellSessionOutput>> {
@@ -743,10 +753,12 @@ impl RuntimeShellSessionManager {
         should_reap: impl Fn(&str) -> bool,
         remove_completed_output: bool,
     ) -> io::Result<Vec<ShellSessionOutput>> {
+        // Processes discovered in the same pass share an observation time.
+        let observed_at = Instant::now();
         let ids = self
             .sessions
             .iter_mut()
-            .filter_map(|(id, session)| match session.try_wait() {
+            .filter_map(|(id, session)| match session.try_wait_at(observed_at) {
                 Ok(Some(status)) if should_reap(id) => Some(Ok((id.clone(), status))),
                 Ok(Some(_)) => None,
                 Ok(None) => None,
@@ -1350,6 +1362,18 @@ impl ShellSession {
     }
 
     fn try_wait(&mut self) -> io::Result<Option<ShellExitStatus>> {
+        self.try_wait_at(Instant::now())
+    }
+
+    fn try_wait_at(&mut self, observed_at: Instant) -> io::Result<Option<ShellExitStatus>> {
+        let status = self.poll_exit_status()?;
+        if status.is_some() {
+            self.exited_at.get_or_insert(observed_at);
+        }
+        Ok(status)
+    }
+
+    fn poll_exit_status(&mut self) -> io::Result<Option<ShellExitStatus>> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.effective_terminal.is_pty() {
             return child_status_without_reaping(self.child.id()?);
@@ -1399,6 +1423,7 @@ impl ShellSession {
             exit_code,
             status,
             termination,
+            exited_at: self.exited_at,
             requested_terminal: self.requested_terminal,
             effective_terminal: self.effective_terminal,
         })

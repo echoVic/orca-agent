@@ -12,6 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use orca_platform::fs::VerifiedDirectory;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -19,7 +20,7 @@ use crate::MAX_SNAPSHOT_FILE_BYTES;
 use crate::error::RewindError;
 use crate::path::{
     BoundedFile, atomic_publish, excluded_directory, file_sha256, read_regular_file,
-    resolve_inside, sha256_hex, sync_dir, validate_digest,
+    relative_components, resolve_inside, sha256_hex, sync_dir, validate_digest,
 };
 use crate::plan::{PlanSkip, PlannedDelete, PlannedWrite, RestorePlan, skip_reason};
 use crate::store::RewindStore;
@@ -187,7 +188,7 @@ impl Applier {
             }
         }
 
-        if writes.is_empty() && deletes.is_empty() {
+        if writes.is_empty() && deletes.is_empty() && plan.remove_directories.is_empty() {
             return Ok(report);
         }
 
@@ -240,6 +241,28 @@ impl Applier {
             report.deleted += 1;
         }
 
+        for path in &plan.remove_directories {
+            if let Err(error) = self.remove_created_directory(path, &mut journal) {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) {
+                    report.skipped.push(PlanSkip {
+                        path: path.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+                report.partial = true;
+                let _ = journal.append(&JournalEntry::Failed {
+                    path: path.clone(),
+                    message: error.to_string(),
+                });
+                return Ok(report);
+            }
+            report.deleted += 1;
+        }
+
         if let Err(error) = journal.append(&JournalEntry::Committed {
             op_id: op_id.clone(),
         }) {
@@ -272,7 +295,10 @@ impl Applier {
                 serde_json::from_str(line).map_err(|error| RewindError::JournalCorrupt {
                     detail: format!("{line:?}: {error}"),
                 })?;
-            if matches!(entry, JournalEntry::Applied { .. }) {
+            if matches!(
+                entry,
+                JournalEntry::Applied { .. } | JournalEntry::RemovedDirectory { .. }
+            ) {
                 applied.push(entry);
             }
         }
@@ -281,6 +307,18 @@ impl Applier {
         let pre_dir = op_dir.join("pre");
         let mut report = RollbackReport::default();
         for entry in applied.iter().rev() {
+            if let JournalEntry::RemovedDirectory { path } = entry {
+                let (parent, name) = self.directory_parent(path)?;
+                match parent.child(name) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        parent.create_directory(name)?;
+                        report.restored += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
             let JournalEntry::Applied { path, previous, .. } = entry else {
                 continue;
             };
@@ -354,6 +392,35 @@ impl Applier {
 
     fn journal_path(&self, op_id: &str) -> PathBuf {
         self.journal_dir.join(format!("{op_id}.jsonl"))
+    }
+
+    fn remove_created_directory(&self, path: &str, journal: &mut JournalWriter) -> io::Result<()> {
+        if excluded_directory(path).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory is excluded",
+            ));
+        }
+        let (parent, name) = self.directory_parent(path)?;
+        parent.child(name)?;
+        journal.append(&JournalEntry::RemovedDirectory {
+            path: path.to_owned(),
+        })?;
+        // Keep entries added since the patch by removing empty directories only.
+        parent.remove_directory(name)
+    }
+
+    fn directory_parent<'a>(
+        &self,
+        path: &'a str,
+    ) -> io::Result<(VerifiedDirectory, &'a std::ffi::OsStr)> {
+        let mut parts = relative_components(path)?;
+        let name = parts.pop().expect("validated path has a name");
+        let mut parent = VerifiedDirectory::open(&self.root)?;
+        for part in parts {
+            parent = parent.child(part)?;
+        }
+        Ok((parent, name))
     }
 
     fn apply_write(
@@ -443,6 +510,9 @@ enum JournalEntry {
         action: JournalAction,
         sha256: String,
         previous: PreviousState,
+    },
+    RemovedDirectory {
+        path: String,
     },
     Failed {
         path: String,
@@ -599,9 +669,28 @@ mod tests {
         Fixture {
             journal_dir: session_root.join("journals"),
             _temp: temp,
-            root,
+            root: root.canonicalize().unwrap(),
             store,
         }
+    }
+
+    #[test]
+    fn directory_removal_waits_for_the_journal() {
+        let fixture = fixture();
+        let directory = fixture.root.join("empty");
+        fs::create_dir(&directory).unwrap();
+        let journal_path = fixture.store.root().join("readonly-journal");
+        fs::write(&journal_path, "").unwrap();
+        let mut journal = JournalWriter {
+            file: File::open(journal_path).unwrap(),
+        };
+        assert!(
+            fixture
+                .applier()
+                .remove_created_directory("empty", &mut journal)
+                .is_err()
+        );
+        assert!(directory.is_dir());
     }
 
     fn write_op(
@@ -710,6 +799,7 @@ mod tests {
                 JournalEntry::Applied { .. } => "applied",
                 JournalEntry::Failed { .. } => "failed",
                 JournalEntry::Committed { .. } => "committed",
+                JournalEntry::RemovedDirectory { .. } => "removed_directory",
             })
             .collect();
         assert_eq!(kinds, vec!["intent", "applied", "failed"]);
@@ -982,6 +1072,7 @@ mod tests {
             },
         );
         let snapshot = SnapshotView {
+            created_directories: Vec::new(),
             ordinal: 1,
             at_message_id: "item_1".to_string(),
             files,

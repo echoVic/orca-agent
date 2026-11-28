@@ -69,6 +69,12 @@ pub fn discover_from_env(cwd: &Path) -> Result<Vec<Skill>, String> {
     discover(cwd, orca_home.as_deref(), agents_home.as_deref())
 }
 
+pub fn discover_metadata_from_env(cwd: &Path) -> Result<Vec<Skill>, String> {
+    let orca_home = orca_core::home::orca_home();
+    let agents_home = dirs::home_dir().map(|home| home.join(".agents"));
+    discover_metadata(cwd, orca_home.as_deref(), agents_home.as_deref())
+}
+
 pub fn discover(
     cwd: &Path,
     orca_home: Option<&Path>,
@@ -91,7 +97,7 @@ fn discover_with_body(
     agents_home: Option<&Path>,
     include_body: bool,
 ) -> Result<Vec<Skill>, String> {
-    let project_root = project_root(cwd);
+    let project_root = project_skill_root(cwd);
     let mut skills = Vec::new();
     if let Some(home) = orca_home {
         collect_skills(
@@ -111,11 +117,11 @@ fn discover_with_body(
             &mut skills,
         )?;
     }
-    if let Some(project_root) = project_root
-        && orca_home.is_some_and(|home| {
-            orca_core::config::folder_trust::is_trusted_with_config_dir(&project_root, home)
-        })
-    {
+    if orca_home.is_some_and(|home| {
+        orca_core::config::folder_trust::is_trusted_with_config_dir(&project_root, home)
+            && (cwd == project_root
+                || orca_core::config::folder_trust::is_trusted_with_config_dir(cwd, home))
+    }) {
         collect_skills(
             &project_root.join(".orca/skills"),
             SkillSource::Project,
@@ -131,7 +137,12 @@ fn discover_with_body(
             &mut skills,
         )?;
     }
-    skills.sort_by(|left, right| left.id.cmp(&right.id));
+    skills.sort_by(|left, right| {
+        left.id.cmp(&right.id).then_with(|| {
+            matches!(right.source, SkillSource::Project)
+                .cmp(&matches!(left.source, SkillSource::Project))
+        })
+    });
     skills.dedup_by(|left, right| left.id == right.id);
     Ok(skills)
 }
@@ -142,16 +153,11 @@ pub fn explicit_skill_prompt_block(cwd: &Path, prompt: &str) -> Result<Option<St
         return Ok(None);
     }
     let skills = discover_from_env(cwd)?;
-    let selected: Vec<(Skill, Option<String>)> = mentioned
+    let selected: Vec<Skill> = mentioned
         .into_iter()
-        .filter_map(|(id, arg)| {
-            skills
-                .iter()
-                .find(|skill| skill.id == id)
-                .map(|skill| (skill.clone(), arg))
-        })
+        .filter_map(|(id, _)| skills.iter().find(|skill| skill.id == id).cloned())
         .collect();
-    Ok(format_skills_prompt_block_with_args(&selected))
+    Ok(format_skills_prompt_block(&selected))
 }
 
 /// Returns `(id, arg)` pairs for every `$id` or `$id:arg` mention in `text`.
@@ -210,16 +216,11 @@ pub fn mentioned_skill_ids(text: &str) -> Vec<String> {
 }
 
 pub fn format_skills_prompt_block(skills: &[Skill]) -> Option<String> {
-    let pairs: Vec<(Skill, Option<String>)> = skills.iter().map(|s| (s.clone(), None)).collect();
-    format_skills_prompt_block_with_args(&pairs)
-}
-
-pub fn format_skills_prompt_block_with_args(skills: &[(Skill, Option<String>)]) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
     let mut block = String::from("<skills>\n");
-    for (skill, arg) in skills {
+    for skill in skills {
         block.push_str(&format!(
             r#"<skill id="{}" name="{}" source="{}" path="{}">"#,
             escape_attr(&skill.id),
@@ -229,13 +230,9 @@ pub fn format_skills_prompt_block_with_args(skills: &[(Skill, Option<String>)]) 
         ));
         block.push('\n');
         if let Some(when) = &skill.when_to_use {
-            block.push_str(&format!("When to use: {when}\n"));
+            block.push_str(&format!("When to use: {}\n", escape_skill_text(when)));
         }
-        let body = if let Some(arg) = arg {
-            skill.body.replace("{{arg}}", arg)
-        } else {
-            skill.body.clone()
-        };
+        let body = escape_skill_text(&skill.body);
         block.push_str(&body);
         if !body.ends_with('\n') {
             block.push('\n');
@@ -498,21 +495,13 @@ fn valid_skill_id(id: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
-fn project_root(cwd: &Path) -> Option<PathBuf> {
-    for start in [Some(cwd.to_path_buf()), cwd.canonicalize().ok()]
-        .into_iter()
-        .flatten()
-    {
-        for candidate in start.ancestors() {
-            if candidate.join(".git").exists()
-                || candidate.join("Cargo.toml").exists()
-                || candidate.join("package.json").exists()
-            {
-                return Some(candidate.to_path_buf());
-            }
-        }
-    }
-    Some(cwd.to_path_buf())
+pub fn project_skill_root(cwd: &Path) -> PathBuf {
+    let workspace = canonical_or_self(cwd);
+    workspace
+        .ancestors()
+        .find(|candidate| candidate.join(".git").exists())
+        .unwrap_or(&workspace)
+        .to_path_buf()
 }
 
 fn canonical_or_self(path: &Path) -> PathBuf {
@@ -520,9 +509,12 @@ fn canonical_or_self(path: &Path) -> PathBuf {
 }
 
 fn escape_attr(value: &str) -> String {
+    escape_skill_text(value).replace('"', "&quot;")
+}
+
+fn escape_skill_text(value: &str) -> String {
     value
         .replace('&', "&amp;")
-        .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
@@ -538,6 +530,79 @@ mod tests {
             orca_core::config::folder_trust::TrustLevel::Trusted,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_project_skill_wins_over_a_user_skill() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_skill(
+            &home.path().join("skills/review"),
+            "Review",
+            "User description",
+            "User body",
+        );
+        write_skill(
+            &project.path().join(".orca/skills/review"),
+            "Review",
+            "Project description",
+            "Project body",
+        );
+        trust_project(home.path(), project.path());
+
+        let metadata = discover_metadata(project.path(), Some(home.path()), None).unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].description, "Project description");
+        let skills = discover(project.path(), Some(home.path()), None).unwrap();
+        assert_eq!(skills[0].body, "Project body");
+    }
+
+    #[test]
+    fn skills_are_found_from_the_git_root() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let subcrate = project.path().join("crates/child");
+        fs::create_dir_all(&subcrate).unwrap();
+        fs::write(project.path().join(".git"), "gitdir: ../worktrees/example").unwrap();
+        fs::write(subcrate.join("Cargo.toml"), "[package]\nname = \"child\"\n").unwrap();
+        write_skill(
+            &project.path().join(".orca/skills/review"),
+            "Review",
+            "Project skill",
+            "Project body",
+        );
+        trust_project(home.path(), project.path());
+
+        let skills = discover(&subcrate, Some(home.path()), None).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].id, "review");
+    }
+
+    #[test]
+    fn skills_respect_an_untrusted_subdirectory() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let child = project.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        write_skill(
+            &project.path().join(".orca/skills/review"),
+            "Review",
+            "Project skill",
+            "Project body",
+        );
+        trust_project(home.path(), project.path());
+        orca_core::config::folder_trust::set_trust_with_config_dir(
+            &child,
+            home.path(),
+            orca_core::config::folder_trust::TrustLevel::Untrusted,
+        )
+        .unwrap();
+        assert!(
+            discover(&child, Some(home.path()), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

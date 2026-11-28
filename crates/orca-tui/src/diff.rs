@@ -1,15 +1,10 @@
-use orca_core::tool_types::{FileChangePreview, ToolResult};
+use orca_core::tool_types::ToolResult;
 
 pub fn render(result: &ToolResult) -> Option<String> {
-    match result.file_change_preview.as_deref()? {
-        FileChangePreview::UnifiedDiff { text, .. } => Some(text.clone()),
-        FileChangePreview::Omitted {
-            path,
-            max_input_bytes,
-        } => Some(format!(
-            "[Diff preview omitted for {path}: input exceeds {max_input_bytes} bytes]"
-        )),
-    }
+    result
+        .file_change_preview
+        .as_deref()
+        .map(|preview| preview.display_text())
 }
 
 #[cfg(test)]

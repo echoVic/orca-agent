@@ -95,7 +95,10 @@ A running turn shows an activity line above the input:
  ↳ then run the whole test suite
 ~~~
 
-- `Esc` (or `Ctrl+G`) interrupts the turn.
+- `Esc` (or `Ctrl+G`) interrupts the turn. If the reply already shows text,
+  Orca keeps what it received and adds `(interrupted)`. If the reply reaches
+  the model's output limit, Orca keeps it with `(stopped at the output limit)`.
+  You can ask Orca to continue, including after you reopen the session.
 - Before its first model request, a turn waits for any MCP server still
   connecting, so the model is offered its tools; the activity line says
   `connecting MCP servers` meanwhile, and `Esc` interrupts the wait with the
@@ -403,7 +406,7 @@ shows the file plan, skipped paths, warnings, and a unified-diff preview (Tab
 toggles it, PgUp/PgDn scrolls); files changed by bash or external processes
 are never restored. A session keeps its most recent 100 checkpoints and older
 ones support the conversation rewind only. Checkpoints cover only files
-written by `edit` / `write_file`; set `ORCA_DISABLE_FILE_HISTORY=1` to disable
+changed by `edit`, `write_file`, or `apply_patch`; set `ORCA_DISABLE_FILE_HISTORY=1` to disable
 capture. The command-line equivalent is `orca rewind`.
 
 ## Quitting

@@ -529,7 +529,7 @@ fn exec_injects_project_instructions_into_system_prompt() {
 }
 
 #[test]
-fn exec_does_not_persist_explicitly_mentioned_skill_in_system_prompt() {
+fn exec_persists_the_mentioned_skill_as_its_own_message() {
     let home = TempDir::new().expect("temp home");
     let project = TempDir::new().expect("temp project");
     std::fs::write(
@@ -554,18 +554,23 @@ fn exec_does_not_persist_explicitly_mentioned_skill_in_system_prompt() {
 
     assert_eq!(output.status.code(), Some(0));
 
-    let transcript = saved_conversation_text(home.path());
-    assert!(
-        !transcript.contains("<skills>"),
-        "explicit skills should ride the model-only volatile overlay, not the persisted system prompt"
-    );
-    assert!(
-        !transcript.contains(r#"<skill id=\"debugging\""#),
-        "explicit skill metadata should not be persisted into history"
-    );
-    assert!(
-        !transcript.contains("Use logs first."),
-        "explicit skill body should not be persisted into history"
+    let documents = session_documents(home.path());
+    let records = &documents[0].1;
+    let systems: Vec<&str> = records
+        .iter()
+        .filter_map(|record| {
+            (record["message"]["role"] == "system")
+                .then(|| record["message"]["content"].as_str())
+                .flatten()
+        })
+        .collect();
+    assert!(!systems.first().unwrap().contains("Use logs first."));
+    assert_eq!(
+        systems
+            .iter()
+            .filter(|content| content.contains("Use logs first."))
+            .count(),
+        1
     );
 }
 

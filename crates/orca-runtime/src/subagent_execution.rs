@@ -260,6 +260,7 @@ pub(crate) fn run_subagent_batch_tool_turn<W: io::Write>(
         activity_ingress,
         agent_controller,
         &child_budgets,
+        Some(conversation),
     );
 
     let receipts = execution.child_budget_usage;
@@ -324,6 +325,7 @@ fn execute_subagent_batch(
     activity_ingress: Option<Arc<dyn crate::runtime_surface::RuntimeSubagentActivityIngress>>,
     agent_controller: Option<Arc<AgentController>>,
     child_budgets: &[Option<orca_core::budget::BudgetSpec>],
+    parent_conversation: Option<&Conversation>,
 ) -> SubagentBatchExecution {
     #[cfg(test)]
     let activity_ingress =
@@ -335,6 +337,7 @@ fn execute_subagent_batch(
         vec![None; tool_requests.len()];
     let mut child_budget_usage: Vec<Option<orca_core::budget::BudgetUsage>> =
         vec![None; tool_requests.len()];
+    let mut fork_notes = vec![None; tool_requests.len()];
     let mut runtime_outputs: Vec<Option<RuntimeSubagentCallOutput>> =
         (0..tool_requests.len()).map(|_| None).collect();
     let mut event_error = None;
@@ -348,9 +351,10 @@ fn execute_subagent_batch(
     );
     let batch_id = uuid::Uuid::now_v7().to_string();
 
-    let event_registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+    let event_registry = orca_tools::registry::tool_registry_for_session(
         Some(mcp_registry),
         &config.external_tools,
+        config.tools.apply_patch,
     );
     for (idx, tool_request) in tool_requests.iter().enumerate() {
         if event_error.is_some() {
@@ -482,10 +486,26 @@ fn execute_subagent_batch(
         }
 
         let effective = invocation.effective;
-        let request = subagent::with_delegation_snapshot(
+        let mut request = subagent::with_delegation_snapshot(
             subagent::create_subagent_request(&effective),
             orca_core::config::DelegationSnapshot::from_config(config),
         );
+        match subagent::prepare_fork_request(
+            &mut request,
+            config,
+            parent_conversation,
+            task_registry,
+        ) {
+            Ok(note) => fork_notes[idx] = note,
+            Err(error) => {
+                let result = tool_types::ToolResult::failed_before_start(&effective, error, None);
+                if emit_deltas {
+                    emit_batch_event(sink, events.tool_call_completed(&result), &mut event_error);
+                }
+                results[idx] = Some((RunStatus::Failed, result));
+                continue;
+            }
+        }
         let description = request.description.clone();
         let tool_id = effective.id.clone();
         let child_config = match child_budgets.get(idx) {
@@ -544,9 +564,10 @@ fn execute_subagent_batch(
         runtime_outputs[idx] = Some(output);
     }
     for (idx, output) in runtime_outputs.into_iter().enumerate() {
-        let Some(output) = output else {
+        let Some(mut output) = output else {
             continue;
         };
+        add_fork_note(&mut output.result, fork_notes[idx]);
         cost_tracker.merge(&output.cost_tracker);
         if emit_deltas && agent_controller.is_none() {
             emit_runtime_subagent_terminal(events, sink, &output, &mut event_error);
@@ -645,6 +666,7 @@ pub(crate) fn execute_subagent_tool<W: io::Write>(
         None,
         event_error,
         child_budget,
+        None,
     )
 }
 
@@ -673,6 +695,7 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
     agent_controller: Option<Arc<AgentController>>,
     event_error: &mut Option<io::Error>,
     child_budget: Option<&orca_core::budget::BudgetSpec>,
+    parent_conversation: Option<&Conversation>,
 ) -> io::Result<(
     tool_types::ToolResult,
     Option<orca_core::budget::BudgetUsage>,
@@ -687,6 +710,20 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
             None,
         ));
     }
+    let fork_note = match subagent::prepare_fork_request(
+        &mut request,
+        config,
+        parent_conversation,
+        task_registry,
+    ) {
+        Ok(note) => note,
+        Err(error) => {
+            return Ok((
+                tool_types::ToolResult::failed_before_start(tool_request, error, None),
+                None,
+            ));
+        }
+    };
     request.budget_reservation = task_registry.take_child_budget(root_task_id, &tool_request.id);
     if let Some(binding) = &request.budget_reservation
         && binding.settled_without_submission()?
@@ -831,7 +868,7 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         ),
     };
     if crate::subagent_placement::detaches(placement) {
-        let launch = launch_async_subagent(AsyncSubagentLaunchContext {
+        let mut launch = launch_async_subagent(AsyncSubagentLaunchContext {
             config: &child_config,
             cwd,
             tool_request,
@@ -845,6 +882,7 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
             activity_ingress: activity_ingress.clone(),
             enforce_admission: true,
         });
+        add_fork_note(&mut launch.result, fork_note);
         if emit_deltas && let Some(task) = launch.task.as_ref() {
             emit_batch_event(sink, events.task_status_updated(task), event_error);
         }
@@ -875,12 +913,13 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         1,
     );
     let tool_calls = RuntimeToolCallRuntime::for_normal_execution();
-    let execution = tool_calls.execute_subagent(invocation, cancel, |task| {
+    let mut execution = tool_calls.execute_subagent(invocation, cancel, |task| {
         if !emit_deltas || agent_controller.is_some() {
             return Ok(());
         }
         sink.emit(task.attach_to_event(events.subagent_started(&tool_request.id, &description)))
     });
+    add_fork_note(&mut execution.output.result, fork_note);
     cost_tracker.merge(&execution.output.cost_tracker);
     if event_error.is_none() {
         *event_error = execution.event_error;
@@ -889,6 +928,20 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         emit_runtime_subagent_terminal(events, sink, &execution.output, event_error);
     }
     Ok((execution.output.result, execution.output.child_budget_usage))
+}
+
+fn add_fork_note(result: &mut tool_types::ToolResult, note: Option<&str>) {
+    let (Some(note), Some(output)) = (note, &mut result.output) else {
+        return;
+    };
+    let note = format!("Fork context unavailable: {note}. Started fresh.");
+    if let Ok(serde_json::Value::Object(mut payload)) = serde_json::from_str(output) {
+        payload.insert("context_note".into(), note.into());
+        *output = serde_json::Value::Object(payload).to_string();
+    } else {
+        output.push_str("\n\n");
+        output.push_str(&note);
+    }
 }
 
 fn config_for_remaining_subagent_budget(
@@ -1600,6 +1653,7 @@ mod tests {
             Some(activity_ingress),
             Some(controller),
             &[],
+            None,
         )
     }
 
@@ -2352,6 +2406,7 @@ mod tests {
             None,
             &mut event_error,
             None,
+            None,
         )
         .expect("subagent permission bridge");
 
@@ -2411,6 +2466,7 @@ mod tests {
             None,
             Some(controller),
             &mut event_error,
+            None,
             None,
         )
         .expect("threaded sync launch result");
@@ -2485,6 +2541,7 @@ mod tests {
             None,
             Some(controller),
             &mut event_error,
+            None,
             None,
         )
         .expect("hosted async route result");
@@ -2568,6 +2625,7 @@ mod tests {
             Some(activity_ingress.clone()),
             Some(controller),
             &mut event_error,
+            None,
             None,
         )
         .expect("threaded sync launch failure result");
@@ -2655,6 +2713,7 @@ mod tests {
                 Some(activity_ingress),
                 Some(controller),
                 &mut event_error,
+                None,
                 None,
             )
             .expect("threaded sync stop result")
@@ -3178,6 +3237,7 @@ mod tests {
             Some(controller),
             &mut event_error,
             None,
+            None,
         )
         .expect("hosted schema result");
         host.shutdown().expect("shutdown runtime host");
@@ -3268,6 +3328,7 @@ mod tests {
             Some(controller),
             &mut event_error,
             None,
+            None,
         )
         .expect("hosted resume rejection");
         host.shutdown().expect("shutdown runtime host");
@@ -3335,6 +3396,7 @@ mod tests {
             Some(activity_ingress.clone()),
             None,
             &mut event_error,
+            None,
             None,
         )
         .expect("ordered terminal result");
@@ -3413,6 +3475,7 @@ mod tests {
             Some(controller),
             &mut event_error,
             None,
+            None,
         )
         .expect("hosted terminal failure result");
         host.shutdown().expect("shutdown runtime host");
@@ -3486,6 +3549,7 @@ mod tests {
             Some(activity_ingress.clone()),
             Some(controller),
             &mut event_error,
+            None,
             None,
         )
         .expect("hosted canonical binding result");
@@ -3571,6 +3635,7 @@ mod tests {
             Some(activity_ingress),
             Some(controller),
             &mut event_error,
+            None,
             None,
         )
         .expect("hosted sync child result");
@@ -4321,6 +4386,7 @@ done
             Some(activity),
             Some(Arc::new(controller)),
             &mut event_error,
+            None,
             None,
         )
         .expect("async child accepted");

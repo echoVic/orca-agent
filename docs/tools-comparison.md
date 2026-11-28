@@ -139,9 +139,10 @@ session、live extension context 或 GoalStore I/O 失败属于控制面错误�
 
 Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 
-- `list_skills` / `read_skill` 可发现和读取 `$ORCA_HOME/skills`、`~/.orca/skills` 和项目 `.orca/skills` 下的 Markdown skills。
+- Orca 从受信任的 Git 根目录查找项目的 `.orca/skills` 和 `.agents/skills`；工作区不在 Git 仓库中时，从受信任的工作区根目录查找。用户级路径为 `$ORCA_HOME/skills`（未设置 `ORCA_HOME` 时用 `~/.orca/skills`）和 `~/.agents/skills`。ID 相同时优先使用项目定义。
+- 模型会收到可用 skill 的 ID 和描述。任务匹配时可调用 `read_skill`，需要完整目录时可调用 `list_skills`。
 - TUI `/skills` 会打开可搜索的 `$` picker；选择后的 `$skill_id` 作为原子 composer token 处理，退格或删除不会留下半个 skill 引用。
-- 当 prompt 明确提到 `$skill_id` 时，Orca 会把对应 `SKILL.md` 注入当轮模型上下文。
+- 提及 `$skill_id` 时，Orca 会将对应的 `SKILL.md` 正文按版本加入对话。后续轮次可以继续使用，直到上下文压缩。
 - `ask_user_question` 是唯一注册且模型可见的澄清工具：单次接受 1-4 个问题，每题需要短 header、问题正文和 2-4 个 `label`/`description` 选项，可附 `preview` 并用 `multiSelect` 标记多选。runtime 将整份 questionnaire 作为一个 typed interaction 发布并等待一次提交，最后返回 `answers` JSON；任一题可留空，取消会取消整次工具调用。
 - headless 路径确定性失败而不阻塞。TUI 在 composer 槽位内联显示整份 questionnaire，支持翻页、单选、多选、自定义答案、preview、未答确认及 `Ctrl+T` Chat；提交 ACK 后才在 transcript 回显答案，失败时恢复完整问卷和原 composer 草稿。
 
@@ -162,7 +163,8 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 | 能力 | 当前差距 | 建议优先级 |
 |------|----------|------------|
 | Notebook 读取 | `read_file` 读 UTF-8 文本；PDF、Word、PowerPoint 和图片由 `read_document` 经 DeepSeek OCR 读取（需要官方 endpoint），图片还不能直接交给模型看 | P2 |
-| apply_patch freeform | 仍以 JSON `edit` / `write_file` 为主 | P2 |
+
+多文件补丁已支持。`apply_patch` 接收 JSON `input` 字符串，可在一次调用中新增、修改、删除和移动多个文件。默认关闭，在配置中设置 `[tools] apply_patch = true` 后启用。
 
 ## 可靠性保证
 
@@ -183,7 +185,6 @@ Orca 的 skills 和结构化问答共用 runtime-owned 交互边界：
 ### 中期
 
 1. 支持图片/PDF/Notebook 读取。
-2. 将 `apply_patch` 做成 grammar-backed freeform tool。
 
 ### 长期
 

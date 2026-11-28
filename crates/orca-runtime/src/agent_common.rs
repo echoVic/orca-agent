@@ -10,7 +10,7 @@ use orca_tools::skills;
 
 use crate::instructions::ProjectInstructions;
 use crate::memory::MemoryBlock;
-use crate::system_prompt::build_system_prompt_for_tools as build_base_system_prompt_for_tools;
+use crate::system_prompt::{SystemPrompt, build_system_prompt_sections};
 
 const PLAN_MODE_INSTRUCTIONS: &str = r#"## Plan Mode
 You are in read-only planning mode. Your job is to investigate the request and produce an implementation-ready plan for user approval before any execution begins.
@@ -72,8 +72,8 @@ pub fn build_agent_system_prompt_for_tools(
         None,
         DelegationPolicy::default(),
         allowed_tools,
-        None,
     )
+    .render()
 }
 
 /// Builds the agent system prompt with the delegation policy that actually
@@ -101,10 +101,11 @@ pub fn build_agent_system_prompt_with_goal(
         active_goal,
         delegation,
         role_tools.as_deref(),
-        None,
     )
+    .render()
 }
 
+#[cfg(test)]
 pub(crate) fn build_agent_system_prompt_for_config(
     cwd: &Path,
     config: &RunConfig,
@@ -114,6 +115,27 @@ pub(crate) fn build_agent_system_prompt_for_config(
     memory: Option<&MemoryBlock>,
     allowed_tools: Option<&[String]>,
 ) -> String {
+    build_agent_system_prompt_sections(
+        cwd,
+        config,
+        subagent_depth,
+        subagent_type,
+        instructions,
+        memory,
+        allowed_tools,
+    )
+    .render()
+}
+
+pub(crate) fn build_agent_system_prompt_sections(
+    cwd: &Path,
+    config: &RunConfig,
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    instructions: Option<&ProjectInstructions>,
+    memory: Option<&MemoryBlock>,
+    allowed_tools: Option<&[String]>,
+) -> SystemPrompt {
     let role_tools = inferred_role_tools(subagent_depth, subagent_type);
     let allowed_tools = allowed_tools
         .or_else(|| {
@@ -137,11 +159,9 @@ pub(crate) fn build_agent_system_prompt_for_config(
             .delegation
             .for_child(subagent_depth, config.subagents.max_depth),
         allowed_tools,
-        Some(config),
     );
     if let Some(definition) = &config.subagents.effective_definition {
-        prompt.push_str("\n\n");
-        prompt.push_str(&definition.system_prompt);
+        prompt.push("custom agent", format!("\n\n{}", definition.system_prompt));
     }
     prompt
 }
@@ -157,38 +177,32 @@ fn build_agent_system_prompt_with_goal_and_tools(
     active_goal: Option<&ThreadGoal>,
     delegation: DelegationPolicy,
     allowed_tools: Option<&[String]>,
-    config: Option<&RunConfig>,
-) -> String {
-    let mut prompt = if let Some(config) = config {
-        crate::system_prompt::build_system_prompt_for_config(
-            cwd,
-            config,
-            subagent_depth,
-            allowed_tools,
-        )
-    } else {
-        build_base_system_prompt_for_tools(cwd, allowed_tools)
-    };
+) -> SystemPrompt {
+    let mut prompt = build_system_prompt_sections(cwd, allowed_tools);
     if let Some(block) = memory.and_then(MemoryBlock::to_system_prompt_block) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&block);
+        prompt.push("memory", format!("\n\n{block}"));
     }
-    if let Some(block) = instructions.and_then(ProjectInstructions::to_system_prompt_block) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&block);
+    if let Some(instructions) = instructions
+        && let Some(block) = instructions.to_system_prompt_block()
+    {
+        prompt.push_instructions(format!("\n\n{block}"), instructions.scope(cwd));
     }
     if subagent_depth == 0 {
-        prompt.push_str(&format_subagent_guidance(delegation));
+        prompt.push("delegation", format_subagent_guidance(delegation));
     } else {
-        prompt.push_str(&format_child_agent_contract(subagent_type, delegation));
+        prompt.push(
+            "agent role",
+            format_child_agent_contract(subagent_type, delegation),
+        );
     }
     if approval_mode == ApprovalMode::Plan {
-        prompt.push_str("\n\n");
-        prompt.push_str(PLAN_MODE_INSTRUCTIONS);
+        prompt.push("plan mode", format!("\n\n{PLAN_MODE_INSTRUCTIONS}"));
     }
     if let Some(goal) = active_goal {
-        prompt.push_str("\n\n");
-        prompt.push_str(&format_goal_mode_instructions(goal));
+        prompt.push(
+            "goal mode",
+            format!("\n\n{}", format_goal_mode_instructions(goal)),
+        );
     }
     prompt
 }
@@ -231,12 +245,13 @@ pub fn format_subagent_guidance(delegation: DelegationPolicy) -> String {
 
 {permission}
 - {exploration_rule}
-- Scope children to one subsystem or call chain and a few entry files, not repo-wide audits. Give each user-named independent branch its own child when capacity allows; do not bundle unrelated branches to reduce count.
+- Limit children to one subsystem or call chain and a few entry files, and do not bundle unrelated branches. Give each user-named independent branch its own child as capacity allows.
 - {context_rule}
-- Keep single-file work, small lookups, coupled changes, and live user input local.
+- Keep single-file work, small lookups, coupled edits, and user input local.
 - Continue non-overlapping work. Integrate exact evidence, including missing-file errors; do not repeat searches/reread cited files unless verifying a concrete inconsistency.
-- One launch per named branch: integrate complete/partial/failed/uncertain results and questions. Replace only for explicit exhaustive completion or a new independently bounded blocking question.
-- Stay in scope; stop when briefing costs exceed remaining work. Capacity is a ceiling, not a target/quota.
+- If only child results remain, end your reply. Orca resumes the turn as results arrive.
+- One launch per named branch. Integrate all results and questions. Replace only for explicit exhaustive completion or a new independently bounded blocking question.
+- Stop when briefing costs exceed remaining work. Capacity is a ceiling, not a target/quota.
 Roles, tool ceilings, reports: see `subagent`."#
     )
 }
@@ -453,7 +468,13 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 pub fn format_tool_result_for_model(result: &ToolResult) -> String {
     match (&result.output, &result.error) {
         (Some(output), _) => {
-            if result.truncated {
+            if let Some(spill) = result
+                .spill
+                .as_ref()
+                .filter(|spill| spill.matches_call(&result.id))
+            {
+                spill.render(spill.preview(output))
+            } else if result.truncated {
                 format!("{output}\n[output truncated]")
             } else {
                 output.clone()
@@ -479,6 +500,52 @@ pub fn requires_approval(action: ActionKind) -> bool {
 mod tests {
     use super::*;
     use orca_core::goal_types::{ThreadGoal, ThreadGoalStatus};
+    use orca_core::tool_types::{ToolName, ToolRequest};
+
+    #[test]
+    fn spill_like_tool_text_keeps_the_truncation_notice() {
+        let request = ToolRequest {
+            id: "ordinary".into(),
+            name: ToolName::WebFetch,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let path = std::env::current_dir().unwrap().join("spill/ordinary.txt");
+        let notice =
+            orca_core::tool_types::tool_output_spill_notice(10, &path.display().to_string());
+        let output = format!("head\n\n{notice}");
+        let result = ToolResult::completed(&request, output.clone(), true);
+        assert_eq!(
+            format_tool_result_for_model(&result),
+            format!("{output}\n[output truncated]")
+        );
+    }
+
+    #[test]
+    fn a_spilled_result_ends_with_the_file_notice() {
+        let request = ToolRequest {
+            id: "spill".into(),
+            name: ToolName::WebFetch,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let path = std::env::temp_dir().join("spill").join("spill.txt");
+        let notice =
+            orca_core::tool_types::tool_output_spill_notice(10, &path.display().to_string());
+        let output = format!("head\n\ntail\n\n{notice}");
+        let mut result = ToolResult::completed(&request, "head\n\ntail".into(), true);
+        result.set_spill(
+            orca_core::tool_types::ToolOutputSpill::new(
+                path.parent().unwrap().to_owned(),
+                request.id.clone(),
+                10,
+            )
+            .unwrap(),
+        );
+        assert_eq!(format_tool_result_for_model(&result), output);
+    }
 
     #[test]
     fn computer_actions_require_approval() {
@@ -537,7 +604,7 @@ mod tests {
             "verifying a concrete inconsistency",
             "including missing-file errors",
             "One launch per named branch",
-            "complete/partial/failed/uncertain",
+            "Integrate all results and questions",
             "explicit exhaustive completion",
             "new independently bounded blocking question",
         ] {
@@ -550,6 +617,15 @@ mod tests {
             .unwrap();
         assert!(schema.contains("Only for a downstream machine"));
         assert!(schema.contains("omit for ordinary human-readable evidence reports"));
+    }
+
+    #[test]
+    fn delegation_guidance_allows_ending_a_reply_while_subagents_run() {
+        for policy in [DelegationPolicy::Adaptive, DelegationPolicy::Explicit] {
+            let guidance = format_subagent_guidance(policy);
+            assert!(guidance.contains("If only child results remain, end your reply"));
+            assert!(guidance.contains("Orca resumes the turn as results arrive"));
+        }
     }
 
     #[test]

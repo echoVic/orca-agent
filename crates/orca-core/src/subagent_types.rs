@@ -49,12 +49,15 @@ pub enum RoleCapability {
     Execute,
 }
 
-/// How much conversation context the role receives. Phase one ships only
-/// `Fresh`; `Fork` is reserved for the bounded-context work.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// How much conversation context the child receives.
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RoleContextPolicy {
     /// A standalone brief with the current system prompt only.
+    #[default]
     Fresh,
+    /// The parent's completed history followed by the child's brief.
+    Fork,
 }
 
 /// Everything the runtime knows about one built-in role.

@@ -45,7 +45,11 @@ fn tool_schema_preserves_canonical_definitions_across_agent_policies() {
 
     let root = canonical_tool_definitions(&ToolPolicy::base(), &registry);
     let read_file = definition(&root, "read_file");
-    assert!(read_file.description.contains("Read the contents"));
+    assert!(
+        read_file
+            .description
+            .contains("Read a file relative to the workspace root")
+    );
     assert_eq!(
         read_file.input_schema["required"],
         serde_json::json!(["path"])
@@ -63,7 +67,7 @@ fn tool_schema_preserves_canonical_definitions_across_agent_policies() {
         &ToolPolicy::for_subagent(&SubagentType::CodeReviewer),
         &registry,
     );
-    assert!(child.iter().any(|tool| tool.name == "read_file"));
+    assert_eq!(definition(&child, "read_file"), read_file);
     assert!(child.iter().any(|tool| tool.name == "glob"));
     assert!(!child.iter().any(|tool| tool.name == "subagent"));
     assert!(!child.iter().any(|tool| tool.name == "mcp__local__inspect"));

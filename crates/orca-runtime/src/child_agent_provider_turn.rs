@@ -1,5 +1,7 @@
+use std::borrow::Cow;
 use std::io;
 use std::path::Path;
+use std::time::Instant;
 
 use orca_core::cancel::CancelToken;
 use orca_core::config::RunConfig;
@@ -10,6 +12,7 @@ use orca_core::model::{ImageRouteDecision, ModelRouteContext, accepts_tool_image
 use orca_core::provider_types::{ProviderResponse, ProviderStep};
 use orca_core::subagent_types::SubagentType;
 use orca_core::tool_images::{TOOL_IMAGE_UNAVAILABLE_NOTE, drop_tool_images};
+use orca_provider::ProviderConfig;
 
 use crate::child_agent_loop_setup::ChildAgentLoopSetup;
 use crate::child_agent_types::{
@@ -120,8 +123,14 @@ pub fn run_child_agent_provider_turn(
             };
         }
     };
-    let model_conversation =
+    let mut model_conversation =
         child_agent_model_conversation(&setup.conversation, &pre_model_outcome, model_turn);
+    if config.provider == orca_core::config::ProviderKind::DeepSeek {
+        orca_provider::deepseek_http::bind_replay_source(
+            &mut model_conversation,
+            &setup.conversation,
+        );
+    }
 
     let response = orca_provider::call_streaming(
         config.provider,
@@ -191,8 +200,14 @@ pub fn run_child_agent_provider_turn_observed(
             };
         }
     };
-    let model_conversation =
+    let mut model_conversation =
         child_agent_model_conversation(&setup.conversation, &pre_model_outcome, model_turn);
+    if config.provider == orca_core::config::ProviderKind::DeepSeek {
+        orca_provider::deepseek_http::bind_replay_source(
+            &mut model_conversation,
+            &setup.conversation,
+        );
+    }
 
     let mut activity_error = None;
     let response = orca_provider::call_streaming(
@@ -256,10 +271,11 @@ pub fn compact_child_agent_conversation_if_needed(
     let mut events = EventFactory::new("child-agent-compaction".to_string());
     let mut sink = EventSink::new(child_event_output(), config.output_format);
     let subagent_type = SubagentType::General;
+    let provider = child_compaction_provider(config, &setup.provider_config);
     let mut compaction = RuntimeCompactionStep::new(
         config.provider,
         &setup.context_config,
-        &setup.provider_config,
+        &provider,
         RuntimeTurnContext::new(cwd, "", 0, false, &subagent_type),
         hooks,
         &mut events,
@@ -267,6 +283,28 @@ pub fn compact_child_agent_conversation_if_needed(
         None,
     );
     compaction.compact_if_needed(&mut setup.conversation)
+}
+
+fn child_compaction_provider<'a>(
+    config: &RunConfig,
+    provider: &'a ProviderConfig,
+) -> Cow<'a, ProviderConfig> {
+    let model = config
+        .model
+        .route(ModelRouteContext {
+            subagent_type: &SubagentType::General,
+            subagent_model: None,
+            has_images: false,
+        })
+        .actual_model;
+    if provider.model.as_deref() == Some(model.as_str()) {
+        Cow::Borrowed(provider)
+    } else {
+        Cow::Owned(ProviderConfig {
+            model: Some(model),
+            ..provider.clone()
+        })
+    }
 }
 
 /// Before a child request: compact when needed, and fail the child with a
@@ -278,19 +316,37 @@ pub fn prepare_child_agent_request(
     cwd: &Path,
     hooks: &HookRunner,
 ) -> io::Result<Result<(), String>> {
+    prepare_child_agent_request_with_cost(config, setup, cwd, hooks, None, None)
+}
+
+pub(crate) fn prepare_child_agent_request_with_cost(
+    config: &RunConfig,
+    setup: &mut ChildAgentLoopSetup,
+    cwd: &Path,
+    hooks: &HookRunner,
+    cost_tracker: Option<&mut CostTracker>,
+    deadline: Option<Instant>,
+) -> io::Result<Result<(), String>> {
     let mut events = EventFactory::new("child-agent-compaction".to_string());
     let mut sink = EventSink::new(child_event_output(), config.output_format);
     let subagent_type = SubagentType::General;
+    let provider = child_compaction_provider(config, &setup.provider_config);
     let mut compaction = RuntimeCompactionStep::new(
         config.provider,
         &setup.context_config,
-        &setup.provider_config,
+        &provider,
         RuntimeTurnContext::new(cwd, "", 0, false, &subagent_type),
         hooks,
         &mut events,
         &mut sink,
         None,
-    );
+    )
+    .with_deadline(deadline);
+    if let Some(tracker) = cost_tracker {
+        compaction = compaction
+            .with_cost_tracker(tracker)
+            .with_max_cost(config.budget.max_cost_usd_micros);
+    }
     Ok(compaction
         .prepare_request(&mut setup.conversation)?
         .map_err(|overflow| {
@@ -305,6 +361,18 @@ pub fn handle_child_agent_provider_error(
     hooks: &HookRunner,
     response: &ProviderResponse,
 ) -> io::Result<Option<ChildAgentProviderErrorDecision>> {
+    handle_child_agent_provider_error_with_cost(config, setup, cwd, hooks, response, None, None)
+}
+
+pub(crate) fn handle_child_agent_provider_error_with_cost(
+    config: &RunConfig,
+    setup: &mut ChildAgentLoopSetup,
+    cwd: &Path,
+    hooks: &HookRunner,
+    response: &ProviderResponse,
+    cost_tracker: Option<&mut CostTracker>,
+    deadline: Option<Instant>,
+) -> io::Result<Option<ChildAgentProviderErrorDecision>> {
     let Some(error) = response.steps.iter().find_map(|step| match step {
         ProviderStep::Error(message) => Some(message.clone()),
         _ => None,
@@ -313,24 +381,28 @@ pub fn handle_child_agent_provider_error(
         return Ok(None);
     };
 
-    match RuntimeCompactionPolicy::decide_for_provider_error(
-        &error.message,
-        &setup.compaction_retry,
-    ) {
+    match RuntimeCompactionPolicy::decide_for_provider_error(&error, &setup.compaction_retry) {
         RuntimeCompactionRetryDecision::CompactAndRetry { trigger, reason: _ } => {
             let mut events = EventFactory::new("child-agent-compaction".to_string());
             let mut sink = EventSink::new(child_event_output(), config.output_format);
             let subagent_type = SubagentType::General;
+            let provider = child_compaction_provider(config, &setup.provider_config);
             let mut compaction = RuntimeCompactionStep::new(
                 config.provider,
                 &setup.context_config,
-                &setup.provider_config,
+                &provider,
                 RuntimeTurnContext::new(cwd, "", 0, false, &subagent_type),
                 hooks,
                 &mut events,
                 &mut sink,
                 None,
-            );
+            )
+            .with_deadline(deadline);
+            if let Some(tracker) = cost_tracker {
+                compaction = compaction
+                    .with_cost_tracker(tracker)
+                    .with_max_cost(config.budget.max_cost_usd_micros);
+            }
             if compaction.compact_after_provider_error_retry(&mut setup.conversation, trigger)? {
                 setup.compaction_retry.record_prompt_too_long_retry();
                 Ok(Some(ChildAgentProviderErrorDecision::RetryAfterCompaction))

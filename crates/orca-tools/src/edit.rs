@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
 
@@ -39,6 +40,7 @@ pub fn execute_or_cancel(
 
     ToolResult::completed(request, format!("edited {}", plan.relative_path), false)
         .with_file_change_preview(preview)
+        .with_touched_file(plan.path)
 }
 
 /// The diff this edit would make, without writing it, for an approval to
@@ -59,6 +61,35 @@ struct PlannedEdit {
     updated: String,
 }
 
+pub(crate) fn crlf_majority(bytes: &[u8]) -> bool {
+    let mut crlf = 0;
+    let mut lf = 0;
+    let mut previous_was_cr = false;
+    for &byte in bytes {
+        if byte == b'\n' {
+            if previous_was_cr {
+                crlf += 1;
+            } else {
+                lf += 1;
+            }
+        }
+        previous_was_cr = byte == b'\r';
+    }
+    crlf > lf
+}
+
+fn normalize_for_edit(text: &str, crlf: bool) -> Cow<'_, str> {
+    if crlf {
+        Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+fn restored_len(text: &str, crlf: bool) -> usize {
+    text.len() + if crlf { text.matches('\n').count() } else { 0 }
+}
+
 fn plan_edit(
     request: &ToolRequest,
     cwd: &Path,
@@ -74,23 +105,29 @@ fn plan_edit(
     }
     let contents = read_text_file_with_limit(&path, MAX_EDIT_FILE_BYTES, should_cancel)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let matches = contents.matches(&*old).count();
+    let crlf = crlf_majority(contents.as_bytes());
+    let matching_contents = normalize_for_edit(&contents, crlf);
+    let old = normalize_for_edit(&old, crlf);
+    let new = normalize_for_edit(&new, crlf);
+    let matches = matching_contents.matches(old.as_ref()).take(2).count();
     if matches == 0 {
         return Err("edit old text was not found".to_string());
     }
     if matches > 1 {
         return Err("edit old text matched multiple locations".to_string());
     }
-    let updated_bytes = contents
-        .len()
-        .saturating_sub(old.len())
-        .saturating_add(new.len());
+    let updated_bytes = restored_len(&matching_contents, crlf)
+        .saturating_sub(restored_len(&old, crlf))
+        .saturating_add(restored_len(&new, crlf));
     if updated_bytes > MAX_EDIT_FILE_BYTES {
         return Err(format!(
             "edited file would be too large ({updated_bytes} bytes; maximum {MAX_EDIT_FILE_BYTES} bytes)"
         ));
     }
-    let updated = contents.replacen(&*old, &new, 1);
+    let mut updated = matching_contents.replacen(old.as_ref(), &new, 1);
+    if crlf {
+        updated = updated.replace('\n', "\r\n");
+    }
     let relative_path = path
         .strip_prefix(cwd)
         .unwrap_or(&path)
@@ -177,6 +214,74 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn edit_text(contents: &str, old: &str, new: &str) -> (ToolResult, String) {
+        let dir = temp_dir("line-endings");
+        let file = dir.join("test.txt");
+        fs::write(&file, contents).unwrap();
+        let raw = serde_json::json!({"path": "test.txt", "old_text": old, "new_text": new});
+        let result = execute(&make_request(None, Some(&raw.to_string())), &dir);
+        (result, fs::read_to_string(&file).unwrap())
+    }
+
+    #[test]
+    fn a_multi_line_edit_matches_a_crlf_file() {
+        let (result, text) = edit_text("a\r\nb\r\nc\r\n", "a\nb", "x\ny");
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(text, "x\r\ny\r\nc\r\n");
+        assert_eq!(
+            result.file_change_preview.as_deref(),
+            Some(&build_file_change_preview(
+                "test.txt",
+                Some("a\r\nb\r\nc\r\n"),
+                Some(&text),
+            ))
+        );
+    }
+
+    #[test]
+    fn old_text_with_crlf_still_matches_a_crlf_file() {
+        let (result, text) = edit_text("a\r\nb\r\nc\r\n", "a\r\nb", "x\r\ny");
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(text, "x\r\ny\r\nc\r\n");
+    }
+
+    #[test]
+    fn uniqueness_is_counted_on_normalized_text() {
+        let original = "a\r\nb\r\na\r\nb\r\n";
+        let (result, text) = edit_text(original, "a\nb", "x\ny");
+
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("edit old text matched multiple locations")
+        );
+        assert_eq!(text, original);
+    }
+
+    #[test]
+    fn an_lf_file_is_edited_as_before() {
+        let (result, text) = edit_text("a\nb\nc\n", "a\nb", "x\ny");
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(text, "x\ny\nc\n");
+    }
+
+    #[test]
+    fn a_file_without_crlf_majority_is_edited_byte_exactly() {
+        for (original, old, new, expected) in [
+            ("a\rb\rc", "a\rb", "x\ry", "x\ry\rc"),
+            ("one line", "one", "another", "another line"),
+            ("a\r\nb\nc", "b\nc", "y\nz", "a\r\ny\nz"),
+        ] {
+            let (result, text) = edit_text(original, old, new);
+
+            assert_eq!(result.status, ToolStatus::Completed);
+            assert_eq!(text, expected);
+        }
     }
 
     #[test]

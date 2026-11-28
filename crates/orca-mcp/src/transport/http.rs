@@ -6,7 +6,7 @@ use std::io::Read;
 use std::sync::mpsc;
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -27,6 +27,8 @@ pub(crate) const MAX_SSE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// A streamable HTTP POST accepts both ways a server may answer it.
 pub(crate) const HTTP_ACCEPT: &str = "application/json, text/event-stream";
+
+static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
@@ -66,6 +68,7 @@ pub(super) struct StreamableHttpTransport {
     headers: HeaderMap,
     auth: Arc<RemoteAuth>,
     session: Mutex<HttpSession>,
+    session_generation: AtomicU64,
     next_id: Mutex<u64>,
     client: reqwest::blocking::Client,
     startup_timeout: Duration,
@@ -173,6 +176,7 @@ impl StreamableHttpTransport {
             headers: configured_headers(config)?,
             auth,
             session: Mutex::new(HttpSession::default()),
+            session_generation: AtomicU64::new(0),
             next_id: Mutex::new(1),
             client: crate::http::blocking_client().map_err(|error| {
                 format!(
@@ -187,6 +191,10 @@ impl StreamableHttpTransport {
 }
 
 impl McpTransport for StreamableHttpTransport {
+    fn session_generation(&self) -> u64 {
+        self.session_generation.load(Ordering::Relaxed)
+    }
+
     fn initialize(&self) -> Result<Value, String> {
         self.start_session().map_err(HttpRequestError::into_message)
     }
@@ -355,6 +363,10 @@ impl StreamableHttpTransport {
             .get(MCP_SESSION_ID_HEADER)
             .filter(|id| !id.is_empty())
             .cloned();
+        self.session_generation.store(
+            NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         let protocol_version = match negotiated_protocol_version(&self.server_name, &result) {
             Ok(version) => version,
             Err(error) => {
@@ -500,13 +512,7 @@ impl StreamableHttpTransport {
             Err(error) if error.ended_session() => {}
             first => return first.map_err(HttpRequestError::into_message),
         }
-        self.start_session().map_err(|error| {
-            format!(
-                "MCP server '{}' ended its session, and starting a new one failed: {}",
-                self.server_name,
-                error.into_message()
-            )
-        })?;
+        self.renew_session()?;
         retry().map_err(|error| {
             if error.ended_session() {
                 format!(
@@ -520,6 +526,16 @@ impl StreamableHttpTransport {
         })
     }
 
+    fn renew_session(&self) -> Result<(), String> {
+        self.start_session().map(|_| ()).map_err(|error| {
+            format!(
+                "MCP server '{}' ended its session, and starting a new one failed: {}",
+                self.server_name,
+                error.into_message()
+            )
+        })
+    }
+
     fn request_with_timeout_or_cancel(
         &self,
         method: &str,
@@ -529,6 +545,13 @@ impl StreamableHttpTransport {
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Value, String> {
         let first = self.stream_request(method, params.clone(), timeout, handler, should_cancel);
+        if method == "tools/call" && first.as_ref().is_err_and(HttpRequestError::ended_session) {
+            self.renew_session()?;
+            return Err(format!(
+                "MCP server '{}' renewed its session. Review its current tools and submit the tool call again.",
+                self.server_name
+            ));
+        }
         self.retry_in_new_session(first, || {
             self.stream_request(method, params, timeout, handler, should_cancel)
         })
@@ -761,6 +784,12 @@ impl SseFallbackTransport {
 }
 
 impl McpTransport for SseFallbackTransport {
+    fn session_generation(&self) -> u64 {
+        self.transport
+            .get()
+            .map_or(0, |transport| transport.session_generation())
+    }
+
     fn capability_receipt(&self) -> Option<CapabilityReceipt> {
         self.transport.get()?.capability_receipt()
     }
@@ -2926,13 +2955,13 @@ mod tests {
 
     #[test]
     fn an_expired_http_session_is_reinitialized_once() {
-        // The server ends session s1 as soon as it starts. Both request paths
-        // start session s2 and send the request once more.
+        // The server ends session s1 as soon as it starts. A tool call returns
+        // to the caller after renewal, while a tool listing retries once.
         let (server, transport) = expiring_http_session(vec!["s1"]);
-        let result = transport
+        let error = transport
             .call_tool("echo", json!({"text": "again"}))
-            .expect("tool call in the new session");
-        assert_eq!(result["content"][0]["text"], "again");
+            .unwrap_err();
+        assert!(error.contains("submit the tool call again"), "{error}");
         assert_eq!(
             server.session_trail(),
             [
@@ -2941,7 +2970,6 @@ mod tests {
                 "tools/call s1",
                 "initialize",
                 "notifications/initialized s2",
-                "tools/call s2"
             ]
         );
 
@@ -2973,14 +3001,83 @@ mod tests {
         // Ended again straight away: one retry, then an error naming the server.
         let (server, transport) = expiring_http_session(vec!["s1", "s2"]);
         let error = transport
-            .call_tool("echo", json!({"text": "again"}))
-            .expect_err("a second 404 must fail the call");
+            .list_tools(None)
+            .expect_err("a second 404 must fail the listing");
         assert!(
             error.contains("MCP server 'expiring'") && error.contains("404 Not Found"),
             "unexpected error: {error}"
         );
         assert_eq!(server.requests_for("initialize").len(), 2);
-        assert_eq!(server.requests_for("tools/call").len(), 2);
+        assert_eq!(server.requests_for("tools/list").len(), 2);
+    }
+
+    #[test]
+    fn eager_tools_refresh_when_http_renews_a_session() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            sessions: vec!["s1", "s2"],
+            renew_tools_on_call: true,
+            ..Default::default()
+        });
+        let registry = crate::initialize_registry(&[streamable_http_config("docs", &server)], None);
+        assert!(registry.wait_for_startup(&|| false));
+        let echo = registry.resolve_agent_tool("mcp__docs__echo").unwrap();
+        let error = registry.call_tool(&echo, json!({})).unwrap_err();
+        assert!(error.contains("submit the tool call again"), "{error}");
+        assert_eq!(server.requests_for("tools/call").len(), 1);
+        assert!(registry.resolve_agent_tool("mcp__docs__echo").is_none());
+        let search = registry.resolve_agent_tool("mcp__docs__search").unwrap();
+        assert!(
+            registry
+                .call_tool(&search, json!({"text":"new request"}))
+                .is_ok()
+        );
+        assert!(
+            server
+                .session_trail()
+                .ends_with(&["tools/list s2".into(), "tools/call s2".into()])
+        );
+    }
+
+    #[test]
+    fn on_demand_tools_refresh_when_http_renews_a_session() {
+        let server = StreamableHttpServer::start(StreamableHttpBehavior {
+            sessions: vec!["s1", "s2"],
+            renew_tools_on_call: true,
+            ..Default::default()
+        });
+        let mut config = streamable_http_config("docs", &server);
+        config.tool_loading = orca_core::mcp_types::McpToolLoading::OnDemand;
+        let registry = crate::initialize_registry(&[config], None);
+        assert!(registry.wait_for_startup(&|| false));
+        registry.load_tools("docs", &["echo".into()]).unwrap();
+        let echo = registry.resolve_agent_tool("mcp__docs__echo").unwrap();
+        let error = registry
+            .call_tool(&echo, json!({"text":"test"}))
+            .unwrap_err();
+        assert!(error.contains("submit the tool call again"), "{error}");
+        assert_eq!(server.requests_for("tools/call").len(), 1);
+        assert!(registry.call_tool(&echo, json!({})).is_err());
+        assert_eq!(server.requests_for("tools/call").len(), 1);
+        assert_eq!(
+            registry
+                .tools()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            ["search"]
+        );
+        assert!(registry.resolve_agent_tool("mcp__docs__echo").is_none());
+        assert!(registry.resolve_agent_tool("mcp__docs__search").is_none());
+        registry.load_tools("docs", &["search".into()]).unwrap();
+        let search = registry.resolve_agent_tool("mcp__docs__search").unwrap();
+        registry
+            .call_tool(&search, json!({"text":"new request"}))
+            .unwrap();
+        assert!(
+            server
+                .session_trail()
+                .ends_with(&["tools/list s2".into(), "tools/call s2".into()])
+        );
     }
 
     #[test]
@@ -3727,6 +3824,7 @@ mod tests {
         /// Sessions the server ends right after they are initialized: every
         /// later request that carries one gets 404.
         ended_sessions: Vec<&'static str>,
+        renew_tools_on_call: bool,
         /// The status the server acknowledges notifications with.
         notification_status: u16,
         /// Answer requests with an SSE stream that carries a log notification
@@ -3751,6 +3849,7 @@ mod tests {
                 protocol_version: "2025-06-18",
                 sessions: Vec::new(),
                 ended_sessions: Vec::new(),
+                renew_tools_on_call: false,
                 notification_status: 202,
                 event_stream: false,
                 elicit: false,
@@ -3971,6 +4070,12 @@ mod tests {
             let Some(session) = session else {
                 return write_http_status(stream, 400);
             };
+            if behavior.renew_tools_on_call
+                && session == "s1"
+                && request.rpc_method() == Some("tools/call")
+            {
+                return write_http_status(stream, 404);
+            }
             if !behavior.sessions.contains(&session)
                 || (is_request && behavior.ended_sessions.contains(&session))
             {
@@ -3988,10 +4093,17 @@ mod tests {
         }
         let result = match request.rpc_method() {
             Some("tools/list") => json!({"tools": [{
-                "name": "echo",
+                "name": if behavior.renew_tools_on_call && session == Some("s2") { "search" } else { "echo" },
                 "description": "echoes its text",
                 "inputSchema": {"type": "object"}
             }]}),
+            Some("tools/call")
+                if behavior.renew_tools_on_call
+                    && session == Some("s2")
+                    && request.body["params"]["name"] != "search" =>
+            {
+                return write_http_status(stream, 400);
+            }
             Some("tools/call") if behavior.elicit => {
                 return elicit_before_answering(stream, id, log);
             }

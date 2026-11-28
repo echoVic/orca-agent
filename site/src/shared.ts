@@ -4,9 +4,30 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.23";
+export const releaseVersion = "v0.5.26";
 
 export const releases = [
+  {
+    version: "v0.5.26",
+    date: "2026-11-28",
+    title: "Reuse conversation context and keep full tool results",
+    body: "Deep compaction writes a structured checkpoint from the cached conversation. Resumed sessions keep their recorded prompt, and a fork child can start from the parent's completed history. Large tool results remain readable after compaction. Orca discovers nested AGENTS.md files, shows the model a skills catalog, and supports on-demand MCP tools and opt-in multi-file patches. You can steer a parent waiting for children, and concurrent workflow task-list updates are preserved.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.26",
+  },
+  {
+    version: "v0.5.25",
+    date: "2026-11-27",
+    title: "Keep interrupted replies and see provider retries",
+    body: "Replies cut short by Esc or the output limit stay in the conversation after a resume. The terminal shows when a provider will retry, and DeepSeek errors include the HTTP status and request ID when available. The session picker identifies transcripts that need a newer Orca. Background commands can report completion during the same turn. DeepSeek's 128-tool cap gives Orca's tools priority, and MCP server instructions reach the model. Scripts stopped by a limit keep their logs, and edit and write_file preserve CRLF line endings.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.25",
+  },
+  {
+    version: "v0.5.24",
+    date: "2026-11-27",
+    title: "grep handles patterns that start with a dash",
+    body: "grep now accepts patterns that start with -. A search for -> Result used to fail with an rg usage error and now finds matching lines. Patterns still use regular expressions. Your ripgrep config file no longer changes the results. A path outside the workspace or a symlink leading out of it is refused with path escapes workspace. The grep tests cover patterns starting with -, a file named -, paths that resolve to the workspace root, and refusals for paths outside the workspace, including through a symlink. Session search now finds text that starts with -.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.24",
+  },
   {
     version: "v0.5.23",
     date: "2026-11-23",

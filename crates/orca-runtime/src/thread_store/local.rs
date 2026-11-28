@@ -18,7 +18,7 @@ use super::projection::{
     conversation_records_to_thread_items, conversation_records_to_thread_turns,
     is_surface_coordinator_record, normalized_stored_messages, stored_message_to_thread_json,
 };
-use super::reader::iter_records;
+use super::reader::{is_ignorable_search_line, iter_records};
 use super::session_index::{self, SessionSummaryPage};
 use super::types::{
     SessionMeta, SessionRecord, SessionSummary, SessionTranscript, SortDirection,
@@ -302,8 +302,10 @@ impl JsonlThreadStore {
             target,
             orca_platform::fs::AtomicWritePolicy::NoFollow,
             |output| {
-                for record in iter_records(&path, HydrateImages::All)? {
-                    super::writer::write_record_line(&mut *output, &record?)?;
+                for record in iter_records(&path, HydrateImages::All)?.require_metadata() {
+                    let mut record = record?;
+                    super::spill::omit_from_export(&mut record);
+                    super::writer::write_record_line(&mut *output, &record)?;
                 }
                 Ok(())
             },
@@ -313,10 +315,10 @@ impl JsonlThreadStore {
 }
 
 pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
-    let path = if is_latest_selector(selector) {
-        latest_session_path(true)?
-    } else {
-        find_session_path(selector, true)?
+    let path = match resolve_session_path(selector, true)? {
+        Some(path) => Some(path),
+        None if !is_latest_selector(selector) => super::retention::find_pending_delete(selector)?,
+        None => None,
     }
     .ok_or_else(|| {
         io::Error::new(
@@ -326,10 +328,7 @@ pub fn delete_session(selector: &str) -> io::Result<PathBuf> {
     })?;
     let _owner = super::retention::acquire_idle_owner(&path)?;
     let _lock = acquire_file_lock(&path)?;
-    fs::remove_file(&path)?;
-    assets::remove_directory(&path)?;
-    #[cfg(not(test))]
-    let _ = session_index::remove_path(&path);
+    super::retention::finish_delete(&path)?;
     Ok(path)
 }
 
@@ -658,6 +657,9 @@ pub(crate) fn storage_identity_for_path(path: &Path) -> String {
 
 pub fn search_sessions(query: &str, include_archived: bool) -> io::Result<Vec<SearchHit>> {
     let mut hits = Vec::new();
+    // The in-process backend searches only the inspected prefix. Ripgrep can
+    // also match raw lines past that limit, with each hit checked against the
+    // bounded catalog health and its own skippable marker.
     let used_ripgrep = search_roots_with_ripgrep(query, include_archived, &mut hits)?;
     let mut seen: HashSet<(PathBuf, usize)> = hits
         .iter()
@@ -733,6 +735,9 @@ impl RipgrepSearchCollector {
         let Some(line_text) = value["data"]["lines"]["text"].as_str() else {
             return;
         };
+        if is_ignorable_search_line(line_text) {
+            return;
+        }
         let path = PathBuf::from(path_text);
         let (line, _) = truncate_output(
             line_text.trim_end_matches('\n').to_string(),
@@ -745,6 +750,22 @@ impl RipgrepSearchCollector {
             line,
         });
     }
+}
+
+fn ripgrep_search_command(query: &str, roots: &[PathBuf]) -> Command {
+    let mut command = Command::new("rg");
+    command
+        .arg("--no-config")
+        .arg("--json")
+        .arg("--fixed-strings")
+        .arg("--glob")
+        .arg("*.jsonl")
+        .arg(format!("--regexp={query}"))
+        .arg("--")
+        .args(roots)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
 }
 
 fn search_roots_with_ripgrep(
@@ -763,16 +784,7 @@ fn search_roots_with_ripgrep(
         return Ok(true);
     }
 
-    let mut command = Command::new("rg");
-    command
-        .arg("--json")
-        .arg("--fixed-strings")
-        .arg("--glob")
-        .arg("*.jsonl")
-        .arg(query)
-        .args(&roots)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = ripgrep_search_command(query, &roots);
     orca_tools::process::prepare_non_interactive_command(&mut command);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (child, process_job, _receipt) =
@@ -861,13 +873,16 @@ fn push_matching_lines(
     path: &Path,
     archived: bool,
     query: &str,
-    lines: &[String],
+    lines: &[Option<String>],
     hits: &mut Vec<SearchHit>,
     seen: &mut HashSet<(PathBuf, usize)>,
 ) {
     for (index, line) in lines.iter().enumerate() {
         let line_number = index + 1;
-        if line.contains(query) && seen.insert((path.to_path_buf(), line_number)) {
+        if let Some(line) = line
+            && line.contains(query)
+            && seen.insert((path.to_path_buf(), line_number))
+        {
             push_search_hit(path, archived, line_number, line.clone(), hits);
         }
     }
@@ -883,7 +898,7 @@ fn push_search_hit(
     // A bounded index scan may be incomplete without making its prefix
     // unusable for search or turning a large transcript into a corrupt one.
     if let Ok(summary) = summarize_session_with_archive_flag(path, archived) {
-        if summary.health == StoredSessionHealth::Quarantined {
+        if summary.health.blocks_mutation() {
             return;
         }
         hits.push(SearchHit {
@@ -982,6 +997,21 @@ fn latest_session_path(include_archived: bool) -> io::Result<Option<PathBuf>> {
 }
 
 pub(crate) fn collect_session_files(dir: &Path, on_file: &mut dyn FnMut(&Path)) -> io::Result<()> {
+    collect_history_files(dir, false, on_file)
+}
+
+pub(super) fn collect_pending_deletions(
+    dir: &Path,
+    on_file: &mut dyn FnMut(&Path),
+) -> io::Result<()> {
+    collect_history_files(dir, true, on_file)
+}
+
+fn collect_history_files(
+    dir: &Path,
+    pending: bool,
+    on_file: &mut dyn FnMut(&Path),
+) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -992,8 +1022,14 @@ pub(crate) fn collect_session_files(dir: &Path, on_file: &mut dyn FnMut(&Path)) 
                 .to_string_lossy()
                 .ends_with(".jsonl.assets")
         {
-            collect_session_files(&path, on_file)?;
-        } else if file_type.is_file() && is_history_file(&path) {
+            collect_history_files(&path, pending, on_file)?;
+        } else if file_type.is_file()
+            && if pending {
+                super::retention::original_path(&path).is_some_and(|path| is_history_file(&path))
+            } else {
+                is_history_file(&path)
+            }
+        {
             on_file(&path);
         }
     }
@@ -1091,7 +1127,7 @@ impl ThreadStore for JsonlThreadStore {
             )
         })?;
         let _lock = acquire_file_lock(&path)?;
-        let records = iter_records(&path, HydrateImages::All)?;
+        let records = iter_records(&path, HydrateImages::All)?.require_metadata();
         let mut patched = false;
         let records = records.map(|record| {
             let mut record = record?;
@@ -1136,12 +1172,6 @@ impl ThreadStore for JsonlThreadStore {
             Ok(record)
         });
         rewrite_records_unlocked(&path, records)?;
-        if !patched {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "session transcript has no metadata record",
-            ));
-        }
         let summary = summarize_session_with_archive_flag(&path, path.starts_with(archive_dir()))?;
         #[cfg(not(test))]
         let _ = session_index::upsert_summary(&summary);
@@ -1581,6 +1611,52 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_query_does_not_match_a_skipped_record() {
+        let home = tempfile::tempdir().unwrap();
+        crate::history::with_test_orca_home(home.path(), |_| {
+            let root = sessions_dir();
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("compat.jsonl");
+            let meta = serde_json::to_string(&SessionRecord::Meta(crate::history::create_meta(
+                home.path(),
+                "mock",
+                None,
+                "searchable session",
+            )))
+            .unwrap();
+            let skipped = r#"{"type":"future.note","ignorable":true}"#;
+            let message = r#"{"type":"conversation.message","message":{"role":"user","content":"after skipped record"}}"#;
+            let lines = [meta.as_str(), "", skipped, message];
+            fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+            let mut hits = Vec::new();
+            search_root_in_process(&root, false, "", &mut hits, &mut HashSet::new()).unwrap();
+            assert_eq!(
+                hits.iter().map(|hit| hit.line_number).collect::<Vec<_>>(),
+                [1, 2, 4]
+            );
+
+            let mut collector = RipgrepSearchCollector::new();
+            for (index, line) in lines.iter().enumerate() {
+                let frame = match_line(&path, line, index + 1);
+                collector.push(orca_tools::process::BoundedLine {
+                    bytes: &frame,
+                    observed_bytes: frame.len(),
+                    omitted_bytes: 0,
+                });
+            }
+            assert_eq!(
+                collector
+                    .matches
+                    .iter()
+                    .map(|hit| hit.line_number)
+                    .collect::<Vec<_>>(),
+                [1, 2, 4]
+            );
+        });
+    }
+
+    #[test]
     fn ripgrep_search_collector_bounds_snippets_and_hit_count() {
         let path = sessions_dir().join("thread.jsonl");
         let mut collector = RipgrepSearchCollector::new();
@@ -1620,6 +1696,70 @@ mod tests {
         });
 
         assert!(collector.matches.is_empty());
+    }
+
+    fn record_searchable_session(workspace: &Path, text: &str) -> String {
+        let store = JsonlThreadStore::new();
+        let mut session = store
+            .create_live_thread(workspace, "mock", None, "search transcript")
+            .expect("create transcript");
+        let session_id = session.thread_id().to_string();
+        session
+            .writer_mut()
+            .enter_turn(orca_core::thread_identity::TurnId::new());
+        session
+            .writer_mut()
+            .append_message(&orca_core::conversation::Message::user(text.to_string()))
+            .expect("write searchable message");
+        session.complete("success").expect("complete transcript");
+        session_id
+    }
+
+    #[test]
+    fn session_search_passes_the_query_and_roots_as_values() {
+        let roots = [PathBuf::from("sessions"), PathBuf::from("archived")];
+        let command = ripgrep_search_command("-> Result", &roots);
+
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--no-config",
+                "--json",
+                "--fixed-strings",
+                "--glob",
+                "*.jsonl",
+                "--regexp=-> Result",
+                "--",
+                "sessions",
+                "archived",
+            ]
+            .map(std::ffi::OsStr::new),
+        );
+    }
+
+    #[test]
+    fn a_session_search_for_text_starting_with_a_dash_finds_it() {
+        let home = tempfile::tempdir().expect("temporary Orca home");
+        crate::history::with_test_orca_home(home.path(), |home| {
+            let session_id = record_searchable_session(home, "-> Result");
+
+            let hits = search_sessions("-> Result", false).expect("search for text");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].session_id, session_id);
+        });
+    }
+
+    #[test]
+    fn a_session_search_for_an_rg_option_name_is_literal() {
+        let home = tempfile::tempdir().expect("temporary Orca home");
+        crate::history::with_test_orca_home(home.path(), |home| {
+            let session_id = record_searchable_session(home, "see --help for details");
+            record_searchable_session(home, "see the help page for details");
+
+            let hits = search_sessions("--help", false).expect("search for text");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].session_id, session_id);
+        });
     }
 
     #[test]

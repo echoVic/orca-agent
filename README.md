@@ -210,12 +210,17 @@ recall, storage, privacy, and deletion.
 - Saves local conversations with `--resume` for continuation and `--fork` for
   branching; `orca exec resume <SESSION_ID>` restores a headless session with a
   fresh budget scope, and headless exits print the exact resume command.
+- Keeps large MCP, external, and web tool results in recorded sessions so the
+  model can page through them with `read_file` or search them with `grep`.
+  Set `apply_patch = true` under `[tools]` to enable multi-file patches.
 - Gives synchronous subagents, async subagents, and workflow child agents a
   runtime-owned continuation id. A later `subagent` call can pass
   `resume_from` with that continuation id (or the originating task id) to append
   a new prompt to the same durable child conversation. Task/status output on
   TUI, ACP, JSONL, and headless surfaces includes the current attempt,
   checkpoint, resumable, and indeterminate state.
+  Use `context: "fork"` on a new `subagent` call to start with the parent's
+  completed DeepSeek history.
 - Runs direct, nested, Workflow, hosted, continued, and recovered children
   through one durable execution scope per root task tree. The default 32
   execution leases are a capacity ceiling rather than a delegation target;
@@ -236,10 +241,12 @@ recall, storage, privacy, and deletion.
   budget disables automatic continuation when exhausted), plus subagents and
   JavaScript workflows for longer tasks that need continuation or parallel work.
 - Loads project instructions, skills, plugins, custom tools, MCP tools, and MCP
-  resources after the workspace is trusted.
+  resources after the workspace is trusted. Orca discovers nested `AGENTS.md`
+  as files are read or changed and gives the model a catalog of available skills.
 - Manages MCP servers with `orca mcp add`, `list`, `get`, `remove`, `login`,
   and `logout`: local stdio servers, and remote ones over streamable HTTP or
   legacy SSE that sign in with OAuth or a bearer token from the environment.
+  Set `tool_loading = "on-demand"` on a server to load its tools as needed.
 - Exposes stable JSONL, app-server, and Agent Client Protocol (ACP) contracts
   for editors, harnesses, and CI.
 

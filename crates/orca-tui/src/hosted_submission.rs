@@ -328,8 +328,10 @@ mod tests {
                 additional_working_directories: Vec::new(),
                 metadata_writable_directories: Vec::new(),
                 network_domain_permissions: Default::default(),
+                additional_fields: Default::default(),
             },
             messages: Vec::new(),
+            repeat_tool_streak: None,
             compactions: Vec::new(),
             summaries: Vec::new(),
             usage: None,
@@ -338,6 +340,8 @@ mod tests {
             completion_error: None,
             next_event_seq: 0,
             semantic_events: Vec::new(),
+            nested_instructions: Vec::new(),
+            written_instruction_sources: Vec::new(),
             path: std::env::temp_dir().join("hosted-submission-preserved.jsonl"),
         }
     }

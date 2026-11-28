@@ -10,7 +10,8 @@ use uuid::Uuid;
 use crate::thread_store::sessions_dir;
 use orca_core::config::{ActivePermissionProfile, AdditionalWorkingDirectory};
 use orca_core::conversation::{
-    Conversation, Message, SummaryState, is_delivered_notice, normalize_tool_boundaries,
+    Conversation, Message, SummaryState, SystemPromptRecord, is_delivered_notice,
+    normalize_tool_boundaries,
 };
 use orca_core::{approval_rules::PermissionRules, approval_types::ApprovalMode};
 
@@ -26,7 +27,7 @@ pub use crate::thread_store::{
     rename_session, search_sessions,
 };
 
-const SESSION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SESSION_SCHEMA_VERSION: u32 = 1;
 
 /// Serializes tests that deliberately share process-wide state (the session
 /// index, the task registry index, recorded sessions under the process-wide
@@ -283,29 +284,98 @@ impl JsonlThreadStore {
 }
 
 pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String) -> Conversation {
-    let mut conversation = Conversation::new();
-    conversation.add_system(system_prompt);
-    let mut restored_messages = replay_compactions_for_resume(
+    resume_conversation_in_cwd(transcript, system_prompt, Path::new(&transcript.meta.cwd))
+}
+
+pub(crate) fn resume_conversation_in_cwd(
+    transcript: &SessionTranscript,
+    system_prompt: String,
+    active_cwd: &Path,
+) -> Conversation {
+    let restored = replay_compactions_for_resume(
         &transcript.messages,
         &transcript.compactions,
         &transcript.summaries,
-    )
-    .into_iter()
-    // The old system prompt and ephemeral system context are rebuilt rather
-    // than restored. The truncation marker and delivered notices are
-    // conversation content; a notice stays until compaction summarizes it.
-    .filter(|message| {
-        !matches!(
-            message,
-            Message::System {
-                content,
-                pinned: false,
-            } if !content.starts_with(
-                "[Earlier conversation history was truncated to fit context window]"
-            ) && !is_delivered_notice(content)
-        )
-    })
-    .collect::<Vec<_>>();
+    );
+    let mut loaded_sources = HashMap::new();
+    let prompt_sources_are_loaded = |message: &Message| {
+        message.system_prompt_record().is_none_or(|record| {
+            !record.redacted && prompt_sources_can_replay(record, active_cwd, &mut loaded_sources)
+        })
+    };
+    let instruction_messages_can_replay = restored.iter().all(|message| {
+        instruction_fragments_can_replay(message, active_cwd)
+            && crate::skill_context::should_replay_mention(message, active_cwd) != Some(false)
+    });
+    let prompt_can_replay =
+        instruction_messages_can_replay && restored.iter().all(prompt_sources_are_loaded);
+    let recorded_prompt = restored.first().filter(|message| {
+        prompt_can_replay
+            && message
+                .system_prompt_record()
+                .is_some_and(|record| leading_prompt_matches_sections(message, record))
+    });
+    let mut conversation = Conversation::new();
+    conversation.repeat_tool_streak = transcript
+        .repeat_tool_streak
+        .clone()
+        .or_else(|| crate::session::repeat_tool_streak_from_history(&transcript.messages));
+    conversation.messages.push(
+        recorded_prompt
+            .cloned()
+            .unwrap_or_else(|| Message::system(system_prompt)),
+    );
+    crate::instructions::restore_nested_state(
+        &mut conversation,
+        Path::new(&transcript.meta.cwd),
+        &transcript.messages,
+        &transcript.nested_instructions,
+        &transcript.written_instruction_sources,
+    );
+    let replay_prompt_updates = recorded_prompt.is_some();
+    let last_redactions = restored
+        .iter()
+        .enumerate()
+        .flat_map(|(index, message)| {
+            let changes = match message {
+                Message::System {
+                    context_fragments, ..
+                } => context_fragments.as_slice(),
+                _ => &[],
+            };
+            changes
+                .iter()
+                .filter(|change| change.redacted)
+                .map(move |change| (change.id.clone(), index))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut restored_messages = restored
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, message)| restore_fragment_batch(message, index, &last_redactions))
+        // Keep delivered context in its original position when its sources still apply.
+        .filter(|message| {
+            if message.is_context_fragment_batch() {
+                return instruction_fragments_can_replay(message, active_cwd);
+            }
+            if message.is_system_prompt_update() {
+                return replay_prompt_updates;
+            }
+            if let Some(replay) = crate::skill_context::should_replay_mention(message, active_cwd) {
+                return replay;
+            }
+            !matches!(
+                message,
+                Message::System {
+                    content,
+                    pinned: false,
+                ..
+                } if !content.starts_with(
+                    "[Earlier conversation history was truncated to fit context window]"
+                ) && !is_delivered_notice(content)
+            )
+        })
+        .collect::<Vec<_>>();
     normalize_tool_boundaries(&mut restored_messages);
     for message in restored_messages.iter() {
         conversation.messages.push(message.clone());
@@ -317,6 +387,12 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
         .find_map(|record| record.summary_state.clone())
     {
         conversation.summary = summary_state;
+        let spill_dir = crate::thread_store::spill::directory(&transcript.meta.session_id);
+        conversation.summary.tool_output_spills.retain(|spill| {
+            spill_dir
+                .as_deref()
+                .is_some_and(|dir| spill.belongs_to_directory(dir))
+        });
         conversation.rolling_summary = transcript
             .summaries
             .last()
@@ -335,6 +411,124 @@ pub fn resume_conversation(transcript: &SessionTranscript, system_prompt: String
             .map(|record| record.summary.clone());
     }
     conversation
+}
+
+pub(crate) fn prompt_sources_can_replay(
+    record: &SystemPromptRecord,
+    active_cwd: &Path,
+    loaded_sources: &mut HashMap<PathBuf, Vec<PathBuf>>,
+) -> bool {
+    record.version == orca_core::conversation::SYSTEM_PROMPT_RECORD_VERSION
+        && record.sections.iter().all(|section| {
+            if section.name != "project instructions" || section.text.is_none() {
+                return true;
+            }
+            let Some(scope) = &section.instruction_scope else {
+                return false;
+            };
+            scope.sources.is_empty()
+                || ((scope.cwd == active_cwd
+                    || orca_core::config::folder_trust::is_trusted(active_cwd))
+                    && {
+                        let loaded = loaded_sources.entry(scope.cwd.clone()).or_insert_with(|| {
+                            crate::instructions::load_for_cwd_or_default(&scope.cwd)
+                                .scope(&scope.cwd)
+                                .sources
+                        });
+                        scope
+                            .sources
+                            .iter()
+                            .all(|source| loaded.binary_search(source).is_ok())
+                    })
+        })
+}
+
+pub(crate) fn leading_prompt_matches_sections(
+    message: &Message,
+    record: &orca_core::conversation::SystemPromptRecord,
+) -> bool {
+    if record.update || record.sections.is_empty() {
+        return false;
+    }
+    let mut names = std::collections::HashSet::new();
+    if !record
+        .sections
+        .iter()
+        .all(|section| section.text.is_some() && names.insert(&section.name))
+    {
+        return false;
+    }
+    let reconstructed = record
+        .sections
+        .iter()
+        .filter_map(|section| section.text.as_deref())
+        .collect::<String>();
+    message.content_str() == Some(reconstructed.as_str())
+}
+
+fn restore_fragment_batch(
+    message: Message,
+    index: usize,
+    last_redactions: &HashMap<String, usize>,
+) -> Option<Message> {
+    let Message::System {
+        content,
+        context_fragments,
+        ..
+    } = &message
+    else {
+        return Some(message);
+    };
+    let keep = |change: &orca_core::conversation::ContextFragmentChange| {
+        last_redactions
+            .get(&change.id)
+            .is_none_or(|redacted_at| *redacted_at < index)
+    };
+    if context_fragments.iter().all(keep) {
+        return Some(message);
+    }
+    let mut restored = String::new();
+    let mut changes = Vec::new();
+    for change in context_fragments.iter().filter(|change| keep(change)) {
+        let text = content.get(change.span.clone()?)?;
+        if !restored.is_empty() {
+            restored.push_str("\n\n");
+        }
+        let start = restored.len();
+        restored.push_str(text);
+        let mut change = change.clone();
+        change.span = Some(start..restored.len());
+        changes.push(change);
+    }
+    (!changes.is_empty()).then(|| Message::context_fragment_batch(restored, changes))
+}
+
+pub(crate) fn instruction_fragments_can_replay(message: &Message, cwd: &Path) -> bool {
+    let Message::System {
+        context_fragments, ..
+    } = message
+    else {
+        return true;
+    };
+    context_fragments
+        .iter()
+        .all(|change| match change.id.as_str() {
+            crate::instructions::NESTED_CONTEXT if change.digest.is_some() || change.redacted => {
+                change
+                    .instruction_scope
+                    .as_ref()
+                    .is_some_and(|scope| crate::instructions::nested_scope_is_loaded(scope, cwd))
+            }
+            orca_core::conversation::SKILLS_CONTEXT_FRAGMENT_ID
+                if change.digest.is_some() || change.redacted =>
+            {
+                change
+                    .instruction_scope
+                    .as_ref()
+                    .is_some_and(|scope| crate::skill_context::catalog_scope_is_loaded(scope, cwd))
+            }
+            _ => true,
+        })
 }
 
 fn replay_compactions_for_resume(
@@ -434,6 +628,7 @@ pub fn create_meta(cwd: &Path, provider: &str, model: Option<String>, prompt: &s
         additional_working_directories: Vec::new(),
         metadata_writable_directories: Vec::new(),
         network_domain_permissions: Default::default(),
+        additional_fields: Default::default(),
     }
 }
 
@@ -642,6 +837,7 @@ mod tests {
                 "please run ORCA_API_KEY={env_secret} and password={password_secret}"
             )))?;
             writer.append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some(format!(
                     "configured with {{\"DEEPSEEK_API_KEY\":\"{json_secret}\"}}"
                 )),
@@ -873,6 +1069,11 @@ mod tests {
             );
             compacted.add_system_pinned("[Hook context]\nretained".to_string());
             compacted.add_user("tail".to_string());
+            compacted.repeat_tool_streak = Some(orca_core::conversation::RepeatToolStreak {
+                tool_name: "read_file".to_string(),
+                arguments: r#"{"path":"a"}"#.to_string(),
+                count: 4,
+            });
             writer.append_manual_compaction_snapshot(
                 &identity,
                 5,
@@ -881,13 +1082,27 @@ mod tests {
             )?;
 
             let transcript = load_session("latest")?;
+            assert_eq!(
+                transcript
+                    .repeat_tool_streak
+                    .as_ref()
+                    .map(|streak| streak.count),
+                Some(4)
+            );
             let resumed = resume_conversation(&transcript, "fresh system".to_string());
+            assert_eq!(
+                resumed
+                    .repeat_tool_streak
+                    .as_ref()
+                    .map(|streak| streak.count),
+                Some(4)
+            );
             assert!(matches!(
                 resumed.messages.as_slice(),
                 [
                     Message::System { content: system, .. },
-                    Message::System { content: marker, pinned: false },
-                    Message::System { content: hook, pinned: true },
+                    Message::System { content: marker, pinned: false, .. },
+                    Message::System { content: hook, pinned: true, .. },
                     Message::User { content: tail, .. },
                 ] if system == "fresh system"
                     && marker
@@ -910,6 +1125,7 @@ mod tests {
             writer.enter_turn(TurnId::new());
             writer.append_message(&Message::user("start".to_string()))?;
             writer.append_message(&Message::Assistant {
+                cut_short: None,
                 content: None,
                 reasoning_content: None,
                 tool_calls: vec![RawToolCall {
@@ -1040,6 +1256,7 @@ mod tests {
             messages: vec![
                 Message::user("first".to_string()),
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: Some("private thinking".to_string()),
                     tool_calls: vec![],
@@ -1047,6 +1264,7 @@ mod tests {
                 },
                 Message::user("second".to_string()),
             ],
+            repeat_tool_streak: None,
             compactions: Vec::new(),
             summaries: Vec::new(),
             usage: None,
@@ -1055,6 +1273,8 @@ mod tests {
             completion_error: None,
             next_event_seq: 0,
             semantic_events: Vec::new(),
+            nested_instructions: Vec::new(),
+            written_instruction_sources: Vec::new(),
             path: cwd.join("reasoning-only.jsonl"),
         };
 
@@ -1133,6 +1353,7 @@ mod tests {
                 &SummaryState {
                     baseline: Some("rebuilt baseline".to_string()),
                     deltas: vec!["fresh delta".to_string()],
+                    ..Default::default()
                 },
             )?;
             let transcript = load_session("latest")?;
@@ -1159,12 +1380,14 @@ mod tests {
             writer.enter_turn(TurnId::new());
             writer.append_message(&Message::user("collapsed old user".repeat(100)))?;
             writer.append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some("collapsed old assistant".repeat(100)),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 pinned: false,
             })?;
             writer.append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some("kept tail before compaction".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -1178,6 +1401,7 @@ mod tests {
                 &SummaryState {
                     baseline: Some("summary baseline".to_string()),
                     deltas: Vec::new(),
+                    ..Default::default()
                 },
             )?;
             writer.enter_turn(TurnId::new());
@@ -1214,6 +1438,7 @@ mod tests {
             Message::system("system".to_string()),
             Message::user("old-a".to_string()),
             Message::Assistant {
+                cut_short: None,
                 content: Some("old-b".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -1221,6 +1446,7 @@ mod tests {
             },
             Message::user("old-c".to_string()),
             Message::Assistant {
+                cut_short: None,
                 content: Some("old-d".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),

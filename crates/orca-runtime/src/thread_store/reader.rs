@@ -1,14 +1,19 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::Deserializer;
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+
 use super::assets::{self, HydrateImages};
-use super::types::{SessionRecord, StoredSessionHealth, StoredSessionHealthIssue};
+use super::types::{SessionMeta, SessionRecord, StoredSessionHealth, StoredSessionHealthIssue};
 use super::writer::{
     MAX_SESSION_LINE_BYTES, open_regular_history_file, parse_session_record, read_bounded_line,
-    session_health_error,
+    session_health_error, validate_session_record,
 };
+use crate::history::SESSION_SCHEMA_VERSION;
 
 /// A scan budget is an inspection policy, never a transcript validity limit.
 #[derive(Clone, Copy)]
@@ -79,12 +84,59 @@ pub(crate) struct SessionRecords {
     offset: u64,
     pub line_number: u64,
     done: bool,
+    missing_meta: bool,
     pub health: StoredSessionHealth,
     pub issue: Option<StoredSessionHealthIssue>,
+    /// Catalog metadata can be read from a newer header without replaying it.
+    pub(super) newer_meta: Option<SessionMeta>,
+}
+
+#[derive(serde::Deserialize)]
+struct SessionSchemaHeader {
+    #[serde(rename = "type")]
+    record_type: String,
+    schema_version: u64,
 }
 
 pub(crate) fn iter_records(path: &Path, images: HydrateImages) -> io::Result<SessionRecords> {
     SessionRecords::open(path, None, images)
+}
+
+fn has_repeated_key(text: &str) -> bool {
+    struct RepeatedKey;
+
+    impl<'de> Visitor<'de> for RepeatedKey {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a session record object")
+        }
+
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<bool, M::Error> {
+            let mut keys = HashSet::new();
+            let mut repeated = false;
+            while let Some(key) = map.next_key::<String>()? {
+                repeated |= !keys.insert(key);
+                map.next_value::<IgnoredAny>()?;
+            }
+            Ok(repeated)
+        }
+    }
+
+    serde_json::Deserializer::from_str(text)
+        .deserialize_map(RepeatedKey)
+        .unwrap_or(false)
+}
+
+/// Raw search matches have not passed through the transcript iterator.
+pub(super) fn is_ignorable_search_line(text: &str) -> bool {
+    !has_repeated_key(text)
+        && serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| {
+            value["ignorable"] == true
+                && value["type"].is_string()
+                && !assets::is_asset_record(&value)
+                && matches!(parse_session_record(text), Err("unknown_record_type"))
+        })
 }
 
 /// Read preview bytes even for tool images omitted by normal session resume.
@@ -143,7 +195,12 @@ impl SessionRecords {
             offset: 0,
         }
         .take(snapshot.encoded_bytes);
-        let compressed = path.extension().and_then(|s| s.to_str()) == Some("zst");
+        let compressed = super::retention::original_path(path)
+            .as_deref()
+            .unwrap_or(path)
+            .extension()
+            .and_then(|s| s.to_str())
+            == Some("zst");
         let reader: Box<dyn BufRead> = if compressed {
             let decoder = zstd::stream::read::Decoder::new(file)?;
             Box::new(BufReader::new(decoder))
@@ -160,9 +217,16 @@ impl SessionRecords {
             offset: 0,
             line_number: 0,
             done: false,
+            missing_meta: false,
             health: StoredSessionHealth::Healthy,
             issue: None,
+            newer_meta: None,
         })
+    }
+
+    pub(super) fn require_metadata(mut self) -> Self {
+        self.missing_meta = true;
+        self
     }
 
     pub fn text(&self) -> &str {
@@ -178,16 +242,123 @@ impl SessionRecords {
             code: code.to_owned(),
             line: Some(self.line_number),
             offset: Some(offset),
+            record_type: None,
         });
     }
 
     fn fail(&mut self, code: &str, offset: u64) -> Option<io::Result<SessionRecord>> {
-        self.stop(StoredSessionHealth::Quarantined, code, offset);
+        self.stop_with_error(StoredSessionHealth::Quarantined, code, offset, None)
+    }
+
+    fn stop_with_error(
+        &mut self,
+        health: StoredSessionHealth,
+        code: &str,
+        offset: u64,
+        record_type: Option<String>,
+    ) -> Option<io::Result<SessionRecord>> {
+        self.stop(health, code, offset);
+        if let Some(issue) = &mut self.issue {
+            issue.record_type = record_type;
+        }
         Some(Err(session_health_error(
             &self.path,
             self.health,
             self.issue.as_ref(),
         )))
+    }
+
+    fn handle_parse_error(
+        &mut self,
+        code: &'static str,
+        offset: u64,
+        terminated: bool,
+    ) -> Option<io::Result<SessionRecord>> {
+        if code == "incomplete_record" && !terminated && !self.compressed {
+            if self.missing_meta {
+                return self.stop_with_error(
+                    StoredSessionHealth::RecoverableTail,
+                    "recoverable_tail",
+                    offset,
+                    None,
+                );
+            }
+            self.stop(
+                StoredSessionHealth::RecoverableTail,
+                "recoverable_tail",
+                offset,
+            );
+            return None;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(self.text()) else {
+            return self.fail(code, offset);
+        };
+        if assets::is_asset_record(&value) {
+            let record = assets::hydrate(&self.path, value, self.images)
+                .map_err(|_| "invalid_image_asset")
+                .and_then(|value| {
+                    serde_json::from_value(value).map_err(|_| "malformed_asset_record")
+                })
+                .and_then(|record| match validate_session_record(record) {
+                    Err("unknown_record_type") => Err("malformed_asset_record"),
+                    result => result,
+                });
+            return match record {
+                Ok(record) => self.check_record_version(record, offset),
+                Err(code) => self.fail(code, offset),
+            };
+        }
+        if value["type"] == "session.meta"
+            && serde_json::from_str::<SessionSchemaHeader>(self.text()).is_ok_and(|header| {
+                header.record_type == "session.meta"
+                    && header.schema_version > u64::from(SESSION_SCHEMA_VERSION)
+            })
+        {
+            return self.stop_with_error(
+                StoredSessionHealth::NewerVersion,
+                "newer_schema_version",
+                offset,
+                None,
+            );
+        }
+        if code == "unknown_record_type" {
+            let Some(tag) = value["type"].as_str() else {
+                return self.fail("malformed_record", offset);
+            };
+            if value["ignorable"] == true {
+                return Some(Ok(SessionRecord::Ignorable(std::mem::take(&mut self.line))));
+            }
+            return self.stop_with_error(
+                StoredSessionHealth::NewerVersion,
+                code,
+                offset,
+                Some(tag.chars().take(128).collect()),
+            );
+        }
+        self.fail(code, offset)
+    }
+
+    fn check_record_version(
+        &mut self,
+        record: SessionRecord,
+        offset: u64,
+    ) -> Option<io::Result<SessionRecord>> {
+        match record {
+            SessionRecord::Meta(meta) if meta.schema_version > SESSION_SCHEMA_VERSION => {
+                self.newer_meta = Some(meta);
+                self.stop_with_error(
+                    StoredSessionHealth::NewerVersion,
+                    "newer_schema_version",
+                    offset,
+                    None,
+                )
+            }
+            SessionRecord::Meta(_) => {
+                self.missing_meta = false;
+                Some(Ok(record))
+            }
+            record => Some(Ok(record)),
+        }
     }
 }
 
@@ -199,6 +370,9 @@ impl Iterator for SessionRecords {
             // Probe EOF before reporting a partial scan at an exact boundary.
             match self.reader.fill_buf() {
                 Ok([]) => {
+                    if self.missing_meta {
+                        return self.fail("missing_session_meta", self.offset);
+                    }
                     self.done = true;
                     return None;
                 }
@@ -267,33 +441,13 @@ impl Iterator for SessionRecords {
                 Ok(text) => text.trim_end_matches(['\r', '\n']),
                 Err(_) => return self.fail("invalid_utf8", start),
             };
-            let parsed = parse_session_record(text).or_else(|code| {
-                let Ok(value) = serde_json::from_str(text) else {
-                    return Err(code);
-                };
-                if !assets::is_asset_record(&value) {
-                    return Err(code);
-                }
-                let value = assets::hydrate(&self.path, value, self.images)
-                    .map_err(|_| "invalid_image_asset")?;
-                let record: SessionRecord =
-                    serde_json::from_value(value).map_err(|_| "malformed_asset_record")?;
-                super::writer::validate_session_record(record)
-            });
-            match parsed {
-                Ok(record) => {
-                    return Some(Ok(record));
-                }
-                Err("incomplete_record") if !terminated && !self.compressed => {
-                    self.stop(
-                        StoredSessionHealth::RecoverableTail,
-                        "recoverable_tail",
-                        start,
-                    );
-                    return None;
-                }
-                Err(code) => return self.fail(code, start),
+            if has_repeated_key(text) {
+                return self.fail("malformed_record", start);
             }
+            return match parse_session_record(text) {
+                Ok(record) => self.check_record_version(record, start),
+                Err(code) => self.handle_parse_error(code, start, terminated),
+            };
         }
         None
     }

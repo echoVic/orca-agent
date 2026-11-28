@@ -8,14 +8,17 @@ use orca_core::approval_types::ApprovalMode;
 use orca_core::config::{
     ActivePermissionProfile, AdditionalWorkingDirectory, PermissionProfileNetworkAccess,
 };
-use orca_core::conversation::{ImageInput, Message, RawToolCall};
+use orca_core::conversation::{
+    ImageInput, Message, NestedInstructionSource, NestedInstructionVersion, RawToolCall,
+};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::EventEnvelope;
 use orca_core::plan_types::PlanItem;
 use orca_core::thread_identity::{ConversationItemId, TurnId};
 use orca_core::thread_item_projection::{CompletedModelItem, CompletedModelResponse};
 use orca_core::tool_types::{
-    ToolInvocationStarted, ToolResultKind, ToolStatus, ToolTerminal, ToolTerminalSource,
+    McpToolLoad, ToolInvocationStarted, ToolOutputSpill, ToolResultKind, ToolStatus, ToolTerminal,
+    ToolTerminalSource,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -34,6 +37,7 @@ pub enum StoredSessionHealth {
     RecoverableTail,
     Quarantined,
     InspectionLimited,
+    NewerVersion,
 }
 
 impl StoredSessionHealth {
@@ -43,6 +47,7 @@ impl StoredSessionHealth {
             Self::RecoverableTail => "recoverable_tail",
             Self::Quarantined => "quarantined",
             Self::InspectionLimited => "inspection_limited",
+            Self::NewerVersion => "newer_version",
         }
     }
 
@@ -53,7 +58,7 @@ impl StoredSessionHealth {
     pub fn blocks_mutation(self) -> bool {
         // A partial inspection is not proof of corruption. Resume performs
         // its own complete streaming validation before allowing mutation.
-        matches!(self, Self::Quarantined)
+        matches!(self, Self::Quarantined | Self::NewerVersion)
     }
 }
 
@@ -66,6 +71,8 @@ pub struct StoredSessionHealthIssue {
     pub line: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_type: Option<String>,
 }
 
 /// Durable identity for a thread that executes a subagent task.
@@ -83,7 +90,6 @@ pub struct StoredAgentScope {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct SessionMeta {
     pub schema_version: u32,
     pub session_id: String,
@@ -112,6 +118,9 @@ pub struct SessionMeta {
     pub metadata_writable_directories: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub network_domain_permissions: HashMap<String, PermissionProfileNetworkAccess>,
+    /// Fields written by newer versions are carried through transcript rewrites.
+    #[serde(flatten)]
+    pub additional_fields: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -158,6 +167,7 @@ impl SessionSummary {
 pub struct SessionTranscript {
     pub meta: SessionMeta,
     pub messages: Vec<Message>,
+    pub repeat_tool_streak: Option<orca_core::conversation::RepeatToolStreak>,
     pub compactions: Vec<CompactionRecord>,
     pub summaries: Vec<ContextSummaryRecord>,
     pub usage: Option<UsageTotals>,
@@ -167,6 +177,8 @@ pub struct SessionTranscript {
     pub next_event_seq: u64,
     pub semantic_events: Vec<EventEnvelope>,
     pub path: PathBuf,
+    pub nested_instructions: Vec<NestedInstructionVersion>,
+    pub written_instruction_sources: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -179,6 +191,12 @@ pub(crate) struct ManualCompactionSnapshotRecord {
     pub messages: Vec<StoredMessage>,
     pub rolling_summary: Option<String>,
     pub summary_state: orca_core::conversation::SummaryState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_instructions: Vec<NestedInstructionVersion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub written_instruction_sources: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_tool_streak: Option<orca_core::conversation::RepeatToolStreak>,
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +207,8 @@ pub(crate) struct ManualCompactionDurableSnapshot {
     pub conversation: orca_core::conversation::Conversation,
 }
 
+/// Write `"ignorable": true` on a new record type only when older Orca versions
+/// can safely skip it. Other new types require a newer Orca to open the session.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum SessionRecord {
@@ -299,6 +319,12 @@ pub(crate) enum SessionRecord {
     /// conversation.
     #[serde(rename = "session.snapshot_retention")]
     SnapshotRetention(SnapshotRetentionRecord),
+    /// The original JSONL bytes of a record the reader can skip.
+    #[serde(skip)]
+    Ignorable(Vec<u8>),
+    /// Serde fallback so new types are recognized from this enum's own tags.
+    #[serde(other, skip_serializing)]
+    Unrecognized,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -386,6 +412,8 @@ pub struct FileSnapshotRecord {
     pub end_digest: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub files: std::collections::BTreeMap<String, SnapshotFileEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_directories: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_stats: Option<SnapshotChangeStats>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -514,6 +542,12 @@ pub(crate) enum StoredMessage {
         content: String,
         #[serde(default)]
         pinned: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nested_instruction: Option<Box<NestedInstructionSource>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        context_fragments: Vec<orca_core::conversation::ContextFragmentChange>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<Box<orca_core::conversation::SystemPromptRecord>>,
     },
     User {
         content: String,
@@ -526,6 +560,8 @@ pub(crate) enum StoredMessage {
         content: Option<String>,
         reasoning_content: Option<String>,
         tool_calls: Vec<RawToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cut_short: Option<orca_core::conversation::CutShort>,
         #[serde(default)]
         pinned: bool,
     },
@@ -561,6 +597,10 @@ impl StoredToolTerminal {
         self.terminal.as_ref()
     }
 
+    pub(crate) fn take_spill(&mut self) -> Option<Box<ToolOutputSpill>> {
+        self.terminal.as_mut()?.spill.take()
+    }
+
     pub(crate) fn error_mut(&mut self) -> Option<&mut String> {
         self.terminal.as_mut()?.error.as_mut()
     }
@@ -582,6 +622,10 @@ struct StoredToolTerminalWire {
     terminal_source: Option<ToolTerminalSource>,
     #[serde(default)]
     invocation_started: Option<ToolInvocationStarted>,
+    #[serde(default)]
+    spill: Option<Box<ToolOutputSpill>>,
+    #[serde(default)]
+    mcp_tool_load: Option<McpToolLoad>,
 }
 
 impl StoredToolTerminalWire {
@@ -596,11 +640,17 @@ impl StoredToolTerminalWire {
                 self.terminal_source.unwrap_or_default(),
                 self.invocation_started.unwrap_or_default(),
             )
-            .map(Some);
+            .map(|mut terminal| {
+                terminal.spill = self.spill;
+                terminal.mcp_tool_load = self.mcp_tool_load;
+                Some(terminal)
+            });
         }
         if self.kind.is_some()
             || self.terminal_source.is_some()
             || self.invocation_started.is_some()
+            || self.spill.is_some()
+            || self.mcp_tool_load.is_some()
         {
             return Err(
                 "stored tool terminal kind/source/start metadata requires status".to_string(),
@@ -631,6 +681,8 @@ pub(crate) fn validate_stored_tool_terminal_fields(message: &Value) -> Option<Re
         "kind",
         "terminal_source",
         "invocation_started",
+        "spill",
+        "mcp_tool_load",
     ];
     let object = message.as_object()?;
     if !fields.iter().any(|field| object.contains_key(*field)) {
@@ -663,15 +715,31 @@ impl Serialize for StoredToolTerminal {
                 map.serialize_entry("truncated", &true)?;
             }
             map.serialize_entry("kind", &terminal.kind)?;
+            if let Some(spill) = &terminal.spill {
+                map.serialize_entry("spill", spill)?;
+            }
             if terminal.source != ToolTerminalSource::Observed {
                 map.serialize_entry("terminal_source", &terminal.source)?;
             }
             if terminal.started != ToolInvocationStarted::Unknown {
                 map.serialize_entry("invocation_started", &terminal.started)?;
             }
+            if let Some(load) = &terminal.mcp_tool_load {
+                map.serialize_entry("mcp_tool_load", load)?;
+            }
         }
         map.end()
     }
+}
+
+fn deserialize_prompt_metadata<'de, D>(
+    deserializer: D,
+) -> Result<Option<Box<orca_core::conversation::SystemPromptRecord>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).ok())
 }
 
 #[derive(Deserialize)]
@@ -681,6 +749,12 @@ enum StoredMessageWire {
         content: String,
         #[serde(default)]
         pinned: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nested_instruction: Option<Box<NestedInstructionSource>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        context_fragments: Vec<orca_core::conversation::ContextFragmentChange>,
+        #[serde(default, deserialize_with = "deserialize_prompt_metadata")]
+        system_prompt: Option<Box<orca_core::conversation::SystemPromptRecord>>,
     },
     User {
         content: String,
@@ -693,6 +767,8 @@ enum StoredMessageWire {
         content: Option<String>,
         reasoning_content: Option<String>,
         tool_calls: Vec<RawToolCall>,
+        #[serde(default)]
+        cut_short: Option<orca_core::conversation::CutShort>,
         #[serde(default)]
         pinned: bool,
     },
@@ -714,7 +790,19 @@ impl<'de> Deserialize<'de> for StoredMessage {
         D: Deserializer<'de>,
     {
         match StoredMessageWire::deserialize(deserializer)? {
-            StoredMessageWire::System { content, pinned } => Ok(Self::System { content, pinned }),
+            StoredMessageWire::System {
+                content,
+                pinned,
+                nested_instruction,
+                context_fragments,
+                system_prompt,
+            } => Ok(Self::System {
+                content,
+                pinned,
+                nested_instruction,
+                context_fragments,
+                system_prompt,
+            }),
             StoredMessageWire::User {
                 content,
                 images,
@@ -728,11 +816,13 @@ impl<'de> Deserialize<'de> for StoredMessage {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             } => Ok(Self::Assistant {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             }),
             StoredMessageWire::Tool {
@@ -758,9 +848,17 @@ impl<'de> Deserialize<'de> for StoredMessage {
 impl From<&Message> for StoredMessage {
     fn from(message: &Message) -> Self {
         match message {
-            Message::System { content, pinned } => Self::System {
+            Message::System {
+                content,
+                pinned,
+                context_fragments,
+                system_prompt,
+            } => Self::System {
                 content: content.clone(),
                 pinned: *pinned,
+                nested_instruction: None,
+                context_fragments: context_fragments.clone(),
+                system_prompt: system_prompt.clone(),
             },
             Message::User {
                 content,
@@ -775,11 +873,13 @@ impl From<&Message> for StoredMessage {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             } => Self::Assistant {
                 content: content.clone(),
                 reasoning_content: reasoning_content.clone(),
                 tool_calls: tool_calls.clone(),
+                cut_short: *cut_short,
                 pinned: *pinned,
             },
             Message::Tool {
@@ -802,7 +902,23 @@ impl From<&Message> for StoredMessage {
 impl From<StoredMessage> for Message {
     fn from(message: StoredMessage) -> Self {
         match message {
-            StoredMessage::System { content, pinned } => Self::System { content, pinned },
+            StoredMessage::System {
+                content,
+                pinned,
+                nested_instruction,
+                context_fragments,
+                system_prompt,
+            } => Self::System {
+                content: match nested_instruction {
+                    Some(identity) => {
+                        crate::instructions::render_nested_record(&identity, &content)
+                    }
+                    None => content,
+                },
+                pinned,
+                context_fragments,
+                system_prompt,
+            },
             StoredMessage::User {
                 content,
                 images,
@@ -816,11 +932,13 @@ impl From<StoredMessage> for Message {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             } => Self::Assistant {
                 content,
                 reasoning_content,
                 tool_calls,
+                cut_short,
                 pinned,
             },
             StoredMessage::Tool {

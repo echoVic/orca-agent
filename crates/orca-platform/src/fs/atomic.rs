@@ -13,6 +13,19 @@ pub enum AtomicWritePolicy {
     ReplaceDestination,
 }
 
+/// Move a file within its directory and persist the directory change.
+pub fn move_file_for_cleanup(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::rename(source, destination)?;
+        File::open(destination.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        platform::move_file_for_cleanup(source, destination)
+    }
+}
+
 pub fn atomic_write(
     destination: &Path,
     contents: &[u8],
@@ -25,33 +38,132 @@ pub fn atomic_write(
 
 /// Writes a file only its owner can read or write, such as one holding a
 /// credential: whatever mode an earlier version had, the file replacing it
-/// is owner-only, and so is it before any byte is written. Windows keeps the
-/// user profile's access control.
+/// is owner-only, and so is it before any byte is written.
 pub fn atomic_write_private(
     destination: &Path,
     contents: &[u8],
     policy: AtomicWritePolicy,
 ) -> Result<(), PlatformError> {
-    atomic_write_with(destination, policy, |temporary| {
+    atomic_write_impl(destination, policy, true, |temporary| {
+        #[cfg(unix)]
         restrict_to_owner(temporary)?;
         temporary.write_all(contents)
     })
 }
 
 #[cfg(unix)]
-fn restrict_to_owner(file: &File) -> io::Result<()> {
+pub(super) fn restrict_to_owner(file: &File) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 
-#[cfg(not(unix))]
-fn restrict_to_owner(_file: &File) -> io::Result<()> {
-    Ok(())
+#[cfg(windows)]
+pub(super) fn restrict_to_owner(file: &File) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile, WRITE_DAC,
+    };
+
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let acl_file = unsafe { File::from_raw_handle(handle) };
+    let descriptor = PrivateDescriptor::new()?;
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut acl = null_mut();
+    if unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted) }
+        == 0
+    {
+        Err(io::Error::last_os_error())
+    } else if present == 0 || acl.is_null() {
+        Err(io::Error::other("owner-only access list is missing"))
+    } else {
+        let status = unsafe {
+            SetSecurityInfo(
+                acl_file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                acl,
+                null(),
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
+    }
 }
+
+#[cfg(windows)]
+struct PrivateDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+
+#[cfg(windows)]
+impl PrivateDescriptor {
+    fn new() -> io::Result<Self> {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+
+        let mut descriptor = null_mut();
+        // OW denotes the file's owner. Protect the ACL from inherited entries.
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                windows_sys::core::w!("D:P(A;;FA;;;OW)"),
+                1,
+                &mut descriptor,
+                null_mut(),
+            )
+        };
+        if converted == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self(descriptor))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PrivateDescriptor {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(self.0) };
+    }
+}
+
+#[cfg(windows)]
+pub(super) use platform::create_new_private;
 
 pub fn atomic_write_with<F>(
     destination: &Path,
     policy: AtomicWritePolicy,
+    write_contents: F,
+) -> Result<(), PlatformError>
+where
+    F: FnOnce(&mut File) -> io::Result<()>,
+{
+    atomic_write_impl(destination, policy, false, write_contents)
+}
+
+fn atomic_write_impl<F>(
+    destination: &Path,
+    policy: AtomicWritePolicy,
+    private: bool,
     write_contents: F,
 ) -> Result<(), PlatformError>
 where
@@ -70,10 +182,10 @@ where
         .ok_or_else(|| invalid_destination(destination, "destination has no file name"))?;
 
     let existing = inspect_destination(destination, policy)?;
-    let (mut temporary, temporary_path) = create_temporary(parent, file_name)?;
+    let (mut temporary, temporary_path) = create_temporary(parent, file_name, private)?;
     let mut cleanup = TempCleanup::new(temporary_path.clone());
 
-    if let Some(permissions) = existing.permissions {
+    if !private && let Some(permissions) = existing.permissions {
         temporary
             .set_permissions(permissions)
             .map_err(|error| PlatformError::io("preserve destination permissions", error))?;
@@ -83,7 +195,7 @@ where
     flush_file(&temporary)?;
     drop(temporary);
 
-    platform::replace(&temporary_path, destination, existing.existed)?;
+    platform::replace(&temporary_path, destination, existing.existed, private)?;
     cleanup.disarm();
     platform::sync_parent(parent)?;
     Ok(())
@@ -158,6 +270,7 @@ fn supports_link_replacement() -> bool {
 fn create_temporary(
     parent: &Path,
     file_name: &std::ffi::OsStr,
+    private: bool,
 ) -> Result<(File, PathBuf), PlatformError> {
     for _ in 0..128 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -165,7 +278,7 @@ fn create_temporary(
         name.push(file_name);
         name.push(format!(".orca-{}-{sequence}.tmp", std::process::id()));
         let path = parent.join(name);
-        match platform::create_new(&path) {
+        match platform::create_new(&path, private) {
             Ok(file) => return Ok((file, path)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -226,8 +339,12 @@ mod platform {
         Ok(())
     }
 
-    pub(super) fn create_new(path: &Path) -> io::Result<File> {
-        OpenOptions::new()
+    pub(super) fn create_new(path: &Path, private: bool) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        if private {
+            options.mode(0o600);
+        }
+        options
             .create_new(true)
             .read(true)
             .write(true)
@@ -243,6 +360,7 @@ mod platform {
         temporary: &Path,
         destination: &Path,
         _destination_existed: bool,
+        _private: bool,
     ) -> Result<(), PlatformError> {
         std::fs::rename(temporary, destination)
             .map_err(|error| PlatformError::io("atomically replace destination", error))
@@ -288,13 +406,65 @@ mod platform {
         })
     }
 
-    pub(super) fn create_new(path: &Path) -> io::Result<File> {
+    pub(super) fn create_new(path: &Path, private: bool) -> io::Result<File> {
+        if private {
+            use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+            return create_new_private(
+                path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            );
+        }
         OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .open(path)
+    }
+
+    pub(in crate::fs) fn create_new_private(
+        path: &Path,
+        access: u32,
+        share: u32,
+    ) -> io::Result<File> {
+        use std::os::windows::io::FromRawHandle;
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+        };
+
+        let path = wide_path(path);
+        if path[..path.len() - 1].contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file path contains a null character",
+            ));
+        }
+        let descriptor = PrivateDescriptor::new()?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                access,
+                share,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_handle(handle) })
+        }
     }
 
     pub(super) fn flush(file: &File) -> io::Result<()> {
@@ -310,12 +480,13 @@ mod platform {
         temporary: &Path,
         destination: &Path,
         destination_existed: bool,
+        private: bool,
     ) -> Result<(), PlatformError> {
         let temporary = wide_path(temporary);
         let destination = wide_path(destination);
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let result = if destination_existed {
+            let result = if destination_existed && !private {
                 unsafe {
                     ReplaceFileW(
                         destination.as_ptr(),
@@ -331,7 +502,12 @@ mod platform {
                     MoveFileExW(
                         temporary.as_ptr(),
                         destination.as_ptr(),
-                        MOVEFILE_WRITE_THROUGH,
+                        MOVEFILE_WRITE_THROUGH
+                            | if private && destination_existed {
+                                windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+                            } else {
+                                0
+                            },
                     )
                 }
             };
@@ -351,6 +527,22 @@ mod platform {
     }
 
     pub(super) fn sync_parent(_parent: &Path) -> Result<(), PlatformError> {
+        Ok(())
+    }
+
+    pub(super) fn move_file_for_cleanup(source: &Path, destination: &Path) -> io::Result<()> {
+        let source = wide_path(source);
+        let destination = wide_path(destination);
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         Ok(())
     }
 
@@ -375,6 +567,44 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn private_atomic_replacement_keeps_a_protected_access_list() {
+            use windows_sys::Win32::Foundation::LocalFree;
+            use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+            use windows_sys::Win32::Security::{
+                DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+            };
+
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("record");
+            std::fs::write(&path, b"old").unwrap();
+            atomic_write_private(&path, b"new", AtomicWritePolicy::NoFollow).unwrap();
+            let file = File::open(path).unwrap();
+            let mut descriptor = std::ptr::null_mut();
+            let status = unsafe {
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                )
+            };
+            assert_eq!(status, 0);
+            let mut control = 0;
+            let mut revision = 0;
+            let valid = unsafe {
+                let valid = GetSecurityDescriptorControl(descriptor, &mut control, &mut revision);
+                LocalFree(descriptor);
+                valid
+            };
+            assert_ne!(valid, 0);
+            assert_ne!(control & SE_DACL_PROTECTED, 0);
+        }
 
         #[test]
         fn retryable_replace_errors_cover_safe_windows_collision_states() {

@@ -1751,6 +1751,9 @@ fn run_subagent_worker(
         prompt,
         subagent_type: requested_subagent_type,
         model: requested_model,
+        context: _,
+        fork_prefix_ref,
+        captured_fork_prefix,
         mode: _,
         isolation: requested_isolation,
         schema,
@@ -1975,11 +1978,11 @@ fn run_subagent_worker(
                 compatibility,
             };
             coordinator
-                .create(input.clone())
-                .or_else(|_| coordinator.create(input))
+                .create_with_fork(input.clone(), fork_prefix_ref)
+                .or_else(|_| coordinator.create_with_fork(input, fork_prefix_ref))
         }
     };
-    let prepared = match prepared {
+    let mut prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             let worktree = worktree_execution.finish();
@@ -1996,6 +1999,9 @@ fn run_subagent_worker(
             );
         }
     };
+    if let Some(prefix) = captured_fork_prefix {
+        prepared.fork_prefix = Some(prefix);
+    }
     let lease = match coordinator
         .acquire(&prepared)
         .or_else(|_| coordinator.acquire(&prepared))
@@ -2182,8 +2188,11 @@ fn execute_acquired_sync_subagent(
         headless_root: child_config.tools.headless_exec,
         allowed_tools: None,
         tool_policy_label: None,
-        workflow_ipc,
+        workflow_ipc: workflow_ipc
+            .as_ref()
+            .map(WorkflowIpcContext::for_nested_attempt),
         continuation: continuation_start,
+        fork_prefix: prepared.fork_prefix.clone(),
     };
     let surface_task_id = match SurfaceTaskId::try_new(registry_task_id.clone()) {
         Ok(task_id) => task_id,
@@ -2328,26 +2337,42 @@ fn execute_acquired_sync_subagent(
         });
         run_child_agent(&child_config, &child_request, &mut runtime)
     }));
+    let claim_cleanup_error = child_request
+        .workflow_ipc
+        .as_ref()
+        .and_then(|ipc| ipc.release_child_claims().err());
     let worktree = worktree_execution.finish();
     let (output, panicked) = match child {
-        Ok((child, cost_tracker)) => (
-            finish_child_output(
-                tool_request,
-                description,
-                schema.as_ref(),
-                child,
-                cost_tracker,
-                worktree,
-                lifecycle,
-                started_task,
-            ),
-            false,
-        ),
+        Ok((mut child, cost_tracker)) => {
+            if let Some(error) = claim_cleanup_error {
+                child.status = RunStatus::Failed;
+                child.error = Some(match child.error {
+                    Some(existing) => format!("{existing}\n{error}"),
+                    None => error,
+                });
+            }
+            (
+                finish_child_output(
+                    tool_request,
+                    description,
+                    schema.as_ref(),
+                    child,
+                    cost_tracker,
+                    worktree,
+                    lifecycle,
+                    started_task,
+                ),
+                false,
+            )
+        }
         Err(payload) => {
             let mut error = format!(
                 "Subagent worker panicked after execution started: {}. Inspect external state before retrying.",
                 panic_payload_message(payload)
             );
+            if let Some(cleanup_error) = claim_cleanup_error {
+                error.push_str(&format!("\n{cleanup_error}"));
+            }
             match worktree {
                 Ok(worktree) => append_worktree_outcome(&mut error, worktree.as_ref()),
                 Err(cleanup_error) => error.push_str(&format!(
@@ -2632,8 +2657,9 @@ pub(crate) fn build_checkpoint_observer(
                     last_tool_boundary: captured_boundary,
                     created_at_ms: unix_time_ms(),
                     digest: crate::runtime_surface::Sha256Digest::new([0; 32]),
+                    full_digest: None,
                 };
-                checkpoint.digest = checkpoint.computed_digest()?;
+                checkpoint.seal()?;
                 pending_checkpoint = Some(checkpoint.clone());
                 checkpoint
             };
@@ -3312,6 +3338,9 @@ mod tests {
             prompt: "p".to_string(),
             subagent_type: SubagentType::Explorer,
             model: None,
+            context: orca_core::subagent_types::RoleContextPolicy::Fresh,
+            fork_prefix_ref: None,
+            captured_fork_prefix: None,
             mode: crate::subagent::SubagentMode::Async,
             isolation: SubagentIsolation::None,
             schema: None,

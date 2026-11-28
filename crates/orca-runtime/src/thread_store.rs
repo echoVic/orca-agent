@@ -9,12 +9,13 @@ mod retention;
 mod rewind_records_tests;
 #[cfg_attr(test, allow(dead_code))]
 mod session_index;
+pub(crate) mod spill;
 #[cfg(test)]
 mod storage_tests;
 mod types;
 mod writer;
 
-use orca_core::conversation::Conversation;
+pub(crate) use orca_core::history_redaction::redact_sensitive_text;
 
 pub(crate) use assets::HydrateImages;
 pub use live_thread::LiveThread;
@@ -59,17 +60,11 @@ pub(crate) use writer::{
     RewindTranscriptCut, RewindTranscriptSplit, RewindUserMessage, read_effective_user_messages,
     read_latest_context_tokens, read_manual_compaction_snapshot, read_prompt_queue_snapshot,
     read_session_meta, read_snapshot_retention, read_snapshots, read_transcript_before_message,
-    read_transcript_split_at_message, read_transcript_until_effective, redact_sensitive_text,
+    read_transcript_split_at_message, read_transcript_until_effective,
     stored_session_health_error_details, truncate_transcript_at_boundary,
     write_prompt_queue_snapshot,
 };
-
-pub(crate) fn resume_conversation(
-    transcript: &SessionTranscript,
-    system_prompt: String,
-) -> Conversation {
-    crate::history::resume_conversation(transcript, system_prompt)
-}
+pub(crate) use writer::{redact_fragment_metadata, redact_json_value, redact_prompt_record};
 
 #[cfg(test)]
 mod tests {
@@ -168,16 +163,14 @@ mod tests {
     #[test]
     fn thread_store_projects_conversation_turns() {
         let messages = vec![
-            Message::System {
-                content: "system".to_string(),
-                pinned: false,
-            },
+            Message::system("system".to_string()),
             Message::User {
                 content: "hello".to_string(),
                 images: Vec::new(),
                 pinned: false,
             },
             Message::Assistant {
+                cut_short: None,
                 content: Some("hi".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -220,6 +213,7 @@ mod tests {
             ))),
             types::StoredConversationRecord::legacy(types::StoredMessage::from(
                 &Message::Assistant {
+                    cut_short: None,
                     content: Some("legacy assistant".to_string()),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
@@ -235,6 +229,7 @@ mod tests {
                 typed_assistant.clone(),
                 typed_turn.clone(),
                 types::StoredMessage::from(&Message::Assistant {
+                    cut_short: None,
                     content: Some("typed assistant".to_string()),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
@@ -354,6 +349,7 @@ mod tests {
                 ConversationItemId::new(),
                 turn_id.clone(),
                 types::StoredMessage::from(&Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {
@@ -438,6 +434,7 @@ mod tests {
                     ConversationItemId::new(),
                     turn_id.clone(),
                     types::StoredMessage::from(&Message::Assistant {
+                        cut_short: None,
                         content: None,
                         reasoning_content: None,
                         tool_calls: vec![RawToolCall {
@@ -493,6 +490,7 @@ mod tests {
         let messages = vec![
             Message::user("deploy production".to_string()),
             Message::Assistant {
+                cut_short: None,
                 content: None,
                 reasoning_content: None,
                 tool_calls: vec![RawToolCall {
@@ -574,6 +572,7 @@ mod tests {
             let messages = vec![
                 Message::user("run tool".to_string()),
                 Message::Assistant {
+                    cut_short: None,
                     content: None,
                     reasoning_content: None,
                     tool_calls: vec![RawToolCall {

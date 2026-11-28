@@ -163,6 +163,10 @@ and `plan_item_id`. Concatenating their `payload.text` preserves the exact text,
 including whitespace. A merged event keeps the first event's envelope, so `seq`
 values remain monotonic but may skip values. `model.response.completed` carries
 the full response text in `assistant_reasoning` and `assistant_content`.
+When Orca keeps a cut-short reply, the same payload records `cut_short` as
+`interrupted` or `output_limit` alongside the response identity. The kept
+reply carries an empty tool-call list, and the turn retains its cancel or
+provider failure status.
 
 Its optional `payload.observation` reports logical provider `elapsed_ms`,
 `first_delta_ms`, and `first_delta_kind` (`reasoning`, `text`, or `tool`). The
@@ -174,11 +178,20 @@ not isolate transport latency, model latency, or runtime overhead.
 `after_tokens_est`, elapsed time, summary requests with outcome and returned
 usage, and local prefix reuse estimates. Runtime adds confirmed summary cost
 estimates and service cache ratios. Failed, cancelled, and rejected summaries
-retain known usage. Local prefix estimates are distinct from service cache
-metadata. Missing usage stays null and incomplete totals are labelled; summary
-cost is separate from the main cumulative attempt cost stream and is not charged
-to the runtime operation cost counter. Summary requests still share operation
-cancellation and deadline controls.
+retain known usage. Missing usage stays null and incomplete totals are labelled.
+
+Deep compaction first replays the conversation through the compaction cut on
+the session's model, with one instruction appended for an eight-section
+checkpoint. Earlier checkpoints are folded into the new one. DeepSeek bills
+cached input at cache-hit rates. The returned usage identifies how much of the
+request hit the cache. If the replay cannot produce a smaller usable checkpoint,
+Orca tries the hierarchical Flash summary and then local truncation.
+
+Summary requests with `purpose: "replay"` contribute to `usage.updated` and the
+operation's cost budget, including when Orca rejects the result. Their cost in
+the compaction observation is a breakdown of that same charge. Hierarchical
+summary costs are available in the compaction observation. Summary requests
+share operation cancellation and deadline controls.
 
 ## Event Types
 
@@ -187,6 +200,7 @@ cancellation and deadline controls.
 - `assistant.reasoning.delta`
 - `assistant.message.delta`
 - `model.response.completed`
+- `provider.retry`
 - `provider.replay.updated`
 - `approval.requested`
 - `approval.resolved`
@@ -199,6 +213,16 @@ cancellation and deadline controls.
 - `error`
 - `session.rewind`
 - `session.completed`
+
+`orca exec` emits `provider.retry` before a scheduled provider retry. The
+payload contains `attempt` (the 1-based count of completed HTTP sends),
+`max_attempts` (the shared send limit), `delay_ms` (the scheduled wait including
+any active quota cooldown), `kind` (the provider error kind), and `reason` (up
+to 200 characters of the redacted diagnostic). Orca emits this event live.
+Terminal errors retain the bounded diagnostic and any available HTTP status
+and request ID.
+After a successful retry, `context.updated` shows the successful attempt's input
+tokens. `usage.updated` includes usage reported by failed attempts as well.
 
 `session.rewind` is emitted on the live runtime event stream after `/rewind`
 actually applied and its durable `session.rewind` transcript record was

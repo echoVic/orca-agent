@@ -122,7 +122,7 @@ pub trait RuntimeProviderResponseIngress: Send + Sync + std::fmt::Debug {
     fn commit_provider_attempt_failure(
         &self,
         _identity: &ModelResponseIdentity,
-        _message: &str,
+        _retry: &orca_core::provider_types::ProviderRetry,
     ) -> io::Result<()> {
         Ok(())
     }
@@ -147,6 +147,13 @@ pub trait RuntimeProviderResponseIngress: Send + Sync + std::fmt::Debug {
             self.commit_provider_step(identity, step)?;
         }
         Ok(())
+    }
+    fn publish_provider_steps(
+        &self,
+        identity: &ModelResponseIdentity,
+        steps: &[ProviderStep],
+    ) -> io::Result<()> {
+        self.commit_provider_steps(identity, steps)
     }
     fn commit_tool_results(&self, results: &[ToolResult]) -> io::Result<()>;
     /// What a running tool wrote for the person watching, recorded as it is

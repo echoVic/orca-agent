@@ -273,6 +273,12 @@ impl ThreadActor {
             task_id: task_id.clone(),
             usage_ledger: self.usage_ledger.clone(),
             response_identity: suspension.identity().clone(),
+            cwd: active
+                .config
+                .cwd
+                .clone()
+                .unwrap_or(std::env::current_dir()?),
+            apply_patch: active.config.tools.apply_patch,
             surface_outcome,
             surface_provider_ingress,
         };
@@ -486,6 +492,15 @@ impl ThreadActor {
                     }) if operation_id == &typed.fence.operation_fence.operation_id
                 )
             });
+        let response = if committed_user_cancel || outcome.status == RunStatus::Cancelled {
+            interrupted_background_provider_reply(
+                &snapshot,
+                &typed.fence.operation_fence,
+                outcome.response.as_ref(),
+            )
+        } else {
+            outcome.response.clone()
+        };
         let next_task_revision =
             surface::TaskRevision::try_new(task.revision.get().checked_add(1).ok_or_else(
                 || RuntimeHostError::ThreadStartFailed {
@@ -602,8 +617,7 @@ impl ThreadActor {
             surface::SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
                 .expect("generated UUID is v7");
         let operation_id = typed.fence.operation_fence.operation_id.clone();
-        let mut completion_events = outcome
-            .response
+        let mut completion_events = response
             .as_ref()
             .map(|response| {
                 self.generation_context_controller
@@ -611,9 +625,10 @@ impl ThreadActor {
                         self.resident_surface.coordinator.state().snapshot(),
                         &typed.fence,
                         response,
-                        &orca_tools::registry::tool_registry_with_mcp_and_external(
+                        &orca_tools::registry::tool_registry_for_session(
                             Some(&self.handle.mcp_registry),
                             &typed.external_tools,
+                            typed.apply_patch,
                         ),
                     )
             })
@@ -784,6 +799,7 @@ impl ThreadActor {
             finalize_intent_id,
             terminal_commit_id,
             completion_batch,
+            kept_response: response.filter(|response| response.cut_short.is_some()),
             terminal,
             usage,
             terminal_batch: None,
@@ -851,6 +867,13 @@ impl ThreadActor {
             })?;
             pending.stage = TypedProviderCompletionStage::Terminal;
         }
+        if let Some((events, writer)) = &pending.typed.reply_journal {
+            journal_kept_background_provider_reply(
+                Some(writer),
+                &mut events.fork(),
+                pending.kept_response.as_ref(),
+            )?;
+        }
         if let Some(prepared) = pending.background_approval.take() {
             self.resident_surface.interactions.insert(
                 prepared.interaction_id.clone(),
@@ -870,6 +893,7 @@ impl ThreadActor {
             self.mirror_typed_provider_outcome_after_terminal(
                 &pending.typed,
                 pending.shutdown_reason.as_ref(),
+                false,
             );
             return Ok(());
         }
@@ -960,6 +984,10 @@ impl ThreadActor {
         self.mirror_typed_provider_outcome_after_terminal(
             &pending.typed,
             pending.shutdown_reason.as_ref(),
+            matches!(
+                pending.terminal,
+                surface::OperationTerminal::Cancelled { .. }
+            ),
         );
         Ok(())
     }
@@ -968,8 +996,9 @@ impl ThreadActor {
         &mut self,
         typed: &TypedProviderBackground,
         shutdown_reason: Option<&surface::SurfaceShutdownReason>,
+        cancelled: bool,
     ) {
-        let Some(outcome) = typed
+        let Some(mut outcome) = typed
             .outcome
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -977,6 +1006,10 @@ impl ThreadActor {
         else {
             return;
         };
+        if cancelled {
+            outcome.status = RunStatus::Cancelled;
+            outcome.error = None;
+        }
         let already_terminal =
             typed
                 .task_registry
@@ -1000,7 +1033,7 @@ impl ThreadActor {
                 outcome.operation_terminal,
                 Some(orca_core::budget::OperationTerminal::Stopped { .. })
             );
-            let result = if budget_stopped {
+            let result = if budget_stopped && !cancelled {
                 typed.task_registry.stop_with_usage(
                     typed.task_id.as_str(),
                     "budget_exhausted".to_string(),

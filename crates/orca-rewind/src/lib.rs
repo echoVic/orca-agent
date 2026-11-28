@@ -43,7 +43,7 @@ pub const ZSTD_THRESHOLD_BYTES: u64 = 4096;
 pub use apply::{Applier, ApplyReport, RollbackReport};
 pub use diff::{FileDiffPreview, plan_diff_previews};
 pub use error::{RewindError, rewind_error};
-pub use path::{file_sha256, resolve_inside};
+pub use path::{excluded_directory, file_sha256, resolve_inside};
 pub use plan::{
     LineDiffStats, PlanOptions, PlanSkip, PlanWarning, PlannedDelete, PlannedWrite, RestorePlan,
     SnapshotFileView, SnapshotView, build_plan, line_diff_stats,

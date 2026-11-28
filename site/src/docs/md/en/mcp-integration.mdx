@@ -235,6 +235,38 @@ A server can mark a tool read-only in its `tools/list` response
 - A tool the server also marks `destructiveHint` is still asked about,
   the same as any other write.
 
+## Load tools on demand
+
+Set `tool_loading` in a server's configuration entry to `"eager"` (the
+default) or `"on-demand"`. Use on-demand loading for a server whose tool
+schemas would otherwise take up much of the model's context.
+
+~~~toml
+[[mcp_servers]]
+name = "docs"
+transport = "http"
+url = "https://mcp.example.test/mcp"
+tool_loading = "on-demand"
+~~~
+
+The model initially sees `mcp__docs__load_tools` and a catalog of tool names
+with short descriptions. It sends the server's tool names in an array, for
+example `{"names":["search","fetch"]}`. If any name is unknown, the call
+lists the valid names and loads nothing. The existing tool filters apply to
+the catalog. Orca reserves `load_tools` for its own loader on on-demand servers.
+When the catalog is shortened to fit the prompt, `{"names":[]}` lists the
+available names for that server.
+
+Loaded tools appear on the next model request and count toward DeepSeek's
+128-tool limit. A saved session restores its selection on resume. A reconnect
+keeps the tools the server still offers. Subagents start with an empty
+selection. When loading changes the tool list, the next request misses the
+prompt cache once.
+
+If an HTTP session expires during a tool call, Orca renews the session,
+refreshes its tool list, and asks the model to review the current tools
+before submitting the call again. This applies to both loading modes.
+
 ## Tool filters
 
 A server's entry can limit which of its tools Orca registers. `orca mcp add`

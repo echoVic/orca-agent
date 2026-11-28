@@ -3146,8 +3146,9 @@ impl ThreadActor {
             tool_use_id: surface_tool_use_id,
         };
         let returned_workflow = final_workflow;
-        let runner =
-            runner.with_progress_ingress(Some(Arc::new(RuntimeSurfaceWorkflowLifecycleIngress {
+        let runner = runner
+            .with_provider_retries(self.resident_surface.hub.clone(), operation_id.clone())
+            .with_progress_ingress(Some(Arc::new(RuntimeSurfaceWorkflowLifecycleIngress {
                 command_tx: self.handle.command_tx.clone(),
                 fence: generation_fence,
             })));
@@ -8539,6 +8540,7 @@ impl ThreadActor {
                         .map(|(interaction_id, _)| interaction_id)
                         .collect::<Vec<_>>(),
                 );
+                active.generation.user_interrupted = true;
                 Self::cancel_active_task_tree(active);
                 Ok(Self::committed_jsonl_turn_control(
                     request_id,
@@ -8648,13 +8650,7 @@ impl ThreadActor {
                 }
                 let resolved = resolve_surface_input(input)
                     .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-                // Hand the input to the turn before recording it: a turn that
-                // has already decided to end refuses it, and the client hears
-                // the turn is idle rather than see its steer never answered.
                 let steer_text = resolved.canonical_text.as_str().to_string();
-                if !active.steer_handle.push(steer_text.clone()) {
-                    return Ok(jsonl_idle_turn_control(request_id, legacy_turn_id, &action));
-                }
                 let persisted = surface_input_for_persisted_presentation(&resolved);
                 let input_item_id = surface::SurfaceItemId::new();
                 let batch = self.surface_event_batch_with_commit_id(
@@ -8688,12 +8684,14 @@ impl ThreadActor {
                     )],
                     None,
                 );
-                if self
-                    .commit_surface_generation_batch_with_retry(fence, &batch)
-                    .is_err()
+                if !active
+                    .steer_handle
+                    .commit_steer(input_item_id.clone(), steer_text, || {
+                        self.commit_surface_generation_batch_with_retry(fence, &batch)
+                    })
+                    .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?
                 {
-                    active.steer_handle.retract(&steer_text);
-                    return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+                    return Ok(jsonl_idle_turn_control(request_id, legacy_turn_id, &action));
                 }
                 Ok(Self::committed_jsonl_turn_control(
                     request_id,
@@ -9636,6 +9634,19 @@ impl ThreadActor {
                         | surface::SurfaceCapabilityCallState::WrittenAwaitingResponse,
                 )
             )
+    }
+
+    pub(super) fn surface_provider_response_admitted(
+        active: &ActiveOperation,
+        cut_short: Option<orca_core::conversation::CutShort>,
+    ) -> bool {
+        if cut_short == Some(orca_core::conversation::CutShort::Interrupted) {
+            return active.surface_terminalization
+                == Some(surface::TerminalizationCause::UserCancel)
+                || (active.surface_terminalization.is_none()
+                    && active.generation.user_interrupted);
+        }
+        !Self::surface_interaction_admission_closed(active)
     }
 
     pub(super) fn surface_interaction_admission_closed(active: &ActiveOperation) -> bool {

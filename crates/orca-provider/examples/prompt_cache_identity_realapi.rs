@@ -67,6 +67,7 @@ fn main() {
         std::process::exit(1);
     };
     conversation.messages.push(Message::Assistant {
+        cut_short: None,
         content: Some(first_content),
         reasoning_content: first.assistant_reasoning.clone(),
         tool_calls: Vec::new(),

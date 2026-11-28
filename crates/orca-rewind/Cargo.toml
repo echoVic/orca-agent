@@ -6,6 +6,7 @@ description = "Content-addressed file checkpoints for Orca /rewind: blob store, 
 license = "MIT"
 
 [dependencies]
+orca-platform = { path = "../orca-platform" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

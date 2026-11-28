@@ -449,6 +449,19 @@ impl OutputArchive {
             .ok_or_else(missing)
     }
 
+    pub(super) fn finished_shell_id(&self, task_id: &str) -> io::Result<String> {
+        self.check_files()?;
+        self.connection
+            .query_row(
+                "SELECT shell_id FROM shells WHERE task_id = ?1 AND state != 'running'",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?
+            .ok_or_else(missing)
+    }
+
     pub(super) fn finish(
         &self,
         task_id: &str,

@@ -1010,6 +1010,7 @@ mod agent_visit {
                 turn_id: owner.agent_loop_turns[0].turn_id.clone(),
                 text: DisplayText::new("owner's last item"),
                 pinned: false,
+                cut_short: None,
             });
             main.items.push(SurfaceItem::SystemMessage {
                 id: SurfaceItemId::new(),

@@ -27,17 +27,17 @@ use orca_rewind::{
 };
 use tempfile::TempDir;
 
-struct Fixture {
+pub(crate) struct Fixture {
     _home_guard: TestOrcaHomeGuard,
     home: TempDir,
     cwd: TempDir,
-    writer: SessionWriter,
+    pub(crate) writer: SessionWriter,
     session_id: String,
     transcript: PathBuf,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let home = tempfile::tempdir().expect("temporary ORCA_HOME");
         let home_guard = redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().expect("workspace");
@@ -61,17 +61,18 @@ impl Fixture {
         }
     }
 
-    fn cwd(&self) -> &Path {
+    pub(crate) fn cwd(&self) -> &Path {
         self.cwd.path()
     }
 
-    fn append_turn(&mut self, prompt: &str, reply: &str) {
+    pub(crate) fn append_turn(&mut self, prompt: &str, reply: &str) {
         self.writer.enter_turn(TurnId::new());
         self.writer
             .append_message(&Message::user(prompt.to_string()))
             .expect("user message");
         self.writer
             .append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some(reply.to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -88,7 +89,7 @@ impl Fixture {
             .collect()
     }
 
-    fn store(&self) -> RewindStore {
+    pub(crate) fn store(&self) -> RewindStore {
         let store_dir = self
             .home
             .path()
@@ -98,7 +99,7 @@ impl Fixture {
         RewindStore::open(&store_dir).expect("rewind store")
     }
 
-    fn store_dir(&self) -> PathBuf {
+    pub(crate) fn store_dir(&self) -> PathBuf {
         self.home
             .path()
             .join("rewind")
@@ -123,6 +124,7 @@ impl Fixture {
         change_stats: Option<SnapshotChangeStats>,
     ) -> FileSnapshotRecord {
         FileSnapshotRecord {
+            created_directories: Vec::new(),
             schema_version: 1,
             snapshot_id: format!("snap_{ordinal}"),
             session_id: self.session_id.clone(),
@@ -163,10 +165,11 @@ fn blob_ref(pre: &PreImage) -> BlobRef {
     }
 }
 
-fn snapshot_view(record: &FileSnapshotRecord) -> SnapshotView {
+pub(crate) fn snapshot_view(record: &FileSnapshotRecord) -> SnapshotView {
     SnapshotView {
         ordinal: record.ordinal,
         at_message_id: record.at_message_id.clone(),
+        created_directories: record.created_directories.clone(),
         files: record
             .files
             .iter()
@@ -574,6 +577,74 @@ fn turn_capture_records_pre_images_before_writes() {
     );
     assert_eq!(stats.deletions, 1, "the rewritten line is removed once");
     assert!(!stats.omitted);
+}
+
+#[test]
+fn rewind_restores_every_file_a_patch_changed() {
+    let mut fixture = Fixture::new();
+    fixture.append_turn("apply the patch", "patched");
+    let cwd = fixture.cwd().canonicalize().unwrap();
+    for (name, text) in [
+        ("update", "old\n"),
+        ("delete", "removed\n"),
+        ("move", "original\n"),
+    ] {
+        fixture.write_workspace_file(name, text);
+    }
+    let mut config = orca_core::config::RunConfig::default();
+    config.cwd = Some(cwd.clone());
+    config.history_mode = orca_core::config::HistoryMode::Record;
+    let mut conversation = Conversation::new();
+    conversation.add_system("system".into());
+    conversation.add_user("apply the patch".into());
+    let turn = crate::rewind::begin_turn(
+        &config,
+        &cwd,
+        "patch-turn",
+        &conversation,
+        Some(&mut fixture.writer),
+    )
+    .unwrap();
+    let request = ToolRequest {
+        id: "patch".into(),
+        name: ToolName::plain("apply_patch"),
+        action: ActionKind::Write,
+        target: None,
+        raw_arguments: Some(serde_json::json!({"input": "*** Begin Patch\n*** Update File: update\n@@\n-old\n+changed\n*** Delete File: delete\n*** Update File: move\n*** Move to: moved\n@@\n-original\n+new\n*** Add File: new/created\n+added\n*** End Patch"}).to_string()),
+    };
+    let prepared = orca_tools::apply_patch::prepare(&request, &cwd, || false).unwrap();
+    let capture = turn.prepare_patch_capture(&prepared).unwrap();
+    let result = prepared.commit(&request, || false);
+    turn.record_patch_effects(capture, &result.file_effects);
+    assert_eq!(
+        result.status,
+        orca_core::tool_types::ToolStatus::Completed,
+        "{:?}",
+        result.error
+    );
+    let snapshot = turn.finish_record().unwrap().unwrap();
+    assert_eq!(snapshot.files.len(), 5);
+    let store = fixture.store();
+    let plan = build_plan(
+        &cwd,
+        &store,
+        &[snapshot_view(&snapshot)],
+        PlanOptions { target_ordinal: 0 },
+    )
+    .unwrap();
+    let report = Applier::new(cwd.clone(), store, fixture.store_dir().join("journals"))
+        .apply(&plan)
+        .unwrap();
+    assert!(!report.partial);
+    for (name, text) in [
+        ("update", "old\n"),
+        ("delete", "removed\n"),
+        ("move", "original\n"),
+    ] {
+        assert_eq!(std::fs::read_to_string(cwd.join(name)).unwrap(), text);
+    }
+    assert!(!cwd.join("moved").exists());
+    assert!(!cwd.join("new").exists());
 }
 
 fn write_request(path: &str) -> ToolRequest {

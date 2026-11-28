@@ -180,6 +180,32 @@ incomplete resources/list result for '<server>': MCP server repeated a list curs
 - 一个工具是否只读，完全以服务器自己的声明为准。
 - 服务器同时标了 `destructiveHint` 的工具，仍会像其他写操作一样询问。
 
+## 按需加载工具
+
+在服务器配置条目中设置 `tool_loading`。默认值 `"eager"` 会直接向模型提供工具定义。
+如果某个服务器的工具定义占用太多上下文，可以设为 `"on-demand"`。
+
+~~~toml
+[[mcp_servers]]
+name = "docs"
+transport = "http"
+url = "https://mcp.example.test/mcp"
+tool_loading = "on-demand"
+~~~
+
+模型起初会看到 `mcp__docs__load_tools`，以及包含工具名和简短描述的目录。调用时传入服务器
+定义的工具名，例如 `{"names":["search","fetch"]}`。只要有一个名字无效，整次调用就不会加载
+任何工具，并会列出可用名称。目录仍受工具筛选规则约束。按需模式下，`load_tools` 是 Orca 为
+加载工具保留的名称。
+如果目录因上下文空间不足而缩短，传入 `{"names":[]}` 可以查看该服务器的可用工具名。
+
+已加载的工具从下一次模型请求开始可用，并计入 DeepSeek 的 128 个工具上限。恢复已保存的
+会话时，Orca 会恢复已加载的工具。服务器重新连接后，仍由服务器提供的工具会保留。子代理启动时
+尚未加载任何工具。加载操作改变工具列表时，下一次请求会有一次提示词缓存未命中。
+
+如果 HTTP 会话在工具调用期间过期，Orca 会续建会话并刷新工具列表。模型会收到提示，
+查看当前可用的工具后再提交调用。两种加载模式都适用。
+
 ## 工具筛选
 
 服务器条目可以限定 Orca 注册它的哪些工具。`orca mcp add` 不设置这两个键，需要手动

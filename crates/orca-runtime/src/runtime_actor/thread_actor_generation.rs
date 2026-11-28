@@ -1179,11 +1179,22 @@ impl ThreadActor {
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
         steps: &[ProviderStep],
     ) -> io::Result<()> {
-        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let active_generation = active.is_some_and(|active| {
             active.surface_operation.as_ref() == Some(&fence)
                 && !Self::surface_interaction_admission_closed(active)
         });
+        if active_generation
+            && self.resident_surface.coordinator.has_incomplete_batch()
+            && self.has_pending_surface_transition_retry()
+        {
+            // Defer before projection consumes redaction or plan-parser state.
+            // The pending transition owns the next surface cursor range.
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "provider stream is waiting for an earlier surface commit",
+            ));
+        }
+        let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
         let Some(projection) = self.generation_context_controller.provider_steps_events(
             &snapshot,
             active_generation,
@@ -1194,13 +1205,20 @@ impl ThreadActor {
         else {
             return Ok(());
         };
-        let batch = self.surface_event_batch_with_commit_id(projection.events, None);
-        match projection.background_fence {
-            Some(background_fence) => {
-                self.commit_surface_background_batch_with_retry(background_fence, &batch)
+        if !projection.events.is_empty() {
+            let batch = self.surface_event_batch_with_commit_id(projection.events, None);
+            match projection.background_fence {
+                Some(background_fence) => {
+                    self.commit_surface_background_batch_with_retry(background_fence, &batch)?;
+                }
+                None => self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?,
             }
-            None => self.commit_surface_generation_batch_with_retry(fence, &batch),
-        }?;
+        }
+        for retry in projection.retries {
+            self.resident_surface
+                .hub
+                .publish_provider_retry(&fence.operation_id, retry);
+        }
         Ok(())
     }
 
@@ -2210,12 +2228,16 @@ impl ThreadActor {
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
         message: &str,
     ) -> io::Result<()> {
-        self.commit_surface_provider_attempt_failure(active, fence, identity, message)?;
+        self.commit_surface_provider_attempt_failure(active, fence, identity, None)?;
         active.surface_execution_failure = Some(surface::GenerationExecutionFailureClass::Provider);
-        active.surface_execution_failure_diagnostic = Some(surface_safe_diagnostic(
-            message,
-            "provider execution failed with an invalid diagnostic",
-        ));
+        active.surface_execution_failure_diagnostic = Some(
+            surface::SafeDiagnosticText::try_new(message).unwrap_or_else(|_| {
+                surface::SafeDiagnosticText::try_new(
+                    "provider execution failed with an invalid diagnostic",
+                )
+                .expect("fixed diagnostic is bounded")
+            }),
+        );
         Ok(())
     }
 
@@ -2224,7 +2246,7 @@ impl ThreadActor {
         active: &ActiveOperation,
         fence: surface::SurfaceOperationFence,
         identity: &orca_core::thread_item_projection::ModelResponseIdentity,
-        _message: &str,
+        retry: Option<orca_core::provider_types::ProviderRetry>,
     ) -> io::Result<()> {
         if active.surface_operation.as_ref() != Some(&fence) {
             return Err(io::Error::new(
@@ -2242,11 +2264,15 @@ impl ThreadActor {
         let events = self
             .generation_context_controller
             .provider_attempt_failure_events(&snapshot, &fence, identity)?;
-        if events.is_empty() {
-            return Ok(());
+        if !events.is_empty() {
+            let batch = self.surface_event_batch_with_commit_id(events, None);
+            self.commit_surface_generation_batch_with_retry(fence.clone(), &batch)?;
         }
-        let batch = self.surface_event_batch_with_commit_id(events, None);
-        self.commit_surface_generation_batch_with_retry(fence, &batch)?;
+        if let Some(retry) = retry {
+            self.resident_surface
+                .hub
+                .publish_provider_retry(&fence.operation_id, Some(retry));
+        }
         Ok(())
     }
 
@@ -2262,20 +2288,45 @@ impl ThreadActor {
                 "provider response generation fence is stale",
             ));
         }
-        if Self::surface_interaction_admission_closed(active) {
+        if !Self::surface_provider_response_admitted(active, response.cut_short) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "runtime generation is terminalizing",
             ));
         }
         let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
+        let mut response =
+            if response.cut_short == Some(orca_core::conversation::CutShort::Interrupted) {
+                let partial = published_reply_prefix(
+                    &snapshot,
+                    &fence,
+                    &response.identity,
+                    response
+                        .response
+                        .assistant_content
+                        .as_deref()
+                        .unwrap_or_default(),
+                );
+                crate::provider_turn::cut_short_response(
+                    partial,
+                    &response.identity,
+                    orca_core::conversation::CutShort::Interrupted,
+                )
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "cancelled before publishing assistant text",
+                    )
+                })?
+            } else {
+                response.clone()
+            };
         // A tool-call id only has to be unique inside one response, but the
         // surface keys a tool by its id for the whole session. Rename the calls
         // that reuse an id from an *earlier* response (a provider deriving ids
         // deterministically, a relay, or a replayed turn) before they reach the
         // reducer, and hand the renamed response back so the conversation and
         // the tool results use the same names (issue #67).
-        let mut response = response.clone();
         rename_tool_calls_held_by_earlier_responses(&snapshot, &mut response)?;
         let events = self
             .generation_context_controller
@@ -2283,9 +2334,10 @@ impl ThreadActor {
                 &snapshot,
                 &fence,
                 &response,
-                &orca_tools::registry::tool_registry_with_mcp_and_external(
+                &orca_tools::registry::tool_registry_for_session(
                     Some(&self.handle.mcp_registry),
                     &active.config.external_tools,
+                    active.config.tools.apply_patch,
                 ),
             )?;
         if events.is_empty() {
@@ -2431,7 +2483,7 @@ impl ThreadActor {
             source,
             invocation_started,
         };
-        let output = result.output.as_deref().map(surface_persisted_display_text);
+        let output = result.output_preview().map(surface_persisted_display_text);
         let error = result.error.as_deref().map(surface_persisted_display_text);
         let content = output
             .clone()
@@ -3641,7 +3693,7 @@ impl ThreadActor {
         snapshot: &surface::SurfaceSnapshot,
         fence: &surface::SurfaceOperationFence,
         request: &orca_core::tool_types::ToolRequest,
-        external_tools: &[orca_core::external_config::ExternalToolConfig],
+        config: &orca_core::config::RunConfig,
     ) -> io::Result<surface::SurfaceToolRequest> {
         let tool_call_id = surface::SurfaceToolCallId::try_new(request.id.clone())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "empty tool call id"))?;
@@ -3670,9 +3722,10 @@ impl ThreadActor {
             || !records_request_action_and_target(
                 &tool,
                 request,
-                &orca_tools::registry::tool_registry_with_mcp_and_external(
+                &orca_tools::registry::tool_registry_for_session(
                     Some(&self.handle.mcp_registry),
-                    external_tools,
+                    &config.external_tools,
+                    config.tools.apply_patch,
                 ),
             )
             || tool.raw_arguments.as_str() != raw_arguments
@@ -3996,12 +4049,8 @@ impl ThreadActor {
                 ));
             }
             let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-            let tool = self.surface_tool_for_runtime_request(
-                &snapshot,
-                &fence,
-                &request,
-                &active.config.external_tools,
-            )?;
+            let tool =
+                self.surface_tool_for_runtime_request(&snapshot, &fence, &request, &active.config)?;
             let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
             let surface::OperationOrigin::AcpPrompt { session_id, .. } = &operation.intent.origin
@@ -4313,12 +4362,8 @@ impl ThreadActor {
                 ));
             }
             let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-            let tool = self.surface_tool_for_runtime_request(
-                &snapshot,
-                &fence,
-                &request,
-                &active.config.external_tools,
-            )?;
+            let tool =
+                self.surface_tool_for_runtime_request(&snapshot, &fence, &request, &active.config)?;
             let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
             let surface::OperationOrigin::AcpPrompt { session_id, .. } = &operation.intent.origin
@@ -4616,12 +4661,8 @@ impl ThreadActor {
                 ));
             }
             let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-            let tool = self.surface_tool_for_runtime_request(
-                &snapshot,
-                &fence,
-                &request,
-                &active.config.external_tools,
-            )?;
+            let tool =
+                self.surface_tool_for_runtime_request(&snapshot, &fence, &request, &active.config)?;
             let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
             let surface::OperationOrigin::AcpPrompt { session_id, .. } = &operation.intent.origin
@@ -4943,12 +4984,8 @@ impl ThreadActor {
                     io::Error::new(io::ErrorKind::InvalidInput, "invalid ACP terminal identity")
                 })?;
             let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-            let tool = self.surface_tool_for_runtime_request(
-                &snapshot,
-                &fence,
-                &request,
-                &active.config.external_tools,
-            )?;
+            let tool =
+                self.surface_tool_for_runtime_request(&snapshot, &fence, &request, &active.config)?;
             let has_live_lease = snapshot
                 .tools
                 .iter()
@@ -5403,12 +5440,8 @@ impl ThreadActor {
                     )
                 })?;
             let snapshot = self.resident_surface.coordinator.state().snapshot().clone();
-            let tool = self.surface_tool_for_runtime_request(
-                &snapshot,
-                &fence,
-                &request,
-                &active.config.external_tools,
-            )?;
+            let tool =
+                self.surface_tool_for_runtime_request(&snapshot, &fence, &request, &active.config)?;
             let operation = Self::surface_operation_record(&snapshot, &fence.operation_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation missing"))?;
             let surface::OperationOrigin::AcpPrompt { session_id, .. } = &operation.intent.origin
@@ -6002,6 +6035,12 @@ fn surface_file_change(
 ) -> Option<surface::SurfaceFileChange> {
     use orca_core::tool_types::FileChangePreview;
     let named = match preview {
+        FileChangePreview::Patch { text } => {
+            return Some(surface::SurfaceFileChange::Patch {
+                digest: surface::Sha256Digest::digest(text),
+                text: surface::DisplayText::new(text.clone()),
+            });
+        }
         FileChangePreview::UnifiedDiff { .. } => target?,
         FileChangePreview::Omitted { path, .. } => target.unwrap_or(path),
     };
@@ -6017,6 +6056,7 @@ fn surface_file_change(
     }
     let path = surface::CanonicalPath::try_new(resolved).ok()?;
     Some(match preview {
+        FileChangePreview::Patch { .. } => unreachable!("patch preview is handled above"),
         FileChangePreview::UnifiedDiff { text, .. } => surface::SurfaceFileChange::UnifiedDiff {
             path,
             digest: surface::Sha256Digest::digest(text),

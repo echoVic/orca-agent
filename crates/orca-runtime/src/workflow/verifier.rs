@@ -1,7 +1,7 @@
 use std::io;
 
 use orca_core::workflow_types::{
-    WorkflowEvidenceBundle, WorkflowMutationPolicy, WorkflowRunStatus,
+    WorkflowEvidenceBundle, WorkflowEvidenceToolEvent, WorkflowMutationPolicy, WorkflowRunStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -164,11 +164,12 @@ fn contract_failures(evidence: &WorkflowEvidenceBundle) -> Vec<String> {
     }
 
     if contract.mutation_policy == Some(WorkflowMutationPolicy::ReadOnly) {
-        for event in tool_events.iter().filter(|event| {
-            event.status.as_deref() == Some("completed") && is_source_mutation_tool(&event.name)
-        }) {
+        for event in tool_events
+            .into_iter()
+            .filter(|event| mutates_workspace(event))
+        {
             failures.push(format!(
-                "read-only mutation policy was violated by completed `{}` tool call{}",
+                "read-only mutation policy was violated by `{}` tool call{}",
                 event.name,
                 event
                     .target
@@ -182,6 +183,35 @@ fn contract_failures(evidence: &WorkflowEvidenceBundle) -> Vec<String> {
     failures
 }
 
-fn is_source_mutation_tool(name: &str) -> bool {
-    matches!(name, "edit" | "write_file")
+fn mutates_workspace(event: &WorkflowEvidenceToolEvent) -> bool {
+    event.file_effect_count > 0
+        || (event.status.as_deref() == Some("completed")
+            && matches!(event.name.as_str(), "edit" | "write_file"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_apply_patch_counts_as_a_mutation_when_it_left_effects() {
+        let mut event = WorkflowEvidenceToolEvent {
+            name: "apply_patch".into(),
+            status: Some("failed".into()),
+            ..Default::default()
+        };
+        assert!(!mutates_workspace(&event));
+        event.file_effect_count = 1;
+        assert!(mutates_workspace(&event));
+    }
+
+    #[test]
+    fn external_apply_patch_with_no_file_effects_is_not_a_mutation() {
+        let event = WorkflowEvidenceToolEvent {
+            name: "apply_patch".into(),
+            status: Some("completed".into()),
+            ..Default::default()
+        };
+        assert!(!mutates_workspace(&event));
+    }
 }

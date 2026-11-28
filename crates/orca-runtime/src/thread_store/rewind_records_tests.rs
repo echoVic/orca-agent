@@ -81,6 +81,7 @@ impl Fixture {
     fn append_assistant(&mut self, content: &str) -> String {
         self.writer
             .append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some(content.to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -133,6 +134,7 @@ fn rewind_record(session_id: &str, at_message_id: &str, kept_messages: u32) -> S
 
 fn snapshot_record(session_id: &str, at_message_id: &str) -> FileSnapshotRecord {
     FileSnapshotRecord {
+        created_directories: Vec::new(),
         schema_version: 1,
         snapshot_id: "snap_contract_1".to_string(),
         session_id: session_id.to_string(),
@@ -648,7 +650,9 @@ fn summarize_from_fold_truncates_and_appends_a_pinned_summary() {
             ["first prompt".to_string(), "reply one".to_string()]
         );
         match &transcript.messages[2] {
-            Message::System { content, pinned } => {
+            Message::System {
+                content, pinned, ..
+            } => {
                 assert!(pinned, "folded summary must be pinned");
                 assert_eq!(content, "summary of the removed tail");
             }
@@ -694,7 +698,9 @@ fn summarize_up_to_fold_drains_the_front_and_keeps_the_system_position() {
         // after it.
         assert_eq!(texts(&transcript)[0], "persisted system prompt");
         match &transcript.messages[1] {
-            Message::System { content, pinned } => {
+            Message::System {
+                content, pinned, ..
+            } => {
                 assert!(pinned, "folded summary must be pinned");
                 assert_eq!(content, "summary of the prefix");
             }
@@ -738,7 +744,9 @@ fn summarize_up_to_fold_drains_leading_messages_before_the_target() {
         let transcript = fixture.transcript();
         assert_eq!(transcript.messages.len(), 3);
         match &transcript.messages[0] {
-            Message::System { content, pinned } => {
+            Message::System {
+                content, pinned, ..
+            } => {
                 assert!(pinned, "folded summary must be pinned");
                 assert_eq!(content, "summary of the first turn");
             }

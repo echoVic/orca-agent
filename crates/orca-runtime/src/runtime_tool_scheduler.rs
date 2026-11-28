@@ -1,19 +1,38 @@
+use std::collections::HashSet;
+
+use orca_approval::ApprovalPolicy;
+use orca_core::approval_types::ApprovalDecision;
 use orca_core::config::RunConfig;
-use orca_core::tool_types::ToolRequest;
+use orca_core::tool_types::{ToolCapability, ToolName, ToolRequest};
+use orca_mcp::McpRegistry;
 
 use crate::runtime_readonly_tool_turn::{collect_readonly_batch, should_run_readonly_batch};
 use crate::step_context::{RuntimeSamplingRequestState, RuntimeToolDispatchWindow};
 use crate::subagent_execution::{collect_subagent_batch, should_run_subagent_batch};
+use crate::tool_invocation::{
+    approval_request_for_invocation, prepare_tool_invocation_with_external,
+    validate_tool_invocation,
+};
 
 pub(crate) enum RuntimeToolDispatch<'a> {
     Normal(&'a ToolRequest),
     ReadonlyBatch(RuntimeToolDispatchWindow<'a>),
+    NetworkReadBatch(RuntimeToolDispatchWindow<'a>),
     SubagentBatch(RuntimeToolDispatchWindow<'a>),
+}
+
+pub(crate) struct NetworkReadScheduling<'a> {
+    pub(crate) policy: &'a ApprovalPolicy,
+    pub(crate) mcp_registry: &'a McpRegistry,
+    pub(crate) sequential_until: &'a mut usize,
+    pub(crate) tool_allowed: &'a dyn Fn(&ToolRequest) -> bool,
 }
 
 pub(crate) struct RuntimeToolDispatchScheduler<'a> {
     config: &'a RunConfig,
     subagent_depth: u32,
+    parallel_limit: Option<usize>,
+    network_sequential: bool,
 }
 
 impl<'a> RuntimeToolDispatchScheduler<'a> {
@@ -21,38 +40,155 @@ impl<'a> RuntimeToolDispatchScheduler<'a> {
         Self {
             config,
             subagent_depth,
+            parallel_limit: None,
+            network_sequential: !config.budget.to_spec().is_unlimited(),
         }
+    }
+
+    pub(crate) fn with_parallel_limit(mut self, parallel_limit: Option<usize>) -> Self {
+        self.parallel_limit = parallel_limit;
+        self
+    }
+
+    pub(crate) fn with_network_sequential(mut self, network_sequential: bool) -> Self {
+        self.network_sequential = network_sequential;
+        self
     }
 
     pub(crate) fn next_dispatch<'requests>(
         &self,
         sampling_state: &RuntimeSamplingRequestState,
         tool_requests: &'requests [ToolRequest],
+        network: Option<NetworkReadScheduling<'_>>,
     ) -> Option<RuntimeToolDispatch<'requests>> {
         let current = sampling_state.current_tool_request(tool_requests)?;
 
         if should_run_subagent_batch(self.config, current, self.subagent_depth) {
             let window = sampling_state.tool_dispatch_window(tool_requests, |requests, start| {
-                collect_subagent_batch(self.config, requests, start)
+                self.limit_window_end(start, collect_subagent_batch(self.config, requests, start))
             });
             return Some(RuntimeToolDispatch::SubagentBatch(window));
         }
 
-        if should_run_readonly_batch(self.config.tools.max_read_parallel, current) {
+        let max_parallel = self
+            .parallel_limit
+            .map_or(self.config.tools.max_read_parallel, |limit| {
+                self.config.tools.max_read_parallel.min(limit.max(1))
+            });
+        if let Some(network) = network {
             let window = sampling_state.tool_dispatch_window(tool_requests, |requests, start| {
-                collect_readonly_batch(self.config.tools.max_read_parallel, requests, start)
+                if self.network_sequential || start < *network.sequential_until || max_parallel <= 1
+                {
+                    return start;
+                }
+                let mut count = 0;
+                let mut document_targets = HashSet::new();
+                for request in requests[start..].iter().take(max_parallel) {
+                    if !((should_run_readonly_batch(max_parallel, request)
+                        || is_network_read(request))
+                        && (network.tool_allowed)(request))
+                    {
+                        break;
+                    }
+                    if request.name == ToolName::ReadDocument {
+                        if request
+                            .target
+                            .as_ref()
+                            .is_some_and(|target| !document_targets.insert(target.clone()))
+                        {
+                            break;
+                        }
+                    }
+                    count += 1;
+                }
+                start + count
+            });
+            let start = window.end_index() - window.tool_requests().len();
+            if start < *network.sequential_until {
+                return Some(RuntimeToolDispatch::Normal(current));
+            }
+            if !self.network_sequential
+                && window.tool_requests().len() > 1
+                && window.tool_requests().iter().any(is_network_read)
+            {
+                if !sampling_state.permission_overlay.strict_auto_review()
+                    && window
+                        .tool_requests()
+                        .iter()
+                        .all(|request| self.allows_without_asking(request, &network))
+                {
+                    return Some(RuntimeToolDispatch::NetworkReadBatch(window));
+                }
+                *network.sequential_until = window.end_index();
+                return Some(RuntimeToolDispatch::Normal(current));
+            }
+        }
+
+        if should_run_readonly_batch(max_parallel, current) {
+            let window = sampling_state.tool_dispatch_window(tool_requests, |requests, start| {
+                self.limit_window_end(
+                    start,
+                    collect_readonly_batch(self.config.tools.max_read_parallel, requests, start),
+                )
             });
             return Some(RuntimeToolDispatch::ReadonlyBatch(window));
         }
 
         Some(RuntimeToolDispatch::Normal(current))
     }
+
+    fn limit_window_end(&self, start: usize, end: usize) -> usize {
+        self.parallel_limit
+            .map_or(end, |limit| end.min(start.saturating_add(limit.max(1))))
+    }
+
+    fn allows_without_asking(
+        &self,
+        request: &ToolRequest,
+        network: &NetworkReadScheduling<'_>,
+    ) -> bool {
+        let invocation = prepare_tool_invocation_with_external(
+            request,
+            self.subagent_depth,
+            self.config.subagents.max_depth,
+            network.mcp_registry,
+            &self.config.external_tools,
+        );
+        if self.config.subagents.effective_definition.is_some()
+            && validate_tool_invocation(&invocation, network.mcp_registry, self.config).is_err()
+        {
+            return false;
+        }
+        let Some(approval) = approval_request_for_invocation(&invocation) else {
+            return false;
+        };
+        network
+            .policy
+            .resolve_for_tool(
+                &approval,
+                invocation.effective.name.as_str(),
+                approval.target.as_deref().or(request.target.as_deref()),
+            )
+            .decision
+            == ApprovalDecision::Allow
+    }
+}
+
+pub(crate) fn is_network_read(request: &ToolRequest) -> bool {
+    // These built-in reads can use the normal backend without an interactive worker.
+    matches!(
+        request.name,
+        ToolName::WebSearch | ToolName::WebFetch | ToolName::ReadDocument
+    ) && orca_tools::canonical_capabilities(request).is_some_and(|capabilities| {
+        capabilities.contains(ToolCapability::NetworkSearch)
+            && capabilities.is_read_only_or_network_search()
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use orca_core::approval_rules::PermissionRules;
-    use orca_core::approval_types::{ActionKind, ApprovalMode};
+    use orca_core::approval_rules::{PermissionRule, PermissionRules};
+    use orca_core::approval_types::{ActionKind, ApprovalMode, Decision};
     use orca_core::config::{
         HistoryMode, ModelRuntimeConfig, OutputFormat, ProviderKind, RunConfig, ThemeName,
         ToolConfig, WorkflowConfig,
@@ -148,11 +284,103 @@ mod tests {
         match dispatch {
             RuntimeToolDispatch::Normal(request) => vec![request.id.as_str()],
             RuntimeToolDispatch::ReadonlyBatch(window)
+            | RuntimeToolDispatch::NetworkReadBatch(window)
             | RuntimeToolDispatch::SubagentBatch(window) => window
                 .tool_requests()
                 .iter()
                 .map(|request| request.id.as_str())
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn scheduler_keeps_a_network_read_forbidden_by_the_frozen_agent_out_of_the_batch() {
+        let mut config = config();
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.subagents.effective_definition = Some(
+            orca_core::subagent_types::agent_definition::EffectiveAgentDefinition {
+                name: "review".to_string(),
+                description: "Review local files".to_string(),
+                system_prompt: "Inspect the workspace".to_string(),
+                allowed_tools: vec!["read_file".to_string()],
+                model: None,
+            },
+        );
+        let fetch = |id| ToolRequest {
+            raw_arguments: Some(json!({"url": "https://example.com/"}).to_string()),
+            ..request(id, ToolName::WebFetch, ActionKind::Network)
+        };
+        let requests = [fetch("first"), fetch("second")];
+        let scheduler = RuntimeToolDispatchScheduler::new(&config, 1);
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let dispatch = scheduler.next_dispatch(
+            &RuntimeSamplingRequestState::new(),
+            &requests,
+            Some(NetworkReadScheduling {
+                policy: &policy,
+                mcp_registry: &McpRegistry::default(),
+                sequential_until: &mut 0,
+                tool_allowed: &|_| true,
+            }),
+        );
+        assert!(
+            matches!(dispatch, Some(RuntimeToolDispatch::Normal(request)) if request.id == "first")
+        );
+    }
+
+    #[test]
+    fn scheduler_uses_permission_rules_for_the_whole_network_window() {
+        let mut config = config();
+        let search = |id: &str, query: &str| ToolRequest {
+            raw_arguments: Some(json!({"query": query}).to_string()),
+            ..request(id, ToolName::WebSearch, ActionKind::Network)
+        };
+        let requests = [
+            search("first", "review"),
+            request("local", ToolName::ReadFile, ActionKind::Read),
+            search("last", "reference"),
+        ];
+        let registry = McpRegistry::default();
+        config.permission_rules.rules = vec![
+            PermissionRule::new("web_search", "review", Decision::Allow),
+            PermissionRule::new("web_search", "reference", Decision::Allow),
+        ];
+        for allow_last in [true, false] {
+            config.permission_rules.rules[1].decision = if allow_last {
+                Decision::Allow
+            } else {
+                Decision::Prompt
+            };
+            let scheduler = RuntimeToolDispatchScheduler::new(&config, 0);
+            let policy = crate::tool_execution::policy_for_tool_execution(&config);
+            let mut state = RuntimeSamplingRequestState::new();
+            let mut sequential_until = 0;
+            let mut dispatch = |state: &RuntimeSamplingRequestState| {
+                scheduler
+                    .next_dispatch(
+                        state,
+                        &requests,
+                        Some(NetworkReadScheduling {
+                            policy: &policy,
+                            mcp_registry: &registry,
+                            sequential_until: &mut sequential_until,
+                            tool_allowed: &|_| true,
+                        }),
+                    )
+                    .unwrap()
+            };
+            if allow_last {
+                let batch = dispatch(&state);
+                assert!(matches!(batch, RuntimeToolDispatch::NetworkReadBatch(_)));
+                assert_eq!(ids(&batch), ["first", "local", "last"]);
+            } else {
+                for id in ["first", "local", "last"] {
+                    assert!(
+                        matches!(dispatch(&state), RuntimeToolDispatch::Normal(request) if request.id == id)
+                    );
+                    state.advance_tool_cursor_one(requests.len());
+                }
+            }
         }
     }
 
@@ -168,11 +396,169 @@ mod tests {
         let sampling_state = RuntimeSamplingRequestState::new();
 
         let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
-            .next_dispatch(&sampling_state, &requests)
+            .next_dispatch(&sampling_state, &requests, None)
             .expect("dispatch");
 
         assert!(matches!(dispatch, RuntimeToolDispatch::ReadonlyBatch(_)));
         assert_eq!(ids(&dispatch), vec!["read-a", "read-b"]);
+    }
+
+    #[test]
+    fn scheduler_serializes_billed_network_reads_when_the_operation_has_a_budget() {
+        let mut config = config();
+        config.budget.max_cost_usd_micros = Some(1_000);
+        let fetch = |id: &str| ToolRequest {
+            raw_arguments: Some(json!({"url": "https://example.com/"}).to_string()),
+            ..request(id, ToolName::WebFetch, ActionKind::Network)
+        };
+        let requests = [fetch("first"), fetch("second")];
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
+            .next_dispatch(
+                &RuntimeSamplingRequestState::new(),
+                &requests,
+                Some(NetworkReadScheduling {
+                    policy: &policy,
+                    mcp_registry: &McpRegistry::default(),
+                    sequential_until: &mut 0,
+                    tool_allowed: &|_| true,
+                }),
+            )
+            .expect("dispatch");
+
+        assert!(matches!(dispatch, RuntimeToolDispatch::Normal(request) if request.id == "first"));
+    }
+
+    #[test]
+    fn scheduler_limits_a_parallel_window_to_remaining_tool_call_allowance() {
+        let config = config();
+        let fetch = |id: &str| ToolRequest {
+            raw_arguments: Some(json!({"url": "https://example.com/"}).to_string()),
+            ..request(id, ToolName::WebFetch, ActionKind::Network)
+        };
+        let requests = [fetch("first"), fetch("second")];
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
+            .with_parallel_limit(Some(1))
+            .next_dispatch(
+                &RuntimeSamplingRequestState::new(),
+                &requests,
+                Some(NetworkReadScheduling {
+                    policy: &policy,
+                    mcp_registry: &McpRegistry::default(),
+                    sequential_until: &mut 0,
+                    tool_allowed: &|_| true,
+                }),
+            )
+            .expect("dispatch");
+
+        assert!(matches!(dispatch, RuntimeToolDispatch::Normal(request) if request.id == "first"));
+    }
+
+    #[test]
+    fn operation_admission_leaves_the_last_network_call_available_for_dispatch() {
+        let mut config = config();
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mut operation = crate::operation_context::OperationContext::for_tests(
+            orca_core::budget::BudgetSpec {
+                max_tool_calls: Some(3),
+                ..Default::default()
+            },
+            "network-call-allowance",
+        );
+        operation
+            .admit_tool_call("turn", "used-1", "web_fetch")
+            .unwrap()
+            .unwrap();
+        operation
+            .admit_tool_call("turn", "used-2", "web_fetch")
+            .unwrap()
+            .unwrap();
+        let fetch = |id: &str| ToolRequest {
+            raw_arguments: Some(json!({"url": "https://example.com/"}).to_string()),
+            ..request(id, ToolName::WebFetch, ActionKind::Network)
+        };
+        let requests = [fetch("last-allowed"), fetch("must-wait")];
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
+            .with_parallel_limit(crate::tool_turn::remaining_tool_call_allowance(Some(
+                &operation,
+            )))
+            .next_dispatch(
+                &RuntimeSamplingRequestState::new(),
+                &requests,
+                Some(NetworkReadScheduling {
+                    policy: &policy,
+                    mcp_registry: &McpRegistry::default(),
+                    sequential_until: &mut 0,
+                    tool_allowed: &|_| true,
+                }),
+            )
+            .expect("dispatch");
+
+        assert!(
+            matches!(dispatch, RuntimeToolDispatch::Normal(request) if request.id == "last-allowed")
+        );
+    }
+
+    #[test]
+    fn subagent_batch_fits_the_remaining_tool_call_allowance() {
+        let config = config();
+        let mut operation = crate::operation_context::OperationContext::for_tests(
+            orca_core::budget::BudgetSpec {
+                max_tool_calls: Some(3),
+                ..Default::default()
+            },
+            "subagent-call-allowance",
+        );
+        operation
+            .admit_tool_call("turn", "used-1", "web_fetch")
+            .unwrap()
+            .unwrap();
+        operation
+            .admit_tool_call("turn", "used-2", "web_fetch")
+            .unwrap()
+            .unwrap();
+        let requests = [
+            subagent_request("last-allowed"),
+            subagent_request("must-wait"),
+        ];
+        let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
+            .with_parallel_limit(crate::tool_turn::remaining_tool_call_allowance(Some(
+                &operation,
+            )))
+            .next_dispatch(&RuntimeSamplingRequestState::new(), &requests, None)
+            .expect("dispatch");
+
+        assert_eq!(ids(&dispatch), ["last-allowed"]);
+    }
+
+    #[test]
+    fn scheduler_serializes_same_document_reads() {
+        let config = config();
+        let read = |id: &str, offset: u64| ToolRequest {
+            raw_arguments: Some(json!({"path": "paper.pdf", "offset": offset}).to_string()),
+            ..ToolRequest {
+                target: Some("paper.pdf".to_string()),
+                ..request(id, ToolName::ReadDocument, ActionKind::Read)
+            }
+        };
+        let requests = [read("first", 0), read("second", 100)];
+        let policy = crate::tool_execution::policy_for_tool_execution(&config);
+        let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
+            .next_dispatch(
+                &RuntimeSamplingRequestState::new(),
+                &requests,
+                Some(NetworkReadScheduling {
+                    policy: &policy,
+                    mcp_registry: &McpRegistry::default(),
+                    sequential_until: &mut 0,
+                    tool_allowed: &|_| true,
+                }),
+            )
+            .expect("dispatch");
+
+        assert!(matches!(dispatch, RuntimeToolDispatch::Normal(request) if request.id == "first"));
     }
 
     #[test]
@@ -186,14 +572,14 @@ mod tests {
         let mut sampling_state = RuntimeSamplingRequestState::new();
 
         let first = RuntimeToolDispatchScheduler::new(&config, 0)
-            .next_dispatch(&sampling_state, &requests)
+            .next_dispatch(&sampling_state, &requests, None)
             .expect("first dispatch");
         assert!(matches!(first, RuntimeToolDispatch::ReadonlyBatch(_)));
         assert_eq!(ids(&first), vec!["read-a"]);
 
         sampling_state.advance_tool_cursor_one(requests.len());
         let second = RuntimeToolDispatchScheduler::new(&config, 0)
-            .next_dispatch(&sampling_state, &requests)
+            .next_dispatch(&sampling_state, &requests, None)
             .expect("goal dispatch");
         assert!(matches!(second, RuntimeToolDispatch::Normal(_)));
         assert_eq!(ids(&second), vec!["goal-update"]);
@@ -223,7 +609,7 @@ mod tests {
         let sampling_state = RuntimeSamplingRequestState::new();
 
         let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
-            .next_dispatch(&sampling_state, &requests)
+            .next_dispatch(&sampling_state, &requests, None)
             .expect("dispatch");
 
         assert!(matches!(dispatch, RuntimeToolDispatch::SubagentBatch(_)));
@@ -240,7 +626,7 @@ mod tests {
         let sampling_state = RuntimeSamplingRequestState::new();
 
         let dispatch = RuntimeToolDispatchScheduler::new(&config, 0)
-            .next_dispatch(&sampling_state, &requests)
+            .next_dispatch(&sampling_state, &requests, None)
             .expect("dispatch");
 
         assert!(matches!(dispatch, RuntimeToolDispatch::Normal(_)));
@@ -256,7 +642,7 @@ mod tests {
 
         assert!(
             RuntimeToolDispatchScheduler::new(&config, 0)
-                .next_dispatch(&sampling_state, &requests)
+                .next_dispatch(&sampling_state, &requests, None)
                 .is_none()
         );
     }

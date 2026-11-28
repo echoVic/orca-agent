@@ -587,11 +587,32 @@ impl AppState {
                 }
                 self.discard_current_assistant_attempt();
             }
+            TuiEvent::ProviderRetry(retry) => self.provider_retry = retry,
+            TuiEvent::WorkflowProviderRetry {
+                operation_id,
+                retry,
+            } => {
+                if let Some(retry) = retry {
+                    self.workflow_provider_retries.insert(operation_id, retry);
+                } else {
+                    self.workflow_provider_retries.remove(&operation_id);
+                }
+            }
             TuiEvent::AssistantResponseCompleted(message, reasoning) => {
                 if self.suppress_background_main_session_output {
                     return;
                 }
                 self.reconcile_assistant_response(message.as_deref(), reasoning.as_deref());
+            }
+            TuiEvent::AssistantReplyKept(reason) => {
+                if self.suppress_background_main_session_output {
+                    return;
+                }
+                self.take_trailing_receiving_tool_calls();
+                self.flush_proposed_plan_parser();
+                self.finish_assistant_stream();
+                self.push_message(ChatMessage::AssistantCutShort(reason));
+                self.transcript.call_start = self.transcript.messages.len();
             }
             TuiEvent::ToolRequested { id, name, target } => {
                 if self.suppress_background_main_session_output {
@@ -1284,6 +1305,7 @@ impl AppState {
                 self.scroll_to_bottom();
             }
             TuiEvent::SessionCompleted { status } => {
+                self.provider_retry = None;
                 self.denied_approval_stops_turn = false;
                 self.invalidate_recap();
                 let was_backgrounded = self.suppress_background_main_session_output;

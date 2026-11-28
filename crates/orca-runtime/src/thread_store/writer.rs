@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
-use orca_core::conversation::{Message, SummaryState, is_internal_image_analysis};
+use orca_core::conversation::{Message, SummaryState, is_rewindable_user_prompt};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventEnvelope, EventPublicationStore, EventType};
 use orca_core::plan_types::{PlanItem, PlanStatus};
@@ -29,6 +29,7 @@ use crate::history::{self, CompactionRecord, ContextSummaryRecord};
 
 use super::assets::{self, HydrateImages};
 use super::reader::{INDEX_BUDGET, SessionRecords, iter_records};
+use super::redact_sensitive_text;
 #[cfg(not(test))]
 use super::session_index;
 use super::types::{
@@ -45,8 +46,8 @@ pub(crate) const MAX_SESSION_LINE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) struct SessionScan {
     pub records: Vec<SessionRecord>,
     /// Decoded JSONL lines retained only up to the same record/line bounds.
-    /// Search uses these snippets instead of opening the source a second time.
-    pub lines: Vec<String>,
+    /// Skipped records have no snippet. Blank lines keep their own slots.
+    pub lines: Vec<Option<String>>,
     pub health: StoredSessionHealth,
     pub health_issue: Option<StoredSessionHealthIssue>,
     pub source_fingerprint: Option<String>,
@@ -75,6 +76,7 @@ impl SessionScan {
             code: code.into(),
             line,
             offset,
+            record_type: None,
         });
         self
     }
@@ -103,6 +105,13 @@ pub(crate) fn read_manual_compaction_snapshot(
         conversation.messages = record.messages.into_iter().map(Message::from).collect();
         conversation.rolling_summary = record.rolling_summary;
         conversation.summary = record.summary_state;
+        conversation.nested_instructions.versions = record
+            .nested_instructions
+            .into_iter()
+            .map(|version| (version.identity.source.clone(), version))
+            .collect();
+        conversation.nested_instructions.written_sources =
+            record.written_instruction_sources.into_iter().collect();
         ManualCompactionDurableSnapshot {
             operation_id: record.operation_id,
             strategy: record.strategy,
@@ -170,11 +179,31 @@ fn open_completion_history_file(path: &Path) -> io::Result<File> {
 }
 
 pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
+    append_record(path, record).map(|_| ())
+}
+
+fn append_record(path: &Path, record: &SessionRecord) -> io::Result<bool> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
     let _lock = acquire_file_lock(path)?;
+    if let Some(update) = boundary_section_update(record) {
+        let stored = redact_session_record(record);
+        let mut last = None;
+        for candidate in iter_records(path, HydrateImages::NotToolMessages)? {
+            let candidate = candidate?;
+            if let Some(previous) = boundary_section_update(&candidate)
+                && previous.resume_boundary == update.resume_boundary
+                && previous.sections[0].name == update.sections[0].name
+            {
+                last = Some(candidate);
+            }
+        }
+        if last.as_ref().and_then(boundary_section_update) == boundary_section_update(&stored) {
+            return Ok(false);
+        }
+    }
     let line = encode_record_line(path, record)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(&line)?;
@@ -193,7 +222,7 @@ pub(crate) fn write_record(path: &Path, record: &SessionRecord) -> io::Result<()
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn write_durable_record(path: &Path, record: &SessionRecord) -> io::Result<()> {
@@ -279,6 +308,9 @@ fn repair_incomplete_final_record(file: &mut File) -> io::Result<()> {
 }
 
 pub(crate) fn write_record_line(mut writer: impl Write, record: &SessionRecord) -> io::Result<()> {
+    if let SessionRecord::Ignorable(bytes) = record {
+        return writer.write_all(bytes);
+    }
     let redacted = redact_session_record(record);
     writer.write_all(&bounded_json_line(&redacted)?)
 }
@@ -392,16 +424,20 @@ fn write_records_to(
     target_path: &Path,
     records: impl IntoIterator<Item = io::Result<SessionRecord>>,
 ) -> io::Result<()> {
+    let lines = records.into_iter().map(|record| match record? {
+        SessionRecord::Ignorable(bytes) => Ok(bytes),
+        record => encode_record_line(target_path, &record),
+    });
     if target_path.extension().and_then(|ext| ext.to_str()) == Some("zst") {
         let mut encoder = zstd::stream::write::Encoder::new(file, 3)?;
-        for record in records {
-            encoder.write_all(&encode_record_line(target_path, &record?)?)?;
+        for line in lines {
+            encoder.write_all(&line?)?;
         }
         encoder.finish()?;
     } else {
         let mut writer = io::BufWriter::new(file);
-        for record in records {
-            writer.write_all(&encode_record_line(target_path, &record?)?)?;
+        for line in lines {
+            writer.write_all(&line?)?;
         }
         writer.flush()?;
     }
@@ -420,7 +456,7 @@ fn scan_session_with_lines(path: &Path) -> io::Result<SessionScan> {
 
 fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionScan> {
     let mut reader = match SessionRecords::open(path, Some(INDEX_BUDGET), HydrateImages::None) {
-        Ok(reader) => reader,
+        Ok(reader) => reader.require_metadata(),
         Err(error) => {
             let metadata = fs::symlink_metadata(path).ok();
             if metadata
@@ -438,17 +474,30 @@ fn scan_session_inner(path: &Path, collect_lines: bool) -> io::Result<SessionSca
         }
     };
     let mut scan = SessionScan::new(path);
+    let mut last_searchable_line = 0;
     while let Some(record) = reader.next() {
         let Ok(record) = record else {
             break;
         };
-        scan.records.push(record);
+        let skipped = matches!(record, SessionRecord::Ignorable(_));
         if collect_lines {
-            // Preserve physical line numbers, including blank JSONL lines.
+            let line_number = reader.line_number as usize;
             scan.lines
-                .resize(reader.line_number as usize, String::new());
-            *scan.lines.last_mut().expect("current line") = reader.text().to_owned();
+                .resize_with(line_number - 1, || Some(String::new()));
+            scan.lines.push(if skipped {
+                None
+            } else {
+                last_searchable_line = line_number;
+                Some(reader.text().to_owned())
+            });
         }
+        if !skipped {
+            scan.records.push(record);
+        }
+    }
+    scan.lines.truncate(last_searchable_line);
+    if let Some(meta) = reader.newer_meta {
+        scan.records.push(SessionRecord::Meta(meta));
     }
     scan.health = reader.health;
     scan.health_issue = reader.issue;
@@ -524,6 +573,7 @@ pub(super) fn parse_session_record(line: &str) -> Result<SessionRecord, &'static
 
 pub(super) fn validate_session_record(value: SessionRecord) -> Result<SessionRecord, &'static str> {
     match &value {
+        SessionRecord::Unrecognized => Err("unknown_record_type"),
         SessionRecord::Message { id, turn_id, .. } if id.is_some() != turn_id.is_some() => {
             Err("invalid_conversation_identity")
         }
@@ -549,7 +599,7 @@ fn source_fingerprint(path: &Path) -> Option<String> {
     Some(orca_core::hex::lower(&hasher.finalize()))
 }
 
-pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<String>> {
+pub(crate) fn read_history_lines(path: &Path) -> io::Result<Vec<Option<String>>> {
     let scan = scan_session_with_lines(path)?;
     match scan.health {
         StoredSessionHealth::Healthy
@@ -587,6 +637,24 @@ struct StoredSessionHealthError {
 
 impl std::fmt::Display for StoredSessionHealthError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.health == StoredSessionHealth::NewerVersion {
+            write!(
+                formatter,
+                "stored session {} was written by a newer version of Orca",
+                self.path.display()
+            )?;
+            if let Some(record_type) = self
+                .issue
+                .as_ref()
+                .and_then(|issue| issue.record_type.as_ref())
+            {
+                write!(
+                    formatter,
+                    " (it contains a {record_type:?} record this version does not know)"
+                )?;
+            }
+            return write!(formatter, ", please upgrade Orca to open it");
+        }
         let detail = self
             .issue
             .as_ref()
@@ -690,8 +758,38 @@ pub(crate) fn read_transcript_until(
     })?;
     transcript_from_records(
         path,
-        iter_records(path, HydrateImages::NotToolMessages)?.take(count),
+        iter_records(path, HydrateImages::NotToolMessages)?
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                Ok(record)
+                    if index >= count
+                        && !boundary_section_update(&record).is_some_and(|update| {
+                            update.resume_boundary.as_deref() == Some(boundary_message_id)
+                        }) =>
+                {
+                    None
+                }
+                item => Some(item),
+            }),
     )
+}
+
+fn boundary_section_update(
+    record: &SessionRecord,
+) -> Option<&orca_core::conversation::SystemPromptRecord> {
+    match record {
+        SessionRecord::Message {
+            message:
+                StoredMessage::System {
+                    system_prompt: Some(update),
+                    ..
+                },
+            ..
+        } if update.update && update.resume_boundary.is_some() && update.sections.len() == 1 => {
+            Some(update)
+        }
+        _ => None,
+    }
 }
 
 /// A user message that a `/rewind` can target, in effective-history order.
@@ -735,15 +833,14 @@ fn no_saved_message(boundary_message_id: &str) -> io::Error {
 /// A persisted user message that a `/rewind` can target. Unlike
 /// `Conversation::backtrack_last_user`, pinned user messages are included:
 /// headless `orca exec --save-history` persists real prompts as pinned user
-/// turns, and those must stay rewindable. Only internal image-analysis
-/// sidecar observations are excluded (pinned *system* messages are a different
-/// variant and are naturally not candidates).
+/// turns. Internal image observations and expanded skill invocations are
+/// excluded from submission boundaries.
 fn is_rewindable_user_message(message: &StoredMessage) -> bool {
     matches!(
         message,
         StoredMessage::User {
-            content, images, ..
-        } if !images.is_empty() || !is_internal_image_analysis(content)
+            content, images, pinned
+        } if is_rewindable_user_prompt(content, images, *pinned)
     )
 }
 
@@ -1353,6 +1450,7 @@ pub(crate) fn transcript_from_records(
 ) -> io::Result<SessionTranscript> {
     let mut meta = None;
     let mut messages = Vec::new();
+    let mut repeat_tool_streak: Option<orca_core::conversation::RepeatToolStreak> = None;
     let mut compactions = Vec::new();
     let mut summaries = Vec::new();
     let mut usage_baseline = UsageTotals::default();
@@ -1365,11 +1463,29 @@ pub(crate) fn transcript_from_records(
     let mut completion_error = None;
     let mut next_event_seq = 0;
     let mut semantic_events = Vec::new();
+    let mut nested_instructions = BTreeMap::new();
+    let mut written_instruction_sources = Vec::new();
 
     for record in records {
         match record? {
             SessionRecord::Meta(m) => meta = Some(m),
             SessionRecord::Message { message, .. } => {
+                if let StoredMessage::System {
+                    content,
+                    nested_instruction: Some(identity),
+                    ..
+                } = &message
+                {
+                    written_instruction_sources
+                        .retain(|path| path != &identity.workspace.join(&identity.source));
+                    nested_instructions.insert(
+                        identity.source.clone(),
+                        orca_core::conversation::NestedInstructionVersion {
+                            identity: *identity.clone(),
+                            content: content.clone(),
+                        },
+                    );
+                }
                 messages.push(message.into());
             }
             SessionRecord::Completed { status, error, .. } => {
@@ -1388,7 +1504,12 @@ pub(crate) fn transcript_from_records(
             SessionRecord::ContextSummary(record) => summaries.push(record),
             SessionRecord::ManualCompactionSnapshot(record) => {
                 let after_messages = record.messages.len();
+                written_instruction_sources = record.written_instruction_sources;
+                for version in record.nested_instructions {
+                    nested_instructions.insert(version.identity.source.clone(), version);
+                }
                 messages = record.messages.into_iter().map(Message::from).collect();
+                repeat_tool_streak = record.repeat_tool_streak;
                 compactions.clear();
                 summaries.clear();
                 if record.rolling_summary.is_some() || !record.summary_state.is_empty() {
@@ -1438,6 +1559,7 @@ pub(crate) fn transcript_from_records(
             // File snapshots and retention watermarks are audit data for
             // `/rewind`; they never add or remove conversation messages.
             SessionRecord::FileSnapshot(_) | SessionRecord::SnapshotRetention(_) => {}
+            SessionRecord::Ignorable(_) | SessionRecord::Unrecognized => {}
             SessionRecord::SessionRewind(record) => {
                 apply_rewind_to_transcript(
                     &mut messages,
@@ -1472,6 +1594,7 @@ pub(crate) fn transcript_from_records(
     Ok(SessionTranscript {
         meta,
         messages,
+        repeat_tool_streak,
         compactions,
         summaries,
         usage,
@@ -1481,6 +1604,8 @@ pub(crate) fn transcript_from_records(
         next_event_seq,
         semantic_events,
         path: path.to_path_buf(),
+        nested_instructions: nested_instructions.into_values().collect(),
+        written_instruction_sources,
     })
 }
 
@@ -1554,6 +1679,11 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
             for message in &mut record.messages {
                 redact_stored_message(message);
             }
+            for version in &mut record.nested_instructions {
+                if redact_string_in_place(&mut version.content) {
+                    version.identity.digest.clear();
+                }
+            }
             if let Some(summary) = &mut record.rolling_summary {
                 redact_string_in_place(summary);
             }
@@ -1616,6 +1746,7 @@ fn redact_session_record(record: &SessionRecord) -> SessionRecord {
         SessionRecord::SnapshotRetention(record) => {
             redact_string_in_place(&mut record.session_id);
         }
+        SessionRecord::Ignorable(_) | SessionRecord::Unrecognized => {}
     }
     redacted
 }
@@ -1626,13 +1757,40 @@ fn add_usage_totals(totals: &mut UsageTotals, usage: UsageTotals) {
 
 fn redact_stored_message(message: &mut StoredMessage) {
     match message {
-        StoredMessage::System { content, .. } | StoredMessage::User { content, .. } => {
-            redact_string_in_place(content)
+        StoredMessage::System {
+            content,
+            system_prompt,
+            context_fragments,
+            nested_instruction,
+            ..
+        } => {
+            let redacted = redact_sensitive_text(content);
+            let changed = redacted != *content;
+            if changed {
+                redact_fragment_metadata(content, &redacted, context_fragments);
+                *content = redacted;
+                if let Some(identity) = nested_instruction {
+                    identity.digest.clear();
+                }
+            }
+            if let Some(record) = system_prompt {
+                redact_prompt_record(record, changed);
+            }
+        }
+        StoredMessage::User { content, .. } => {
+            redact_string_in_place(content);
         }
         StoredMessage::Tool {
             content, terminal, ..
         } => {
-            redact_string_in_place(content);
+            if let Some(spill) = terminal
+                .terminal_ref()
+                .and_then(|terminal| terminal.spill.as_deref())
+            {
+                *content = spill.render(&redact_sensitive_text(spill.preview(content)));
+            } else {
+                redact_string_in_place(content);
+            }
             if let Some(error) = terminal.error_mut() {
                 redact_string_in_place(error);
             }
@@ -1656,9 +1814,61 @@ fn redact_stored_message(message: &mut StoredMessage) {
     }
 }
 
-fn redact_json_value(value: &mut serde_json::Value) {
+pub(crate) fn redact_prompt_record(
+    record: &mut orca_core::conversation::SystemPromptRecord,
+    content_changed: bool,
+) {
+    record.redacted |= content_changed;
+    for section in &mut record.sections {
+        if let Some(text) = &mut section.text {
+            record.redacted |= redact_string_in_place(text);
+        }
+    }
+}
+
+pub(crate) fn redact_fragment_metadata(
+    original: &str,
+    redacted: &str,
+    changes: &mut [orca_core::conversation::ContextFragmentChange],
+) {
+    let mut reconstructed = String::new();
+    let mut cursor = 0;
+    for change in changes.iter_mut() {
+        let Some(span) = change.span.clone() else {
+            break;
+        };
+        let Some(separator) = original.get(cursor..span.start) else {
+            break;
+        };
+        let Some(text) = original.get(span.clone()) else {
+            break;
+        };
+        reconstructed.push_str(separator);
+        let start = reconstructed.len();
+        let stored = redact_sensitive_text(text);
+        reconstructed.push_str(&stored);
+        change.span = Some(start..reconstructed.len());
+        if stored != text {
+            change.redacted = true;
+            change.digest = None;
+        }
+        cursor = span.end;
+    }
+    // A redaction can extend across fragments, invalidating individual spans.
+    if cursor != original.len() || reconstructed != redacted {
+        for change in changes {
+            change.span = None;
+            change.redacted = true;
+            change.digest = None;
+        }
+    }
+}
+
+pub(crate) fn redact_json_value(value: &mut serde_json::Value) {
     match value {
-        serde_json::Value::String(text) => redact_string_in_place(text),
+        serde_json::Value::String(text) => {
+            redact_string_in_place(text);
+        }
         serde_json::Value::Array(values) => {
             for value in values {
                 redact_json_value(value);
@@ -1673,199 +1883,13 @@ fn redact_json_value(value: &mut serde_json::Value) {
     }
 }
 
-fn redact_string_in_place(value: &mut String) {
-    *value = redact_sensitive_text(value);
-}
-
-pub(crate) fn redact_sensitive_text(value: &str) -> String {
-    redact_standalone_secret_tokens(&redact_keyed_secret_values(value))
-}
-
-fn redact_keyed_secret_values(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut output = String::with_capacity(value.len());
-    let mut cursor = 0;
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'=' && bytes[index] != b':' {
-            index += 1;
-            continue;
-        }
-
-        let key_start = key_start_before_delimiter(bytes, index);
-        let key = trim_key_candidate(&value[key_start..index]);
-        if !is_sensitive_key(key) {
-            index += 1;
-            continue;
-        }
-
-        let mut value_start = index + 1;
-        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
-            value_start += 1;
-        }
-        let quote = (value_start < bytes.len()
-            && (bytes[value_start] == b'"' || bytes[value_start] == b'\''))
-            .then(|| bytes[value_start]);
-        let content_start = if quote.is_some() {
-            value_start + 1
-        } else {
-            value_start
-        };
-        let content_end = if let Some(quote) = quote {
-            quoted_value_end(bytes, content_start, quote)
-        } else {
-            unquoted_value_end(
-                bytes,
-                content_start,
-                key_is_in_url_query(&value[..key_start]),
-            )
-        };
-        if content_start == content_end {
-            index += 1;
-            continue;
-        }
-
-        output.push_str(&value[cursor..content_start]);
-        output.push_str("<redacted>");
-        if quote.is_some() && content_end < bytes.len() {
-            output.push(bytes[content_end] as char);
-            cursor = content_end + 1;
-            index = cursor;
-        } else {
-            cursor = content_end;
-            index = cursor;
-        }
-    }
-    output.push_str(&value[cursor..]);
-    output
-}
-
-fn key_start_before_delimiter(bytes: &[u8], delimiter_index: usize) -> usize {
-    let mut start = delimiter_index;
-    while start > 0 {
-        let previous = bytes[start - 1];
-        if previous.is_ascii_whitespace()
-            || matches!(previous, b'{' | b'[' | b',' | b';' | b'(' | b'?' | b'&')
-        {
-            break;
-        }
-        start -= 1;
-    }
-    start
-}
-
-fn trim_key_candidate(key: &str) -> &str {
-    key.trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '{' | '[' | ','))
-}
-
-fn is_sensitive_key(key: &str) -> bool {
-    // A key is a config, env, or JSON name. A path or a code span before a
-    // colon (`auth/token.py`: …) is prose naming a file, not a credential.
-    if key.is_empty()
-        || !key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'$'))
-    {
+fn redact_string_in_place(value: &mut String) -> bool {
+    let redacted = redact_sensitive_text(value);
+    if redacted == *value {
         return false;
     }
-    let key = key.to_ascii_lowercase();
-    key.contains("api_key")
-        || key.contains("apikey")
-        || key.contains("token")
-        || key.contains("password")
-        || key.contains("secret")
-        || key.contains("authorization")
-}
-
-fn quoted_value_end(bytes: &[u8], mut index: usize, quote: u8) -> usize {
-    let mut escaped = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if escaped {
-            escaped = false;
-        } else if byte == b'\\' {
-            escaped = true;
-        } else if byte == quote {
-            return index;
-        }
-        index += 1;
-    }
-    index
-}
-
-fn key_is_in_url_query(prefix: &str) -> bool {
-    let token = prefix
-        .rsplit(|ch: char| {
-            ch.is_whitespace() || matches!(ch, '\"' | '\'' | '{' | '[' | '(' | ',' | ';')
-        })
-        .next()
-        .unwrap_or(prefix);
-    let Some(scheme_end) = token.find("://") else {
-        return false;
-    };
-    let Some(query_start) = token.find('?') else {
-        return false;
-    };
-    scheme_end < query_start && !token.contains('#')
-}
-
-fn unquoted_value_end(bytes: &[u8], mut index: usize, url_query: bool) -> usize {
-    while index < bytes.len()
-        && !bytes[index].is_ascii_whitespace()
-        && !matches!(bytes[index], b',' | b'}' | b']' | b';')
-        && !(url_query && matches!(bytes[index], b'&' | b'#'))
-    {
-        index += 1;
-    }
-    index
-}
-
-fn redact_standalone_secret_tokens(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut token = String::new();
-    for ch in value.chars() {
-        if is_secret_token_boundary(ch) {
-            push_redacted_token(&mut output, &mut token);
-            output.push(ch);
-        } else {
-            token.push(ch);
-        }
-    }
-    push_redacted_token(&mut output, &mut token);
-    output
-}
-
-fn is_secret_token_boundary(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, '"' | '\'' | '{' | '}' | '[' | ']' | ',' | ':')
-}
-
-fn push_redacted_token(output: &mut String, token: &mut String) {
-    if token.is_empty() {
-        return;
-    }
-    if looks_like_standalone_secret(token) {
-        output.push_str("<redacted>");
-    } else {
-        output.push_str(token);
-    }
-    token.clear();
-}
-
-fn looks_like_standalone_secret(token: &str) -> bool {
-    let trimmed = token.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            '.' | ';' | ')' | '(' | '<' | '>' | '`' | '"' | '\'' | '='
-        )
-    });
-    let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("sk-")
-        || (trimmed.len() >= 16
-            && lower.contains("secret")
-            && (lower.contains("token")
-                || lower.contains("password")
-                || lower.contains("key")
-                || lower.contains("test")))
+    *value = redacted;
+    true
 }
 
 pub(crate) fn acquire_file_lock(path: &Path) -> io::Result<ExclusiveFileLock> {
@@ -2060,6 +2084,21 @@ impl SessionWriter {
             .clone()
     }
 
+    pub(crate) fn has_conversation_item(&self, item_id: &ConversationItemId) -> bool {
+        self.conversation_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|record| record.item_id.as_ref() == Some(item_id))
+    }
+
+    pub(crate) fn next_event_seq(&self) -> u64 {
+        *self
+            .event_sequence_cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn append_message(&mut self, message: &Message) -> io::Result<()> {
         let message = StoredMessage::from(message);
         let record = match &self.turn_id {
@@ -2077,6 +2116,28 @@ impl SessionWriter {
                     "conversation message append requires an active turn identity",
                 ));
             }
+        };
+        self.append_conversation_record(record)
+    }
+
+    pub(crate) fn append_nested_instruction(
+        &mut self,
+        version: &orca_core::conversation::NestedInstructionVersion,
+    ) -> io::Result<()> {
+        let message = StoredMessage::System {
+            content: version.content.clone(),
+            pinned: false,
+            nested_instruction: Some(Box::new(version.identity.clone())),
+            context_fragments: Vec::new(),
+            system_prompt: None,
+        };
+        let record = match &self.turn_id {
+            Some(turn) => StoredConversationRecord::identified(
+                ConversationItemId::new(),
+                turn.clone(),
+                message,
+            ),
+            None => StoredConversationRecord::legacy(message),
         };
         self.append_conversation_record(record)
     }
@@ -2164,8 +2225,9 @@ impl SessionWriter {
             .conversation_records
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        write_record(&self.path, &record.as_session_record())?;
-        records.push(record);
+        if append_record(&self.path, &record.as_session_record())? {
+            records.push(record);
+        }
         Ok(())
     }
 
@@ -2415,6 +2477,23 @@ impl SessionWriter {
             messages: messages.iter().map(StoredMessage::from).collect(),
             rolling_summary: conversation.rolling_summary.clone(),
             summary_state: conversation.summary.clone(),
+            nested_instructions: conversation
+                .nested_instructions
+                .versions
+                .values()
+                .cloned()
+                .collect(),
+            written_instruction_sources: {
+                let mut sources = conversation
+                    .nested_instructions
+                    .written_sources
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                sources.sort();
+                sources
+            },
+            repeat_tool_streak: conversation.repeat_tool_streak.clone(),
         });
         let result = write_durable_record(&self.path, &record);
         #[cfg(test)]
@@ -2697,6 +2776,7 @@ mod tests {
             additional_working_directories: Vec::new(),
             metadata_writable_directories: Vec::new(),
             network_domain_permissions: Default::default(),
+            additional_fields: Default::default(),
         };
         write_record(&path, &SessionRecord::Meta(meta)).expect("write metadata");
         let writer = SessionWriter {
@@ -3022,6 +3102,7 @@ mod tests {
             .expect("append prefix");
         writer
             .append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some("discarded answer".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -3038,6 +3119,7 @@ mod tests {
         compacted.summary = orca_core::conversation::SummaryState {
             baseline: Some("baseline".to_string()),
             deltas: vec!["delta".to_string()],
+            ..Default::default()
         };
         let identity = crate::session::ManualCompactionPersistenceIdentity {
             operation_id: crate::runtime_surface::SurfaceOperationId::try_from_bytes(
@@ -3052,6 +3134,7 @@ mod tests {
             .expect("post-write ambiguity is reprobed and durably acknowledged");
         writer
             .append_message(&Message::Assistant {
+                cut_short: None,
                 content: Some("post-compaction answer".to_string()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -3438,20 +3521,21 @@ mod tests {
             redact_sensitive_text("db.password=hunter2"),
             "db.password=<redacted>"
         );
+        let redacted = redact_sensitive_text(r#"{"refresh_token": "abc"}"#);
         assert_eq!(
-            redact_sensitive_text(r#"{"refresh_token": "abc"}"#),
-            r#"{"refresh_token": "<redacted>"}"#
+            serde_json::from_str::<serde_json::Value>(&redacted).unwrap(),
+            serde_json::json!({"refresh_token": "<redacted>"})
         );
     }
 
     #[test]
     fn non_url_keyed_values_redact_the_entire_value_with_query_punctuation() {
         assert_eq!(
-            redact_keyed_secret_values("api_key=ordinary&suffix#remainder"),
+            redact_sensitive_text("api_key=ordinary&suffix#remainder"),
             "api_key=<redacted>"
         );
         assert_eq!(
-            redact_keyed_secret_values("token: ordinary#remainder&suffix"),
+            redact_sensitive_text("token: ordinary#remainder&suffix"),
             "token: <redacted>"
         );
     }
@@ -3698,6 +3782,13 @@ mod tests {
     #[test]
     fn scanner_accepts_a_complete_final_record_without_a_newline() {
         let path = tempfile::NamedTempFile::new().expect("temp transcript");
+        let meta = serde_json::to_string(&SessionRecord::Meta(history::create_meta(
+            Path::new("/workspace"),
+            "mock",
+            None,
+            "test transcript",
+        )))
+        .unwrap();
         let valid = serde_json::to_string(&SessionRecord::Message {
             id: None,
             turn_id: None,
@@ -3708,11 +3799,11 @@ mod tests {
             },
         })
         .expect("serialize valid record");
-        fs::write(path.path(), valid).expect("write transcript");
+        fs::write(path.path(), format!("{meta}\n{valid}")).expect("write transcript");
 
         let scan = scan_session(path.path()).expect("scan transcript");
         assert_eq!(scan.health, StoredSessionHealth::Healthy);
-        assert_eq!(scan.records.len(), 1);
+        assert_eq!(scan.records.len(), 2);
     }
 
     #[test]

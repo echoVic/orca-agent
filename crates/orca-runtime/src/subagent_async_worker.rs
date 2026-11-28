@@ -497,6 +497,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         tool_policy_label: None,
         workflow_ipc: None,
         continuation: continuation_start,
+        fork_prefix: prepared.fork_prefix.clone(),
     };
     let surface_task_id = SurfaceTaskId::try_new(agent_id.clone())
         .expect("async task registry created a non-empty task id");
@@ -1266,13 +1267,16 @@ fn launch_admitted_async_subagent(
             },
             parent_fence.as_ref(),
         ),
-        None => coordinator.create(CreateContinuationInput {
-            continuation_id: Some(AgentContinuationId::new()),
-            parent_task_id: root_task_id.map(str::to_string),
-            task_id: agent_id.clone(),
-            prompt_id,
-            compatibility,
-        }),
+        None => coordinator.create_with_fork(
+            CreateContinuationInput {
+                continuation_id: Some(AgentContinuationId::new()),
+                parent_task_id: root_task_id.map(str::to_string),
+                task_id: agent_id.clone(),
+                prompt_id,
+                compatibility,
+            },
+            request.fork_prefix_ref,
+        ),
     };
     let prepared = match prepared {
         Ok(prepared) => prepared,
@@ -1628,7 +1632,10 @@ fn spawn_async_subagent_worker(
         activity_start_precommitted,
     } = context;
     let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let request_json = serde_json::to_string(request).map_err(|error| error.to_string())?;
+    // The worker loads its inherited history through the continuation.
+    let mut worker_request = request.clone();
+    worker_request.fork_prefix_ref = None;
+    let request_json = serde_json::to_string(&worker_request).map_err(|error| error.to_string())?;
     let api_key = config.api_key.as_deref();
     let mut worker_args = vec![
         "subagent-worker".to_string(),

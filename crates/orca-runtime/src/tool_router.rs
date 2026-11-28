@@ -44,6 +44,8 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) execution_request: &'a tool_types::ToolRequest,
+    pub(crate) parent_conversation: Option<&'a orca_core::conversation::Conversation>,
+    pub(crate) prepared_patch: Option<Arc<orca_tools::apply_patch::PreparedPatch>>,
     pub(crate) goal_mode: bool,
     pub(crate) headless: bool,
     pub(crate) subagent_depth: u32,
@@ -54,6 +56,7 @@ pub(crate) struct RuntimeToolInvocationContext<'a, W: io::Write> {
     pub(crate) emit_deltas: bool,
     pub(crate) cost_tracker: &'a mut CostTracker,
     pub(crate) cancel: &'a CancelToken,
+    pub(crate) steer_handle: Option<&'a crate::lifecycle::ThreadSteerHandle>,
     pub(crate) task_registry: &'a TaskRegistry,
     pub(crate) background_workflows: &'a mut Vec<BackgroundWorkflowRun>,
     pub(crate) workflow_ipc: Option<&'a WorkflowIpcContext>,
@@ -152,6 +155,8 @@ impl<'a> RuntimeToolRouter<'a> {
             events,
             sink,
             execution_request,
+            parent_conversation,
+            prepared_patch,
             goal_mode,
             headless,
             subagent_depth,
@@ -162,6 +167,7 @@ impl<'a> RuntimeToolRouter<'a> {
             emit_deltas,
             cost_tracker,
             cancel,
+            steer_handle,
             task_registry,
             background_workflows,
             workflow_ipc,
@@ -342,6 +348,7 @@ impl<'a> RuntimeToolRouter<'a> {
                     }),
                     event_error,
                     child_budget.as_ref(),
+                    parent_conversation,
                 )?;
                 dispatch_child_budget_usage = child_budget_usage;
                 Ok(result)
@@ -420,21 +427,8 @@ impl<'a> RuntimeToolRouter<'a> {
                 workflow_ipc.map(|ipc| ipc as &dyn RuntimeWorkflowIpc),
             )),
             RuntimeSpecialToolDispatch::Normal => {
-                let additional_roots = config
-                    .additional_working_directories
-                    .iter()
-                    .filter(|directory| {
-                        directory.source
-                            != crate::runtime_permission::SESSION_METADATA_DIRECTORY_SOURCE
-                    })
-                    .map(|directory| directory.path.clone())
-                    .chain(
-                        permission_overlay
-                            .additional_working_directories()
-                            .iter()
-                            .cloned(),
-                    )
-                    .collect::<Vec<_>>();
+                let additional_roots =
+                    crate::runtime_permission::tool_working_directories(config, permission_overlay);
                 // `bash` is the single command entry point, so it is the tool
                 // that needs the runtime-owned terminal service.
                 // Every command tool shares one runtime-owned terminal service:
@@ -470,7 +464,7 @@ impl<'a> RuntimeToolRouter<'a> {
                             .unwrap_or(&self.runtime.thread_extensions)
                             .get_or_init(crate::git_write_command::GitMetadataWriteSession::default)
                     });
-                let invocation = RuntimeNormalToolInvocation::snapshot(
+                let mut invocation = RuntimeNormalToolInvocation::snapshot(
                     config,
                     execution_request,
                     cwd,
@@ -485,6 +479,8 @@ impl<'a> RuntimeToolRouter<'a> {
                 .with_terminal_service(terminal_service)
                 .with_git_metadata_write_session(git_metadata_write_session)
                 .with_owner(root_task_id);
+                invocation.prepared_patch = prepared_patch;
+                invocation.steer_handle = steer_handle.cloned();
                 let output = {
                     // A piece that could not be recorded is dropped: the tool
                     // goes on, and its result is recorded as always.
@@ -738,11 +734,13 @@ mod tests {
             let mut event_error = None;
             let result = RuntimeToolRouter::new(&mut runtime)
                 .dispatch(RuntimeToolInvocationContext {
+                    parent_conversation: None,
                     config: &config,
                     cwd: cwd.path(),
                     events: &mut events,
                     sink: &mut sink,
                     execution_request: &request,
+                    prepared_patch: None,
                     goal_mode: false,
                     headless: false,
                     subagent_depth: depth,
@@ -753,6 +751,7 @@ mod tests {
                     emit_deltas: false,
                     cost_tracker: &mut cost,
                     cancel: &cancel,
+                    steer_handle: None,
                     task_registry: &tasks,
                     background_workflows: &mut workflows,
                     workflow_ipc: None,
@@ -868,11 +867,13 @@ mod tests {
             let mut event_error = None;
             let result = RuntimeToolRouter::new(&mut runtime)
                 .dispatch(RuntimeToolInvocationContext {
+                    parent_conversation: None,
                     config: &config,
                     cwd: cwd.path(),
                     events: &mut events,
                     sink: &mut sink,
                     execution_request: &request,
+                    prepared_patch: None,
                     goal_mode: false,
                     headless: false,
                     subagent_depth: 0,
@@ -883,6 +884,7 @@ mod tests {
                     emit_deltas: false,
                     cost_tracker: &mut cost,
                     cancel: &cancel,
+                    steer_handle: None,
                     task_registry: &tasks,
                     background_workflows: &mut workflows,
                     workflow_ipc: None,
@@ -997,11 +999,13 @@ mod tests {
         let mut event_error = None;
         RuntimeToolRouter::new(&mut runtime)
             .dispatch(RuntimeToolInvocationContext {
+                parent_conversation: None,
                 config: &config,
                 cwd: cwd.path(),
                 events: &mut events,
                 sink: &mut sink,
                 execution_request: request,
+                prepared_patch: None,
                 goal_mode,
                 headless,
                 subagent_depth,
@@ -1012,6 +1016,7 @@ mod tests {
                 emit_deltas: false,
                 cost_tracker: &mut cost,
                 cancel: &cancel,
+                steer_handle: None,
                 task_registry: &tasks,
                 background_workflows: &mut workflows,
                 workflow_ipc: None,

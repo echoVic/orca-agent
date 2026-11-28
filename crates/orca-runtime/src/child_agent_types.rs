@@ -219,6 +219,7 @@ pub struct ChildAgentRequest {
     pub tool_policy_label: Option<String>,
     pub(crate) workflow_ipc: Option<WorkflowIpcContext>,
     pub(crate) continuation: Option<ChildAgentContinuationStart>,
+    pub(crate) fork_prefix: Option<std::sync::Arc<orca_core::conversation::ProviderForkPrefix>>,
 }
 
 impl ChildAgentRequest {
@@ -242,6 +243,7 @@ impl ChildAgentRequest {
             tool_policy_label: None,
             workflow_ipc: None,
             continuation: None,
+            fork_prefix: None,
         }
     }
 }
@@ -279,6 +281,8 @@ pub(crate) struct ChildAgentRuntime<'a, W: io::Write> {
     /// This child's own durable task id, when it has one.
     pub child_task_id: Option<&'a str>,
     pub checkpoint_observer: Option<&'a dyn ChildAgentCheckpointSink>,
+    pub provider_response_ingress:
+        Option<&'a dyn crate::runtime_surface::RuntimeProviderResponseIngress>,
     /// Owned because child execution may cross a worker boundary. The value
     /// is already scoped to this child attempt by the synchronous invoker.
     pub permission_handler: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
@@ -328,6 +332,7 @@ impl<'a, W: io::Write> ChildAgentRuntime<'a, W> {
             root_task_id: context.root_task_id,
             child_task_id: context.child_task_id,
             checkpoint_observer: context.checkpoint_observer,
+            provider_response_ingress: None,
             permission_handler: context.permission_handler,
             turn_id: context.turn_id,
             executor: context.executor,

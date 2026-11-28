@@ -17,6 +17,14 @@ Choose the narrowest mode that can complete the task. Full Access runs host
 tools without Orca's workspace sandbox; it does not override OS permissions,
 workspace trust, or explicit denials.
 
+When the model requests consecutive reads such as `web_search`, `web_fetch`,
+and `read_document`, Orca can run them alongside local read tools in a batch
+of up to `tools.max_read_parallel` calls. Every call in the batch must already
+be allowed by the active approval policy. If any call needs approval, Orca
+processes that batch one call at a time. Network reads also run one at a time
+under a cost cap, such as `--max-cost-usd`. Reads of the same document run
+sequentially. Orca records results in the model's request order.
+
 ## Select a mode
 
 New TUI sessions default to `full-auto` (yolo) when no mode is configured;

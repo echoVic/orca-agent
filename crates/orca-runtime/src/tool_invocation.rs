@@ -9,7 +9,9 @@ use orca_core::subagent_types::SubagentType;
 use orca_core::tool_types::{ToolName, ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
 use orca_provider::ProviderConfig;
-use orca_provider::tool_schema::ProviderToolDefinition;
+use orca_provider::tool_schema::{
+    DEEPSEEK_MAX_TOOLS, ProviderToolDefinition, limit_tool_definitions_with_loaders,
+};
 use orca_tools::schema::{ToolPolicy, canonical_tool_definitions, normalize_tool_request};
 
 use crate::hooks::{HookOutcome, tool_request_with_hook_outcome};
@@ -132,7 +134,8 @@ impl ToolExecutionFailure {
     }
 }
 
-pub(crate) fn provider_tool_schema_override(
+#[cfg(test)]
+fn provider_tool_schema_override(
     subagent_depth: u32,
     subagent_type: &SubagentType,
     tool_policy: AgentToolPolicyContext<'_>,
@@ -143,6 +146,15 @@ pub(crate) fn provider_tool_schema_override(
         Some(mcp_registry),
         external_tools,
     );
+    provider_tool_definitions(subagent_depth, subagent_type, tool_policy, &registry)
+}
+
+fn provider_tool_definitions(
+    subagent_depth: u32,
+    subagent_type: &SubagentType,
+    tool_policy: AgentToolPolicyContext<'_>,
+    registry: &orca_tools::registry::ToolRegistry,
+) -> Option<Vec<ProviderToolDefinition>> {
     let mut policy = if let Some(allowed_tools) = tool_policy.allowed_tools() {
         ToolPolicy::allowed(allowed_tools)
     } else if subagent_depth > 0 {
@@ -160,7 +172,7 @@ pub(crate) fn provider_tool_schema_override(
         policy = policy.with_report_blocker();
     }
     Some(
-        canonical_tool_definitions(&policy, &registry)
+        canonical_tool_definitions(&policy, registry)
             .into_iter()
             .filter(|definition| {
                 // A policy the model cannot act on must not be advertised.
@@ -191,13 +203,13 @@ pub(crate) fn provider_config_for_agent_loop(
     session_tools: &crate::extension::ExtensionData,
 ) -> ProviderConfig {
     let shell_readiness = crate::shell_readiness::ShellReadiness::for_config(config);
-    let mut tools_override = provider_tool_schema_override(
-        subagent_depth,
-        subagent_type,
-        tool_policy,
-        mcp_registry,
+    let registry = orca_tools::registry::tool_registry_for_session(
+        Some(mcp_registry),
         &config.external_tools,
+        config.tools.apply_patch,
     );
+    let mut tools_override =
+        provider_tool_definitions(subagent_depth, subagent_type, tool_policy, &registry);
     if let Some(tools) = tools_override.as_mut() {
         omit_unavailable_session_tools(tools, config, tool_policy.workflow_child);
         omit_unavailable_shell_launch_tools(tools, &shell_readiness);
@@ -208,6 +220,61 @@ pub(crate) fn provider_config_for_agent_loop(
             || tool_policy.allowed_tools().is_some()
         {
             tools.retain(|tool| tool.name != "computer");
+        }
+        let is_mcp = |name: &str| {
+            registry
+                .get(name)
+                .map(|tool| matches!(tool.spec().name, ToolName::Mcp(_)))
+        };
+        let loaders: HashSet<_> = mcp_registry
+            .on_demand_loaders()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        if config.provider == orca_core::config::ProviderKind::DeepSeek {
+            let priority_count = tools
+                .iter()
+                .filter(|tool| is_mcp(&tool.name) != Some(true) || loaders.contains(&tool.name))
+                .count();
+            if !loaders.is_empty() {
+                let allowed = if let Some(names) = tool_policy.allowed_tools() {
+                    Some(
+                        names
+                            .iter()
+                            .filter_map(|name| {
+                                registry
+                                    .resolve(name)
+                                    .map(|tool| tool.tool.name().to_string())
+                            })
+                            .collect(),
+                    )
+                } else if subagent_depth > 0 {
+                    Some(
+                        subagent_type
+                            .allowed_tools()
+                            .iter()
+                            .filter_map(|name| {
+                                registry
+                                    .resolve(name)
+                                    .map(|tool| tool.tool.name().to_string())
+                            })
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+                mcp_registry
+                    .set_tool_budget(DEEPSEEK_MAX_TOOLS.saturating_sub(priority_count), allowed);
+            }
+            let dropped =
+                limit_tool_definitions_with_loaders(tools, DEEPSEEK_MAX_TOOLS, is_mcp, |name| {
+                    loaders.contains(name)
+                });
+            if let Some(warnings) =
+                session_tools.get::<std::sync::Arc<crate::mcp_startup::McpStartupWarnings>>()
+            {
+                warnings.report_tool_limit(dropped);
+            }
         }
     }
     let mut provider_config = ProviderConfig {
@@ -283,7 +350,7 @@ pub(crate) fn reject_disallowed_child_tool(
     policy: AgentToolPolicyContext<'_>,
     subagent_type: &SubagentType,
     mcp_registry: &McpRegistry,
-    external_tools: &[ExternalToolConfig],
+    config: &RunConfig,
 ) -> Option<ToolResult> {
     if tool_request.name == ToolName::ReportBlocker
         && !matches!(subagent_type, SubagentType::Custom(_))
@@ -297,7 +364,7 @@ pub(crate) fn reject_disallowed_child_tool(
         policy.allowed_tools(),
         policy.label(),
         mcp_registry,
-        external_tools,
+        config,
     )
 }
 
@@ -306,12 +373,13 @@ fn child_tool_policy_failure(
     allowed_tools: Option<&[String]>,
     policy_label: Option<&str>,
     mcp_registry: &McpRegistry,
-    external_tools: &[ExternalToolConfig],
+    config: &RunConfig,
 ) -> Option<ToolResult> {
     let allowed_tools = allowed_tools?;
-    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+    let registry = orca_tools::registry::tool_registry_for_session(
         Some(mcp_registry),
-        external_tools,
+        &config.external_tools,
+        config.tools.apply_patch,
     );
     let allowed_canonical_names = allowed_tools
         .iter()
@@ -344,9 +412,10 @@ pub fn prepare_tool_invocation(
     mcp_registry: &McpRegistry,
     config: &RunConfig,
 ) -> ToolInvocation {
-    let registry = orca_tools::registry::tool_registry_with_mcp_and_external(
+    let registry = orca_tools::registry::tool_registry_for_session(
         Some(mcp_registry),
         &config.external_tools,
+        config.tools.apply_patch,
     );
     let effective =
         normalize_tool_request(&registry, tool_request).unwrap_or_else(|_| tool_request.clone());
@@ -354,11 +423,13 @@ pub fn prepare_tool_invocation(
         if effective.name == ToolName::Subagent && subagent_depth >= config.subagents.max_depth {
             None
         } else {
-            Some(orca_tools::canonical_action_kind_with_mcp_and_external(
-                &effective,
-                Some(mcp_registry),
-                &config.external_tools,
-            ))
+            Some(
+                registry
+                    .resolve(effective.name.as_str())
+                    .map_or(effective.action, |tool| {
+                        tool.spec.capabilities.action_kind()
+                    }),
+            )
         };
 
     ToolInvocation {
@@ -411,7 +482,7 @@ pub fn validate_tool_invocation(
             Some(&definition.allowed_tools),
             Some("frozen custom agent policy"),
             mcp_registry,
-            &config.external_tools,
+            config,
         )
     {
         return Err(ToolExecutionFailure {
@@ -423,14 +494,16 @@ pub fn validate_tool_invocation(
         });
     }
     validate_shell_readiness(invocation, config)?;
-    orca_tools::validate_with_mcp_and_external(
-        &invocation.effective,
+    let registry = orca_tools::registry::tool_registry_for_session(
         Some(mcp_registry),
         &config.external_tools,
-    )
-    .map_err(|error| ToolExecutionFailure {
-        request: invocation.effective.clone(),
-        message: format!("tool arguments failed schema validation: {error}"),
+        config.tools.apply_patch,
+    );
+    orca_tools::registry::validate_tool_request(&registry, &invocation.effective).map_err(|error| {
+        ToolExecutionFailure {
+            request: invocation.effective.clone(),
+            message: format!("tool arguments failed schema validation: {error}"),
+        }
     })
 }
 
@@ -762,6 +835,235 @@ mod tests {
         .collect()
     }
 
+    fn patch_prefix_digests() -> Vec<String> {
+        use sha2::{Digest, Sha256};
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let cwd = workspace.path();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let agents = home.path().join("agents");
+        std::fs::create_dir(&agents).unwrap();
+        let mcp = McpRegistry::default();
+        let mut config = config_with_external(Vec::new());
+        config.cwd = Some(cwd.to_path_buf());
+        config.approval_mode = ApprovalMode::FullAuto;
+        let prefix = |config: &RunConfig, custom: bool| {
+            let catalog = crate::subagent::discover_agents(config, cwd, &mcp);
+            let allowed = custom.then(|| catalog.agents["audit"].allowed_tools.as_slice());
+            let role = if custom {
+                SubagentType::Custom("audit".into())
+            } else {
+                SubagentType::General
+            };
+            let defs = provider_config_for_agent_loop(
+                config,
+                cwd,
+                u32::from(custom),
+                &role,
+                AgentToolPolicyContext::new(allowed, None),
+                &mcp,
+                &crate::extension::ExtensionData::new("prefix-fixture"),
+            )
+            .tools_override
+            .unwrap();
+            let prompt = if custom {
+                crate::system_prompt::build_system_prompt_for_tools(cwd, allowed)
+            } else {
+                crate::system_prompt::build_system_prompt_with_shell(cwd, None)
+            }
+            .replace(
+                &format!("- Working directory: {}", cwd.display()),
+                "- Working directory: <workspace>",
+            )
+            .replace(
+                &format!("- Operating system: {}", std::env::consts::OS),
+                "- Operating system: <host>",
+            );
+            let wire = json!({"tools": orca_provider::tool_schema::deepseek_tools_schema(&defs), "messages": [{"role":"system", "content":prompt}]});
+            Sha256::digest(serde_json::to_vec(&wire).unwrap())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let workspace_prefix = prefix(&config, false);
+        std::fs::write(agents.join("audit.md"), "---\nname: audit\ndescription: Audit source\ntools: [read_file]\n---\nAudit the workspace.\n").unwrap();
+        std::fs::write(agents.join("patch-audit.md"), "---\nname: patch-audit\ndescription: Apply changes\ntools: [read_file, apply_patch]\n---\nApply a patch.\n").unwrap();
+        let catalog_prefix = prefix(&config, false);
+        let custom_prefix = prefix(&config, true);
+        config.external_tools.push(ExternalToolConfig {
+            name: "apply_patch".into(),
+            description: "Check a submitted patch".into(),
+            action_kind: ActionKind::Read,
+            command: "echo external-patch".into(),
+            schema: json!({"type":"object", "properties": {}}),
+        });
+        vec![
+            workspace_prefix,
+            catalog_prefix,
+            custom_prefix,
+            prefix(&config, false),
+        ]
+    }
+
+    #[test]
+    fn apply_patch_flag_off_preserves_the_serialized_provider_prefix() {
+        // Includes byte paging for saved read_file results and background command notices.
+        assert_eq!(
+            patch_prefix_digests(),
+            [
+                "9d877027c66bd39a142eee85ca73c3ae85caae8ade25422fcc95add4c3e9defc",
+                "2b9ec247ec40bcdb5fad039f055d41620a6d3bdcb251f6e4554cef23325558af",
+                "2a4e220994210f0092563f34d27745878a9a6fdea2fc5c43637f2b01dc958f4a",
+                "a997d599dd77f7c5ddc189fa9831c5d02412b965fe2dd853d4003da8fad16a1c",
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_patch_flag_off_dispatches_the_external_tool() {
+        let _home = crate::history::isolated_test_orca_home();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_external(vec![ExternalToolConfig {
+            name: "apply_patch".into(),
+            description: "Check a submitted patch".into(),
+            action_kind: ActionKind::Read,
+            command: "echo external-patch".into(),
+            schema: json!({"type":"object", "properties": {}}),
+        }]);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let mcp = McpRegistry::default();
+        let requested = request(
+            ToolName::plain("apply_patch"),
+            ActionKind::Write,
+            None,
+            Some("{}"),
+        );
+        let invocation = prepare_tool_invocation(&requested, 0, &mcp, &config);
+        assert_eq!(
+            invocation.effective.name,
+            ToolName::External("apply_patch".into())
+        );
+        validate_tool_invocation(&invocation, &mcp, &config).unwrap();
+        let result = orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_profile(
+            &invocation.effective, dir.path(), &[], &mcp, &config.external_tools,
+            config.tools.output_truncation, 0, None, config.execution_profile, None, || false,
+        );
+        assert_eq!(
+            result.status,
+            orca_core::tool_types::ToolStatus::Completed,
+            "{:?}",
+            result.error
+        );
+        assert_eq!(result.output.as_deref().unwrap().trim(), "external-patch");
+    }
+
+    #[test]
+    fn apply_patch_is_absent_unless_enabled() {
+        let mut config = config_with_external(Vec::new());
+        let registry = McpRegistry::default();
+        let requested = request(
+            ToolName::plain("apply_patch"),
+            ActionKind::Read,
+            None,
+            Some(r#"{"input":"*** Begin Patch\n*** Add File: a\n+a\n*** End Patch"}"#),
+        );
+        for enabled in [false, true] {
+            if enabled {
+                config.tools = toml::from_str("apply_patch = true").unwrap();
+            }
+            let tool_registry =
+                orca_tools::registry::tool_registry_for_session(Some(&registry), &[], enabled);
+            let tools = super::provider_tool_definitions(
+                0,
+                &SubagentType::General,
+                AgentToolPolicyContext::unrestricted(),
+                &tool_registry,
+            )
+            .unwrap();
+            assert_eq!(schema_names(&tools).contains(&"apply_patch"), enabled);
+            assert!(schema_names(&tools).contains(&"edit"));
+            let invocation = prepare_tool_invocation(&requested, 0, &registry, &config);
+            assert_eq!(
+                validate_tool_invocation(&invocation, &registry, &config).is_ok(),
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn apply_patch_needs_the_same_approval_as_edit() {
+        use orca_core::approval_types::ApprovalDecision;
+        let mut config = config_with_external(Vec::new());
+        config.tools = toml::from_str("apply_patch = true").unwrap();
+        let registry = McpRegistry::default();
+        for (name, args) in [
+            (
+                ToolName::Edit,
+                r#"{"path":"a","old_text":"old","new_text":"new"}"#,
+            ),
+            (
+                ToolName::plain("apply_patch"),
+                r#"{"input":"*** Begin Patch\n*** Add File: a\n+a\n*** End Patch"}"#,
+            ),
+        ] {
+            let requested = request(name, ActionKind::Read, None, Some(args));
+            let invocation = prepare_tool_invocation(&requested, 0, &registry, &config);
+            let approval = approval_request_for_invocation(&invocation).unwrap();
+            assert_eq!(approval.action, ActionKind::Write);
+            for (mode, expected) in [
+                (ApprovalMode::Suggest, ApprovalDecision::Ask),
+                (ApprovalMode::Plan, ApprovalDecision::Deny),
+            ] {
+                let decision = crate::runtime_approval::resolve_for_request(
+                    &orca_approval::ApprovalPolicy::new(mode),
+                    &approval,
+                    &[],
+                    requested.name.as_str(),
+                    approval.target.as_deref(),
+                );
+                assert_eq!(decision.decision, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn mock_provider_keeps_all_130_tools() {
+        let config = RunConfig {
+            provider: ProviderKind::Mock,
+            ..RunConfig::default()
+        };
+        let expected_names: Vec<_> = (0..130).map(|i| format!("mcp__docs__t{i:03}")).collect();
+        let registry = McpRegistry::from_tools_for_test(
+            expected_names
+                .iter()
+                .enumerate()
+                .map(|(i, schema_name)| McpTool {
+                    server: "docs".to_string(),
+                    name: format!("t{i:03}"),
+                    schema_name: schema_name.clone(),
+                    description: None,
+                    input_schema: json!({"type": "object"}),
+                    read_only: true,
+                })
+                .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_config_for_agent_loop(
+            &config,
+            dir.path(),
+            0,
+            &SubagentType::General,
+            AgentToolPolicyContext::new(Some(&expected_names), None),
+            &registry,
+            &crate::extension::ExtensionData::new("schema-test"),
+        );
+        let definitions = provider.tools_override.unwrap();
+        assert_eq!(definitions.len(), 130);
+        let mut names = schema_names(&definitions);
+        names.sort_unstable();
+        assert_eq!(names, expected_names);
+    }
+
     #[test]
     fn run_script_is_advertised_exactly_when_it_is_enabled() {
         for enabled in [true, false] {
@@ -1068,7 +1370,7 @@ mod tests {
                     policy,
                     &SubagentType::Custom(definition.name.clone()),
                     &registry,
-                    &[],
+                    &RunConfig::default(),
                 )
                 .is_none(),
                 expected,

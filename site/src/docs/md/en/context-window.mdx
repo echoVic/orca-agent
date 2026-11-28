@@ -23,6 +23,43 @@ again until the conversation has grown by a tenth. This matters when the current
 prompt alone is larger than the limit. When a request no longer leaves room for
 a reply, compaction always runs and keeps any reduction.
 
+Deep compaction sends the conversation up to the cut to the session's model and
+appends one instruction for a structured checkpoint. It can carry exact paths,
+commands, errors and pending work into the next turn, merging facts that still
+apply from earlier summaries. Orca keeps the recent tail and pinned messages.
+
+DeepSeek charges cache-hit rates for the replayed input it already has cached.
+Orca includes the replay's reported usage in the session cost and cost budget.
+If the replay does not fit or fails to produce a smaller usable checkpoint,
+Orca tries a hierarchical summary on Flash, then local truncation.
+
 For a task that needs a precise earlier fact, include the file path, test name,
 or session boundary in the next prompt rather than relying on an implicit
 context guess.
+
+## Context after compaction
+
+DeepSeek requests get a new context message when a fragment changes or no
+longer applies. Micro-compaction keeps context messages already sent. When
+compaction replaces the prefix, Orca sends the current fragments once after
+the summary on the next request. The plan still appears at the end of each
+request so the model sees its latest state.
+
+A resumed session can keep its recorded leading prompt until compaction
+folds in the current instructions. See [Prefix Cache](#prefix-cache).
+
+## Large tool results
+
+In a recorded session, Orca saves a completed MCP, external tool, `web_fetch`,
+or `web_search` text result when it exceeds an estimated 12,500 tokens. The
+model gets the beginning and end of the result and a path to the full text.
+It can call `read_file` with `unit: "bytes"`, `offset`, and `limit` or run `grep` on that path.
+Those tools can read saved results belonging to the current session.
+
+Orca redacts the results before saving them under
+`$ORCA_HOME/session-results/<session-id>/spill/`, with owner-only permissions
+on Unix. The path stays in the result during
+micro-compaction, and deleting the session removes its files. If Orca cannot
+save the text, the tool returns its usual output. External-tool output beyond
+the 1 MiB capture limit is unavailable. Shell tasks, `read_file`,
+`grep`, `glob`, and `task_read_output` use their existing output limits or paging.

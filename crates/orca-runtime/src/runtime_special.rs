@@ -541,7 +541,7 @@ impl RuntimeToolActorContext {
             return ToolResult::failed(request, format!("task '{task_id}' not found"), None);
         };
         if is_terminal_task_status(record.status) {
-            return ToolResult::failed(
+            let mut result = ToolResult::failed(
                 request,
                 format!(
                     "task is already {} and cannot be stopped",
@@ -549,6 +549,10 @@ impl RuntimeToolActorContext {
                 ),
                 None,
             );
+            if record.task_type == TaskType::Shell {
+                result.observed_shell_completions.push(record.id);
+            }
+            return result;
         }
         let stopped_immediately = if record.status == TaskStatus::ApprovalRequired {
             if let Err(error) = task_registry.stop(task_id, "Task stopped".to_string()) {
