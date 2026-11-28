@@ -1,28 +1,26 @@
-use std::fs;
 use std::io;
 use std::path::Path;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 
-use crate::{resolve_workspace_path, workspace_read::listing_entry};
+use crate::{
+    resolve_workspace_read_path,
+    workspace_read::{listing_entry, open_directory},
+};
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
-    let root = match cwd.canonicalize() {
-        Ok(root) => root,
-        Err(error) => {
-            return ToolResult::failed(request, format!("cannot resolve cwd: {error}"), None);
-        }
-    };
-    let path = match resolve_workspace_path(cwd, request.target.as_deref()) {
-        Ok(p) => p,
+    let resolved = match resolve_workspace_read_path(cwd, request.target.as_deref()) {
+        Ok(path) => path,
         Err(error) => return ToolResult::failed(request, error, None),
     };
-    let entries = match fs::read_dir(&path) {
+    let entries = match open_directory(&resolved.root, &resolved.canonical)
+        .and_then(|dir| dir.read_names())
+    {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return ToolResult::completed_kind(
                 request,
-                "(empty)".to_string(),
+                "(empty)".into(),
                 false,
                 ToolResultKind::Empty,
             );
@@ -30,23 +28,16 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         Err(error) => {
             return ToolResult::failed(
                 request,
-                format!("failed to list {}: {error}", path.display()),
+                format!("failed to list {}: {error}", resolved.path.display()),
                 None,
             );
         }
     };
 
     let mut names = Vec::new();
-    for entry in entries {
-        match entry {
-            Ok(entry) => {
-                if listing_entry(&root, &entry.path()).is_some() {
-                    names.push(entry.file_name().to_string_lossy().to_string());
-                }
-            }
-            Err(error) => {
-                return ToolResult::failed(request, format!("failed to read entry: {error}"), None);
-            }
+    for name in entries {
+        if listing_entry(&resolved.root, &resolved.path.join(&name)).is_some() {
+            names.push(name.to_string_lossy().into_owned());
         }
     }
     names.sort();
@@ -91,7 +82,7 @@ mod tests {
     #[test]
     fn missing_directory_completes_with_empty_listing() {
         let cwd = temp_dir("list-files-missing");
-        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::create_dir_all(cwd.join(".orca")).expect("create temp workspace");
         let request = ToolRequest {
             id: "list-1".to_string(),
             name: ToolName::ListFiles,

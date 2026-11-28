@@ -302,52 +302,158 @@ pub fn collect_readonly_batch(
 }
 
 pub fn resolve_workspace_path(cwd: &Path, target: Option<&str>) -> Result<PathBuf, String> {
-    let target = target.unwrap_or(".");
+    resolve_workspace_read_path(cwd, target).map(|resolved| resolved.path)
+}
+
+pub(crate) struct ResolvedWorkspacePath {
+    pub path: PathBuf,
+    pub root: PathBuf,
+    pub canonical: PathBuf,
+}
+
+pub(crate) fn resolve_workspace_read_path(
+    cwd: &Path,
+    target: Option<&str>,
+) -> Result<ResolvedWorkspacePath, String> {
+    resolve_workspace_path_inner(cwd, target, false)
+}
+
+/// Resolve a write target using the lexical path shown in edit and patch previews.
+pub fn resolve_workspace_write_path(cwd: &Path, target: &str) -> Result<PathBuf, String> {
+    resolve_workspace_path_inner(cwd, Some(target), true).map(|resolved| resolved.path)
+}
+
+fn resolve_workspace_path_inner(
+    cwd: &Path,
+    target: Option<&str>,
+    allow_missing_parents: bool,
+) -> Result<ResolvedWorkspacePath, String> {
+    use std::path::Component;
+
+    let target = target.filter(|target| !target.is_empty()).unwrap_or(".");
     #[cfg(windows)]
     reject_drive_relative(target)?;
     #[cfg(windows)]
     let candidate = PathBuf::from(target.replace('/', "\\"));
     #[cfg(not(windows))]
     let candidate = PathBuf::from(target);
-    let joined = if candidate.is_absolute() {
-        candidate
-    } else {
-        cwd.join(candidate)
-    };
+    let joined = join_requested_path(cwd, candidate);
 
+    // Check the lexical target before resolving any components on disk.
     let mut normalized = PathBuf::new();
+    let mut has_parent_component = false;
     for component in joined.components() {
         match component {
-            std::path::Component::ParentDir => {
+            Component::ParentDir => {
                 normalized.pop();
+                has_parent_component = true;
             }
-            std::path::Component::CurDir => {}
+            Component::CurDir => {}
             _ => normalized.push(component),
         }
     }
-
     #[cfg(windows)]
     if cwd.is_absolute() {
         normalized = windows_path_in_workspace(cwd, &normalized, target)?;
     }
-
     if !normalized.starts_with(cwd) {
         return Err(format!("path escapes workspace: {target}"));
     }
 
-    if normalized.exists() {
-        let canonical = normalized
-            .canonicalize()
-            .map_err(|e| format!("cannot resolve path: {e}"))?;
-        let canonical_cwd = cwd
-            .canonicalize()
-            .map_err(|e| format!("cannot resolve cwd: {e}"))?;
-        if !canonical.starts_with(&canonical_cwd) {
-            return Err(format!("path escapes workspace via symlink: {target}"));
+    let root = cwd
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve cwd: {error}"))?;
+    let resolve_error = |error| format!("cannot resolve path {target}: {error}");
+    let joined = if allow_missing_parents {
+        normalized.clone()
+    } else if has_parent_component {
+        resolve_parent_components(&joined).map_err(resolve_error)?
+    } else {
+        joined
+    };
+    let canonical = match joined.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut parent = joined.parent().ok_or_else(|| resolve_error(error))?;
+            let canonical_parent = loop {
+                match parent.canonicalize() {
+                    Ok(path) if path.is_dir() => break path,
+                    Ok(_) => {
+                        return Err(format!(
+                            "cannot resolve path {target}: a parent is not a directory"
+                        ));
+                    }
+                    Err(error)
+                        if allow_missing_parents
+                            && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        parent = parent.parent().ok_or_else(|| resolve_error(error))?;
+                    }
+                    Err(error) => return Err(resolve_error(error)),
+                }
+            };
+            canonical_parent.join(joined.strip_prefix(parent).expect("checked path parent"))
+        }
+        Err(error) => return Err(resolve_error(error)),
+    };
+    let relative = canonical
+        .strip_prefix(&root)
+        .map_err(|_| format!("path escapes workspace via symlink: {target}"))?;
+    // A parent component after a link can lead to a different in-workspace
+    // path than the label obtained by removing those components lexically.
+    let path =
+        if has_parent_component && normalized.canonicalize().ok().as_deref() != Some(&canonical) {
+            cwd.join(relative)
+        } else {
+            normalized
+        };
+    Ok(ResolvedWorkspacePath {
+        path,
+        root,
+        canonical,
+    })
+}
+
+#[cfg(not(windows))]
+fn join_requested_path(cwd: &Path, candidate: PathBuf) -> PathBuf {
+    cwd.join(candidate)
+}
+
+#[cfg(windows)]
+fn join_requested_path(cwd: &Path, candidate: PathBuf) -> PathBuf {
+    if candidate.is_absolute() {
+        return candidate;
+    }
+    // Appending to a verbatim PathBuf with push would remove parent components
+    // before we have checked that the directories they refer to exist.
+    let mut joined = if candidate.has_root() {
+        match cwd.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => prefix.as_os_str().to_owned(),
+            _ => return candidate,
+        }
+    } else {
+        let mut directory = cwd.as_os_str().to_owned();
+        directory.push("\\");
+        directory
+    };
+    joined.push(candidate.as_os_str());
+    PathBuf::from(joined)
+}
+
+fn resolve_parent_components(path: &Path) -> std::io::Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        if component == std::path::Component::ParentDir {
+            resolved = resolved.canonicalize()?;
+            if !resolved.is_dir() {
+                return Err(std::io::ErrorKind::NotADirectory.into());
+            }
+            resolved.pop();
+        } else {
+            resolved.push(component);
         }
     }
-
-    Ok(normalized)
+    Ok(resolved)
 }
 
 #[cfg(any(test, windows))]
@@ -394,6 +500,32 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_file_used_as_a_directory_is_an_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::create_dir(workspace.path().join("crates")).unwrap();
+        assert!(resolve_workspace_path(workspace.path(), Some("Cargo.toml/../crates")).is_err());
+    }
+
+    #[test]
+    fn a_missing_intermediate_directory_is_an_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("crates")).unwrap();
+        assert!(resolve_workspace_path(workspace.path(), Some("missing/../crates")).is_err());
+        assert!(resolve_workspace_path(workspace.path(), Some("missing/file.txt")).is_err());
+        assert!(resolve_workspace_path(workspace.path(), Some("crates/file.txt")).is_ok());
+    }
+
+    #[test]
+    fn an_empty_path_means_the_workspace_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_workspace_path(workspace.path(), Some("")).unwrap(),
+            workspace.path()
+        );
+    }
 
     #[test]
     fn verbatim_and_normal_windows_paths_compare_equal() {
@@ -479,6 +611,22 @@ mod tests {
             open_workspace_file(&root, &path).unwrap_err().to_string(),
             format!("path changed while it was opened: {}", path.display())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_root_swapped_after_resolution_is_refused() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap().join("workspace");
+        let neighbor = fixture.path().join("neighbor");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&neighbor).unwrap();
+        fs::write(root.join("notes.txt"), "workspace text").unwrap();
+        fs::write(neighbor.join("notes.txt"), "neighbor text").unwrap();
+        let path = resolve_workspace_read_path(&root, Some("notes.txt")).unwrap();
+        fs::rename(&root, fixture.path().join("previous")).unwrap();
+        symlink(&neighbor, &root).unwrap();
+        assert!(crate::workspace_read::open_read_file(&path).is_err());
     }
 
     #[cfg(unix)]

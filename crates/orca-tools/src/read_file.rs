@@ -41,9 +41,9 @@ pub(crate) fn execute_in_session(
 ) -> ToolResult {
     let args = parse_args(request);
     let target = args.path.as_deref().or(request.target.as_deref());
-    let (path, spill) = match crate::spill::resolve_read_path(cwd, target, spill_dir) {
-        Ok(ReadTarget::Workspace(path)) => (path, None),
-        Ok(ReadTarget::Spill(path, file)) => (path, Some(file)),
+    let (path, workspace, spill) = match crate::spill::resolve_read_path(cwd, target, spill_dir) {
+        Ok(ReadTarget::Workspace(workspace)) => (workspace.path.clone(), Some(workspace), None),
+        Ok(ReadTarget::Spill(path, file)) => (path, None, Some(file)),
         Err(error) => return ToolResult::failed(request, error, None),
     };
     let output = match (args.unit.as_deref(), spill) {
@@ -61,9 +61,10 @@ pub(crate) fn execute_in_session(
                     .metadata()
                     .map(|metadata| (file, metadata.len()))
                     .map_err(FileAdmissionError::from),
-                None => crate::workspace_read::open_read_file(cwd, &path)
-                    .map(|(file, size, _)| (file, size))
-                    .map_err(FileAdmissionError::from),
+                None => crate::workspace_read::open_read_file(
+                    workspace.as_ref().expect("workspace read"),
+                )
+                .map_err(FileAdmissionError::from),
             };
             opened.and_then(|(file, size)| read_lines(file, size, &args, max_bytes, &should_cancel))
         }

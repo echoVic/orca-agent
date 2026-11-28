@@ -19,7 +19,7 @@ use crate::deepseek_web::{
 };
 use crate::ocr_disk_cache;
 use crate::read_file::render_lines;
-use crate::resolve_workspace_path;
+use crate::resolve_workspace_read_path;
 
 /// The largest file DeepSeek OCR accepts.
 const MAX_OCR_BYTES: u64 = 100 * 1024 * 1024;
@@ -66,11 +66,12 @@ pub fn execute_or_cancel(
         .and_then(|raw| serde_json::from_str::<ReadDocumentArgs>(raw).ok())
         .unwrap_or_default();
     let target = args.path.as_deref().or(request.target.as_deref());
-    let path = match resolve_workspace_path(cwd, target) {
+    let workspace = match resolve_workspace_read_path(cwd, target) {
         Ok(path) => path,
         Err(error) => return ToolResult::failed(request, error, None),
     };
-    let Some(kind) = document_kind(&path) else {
+    let path = &workspace.path;
+    let Some(kind) = document_kind(path) else {
         return ToolResult::failed(
             request,
             format!(
@@ -97,7 +98,7 @@ pub fn execute_or_cancel(
             None,
         )
     };
-    let (mut file, size, canonical) = match crate::workspace_read::open_read_file(cwd, &path) {
+    let (mut file, size) = match crate::workspace_read::open_read_file(&workspace) {
         Ok(opened) => opened,
         Err(error) => return failed(&error),
     };
@@ -119,7 +120,7 @@ pub fn execute_or_cancel(
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     let key = OcrKey {
-        path: canonical,
+        path: workspace.canonical,
         size,
         modified: file
             .metadata()

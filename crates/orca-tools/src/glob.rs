@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 use globset::{Glob, GlobSetBuilder};
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 use serde::Deserialize;
-use walkdir::WalkDir;
 
-use crate::{resolve_workspace_path, workspace_read::listing_entry};
+use crate::{
+    ResolvedWorkspacePath, resolve_workspace_read_path,
+    workspace_read::{listing_entry, open_directory},
+};
 
 #[derive(Deserialize)]
 struct GlobArgs {
@@ -45,18 +47,12 @@ pub fn execute_or_cancel(
         Ok(args) => args,
         Err(error) => return ToolResult::failed(request, error, None),
     };
-    let root = match cwd.canonicalize() {
-        Ok(root) => root,
-        Err(error) => {
-            return ToolResult::failed(request, format!("cannot resolve cwd: {error}"), None);
-        }
-    };
     let base = args.path.as_deref().unwrap_or(".");
-    let search_root = match resolve_workspace_path(cwd, Some(base)) {
+    let resolved = match resolve_workspace_read_path(cwd, Some(base)) {
         Ok(path) => path,
         Err(error) => return ToolResult::failed(request, error, None),
     };
-    let Some(is_directory) = listing_entry(&root, &search_root) else {
+    let Some(is_directory) = listing_entry(&resolved.root, &resolved.path) else {
         return ToolResult::completed_kind(
             request,
             "(no matches)".to_string(),
@@ -66,16 +62,8 @@ pub fn execute_or_cancel(
     };
 
     if matches!(args.mode, Some(GlobMode::Fuzzy)) {
-        return execute_fuzzy(
-            request,
-            cwd,
-            &root,
-            &search_root,
-            &args,
-            max_bytes,
-            should_cancel,
-        )
-        .unwrap_or_else(cancelled);
+        return execute_fuzzy(request, cwd, &resolved, &args, max_bytes, should_cancel)
+            .unwrap_or_else(cancelled);
     }
 
     let pattern = args
@@ -87,12 +75,12 @@ pub fn execute_or_cancel(
         Err(error) => return ToolResult::failed(request, error, None),
     };
     let mut matches = if is_directory {
-        match match_tree(cwd, &root, &search_root, &matcher, should_cancel) {
+        match match_tree(cwd, &resolved, &matcher, should_cancel) {
             Some(matches) => matches,
             None => return cancelled(),
         }
     } else {
-        match_file(cwd, &search_root, &matcher)
+        match_file(cwd, &resolved.path, &matcher)
     };
 
     matches.sort();
@@ -159,8 +147,7 @@ fn parse_args(request: &ToolRequest) -> Result<GlobArgs, String> {
 fn execute_fuzzy(
     request: &ToolRequest,
     cwd: &Path,
-    root: &Path,
-    search_root: &Path,
+    resolved: &ResolvedWorkspacePath,
     args: &GlobArgs,
     max_bytes: usize,
     should_cancel: &dyn Fn() -> bool,
@@ -172,15 +159,19 @@ fn execute_fuzzy(
         .trim();
     let mut matches = Vec::new();
     let mut visited = 0;
-    collect_fuzzy_matches(
-        cwd,
-        root,
-        search_root,
-        query,
-        &mut matches,
-        &mut visited,
-        should_cancel,
-    )?;
+    walk_listing(resolved, true, should_cancel, |relative, is_directory| {
+        let candidate = relative_to_workspace(cwd, &resolved.path.join(relative));
+        let candidate = if is_directory {
+            format!("{candidate}/")
+        } else {
+            candidate
+        };
+        if let Some(score) = fuzzy_score(&candidate, query) {
+            matches.push((score, candidate));
+        }
+        visited += 1;
+        visited < MAX_FUZZY_VISITS
+    })?;
     matches.sort_by(|left, right| {
         left.0
             .cmp(&right.0)
@@ -274,30 +265,17 @@ fn build_matcher(pattern: &str) -> Result<globset::GlobSet, String> {
 /// The paths under `search_root` that match, or `None` when told to stop.
 fn match_tree(
     cwd: &Path,
-    root: &Path,
-    search_root: &Path,
+    resolved: &ResolvedWorkspacePath,
     matcher: &globset::GlobSet,
     should_cancel: &dyn Fn() -> bool,
 ) -> Option<Vec<String>> {
     let mut matches = Vec::new();
-    for entry in WalkDir::new(search_root).follow_links(false).into_iter() {
-        if should_cancel() {
-            return None;
+    walk_listing(resolved, false, should_cancel, |relative, _| {
+        if matcher.is_match(relative) {
+            matches.push(relative_to_workspace(cwd, &resolved.path.join(relative)));
         }
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let path = entry.path();
-        if path == search_root {
-            continue;
-        }
-        let Ok(relative_to_root) = path.strip_prefix(search_root) else {
-            continue;
-        };
-        if matcher.is_match(relative_to_root) && listing_entry(root, path).is_some() {
-            matches.push(relative_to_workspace(cwd, path));
-        }
-    }
+        true
+    })?;
     Some(matches)
 }
 
@@ -310,60 +288,44 @@ fn match_file(cwd: &Path, path: &Path, matcher: &globset::GlobSet) -> Vec<String
     }
 }
 
-fn collect_fuzzy_matches(
-    cwd: &Path,
-    root: &Path,
-    search_root: &Path,
-    query: &str,
-    scored: &mut Vec<(usize, String)>,
-    visited: &mut usize,
+fn walk_listing(
+    resolved: &ResolvedWorkspacePath,
+    skip_hidden: bool,
     should_cancel: &dyn Fn() -> bool,
+    mut visit: impl FnMut(&Path, bool) -> bool,
 ) -> Option<()> {
-    if *visited >= MAX_FUZZY_VISITS {
-        return Some(());
-    }
-    for entry in WalkDir::new(search_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| !is_hidden_entry(entry.path(), search_root))
-    {
-        if *visited >= MAX_FUZZY_VISITS {
-            return Some(());
-        }
+    let mut directories = vec![PathBuf::new()];
+    while let Some(relative) = directories.pop() {
         if should_cancel() {
             return None;
         }
-        let Ok(entry) = entry else {
+        let directory = resolved.canonical.join(&relative);
+        let Ok(names) = open_directory(&resolved.root, &directory).and_then(|dir| dir.read_names())
+        else {
             continue;
         };
-        let path = entry.path();
-        if path == search_root {
-            continue;
-        }
-        *visited += 1;
-        let candidate = relative_to_workspace(cwd, path);
-        let Some(is_directory) = listing_entry(root, path) else {
-            continue;
-        };
-        let candidate = if is_directory {
-            format!("{candidate}/")
-        } else {
-            candidate
-        };
-        if let Some(score) = fuzzy_score(&candidate, query) {
-            scored.push((score, candidate));
+        for name in names {
+            if should_cancel() {
+                return None;
+            }
+            if skip_hidden && name.as_encoded_bytes().starts_with(b".") {
+                continue;
+            }
+            let child = relative.join(name);
+            let path = resolved.path.join(&child);
+            let Some(is_directory) = listing_entry(&resolved.root, &path) else {
+                continue;
+            };
+            if !visit(&child, is_directory) {
+                return Some(());
+            }
+            if is_directory {
+                // A directory replaced with a link will fail the next verified open.
+                directories.push(child);
+            }
         }
     }
     Some(())
-}
-
-fn is_hidden_entry(path: &Path, search_root: &Path) -> bool {
-    if path == search_root {
-        return false;
-    }
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with('.'))
 }
 
 fn fuzzy_score(candidate: &str, query: &str) -> Option<usize> {

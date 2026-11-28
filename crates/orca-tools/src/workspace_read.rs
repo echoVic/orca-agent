@@ -15,12 +15,10 @@ pub(crate) fn canonical_read_path(root: &Path, path: &Path) -> io::Result<PathBu
     Ok(canonical)
 }
 
-pub(crate) fn open_read_file(cwd: &Path, path: &Path) -> io::Result<(File, u64, PathBuf)> {
-    let root = cwd.canonicalize()?;
-    let canonical = canonical_read_path(&root, path)?;
-    let file = open_workspace_file(&root, &canonical)?;
+pub(crate) fn open_read_file(path: &crate::ResolvedWorkspacePath) -> io::Result<(File, u64)> {
+    let file = open_workspace_file(&path.root, &path.canonical)?;
     let size = file.metadata()?.len();
-    Ok((file, size, canonical))
+    Ok((file, size))
 }
 
 /// Open a resolved file from its canonical root, without following any links
@@ -60,7 +58,7 @@ fn changed_path(path: &Path, kind: io::ErrorKind) -> io::Error {
     )
 }
 
-fn open_directory(root: &Path, path: &Path) -> io::Result<VerifiedDirectory> {
+pub(crate) fn open_directory(root: &Path, path: &Path) -> io::Result<VerifiedDirectory> {
     let relative = path
         .strip_prefix(root)
         .map_err(|_| io::ErrorKind::PermissionDenied)?;

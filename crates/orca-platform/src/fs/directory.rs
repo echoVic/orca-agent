@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path};
@@ -60,6 +60,10 @@ impl VerifiedDirectory {
         self.0.child(name).map(Self)
     }
 
+    pub fn read_names(&self) -> io::Result<Vec<OsString>> {
+        self.0.read_names()
+    }
+
     pub fn identity(&self) -> io::Result<FileIdentity> {
         Ok(file_links(self.0.file())?.identity)
     }
@@ -119,6 +123,22 @@ fn as_io(error: PlatformError) -> io::Error {
 
 pub fn stale_path() -> io::Error {
     io::Error::other("path changed after patch preparation")
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn a_verified_directory_lists_the_opened_directory_after_its_name_changes() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let path = root.join("directory");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("original.txt"), "original").unwrap();
+    let directory = VerifiedDirectory::open(&path).unwrap();
+    std::fs::rename(&path, root.join("moved")).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("replacement.txt"), "replacement").unwrap();
+
+    assert_eq!(directory.read_names().unwrap(), ["original.txt"]);
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -217,6 +237,18 @@ mod platform {
                 return Err(io::Error::last_os_error());
             }
             Ok(unsafe { File::from_raw_fd(fd) })
+        }
+
+        pub(super) fn read_names(&self) -> io::Result<Vec<OsString>> {
+            let mut names = Vec::new();
+            for entry in rustix::fs::Dir::read_from(&self.0)? {
+                let entry = entry?;
+                let name = entry.file_name().to_bytes();
+                if name != b"." && name != b".." {
+                    names.push(OsStr::from_bytes(name).to_owned());
+                }
+            }
+            Ok(names)
         }
 
         pub(super) fn child(&self, name: &OsStr) -> io::Result<Self> {
@@ -412,6 +444,13 @@ mod platform {
 
         pub(super) fn file(&self) -> &File {
             &self.0.file
+        }
+
+        pub(super) fn read_names(&self) -> io::Result<Vec<OsString>> {
+            // The handle and its ancestors are held without delete sharing.
+            std::fs::read_dir(&self.0.path)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect()
         }
 
         pub(super) fn child(&self, name: &OsStr) -> io::Result<Self> {

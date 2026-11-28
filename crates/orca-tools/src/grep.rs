@@ -15,9 +15,9 @@ use regex::Regex;
 use serde::Deserialize;
 use walkdir::WalkDir;
 
+use crate::ResolvedWorkspacePath;
 use crate::spill::ReadTarget;
 use crate::workspace_ignore::WorkspaceIgnores;
-use crate::workspace_read::canonical_read_path;
 
 const DEFAULT_GREP_HEAD_LIMIT: usize = 250;
 const MAX_GREP_HEAD_LIMIT: usize = 1_000;
@@ -82,14 +82,17 @@ fn execute_with_read_enforcement(
     };
 
     let requested_path = args.path.as_deref().unwrap_or(".");
-    let (search_path, spill) =
+    let (search_path, workspace, spill) =
         match crate::spill::resolve_read_path(cwd, Some(requested_path), spill_dir) {
-            Ok(ReadTarget::Workspace(path)) => (path, None),
-            Ok(ReadTarget::Spill(path, file)) => (path, Some(file)),
+            Ok(ReadTarget::Workspace(workspace)) => (workspace.path.clone(), Some(workspace), None),
+            Ok(ReadTarget::Spill(path, file)) => (path, None, Some(file)),
             Err(message) => return ToolResult::failed(request, message, None),
         };
 
-    if spill.is_none() && !search_path.exists() {
+    if workspace
+        .as_ref()
+        .is_some_and(|path| !path.canonical.exists())
+    {
         return ToolResult::completed_kind(
             request,
             "(no matches)".to_string(),
@@ -98,21 +101,33 @@ fn execute_with_read_enforcement(
         );
     }
 
-    let fallback = |spill| {
-        execute_fallback(
+    let fallback = |spill: Option<File>| match workspace.as_ref() {
+        Some(workspace) => execute_workspace_search(
             request,
             cwd,
             pattern,
-            &search_path,
-            spill,
+            workspace,
             max_bytes,
             &should_cancel,
-        )
+            gitconfig_excludes_path().as_deref(),
+        ),
+        None => execute_spill_search(
+            request,
+            pattern,
+            &search_path,
+            spill.expect("spill read"),
+            max_bytes,
+            &should_cancel,
+        ),
     };
     if decision.state != EnforcementState::Enforced {
         return fallback(spill);
     }
-    let root = match cwd.canonicalize() {
+    let root = match workspace
+        .as_ref()
+        .map(|path| Ok(path.root.clone()))
+        .unwrap_or_else(|| cwd.canonicalize())
+    {
         Ok(root) => root,
         Err(error) => {
             return ToolResult::failed(request, format!("cannot resolve cwd: {error}"), None);
@@ -130,10 +145,7 @@ fn execute_with_read_enforcement(
             }
         },
         None => {
-            let canonical = match canonical_read_path(&root, &search_path) {
-                Ok(path) => path,
-                Err(error) => return ToolResult::failed(request, error.to_string(), None),
-            };
+            let canonical = &workspace.as_ref().expect("workspace read").canonical;
             if canonical.is_dir() {
                 let label = if Path::new(requested_path).is_absolute() {
                     search_path.as_path()
@@ -154,13 +166,13 @@ fn execute_with_read_enforcement(
                         gitconfig_excludes_path().as_deref(),
                     ),
                     root: root.clone(),
-                    base: canonical,
+                    base: canonical.clone(),
                     label: label.to_owned(),
                     opened: None,
                 };
                 (path, None, Some(directory))
             } else {
-                match crate::open_workspace_file(&root, &canonical) {
+                match crate::open_workspace_file(&root, canonical) {
                     Ok(file) => (PathBuf::from("-"), Some(file), None),
                     Err(error) => return ToolResult::failed(request, error.to_string(), None),
                 }
@@ -302,18 +314,14 @@ fn rg_read_completed(code: Option<i32>, stderr: &[u8], omitted: usize) -> bool {
             }))
 }
 
-fn execute_fallback(
+fn execute_spill_search(
     request: &ToolRequest,
-    cwd: &Path,
     pattern: &str,
     search_path: &Path,
-    spill: Option<File>,
+    file: File,
     max_bytes: usize,
     should_cancel: &dyn Fn() -> bool,
 ) -> ToolResult {
-    let Some(file) = spill else {
-        return execute_in_process(request, cwd, pattern, search_path, max_bytes, should_cancel);
-    };
     let regex = match Regex::new(pattern) {
         Ok(regex) => regex,
         Err(error) => return ToolResult::failed(request, error.to_string(), None),
@@ -452,6 +460,7 @@ fn split_at_byte(bytes: &[u8], separator: u8) -> Option<(&[u8], &[u8])> {
     Some((&bytes[..index], &bytes[index + 1..]))
 }
 
+#[cfg(test)]
 pub(crate) fn execute_in_process(
     request: &ToolRequest,
     cwd: &Path,
@@ -471,11 +480,36 @@ pub(crate) fn execute_in_process(
     )
 }
 
+#[cfg(test)]
 fn execute_in_process_with_global_excludes(
     request: &ToolRequest,
     cwd: &Path,
     pattern: &str,
     search_path: &Path,
+    max_bytes: usize,
+    should_cancel: &dyn Fn() -> bool,
+    global_excludes: Option<&Path>,
+) -> ToolResult {
+    let workspace = match crate::resolve_workspace_read_path(cwd, search_path.to_str()) {
+        Ok(path) => path,
+        Err(error) => return ToolResult::failed(request, error, None),
+    };
+    execute_workspace_search(
+        request,
+        cwd,
+        pattern,
+        &workspace,
+        max_bytes,
+        should_cancel,
+        global_excludes,
+    )
+}
+
+fn execute_workspace_search(
+    request: &ToolRequest,
+    cwd: &Path,
+    pattern: &str,
+    workspace: &ResolvedWorkspacePath,
     max_bytes: usize,
     should_cancel: &dyn Fn() -> bool,
     global_excludes: Option<&Path>,
@@ -488,18 +522,13 @@ fn execute_in_process_with_global_excludes(
     let offset = parse_args(request).offset.unwrap_or(0);
     let limit = normalized_head_limit(parse_args(request).head_limit);
     let mut collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
-    let root = match cwd.canonicalize() {
-        Ok(root) => root,
-        Err(error) => {
-            return ToolResult::failed(request, format!("cannot resolve cwd: {error}"), None);
-        }
-    };
-    let base = match canonical_read_path(&root, search_path) {
-        Ok(base) => base,
-        Err(error) => return ToolResult::failed(request, error.to_string(), None),
-    };
+    let ResolvedWorkspacePath {
+        root,
+        canonical: base,
+        path: search_path,
+    } = workspace;
     let mut ignores = WorkspaceIgnores::new(root.clone(), global_excludes);
-    let mut walker = WalkDir::new(&base).follow_links(false).into_iter();
+    let mut walker = WalkDir::new(base).follow_links(false).into_iter();
     while let Some(entry) = walker.next() {
         if should_cancel() {
             return ToolResult::cancelled(request, GREP_CANCELLED, None);
@@ -517,11 +546,11 @@ fn execute_in_process_with_global_excludes(
         if !entry.file_type().is_file() {
             continue;
         }
-        let Ok(file) = crate::open_workspace_file(&root, path) else {
+        let Ok(file) = crate::open_workspace_file(root, path) else {
             continue;
         };
         let label = search_path.join(
-            path.strip_prefix(&base)
+            path.strip_prefix(base)
                 .expect("walker path is below its root"),
         );
         let path = if path == base { search_path } else { &label };
@@ -1153,6 +1182,16 @@ mod tests {
     }
 
     #[test]
+    fn a_dot_slash_prefix_keeps_relative_output() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(workspace.path().join("src/notes.txt"), "needle\n").unwrap();
+        let request = grep_request(r#"{"pattern":"needle","path":"./src"}"#);
+        let result = execute(&request, workspace.path(), 4096);
+        assert_eq!(result.output.as_deref(), Some("src/notes.txt:1:needle"));
+    }
+
+    #[test]
     fn a_path_named_dash_is_searched_as_a_file() {
         let cwd = temp_dir("grep-dash-path");
         fs::create_dir_all(&cwd).expect("create temp workspace");
@@ -1191,7 +1230,7 @@ mod tests {
     #[test]
     fn missing_search_path_completes_with_no_matches() {
         let cwd = temp_dir("grep-missing");
-        fs::create_dir_all(&cwd).expect("create temp workspace");
+        fs::create_dir_all(cwd.join("tests")).expect("create temp workspace");
         let request = ToolRequest {
             id: "grep-1".to_string(),
             name: ToolName::Grep,

@@ -17,7 +17,7 @@ use crate::file_admission::{
     MAX_DIFF_OUTPUT_BYTES, MAX_EDIT_FILE_BYTES, build_file_change_preview_with_headers,
     read_utf8_reader_with_limit,
 };
-use crate::resolve_workspace_path;
+use crate::resolve_workspace_write_path;
 
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_OPERATIONS: usize = 100;
@@ -341,7 +341,7 @@ fn resolve_target(
             .identity(&full.to_string_lossy())
             .map_err(|error| error.to_string())?;
     }
-    let path = resolve_workspace_path(cwd, Some(label))?;
+    let path = resolve_workspace_write_path(cwd, label)?;
     let mut ancestor = path.as_path();
     let (canonical, directory) = loop {
         match fs::symlink_metadata(ancestor) {

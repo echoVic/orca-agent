@@ -88,7 +88,7 @@ fn preview(
 }
 
 pub(crate) enum ReadTarget {
-    Workspace(PathBuf),
+    Workspace(crate::ResolvedWorkspacePath),
     Spill(PathBuf, File),
 }
 
@@ -111,7 +111,7 @@ pub(crate) fn resolve_read_path(
             return Err(format!("invalid spill file path: {}", path.display()));
         }
     }
-    crate::resolve_workspace_path(cwd, target).map(ReadTarget::Workspace)
+    crate::resolve_workspace_read_path(cwd, target).map(ReadTarget::Workspace)
 }
 
 #[cfg(test)]
