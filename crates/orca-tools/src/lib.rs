@@ -303,6 +303,11 @@ pub fn collect_readonly_batch(
 
 pub fn resolve_workspace_path(cwd: &Path, target: Option<&str>) -> Result<PathBuf, String> {
     let target = target.unwrap_or(".");
+    #[cfg(windows)]
+    reject_drive_relative(target)?;
+    #[cfg(windows)]
+    let candidate = PathBuf::from(target.replace('/', "\\"));
+    #[cfg(not(windows))]
     let candidate = PathBuf::from(target);
     let joined = if candidate.is_absolute() {
         candidate
@@ -319,6 +324,11 @@ pub fn resolve_workspace_path(cwd: &Path, target: Option<&str>) -> Result<PathBu
             std::path::Component::CurDir => {}
             _ => normalized.push(component),
         }
+    }
+
+    #[cfg(windows)]
+    if cwd.is_absolute() {
+        normalized = windows_path_in_workspace(cwd, &normalized, target)?;
     }
 
     if !normalized.starts_with(cwd) {
@@ -340,6 +350,38 @@ pub fn resolve_workspace_path(cwd: &Path, target: Option<&str>) -> Result<PathBu
     Ok(normalized)
 }
 
+#[cfg(any(test, windows))]
+fn reject_drive_relative(path: &str) -> Result<(), String> {
+    let spelling = path.replace('/', "\\");
+    let spelling = spelling.strip_prefix(r"\\?\").unwrap_or(&spelling);
+    let bytes = spelling.as_bytes();
+    if bytes.first().is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(1) == Some(&b':')
+        && bytes.get(2) != Some(&b'\\')
+    {
+        return Err(format!("drive-relative paths are not supported: {path}"));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, windows))]
+fn windows_path_identity(path: &str) -> Result<orca_platform::fs::PathIdentity, String> {
+    reject_drive_relative(path)?;
+    orca_platform::fs::PathIdentity::windows(path).map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn windows_path_in_workspace(cwd: &Path, path: &Path, target: &str) -> Result<PathBuf, String> {
+    let workspace = windows_path_identity(&cwd.to_string_lossy())?;
+    let candidate = windows_path_identity(&path.to_string_lossy())?;
+    if !candidate.is_within(&workspace) {
+        return Err(format!("path escapes workspace: {target}"));
+    }
+    let mut path = cwd.to_owned();
+    path.extend(candidate.components().skip(workspace.components().count()));
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +394,67 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn verbatim_and_normal_windows_paths_compare_equal() {
+        assert_eq!(
+            windows_path_identity(r"\\?\C:\work\repo\src").unwrap(),
+            windows_path_identity(r"C:\work/repo\src").unwrap(),
+        );
+    }
+
+    #[test]
+    fn verbatim_unc_and_unc_compare_equal() {
+        assert_eq!(
+            windows_path_identity(r"\\?\UNC\server\share\repo\src").unwrap(),
+            windows_path_identity(r"\\server/share\repo/src").unwrap(),
+        );
+    }
+
+    #[test]
+    fn drive_relative_paths_are_refused() {
+        assert_eq!(
+            windows_path_identity("C:foo").unwrap_err(),
+            "drive-relative paths are not supported: C:foo",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolver_accepts_normal_and_verbatim_paths_with_mixed_separators() {
+        let fixture = tempfile::tempdir().unwrap();
+        let verbatim = fixture.path().canonicalize().unwrap();
+        let plain = Path::new(verbatim.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+        fs::create_dir(plain.join("src")).unwrap();
+        for (root, target) in [
+            (&verbatim as &Path, plain.join("src")),
+            (plain, verbatim.join("src")),
+        ] {
+            let mixed = target.to_str().unwrap().replace(r"\src", "/src");
+            assert_eq!(
+                resolve_workspace_path(root, Some(&mixed)).unwrap(),
+                root.join("src")
+            );
+        }
+        assert_eq!(
+            resolve_workspace_path(plain, Some("C:foo")).unwrap_err(),
+            "drive-relative paths are not supported: C:foo",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unc_paths_use_the_workspace_spelling() {
+        let plain = Path::new(r"\\server\share\repo");
+        let verbatim = Path::new(r"\\?\UNC\server\share\repo");
+        for (root, target) in [(plain, verbatim), (verbatim, plain)] {
+            let target = target.join("src");
+            assert_eq!(
+                windows_path_in_workspace(root, &target, "src").unwrap(),
+                root.join("src")
+            );
+        }
+    }
 
     #[cfg(unix)]
     pub(crate) use std::os::unix::fs::symlink;

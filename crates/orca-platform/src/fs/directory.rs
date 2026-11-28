@@ -370,6 +370,7 @@ mod platform {
         let mut root = PathBuf::from(prefix.as_os_str());
         root.push("\\");
         let verified = PathPolicy::windows_sandbox()
+            .with_unc_paths(true)
             .open_no_follow_pinned(&root, DIRECTORY_ACCESS)
             .map_err(as_io)?;
         let mut directory = Directory::new(verified.into_file(), root, None);
@@ -478,6 +479,7 @@ mod platform {
                 io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8")
             })?;
             PathPolicy::windows_sandbox()
+                .with_unc_paths(true)
                 .identity(text)
                 .map_err(as_io)?;
             let mut wide: Vec<_> = name.encode_wide().collect();
