@@ -1096,40 +1096,58 @@ mod tests {
 
     #[test]
     fn a_return_with_a_view_bound_does_not_wait_behind_the_controller() {
+        let on_child = crate::hosted_child::live_child_for_test::ViewOnChild::start();
+        assert!(on_child.view.has_focus());
         let (raw_tx, raw_rx) = mpsc::unbounded();
         let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
-        let control = TuiSurfaceTaskControl::isolated_for_test();
-        let host = orca_runtime::runtime_host::RuntimeHost::start_with_background_capacity(1)
-            .expect("runtime host");
-        let attachment = crate::protocol::SessionAttachmentId::new(1);
-        control.bind_view(crate::hosted_view::HostedView::new(
-            host.handle(),
-            event_tx.clone(),
-            std::sync::Arc::new(std::sync::Mutex::new(
-                crate::attachment_routing::AttachmentRouting::new(attachment),
-            )),
-            event_tx.clone(),
-            attachment,
-        ));
-        let (mut dispatcher, command_rx) =
-            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
-
-        raw_tx
-            .send(UserAction::Submit("a turn the controller runs".to_string()))
-            .expect("submit");
+        let (command_tx, command_rx) = mpsc::bounded(1);
+        let (_shutdown_tx, shutdown_rx) = mpsc::bounded(1);
+        let (_finished_tx, finished_rx) = mpsc::unbounded();
+        let (ack_tx, _ack_rx) = mpsc::unbounded();
+        let prompt = "a turn pending in the controller mailbox";
+        command_tx.send(UserAction::Submit(prompt.into())).unwrap();
+        let control = on_child.control.clone();
+        let dispatcher = std::thread::spawn(move || {
+            super::run_dispatcher(
+                raw_rx,
+                event_tx,
+                command_tx,
+                ack_tx,
+                (shutdown_rx, finished_rx),
+                control,
+                1,
+            );
+        });
         raw_tx
             .send(UserAction::ReturnToParentThread)
             .expect("return action");
 
-        assert!(matches!(
-            command_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(UserAction::Submit(prompt)) if prompt == "a turn the controller runs"
-        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut returned = false;
+        while let Ok(event) = on_child.events.recv_deadline(deadline) {
+            if matches!(
+                event.into_test_payload(),
+                TuiEvent::ReturnedMainProjection(..)
+            ) {
+                returned = true;
+                break;
+            }
+        }
+        drop(raw_tx);
+        dispatcher.join().expect("shutdown dispatcher");
+        let still_focused = on_child.view.has_focus();
+        let commands: Vec<_> = command_rx.try_iter().collect();
+        on_child.shutdown();
+
         assert!(
-            command_rx.recv_timeout(Duration::from_millis(200)).is_err(),
-            "the return never entered the mailbox"
+            returned,
+            "Return did not project main while submit was pending"
         );
-        dispatcher.shutdown().expect("shutdown dispatcher");
+        assert!(!still_focused, "Return did not clear child focus");
+        assert!(
+            matches!(commands.as_slice(), [UserAction::Submit(queued)] if queued == prompt),
+            "expected only the original submit, got {commands:?}"
+        );
     }
 
     #[test]

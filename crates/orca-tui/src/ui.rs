@@ -13765,8 +13765,8 @@ mod tests {
                 main_status: Some(crate::types::SideParentStatus::Running),
                 projection: Box::new(projection),
             });
-            for event in TuiSurfaceProjection::for_conversation(&snapshot, None)
-                .hydrate_open_streams()
+            for event in
+                TuiSurfaceProjection::for_conversation(&snapshot, None).hydrate_open_streams()
             {
                 state.update(event);
             }
