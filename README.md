@@ -228,7 +228,8 @@ recall, storage, privacy, and deletion.
   children yield their lease before re-entering the fair queue.
 - Keeps up to four active child summaries visible in the conversation and up to
   eight durable activity entries per child. `/agents` opens live and read-only
-  subagent conversations and offers follow-up controls where supported.
+  subagent conversations, `s` stops one while it runs, and other tasks offer
+  resume, retry, or a follow-up where they support it.
 - Learns a bounded set of durable project facts after successfully committed
   turns and retrieves only prompt-relevant facts on later turns.
 - Runs with no implicit turn ceiling; optional `[budget]` limits
