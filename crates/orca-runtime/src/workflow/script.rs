@@ -132,11 +132,33 @@ fn resolve_workflow_script_with_dirs_to_path(
     persisted_path: &Path,
     access: ScriptPathAccess<'_>,
 ) -> io::Result<ResolvedWorkflowScript> {
-    let read_script = |path: &Path, label: &str| match access {
-        ScriptPathAccess::User => fs::read_to_string(path),
-        ScriptPathAccess::Model => {
-            read_model_script_path(path, label, cwd, user_workflow_dir, config_dir)
+    let workspace = if matches!(access, ScriptPathAccess::Model) {
+        Some(orca_tools::pin_read_root(cwd)?)
+    } else {
+        None
+    };
+    let user = if workspace.is_some() || input.name.is_some() {
+        match orca_tools::pin_read_root(user_workflow_dir) {
+            Ok(root) => Some(root),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
         }
+    } else {
+        None
+    };
+    let read_script = |path: &Path, label: &str| match access {
+        ScriptPathAccess::User if path.starts_with(user_workflow_dir) && user.is_some() => {
+            let root = user.as_deref().expect("checked workflow root");
+            read_resolved_workflow_script(root, &path.canonicalize()?)
+        }
+        ScriptPathAccess::User => fs::read_to_string(path),
+        ScriptPathAccess::Model => read_model_script_path(
+            path,
+            label,
+            workspace.as_deref().expect("model workspace root"),
+            user.as_deref(),
+            config_dir,
+        ),
         ScriptPathAccess::Draft(session_dir) => {
             let root = session_dir.canonicalize()?.join("workflow-drafts");
             let canonical = path.canonicalize()?;
@@ -196,18 +218,16 @@ fn resolve_workflow_script_with_dirs_to_path(
 fn read_model_script_path(
     path: &Path,
     label: &str,
-    cwd: &Path,
-    user_workflow_dir: &Path,
+    workspace: &Path,
+    user: Option<&Path>,
     config_dir: Option<&Path>,
 ) -> io::Result<String> {
-    let workspace = cwd.canonicalize()?;
-    let user = user_workflow_dir.canonicalize().ok();
     let canonical = path.canonicalize()?;
-    if canonical.starts_with(&workspace) {
-        return read_resolved_workflow_script(&workspace, &canonical);
+    if canonical.starts_with(workspace) {
+        return read_resolved_workflow_script(workspace, &canonical);
     }
     if let Some(user) = user.filter(|user| canonical.starts_with(user)) {
-        return read_resolved_workflow_script(&user, &canonical);
+        return read_resolved_workflow_script(user, &canonical);
     }
     if let Some(config_dir) = config_dir {
         for ancestor in workspace.ancestors().skip(1) {
@@ -1263,6 +1283,46 @@ mod tests {
                 FILE_WORKFLOW
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_user_workflow_root_is_refused() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let cwd = base.join("workspace");
+        let user = base.join("workflows");
+        let neighbor = base.join("neighbor");
+        for path in [&cwd, &user, &neighbor] {
+            std::fs::create_dir(path).unwrap();
+        }
+        for dir in [&user, &neighbor] {
+            std::fs::write(dir.join("file.js"), FILE_WORKFLOW).unwrap();
+        }
+        let input = super::WorkflowInput {
+            name: Some("file".into()),
+            ..Default::default()
+        };
+        let prepare = || {
+            super::resolve_workflow_script_with_dirs_to_path(
+                &input,
+                &cwd,
+                &user,
+                None,
+                &cwd.join("persisted.js"),
+                super::ScriptPathAccess::Model,
+            )
+        };
+        assert_eq!(prepare().unwrap().script, FILE_WORKFLOW);
+        std::fs::rename(&user, base.join("previous")).unwrap();
+        std::os::unix::fs::symlink(&neighbor, &user).unwrap();
+        assert_eq!(
+            prepare().unwrap_err().to_string(),
+            format!(
+                "workspace root changed while Orca was running: {}",
+                user.display()
+            )
+        );
     }
 
     #[test]

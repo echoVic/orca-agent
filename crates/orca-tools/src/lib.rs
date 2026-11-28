@@ -37,7 +37,7 @@ mod workspace_ignore;
 mod workspace_read;
 pub mod write_file;
 
-pub use workspace_read::open_workspace_file;
+pub use workspace_read::{open_workspace_file, pin_read_root};
 
 pub use registry::{Tool, ToolContext, ToolRegistry, validate_tool_request};
 
@@ -360,9 +360,12 @@ fn resolve_workspace_path_inner(
         return Err(format!("path escapes workspace: {target}"));
     }
 
-    let root = cwd
-        .canonicalize()
-        .map_err(|error| format!("cannot resolve cwd: {error}"))?;
+    let root = if allow_missing_parents {
+        cwd.canonicalize()
+            .map_err(|error| format!("cannot resolve cwd: {error}"))?
+    } else {
+        pin_read_root(cwd).map_err(|error| error.to_string())?
+    };
     let resolve_error = |error| format!("cannot resolve path {target}: {error}");
     let joined = if allow_missing_parents {
         normalized.clone()
@@ -610,6 +613,48 @@ mod tests {
         assert_eq!(
             open_workspace_file(&root, &path).unwrap_err().to_string(),
             format!("path changed while it was opened: {}", path.display())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_workspace_is_refused_by_read_file() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap().join("workspace");
+        let neighbor = fixture.path().join("neighbor");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&neighbor).unwrap();
+        fs::write(root.join("notes.txt"), "workspace text").unwrap();
+        fs::write(neighbor.join("notes.txt"), "neighbor text").unwrap();
+        let request = ToolRequest {
+            id: "read".into(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("notes.txt".into()),
+            raw_arguments: None,
+        };
+        assert!(
+            read_file::execute(&request, &root, 4096)
+                .output
+                .unwrap()
+                .contains("workspace text")
+        );
+        fs::rename(&root, fixture.path().join("previous")).unwrap();
+        symlink(&neighbor, &root).unwrap();
+        let expected = format!(
+            "workspace root changed while Orca was running: {}",
+            root.display()
+        );
+        assert_eq!(
+            read_file::execute(&request, &root, 4096).error.as_deref(),
+            Some(expected.as_str())
+        );
+        fs::remove_file(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("notes.txt"), "new directory").unwrap();
+        assert_eq!(
+            read_file::execute(&request, &root, 4096).error.as_deref(),
+            Some(expected.as_str())
         );
     }
 
