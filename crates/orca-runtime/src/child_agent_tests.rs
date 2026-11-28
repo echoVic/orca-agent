@@ -2640,6 +2640,9 @@ fn assert_hosted_fork_stop(with_sibling: bool) {
         Some(&parent.id),
     );
     let batch_size = if with_sibling { 2 } else { 1 };
+    if with_sibling {
+        std::fs::write(cwd.path().join("require-sibling"), []).unwrap();
+    }
     for (index, name) in ["stop-target", "sibling"]
         .into_iter()
         .take(batch_size)
@@ -2667,6 +2670,19 @@ fn assert_hosted_fork_stop(with_sibling: bool) {
                 std::fs::write(runtime.cwd.join(&request.prompt), [])?;
                 let release_sibling = runtime.cwd.join("release-sibling");
                 let is_target = request.prompt == "stop-target";
+                std::fs::write(runtime.cwd.join(format!("ready-{}", request.prompt)), [])?;
+                let readiness_deadline = Instant::now() + Duration::from_secs(10);
+                while runtime.cwd.join("require-sibling").exists()
+                    && (!runtime.cwd.join("ready-stop-target").exists()
+                        || !runtime.cwd.join("ready-sibling").exists())
+                {
+                    if Instant::now() >= readiness_deadline {
+                        return Err(io::Error::other(
+                            "sibling did not reach the readiness barrier",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 let deadline = Instant::now() + Duration::from_secs(if is_target { 3 } else { 10 });
                 while !runtime.cancel.is_cancelled() && (is_target || !release_sibling.exists()) {
                     if Instant::now() >= deadline {
