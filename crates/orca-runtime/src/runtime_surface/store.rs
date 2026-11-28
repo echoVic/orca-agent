@@ -3151,6 +3151,9 @@ static PROVIDER_RESPONSE_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, us
 static PENDING_PROVIDER_RESPONSE_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
 #[cfg(test)]
+static PROVIDER_RESPONSE_APPEND_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+#[cfg(test)]
 static SETTINGS_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 #[cfg(test)]
 static PENDING_SETTINGS_CHECKPOINT_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
@@ -3479,6 +3482,15 @@ impl JsonlSurfaceCommitLedger {
         count: usize,
     ) {
         PROVIDER_RESPONSE_CHECKPOINT_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.into(), count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_provider_response_append_failures(path: impl Into<PathBuf>, count: usize) {
+        PROVIDER_RESPONSE_APPEND_FAILURES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4203,14 +4215,26 @@ impl JsonlSurfaceCommitLedger {
     }
 
     #[cfg(test)]
-    fn arm_provider_response_checkpoint_failures(&self, batch: &SurfaceCommitBatch) {
-        let is_provider_response = batch.events.as_slice().iter().any(|event| {
+    fn is_provider_response(batch: &SurfaceCommitBatch) -> bool {
+        batch.events.as_slice().iter().any(|event| {
             matches!(
                 &event.event,
-                SurfaceEvent::Assistant(AssistantPatch::ResponseCompleted { .. })
+                SurfaceEvent::Assistant(
+                    AssistantPatch::ResponseCompleted { .. } | AssistantPatch::ResponseKept { .. }
+                )
             )
-        });
-        if !is_provider_response {
+        })
+    }
+
+    #[cfg(test)]
+    fn take_provider_response_append_failure(&self, batch: &SurfaceCommitBatch) -> bool {
+        Self::is_provider_response(batch)
+            && self.take_provider_response_fault(&PROVIDER_RESPONSE_APPEND_FAILURES)
+    }
+
+    #[cfg(test)]
+    fn arm_provider_response_checkpoint_failures(&self, batch: &SurfaceCommitBatch) {
+        if !Self::is_provider_response(batch) {
             return;
         }
         let mut failures = PROVIDER_RESPONSE_CHECKPOINT_FAILURES
@@ -4361,7 +4385,15 @@ impl JsonlSurfaceCommitLedger {
 
     #[cfg(test)]
     fn take_provider_response_checkpoint_failure(&self) -> bool {
-        let mut failures = PENDING_PROVIDER_RESPONSE_CHECKPOINT_FAILURES
+        self.take_provider_response_fault(&PENDING_PROVIDER_RESPONSE_CHECKPOINT_FAILURES)
+    }
+
+    #[cfg(test)]
+    fn take_provider_response_fault(
+        &self,
+        faults: &OnceLock<Mutex<HashMap<PathBuf, usize>>>,
+    ) -> bool {
+        let mut failures = faults
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4510,6 +4542,10 @@ impl SurfaceCommitLedger for JsonlSurfaceCommitLedger {
         }
         #[cfg(test)]
         if self.take_provider_terminal_append_failure(batch) {
+            return Err(SurfaceLedgerError::AppendFailed);
+        }
+        #[cfg(test)]
+        if self.take_provider_response_append_failure(batch) {
             return Err(SurfaceLedgerError::AppendFailed);
         }
         #[cfg(test)]

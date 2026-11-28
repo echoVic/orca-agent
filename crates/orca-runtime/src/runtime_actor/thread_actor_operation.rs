@@ -9715,9 +9715,12 @@ fn is_running_kept_subagent(
 #[cfg(test)]
 mod jsonl_resume_generation_regression_tests {
     use super::*;
+    use orca_core::conversation::CutShort;
+    use orca_core::provider_types::PartialReply;
     use std::sync::mpsc::{Receiver, Sender};
 
     const GATE_TIMEOUT: Duration = Duration::from_secs(30);
+    const REPLY_PREFIX: &str = "Keep the part already published.";
 
     struct GatedJsonlResumeExecutor {
         entered: Sender<(GenerationFence, bool, CancelToken)>,
@@ -9774,36 +9777,105 @@ mod jsonl_resume_generation_regression_tests {
         }
     }
 
-    /// Runs until it is released, then fails as a generation does whose
-    /// last send met the mailbox a shutdown closed.
-    struct GatedClosedMailboxExecutor {
+    struct GatedShutdownExecutor {
         entered: Sender<CancelToken>,
         release: Mutex<Receiver<()>>,
+        exit: ShutdownGenerationExit,
     }
 
-    impl ThreadOperationExecutor for GatedClosedMailboxExecutor {
+    #[derive(Clone, Copy)]
+    enum ShutdownGenerationExit {
+        RefusedSend,
+        UnrelatedFailure,
+        InterruptedReply,
+        ReplyAppendFailure,
+        ReplyCheckpointFailure,
+    }
+
+    impl ThreadOperationExecutor for GatedShutdownExecutor {
         fn run_turn(
             &self,
             _thread: &mut RuntimeThread,
-            _request: &HostedTurnRequest,
-            _generation: &GenerationContext,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
             _events: &mut EventFactory,
             _writer: &mut (dyn io::Write + Send),
             cancel: &CancelToken,
         ) -> io::Result<ThreadOperationOutcome> {
+            let ingress = generation
+                .handlers
+                .provider_response_ingress
+                .as_deref()
+                .expect("generation has semantic ingress");
+            let identity = ModelResponseIdentity::new(request.turn_id().clone());
+            if matches!(
+                self.exit,
+                ShutdownGenerationExit::InterruptedReply
+                    | ShutdownGenerationExit::ReplyAppendFailure
+                    | ShutdownGenerationExit::ReplyCheckpointFailure
+            ) {
+                ingress.publish_provider_steps(
+                    &identity,
+                    &[ProviderStep::MessageDelta(REPLY_PREFIX.to_string())],
+                )?;
+            }
             self.entered
                 .send(cancel.clone())
-                .map_err(|_| io::Error::other("closed-mailbox entry receiver closed"))?;
+                .map_err(|_| io::Error::other("shutdown entry receiver closed"))?;
             self.release
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .recv_timeout(GATE_TIMEOUT)
-                .map_err(|_| io::Error::other("closed-mailbox generation was not released"))?;
-            Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "runtime semantic ingress actor is unavailable",
-            ))
+                .map_err(|_| io::Error::other("shutdown generation was not released"))?;
+            if matches!(self.exit, ShutdownGenerationExit::UnrelatedFailure) {
+                return Err(io::Error::other(
+                    "generation failed independently of shutdown",
+                ));
+            }
+            let refusal = refused_shutdown_tool_results(ingress);
+            if matches!(self.exit, ShutdownGenerationExit::RefusedSend) {
+                return Err(refusal);
+            }
+            let mut reply = crate::provider_turn::cut_short_response(
+                PartialReply {
+                    content: REPLY_PREFIX.to_string(),
+                    reasoning: None,
+                },
+                &identity,
+                CutShort::Interrupted,
+            )
+            .expect("published reply has visible text");
+            let acknowledgement = ingress.commit_response(&mut reply);
+            if matches!(self.exit, ShutdownGenerationExit::InterruptedReply) {
+                acknowledgement?;
+                return Err(refusal);
+            }
+            let error = acknowledgement.expect_err("reply save should exhaust its retries");
+            let expected_fault = if matches!(self.exit, ShutdownGenerationExit::ReplyAppendFailure)
+            {
+                "AppendFailed"
+            } else {
+                "CheckpointFailed"
+            };
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(
+                error.to_string(),
+                format!("failed to commit provider semantic batch: Ledger({expected_fault})")
+            );
+            let _ = refused_shutdown_tool_results(ingress);
+            Err(error)
         }
+    }
+
+    fn refused_shutdown_tool_results(
+        ingress: &dyn surface::RuntimeProviderResponseIngress,
+    ) -> io::Error {
+        let error = ingress
+            .commit_tool_results(&[])
+            .expect_err("shutdown must refuse the generation's tool results");
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(error.to_string(), "runtime thread is shutting down");
+        error
     }
 
     fn request_id() -> surface::SurfaceRequestId {
@@ -9858,25 +9930,93 @@ mod jsonl_resume_generation_regression_tests {
     }
 
     /// A host shutdown that finds a turn's interrupt committed and its
-    /// generation still running ends the turn as the interrupt does. The
-    /// generation's error from the mailbox the shutdown closed is not a
-    /// failure of the turn.
+    /// generation still running ends the turn as the interrupt does, even
+    /// when shutdown refuses the generation's final send.
     #[test]
     fn host_shutdown_after_a_committed_interrupt_ends_the_turn_cancelled() {
+        let terminals =
+            run_shutdown_after_a_committed_interrupt(ShutdownGenerationExit::RefusedSend);
+        assert_eq!(
+            terminals,
+            vec![surface::OperationTerminal::Cancelled {
+                reason: surface::CancelReason::User,
+            }],
+            "the turn must end as its interrupt did"
+        );
+    }
+
+    #[test]
+    fn committed_interrupt_shutdown_keeps_reply_after_refusing_own_send() {
+        assert_eq!(
+            run_shutdown_after_a_committed_interrupt(ShutdownGenerationExit::InterruptedReply),
+            vec![surface::OperationTerminal::Cancelled {
+                reason: surface::CancelReason::User
+            }]
+        );
+    }
+
+    #[test]
+    fn committed_interrupt_shutdown_keeps_reply_save_failure_over_own_refusals() {
+        let terminals =
+            run_shutdown_after_a_committed_interrupt(ShutdownGenerationExit::ReplyAppendFailure);
+        assert!(
+            matches!(
+                terminals.as_slice(),
+                [surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::RuntimeInvariant,
+                    message,
+                }] if message.as_str() == "failed to commit provider semantic batch: Ledger(AppendFailed)"
+            ),
+            "unexpected terminals: {terminals:?}"
+        );
+    }
+
+    #[test]
+    fn committed_interrupt_shutdown_reports_reply_checkpoint_exhaustion() {
+        let terminals = run_shutdown_after_a_committed_interrupt(
+            ShutdownGenerationExit::ReplyCheckpointFailure,
+        );
+        assert!(
+            terminals.is_empty(),
+            "an uncheckpointed reply blocks finalization: {terminals:?}"
+        );
+    }
+
+    #[test]
+    fn committed_interrupt_shutdown_probe_does_not_hide_an_unrelated_failure() {
+        let terminals =
+            run_shutdown_after_a_committed_interrupt(ShutdownGenerationExit::UnrelatedFailure);
+        assert!(
+            matches!(
+                terminals.as_slice(),
+                [surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::RuntimeInvariant,
+                    message,
+                }] if message.as_str() == "generation failed independently of shutdown"
+            ),
+            "unexpected terminals: {terminals:?}"
+        );
+    }
+
+    fn run_shutdown_after_a_committed_interrupt(
+        exit: ShutdownGenerationExit,
+    ) -> Vec<surface::OperationTerminal> {
         let _ = crate::history::claim_isolated_test_orca_home_if_unset();
         let cwd = tempfile::tempdir().unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let host = RuntimeHost::start_with_executor(Arc::new(GatedClosedMailboxExecutor {
+        let host = RuntimeHost::start_with_executor(Arc::new(GatedShutdownExecutor {
             entered: entered_tx,
             release: Mutex::new(release_rx),
+            exit,
         }))
-        .expect("start closed-mailbox host");
+        .expect("start gated shutdown host");
         let gates = ReleaseGenerationGates(vec![release_tx]);
         let thread = host
             .start_thread(
                 RunConfig {
                     cwd: Some(cwd.path().to_path_buf()),
+                    provider: orca_core::config::ProviderKind::Mock,
                     output_format: orca_core::config::OutputFormat::Jsonl,
                     history_mode: HistoryMode::Record,
                     tools: orca_core::config::ToolConfig {
@@ -9975,24 +10115,91 @@ mod jsonl_resume_generation_regression_tests {
             Some(surface::PendingControlIntent::Interrupt { .. })
         ));
 
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load runtime transcript")
+            .path;
+        match exit {
+            ShutdownGenerationExit::ReplyAppendFailure => {
+                surface::JsonlSurfaceCommitLedger::inject_provider_response_append_failures(
+                    &transcript_path,
+                    SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS,
+                );
+            }
+            ShutdownGenerationExit::ReplyCheckpointFailure => {
+                surface::JsonlSurfaceCommitLedger::inject_provider_response_checkpoint_failures(
+                    &transcript_path,
+                    SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS,
+                );
+            }
+            _ => {}
+        }
+
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let _ = shutdown_tx.send(host.shutdown());
         });
-        // The generation is released only once the shutdown has closed the
-        // mailbox under it, so its error is the one the closed mailbox gives.
-        let deadline = std::time::Instant::now() + GATE_TIMEOUT;
-        while !thread.command_tx.is_closed() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the shutdown never closed the thread's mailbox"
-            );
-            std::thread::yield_now();
-        }
+        wait_for_shutdown_refusal(&thread);
         gates.0[0].send(()).expect("release the generation");
-        let _shutdown = shutdown_rx
+        let shutdown = shutdown_rx
             .recv_timeout(GATE_TIMEOUT)
             .expect("host shutdown hung");
+
+        let ledger =
+            surface::JsonlSurfaceCommitLedger::new(transcript_path, snapshot.cursor.clone());
+        if matches!(exit, ShutdownGenerationExit::ReplyCheckpointFailure) {
+            let error =
+                shutdown.expect_err("the prepared reply blocks a different finalization batch");
+            assert!(
+                matches!(error, RuntimeHostError::ThreadStartFailed { message }
+                if message.contains("typed surface generation stop and finalization start failed: CursorRangeAlreadyConsumed"))
+            );
+            let recovered = ledger
+                .recover_batches()
+                .expect("recover recorded surface batches");
+            assert!(
+                recovered
+                    .prepared
+                    .is_some_and(|batch| batch.events.as_slice().iter().any(|event| {
+                        matches!(
+                            &event.event,
+                            surface::SurfaceEvent::Assistant(
+                                surface::AssistantPatch::ResponseKept {
+                                    reason: CutShort::Interrupted,
+                                    ..
+                                }
+                            )
+                        )
+                    }))
+            );
+        } else {
+            shutdown.expect("host completes shutdown");
+        }
+
+        if matches!(exit, ShutdownGenerationExit::InterruptedReply) {
+            let recovered = ledger
+                .recover_batches()
+                .expect("recover recorded surface batches");
+            let replies = recovered
+                .committed
+                .iter()
+                .flat_map(|batch| batch.events.as_slice())
+                .filter_map(|event| match &event.event {
+                    surface::SurfaceEvent::Assistant(surface::AssistantPatch::ResponseKept {
+                        response,
+                        reason,
+                    }) => Some((
+                        response
+                            .message_item
+                            .as_ref()
+                            .map(|item| item.text.as_str()),
+                        *reason,
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(replies, [(Some(REPLY_PREFIX), CutShort::Interrupted)]);
+        }
 
         let mut terminals = Vec::new();
         while let Some(item) = subscription.try_recv() {
@@ -10009,13 +10216,35 @@ mod jsonl_resume_generation_regression_tests {
                 }
             }
         }
-        assert_eq!(
-            terminals,
-            vec![surface::OperationTerminal::Cancelled {
-                reason: surface::CancelReason::User,
-            }],
-            "the turn must end as its interrupt did"
-        );
+        terminals
+    }
+
+    fn wait_for_shutdown_refusal(thread: &RuntimeThreadHandle) {
+        let deadline = std::time::Instant::now() + GATE_TIMEOUT;
+        loop {
+            let (reply, response) = mpsc::sync_channel(1);
+            match thread
+                .command_tx
+                .try_send(ThreadCommand::ReadState { reply })
+            {
+                Ok(()) => {
+                    if matches!(
+                        response.recv_timeout(
+                            deadline.saturating_duration_since(std::time::Instant::now())
+                        ),
+                        Ok(Err(RuntimeHostError::ThreadUnavailable))
+                    ) {
+                        return;
+                    }
+                }
+                Err(TrySendError::Full(_)) => std::thread::yield_now(),
+                Err(TrySendError::Closed(_)) => panic!("mailbox closed before shutdown refusal"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown did not refuse ReadState"
+            );
+        }
     }
 
     fn run_gated_jsonl_resume(interrupt_successor: bool) {
