@@ -583,22 +583,8 @@ fn handle_line<W: Write + Send + 'static>(
     }
     {
         let mut writer = writer.lock().map_err(lock_error)?;
-        match drain_command_exec_processes(state, &mut *writer)? {
-            CommandExecDrainOutcome::NetworkPermissionRequired { request, block } => {
-                request_command_exec_network_permission(state, request, block, &mut *writer)?;
-            }
-            CommandExecDrainOutcome::NetworkPermissionDenied {
-                command_event_id,
-                reason,
-            } => {
-                protocol::write_server_event(
-                    &mut *writer,
-                    &command_event_id,
-                    ServerEvent::error(reason),
-                )?;
-            }
-            CommandExecDrainOutcome::Drained => {}
-        }
+        let outcome = drain_command_exec_processes(state, &mut *writer)?;
+        write_command_exec_drain_outcome(state, outcome, &mut *writer)?;
     }
 
     router::dispatch_submission(config, state, submission, writer)?;
@@ -1821,6 +1807,24 @@ fn run_command_exec_list<W: Write>(
         .into_iter()
         .map(|snapshot| (snapshot.id.clone(), snapshot))
         .collect::<HashMap<_, _>>();
+    let observed_exits = shell_snapshots
+        .values()
+        .filter(|snapshot| !snapshot.status.is_active())
+        .map(|snapshot| snapshot.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if !observed_exits.is_empty() {
+        loop {
+            let outcome = state.command_exec.drain_observed_exits(
+                state.shells.sessions_mut(),
+                &observed_exits,
+                writer,
+            )?;
+            if matches!(outcome, CommandExecDrainOutcome::Drained) {
+                break;
+            }
+            write_command_exec_drain_outcome(state, outcome, writer)?;
+        }
+    }
     let processes = state
         .command_exec
         .list()
@@ -1883,6 +1887,14 @@ fn run_command_exec_read<W: Write>(
         &id,
         writer,
     )?;
+    write_command_exec_drain_outcome(state, outcome, writer)
+}
+
+fn write_command_exec_drain_outcome<W: Write>(
+    state: &mut ServerState,
+    outcome: CommandExecDrainOutcome,
+    writer: &mut W,
+) -> io::Result<()> {
     match outcome {
         CommandExecDrainOutcome::NetworkPermissionRequired { request, block } => {
             request_command_exec_network_permission(state, request, block, writer)
@@ -3660,6 +3672,68 @@ mod tests {
                 assert_eq!(listed["event"], "command_exec_listed");
                 assert_eq!(listed["processes"], json!([]));
             }
+        });
+    }
+
+    #[test]
+    fn command_exec_list_delivers_an_exit_after_the_pre_dispatch_drain() {
+        use std::time::Instant;
+
+        with_orca_home(|_home| {
+            let cwd = tempdir().expect("tempdir");
+            let mut state = ServerState::default();
+            let command = test_shell_script(
+                "read -r line; printf first-done",
+                "$null = [Console]::ReadLine(); [Console]::Out.Write('first-done')",
+            );
+            let handle = state
+                .shells
+                .spawn(
+                    cwd.path(),
+                    ShellSessionCommand {
+                        command,
+                        argv: None,
+                        cwd: cwd.path().to_path_buf(),
+                        additional_readable_directories: Vec::new(),
+                        additional_working_directories: Vec::new(),
+                        denied_working_directories: Vec::new(),
+                        allowed_unix_socket_roots: Vec::new(),
+                        metadata_read_only_paths: Vec::new(),
+                        env: Default::default(),
+                        description: "gated command".to_string(),
+                        terminal: crate::shell_session::ShellTerminalMode::pipe(),
+                        sandbox: ShellSandboxMode::DangerFullAccess,
+                    },
+                    None,
+                )
+                .expect("spawn command exec shell");
+            state
+                .command_exec
+                .insert("process".to_string(), command_exec_process(&handle.id))
+                .unwrap();
+
+            let mut output = Vec::new();
+            drain_command_exec_processes(&mut state, &mut output).expect("pre-dispatch drain");
+            assert!(output.is_empty());
+            let manager = state.shells.sessions_mut().unwrap();
+            assert!(!manager.has_exited_for_test(&handle.id).unwrap());
+            manager.write_stdin(&handle.id, "release\n").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !manager.has_exited_for_test(&handle.id).expect("poll exit") {
+                assert!(Instant::now() < deadline, "command did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            run_command_exec_list(&mut state, Value::from("list"), &mut output).unwrap();
+            let events = parse_jsonl(&output);
+            assert_eq!(events.len(), 2, "expected completion and list: {events:?}");
+            assert_eq!(events[0]["id"], "cmd");
+            assert_eq!(events[0]["event"], "command_exec_completed");
+            assert_eq!(events[0]["exitCode"], 0);
+            assert_eq!(events[0]["stdout"], "first-done");
+            assert_eq!(events[1]["id"], "list");
+            assert_eq!(events[1]["event"], "command_exec_listed");
+            assert_eq!(events[1]["processes"], json!([]));
         });
     }
 

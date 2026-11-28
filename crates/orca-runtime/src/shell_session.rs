@@ -871,7 +871,7 @@ impl RuntimeShellSessionManager {
             .unwrap_or_else(Instant::now);
         loop {
             let session = self.session_mut(id)?;
-            if session.try_wait()?.is_some() {
+            if session.exited_at.is_some() || session.try_wait()?.is_some() {
                 return self.finish_terminal_session(id, remove_completed_output);
             }
             if session.output_size() > 0 || Instant::now() >= deadline {

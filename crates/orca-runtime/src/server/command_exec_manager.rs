@@ -403,7 +403,7 @@ impl CommandExecManager {
         writer: &mut W,
         timeout: Duration,
     ) -> io::Result<CommandExecDrainOutcome> {
-        self.drain_inner(shell_sessions, writer, timeout, false)
+        self.drain_inner(shell_sessions, writer, timeout, false, None)
     }
 
     pub(super) fn drain_until_output_or_timeout<W: Write>(
@@ -412,7 +412,22 @@ impl CommandExecManager {
         writer: &mut W,
         timeout: Duration,
     ) -> io::Result<CommandExecDrainOutcome> {
-        self.drain_inner(shell_sessions, writer, timeout, true)
+        self.drain_inner(shell_sessions, writer, timeout, true, None)
+    }
+
+    pub(super) fn drain_observed_exits<W: Write>(
+        &mut self,
+        shell_sessions: Option<&mut RuntimeShellSessionManager>,
+        observed_exits: &HashSet<&str>,
+        writer: &mut W,
+    ) -> io::Result<CommandExecDrainOutcome> {
+        self.drain_inner(
+            shell_sessions,
+            writer,
+            Duration::ZERO,
+            false,
+            Some(observed_exits),
+        )
     }
 
     fn drain_inner<W: Write>(
@@ -421,6 +436,7 @@ impl CommandExecManager {
         writer: &mut W,
         timeout: Duration,
         return_on_output: bool,
+        observed_exits: Option<&HashSet<&str>>,
     ) -> io::Result<CommandExecDrainOutcome> {
         let Some(manager) = shell_sessions else {
             return Ok(CommandExecDrainOutcome::Drained);
@@ -441,6 +457,9 @@ impl CommandExecManager {
                 else {
                     continue;
                 };
+                if observed_exits.is_some_and(|ids| !ids.contains(shell_id.as_str())) {
+                    continue;
+                }
                 let mut output =
                     match manager.read_preserving_output(&shell_id, Duration::from_millis(1)) {
                         Ok(output) => output,
