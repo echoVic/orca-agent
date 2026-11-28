@@ -3757,22 +3757,39 @@ impl ChildAgentCoordinator {
                             status: record.status,
                         });
                     }
-                    let next_status = terminal_status(&terminal);
-                    record.status.transition_to(next_status)?;
-                    record
-                        .current_attempt
-                        .state
-                        .transition_to(AttemptState::Terminal)?;
-                    record.current_attempt.owner_id = None;
-                    record.current_attempt.lease_expires_at_ms = None;
-                    record.current_attempt.completed_at_ms = Some(now_ms);
-                    record.active_tool_boundary = None;
-                    record.terminal = Some(terminal);
-                    record.updated_at_ms = now_ms;
-                    Ok(())
+                    settle_running_attempt(record, terminal, now_ms)
                 })?;
         self.install_projection(&committed)?;
         Ok(ContinuationProjection::from(&committed))
+    }
+
+    /// Records a refusal before the executor ran, preserving any inherited
+    /// checkpoint. An expired lease can settle only the acquisition it names.
+    pub(crate) fn fail_before_execution(
+        &self,
+        lease: &ContinuationLease,
+        error: String,
+    ) -> Result<(), AgentContinuationError> {
+        let now_ms = continuation_now_ms();
+        let fence = lease.fence(lease.revision);
+        let (_, committed) =
+            self.store
+                .mutate_record(&lease.continuation_id, lease.revision, move |record| {
+                    fence.validate(record)?;
+                    if record.current_attempt.owner_id.as_deref() != Some(lease.owner_id.as_str()) {
+                        return Err(AgentContinuationError::LeaseExpired);
+                    }
+                    if record.status != ContinuationStatus::Running
+                        || record.current_attempt.state != AttemptState::Running
+                        || record.active_tool_boundary.is_some()
+                    {
+                        return Err(AgentContinuationError::NotResumable {
+                            status: record.status,
+                        });
+                    }
+                    settle_running_attempt(record, AgentTerminal::Failed { error }, now_ms)
+                })?;
+        self.install_projection(&committed)
     }
 
     /// Persists the replay disposition before a child tool is invoked. This
@@ -4120,6 +4137,25 @@ fn terminal_status(terminal: &AgentTerminal) -> ContinuationStatus {
         AgentTerminal::Cancelled { .. } => ContinuationStatus::Cancelled,
         AgentTerminal::Indeterminate { .. } => ContinuationStatus::Indeterminate,
     }
+}
+
+fn settle_running_attempt(
+    record: &mut AgentContinuationRecord,
+    terminal: AgentTerminal,
+    now_ms: i64,
+) -> Result<(), AgentContinuationError> {
+    record.status.transition_to(terminal_status(&terminal))?;
+    record
+        .current_attempt
+        .state
+        .transition_to(AttemptState::Terminal)?;
+    record.current_attempt.owner_id = None;
+    record.current_attempt.lease_expires_at_ms = None;
+    record.current_attempt.completed_at_ms = Some(now_ms);
+    record.active_tool_boundary = None;
+    record.terminal = Some(terminal);
+    record.updated_at_ms = now_ms;
+    Ok(())
 }
 
 fn task_binding_label(task_id: Option<&str>) -> String {

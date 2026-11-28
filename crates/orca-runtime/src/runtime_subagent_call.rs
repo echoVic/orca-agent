@@ -2229,6 +2229,10 @@ fn execute_acquired_sync_subagent(
         Ok(()) => {}
         Err(error) => {
             let worktree = worktree_execution.finish();
+            let _ = coordinator.fail_before_execution(
+                &lease,
+                continuation_error("failed to validate child continuation lease", &error),
+            );
             return sync_setup_failure_with_worktree(
                 tool_request,
                 description,
@@ -3621,6 +3625,7 @@ mod tests {
         cwd: &Path,
         registry: &TaskRegistry,
         cancel: &CancelToken,
+        resume_from: Option<&str>,
         executor: ChildAgentExecutor<io::Sink>,
     ) -> RuntimeSubagentCallOutput {
         let tool_request = ToolRequest {
@@ -3629,8 +3634,11 @@ mod tests {
             action: ActionKind::Agent,
             target: None,
             raw_arguments: Some(
-                serde_json::json!({"description":"Inspect", "prompt":"Inspect", "mode":"sync"})
-                    .to_string(),
+                serde_json::json!({
+                    "description": "Inspect", "prompt": "Inspect", "mode": "sync",
+                    "resume_from": resume_from,
+                })
+                .to_string(),
             ),
         };
         let request = crate::subagent::create_subagent_request(&tool_request);
@@ -3669,6 +3677,7 @@ mod tests {
             cwd.path(),
             &registry,
             &CancelToken::new(),
+            None,
             |_, _, runtime, _| {
                 std::fs::write(runtime.cwd.join("child-started"), [])?;
                 Err(io::Error::other("child started on an expired lease"))
@@ -3688,56 +3697,152 @@ mod tests {
     }
 
     #[test]
+    fn a_child_refused_before_start_can_be_resumed() {
+        use crate::child_agent_types::ChildAgentCheckpointObservation;
+        use orca_core::conversation::Conversation;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut registry = TaskRegistry::new("sync-resume-after-refusal".into());
+        let cancel = CancelToken::new();
+        let original = run_sync_child_for_lease_test(
+            cwd.path(),
+            &registry,
+            &cancel,
+            None,
+            |_, _, runtime, _| {
+                let mut conversation = Conversation::new();
+                conversation.add_user("Inspect the workspace.".into());
+                conversation.add_assistant(Some("Inspection complete.".into()), None, vec![]);
+                runtime
+                    .checkpoint_observer
+                    .unwrap()
+                    .checkpoint(ChildAgentCheckpointObservation {
+                        conversation: &conversation,
+                        turn: 1,
+                        usage: Default::default(),
+                        last_tool_boundary: None,
+                    })
+                    .unwrap();
+                Ok(ChildAgentResult {
+                    status: RunStatus::Success,
+                    final_message: Some("Inspection complete.".into()),
+                    error: None,
+                    budget_usage: None,
+                })
+            },
+        );
+        assert_eq!(
+            original.status,
+            RunStatus::Success,
+            "{:?}",
+            original.event_error
+        );
+        let task = &registry.list()[0];
+        let source = registry.continuation_projection(&task.id).unwrap().unwrap();
+        let selector = source.continuation_id.as_str();
+        let checkpoint_id = source.checkpoint_id.unwrap();
+
+        registry.continuation_lease_duration_ms = Some(0);
+        let refused = run_sync_child_for_lease_test(
+            cwd.path(),
+            &registry,
+            &cancel,
+            Some(selector),
+            |_, _, runtime, _| {
+                std::fs::write(runtime.cwd.join("child-started"), [])?;
+                Err(io::Error::other("child started on an expired lease"))
+            },
+        );
+        assert_eq!(refused.status, RunStatus::Failed);
+        assert!(refused.event_error.unwrap().contains("lease has expired"));
+        assert!(!cwd.path().join("child-started").exists());
+
+        registry.continuation_lease_duration_ms = None;
+        let resumed = run_sync_child_for_lease_test(
+            cwd.path(),
+            &registry,
+            &cancel,
+            Some(selector),
+            |_, request, _, _| {
+                assert_eq!(request.continuation.as_ref().unwrap().checkpoint().turn, 1);
+                Ok(ChildAgentResult {
+                    status: RunStatus::Success,
+                    final_message: Some("Inspection resumed.".into()),
+                    error: None,
+                    budget_usage: None,
+                })
+            },
+        );
+        assert_eq!(
+            resumed.status,
+            RunStatus::Success,
+            "{:?}",
+            resumed.event_error
+        );
+        let projection = ChildAgentCoordinator::new(registry)
+            .unwrap()
+            .projection(selector)
+            .unwrap();
+        assert_eq!(projection.checkpoint_id, Some(checkpoint_id));
+    }
+
+    #[test]
     fn a_synchronous_child_stops_when_it_loses_its_lease() {
         use std::time::{Duration, Instant};
 
         let cwd = tempfile::tempdir().unwrap();
         let registry = TaskRegistry::new("sync-lost-lease".into());
         let parent_cancel = CancelToken::new();
-        run_sync_child_for_lease_test(cwd.path(), &registry, &parent_cancel, |_, _, runtime, _| {
-            let registry = runtime.task_registry.unwrap();
-            let task_id = runtime.child_task_id.unwrap();
-            let store = registry.continuation_store().unwrap();
-            let id = registry
-                .continuation_projection(task_id)
-                .unwrap()
-                .unwrap()
-                .continuation_id;
-            assert!(!runtime.cancel.is_cancelled());
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let record = store.load_record(&id).unwrap().unwrap();
-                match store.mutate_record(&id, record.revision, |record| {
-                    record.current_attempt.lease_expires_at_ms = Some(0);
-                    Ok(())
-                }) {
-                    Ok(_) => break,
-                    Err(AgentContinuationError::RevisionConflict { .. }) => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "could not expire the child's lease"
-                        );
+        run_sync_child_for_lease_test(
+            cwd.path(),
+            &registry,
+            &parent_cancel,
+            None,
+            |_, _, runtime, _| {
+                let registry = runtime.task_registry.unwrap();
+                let task_id = runtime.child_task_id.unwrap();
+                let store = registry.continuation_store().unwrap();
+                let id = registry
+                    .continuation_projection(task_id)
+                    .unwrap()
+                    .unwrap()
+                    .continuation_id;
+                assert!(!runtime.cancel.is_cancelled());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let record = store.load_record(&id).unwrap().unwrap();
+                    match store.mutate_record(&id, record.revision, |record| {
+                        record.current_attempt.lease_expires_at_ms = Some(0);
+                        Ok(())
+                    }) {
+                        Ok(_) => break,
+                        Err(AgentContinuationError::RevisionConflict { .. }) => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "could not expire the child's lease"
+                            );
+                        }
+                        Err(error) => panic!("could not expire the child's lease: {error}"),
                     }
-                    Err(error) => panic!("could not expire the child's lease: {error}"),
                 }
-            }
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !runtime.cancel.is_cancelled() {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::other(
-                        "child did not stop after losing its lease",
-                    ));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !runtime.cancel.is_cancelled() {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::other(
+                            "child did not stop after losing its lease",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(5));
                 }
-                thread::sleep(Duration::from_millis(5));
-            }
-            std::fs::write(runtime.cwd.join("child-stopped"), [])?;
-            Ok(ChildAgentResult {
-                status: RunStatus::Cancelled,
-                final_message: None,
-                error: None,
-                budget_usage: None,
-            })
-        });
+                std::fs::write(runtime.cwd.join("child-stopped"), [])?;
+                Ok(ChildAgentResult {
+                    status: RunStatus::Cancelled,
+                    final_message: None,
+                    error: None,
+                    budget_usage: None,
+                })
+            },
+        );
 
         assert!(
             cwd.path().join("child-stopped").exists(),
