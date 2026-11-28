@@ -160,15 +160,14 @@ fn resolve_workflow_script_with_dirs_to_path(
             config_dir,
         ),
         ScriptPathAccess::Draft(session_dir) => {
-            let root = session_dir.canonicalize()?.join("workflow-drafts");
-            let canonical = path.canonicalize()?;
-            if !canonical.starts_with(&root) {
-                return Err(io::Error::new(
+            let root = orca_tools::pin_read_root(session_dir)?;
+            let relative = path.strip_prefix(session_dir).map_err(|_| {
+                io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "workflow draft script must be inside the session drafts directory",
-                ));
-            }
-            read_resolved_workflow_script(&root, &canonical)
+                )
+            })?;
+            read_resolved_workflow_script(&root, &root.join(relative))
         }
     };
     let (source_kind, original_path, script) = if let Some(script_path) = input
@@ -256,7 +255,7 @@ pub(super) fn single_workflow_component(name: &str) -> bool {
     !name.contains(['/', '\\'])
         && matches!(
             Path::new(name).components().next(),
-            Some(std::path::Component::Normal(_))
+            Some(std::path::Component::Normal(component)) if component == name
         )
 }
 
@@ -1217,6 +1216,9 @@ fn sha256_hex(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     use orca_core::config::WorkflowConfig;
 
     use super::{
@@ -1315,7 +1317,7 @@ mod tests {
         };
         assert_eq!(prepare().unwrap().script, FILE_WORKFLOW);
         std::fs::rename(&user, base.join("previous")).unwrap();
-        std::os::unix::fs::symlink(&neighbor, &user).unwrap();
+        symlink(&neighbor, &user).unwrap();
         assert_eq!(
             prepare().unwrap_err().to_string(),
             format!(
@@ -1358,7 +1360,7 @@ mod tests {
         std::fs::write(&other, FILE_WORKFLOW).unwrap();
         let resolved = path.canonicalize().unwrap();
         std::fs::rename(&path, cwd.join("previous.js")).unwrap();
-        std::os::unix::fs::symlink(other, &path).unwrap();
+        symlink(other, &path).unwrap();
         let error = super::read_resolved_workflow_script(&cwd, &resolved).unwrap_err();
         assert_eq!(
             error.to_string(),

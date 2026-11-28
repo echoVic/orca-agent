@@ -85,6 +85,7 @@ struct WorkflowHostRunPolicy<'a> {
     collect_events: bool,
     max_agent_workers: usize,
     workflow_ipc: Option<&'a WorkflowIpcContext>,
+    script_digest: Option<&'a str>,
 }
 
 impl<'a> WorkflowHostRunPolicy<'a> {
@@ -93,17 +94,20 @@ impl<'a> WorkflowHostRunPolicy<'a> {
             collect_events: true,
             max_agent_workers: DEFAULT_WORKFLOW_HOST_AGENT_WORKERS,
             workflow_ipc: None,
+            script_digest: None,
         }
     }
 
     fn callback_only(
         max_agent_workers: usize,
         workflow_ipc: Option<&'a WorkflowIpcContext>,
+        script_digest: Option<&'a str>,
     ) -> Self {
         Self {
             collect_events: false,
             max_agent_workers: max_agent_workers.max(1),
             workflow_ipc,
+            script_digest,
         }
     }
 }
@@ -246,7 +250,7 @@ impl WorkflowHost {
     }
 
     pub(crate) fn run_with_agent_event_control_and_ipc_paths<F, E, C, A>(
-        script_path: &Path,
+        (script_path, script_digest): (&Path, &str),
         args: Value,
         (ipc_paths, workflow_ipc): (&WorkflowHostIpcPaths, &WorkflowIpcContext),
         max_agent_workers: usize,
@@ -266,7 +270,11 @@ impl WorkflowHost {
             script_path,
             args,
             Some(ipc_paths),
-            WorkflowHostRunPolicy::callback_only(max_agent_workers, Some(workflow_ipc)),
+            WorkflowHostRunPolicy::callback_only(
+                max_agent_workers,
+                Some(workflow_ipc),
+                Some(script_digest),
+            ),
             on_agent_call,
             on_event,
             should_cancel,
@@ -334,7 +342,8 @@ impl WorkflowHost {
         command
             .arg(mailbox_path.unwrap_or_else(|| Path::new("")))
             .arg(&task_list_reply)
-            .arg(MAX_WORKFLOW_HOST_FRAME_BYTES.to_string());
+            .arg(MAX_WORKFLOW_HOST_FRAME_BYTES.to_string())
+            .arg(policy.script_digest.unwrap_or_default());
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1606,7 +1615,7 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
             &script,
             serde_json::Value::Null,
             None,
-            WorkflowHostRunPolicy::callback_only(1, None),
+            WorkflowHostRunPolicy::callback_only(1, None, None),
             |call| {
                 Ok(HostCommand::AgentResult {
                     call_id: call.call_id,

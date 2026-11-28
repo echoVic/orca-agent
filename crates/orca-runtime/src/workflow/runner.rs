@@ -1200,33 +1200,21 @@ impl WorkflowRunner {
             Some(cwd) => cwd,
             None => std::env::current_dir()?,
         };
-        fs::create_dir_all(&self.session_dir)?;
-
-        let access = if matches!(access, ScriptPathAccess::Model) {
-            if let Some(run_id) = request.input.resume_from_run_id.as_deref()
-                && !single_workflow_component(run_id)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "resumeFromRunId must be a workflow run ID",
-                ));
+        if matches!(access, ScriptPathAccess::Model)
+            && let Some(run_id) = request.input.resume_from_run_id.as_deref()
+            && !single_workflow_component(run_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resumeFromRunId must be a workflow run ID",
+            ));
+        }
+        let access = if let Some(draft) = request.input.draft_id.as_deref() {
+            super::draft::validate_draft_id(draft)?;
+            if matches!(access, ScriptPathAccess::Model) {
+                orca_tools::pin_read_root(&cwd)?;
             }
-            if let Some(draft) = request
-                .input
-                .draft_id
-                .as_deref()
-                .filter(|id| !id.trim().is_empty())
-            {
-                if !single_workflow_component(draft) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "draftId must be a workflow draft ID",
-                    ));
-                }
-                ScriptPathAccess::Draft(&self.session_dir)
-            } else {
-                access
-            }
+            ScriptPathAccess::Draft(&self.session_dir)
         } else {
             access
         };
@@ -1250,6 +1238,7 @@ impl WorkflowRunner {
         let run_id = format!("workflow-run-{}", uuid::Uuid::new_v4());
         let persisted_script_path = self.state.run_dir(&run_id).join("script.js");
         let resolved_input = self.resolve_launch_input(&request.input)?;
+        fs::create_dir_all(&self.session_dir)?;
         let resolved = resolve_workflow_script_for_launch(
             &resolved_input,
             &cwd,
@@ -1319,13 +1308,10 @@ impl WorkflowRunner {
     }
 
     fn resolve_launch_input(&self, input: &WorkflowInput) -> io::Result<WorkflowInput> {
-        let Some(draft_id) = input
-            .draft_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        else {
+        let Some(draft_id) = input.draft_id.as_deref() else {
             return Ok(input.clone());
         };
+        super::draft::validate_draft_id(draft_id)?;
 
         if input.script.is_some() || input.script_path.is_some() || input.name.is_some() {
             return Err(io::Error::new(
@@ -1339,13 +1325,6 @@ impl WorkflowRunner {
             .join("workflow-drafts")
             .join(draft_id)
             .join("script.js");
-        if !script_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("workflow draft `{draft_id}` not found"),
-            ));
-        }
-
         Ok(WorkflowInput {
             draft_id: None,
             script_path: Some(script_path.display().to_string()),
@@ -1413,7 +1392,7 @@ impl WorkflowRunner {
         let mut phase_agent_baselines = std::collections::HashMap::new();
         let mut agent_events_seen = 0u32;
         match WorkflowHost::run_with_agent_event_control_and_ipc_paths(
-            &resolved.persisted_path,
+            (&resolved.persisted_path, &resolved.script_digest),
             args,
             (&ipc_paths, &workflow_ipc),
             workflow_limits.max_concurrent_agents,

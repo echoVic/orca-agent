@@ -429,6 +429,7 @@ pub(crate) fn execute_workflow_draft_action_tool(
     }
 
     let input = parse_workflow_draft_action_input(tool_request)?;
+    crate::workflow::draft::validate_draft_id(&input.draft_id)?;
     if input.action == "run"
         && let Some(result) = reject_unwaited_typed_workflow(
             tool_request,
@@ -440,6 +441,9 @@ pub(crate) fn execute_workflow_draft_action_tool(
     }
     let session_dir = task_registry.workflow_session_dir(cwd)?;
     let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
+    if input.action == "run" {
+        orca_tools::pin_read_root(cwd)?;
+    }
     let draft = draft_store.load(&input.draft_id)?;
 
     let output = match input.action.as_str() {
@@ -448,7 +452,7 @@ pub(crate) fn execute_workflow_draft_action_tool(
                 .with_child_executor(child_executor)
                 .with_parent_budget(parent_budget);
             let prepared =
-                runner.prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+                runner.prepare_model_background(WorkflowLaunchRequest::from(WorkflowInput {
                     draft_id: Some(input.draft_id.clone()),
                     args: input.args.clone(),
                     token_budget: input.token_budget,
@@ -846,6 +850,7 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct RecordingWorkflowIngress {
         events: Arc<Mutex<Vec<RecordedWorkflowIngress>>>,
+        replace_prepared_script_in: Option<std::path::PathBuf>,
     }
 
     impl RecordingWorkflowIngress {
@@ -862,6 +867,14 @@ mod tests {
             &self,
             started: &RuntimeWorkflowStarted,
         ) -> io::Result<RuntimeWorkflowIngressReceipt> {
+            if let Some(session) = &self.replace_prepared_script_in {
+                let script = session
+                    .join("workflow-runs")
+                    .join(started.workflow_run_id.as_str())
+                    .join("script.js");
+                let contents = std::fs::read_to_string(&script)?;
+                std::fs::write(script, contents.replace("startup boom", "replacement ran"))?;
+            }
             self.events
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1274,6 +1287,129 @@ export const meta = {
             &registry,
             None,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_draft_action_checks_id_and_files_before_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.cwd = Some(temp.path().to_owned());
+        let registry = TaskRegistry::new("session-draft-reads".to_string());
+        let session = registry.workflow_session_dir(temp.path()).unwrap();
+        let store = WorkflowDraftStore::new(session.join("workflow-drafts"));
+        let draft = store
+            .create_from_script(
+                registry.session_id(),
+                temp.path(),
+                startup_failure_script(),
+                1,
+            )
+            .unwrap();
+        let run = |id: &str| {
+            let request = tool_request(
+                "run",
+                ToolName::WorkflowDraftAction,
+                serde_json::json!({ "draftId": id, "action": "run" }),
+            );
+            execute_workflow_draft_action_tool(
+                &config,
+                temp.path(),
+                &mut EventFactory::new("test-run".to_string()),
+                &mut EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl),
+                &request,
+                true,
+                &registry,
+                &mut Vec::new(),
+                unused_child_executor,
+                true,
+                None,
+                None,
+            )
+        };
+        assert_eq!(
+            run("../draft").unwrap_err().to_string(),
+            "draftId must be a workflow draft ID"
+        );
+        for path in [
+            store.draft_path(&draft.draft_id),
+            store.script_path(&draft.draft_id),
+        ] {
+            let stored = temp.path().join(path.file_name().unwrap());
+            std::fs::rename(&path, &stored).unwrap();
+            std::os::unix::fs::symlink(&stored, &path).unwrap();
+            let error = run(&draft.draft_id).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("path changed while it was opened"),
+                "{error}"
+            );
+            std::fs::remove_file(&path).unwrap();
+            std::fs::rename(stored, path).unwrap();
+        }
+    }
+
+    #[test]
+    fn workflow_draft_action_refuses_a_script_changed_before_host_start() {
+        let _guard = crate::history::lock_test_env();
+        if !WorkflowHost::node_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.cwd = Some(temp.path().to_owned());
+        let registry = TaskRegistry::new("session-draft-replaced-script".to_string());
+        let session = registry.workflow_session_dir(temp.path()).unwrap();
+        let store = WorkflowDraftStore::new(session.join("workflow-drafts"));
+        let draft = store
+            .create_from_script(
+                registry.session_id(),
+                temp.path(),
+                startup_failure_script(),
+                1,
+            )
+            .unwrap();
+        let ingress = RecordingWorkflowIngress {
+            replace_prepared_script_in: Some(session),
+            ..Default::default()
+        };
+        let request = tool_request(
+            "run",
+            ToolName::WorkflowDraftAction,
+            serde_json::json!({ "draftId": draft.draft_id, "action": "run" }),
+        );
+        let mut events = EventFactory::new("test-run".to_string());
+        let mut sink = EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl);
+        let mut background = Vec::new();
+        execute_workflow_draft_action_tool(
+            &config,
+            temp.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            true,
+            &registry,
+            &mut background,
+            unused_child_executor,
+            true,
+            Some(&ingress),
+            None,
+        )
+        .unwrap();
+        observe_test_background_workflows(
+            &mut events,
+            &mut sink,
+            &mut background,
+            &registry,
+            Some(&ingress),
+        );
+        let emitted = String::from_utf8(sink.writer_mut().get_ref().clone()).unwrap();
+        assert!(
+            emitted.contains("workflow script changed after preparation"),
+            "{emitted}"
+        );
+        assert!(!emitted.contains("replacement ran"), "{emitted}");
     }
 
     #[test]
