@@ -6,6 +6,7 @@ use orca_core::config::WorkflowConfig;
 use orca_core::workflow_types::{
     WorkflowArgSpec, WorkflowArgType, WorkflowArgsSchema, WorkflowInput, WorkflowMeta,
 };
+use orca_platform::fs::VerifiedDirectory;
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 
@@ -43,7 +44,7 @@ pub fn resolve_workflow_script(
 pub(super) enum ScriptPathAccess<'a> {
     User,
     Model,
-    Draft(&'a Path),
+    Draft(&'a Path, &'a VerifiedDirectory),
 }
 
 pub fn resolve_workflow_script_to_path(
@@ -181,15 +182,16 @@ fn resolve_workflow_script_with_dirs_to_path(
             user,
             config_dir,
         ),
-        ScriptPathAccess::Draft(session_dir) => {
-            let root = session_dir.canonicalize()?;
+        ScriptPathAccess::Draft(session_dir, root) => {
             let relative = path.strip_prefix(session_dir).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "workflow draft script must be inside the session drafts directory",
                 )
             })?;
-            read_resolved_workflow_script(&root, &root.join(relative))
+            let mut script = String::new();
+            orca_tools::open_relative_file(root, relative)?.read_to_string(&mut script)?;
+            Ok(script)
         }
     };
     let (source_kind, original_path, script) = if let Some(script_path) = input

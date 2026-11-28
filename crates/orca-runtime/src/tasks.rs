@@ -30,7 +30,9 @@ use orca_core::thread_identity::TurnId;
 use orca_core::thread_item_projection::ModelResponseIdentity;
 use orca_core::tool_types::ToolRequest;
 use orca_core::workflow_types::WorkflowInput;
-use orca_platform::fs::{AtomicWritePolicy, ExclusiveFileLock, atomic_write, open_nofollow};
+use orca_platform::fs::{
+    AtomicWritePolicy, ExclusiveFileLock, VerifiedDirectory, atomic_write, open_nofollow,
+};
 use orca_platform::process::ProcessJob;
 use ring::rand::SystemRandom;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
@@ -702,8 +704,31 @@ impl fmt::Debug for TaskRegistry {
 enum TaskArtifactStorage {
     Recorded,
     ProcessLocal {
-        scratch: Mutex<Option<tempfile::TempDir>>,
+        scratch: Mutex<Option<WorkflowScratch>>,
     },
+}
+
+struct WorkflowScratch {
+    session: Arc<VerifiedDirectory>,
+    directory: tempfile::TempDir,
+}
+
+impl fmt::Debug for WorkflowScratch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.directory.fmt(formatter)
+    }
+}
+
+impl WorkflowScratch {
+    fn new() -> io::Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix("orca-ephemeral-runtime-")
+            .tempdir_in(std::env::temp_dir().canonicalize()?)?;
+        let root = VerifiedDirectory::open(directory.path())?;
+        root.create_directory("workflow-session".as_ref())?;
+        let session = Arc::new(root.child("workflow-session".as_ref())?);
+        Ok(Self { session, directory })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1822,17 +1847,37 @@ impl TaskRegistry {
                     .lock()
                     .map_err(|_| io::Error::other("runtime artifact storage lock poisoned"))?;
                 if scratch.is_none() {
-                    *scratch = Some(
-                        tempfile::Builder::new()
-                            .prefix("orca-ephemeral-runtime-")
-                            .tempdir()?,
-                    );
+                    *scratch = Some(WorkflowScratch::new()?);
                 }
                 Ok(scratch
                     .as_ref()
-                    .expect("process-local scratch was initialized")
+                    .expect("scratch initialized")
+                    .directory
                     .path()
                     .join("workflow-session"))
+            }
+        }
+    }
+
+    pub(crate) fn open_workflow_session(&self, cwd: &Path) -> io::Result<Arc<VerifiedDirectory>> {
+        match self.artifact_storage.as_ref() {
+            TaskArtifactStorage::Recorded => {
+                let directory = orca_tools::open_workspace_root(cwd)?
+                    .child(".orca".as_ref())?
+                    .child("workflow-sessions".as_ref())?
+                    .child(self.session_id().as_ref())?;
+                Ok(Arc::new(directory))
+            }
+            TaskArtifactStorage::ProcessLocal { scratch } => {
+                let mut scratch = scratch
+                    .lock()
+                    .map_err(|_| io::Error::other("runtime artifact storage lock poisoned"))?;
+                if scratch.is_none() {
+                    *scratch = Some(WorkflowScratch::new()?);
+                }
+                Ok(Arc::clone(
+                    &scratch.as_ref().expect("scratch initialized").session,
+                ))
             }
         }
     }

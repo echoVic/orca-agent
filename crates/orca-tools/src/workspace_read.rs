@@ -62,6 +62,24 @@ pub fn open_workspace_file(root: &Path, path: &Path) -> io::Result<File> {
     open_file_in(&directory, name).map_err(changed)
 }
 
+/// Open a regular file beneath a directory the caller already owns.
+pub fn open_relative_file(root: &VerifiedDirectory, path: &Path) -> io::Result<File> {
+    let parent = path.parent().ok_or_else(not_regular)?;
+    let name = path.file_name().ok_or_else(not_regular)?;
+    let mut directory = None;
+    for part in parent {
+        directory = Some(
+            directory
+                .as_ref()
+                .unwrap_or(root)
+                .child(part)
+                .map_err(|error| changed_path(path, error.kind()))?,
+        );
+    }
+    open_file_in(directory.as_ref().unwrap_or(root), name)
+        .map_err(|error| changed_path(path, error.kind()))
+}
+
 pub(crate) fn open_file_in(directory: &VerifiedDirectory, name: &OsStr) -> io::Result<File> {
     let file = directory.open_file(name, FileAccess::Read)?;
     if !file.metadata()?.is_file() {

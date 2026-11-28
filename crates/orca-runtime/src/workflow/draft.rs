@@ -1,7 +1,10 @@
 use std::fs;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use orca_platform::fs::VerifiedDirectory;
 
 use orca_core::workflow_types::{WorkflowDraft, WorkflowSourceMutationRisk};
 
@@ -10,14 +13,25 @@ use super::script::{
 };
 use super::state::WorkflowStateStore;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WorkflowDraftStore {
     root: PathBuf,
+    session: Option<Arc<VerifiedDirectory>>,
 }
 
 impl WorkflowDraftStore {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            session: None,
+        }
+    }
+
+    pub(crate) fn in_session(root: PathBuf, session: Arc<VerifiedDirectory>) -> Self {
+        Self {
+            root,
+            session: Some(session),
+        }
     }
 
     pub fn draft_dir(&self, draft_id: &str) -> PathBuf {
@@ -84,10 +98,15 @@ impl WorkflowDraftStore {
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let root = session.canonicalize()?;
-        let relative = self.draft_path(draft_id);
-        let path = root.join(relative.strip_prefix(session).unwrap_or(&relative));
-        let file = orca_tools::open_workspace_file(&root, &path)?;
+        let path = self.draft_path(draft_id);
+        let relative = path.strip_prefix(session).unwrap_or(&path);
+        let file = match &self.session {
+            Some(root) => orca_tools::open_relative_file(root, relative)?,
+            None => {
+                let root = session.canonicalize()?;
+                orca_tools::open_workspace_file(&root, &root.join(relative))?
+            }
+        };
         let draft: WorkflowDraft = serde_json::from_reader(BufReader::new(file))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if draft.draft_id != draft_id {

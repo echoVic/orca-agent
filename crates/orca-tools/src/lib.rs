@@ -37,7 +37,9 @@ mod workspace_ignore;
 mod workspace_read;
 pub mod write_file;
 
-pub use workspace_read::{open_root as open_workspace_root, open_workspace_file};
+pub use workspace_read::{
+    open_relative_file, open_root as open_workspace_root, open_workspace_file,
+};
 
 pub use registry::{Tool, ToolContext, ToolRegistry, validate_tool_request};
 

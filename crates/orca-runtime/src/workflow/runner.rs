@@ -1214,12 +1214,14 @@ impl WorkflowRunner {
                 "resumeFromRunId must be a workflow run ID",
             ));
         }
+        let draft_session;
         let access = if let Some(draft) = request.input.draft_id.as_deref() {
             super::draft::validate_draft_id(draft)?;
             if matches!(access, ScriptPathAccess::Model) {
                 orca_tools::open_workspace_root(&cwd)?;
             }
-            ScriptPathAccess::Draft(&self.session_dir)
+            draft_session = self.tasks.open_workflow_session(&cwd)?;
+            ScriptPathAccess::Draft(&self.session_dir, &draft_session)
         } else {
             access
         };

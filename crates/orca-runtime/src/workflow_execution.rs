@@ -439,13 +439,16 @@ pub(crate) fn execute_workflow_draft_action_tool(
     {
         return Ok(result);
     }
-    let session_dir = task_registry.workflow_session_dir(cwd)?;
-    let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
+    let workspace = match &config.tools.workspace_read_root {
+        Some(root) => root.clone(),
+        None => cwd.canonicalize()?,
+    };
     if input.action == "run" {
-        if let Some(root) = &config.tools.workspace_read_root {
-            orca_tools::open_workspace_root(root)?;
-        }
+        orca_tools::open_workspace_root(&workspace)?;
     }
+    let session_dir = task_registry.workflow_session_dir(&workspace)?;
+    let session = task_registry.open_workflow_session(&workspace)?;
+    let draft_store = WorkflowDraftStore::in_session(session_dir.join("workflow-drafts"), session);
     let draft = draft_store.load(&input.draft_id)?;
 
     let output = match input.action.as_str() {
@@ -1352,6 +1355,80 @@ export const meta = {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recorded_workflow_draft_action_refuses_a_link_at_the_session_directory() {
+        check_draft_action_with_replaced_session(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_local_workflow_draft_action_reads_from_its_owned_session() {
+        check_draft_action_with_replaced_session(true);
+    }
+
+    #[cfg(unix)]
+    fn check_draft_action_with_replaced_session(process_local: bool) {
+        let _home = crate::history::lock_test_env();
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let cwd = base.join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let mut config = config();
+        config.cwd = Some(cwd.clone());
+        let registry = if process_local {
+            TaskRegistry::new("draft-session".into())
+        } else {
+            TaskRegistry::new_for_cwd("draft-session".into(), &cwd)
+        };
+        let session = registry.workflow_session_dir(&cwd).unwrap();
+        let store = WorkflowDraftStore::new(session.join("workflow-drafts"));
+        let script = startup_failure_script();
+        let draft = store
+            .create_from_script(registry.session_id(), &cwd, script, 1)
+            .unwrap();
+        let neighbor = base.join("neighbor");
+        std::fs::rename(&session, &neighbor).unwrap();
+        let original = base.join("original");
+        std::fs::rename(&neighbor, &original).unwrap();
+        let mut outside = draft.clone();
+        outside.script = "outside workflow".into();
+        WorkflowDraftStore::new(neighbor.join("workflow-drafts"))
+            .write(&outside)
+            .unwrap();
+        std::os::unix::fs::symlink(&neighbor, &session).unwrap();
+        let request = tool_request(
+            "save",
+            ToolName::WorkflowDraftAction,
+            serde_json::json!({"draftId": draft.draft_id, "action": "save", "saveAs": "fixture"}),
+        );
+        let result = execute_workflow_draft_action_tool(
+            &config,
+            &cwd,
+            &mut EventFactory::new("test-run".into()),
+            &mut EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl),
+            &request,
+            false,
+            &registry,
+            &mut Vec::new(),
+            unused_child_executor,
+            true,
+            None,
+            None,
+        );
+        let saved = cwd.join(".orca/workflows/fixture.js");
+        if process_local {
+            assert_eq!(
+                result.unwrap().status,
+                orca_core::tool_types::ToolStatus::Completed
+            );
+            assert_eq!(std::fs::read_to_string(saved).unwrap(), script);
+        } else {
+            assert!(result.is_err());
+            assert!(!saved.exists());
+        }
+    }
+
     #[test]
     fn workflow_draft_action_refuses_a_script_changed_before_host_start() {
         let _guard = crate::history::lock_test_env();
@@ -1477,7 +1554,7 @@ export const meta = {
             &cwd.path().join("persisted-script.js"),
         )
         .expect("the loader finds the saved user workflow");
-        assert_eq!(resolved.original_path, Some(saved));
+        assert_eq!(resolved.original_path, Some(saved.canonicalize().unwrap()));
     }
 
     #[test]
