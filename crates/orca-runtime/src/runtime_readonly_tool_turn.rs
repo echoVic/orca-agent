@@ -33,6 +33,7 @@ use crate::tool_turn::{ToolTurnOutcome, record_root_task_output_truncation};
 pub(crate) struct RuntimeReadonlyBatchContext<'a, W: io::Write> {
     pub(crate) spill_directory: Option<&'a Path>,
     pub(crate) cwd: &'a Path,
+    pub(crate) workspace_read_root: Option<&'a Path>,
     pub(crate) events: &'a mut EventFactory,
     pub(crate) sink: &'a mut EventSink<W>,
     pub(crate) tool_requests: &'a [ToolRequest],
@@ -62,6 +63,7 @@ pub(crate) struct RuntimeReadonlyToolTurnContext<'a, W: io::Write> {
 
 pub(crate) struct RuntimeReadonlyToolTurnRequest<'a> {
     pub(crate) cwd: &'a Path,
+    pub(crate) workspace_read_root: Option<&'a Path>,
     pub(crate) tool_requests: &'a [ToolRequest],
     pub(crate) emit_deltas: bool,
     pub(crate) cancel: &'a CancelToken,
@@ -104,6 +106,7 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
     let RuntimeReadonlyBatchContext {
         spill_directory,
         cwd,
+        workspace_read_root,
         events,
         sink,
         tool_requests,
@@ -324,6 +327,7 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
                     ),
                     request: request.clone(),
                     cwd: cwd.to_path_buf(),
+                    workspace_read_root: workspace_read_root.map(Path::to_path_buf),
                     mcp_registry: mcp_registry.clone(),
                     output_truncation,
                 })
@@ -458,6 +462,7 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
     } = context;
     let RuntimeReadonlyToolTurnRequest {
         cwd,
+        workspace_read_root,
         tool_requests,
         emit_deltas,
         cancel,
@@ -482,6 +487,7 @@ pub(crate) fn run_readonly_tool_turn<W: io::Write>(
     let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
         spill_directory: task_registry.and_then(TaskRegistry::spill_directory),
         cwd,
+        workspace_read_root,
         events,
         sink,
         tool_requests,
@@ -586,6 +592,7 @@ mod tests {
         let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
             spill_directory: None,
             cwd: cwd.path(),
+            workspace_read_root: None,
             events: &mut events,
             sink: &mut EventSink::new(&mut bytes, OutputFormat::Jsonl),
             tool_requests: &requests,
@@ -679,6 +686,7 @@ mod tests {
         let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
             spill_directory: None,
             cwd: Path::new("."),
+            workspace_read_root: None,
             events: &mut events,
             sink: &mut sink,
             tool_requests: &requests,
@@ -966,6 +974,7 @@ mod tests {
                     .cwd
                     .as_deref()
                     .unwrap_or_else(|| Path::new(".")),
+                workspace_read_root: generation.config().tools.workspace_read_root.as_deref(),
                 events,
                 sink: &mut sink,
                 tool_requests: &self.requests,
@@ -1112,6 +1121,7 @@ mod tests {
             let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
                 spill_directory: None,
                 cwd: Path::new("."),
+                workspace_read_root: None,
                 events: &mut events,
                 sink: &mut sink,
                 tool_requests: &[request],
@@ -1192,6 +1202,7 @@ mod tests {
         let mut service_usage = Vec::new();
         let execution = execute_readonly_batch(RuntimeReadonlyBatchContext {
             cwd: cwd.path(),
+            workspace_read_root: None,
             spill_directory: None,
             events: &mut events,
             sink: &mut sink,

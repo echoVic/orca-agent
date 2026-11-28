@@ -152,6 +152,7 @@ fn run_script<W: io::Write>(context: RunScriptContext<'_, W>) -> ToolResult {
     let wall_clock = script_wall_clock(settings.timeout_secs);
     let executor = ReadOnlyToolExecutor {
         cwd,
+        workspace_read_root: config.tools.workspace_read_root.as_deref(),
         mcp_registry,
         cancel,
         // Each of the four asks whether to stop, and is told to once the
@@ -308,6 +309,7 @@ pub fn script_wall_clock(timeout_secs: u64) -> Duration {
 /// read-only batch: no extra roots, no external tools, the read-only profile.
 struct ReadOnlyToolExecutor<'a> {
     cwd: &'a Path,
+    workspace_read_root: Option<&'a Path>,
     mcp_registry: &'a McpRegistry,
     cancel: &'a CancelToken,
     /// When the script that makes the call runs out of time.
@@ -316,19 +318,14 @@ struct ReadOnlyToolExecutor<'a> {
 
 impl ScriptToolExecutor for ReadOnlyToolExecutor<'_> {
     fn execute(&self, request: ToolRequest) -> ToolResult {
-        orca_tools::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_profile(
-            &request,
-            self.cwd,
-            &[],
-            self.mcp_registry,
-            &[],
-            ToolOutputTruncation::bytes(SCRIPT_TOOL_OUTPUT_BYTES),
-            READONLY_TOOL_TIMEOUT_SECS,
-            None,
-            orca_core::capability::ExecutionProfile::ReadOnly,
-            None,
-            || self.stopped(),
-        )
+        let cancelled = || self.stopped();
+        let context = orca_tools::ToolContext::new(self.cwd)
+            .with_workspace_read_root(self.workspace_read_root)
+            .with_output_truncation(ToolOutputTruncation::bytes(SCRIPT_TOOL_OUTPUT_BYTES))
+            .with_shell_timeout(Some(Duration::from_secs(READONLY_TOOL_TIMEOUT_SECS)))
+            .with_execution_profile(orca_core::capability::ExecutionProfile::ReadOnly)
+            .with_cancel(&cancelled);
+        orca_tools::execute_in_context(&request, self.mcp_registry, &[], context)
     }
 
     fn stopped(&self) -> bool {

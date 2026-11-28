@@ -2122,6 +2122,39 @@ fn stopping_child_tool_result_closes_three_call_sibling_boundary() {
 }
 
 #[test]
+fn child_tool_reads_its_own_working_directory() {
+    let parent = tempfile::tempdir().unwrap();
+    let child = tempfile::tempdir().unwrap();
+    std::fs::write(parent.path().join("notes.txt"), "parent file").unwrap();
+    std::fs::write(child.path().join("notes.txt"), "child file").unwrap();
+    let mut config = config(None);
+    config.cwd = Some(parent.path().to_path_buf());
+    crate::command::config::accept_workspace(&mut config, parent.path()).unwrap();
+    let request = ChildAgentRequest::new(
+        "read notes.txt".into(),
+        SubagentType::General,
+        None,
+        1,
+        true,
+    );
+    let cancel = CancelToken::new();
+    let mut events = EventFactory::new("child-checkout".into());
+    let mut sink = EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl);
+    let mut runtime = runtime(
+        &mut sink,
+        &mut events,
+        &cancel,
+        crate::agent_loop::execute_child_agent_loop,
+    );
+    runtime.cwd = child.path();
+    let (result, _) = run_child_agent(&config, &request, &mut runtime);
+    assert_eq!(result.status, RunStatus::Success, "{:?}", result.error);
+    let output = String::from_utf8(sink.writer_mut().get_ref().clone()).unwrap();
+    assert!(output.contains("child file"), "{output}");
+    assert!(!output.contains("parent file"), "{output}");
+}
+
+#[test]
 fn run_child_agent_applies_subagent_model_override() {
     let request = ChildAgentRequest {
         prompt: "inspect repo".to_string(),

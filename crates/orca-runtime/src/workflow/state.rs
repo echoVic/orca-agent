@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -179,6 +179,8 @@ impl Serialize for AgentOutputField {
 #[derive(Clone, Debug)]
 pub struct WorkflowStateStore {
     root: PathBuf,
+    session_path: PathBuf,
+    session: Option<(crate::tasks::TaskRegistry, PathBuf)>,
     agent_cache_write_lock: Arc<Mutex<()>>,
     run_mutation_lock: Arc<Mutex<()>>,
 }
@@ -213,10 +215,88 @@ struct WorkflowControlRequest {
 
 impl WorkflowStateStore {
     pub fn new(root: PathBuf) -> Self {
+        let session = root
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let session_path = if let Some(name) = session.file_name() {
+            let parent = session
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            parent
+                .canonicalize()
+                .map(|parent| parent.join(name))
+                .unwrap_or_else(|_| session.to_path_buf())
+        } else {
+            session
+                .canonicalize()
+                .unwrap_or_else(|_| session.to_path_buf())
+        };
         Self {
             root,
+            session_path,
+            session: None,
             agent_cache_write_lock: Arc::new(Mutex::new(())),
             run_mutation_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub(crate) fn with_session(mut self, tasks: crate::tasks::TaskRegistry, cwd: PathBuf) -> Self {
+        self.session = Some((tasks, cwd));
+        self
+    }
+
+    pub(crate) fn open_session(&self) -> io::Result<Arc<orca_platform::fs::VerifiedDirectory>> {
+        match &self.session {
+            Some((tasks, cwd)) => tasks.open_workflow_session(cwd),
+            None => orca_tools::open_workspace_root(&self.session_path).map(Arc::new),
+        }
+    }
+
+    pub(crate) fn ensure_session(&self) -> io::Result<Arc<orca_platform::fs::VerifiedDirectory>> {
+        if let Some((tasks, cwd)) = &self.session {
+            return tasks.ensure_workflow_session(cwd);
+        }
+        fs::create_dir_all(&self.session_path)?;
+        self.open_session()
+    }
+
+    pub(crate) fn open_artifact(&self, run_id: &str, name: &str) -> io::Result<File> {
+        if !super::script::single_workflow_component(run_id)
+            || run_id.contains([':', '\0'])
+            || run_id.ends_with(['.', ' '])
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected a workflow run ID",
+            ));
+        }
+        let root = self.open_session()?;
+        let runs = self.root.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+        orca_tools::open_relative_file(&root, &Path::new(runs).join(run_id).join(name))
+    }
+
+    fn read_artifact(&self, run_id: &str, name: &str) -> io::Result<String> {
+        retry_transient_workflow_read(
+            || {
+                let mut content = String::new();
+                self.open_artifact(run_id, name)?
+                    .read_to_string(&mut content)?;
+                Ok(content)
+            },
+            std::time::Duration::from_millis(500),
+        )
+    }
+
+    fn read_run_agent_cache(
+        &self,
+        run_id: &str,
+    ) -> io::Result<HashMap<String, CachedWorkflowAgentRecord>> {
+        match self.read_artifact(run_id, "agent-cache.json") {
+            Ok(content) => parse_agent_cache(&content),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(error) => Err(error),
         }
     }
 
@@ -385,7 +465,8 @@ impl WorkflowStateStore {
     }
 
     pub fn load_launch_input(&self, run_id: &str) -> io::Result<WorkflowInput> {
-        read_json(&self.launch_input_path(run_id))
+        serde_json::from_str(&self.read_artifact(run_id, "launch-input.json")?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     pub fn write_worker_record(
@@ -498,9 +579,10 @@ impl WorkflowStateStore {
         run_id: &str,
         call_path: &str,
         input_hash: &str,
-    ) -> Option<String> {
-        self.find_cached_agent_value(run_id, call_path, input_hash)
-            .map(|value| value_to_output_string(value))
+    ) -> io::Result<Option<String>> {
+        Ok(self
+            .find_cached_agent_value(run_id, call_path, input_hash)?
+            .map(value_to_output_string))
     }
 
     pub fn find_cached_agent_value(
@@ -508,24 +590,19 @@ impl WorkflowStateStore {
         run_id: &str,
         call_path: &str,
         input_hash: &str,
-    ) -> Option<Value> {
-        let path = self.run_dir(run_id).join("agent-cache.json");
-        if !path.exists() {
-            return None;
-        }
-
+    ) -> io::Result<Option<Value>> {
         if !super::ipc::WorkflowIpcContext::cached_agent_can_be_reused(
-            &self.task_lists_path(run_id),
+            self.open_artifact(run_id, "task-lists.json"),
             call_path,
-        ) {
-            return None;
+        )? {
+            return Ok(None);
         }
-        let cache = read_agent_cache(&path).ok()?;
-        cache
+        let cache = self.read_run_agent_cache(run_id)?;
+        Ok(cache
             .get(&cache_key(call_path, input_hash))
             .filter(|entry| is_reusable_cached_status(entry.record.status))
             .filter(|entry| entry.output_present)
-            .map(|entry| entry.record.output.clone().unwrap_or(Value::Null))
+            .map(|entry| entry.record.output.clone().unwrap_or(Value::Null)))
     }
 
     pub fn find_agent_record(
@@ -533,15 +610,11 @@ impl WorkflowStateStore {
         run_id: &str,
         call_path: &str,
         input_hash: &str,
-    ) -> Option<WorkflowAgentRecord> {
-        let path = self.run_dir(run_id).join("agent-cache.json");
-        if !path.exists() {
-            return None;
-        }
-        read_agent_cache(&path)
-            .ok()?
+    ) -> io::Result<Option<WorkflowAgentRecord>> {
+        Ok(self
+            .read_run_agent_cache(run_id)?
             .get(&cache_key(call_path, input_hash))
-            .map(|entry| entry.record.clone())
+            .map(|entry| entry.record.clone()))
     }
 
     pub fn cached_agent_result(
@@ -550,12 +623,7 @@ impl WorkflowStateStore {
         call_path: &str,
         input_hash: &str,
     ) -> io::Result<Option<WorkflowAgentCacheRecord>> {
-        let path = self.run_dir(run_id).join("agent-cache.json");
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let cache = read_agent_cache(&path)?;
+        let cache = self.read_run_agent_cache(run_id)?;
         Ok(cache
             .get(&cache_key(call_path, input_hash))
             .filter(|entry| is_reusable_cached_status(entry.record.status))
@@ -615,12 +683,7 @@ impl WorkflowStateStore {
     }
 
     pub(crate) fn agent_records(&self, run_id: &str) -> io::Result<Vec<WorkflowAgentRecord>> {
-        let path = self.run_dir(run_id).join("agent-cache.json");
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let cache = read_agent_cache(&path)?;
+        let cache = self.read_run_agent_cache(run_id)?;
         let mut records = cache
             .values()
             .map(|entry| entry.record.clone())
@@ -866,7 +929,11 @@ fn read_agent_cache(path: &Path) -> io::Result<HashMap<String, CachedWorkflowAge
         || fs::read_to_string(path),
         std::time::Duration::from_millis(500),
     )?;
-    let cache_file: WorkflowAgentCacheFileOnDisk = serde_json::from_str(&content)
+    parse_agent_cache(&content)
+}
+
+fn parse_agent_cache(content: &str) -> io::Result<HashMap<String, CachedWorkflowAgentRecord>> {
+    let cache_file: WorkflowAgentCacheFileOnDisk = serde_json::from_str(content)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     Ok(match cache_file {
         WorkflowAgentCacheFileOnDisk::Current(cache) => cache

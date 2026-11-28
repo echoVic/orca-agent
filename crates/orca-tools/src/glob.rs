@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 use globset::{Glob, GlobSetBuilder};
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 use serde::Deserialize;
-use walkdir::WalkDir;
 
-use crate::resolve_workspace_path;
+use crate::{
+    ResolvedWorkspacePath, resolve_workspace_read_path,
+    workspace_read::{listing_entry, open_directory, open_root},
+};
 
 #[derive(Deserialize)]
 struct GlobArgs {
@@ -46,21 +48,21 @@ pub fn execute_or_cancel(
         Err(error) => return ToolResult::failed(request, error, None),
     };
     let base = args.path.as_deref().unwrap_or(".");
-    let search_root = match resolve_workspace_path(cwd, Some(base)) {
+    let resolved = match resolve_workspace_read_path(cwd, Some(base)) {
         Ok(path) => path,
         Err(error) => return ToolResult::failed(request, error, None),
     };
-    if !search_root.exists() {
+    let Some(is_directory) = listing_entry(&resolved.root, &resolved.path) else {
         return ToolResult::completed_kind(
             request,
             "(no matches)".to_string(),
             false,
             ToolResultKind::NoMatches,
         );
-    }
+    };
 
     if matches!(args.mode, Some(GlobMode::Fuzzy)) {
-        return execute_fuzzy(request, cwd, &search_root, &args, max_bytes, should_cancel)
+        return execute_fuzzy(request, cwd, &resolved, &args, max_bytes, should_cancel)
             .unwrap_or_else(cancelled);
     }
 
@@ -72,13 +74,13 @@ pub fn execute_or_cancel(
         Ok(matcher) => matcher,
         Err(error) => return ToolResult::failed(request, error, None),
     };
-    let mut matches = if search_root.is_file() {
-        match_file(cwd, &search_root, &matcher)
-    } else {
-        match match_tree(cwd, &search_root, &matcher, should_cancel) {
+    let mut matches = if is_directory {
+        match match_tree(cwd, &resolved, &matcher, should_cancel) {
             Some(matches) => matches,
             None => return cancelled(),
         }
+    } else {
+        match_file(cwd, &resolved.path, &matcher)
     };
 
     matches.sort();
@@ -92,12 +94,10 @@ pub fn execute_or_cancel(
         );
     }
 
-    let output = paginate_output(
-        matches,
-        args.offset.unwrap_or(0),
-        args.head_limit,
-        DEFAULT_GLOB_HEAD_LIMIT,
-    );
+    let output = match paginate_output(&resolved, matches, &args) {
+        Ok(output) => output,
+        Err(error) => return ToolResult::failed(request, error.to_string(), None),
+    };
     let (output, truncated) = truncate_output(output, max_bytes);
     ToolResult::completed_kind(
         request,
@@ -145,7 +145,7 @@ fn parse_args(request: &ToolRequest) -> Result<GlobArgs, String> {
 fn execute_fuzzy(
     request: &ToolRequest,
     cwd: &Path,
-    search_root: &Path,
+    resolved: &ResolvedWorkspacePath,
     args: &GlobArgs,
     max_bytes: usize,
     should_cancel: &dyn Fn() -> bool,
@@ -157,14 +157,20 @@ fn execute_fuzzy(
         .trim();
     let mut matches = Vec::new();
     let mut visited = 0;
-    collect_fuzzy_matches(
-        cwd,
-        search_root,
-        query,
-        &mut matches,
-        &mut visited,
-        should_cancel,
-    )?;
+    walk_listing(resolved, true, should_cancel, |relative, is_directory| {
+        let path = resolved.path.join(relative);
+        let candidate = relative_to_workspace(cwd, &path);
+        let candidate = if is_directory {
+            format!("{candidate}/")
+        } else {
+            candidate
+        };
+        if let Some(score) = fuzzy_score(&candidate, query) {
+            matches.push((score, candidate, path));
+        }
+        visited += 1;
+        visited < MAX_FUZZY_VISITS
+    })?;
     matches.sort_by(|left, right| {
         left.0
             .cmp(&right.0)
@@ -175,7 +181,7 @@ fn execute_fuzzy(
     let matches = matches
         .into_iter()
         .take(MAX_FUZZY_MATCHES)
-        .map(|(_, path)| path)
+        .map(|(_, label, path)| (label, path))
         .collect::<Vec<_>>();
     if matches.is_empty() {
         return Some(ToolResult::completed_kind(
@@ -185,12 +191,10 @@ fn execute_fuzzy(
             ToolResultKind::NoMatches,
         ));
     }
-    let output = paginate_output(
-        matches,
-        args.offset.unwrap_or(0),
-        args.head_limit,
-        DEFAULT_GLOB_HEAD_LIMIT,
-    );
+    let output = match paginate_output(resolved, matches, args) {
+        Ok(output) => output,
+        Err(error) => return Some(ToolResult::failed(request, error.to_string(), None)),
+    };
     let (output, truncated) = truncate_output(output, max_bytes);
     Some(ToolResult::completed_kind(
         request,
@@ -205,26 +209,29 @@ fn execute_fuzzy(
 }
 
 fn paginate_output(
-    lines: Vec<String>,
-    offset: usize,
-    head_limit: Option<usize>,
-    default_limit: usize,
-) -> String {
-    if head_limit == Some(0) {
-        return lines.get(offset..).unwrap_or_default().to_vec().join("\n");
-    }
-
+    resolved: &ResolvedWorkspacePath,
+    lines: Vec<(String, PathBuf)>,
+    args: &GlobArgs,
+) -> std::io::Result<String> {
     let total = lines.len();
-    let limit = head_limit.unwrap_or(default_limit);
-    let page = lines
-        .iter()
+    let offset = args.offset.unwrap_or(0);
+    let limit = match args.head_limit {
+        Some(0) => usize::MAX,
+        Some(limit) => limit,
+        None => DEFAULT_GLOB_HEAD_LIMIT,
+    };
+    let next_offset = (total.saturating_sub(offset) > limit).then(|| offset + limit);
+
+    #[cfg(all(test, unix))]
+    crate::workspace_read::listing_test::before_emission();
+    open_root(&resolved.root)?;
+    let mut output = lines
+        .into_iter()
         .skip(offset)
         .take(limit)
-        .cloned()
-        .collect::<Vec<_>>();
-    let next_offset = (total.saturating_sub(offset) > limit).then_some(offset + limit);
-
-    let mut output = page.join("\n");
+        .filter_map(|(label, path)| listing_entry(&resolved.root, &path).map(|_| label))
+        .collect::<Vec<_>>()
+        .join("\n");
     if let Some(next_offset) = next_offset {
         let notice = if offset == 0 {
             format!("[Showing first {limit} results; use offset={next_offset} to continue]")
@@ -243,7 +250,7 @@ fn paginate_output(
             output.push_str(&notice);
         }
     }
-    output
+    Ok(output)
 }
 
 fn build_matcher(pattern: &str) -> Result<globset::GlobSet, String> {
@@ -258,91 +265,68 @@ fn build_matcher(pattern: &str) -> Result<globset::GlobSet, String> {
 /// The paths under `search_root` that match, or `None` when told to stop.
 fn match_tree(
     cwd: &Path,
-    search_root: &Path,
+    resolved: &ResolvedWorkspacePath,
     matcher: &globset::GlobSet,
     should_cancel: &dyn Fn() -> bool,
-) -> Option<Vec<String>> {
+) -> Option<Vec<(String, PathBuf)>> {
     let mut matches = Vec::new();
-    for entry in WalkDir::new(search_root).follow_links(false).into_iter() {
-        if should_cancel() {
-            return None;
+    walk_listing(resolved, false, should_cancel, |relative, _| {
+        if matcher.is_match(relative) {
+            let path = resolved.path.join(relative);
+            matches.push((relative_to_workspace(cwd, &path), path));
         }
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let path = entry.path();
-        if path == search_root {
-            continue;
-        }
-        let Ok(relative_to_root) = path.strip_prefix(search_root) else {
-            continue;
-        };
-        if matcher.is_match(relative_to_root) {
-            matches.push(relative_to_workspace(cwd, path));
-        }
-    }
+        true
+    })?;
     Some(matches)
 }
 
-fn match_file(cwd: &Path, path: &Path, matcher: &globset::GlobSet) -> Vec<String> {
+fn match_file(cwd: &Path, path: &Path, matcher: &globset::GlobSet) -> Vec<(String, PathBuf)> {
     let name = path.file_name().map(PathBuf::from).unwrap_or_default();
     if matcher.is_match(name) {
-        vec![relative_to_workspace(cwd, path)]
+        vec![(relative_to_workspace(cwd, path), path.to_owned())]
     } else {
         Vec::new()
     }
 }
 
-fn collect_fuzzy_matches(
-    cwd: &Path,
-    search_root: &Path,
-    query: &str,
-    scored: &mut Vec<(usize, String)>,
-    visited: &mut usize,
+fn walk_listing(
+    resolved: &ResolvedWorkspacePath,
+    skip_hidden: bool,
     should_cancel: &dyn Fn() -> bool,
+    mut visit: impl FnMut(&Path, bool) -> bool,
 ) -> Option<()> {
-    if *visited >= MAX_FUZZY_VISITS {
-        return Some(());
-    }
-    for entry in WalkDir::new(search_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| !is_hidden_entry(entry.path(), search_root))
-    {
-        if *visited >= MAX_FUZZY_VISITS {
-            return Some(());
-        }
+    let mut directories = vec![PathBuf::new()];
+    while let Some(relative) = directories.pop() {
         if should_cancel() {
             return None;
         }
-        let Ok(entry) = entry else {
+        let directory = resolved.canonical.join(&relative);
+        let Ok(names) = open_directory(&resolved.root, &directory).and_then(|dir| dir.read_names())
+        else {
             continue;
         };
-        let path = entry.path();
-        if path == search_root {
-            continue;
-        }
-        *visited += 1;
-        let candidate = relative_to_workspace(cwd, path);
-        let candidate = if path.is_dir() {
-            format!("{candidate}/")
-        } else {
-            candidate
-        };
-        if let Some(score) = fuzzy_score(&candidate, query) {
-            scored.push((score, candidate));
+        for name in names {
+            if should_cancel() {
+                return None;
+            }
+            if skip_hidden && name.as_encoded_bytes().starts_with(b".") {
+                continue;
+            }
+            let child = relative.join(name);
+            let path = resolved.path.join(&child);
+            let Some(is_directory) = listing_entry(&resolved.root, &path) else {
+                continue;
+            };
+            if !visit(&child, is_directory) {
+                return Some(());
+            }
+            if is_directory {
+                // A directory replaced with a link will fail the next verified open.
+                directories.push(child);
+            }
         }
     }
     Some(())
-}
-
-fn is_hidden_entry(path: &Path, search_root: &Path) -> bool {
-    if path == search_root {
-        return false;
-    }
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with('.'))
 }
 
 fn fuzzy_score(candidate: &str, query: &str) -> Option<usize> {
@@ -384,11 +368,54 @@ fn relative_to_workspace(cwd: &Path, path: &Path) -> String {
 mod tests {
     use std::fs;
 
+    use crate::workspace_tempdir as tempdir;
     use orca_core::approval_types::ActionKind;
     use orca_core::tool_types::{ToolName, ToolResultKind, ToolStatus};
-    use tempfile::tempdir;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_skips_entries_whose_real_location_is_outside() {
+        let workspace = tempdir().unwrap();
+        let neighbor = tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        let linked = root.join("linked");
+        fs::write(neighbor.path().join("notes.txt"), "outside listing").unwrap();
+        crate::tests::symlink(neighbor.path(), &linked).unwrap();
+
+        assert_eq!(listing_entry(&root, &linked.join("notes.txt")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_rechecks_selected_entries_before_emission() {
+        let workspace = tempdir().unwrap();
+        let neighbor = tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("notes.txt"), "original").unwrap();
+        fs::write(root.join("keep.txt"), "inside").unwrap();
+        fs::write(neighbor.path().join("notes.txt"), "outside").unwrap();
+        let outside = neighbor.path().to_owned();
+        let old = root.join("old");
+        crate::workspace_read::listing_test::BEFORE_EMISSION.with(|hook| {
+            hook.replace(Some(Box::new(move || {
+                fs::rename(&sub, old).unwrap();
+                crate::tests::symlink(outside, sub).unwrap();
+            })));
+        });
+        let request = ToolRequest {
+            id: "glob-page".into(),
+            name: ToolName::Glob,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"pattern":"**/*.txt","head_limit":2}"#.into()),
+        };
+        let result = execute(&request, &root, 4096);
+        assert_eq!(result.output.as_deref(), Some("keep.txt"));
+    }
 
     #[test]
     fn a_walk_told_to_stop_is_cancelled() {

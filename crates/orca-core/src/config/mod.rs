@@ -282,7 +282,7 @@ impl BudgetConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolConfig {
     #[serde(default = "default_max_read_parallel")]
     pub max_read_parallel: usize,
@@ -315,6 +315,30 @@ pub struct ToolConfig {
     /// Advertisement only: an exec run without an interactive input transport.
     #[serde(skip)]
     pub headless_exec: bool,
+    /// Canonical workspace path selected by the runtime.
+    #[serde(skip)]
+    pub workspace_read_root: Option<PathBuf>,
+}
+
+// Cold recovery compares the debug representation of the durable settings.
+// Keep the captured workspace path out of that representation.
+impl std::fmt::Debug for ToolConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolConfig")
+            .field("max_read_parallel", &self.max_read_parallel)
+            .field("output_truncation", &self.output_truncation)
+            .field("shell_timeout_secs", &self.shell_timeout_secs)
+            .field("deepseek_web", &self.deepseek_web)
+            .field("apply_patch", &self.apply_patch)
+            .field("script", &self.script)
+            .field(
+                "shell_enforcement_decision",
+                &self.shell_enforcement_decision,
+            )
+            .field("headless_exec", &self.headless_exec)
+            .finish()
+    }
 }
 
 /// `run_script`: JavaScript the model writes that calls read-only tools
@@ -370,6 +394,7 @@ impl Default for ToolConfig {
             script: ScriptToolConfig::default(),
             shell_enforcement_decision: None,
             headless_exec: false,
+            workspace_read_root: None,
         }
     }
 }
@@ -443,7 +468,7 @@ impl WorkflowTeamConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkflowConfig {
     #[serde(default = "default_workflows_enabled")]
     pub enabled: bool,
@@ -461,6 +486,25 @@ pub struct WorkflowConfig {
     pub teams: HashMap<String, WorkflowTeamConfig>,
     #[serde(default)]
     pub capabilities: crate::capability::CapabilitySet,
+    /// User workflow directory resolved when loading configuration.
+    #[serde(skip)]
+    pub user_directory: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for WorkflowConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkflowConfig")
+            .field("enabled", &self.enabled)
+            .field("max_concurrent_agents", &self.max_concurrent_agents)
+            .field("max_agents_per_run", &self.max_agents_per_run)
+            .field("max_agent_retries", &self.max_agent_retries)
+            .field("max_agent_tokens", &self.max_agent_tokens)
+            .field("keyword_trigger_enabled", &self.keyword_trigger_enabled)
+            .field("teams", &self.teams)
+            .field("capabilities", &self.capabilities)
+            .finish()
+    }
 }
 
 impl Default for WorkflowConfig {
@@ -474,6 +518,7 @@ impl Default for WorkflowConfig {
             keyword_trigger_enabled: true,
             teams: HashMap::new(),
             capabilities: crate::capability::CapabilitySet::read_only(),
+            user_directory: None,
         }
     }
 }

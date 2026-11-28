@@ -7,7 +7,7 @@ use orca_core::tool_types::{FileChangePreview, ToolRequest, ToolResult};
 use crate::file_admission::{
     MAX_EDIT_FILE_BYTES, build_file_change_preview, read_text_file_with_limit,
 };
-use crate::resolve_workspace_path;
+use crate::resolve_workspace_write_path;
 
 pub fn execute(request: &ToolRequest, cwd: &Path) -> ToolResult {
     execute_or_cancel(request, cwd, || false)
@@ -96,7 +96,7 @@ fn plan_edit(
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<PlannedEdit, String> {
     let (path_str, old, new) = parse_edit_args(request)?;
-    let path = resolve_workspace_path(cwd, Some(&path_str))?;
+    let path = resolve_workspace_write_path(cwd, &path_str)?;
     if !is_inside_workspace(cwd, &path) {
         return Err("edit target is outside the workspace".to_string());
     }

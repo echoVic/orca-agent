@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,10 +7,45 @@ use std::thread;
 use std::time::Duration;
 
 use orca_runtime::workflow::host::{HostEvent, WorkflowHost, WorkflowHostIpcPaths};
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 // Exact JavaScript bytes are the released workflow-host protocol fixture.
 const WORKFLOW_HOST_SCRIPT: &str = include_str!("../crates/orca-runtime/src/workflow/host.mjs");
+
+const WORKFLOW_HOST_BOOTSTRAP: &str =
+    include_str!("../crates/orca-runtime/src/workflow/host_bootstrap.mjs");
+
+fn start_workflow_host_fixture(source: &str) -> std::process::Child {
+    let mut child = Command::new(WorkflowHost::node_executable())
+        .args([
+            "--input-type=module",
+            "--eval",
+            WORKFLOW_HOST_BOOTSTRAP,
+            "--",
+            "orca-workflow-host.mjs",
+            "workflow.js",
+            "null",
+            "",
+            "",
+            "1048576",
+            "",
+        ])
+        .arg(WORKFLOW_HOST_SCRIPT.len().to_string())
+        .arg(orca_core::hex::lower(&Sha256::digest(
+            WORKFLOW_HOST_SCRIPT.as_bytes(),
+        )))
+        .arg(source.len().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = child.stdin.as_mut().unwrap();
+    input.write_all(WORKFLOW_HOST_SCRIPT.as_bytes()).unwrap();
+    input.write_all(source.as_bytes()).unwrap();
+    child
+}
 
 #[test]
 fn host_emits_phase_and_agent_call_events() {
@@ -934,26 +969,9 @@ fn host_reports_workflow_failed_when_stdin_closes_before_agent_result() {
         return;
     }
 
-    let temp = tempdir().unwrap();
-    let script = temp.path().join("workflow.js");
-    fs::write(
-        &script,
+    let mut child = start_workflow_host_fixture(
         "export const meta = { name: 'stdin-eof-test', description: 'stdin eof', phases: [] };\nawait agent('inspect repo');\nexport default 'done';",
-    )
-    .unwrap();
-
-    let host = temp.path().join("host.mjs");
-    fs::write(&host, WORKFLOW_HOST_SCRIPT).unwrap();
-
-    let mut child = Command::new(WorkflowHost::node_executable())
-        .arg(&host)
-        .arg(&script)
-        .arg("null")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    );
 
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout);
@@ -989,26 +1007,9 @@ fn host_reports_workflow_failed_for_partial_trailing_json_on_stdin_eof() {
         return;
     }
 
-    let temp = tempdir().unwrap();
-    let script = temp.path().join("workflow.js");
-    fs::write(
-        &script,
+    let mut child = start_workflow_host_fixture(
         "export const meta = { name: 'stdin-partial-json-test', description: 'stdin partial json', phases: [] };\nawait agent('inspect repo');\nexport default 'done';",
-    )
-    .unwrap();
-
-    let host = temp.path().join("host.mjs");
-    fs::write(&host, WORKFLOW_HOST_SCRIPT).unwrap();
-
-    let mut child = Command::new(WorkflowHost::node_executable())
-        .arg(&host)
-        .arg(&script)
-        .arg("null")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    );
 
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout);
@@ -1017,7 +1018,6 @@ fn host_reports_workflow_failed_for_partial_trailing_json_on_stdin_eof() {
     assert!(first_line.contains("\"type\":\"agent_call\""));
 
     let mut stdin = child.stdin.take().unwrap();
-    use std::io::Write;
     stdin.write_all(br#"{"type":"agent_result""#).unwrap();
     drop(stdin);
 

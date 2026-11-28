@@ -175,9 +175,8 @@ impl From<WorkspacePathError> for io::Error {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::process::Command;
 
-    use super::{WorkspaceIdentity, WorkspacePathError, attach_stable_cwd};
+    use super::{WorkspaceIdentity, WorkspacePathError};
 
     #[test]
     fn cwd_must_remain_inside_canonical_workspace() {
@@ -235,7 +234,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stable_cwd_uses_open_directory_identity_after_path_replacement() {
-        use std::process::Stdio;
+        use super::attach_stable_cwd;
+        use std::process::{Command, Stdio};
 
         let temp = tempfile::tempdir().expect("tempdir");
         let original = temp.path().join("original");

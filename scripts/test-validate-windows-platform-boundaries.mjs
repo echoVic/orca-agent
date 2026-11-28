@@ -388,7 +388,6 @@ const atomicJobSpawnContracts = [
   ],
   ["crates/orca-tools/src/external.rs", "spawn_with_capability_profile("],
   ["crates/orca-tools/src/git.rs", "spawn_user_trusted("],
-  ["crates/orca-tools/src/grep.rs", "spawn_user_trusted("],
 ];
 for (const [relativePath, marker] of atomicJobSpawnContracts) {
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
@@ -397,6 +396,13 @@ for (const [relativePath, marker] of atomicJobSpawnContracts) {
     `${relativePath} must enter the execution broker before creating its Windows child`,
   );
 }
+const grepSource = readNormalizedSource("crates/orca-tools/src/grep.rs").split("\n#[cfg(test)]\nmod tests")[0];
+assert.match(grepSource, /open_file_in\(/, "grep must use verified file handles");
+assert.doesNotMatch(
+  grepSource,
+  /(?:Command::new|crate::process::spawn_)/,
+  "grep must search in process",
+);
 const verificationSource = readFileSync(
   path.join(repoRoot, "crates/orca-core/src/verification.rs"),
   "utf8",

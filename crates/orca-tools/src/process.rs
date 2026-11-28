@@ -274,8 +274,7 @@ fn spawn_with_broker(
         })
 }
 
-/// Starts one of Orca's own helper processes (git, ripgrep, the clipboard
-/// tools). They never need Orca's credentials, and a repository's git hooks
+/// Starts one of Orca's own helper processes (git and the clipboard tools). They never need Orca's credentials, and a repository's git hooks
 /// run inside git, so the credentials are removed first (#178).
 pub fn spawn_user_trusted(
     mut command: Command,
@@ -940,7 +939,7 @@ mod tests {
 
     #[test]
     fn orca_helper_processes_do_not_inherit_orca_credentials() {
-        // #178: git, ripgrep and the clipboard helpers run as Orca's own
+        // #178: git and the clipboard helpers run as Orca's own
         // helpers, and a repository's git hooks run inside git.
         let cwd = tempfile::tempdir().unwrap();
         let shell = ShellResolver::for_current_host()

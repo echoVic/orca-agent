@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,16 +18,21 @@ use serde_json::Value;
 
 use orca_core::capability::CapabilitySet;
 use orca_core::execution_broker::{ExecutionBroker, LaunchError};
+use orca_core::redaction::redact_sensitive_text;
 use orca_core::retained_output::{RetainedOutput, RetainedOutputSnapshot};
 use orca_platform::fs::{AtomicWritePolicy, atomic_write};
 use orca_platform::process::ProcessJob;
 
 use super::ipc::WorkflowIpcContext;
 
+const WORKFLOW_HOST_MODULE: &[u8] = include_bytes!("host.mjs");
+const WORKFLOW_HOST_BOOTSTRAP: &str = include_str!("host_bootstrap.mjs");
+
 const MAX_WORKFLOW_HOST_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKFLOW_HOST_EVENTS: usize = 8_192;
 const MAX_WORKFLOW_HOST_EVENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WORKFLOW_HOST_STDERR_BYTES: usize = 64 * 1024;
+const MAX_WORKFLOW_HOST_STARTUP_STDERR_BYTES: usize = 2 * 1024;
 const WORKFLOW_HOST_FRAME_CHANNEL_CAPACITY: usize = 8;
 const DEFAULT_WORKFLOW_HOST_AGENT_WORKERS: usize = 16;
 const WORKFLOW_HOST_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -85,6 +90,7 @@ struct WorkflowHostRunPolicy<'a> {
     collect_events: bool,
     max_agent_workers: usize,
     workflow_ipc: Option<&'a WorkflowIpcContext>,
+    script: Option<(&'a str, &'a str)>,
 }
 
 impl<'a> WorkflowHostRunPolicy<'a> {
@@ -93,17 +99,20 @@ impl<'a> WorkflowHostRunPolicy<'a> {
             collect_events: true,
             max_agent_workers: DEFAULT_WORKFLOW_HOST_AGENT_WORKERS,
             workflow_ipc: None,
+            script: None,
         }
     }
 
     fn callback_only(
         max_agent_workers: usize,
         workflow_ipc: Option<&'a WorkflowIpcContext>,
+        script: Option<(&'a str, &'a str)>,
     ) -> Self {
         Self {
             collect_events: false,
             max_agent_workers: max_agent_workers.max(1),
             workflow_ipc,
+            script,
         }
     }
 }
@@ -246,7 +255,7 @@ impl WorkflowHost {
     }
 
     pub(crate) fn run_with_agent_event_control_and_ipc_paths<F, E, C, A>(
-        script_path: &Path,
+        (script_path, script, script_digest): (&Path, &str, &str),
         args: Value,
         (ipc_paths, workflow_ipc): (&WorkflowHostIpcPaths, &WorkflowIpcContext),
         max_agent_workers: usize,
@@ -266,7 +275,11 @@ impl WorkflowHost {
             script_path,
             args,
             Some(ipc_paths),
-            WorkflowHostRunPolicy::callback_only(max_agent_workers, Some(workflow_ipc)),
+            WorkflowHostRunPolicy::callback_only(
+                max_agent_workers,
+                Some(workflow_ipc),
+                Some((script, script_digest)),
+            ),
             on_agent_call,
             on_event,
             should_cancel,
@@ -292,8 +305,14 @@ impl WorkflowHost {
         C: Fn() -> io::Result<bool>,
         A: Fn(),
     {
-        let host_path = ensure_host_file()?;
-        let _host_file = WorkflowHostFileGuard::new(host_path.clone());
+        let script_file;
+        let (script, digest) = match policy.script {
+            Some((script, digest)) => (script.as_bytes(), digest),
+            None => {
+                script_file = fs::read(script_path)?;
+                (script_file.as_slice(), "")
+            }
+        };
         let replies = tempfile::Builder::new()
             .prefix("orca-workflow-replies-")
             .tempdir()?;
@@ -316,15 +335,26 @@ impl WorkflowHost {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
         let node = PathBuf::from(command.get_program());
+        #[cfg(test)]
+        let preload = command
+            .get_args()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find(|args| args[0] == "--require")
+            .map(|args| PathBuf::from(args[1]));
+        #[cfg(test)]
+        let read_paths = preload.as_deref().into_iter().collect::<Vec<_>>();
+        #[cfg(not(test))]
+        let read_paths = [];
         command.args(node_confinement_args(
             &node,
-            &host_path,
-            script_path,
+            &read_paths,
             ipc_paths,
             Some(&task_list_reply),
         ));
         orca_platform::process::remove_credential_env(&mut command);
-        command.arg(&host_path).arg(script_path).arg(args_json);
+        workflow_host_bootstrap(&mut command);
+        command.arg(script_path).arg(args_json);
         let mailbox_path = ipc_paths.map(|paths| paths.mailbox_path.as_path());
         if let Some(path) = mailbox_path {
             if let Some(parent) = path.parent() {
@@ -334,7 +364,11 @@ impl WorkflowHost {
         command
             .arg(mailbox_path.unwrap_or_else(|| Path::new("")))
             .arg(&task_list_reply)
-            .arg(MAX_WORKFLOW_HOST_FRAME_BYTES.to_string());
+            .arg(MAX_WORKFLOW_HOST_FRAME_BYTES.to_string())
+            .arg(digest)
+            .arg(WORKFLOW_HOST_MODULE.len().to_string())
+            .arg(super::script::sha256_hex(WORKFLOW_HOST_MODULE))
+            .arg(script.len().to_string());
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -384,8 +418,26 @@ impl WorkflowHost {
         let agent_error = Arc::new(Mutex::new(None));
         let fatal_worker_error = Arc::new(Mutex::new(None));
         let abort_workers = Arc::new(AtomicBool::new(false));
+        let mut stdout_closed_early = false;
         let on_agent_call = &on_agent_call;
         let execution_result = thread::scope(|scope| -> io::Result<()> {
+            // Start the input writer alongside the output readers. A host
+            // that exits or stops reading cannot hold up cancellation.
+            let input = Arc::clone(&stdin);
+            let (locked, ready) = mpsc::sync_channel(0);
+            let (written, startup_finished) = mpsc::sync_channel(1);
+            scope.spawn(move || {
+                if let Ok(mut input) = input.lock() {
+                    let _ = locked.send(());
+                    let _ = input
+                        .write_all(WORKFLOW_HOST_MODULE)
+                        .and_then(|()| input.write_all(script));
+                }
+                let _ = written.send(());
+            });
+            ready
+                .recv()
+                .map_err(|_| io::Error::other("workflow host stdin lock poisoned"))?;
             let worker_count = policy.max_agent_workers.max(1);
             // The frame count and byte limits bound queued calls. Keep reading
             // frames while workers wait for the script to receive their results,
@@ -428,6 +480,7 @@ impl WorkflowHost {
                     let frame = match frame_rx.recv_timeout(WORKFLOW_HOST_CONTROL_POLL_INTERVAL) {
                         Ok(WorkflowHostFrame::Data(frame)) => frame,
                         Ok(WorkflowHostFrame::Eof) => {
+                            stdout_closed_early = true;
                             return Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
                                 "workflow host stdout closed before a terminal event",
@@ -510,6 +563,15 @@ impl WorkflowHost {
                     if is_terminal {
                         on_abort();
                         abort_workers.store(true, Ordering::Release);
+                        if startup_finished
+                            .recv_timeout(WORKFLOW_HOST_EXIT_GRACE)
+                            .is_err()
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "workflow host did not finish reading its startup input",
+                            ));
+                        }
                         return Ok(());
                     }
                 }
@@ -559,6 +621,26 @@ impl WorkflowHost {
         let stderr_result = join_host_thread(stderr_handle, "stderr reader");
 
         if let Err(error) = execution_result {
+            if stdout_closed_early && let Ok(stderr) = stderr_result {
+                let start = if stderr.is_truncated() {
+                    stderr.retained_head_bytes()
+                } else {
+                    0
+                };
+                let stderr =
+                    redact_sensitive_text(String::from_utf8_lossy(&stderr.bytes[start..]).trim());
+                if !stderr.is_empty() {
+                    let start = stderr.ceil_char_boundary(
+                        stderr
+                            .len()
+                            .saturating_sub(MAX_WORKFLOW_HOST_STARTUP_STDERR_BYTES),
+                    );
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("{error}: {}", &stderr[start..]),
+                    ));
+                }
+            }
             return Err(error);
         }
         stdout_result?;
@@ -666,22 +748,6 @@ enum WorkflowHostFrame {
 struct WorkflowHostExit {
     status: ExitStatus,
     forced: bool,
-}
-
-struct WorkflowHostFileGuard {
-    path: PathBuf,
-}
-
-impl WorkflowHostFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Drop for WorkflowHostFileGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
 }
 
 struct WorkflowHostChild {
@@ -1036,16 +1102,14 @@ pub struct AgentCall {
     pub opts: Value,
 }
 
-fn ensure_host_file() -> io::Result<PathBuf> {
-    static HOST_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-    let seq = HOST_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = env::temp_dir().join(format!(
-        "orca-workflow-host-{}-{seq}.mjs",
-        std::process::id()
-    ));
-    fs::write(&path, include_str!("host.mjs"))?;
-    Ok(node_entry_path(path))
+fn workflow_host_bootstrap(command: &mut Command) {
+    command.args([
+        "--input-type=module",
+        "--eval",
+        WORKFLOW_HOST_BOOTSTRAP,
+        "--",
+        "orca-workflow-host.mjs",
+    ]);
 }
 
 /// `path` as Node can load it as its entry module under the permission model.
@@ -1065,22 +1129,20 @@ fn node_entry_path(path: PathBuf) -> PathBuf {
 ///
 /// - The host's own realm cannot compile code from text, so an object of that
 ///   realm in a script's hands does not become code running there.
-/// - Where Node has a permission model, the process reads the host module, the
-///   script, its mailbox and task list replies. It can only write the mailbox.
+/// - Where Node has a permission model, the process reads its mailbox and task
+///   list replies and can only write the mailbox. Code arrives over stdin.
 ///
 /// A Node without a permission model is given the first flag only.
 fn node_confinement_args(
     node: &Path,
-    host_path: &Path,
-    script_path: &Path,
+    read_paths: &[&Path],
     ipc_paths: Option<&WorkflowHostIpcPaths>,
     task_list_reply: Option<&Path>,
 ) -> Vec<OsString> {
     let mut args = vec![OsString::from("--disallow-code-generation-from-strings")];
     if node_has_permission_model(node) {
         args.extend(permission_model_args(
-            host_path,
-            script_path,
+            read_paths,
             ipc_paths,
             task_list_reply,
         ));
@@ -1088,11 +1150,9 @@ fn node_confinement_args(
     args
 }
 
-/// The flags that let a Node with a permission model read `host_path` and
-/// `script_path`, read and replace the mailbox, and read task list replies.
+/// Allow the host to read its IPC files and replace its mailbox.
 fn permission_model_args(
-    host_path: &Path,
-    script_path: &Path,
+    read_paths: &[&Path],
     ipc_paths: Option<&WorkflowHostIpcPaths>,
     task_list_reply: Option<&Path>,
 ) -> Vec<OsString> {
@@ -1101,11 +1161,8 @@ fn permission_model_args(
         flag.push(path);
         flag
     };
-    let mut args = vec![
-        OsString::from("--permission"),
-        allow("read", host_path),
-        allow("read", script_path),
-    ];
+    let mut args = vec![OsString::from("--permission")];
+    args.extend(read_paths.iter().map(|path| allow("read", path)));
     if let Some(ipc_paths) = ipc_paths {
         // Node asks for read access to a file it renames.
         for path in [
@@ -1153,7 +1210,6 @@ fn node_has_permission_model(node: &Path) -> bool {
 /// the host runs without the permission model rather than not at all. `None`
 /// is a `node` that said nothing in time.
 fn probe_node_permission_model(node: &Path) -> Option<bool> {
-    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     const ANSWER: &[u8] = b"false";
     const MODULE: &str = r#"import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 const file = process.argv[2];
@@ -1164,31 +1220,26 @@ rmSync(file);
 process.stdout.write(String(process.permission.has("child")));
 "#;
 
-    let module = env::temp_dir().join(format!(
-        "orca-workflow-permission-probe-{}-{}.mjs",
-        std::process::id(),
-        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::write(&module, MODULE).ok()?;
-    let module = node_entry_path(module);
-    let _module_file = WorkflowHostFileGuard::new(module.clone());
+    let directory = tempfile::Builder::new()
+        .prefix("orca-workflow-permission-probe-")
+        .tempdir()
+        .ok()?;
+    let root = node_entry_path(directory.path().to_path_buf());
     let ipc_paths = WorkflowHostIpcPaths {
-        mailbox_path: module.with_extension("mailbox"),
-        task_lists_path: module.with_extension("task-lists"),
+        mailbox_path: root.join("mailbox"),
+        task_lists_path: root.join("task-lists"),
     };
-    let _replaced_file = WorkflowHostFileGuard::new(ipc_paths.mailbox_path.clone());
-    let _replacement_file =
-        WorkflowHostFileGuard::new(host_replacement_path(&ipc_paths.mailbox_path));
 
     let mut command = Command::new(node);
     command
-        .args(permission_model_args(
-            &module,
-            &module,
-            Some(&ipc_paths),
-            None,
-        ))
-        .arg(&module)
+        .args(permission_model_args(&[], Some(&ipc_paths), None))
+        .args([
+            "--input-type=module",
+            "--eval",
+            MODULE,
+            "--",
+            "orca-workflow-permission-probe",
+        ])
         .arg(&ipc_paths.mailbox_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1312,16 +1363,192 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn host_file_paths_are_unique_for_parallel_tests() {
-        let first = ensure_host_file().unwrap();
-        let second = ensure_host_file().unwrap();
+    fn a_link_at_the_old_host_module_name_is_left_untouched() {
+        if !WorkflowHost::node_available() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let sentinel = fixture.path().join("sentinel");
+        fs::write(&sentinel, "keep this file").unwrap();
+        let old = env::temp_dir().join(format!("orca-workflow-host-{}-0.mjs", std::process::id()));
+        std::os::unix::fs::symlink(&sentinel, &old).unwrap();
+        let script = fixture.path().join("workflow.js");
+        fs::write(&script, "export const meta = {}; export default true;").unwrap();
+        let result = WorkflowHost::run_collecting_events(&script, Value::Null);
+        fs::remove_file(old).unwrap();
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep this file");
+        assert!(
+            matches!(result.unwrap().last(), Some(HostEvent::WorkflowCompleted { result }) if result == &Value::Bool(true))
+        );
+    }
 
-        assert_ne!(first, second);
-        assert!(first.exists());
-        assert!(second.exists());
-        std::fs::remove_file(first).expect("remove first host file");
-        std::fs::remove_file(second).expect("remove second host file");
+    #[test]
+    fn a_modified_host_module_is_refused() {
+        if !WorkflowHost::node_available() {
+            return;
+        }
+        let replacement = b"console.log('replacement ran')";
+        let mut command = Command::new(WorkflowHost::node_executable());
+        workflow_host_bootstrap(&mut command);
+        command
+            .args(["script.js", "null", "", "", "1024", ""])
+            .arg(replacement.len().to_string())
+            .arg(super::super::script::sha256_hex(WORKFLOW_HOST_MODULE))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(replacement).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("replacement ran"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("workflow host module changed before launch")
+        );
+    }
+
+    #[test]
+    fn workflow_bootstrap_retries_stdin_and_delivers_agent_results() {
+        if !WorkflowHost::node_available() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let command = node_with_preload(
+            fixture.path(),
+            r#"
+const fs = require('node:fs');
+const { readSync } = fs;
+let attempts = 0;
+fs.readSync = (fd, buffer, offset, length, position) => {
+  if (fd === 0) {
+    attempts++;
+    if (attempts <= 2) throw Object.assign(new Error('pipe has no data yet'), { code: 'EAGAIN' });
+    if (attempts === 3) length = Math.min(length, 7);
+  }
+  return readSync(fd, buffer, offset, length, position);
+};
+require('node:module').syncBuiltinESMExports();
+"#,
+        );
+        let script = fixture.path().join("workflow.js");
+        fs::write(
+            &script,
+            "export const meta = { name: 'pipe', description: 'Pipe test', phases: [] };\r\n\
+             export default await agent('check');\r\n",
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let events = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
+            command,
+            &script,
+            Value::Null,
+            None,
+            WorkflowHostRunPolicy::collecting(),
+            |call| {
+                Ok(HostCommand::AgentResult {
+                    call_id: call.call_id,
+                    result: serde_json::json!({"reply": "received ✓"}),
+                })
+            },
+            |_| Ok(()),
+            || Ok(Instant::now() >= deadline),
+            || {},
+        )
+        .expect("read startup payload and agent reply");
+
+        assert!(
+            matches!(events.last(), Some(HostEvent::WorkflowCompleted { result })
+                if *result == serde_json::json!({"reply": "received ✓"}))
+        );
+    }
+
+    #[test]
+    fn workflow_bootstrap_reports_eof_as_short_input() {
+        if !WorkflowHost::node_available() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let mut command = node_with_preload(
+            fixture.path(),
+            r#"
+const fs = require('node:fs');
+const { readSync } = fs;
+fs.readSync = (fd, ...args) => {
+  if (fd === 0) throw Object.assign(new Error('pipe closed'), { code: 'EOF' });
+  return readSync(fd, ...args);
+};
+require('node:module').syncBuiltinESMExports();
+"#,
+        );
+        workflow_host_bootstrap(&mut command);
+        let output = command
+            .args(["workflow.js", "null", "", "", "1024", "", "1"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(!output.status.success());
+        assert!(
+            stderr.contains("Error: workflow host input ended early"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn workflow_host_early_exit_includes_redacted_stderr_tail() {
+        if !WorkflowHost::node_available() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let command = node_with_preload(
+            fixture.path(),
+            r#"
+const { writeFileSync } = require('node:fs');
+writeFileSync(2, 'start of log\n' + '界'.repeat(23_000) + '\n');
+writeFileSync(2, 'api_key=' + 'opaque-demo-value'.repeat(180) + '\n');
+writeFileSync(2, 'workflow startup failed: token=opaque-test-token\n');
+process.exit(7);
+"#,
+        );
+        let script = fixture.path().join("workflow.js");
+        fs::write(&script, "").unwrap();
+
+        let error = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
+            command,
+            &script,
+            Value::Null,
+            None,
+            WorkflowHostRunPolicy::collecting(),
+            |_| unreachable!("fixture exits before sending events"),
+            |_| Ok(()),
+            || Ok(false),
+            || {},
+        )
+        .expect_err("host exits before a terminal event");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        let message = error.to_string();
+        let stderr = message
+            .strip_prefix("workflow host stdout closed before a terminal event: ")
+            .expect(&message);
+        assert!(stderr.len() <= 2 * 1024);
+        assert!(
+            stderr.ends_with("workflow startup failed: token=<redacted>"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("start of log"));
+        assert!(!stderr.contains("opaque-demo-value"));
+    }
+
+    fn node_with_preload(directory: &Path, source: &str) -> Command {
+        let preload = directory.join("preload.cjs");
+        fs::write(&preload, source).unwrap();
+        let mut command = Command::new(WorkflowHost::node_executable());
+        command.arg("--require").arg(node_entry_path(preload));
+        command
     }
 
     #[test]
@@ -1463,9 +1690,11 @@ wait
             .env("ORCA_WORKFLOW_TEST_GATE", &gate)
             .env("ORCA_WORKFLOW_TEST_MARKER", &survivor_marker);
 
+        let script = temp.path().join("unused-workflow.js");
+        fs::write(&script, "").unwrap();
         let error = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
             command,
-            &temp.path().join("unused-workflow.js"),
+            &script,
             serde_json::json!(null),
             None,
             WorkflowHostRunPolicy::collecting(),
@@ -1527,6 +1756,7 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
         let _node_path = TestEnvVar::set("ORCA_NODE_PATH", &node);
         let _pid_path = TestEnvVar::set("ORCA_WORKFLOW_TEST_PID", &pid_path);
         let script = temp.path().join("unused-workflow.js");
+        fs::write(&script, "").unwrap();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             let result = WorkflowHost::run_collecting_events(&script, serde_json::json!(null));
@@ -1606,7 +1836,7 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
             &script,
             serde_json::Value::Null,
             None,
-            WorkflowHostRunPolicy::callback_only(1, None),
+            WorkflowHostRunPolicy::callback_only(1, None, None),
             |call| {
                 Ok(HostCommand::AgentResult {
                     call_id: call.call_id,
@@ -1662,7 +1892,7 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
         permissions.set_mode(0o755);
         std::fs::set_permissions(&node, permissions).expect("chmod lingering node");
         let script = temp.path().join("unused.js");
-        std::fs::write(&script, "export default null;").expect("write workflow");
+        std::fs::write(&script, " ".repeat(2 * 1024 * 1024)).expect("write workflow");
 
         unsafe {
             env::set_var("ORCA_NODE_PATH", &node);
@@ -1807,9 +2037,11 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
             .env("ORCA_API_KEY", "sk-workflow-test")
             .env("BRAVE_SEARCH_API_KEY", "sk-workflow-test");
 
+        let script = temp.path().join("unused-workflow.js");
+        fs::write(&script, "").unwrap();
         let _ = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
             command,
-            &temp.path().join("unused-workflow.js"),
+            &script,
             serde_json::json!(null),
             None,
             WorkflowHostRunPolicy::collecting(),
@@ -1835,8 +2067,7 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
 
         let args = node_confinement_args(
             &node,
-            Path::new("/host.mjs"),
-            Path::new("/workflow.js"),
+            &[Path::new("/host.mjs"), Path::new("/workflow.js")],
             None,
             None,
         );
@@ -1894,7 +2125,7 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
         let entry = node_entry_path(entry);
         let node = WorkflowHost::node_executable();
         let output = Command::new(&node)
-            .args(node_confinement_args(&node, &entry, readable, ipc, None))
+            .args(node_confinement_args(&node, &[&entry, readable], ipc, None))
             .arg(&entry)
             .arg(readable)
             .output()

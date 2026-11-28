@@ -29,12 +29,22 @@ special dispatch 执行，不再通过普通工具 worker 或 thread-local callb
 
 ## 当前 Orca 工具清单
 
+`read_file`、`read_document`、`grep`、`glob` 和 `list_files` 都在工作区内解析路径。空路径指向工作区根目录。路径通向工作区外、中间目录缺失，或把文件当成目录时，工具会拒绝请求。Windows 上也会拒绝 `C:foo` 这类盘符相对路径。Orca 接受工作区时解析其实际路径。此后每次读取都沿这条路径逐级打开目录，遇到符号链接或目录联接点就拒绝。同一路径重新建成普通目录后仍可读取。显式指定的链接可以指向工作区内，硬链接按普通文件处理。`glob` 和 `list_files` 会在返回前检查每个选中的条目。
+
+`grep` 在进程内搜索，按原生路径排序，分页顺序固定。它对原始字节使用默认开启 Unicode 的正则表达式，支持 `(?-u:…)` 中的字节转义，并拒绝模式中的字面换行。它会去掉 UTF-8 文件开头的 BOM，也会解码带 BOM 的 UTF-16。匹配 CRLF 行时会去掉行末的 CR，所以 `^needle$` 可以匹配 `needle\r\n`。搜索单个文件也会显示文件名。Windows 上显示路径使用 `/`，Unix 上保留文件名里的反斜杠。递归搜索跳过二进制文件和无法读取的文件。显式指定二进制文件时，如果匹配，会提示 `binary file matches`。显式指定的文件读失败时会返回错误。超过 16 MiB 的行会跳过，并在结果中汇总计数。打开的目录句柄有上限，排序所需内存随符合条件的路径数量增长。
+
+`grep` 始终跳过 `.git`。忽略规则可以用 `!.env` 这类写法显式纳入隐藏文件。忽略文件必须是普通文件，且大小不超过 1 MiB。过滤优先级依次为 `.rgignore`、`.ignore`、`.gitignore`、`info/exclude` 和全局排除规则。上级目录的 `.ignore` 和 `.gitignore` 最远读到 Git 根目录。Git 根目录以上的忽略文件、只有 `.jj` 的根目录，以及结果中文件名的特殊字符转义暂不支持。相对的 `core.excludesFile` 从工作区解析。默认全局排除文件为 `$XDG_CONFIG_HOME/git/ignore` 或 `~/.config/git/ignore`。
+
+要判断工作区外的 Git 目录是否属于当前工作区，Orca 会先读工作区的 `.git` 指针，再检查候选目录的 `worktrees/<name>/gitdir` 是否指回该 `.git` 文件，或读取候选 Git 目录自身的 `config`，确认 `core.worktree` 指向工作区。因此，确认关联之前就可能读取候选目录的 `config`。确认关联后才会读取 `info/exclude`。系统、全局和 XDG Git 配置可以提供 `core.excludesFile`。这些读取只用于过滤，搜索发现过程不会把读取的内容返回给模型。
+
+模型调用 `Workflow` 时，`name` 必须是单个已保存的工作流名称，不能包含路径分隔符，也不能是 `.` 或 `..`。模型传入的 `scriptPath` 必须解析到工作区内、受信任的上级目录的 `.orca/workflows` 内，或用户工作流目录内。你在命令行中仍可用 `orca workflow run` 直接指定脚本路径。
+
 | 工具 | 类型 | 当前状态 | 说明 |
 |------|------|----------|------|
 | `read_file` | read | 已实现 | 读取 UTF-8 文件内容，输出按 8KB 截断 |
 | `glob` | read | 已实现 | 首选文件发现工具，支持 glob pattern 和 `mode: "fuzzy"` 路径查询，返回 workspace-relative 路径 |
 | `list_files` | read | 兼容 alias | 保留给旧 prompt 和历史会话，模型 prompt 不再优先推荐 |
-| `grep` | read | 已实现 | 优先使用 ripgrep，缺失时回退到进程内正则搜索，空结果返回 `(no matches)` |
+| `grep` | read | 已实现 | 在进程内搜索正则表达式，空结果返回 `(no matches)` |
 | `git_status` | read | 已实现 | `git status --short` |
 | `web_search` | network | 已实现 | 网络搜索，按 network 能力走审批策略 |
 | `bash` | shell | 已实现 | 通过 `sh -c` 执行命令，shell 能力需要对应审批 |

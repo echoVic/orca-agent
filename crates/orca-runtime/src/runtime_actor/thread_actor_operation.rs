@@ -2848,10 +2848,8 @@ impl ThreadActor {
             .as_ref()
             .map(|state| state.thread.session().task_registry().clone())
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let session_dir = task_registry
-            .workflow_session_dir(&cwd)
+        let runner = WorkflowRunner::for_session(config, task_registry.clone(), &cwd)
             .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        let runner = WorkflowRunner::new(config, task_registry.clone(), session_dir);
         let prepared = match runner.prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
             name: Some(catalog_entry_id.as_str().to_string()),
             args: Some(workflow_args.clone()),

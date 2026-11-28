@@ -302,11 +302,10 @@ pub(crate) fn execute_workflow_tool(
     }
 
     let input = parse_workflow_input(tool_request)?;
-    let session_dir = task_registry.workflow_session_dir(cwd)?;
-    let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir)
+    let runner = WorkflowRunner::for_session(config.clone(), task_registry.clone(), cwd)?
         .with_child_executor(child_executor)
         .with_parent_budget(parent_budget);
-    let prepared = runner.prepare_background(WorkflowLaunchRequest::from(input))?;
+    let prepared = runner.prepare_model_background(WorkflowLaunchRequest::from(input))?;
     let task_id = prepared.task_id.clone();
     let run_id = prepared.run_id.clone();
     let workflow_name = prepared.workflow_name.clone();
@@ -429,6 +428,7 @@ pub(crate) fn execute_workflow_draft_action_tool(
     }
 
     let input = parse_workflow_draft_action_input(tool_request)?;
+    crate::workflow::draft::validate_draft_id(&input.draft_id)?;
     if input.action == "run"
         && let Some(result) = reject_unwaited_typed_workflow(
             tool_request,
@@ -438,17 +438,26 @@ pub(crate) fn execute_workflow_draft_action_tool(
     {
         return Ok(result);
     }
-    let session_dir = task_registry.workflow_session_dir(cwd)?;
-    let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
+    let workspace = match &config.tools.workspace_read_root {
+        Some(root) => root.clone(),
+        None => cwd.canonicalize()?,
+    };
+    if input.action == "run" {
+        orca_tools::open_workspace_root(&workspace)?;
+    }
+    let session_dir = task_registry.workflow_session_dir(&workspace)?;
+    let session = task_registry.open_workflow_session(&workspace)?;
+    let draft_store = WorkflowDraftStore::in_session(session_dir.join("workflow-drafts"), session);
     let draft = draft_store.load(&input.draft_id)?;
 
     let output = match input.action.as_str() {
         "run" => {
-            let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir)
-                .with_child_executor(child_executor)
-                .with_parent_budget(parent_budget);
+            let runner =
+                WorkflowRunner::for_session(config.clone(), task_registry.clone(), &workspace)?
+                    .with_child_executor(child_executor)
+                    .with_parent_budget(parent_budget);
             let prepared =
-                runner.prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+                runner.prepare_model_background(WorkflowLaunchRequest::from(WorkflowInput {
                     draft_id: Some(input.draft_id.clone()),
                     args: input.args.clone(),
                     token_budget: input.token_budget,
@@ -846,6 +855,7 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct RecordingWorkflowIngress {
         events: Arc<Mutex<Vec<RecordedWorkflowIngress>>>,
+        replace_prepared_script_in: Option<std::path::PathBuf>,
     }
 
     impl RecordingWorkflowIngress {
@@ -862,6 +872,14 @@ mod tests {
             &self,
             started: &RuntimeWorkflowStarted,
         ) -> io::Result<RuntimeWorkflowIngressReceipt> {
+            if let Some(session) = &self.replace_prepared_script_in {
+                let script = session
+                    .join("workflow-runs")
+                    .join(started.workflow_run_id.as_str())
+                    .join("script.js");
+                let contents = std::fs::read_to_string(&script)?;
+                std::fs::write(script, contents.replace("startup boom", "replacement ran"))?;
+            }
             self.events
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1276,6 +1294,205 @@ export const meta = {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn workflow_draft_action_checks_id_and_files_before_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.cwd = Some(temp.path().to_owned());
+        let registry = TaskRegistry::new("session-draft-reads".to_string());
+        let session = registry.workflow_session_dir(temp.path()).unwrap();
+        let store = WorkflowDraftStore::new(session.join("workflow-drafts"));
+        let draft = store
+            .create_from_script(
+                registry.session_id(),
+                temp.path(),
+                startup_failure_script(),
+                1,
+            )
+            .unwrap();
+        let run = |id: &str| {
+            let request = tool_request(
+                "run",
+                ToolName::WorkflowDraftAction,
+                serde_json::json!({ "draftId": id, "action": "run" }),
+            );
+            execute_workflow_draft_action_tool(
+                &config,
+                temp.path(),
+                &mut EventFactory::new("test-run".to_string()),
+                &mut EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl),
+                &request,
+                true,
+                &registry,
+                &mut Vec::new(),
+                unused_child_executor,
+                true,
+                None,
+                None,
+            )
+        };
+        assert_eq!(
+            run("../draft").unwrap_err().to_string(),
+            "draftId must be a workflow draft ID"
+        );
+        for path in [
+            store.draft_path(&draft.draft_id),
+            store.script_path(&draft.draft_id),
+        ] {
+            let stored = temp.path().join(path.file_name().unwrap());
+            std::fs::rename(&path, &stored).unwrap();
+            link_draft_fixture(&stored, &path);
+            let error = run(&draft.draft_id).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("path changed while it was opened"),
+                "{error}"
+            );
+            std::fs::remove_file(&path).unwrap();
+            std::fs::rename(stored, path).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_workflow_draft_action_refuses_a_link_at_the_session_directory() {
+        check_draft_action_with_replaced_session(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_local_workflow_draft_action_reads_from_its_owned_session() {
+        check_draft_action_with_replaced_session(true);
+    }
+
+    #[cfg(unix)]
+    fn link_draft_fixture(source: &std::path::Path, path: &std::path::Path) {
+        std::os::unix::fs::symlink(source, path).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn check_draft_action_with_replaced_session(process_local: bool) {
+        let _home = crate::history::lock_test_env();
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let cwd = base.join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let mut config = config();
+        config.cwd = Some(cwd.clone());
+        let registry = if process_local {
+            TaskRegistry::new("draft-session".into())
+        } else {
+            TaskRegistry::new_for_cwd("draft-session".into(), &cwd)
+        };
+        let session = registry.workflow_session_dir(&cwd).unwrap();
+        let store = WorkflowDraftStore::new(session.join("workflow-drafts"));
+        let script = startup_failure_script();
+        let draft = store
+            .create_from_script(registry.session_id(), &cwd, script, 1)
+            .unwrap();
+        let neighbor = base.join("neighbor");
+        std::fs::rename(&session, &neighbor).unwrap();
+        let original = base.join("original");
+        std::fs::rename(&neighbor, &original).unwrap();
+        let mut outside = draft.clone();
+        outside.script = "outside workflow".into();
+        WorkflowDraftStore::new(neighbor.join("workflow-drafts"))
+            .write(&outside)
+            .unwrap();
+        link_draft_fixture(&neighbor, &session);
+        let request = tool_request(
+            "save",
+            ToolName::WorkflowDraftAction,
+            serde_json::json!({"draftId": draft.draft_id, "action": "save", "saveAs": "fixture"}),
+        );
+        let result = execute_workflow_draft_action_tool(
+            &config,
+            &cwd,
+            &mut EventFactory::new("test-run".into()),
+            &mut EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl),
+            &request,
+            false,
+            &registry,
+            &mut Vec::new(),
+            unused_child_executor,
+            true,
+            None,
+            None,
+        );
+        let saved = cwd.join(".orca/workflows/fixture.js");
+        if process_local {
+            assert_eq!(
+                result.unwrap().status,
+                orca_core::tool_types::ToolStatus::Completed
+            );
+            assert_eq!(std::fs::read_to_string(saved).unwrap(), script);
+        } else {
+            assert!(result.is_err());
+            assert!(!saved.exists());
+        }
+    }
+
+    #[test]
+    fn workflow_draft_action_runs_the_prepared_script_after_the_file_changes() {
+        let _guard = crate::history::lock_test_env();
+        if !WorkflowHost::node_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.cwd = Some(temp.path().to_owned());
+        let registry = TaskRegistry::new("session-draft-replaced-script".to_string());
+        let session = registry.workflow_session_dir(temp.path()).unwrap();
+        let store = WorkflowDraftStore::new(session.join("workflow-drafts"));
+        let draft = store
+            .create_from_script(
+                registry.session_id(),
+                temp.path(),
+                startup_failure_script(),
+                1,
+            )
+            .unwrap();
+        let ingress = RecordingWorkflowIngress {
+            replace_prepared_script_in: Some(session),
+            ..Default::default()
+        };
+        let request = tool_request(
+            "run",
+            ToolName::WorkflowDraftAction,
+            serde_json::json!({ "draftId": draft.draft_id, "action": "run" }),
+        );
+        let mut events = EventFactory::new("test-run".to_string());
+        let mut sink = EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl);
+        let mut background = Vec::new();
+        execute_workflow_draft_action_tool(
+            &config,
+            temp.path(),
+            &mut events,
+            &mut sink,
+            &request,
+            true,
+            &registry,
+            &mut background,
+            unused_child_executor,
+            true,
+            Some(&ingress),
+            None,
+        )
+        .unwrap();
+        observe_test_background_workflows(
+            &mut events,
+            &mut sink,
+            &mut background,
+            &registry,
+            Some(&ingress),
+        );
+        let emitted = String::from_utf8(sink.writer_mut().get_ref().clone()).unwrap();
+        assert!(emitted.contains("startup boom"), "{emitted}");
+        assert!(!emitted.contains("replacement ran"), "{emitted}");
+    }
+
     #[test]
     fn workflow_draft_action_save_writes_a_user_workflow_under_the_orca_home() {
         // The redirect is a thread-local `ORCA_HOME` override: the user scope
@@ -1339,7 +1556,116 @@ export const meta = {
             &cwd.path().join("persisted-script.js"),
         )
         .expect("the loader finds the saved user workflow");
-        assert_eq!(resolved.original_path, Some(saved));
+        assert_eq!(resolved.original_path, Some(saved.canonicalize().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_workflow_launch_refuses_a_replaced_session_directory() {
+        let _home = crate::history::lock_test_env();
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let cwd = base.join("workspace");
+        let outside = base.join("other");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let mut config = config();
+        config.cwd = Some(cwd.clone());
+        let tasks = TaskRegistry::new_for_cwd("workflow-session".into(), &cwd);
+        let session = tasks.workflow_session_dir(&cwd).unwrap();
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        link_draft_fixture(&outside, &session);
+        let runner = crate::workflow::WorkflowRunner::for_session(config, tasks, &cwd).unwrap();
+        let request = crate::workflow::WorkflowLaunchRequest::from(WorkflowInput {
+            script: Some(startup_failure_script().into()),
+            ..Default::default()
+        });
+        assert!(runner.prepare_model_background(request).is_err());
+        assert!(std::fs::read_dir(outside).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_user_workflow_root_swapped_for_a_link_is_refused() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().canonicalize().unwrap();
+        let home = cwd.join("config");
+        let user = home.join("workflows");
+        let other = cwd.join("other");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("fixture.js"), startup_failure_script()).unwrap();
+        let _home = crate::history::redirect_test_orca_home(&home);
+        let mut config = config();
+        config.workflows.user_directory = crate::command::config::user_workflow_directory();
+        std::fs::rename(&user, home.join("previous")).unwrap();
+        link_draft_fixture(&other, &user);
+        let request = tool_request(
+            "run",
+            ToolName::Workflow,
+            serde_json::json!({"name":"fixture"}),
+        );
+        let result = execute_workflow_tool(
+            &config,
+            &cwd,
+            &mut EventFactory::new("fixture".into()),
+            &mut EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl),
+            &request,
+            false,
+            &TaskRegistry::new("fixture".into()),
+            &mut Vec::new(),
+            unused_child_executor,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!(
+                "workspace path changed while Orca was running: {}",
+                user.display()
+            )
+        );
+    }
+
+    #[test]
+    fn a_model_script_path_outside_the_workspace_is_refused() {
+        let _guard = crate::history::lock_test_env();
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(fixture.path().join("file.js"), "export const meta = { name: 'file', description: 'Fixture', phases: ['main'] }; export default await phase('main', async () => 'done');").unwrap();
+        let mut config = config();
+        config.cwd = Some(cwd.clone());
+        let registry = TaskRegistry::new("file-workflow".into());
+        let mut events = EventFactory::new("file-workflow".into());
+        let mut sink = EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl);
+        let request = tool_request(
+            "file",
+            ToolName::Workflow,
+            serde_json::json!({"scriptPath": "../file.js"}),
+        );
+        let error = execute_workflow_tool(
+            &config,
+            &cwd,
+            &mut events,
+            &mut sink,
+            &request,
+            false,
+            &registry,
+            &mut Vec::new(),
+            unused_child_executor,
+            true,
+            None,
+            None,
+        )
+        .expect_err("a model script path must be confined");
+        assert!(
+            error
+                .to_string()
+                .starts_with("scriptPath must be inside the workspace or a workflows directory:"),
+            "{error}"
+        );
     }
 
     #[test]

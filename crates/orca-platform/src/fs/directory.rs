@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path};
@@ -40,6 +40,19 @@ pub enum FileAccess {
     Delete,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryEntryKind {
+    Directory,
+    File,
+    Other,
+}
+
+pub struct DirectoryEntry {
+    pub name: OsString,
+    pub kind: DirectoryEntryKind,
+    pub hidden: bool,
+}
+
 /// A directory reached without following links in any component. Child names
 /// must be single components. Unix operations are relative to its descriptor.
 pub struct VerifiedDirectory(platform::Directory);
@@ -58,6 +71,56 @@ impl VerifiedDirectory {
     pub fn child(&self, name: &OsStr) -> io::Result<Self> {
         validate_name(name)?;
         self.0.child(name).map(Self)
+    }
+
+    pub fn read_names(&self) -> io::Result<Vec<OsString>> {
+        Ok(self
+            .read_entries()?
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect())
+    }
+
+    pub fn read_entries(&self) -> io::Result<Vec<DirectoryEntry>> {
+        let mut entries = Vec::new();
+        self.visit_entries(|entry| {
+            entries.push(entry);
+            Ok(())
+        })?;
+        Ok(entries)
+    }
+
+    pub fn visit_entries(
+        &self,
+        visit: impl FnMut(DirectoryEntry) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.0.visit_entries(visit)
+    }
+
+    /// Walk a read path without keeping its ancestor handles open.
+    pub fn open_for_read(path: &Path) -> io::Result<Self> {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected an absolute directory",
+            ));
+        }
+        platform::open_directory_for_read(path).map(Self)
+    }
+
+    pub fn child_for_read(&self, name: &OsStr) -> io::Result<Self> {
+        validate_name(name)?;
+        self.0.child_for_read(name).map(Self)
+    }
+
+    pub fn entry_is_regular_file(&self, name: &OsStr) -> io::Result<bool> {
+        validate_name(name)?;
+        self.0.entry_is_regular_file(name)
+    }
+
+    pub fn entry_is_directory(&self, name: &OsStr) -> io::Result<bool> {
+        validate_name(name)?;
+        self.0.entry_is_directory(name)
     }
 
     pub fn identity(&self) -> io::Result<FileIdentity> {
@@ -121,6 +184,22 @@ pub fn stale_path() -> io::Error {
     io::Error::other("path changed after patch preparation")
 }
 
+#[cfg(all(test, unix))]
+#[test]
+fn a_verified_directory_lists_the_opened_directory_after_its_name_changes() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let path = root.join("directory");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("original.txt"), "original").unwrap();
+    let directory = VerifiedDirectory::open(&path).unwrap();
+    std::fs::rename(&path, root.join("moved")).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("replacement.txt"), "replacement").unwrap();
+
+    assert_eq!(directory.read_names().unwrap(), ["original.txt"]);
+}
+
 #[cfg(all(test, target_os = "linux"))]
 #[test]
 fn detects_casefold_in_an_empty_directory_with_a_case_sensitive_parent() {
@@ -146,6 +225,67 @@ mod windows_tests {
         assert!(fs::rename(&parent, temp.path().join("renamed")).is_err());
         dir.create_file(OsStr::new("note.txt")).unwrap();
         assert!(parent.join("child/note.txt").is_file());
+    }
+
+    #[test]
+    fn windows_directory_enumeration_uses_its_open_handle_after_a_reparse_swap() {
+        use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("directory");
+        let outside = temp.path().join("neighbor");
+        fs::create_dir(&path).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("outside.txt"), "outside").unwrap();
+        let reader = VerifiedDirectory::open(&path).unwrap();
+        assert!(reader.read_names().unwrap().is_empty());
+        let writer = fs::OpenOptions::new()
+            .access_mode(GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+            .unwrap();
+        let mut target = OsString::from(r"\??\");
+        target.push(&outside);
+        let target: Vec<u16> = target.encode_wide().collect();
+        let len = u16::try_from(target.len() * 2).unwrap();
+        const MOUNT_POINT_TAG: u32 = 0xA0000003;
+        const SET_REPARSE_POINT: u32 = 0x000900A4;
+        const DELETE_REPARSE_POINT: u32 = 0x000900AC;
+        let mut reparse = Vec::new();
+        reparse.extend(MOUNT_POINT_TAG.to_le_bytes());
+        for field in [len + 12, 0, 0, len, len + 2, 0] {
+            reparse.extend(field.to_le_bytes());
+        }
+        reparse.extend(target.into_iter().chain([0, 0]).flat_map(u16::to_le_bytes));
+        let reparse_control = |code, data: &[u8]| {
+            let mut returned = 0;
+            let result = unsafe {
+                DeviceIoControl(
+                    writer.as_raw_handle(),
+                    code,
+                    data.as_ptr().cast(),
+                    data.len() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(result, 0, "{}", io::Error::last_os_error());
+        };
+        reparse_control(SET_REPARSE_POINT, &reparse);
+        let redirect_visible_by_name = path.join("outside.txt").is_file();
+        let observed = reader.read_names();
+        reparse_control(DELETE_REPARSE_POINT, &[3, 0, 0, 160, 0, 0, 0, 0]);
+        assert!(redirect_visible_by_name);
+        assert!(observed.is_ok_and(|names| names.is_empty()));
     }
 
     #[test]
@@ -190,6 +330,8 @@ mod platform {
         Ok(directory)
     }
 
+    pub(super) use open_directory as open_directory_for_read;
+
     pub(super) fn file_links(file: &File) -> io::Result<FileLinks> {
         let metadata = file.metadata()?;
         Ok(FileLinks {
@@ -217,6 +359,56 @@ mod platform {
                 return Err(io::Error::last_os_error());
             }
             Ok(unsafe { File::from_raw_fd(fd) })
+        }
+
+        pub(super) fn visit_entries(
+            &self,
+            mut visit: impl FnMut(DirectoryEntry) -> io::Result<()>,
+        ) -> io::Result<()> {
+            use rustix::fs::{AtFlags, FileType, statat};
+            for entry in rustix::fs::Dir::read_from(&self.0)? {
+                let entry = entry?;
+                let name = entry.file_name().to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                let file_type = match entry.file_type() {
+                    FileType::Unknown => {
+                        statat(&self.0, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW)
+                            .map(|stat| FileType::from_raw_mode(stat.st_mode))?
+                    }
+                    known => known,
+                };
+                visit(DirectoryEntry {
+                    name: OsStr::from_bytes(name).to_owned(),
+                    kind: match file_type {
+                        FileType::Directory => DirectoryEntryKind::Directory,
+                        FileType::RegularFile => DirectoryEntryKind::File,
+                        _ => DirectoryEntryKind::Other,
+                    },
+                    hidden: name.starts_with(b"."),
+                })?;
+            }
+            Ok(())
+        }
+
+        pub(super) fn entry_is_regular_file(&self, name: &OsStr) -> io::Result<bool> {
+            use rustix::fs::{AtFlags, FileType, statat};
+            let entry = statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            Ok(FileType::from_raw_mode(entry.st_mode) == FileType::RegularFile)
+        }
+
+        pub(super) fn child_for_read(&self, name: &OsStr) -> io::Result<Self> {
+            self.child(name)
+        }
+
+        pub(super) fn entry_is_directory(&self, name: &OsStr) -> io::Result<bool> {
+            use rustix::fs::{AtFlags, FileType, statat};
+            let entry = statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            match FileType::from_raw_mode(entry.st_mode) {
+                FileType::Symlink => Err(io::ErrorKind::PermissionDenied.into()),
+                kind => Ok(kind == FileType::Directory),
+            }
         }
 
         pub(super) fn child(&self, name: &OsStr) -> io::Result<Self> {
@@ -321,28 +513,30 @@ mod platform {
 mod platform {
     use super::*;
     use crate::fs::PathPolicy;
-    use std::mem::{MaybeUninit, size_of};
-    use std::os::windows::ffi::OsStrExt;
+    use std::mem::{MaybeUninit, offset_of, size_of};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::PathBuf;
     use std::ptr::null;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
         FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
         FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     };
     use windows_sys::Win32::Foundation::{
-        GENERIC_READ, GENERIC_WRITE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError,
-        UNICODE_STRING,
+        ERROR_NO_MORE_FILES, GENERIC_READ, GENERIC_WRITE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
+        RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_CASE_SENSITIVE_INFO,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO,
         FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-        FILE_DISPOSITION_INFO_EX, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileCaseSensitiveInfo,
-        FileDispositionInfoEx, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        SYNCHRONIZE, SetFileInformationByHandle,
+        FILE_DISPOSITION_INFO_EX, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileCaseSensitiveInfo,
+        FileDispositionInfoEx, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, SYNCHRONIZE,
+        SetFileInformationByHandle,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -355,9 +549,21 @@ mod platform {
         file: File,
         path: PathBuf,
         _parent: Option<Arc<DirectoryHandle>>,
+        enumeration: Mutex<()>,
     }
 
     pub(super) fn open_directory(path: &Path) -> io::Result<Directory> {
+        open_directory_components(path, Directory::child)
+    }
+
+    pub(super) fn open_directory_for_read(path: &Path) -> io::Result<Directory> {
+        open_directory_components(path, Directory::child_for_read)
+    }
+
+    fn open_directory_components(
+        path: &Path,
+        child: impl Fn(&Directory, &OsStr) -> io::Result<Directory>,
+    ) -> io::Result<Directory> {
         let mut parts = path.components();
         let (Some(Component::Prefix(prefix)), Some(Component::RootDir)) =
             (parts.next(), parts.next())
@@ -370,6 +576,7 @@ mod platform {
         let mut root = PathBuf::from(prefix.as_os_str());
         root.push("\\");
         let verified = PathPolicy::windows_sandbox()
+            .with_unc_paths(true)
             .open_no_follow_pinned(&root, DIRECTORY_ACCESS)
             .map_err(as_io)?;
         let mut directory = Directory::new(verified.into_file(), root, None);
@@ -380,7 +587,7 @@ mod platform {
                     "directory path is not normalized",
                 ));
             };
-            directory = directory.child(name)?;
+            directory = child(&directory, name)?;
         }
         Ok(directory)
     }
@@ -400,17 +607,132 @@ mod platform {
         })
     }
 
+    fn read_entry_batch(
+        mut bytes: &[u8],
+        visit: &mut impl FnMut(DirectoryEntry) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid directory entry");
+        let field = |bytes: &[u8], start| -> Option<u32> {
+            Some(u32::from_ne_bytes(
+                bytes.get(start..start + 4)?.try_into().ok()?,
+            ))
+        };
+        loop {
+            let next = field(bytes, offset_of!(FILE_ID_BOTH_DIR_INFO, NextEntryOffset))
+                .ok_or_else(invalid)? as usize;
+            let attrs = field(bytes, offset_of!(FILE_ID_BOTH_DIR_INFO, FileAttributes))
+                .ok_or_else(invalid)?;
+            let len = field(bytes, offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength))
+                .ok_or_else(invalid)? as usize;
+            let start = offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+            let end = start.checked_add(len).ok_or_else(invalid)?;
+            if len % 2 != 0 || (next != 0 && next < end) {
+                return Err(invalid());
+            }
+            let wide = bytes
+                .get(start..end)
+                .ok_or_else(invalid)?
+                .chunks_exact(2)
+                .map(|part| u16::from_ne_bytes([part[0], part[1]]))
+                .collect::<Vec<_>>();
+            let name = OsString::from_wide(&wide);
+            if name != "." && name != ".." {
+                let kind = if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    DirectoryEntryKind::Other
+                } else if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                    DirectoryEntryKind::Directory
+                } else {
+                    DirectoryEntryKind::File
+                };
+                visit(DirectoryEntry {
+                    hidden: attrs & FILE_ATTRIBUTE_HIDDEN != 0
+                        || name.as_encoded_bytes().starts_with(b"."),
+                    name,
+                    kind,
+                })?;
+            }
+            if next == 0 {
+                return Ok(());
+            }
+            bytes = bytes.get(next..).ok_or_else(invalid)?;
+        }
+    }
+
     impl Directory {
         fn new(file: File, path: PathBuf, parent: Option<Arc<DirectoryHandle>>) -> Self {
             Self(Arc::new(DirectoryHandle {
                 file,
                 path,
                 _parent: parent,
+                enumeration: Mutex::new(()),
             }))
         }
 
         pub(super) fn file(&self) -> &File {
             &self.0.file
+        }
+
+        pub(super) fn visit_entries(
+            &self,
+            mut visit: impl FnMut(DirectoryEntry) -> io::Result<()>,
+        ) -> io::Result<()> {
+            // The enumeration cursor belongs to this handle.
+            let _guard = self.0.enumeration.lock().unwrap();
+            let mut class = FileIdBothDirectoryRestartInfo;
+            let mut buffer = [0u64; 2048];
+            loop {
+                let result = unsafe {
+                    GetFileInformationByHandleEx(
+                        self.file().as_raw_handle(),
+                        class,
+                        buffer.as_mut_ptr().cast(),
+                        size_of::<[u64; 2048]>() as u32,
+                    )
+                };
+                if result == 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                class = FileIdBothDirectoryInfo;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        buffer.as_ptr().cast::<u8>(),
+                        size_of::<[u64; 2048]>(),
+                    )
+                };
+                read_entry_batch(bytes, &mut visit)?;
+            }
+        }
+
+        pub(super) fn entry_is_regular_file(&self, name: &OsStr) -> io::Result<bool> {
+            let file = self.open_child(
+                name,
+                FILE_READ_ATTRIBUTES,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE,
+                SHARE_READ_WRITE,
+            )?;
+            Ok(file.metadata()?.is_file())
+        }
+
+        pub(super) fn child_for_read(&self, name: &OsStr) -> io::Result<Self> {
+            let file = self.open_child(
+                name,
+                DIRECTORY_ACCESS,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE,
+                SHARE_READ_WRITE,
+            )?;
+            Ok(Self::new(file, self.0.path.join(name), None))
+        }
+
+        pub(super) fn entry_is_directory(&self, name: &OsStr) -> io::Result<bool> {
+            let file =
+                self.open_child(name, FILE_READ_ATTRIBUTES, FILE_OPEN, 0, SHARE_READ_WRITE)?;
+            Ok(file.metadata()?.is_dir())
         }
 
         pub(super) fn child(&self, name: &OsStr) -> io::Result<Self> {
@@ -478,6 +800,7 @@ mod platform {
                 io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8")
             })?;
             PathPolicy::windows_sandbox()
+                .with_unc_paths(true)
                 .identity(text)
                 .map_err(as_io)?;
             let mut wide: Vec<_> = name.encode_wide().collect();

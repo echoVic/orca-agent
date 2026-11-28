@@ -613,6 +613,7 @@ impl RuntimeToolActorContext {
         if !workflows_enabled {
             return Ok(ToolResult::failed(request, "workflows are disabled", None));
         }
+        let _session = task_registry.ensure_workflow_session(cwd)?;
         let session_dir = task_registry.workflow_session_dir(cwd)?;
         self.execute_workflow_draft_tool_at(
             request,

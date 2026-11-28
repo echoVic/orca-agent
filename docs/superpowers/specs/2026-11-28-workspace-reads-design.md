@@ -1,0 +1,15 @@
+# Workspace Reads Stay in the Workspace
+
+## Decisions taken with the user on 2026-11-28
+
+1. **D1.** `grep` searches in process using byte regexes with Unicode enabled by default. It checks verified ignore rules before descending and opens files relative to verified directories. It orders native paths before applying `offset` and `head_limit`. Each call starts with a 120-second deadline. Cancellation is checked during discovery, ordering, and scanning. The scan checks full lines through 16 MiB and reports how many longer lines it skipped. The final collector compacts page output. Directory handles are bounded and path discovery retains one entry per eligible path.
+2. **D2.** Read `.gitignore` and `.ignore` from the workspace through its Git root, including intervening ancestors. Ignore sources are regular files of at most 1 MiB, with the nearest match winning within each file type. `.rgignore` takes precedence over `.ignore`, then `.gitignore`, `info/exclude`, and global excludes. A whitelist can include a hidden entry. `.git` is always skipped.
+
+## Read behaviour
+
+- Resolve the workspace path when the runtime accepts it. Each read opens the canonical path from the filesystem root without following links or junctions. A regular directory at the same canonical path remains readable, including after a re-clone. Links that resolve inside the workspace work as explicit targets. Hard links are ordinary files. Windows drive-relative paths are refused.
+- An empty path means the workspace root. Validate intermediate components before applying `..`. A missing intermediate directory or a file used as one is an error.
+- For `glob` and `list_files`, each returned entry was inside the workspace when it was checked. Enumerate from verified directory handles and recheck the selected page before returning it.
+- Outside Git association discovery reads the workspace's `.git` pointer, then checks the candidate `worktrees/<name>/gitdir` backlink or reads the candidate Git directory's `config` for `core.worktree`. These checks can read candidate metadata before establishing the association. The association gates `info/exclude`. Resolving the global excludes file can also read system, global and XDG Git configuration. These reads serve filtering only. Search discovery never returns their content to the model.
+- Model Workflow paths resolve inside the workspace, a trusted ancestor's `.orca/workflows`, or the user workflow directory resolved when configuration loads. A saved name and a draft ID are single components. Recorded drafts and resume artifacts are opened relative to the verified workspace session directory. Process-local sessions read through their scratch directory handle. The launcher sends the host module and prepared script over its input pipe. Node checks the host module digest before loading it, and the host checks the prepared script digest before running it.
+- Edit and Apply Patch continue to resolve their write targets through the existing write resolver. Spill reads continue to use the session's spill directory with verified opens.

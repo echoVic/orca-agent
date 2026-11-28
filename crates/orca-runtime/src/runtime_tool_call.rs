@@ -45,6 +45,7 @@ pub(crate) struct RuntimeReadonlyToolInvocation {
     pub(crate) spill_directory: Option<PathBuf>,
     pub(crate) request: ToolRequest,
     pub(crate) cwd: PathBuf,
+    pub(crate) workspace_read_root: Option<PathBuf>,
     pub(crate) mcp_registry: McpRegistry,
     pub(crate) output_truncation: ToolOutputTruncation,
     pub(crate) network_read: Option<Box<RuntimeNormalToolInvocation>>,
@@ -389,6 +390,7 @@ impl RuntimeReadonlyToolExecutor for DefaultRuntimeReadonlyToolExecutor {
         }
         let cancelled = || cancel.is_cancelled();
         let ctx = orca_tools::ToolContext::new(&invocation.cwd)
+            .with_workspace_read_root(invocation.workspace_read_root.as_deref())
             .with_output_truncation(invocation.output_truncation)
             .with_shell_timeout(Some(Duration::from_secs(READONLY_TOOL_TIMEOUT_SECS)))
             .with_execution_profile(orca_core::capability::ExecutionProfile::ReadOnly)
@@ -1264,6 +1266,7 @@ pub(crate) mod tests {
                 raw_arguments: None,
             },
             cwd: PathBuf::from("."),
+            workspace_read_root: None,
             mcp_registry: McpRegistry::default(),
             output_truncation: ToolOutputTruncation::default(),
             network_read: None,

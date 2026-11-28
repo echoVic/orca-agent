@@ -915,6 +915,7 @@ pub(crate) fn run_tool_turns<W: io::Write>(
             let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
                 request: RuntimeReadonlyToolTurnRequest {
                     cwd,
+                    workspace_read_root: config.tools.workspace_read_root.as_deref(),
                     tool_requests: dispatch_window.tool_requests(),
                     emit_deltas,
                     cancel,
@@ -3919,6 +3920,100 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn readonly_tool_batch_uses_the_workspace_path_selected_at_acceptance() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let accepted = base.join("accepted");
+        let cwd = base.join("requested");
+        let neighbor = base.join("neighbor");
+        for (directory, text) in [(&accepted, "original"), (&neighbor, "neighbor")] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::write(directory.join("tracked.txt"), text).unwrap();
+        }
+        let link = |source: &std::path::Path, target: &std::path::Path| {
+            std::os::unix::fs::symlink(source, target)
+        };
+        link(&accepted, &cwd).unwrap();
+        let mut config = RunConfig::default();
+        crate::command::config::accept_workspace(&mut config, &cwd).unwrap();
+        std::fs::remove_file(&cwd).unwrap();
+        link(&neighbor, &cwd).unwrap();
+        let mut events = EventFactory::new("readonly-tool-turn".to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let mut conversation = Conversation::new();
+        let requests = vec![
+            request(
+                ToolName::ReadFile,
+                ActionKind::Read,
+                Some("tracked.txt"),
+                Some(json!({ "path": "tracked.txt" }).to_string().as_str()),
+            ),
+            ToolRequest {
+                id: "tool-2".to_string(),
+                name: ToolName::ReadFile,
+                action: ActionKind::Read,
+                target: Some("other.txt".to_string()),
+                raw_arguments: Some(json!({ "path": "other.txt" }).to_string()),
+            },
+        ];
+        let registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+
+        let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
+            request: RuntimeReadonlyToolTurnRequest {
+                cwd: &cwd,
+                workspace_read_root: config.tools.workspace_read_root.as_deref(),
+                tool_requests: &requests,
+                emit_deltas: false,
+                cancel: &CancelToken::new(),
+                output_truncation: ToolConfig::default().output_truncation,
+                max_parallel: 2,
+                network: None,
+            },
+            io: RuntimeReadonlyToolTurnIo {
+                events: &mut events,
+                sink: &mut sink,
+                conversation: &mut conversation,
+                history_writer: None,
+            },
+            services: RuntimeReadonlyToolTurnServices {
+                mcp_registry: &registry,
+                hooks: &hooks,
+                provider_response_ingress: None,
+                task_registry: None,
+                root_task_id: None,
+            },
+        })
+        .expect("run readonly tool turn");
+
+        assert!(matches!(outcome, ToolTurnOutcome::Continue));
+        assert_eq!(conversation.messages.len(), 2);
+        let combined_tool_content = conversation
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            matches!(&conversation.messages[0], Message::Tool { tool_call_id, .. }
+                if tool_call_id == "tool-1")
+        );
+        assert!(
+            matches!(&conversation.messages[1], Message::Tool { tool_call_id, .. }
+                if tool_call_id == "tool-2")
+        );
+        assert!(
+            combined_tool_content.contains("original"),
+            "{combined_tool_content}"
+        );
+        assert!(!combined_tool_content.contains("neighbor"));
+    }
+
     #[test]
     fn run_readonly_tool_turn_executes_and_records_batch_results() {
         let cwd = tempfile::tempdir().expect("cwd");
@@ -3947,6 +4042,7 @@ mod tests {
         let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
             request: RuntimeReadonlyToolTurnRequest {
                 cwd: cwd.path(),
+                workspace_read_root: None,
                 tool_requests: &requests,
                 emit_deltas: false,
                 cancel: &CancelToken::new(),
@@ -4019,6 +4115,7 @@ mod tests {
         let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
             request: RuntimeReadonlyToolTurnRequest {
                 cwd: cwd.path(),
+                workspace_read_root: None,
                 tool_requests: &requests,
                 emit_deltas: false,
                 cancel: &cancel,
@@ -4090,6 +4187,7 @@ mod tests {
         let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
             request: RuntimeReadonlyToolTurnRequest {
                 cwd: cwd.path(),
+                workspace_read_root: None,
                 tool_requests: &requests,
                 emit_deltas: false,
                 cancel: &cancel,
@@ -4156,6 +4254,7 @@ mod tests {
         let outcome = run_readonly_tool_turn(RuntimeReadonlyToolTurnContext {
             request: RuntimeReadonlyToolTurnRequest {
                 cwd: cwd.path(),
+                workspace_read_root: None,
                 tool_requests: &requests,
                 emit_deltas: false,
                 cancel: &cancel,

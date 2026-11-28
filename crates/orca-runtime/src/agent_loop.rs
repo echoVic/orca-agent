@@ -246,6 +246,9 @@ pub(crate) fn execute_child_agent_loop<W: io::Write>(
     runtime: &mut ChildAgentRuntime<'_, W>,
     child_cost_tracker: &mut CostTracker,
 ) -> io::Result<ChildAgentResult> {
+    let mut child_config = config.clone();
+    crate::command::config::inherit_workspace(&mut child_config, config, runtime.cwd)?;
+    let config = &child_config;
     let fallback_task_registry;
     let task_registry = if let Some(task_registry) = runtime.task_registry {
         task_registry

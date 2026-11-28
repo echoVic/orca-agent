@@ -454,7 +454,7 @@ Built-in tools:
 | `read_file` | read | Reads UTF-8 file content, truncated at 8KB |
 | `glob` | read | Finds files and directories by glob pattern or `mode: "fuzzy"` path query, sorted as workspace-relative paths; returns `(no matches)` when the path is missing or no entries match |
 | `list_files` | read | Compatibility alias for directory listing; returns sorted names and `(empty)` for missing directories |
-| `grep` | read | Regex search with line numbers; uses `rg` when available and a native in-process fallback otherwise, `(no matches)` for empty results |
+| `grep` | read | In-process byte regex search with line numbers and path-ordered pages. Returns `(no matches)` for an empty search. |
 | `git_status` | read | Runs `git status --short` |
 | `web_search` | network | Searches the web for current information |
 | `bash` | shell | Executes via `sh -c` under the active approval policy and sandbox |
@@ -468,6 +468,16 @@ Built-in tools:
 | `create_goal` | read | Creates a persistent goal while goal mode is running and no unfinished goal exists |
 | `update_goal` | read | Submits an evidence-bearing complete/blocked intent for turn-end verification while Goal mode is running |
 | `ask_user_question` | read | Asks 1-4 structured questions through the interactive runtime; each question has a header and 2-4 described options, with optional preview and multi-select support |
+
+`read_file`, `read_document`, `grep`, `glob`, and `list_files` resolve paths inside the workspace. An empty path selects the workspace root. Paths that leave the workspace, have a missing intermediate directory, or use a file as a directory are refused. On Windows, drive-relative paths such as `C:foo` are also refused. Orca resolves the workspace path when the runtime accepts it. Each read reopens that path without following links or junctions. A regular directory recreated at the same path remains readable. Explicit links that resolve inside the workspace still work, and hard links are ordinary files. `glob` and `list_files` check each selected entry before returning it.
+
+`grep` searches in process on every platform and orders results by native path for stable pagination. It uses byte regexes with Unicode enabled by default, accepts byte escapes in `(?-u:…)` groups, and refuses literal line breaks in patterns. It strips a UTF-8 BOM and decodes BOM-marked UTF-16. CRLF lines are matched without the CR, so `^needle$` matches `needle\r\n`. A single-file search includes the file name. Paths use forward slashes on Windows and keep literal backslashes on Unix. Recursive searches skip binary and unreadable files. An explicit binary match reports `binary file matches`, and a failed read of an explicit file reports the error. Lines above 16 MiB are skipped and counted in one note. Directory handles are bounded and sorting memory grows with the number of eligible paths. A search returns after 120 seconds even if a read stalls. The stalled read can keep the search worker alive until the read returns.
+
+`.git` is always skipped. Hidden entries are skipped unless an ignore rule explicitly includes them. Orca reads regular ignore files of at most 1 MiB, with `.rgignore`, `.ignore`, `.gitignore`, `info/exclude`, and global excludes in that order. It reads ancestor `.ignore` and `.gitignore` files through the Git root. Ignore files above that root, `.jj`-only roots, and escaping of special characters in displayed file names are unsupported. Relative `core.excludesFile` paths resolve from the workspace. The default global excludes file is `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`.
+
+To decide whether an outside Git directory belongs to the workspace, Orca reads the workspace's `.git` pointer and checks the candidate `worktrees/<name>/gitdir` backlink or the candidate Git directory's own `config` for `core.worktree`. `config` can therefore be read before the association is established. The backlink must point to the workspace's `.git` file, or `core.worktree` must resolve to the workspace. The association gates `info/exclude`. System, global and XDG Git configuration can supply `core.excludesFile`. All these reads affect filtering only. Orca never returns their content to the model through search discovery.
+
+The model's `Workflow` tool accepts a saved workflow `name` without path separators. `.` and `..` are invalid names. A model-supplied `scriptPath` must resolve inside the workspace, a trusted ancestor's `.orca/workflows`, or your user workflows directory. You can still pass a path directly to `orca workflow run`. Draft IDs must be a single component. Orca reads drafts and resume artifacts from the verified session directory. The host receives the prepared script bytes directly.
 
 Tools are registered through a canonical registry. Each tool spec declares its capability set, renderer hint, exposure, aliases, and concurrent-safety flag. Runtime approval derives from the resolved tool spec instead of a separate hard-coded name list. Tool arguments are validated before execution with common JSON Schema object keywords, enums, arrays, and `oneOf` / `anyOf` composition.
 

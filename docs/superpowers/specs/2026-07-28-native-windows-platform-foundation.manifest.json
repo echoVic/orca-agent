@@ -442,8 +442,22 @@
       "workflow-host-unix-process-api",
       "crates/orca-runtime/src/workflow/host.rs",
       "unix_std_api",
-      6,
+      7,
       "process-ownership-plan"
+    ],
+    [
+      "readonly-turn-test-workspace-alias",
+      "crates/orca-runtime/src/tool_turn.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "workflow-resume-test-linked-files",
+      "crates/orca-runtime/src/workflow/runner.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
     ],
     [
       "workflow-host-test-fifo-flags",
@@ -470,13 +484,20 @@
       "runtime-host-inline-test-unix-api",
       "crates/orca-runtime/src/runtime_host.rs",
       "unix_std_api",
-      1,
+      3,
       "windows-test-portability"
     ],
     [
       "runtime-host-inline-test-unix-process",
       "crates/orca-runtime/src/runtime_host.rs",
       "unix_libc_process",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "workflow-cache-resume-link-fixture",
+      "tests/workflow_runtime_contract.rs",
+      "unix_std_api",
       1,
       "windows-test-portability"
     ],
@@ -523,10 +544,24 @@
       "windows-test-portability"
     ],
     [
+      "runtime-workflow-script-test-unix-fixture",
+      "crates/orca-runtime/src/workflow/script.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "runtime-workflow-draft-test-unix-fixture",
+      "crates/orca-runtime/src/workflow_execution.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "tools-test-unix-fixture",
       "crates/orca-tools/src/lib.rs",
       "unix_std_api",
-      1,
+      2,
       "windows-test-portability"
     ],
     [
@@ -537,10 +572,17 @@
       "windows-test-portability"
     ],
     [
+      "tools-read-document-test-unix-fixture",
+      "crates/orca-tools/src/read_document.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "tools-grep-test-unix-fixture",
       "crates/orca-tools/src/grep.rs",
       "unix_std_api",
-      1,
+      5,
       "windows-test-portability"
     ],
     [

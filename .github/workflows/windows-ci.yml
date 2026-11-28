@@ -92,6 +92,11 @@ jobs:
           cargo test -p orca-windows-sandbox-setup --locked -- --nocapture
           cargo test -p orca-windows-sandbox --locked -- --nocapture
           cargo test -p orca-tools sandbox --locked -- --nocapture
+          cargo test -p orca-tools --lib windows_resolver_accepts_normal_and_verbatim_paths_with_mixed_separators --locked -- --nocapture
+          cargo test -p orca-tools --lib windows_unc_paths_use_the_workspace_spelling --locked -- --nocapture
+          cargo test -p orca-tools --lib windows_workspace_reads_refuse_a_swapped_root_junction --locked -- --nocapture
+          cargo test -p orca-tools --lib windows_workspace_reads_refuse_a_spill_junction_swap --locked -- --nocapture
+          cargo test -p orca-platform --lib windows_directory_enumeration_uses_its_open_handle_after_a_reparse_swap --locked -- --nocapture
           cargo test -p orca-runtime native_windows_shells_accept_capability_sandbox_modes --locked -- --nocapture
           cargo test -p orca-runtime restricted_windows_pty_session_keeps_terminal_and_resizes --locked -- --nocapture
           cargo test -p orca-runtime native_pty_capabilities_match_supported_hosts --locked -- --nocapture

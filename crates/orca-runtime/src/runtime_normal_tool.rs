@@ -111,6 +111,7 @@ pub(crate) fn execute_runtime_normal_tool(
 
     let cancelled = || context.cancel.is_cancelled();
     let ctx = orca_tools::ToolContext::new(&invocation.cwd)
+        .with_workspace_read_root(invocation.config.tools.workspace_read_root.as_deref())
         .with_output_truncation(invocation.output_truncation)
         .with_shell_timeout(Some(Duration::from_secs(
             invocation.effective_shell_timeout_secs(),

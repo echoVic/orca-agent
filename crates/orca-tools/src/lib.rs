@@ -33,7 +33,13 @@ pub mod update_goal;
 pub mod update_plan;
 pub mod web_fetch;
 pub mod web_search;
+mod workspace_ignore;
+mod workspace_read;
 pub mod write_file;
+
+pub use workspace_read::{
+    open_relative_file, open_root as open_workspace_root, open_workspace_file,
+};
 
 pub use registry::{Tool, ToolContext, ToolRegistry, validate_tool_request};
 
@@ -298,42 +304,234 @@ pub fn collect_readonly_batch(
 }
 
 pub fn resolve_workspace_path(cwd: &Path, target: Option<&str>) -> Result<PathBuf, String> {
-    let target = target.unwrap_or(".");
-    let candidate = PathBuf::from(target);
-    let joined = if candidate.is_absolute() {
-        candidate
-    } else {
-        cwd.join(candidate)
-    };
+    resolve_workspace_read_path(cwd, target).map(|resolved| resolved.path)
+}
 
+pub(crate) struct ResolvedWorkspacePath {
+    pub path: PathBuf,
+    pub root: PathBuf,
+    pub canonical: PathBuf,
+}
+
+pub(crate) fn resolve_workspace_read_path(
+    cwd: &Path,
+    target: Option<&str>,
+) -> Result<ResolvedWorkspacePath, String> {
+    resolve_workspace_path_inner(cwd, target, false)
+}
+
+/// Resolve a write target using the lexical path shown in edit and patch previews.
+pub fn resolve_workspace_write_path(cwd: &Path, target: &str) -> Result<PathBuf, String> {
+    resolve_workspace_path_inner(cwd, Some(target), true).map(|resolved| resolved.path)
+}
+
+fn resolve_workspace_path_inner(
+    cwd: &Path,
+    target: Option<&str>,
+    allow_missing_parents: bool,
+) -> Result<ResolvedWorkspacePath, String> {
+    use std::path::Component;
+
+    let target = target.filter(|target| !target.is_empty()).unwrap_or(".");
+    #[cfg(windows)]
+    reject_drive_relative(target)?;
+    #[cfg(windows)]
+    let candidate = PathBuf::from(target.replace('/', "\\"));
+    #[cfg(not(windows))]
+    let candidate = PathBuf::from(target);
+    let root = if allow_missing_parents {
+        cwd.canonicalize()
+            .map_err(|error| format!("cannot resolve cwd: {error}"))?
+    } else {
+        open_workspace_root(cwd).map_err(|error| error.to_string())?;
+        cwd.to_path_buf()
+    };
+    let joined = join_requested_path(cwd, candidate);
+
+    // Check the lexical target before resolving any components on disk.
     let mut normalized = PathBuf::new();
+    let mut has_parent_component = false;
     for component in joined.components() {
         match component {
-            std::path::Component::ParentDir => {
+            Component::ParentDir => {
                 normalized.pop();
+                has_parent_component = true;
             }
-            std::path::Component::CurDir => {}
+            Component::CurDir => {}
             _ => normalized.push(component),
         }
     }
-
+    #[cfg(windows)]
+    if cwd.is_absolute() {
+        normalized = windows_path_in_workspace(cwd, &normalized, target)?;
+    }
+    #[cfg(target_os = "macos")]
+    if !allow_missing_parents && !normalized.starts_with(cwd) {
+        normalized = macos_path_in_workspace(cwd, &normalized)
+            .ok_or_else(|| format!("path escapes workspace: {target}"))?;
+    }
     if !normalized.starts_with(cwd) {
         return Err(format!("path escapes workspace: {target}"));
     }
 
-    if normalized.exists() {
-        let canonical = normalized
-            .canonicalize()
-            .map_err(|e| format!("cannot resolve path: {e}"))?;
-        let canonical_cwd = cwd
-            .canonicalize()
-            .map_err(|e| format!("cannot resolve cwd: {e}"))?;
-        if !canonical.starts_with(&canonical_cwd) {
-            return Err(format!("path escapes workspace via symlink: {target}"));
+    let resolve_error = |error| format!("cannot resolve path {target}: {error}");
+    let joined = if allow_missing_parents {
+        normalized.clone()
+    } else if has_parent_component {
+        resolve_parent_components(&joined).map_err(resolve_error)?
+    } else if Path::new(target).is_absolute() {
+        normalized.clone()
+    } else {
+        joined
+    };
+    let canonical = match joined.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut parent = joined.parent().ok_or_else(|| resolve_error(error))?;
+            let canonical_parent = loop {
+                match parent.canonicalize() {
+                    Ok(path) if path.is_dir() => break path,
+                    Ok(_) => {
+                        return Err(format!(
+                            "cannot resolve path {target}: a parent is not a directory"
+                        ));
+                    }
+                    Err(error)
+                        if allow_missing_parents
+                            && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        parent = parent.parent().ok_or_else(|| resolve_error(error))?;
+                    }
+                    Err(error) => return Err(resolve_error(error)),
+                }
+            };
+            canonical_parent.join(joined.strip_prefix(parent).expect("checked path parent"))
+        }
+        Err(error) => return Err(resolve_error(error)),
+    };
+    #[cfg(windows)]
+    let canonical = windows_path_in_workspace(&root, &canonical, target)
+        .map_err(|_| format!("path escapes workspace via symlink: {target}"))?;
+    let relative = canonical
+        .strip_prefix(&root)
+        .map_err(|_| format!("path escapes workspace via symlink: {target}"))?;
+    // A parent component after a link can lead to a different in-workspace
+    // path than the label obtained by removing those components lexically.
+    let path =
+        if has_parent_component && normalized.canonicalize().ok().as_deref() != Some(&canonical) {
+            cwd.join(relative)
+        } else {
+            normalized
+        };
+    Ok(ResolvedWorkspacePath {
+        path,
+        root,
+        canonical,
+    })
+}
+
+#[cfg(not(windows))]
+fn join_requested_path(cwd: &Path, candidate: PathBuf) -> PathBuf {
+    cwd.join(candidate)
+}
+
+#[cfg(windows)]
+fn join_requested_path(cwd: &Path, candidate: PathBuf) -> PathBuf {
+    if candidate.is_absolute() {
+        return candidate;
+    }
+    // Appending to a verbatim PathBuf with push would remove parent components
+    // before we have checked that the directories they refer to exist.
+    let mut joined = if candidate.has_root() {
+        match cwd.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => prefix.as_os_str().to_owned(),
+            _ => return candidate,
+        }
+    } else {
+        let mut directory = cwd.as_os_str().to_owned();
+        directory.push("\\");
+        directory
+    };
+    joined.push(candidate.as_os_str());
+    PathBuf::from(joined)
+}
+
+fn resolve_parent_components(path: &Path) -> std::io::Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        if component == std::path::Component::ParentDir {
+            resolved = resolved.canonicalize()?;
+            if !resolved.is_dir() {
+                return Err(std::io::ErrorKind::NotADirectory.into());
+            }
+            resolved.pop();
+        } else {
+            resolved.push(component);
         }
     }
+    Ok(resolved)
+}
 
-    Ok(normalized)
+#[cfg(target_os = "macos")]
+fn macos_path_in_workspace(cwd: &Path, path: &Path) -> Option<PathBuf> {
+    use orca_platform::fs::VerifiedDirectory;
+    use unicode_casefold::UnicodeCaseFold;
+    use unicode_normalization::UnicodeNormalization;
+
+    let depth = path
+        .components()
+        .count()
+        .checked_sub(cwd.components().count())?;
+    let prefix = path.ancestors().nth(depth)?;
+    let normalize =
+        |path: &Path| -> Option<String> { Some(path.to_str()?.nfc().case_fold().nfc().collect()) };
+    let resolved_prefix = prefix.canonicalize().ok()?;
+    if normalize(cwd)? != normalize(&resolved_prefix)? {
+        return None;
+    }
+    let expected = open_workspace_root(cwd).ok()?.identity().ok()?;
+    let actual = VerifiedDirectory::open(&resolved_prefix)
+        .ok()?
+        .identity()
+        .ok()?;
+    (expected == actual).then(|| cwd.join(path.strip_prefix(prefix).expect("checked prefix")))
+}
+
+#[cfg(any(test, windows))]
+fn reject_drive_relative(path: &str) -> Result<(), String> {
+    let spelling = path.replace('/', "\\");
+    let spelling = spelling.strip_prefix(r"\\?\").unwrap_or(&spelling);
+    let bytes = spelling.as_bytes();
+    if bytes.first().is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(1) == Some(&b':')
+        && bytes.get(2) != Some(&b'\\')
+    {
+        return Err(format!("drive-relative paths are not supported: {path}"));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, windows))]
+fn windows_path_identity(path: &str) -> Result<orca_platform::fs::PathIdentity, String> {
+    reject_drive_relative(path)?;
+    orca_platform::fs::PathIdentity::windows(path).map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn windows_path_in_workspace(cwd: &Path, path: &Path, target: &str) -> Result<PathBuf, String> {
+    let workspace = windows_path_identity(&cwd.to_string_lossy())?;
+    let candidate = windows_path_identity(&path.to_string_lossy())?;
+    if !candidate.is_within(&workspace) {
+        return Err(format!("path escapes workspace: {target}"));
+    }
+    let mut path = cwd.to_owned();
+    path.extend(candidate.components().skip(workspace.components().count()));
+    Ok(path)
+}
+
+#[cfg(test)]
+pub(crate) fn workspace_tempdir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)
 }
 
 #[cfg(test)]
@@ -348,6 +546,337 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_file_used_as_a_directory_is_an_error() {
+        let workspace = workspace_tempdir().unwrap();
+        fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::create_dir(workspace.path().join("crates")).unwrap();
+        assert!(resolve_workspace_path(workspace.path(), Some("Cargo.toml/../crates")).is_err());
+    }
+
+    #[test]
+    fn a_missing_intermediate_directory_is_an_error() {
+        let workspace = workspace_tempdir().unwrap();
+        fs::create_dir(workspace.path().join("crates")).unwrap();
+        assert!(resolve_workspace_path(workspace.path(), Some("missing/../crates")).is_err());
+        assert!(resolve_workspace_path(workspace.path(), Some("missing/file.txt")).is_err());
+        assert!(resolve_workspace_path(workspace.path(), Some("crates/file.txt")).is_ok());
+    }
+
+    #[test]
+    fn an_empty_path_means_the_workspace_root() {
+        let workspace = workspace_tempdir().unwrap();
+        assert_eq!(
+            resolve_workspace_path(workspace.path(), Some("")).unwrap(),
+            workspace.path()
+        );
+    }
+
+    #[test]
+    fn verbatim_and_normal_windows_paths_compare_equal() {
+        assert_eq!(
+            windows_path_identity(r"\\?\C:\work\repo\src").unwrap(),
+            windows_path_identity(r"C:\work/repo\src").unwrap(),
+        );
+    }
+
+    #[test]
+    fn verbatim_unc_and_unc_compare_equal() {
+        assert_eq!(
+            windows_path_identity(r"\\?\UNC\server\share\repo\src").unwrap(),
+            windows_path_identity(r"\\server/share\repo/src").unwrap(),
+        );
+    }
+
+    #[test]
+    fn drive_relative_paths_are_refused() {
+        assert_eq!(
+            windows_path_identity("C:foo").unwrap_err(),
+            "drive-relative paths are not supported: C:foo",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_read_resolver_accepts_equivalent_root_spellings_by_identity() {
+        let fixture = workspace_tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let root = base.join("Répo");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("notes.txt"), "inside").unwrap();
+        let mut tested = false;
+        for spelling in ["répo", "Re\u{301}po"] {
+            let alternate = base.join(spelling).join("notes.txt");
+            if alternate.is_file() {
+                tested = true;
+                let resolved = resolve_workspace_read_path(&root, alternate.to_str()).unwrap();
+                assert_eq!(resolved.path, root.join("notes.txt"));
+            }
+        }
+        assert!(tested, "expected a normalization-equivalent path on macOS");
+        assert!(resolve_workspace_read_path(&root, base.join("other/notes.txt").to_str()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolver_accepts_normal_and_verbatim_paths_with_mixed_separators() {
+        let fixture = workspace_tempdir().unwrap();
+        let verbatim = fixture.path().canonicalize().unwrap();
+        let plain = Path::new(verbatim.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+        fs::create_dir(plain.join("src")).unwrap();
+        for (root, target) in [
+            (&verbatim as &Path, plain.join("src")),
+            (plain, verbatim.join("src")),
+        ] {
+            let mixed = target.to_str().unwrap().replace(r"\src", "/src");
+            assert_eq!(
+                resolve_workspace_path(root, Some(&mixed)).unwrap(),
+                root.join("src")
+            );
+        }
+        assert_eq!(
+            resolve_workspace_path(plain, Some("C:foo")).unwrap_err(),
+            "drive-relative paths are not supported: C:foo",
+        );
+    }
+
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/S", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_reads_refuse_a_swapped_root_junction() {
+        let fixture = workspace_tempdir().unwrap();
+        let cwd = fixture.path().join("workspace");
+        let neighbor = fixture.path().join("neighbor");
+        fs::create_dir(&cwd).unwrap();
+        fs::create_dir(&neighbor).unwrap();
+        fs::write(cwd.join("notes.txt"), "inside").unwrap();
+        fs::write(neighbor.join("notes.txt"), "outside").unwrap();
+        let request = ToolRequest {
+            id: "read".into(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("notes.txt".into()),
+            raw_arguments: None,
+        };
+        let accepted = cwd.canonicalize().unwrap();
+        fs::rename(&cwd, fixture.path().join("old")).unwrap();
+        junction(&cwd, &neighbor);
+        let result = read_file::execute(&request, &accepted, 4096);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("workspace path changed while Orca was running")
+        );
+        fs::remove_dir(cwd).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_reads_refuse_a_spill_junction_swap() {
+        let fixture = workspace_tempdir().unwrap();
+        let cwd = fixture.path().join("workspace");
+        let session = fixture.path().join("session");
+        let spill = session.join("spill");
+        let neighbor = fixture.path().join("neighbor");
+        for dir in [&cwd, &spill, &neighbor.join("spill")] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let file = spill.join("call.txt");
+        fs::write(&file, "saved result").unwrap();
+        fs::write(neighbor.join("spill/call.txt"), "outside").unwrap();
+        let request = ToolRequest {
+            id: "read".into(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some(file.to_str().unwrap().into()),
+            raw_arguments: None,
+        };
+        let read = || read_file::execute_in_session(&request, &cwd, 4096, Some(&spill), || false);
+        assert!(read().output.unwrap().contains("saved result"));
+        fs::rename(&session, fixture.path().join("old")).unwrap();
+        junction(&session, &neighbor);
+        let result = read();
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(result.output.is_none());
+        fs::remove_dir(session).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unc_paths_use_the_workspace_spelling() {
+        let plain = Path::new(r"\\server\share\repo");
+        let verbatim = Path::new(r"\\?\UNC\server\share\repo");
+        for (root, target) in [(plain, verbatim), (verbatim, plain)] {
+            let target = target.join("src");
+            assert_eq!(
+                windows_path_in_workspace(root, &target, "src").unwrap(),
+                root.join("src")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) use std::os::unix::fs::symlink;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_link_after_resolution_is_refused() {
+        let fixture = workspace_tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap().join("workspace");
+        let folder = root.join("folder");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("file.txt"), "workspace text").unwrap();
+        let replacement = fixture.path().join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        fs::write(replacement.join("file.txt"), "neighbor text").unwrap();
+
+        let path = resolve_workspace_path(&root, Some("folder/file.txt")).unwrap();
+        fs::rename(&folder, root.join("previous")).unwrap();
+        symlink(&replacement, &folder).unwrap();
+
+        assert_eq!(
+            open_workspace_file(&root, &path).unwrap_err().to_string(),
+            format!("path changed while it was opened: {}", path.display())
+        );
+    }
+
+    #[cfg(unix)]
+    fn read_workspace_notes(root: &Path) -> orca_core::tool_types::ToolResult {
+        let request = ToolRequest {
+            id: "read".into(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("notes.txt".into()),
+            raw_arguments: None,
+        };
+        read_file::execute(&request, root, 4096)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_swapped_for_a_link_before_the_first_read_is_refused() {
+        let fixture = workspace_tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let root = base.join("workspace");
+        let neighbor = base.join("neighbor");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&neighbor).unwrap();
+        fs::write(neighbor.join("notes.txt"), "neighbor text").unwrap();
+        let accepted = root.canonicalize().unwrap();
+        fs::rename(&root, base.join("previous")).unwrap();
+        symlink(&neighbor, &root).unwrap();
+        assert_eq!(
+            read_workspace_notes(&accepted).error.as_deref().unwrap(),
+            format!(
+                "workspace path changed while Orca was running: {}",
+                accepted.display()
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    fn read_after_reclone(new_session: bool) {
+        let fixture = workspace_tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("notes.txt"), "original").unwrap();
+        let accepted = root.canonicalize().unwrap();
+        assert!(
+            read_workspace_notes(&accepted)
+                .output
+                .unwrap()
+                .contains("original")
+        );
+        fs::rename(&root, root.with_file_name("previous")).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("notes.txt"), "recloned").unwrap();
+        let accepted = if new_session {
+            root.canonicalize().unwrap()
+        } else {
+            accepted
+        };
+        assert!(
+            read_workspace_notes(&accepted)
+                .output
+                .unwrap()
+                .contains("recloned")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recloned_workspace_at_the_same_path_keeps_working() {
+        read_after_reclone(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_session_after_a_reclone_reads_normally() {
+        read_after_reclone(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_root_swapped_after_resolution_is_refused() {
+        let fixture = workspace_tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap().join("workspace");
+        let neighbor = fixture.path().join("neighbor");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&neighbor).unwrap();
+        fs::write(root.join("notes.txt"), "workspace text").unwrap();
+        fs::write(neighbor.join("notes.txt"), "neighbor text").unwrap();
+        let path = resolve_workspace_read_path(&root, Some("notes.txt")).unwrap();
+        fs::rename(&root, fixture.path().join("previous")).unwrap();
+        symlink(&neighbor, &root).unwrap();
+        assert!(crate::workspace_read::open_read_file(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_outward_link_in_a_parent_is_refused() {
+        let fixture = workspace_tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap().join("workspace");
+        let neighbor = fixture.path().join("neighbor");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&neighbor).unwrap();
+        fs::write(neighbor.join("file.txt"), "neighbor text").unwrap();
+        let link = root.join("folder");
+        symlink(&neighbor, &link).unwrap();
+
+        let request = ToolRequest {
+            id: "read".into(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("folder/file.txt".into()),
+            raw_arguments: None,
+        };
+        let result = read_file::execute(&request, &root, 4096);
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("escapes workspace")
+        );
+    }
 
     #[test]
     fn micro_compact_preserves_head_and_tail() {
@@ -549,7 +1078,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mcp_tool_execution_observes_cancel_callback() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         let server = temp_dir.path().join("slow_mcp_server.sh");
         fs::write(
             &server,
@@ -876,7 +1405,7 @@ done
     fn external_tool_runs_to_completion_without_an_administrator_cap() {
         // `shell_timeout_secs = 0` is the default and sets no cap; it must
         // not become a one-second limit on every external tool.
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = workspace_tempdir().unwrap();
         let external_tools = vec![ExternalToolConfig {
             name: "slow_lookup".to_string(),
             description: "takes a moment".to_string(),
@@ -910,7 +1439,7 @@ done
 
     #[test]
     fn external_tool_stops_at_the_administrator_cap() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = workspace_tempdir().unwrap();
         let external_tools = vec![ExternalToolConfig {
             name: "slow_lookup".to_string(),
             description: "takes too long".to_string(),
@@ -973,7 +1502,7 @@ done
 
     #[test]
     fn registry_executes_glob_with_pattern_and_path() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         fs::create_dir_all(temp_dir.path().join("src/bin")).expect("fixture dir");
         fs::write(temp_dir.path().join("src/lib.rs"), "lib").expect("fixture");
         fs::write(temp_dir.path().join("src/bin/main.rs"), "main").expect("fixture");
@@ -998,7 +1527,7 @@ done
 
     #[test]
     fn registry_executes_glob_with_workspace_prefixed_pattern_from_dot_path() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         fs::create_dir_all(temp_dir.path().join("src/bin")).expect("fixture dir");
         fs::write(temp_dir.path().join("src/lib.rs"), "lib").expect("fixture");
         fs::write(temp_dir.path().join("src/bin/main.rs"), "main").expect("fixture");
@@ -1023,7 +1552,7 @@ done
 
     #[test]
     fn registry_executes_glob_with_no_matches() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         fs::create_dir_all(temp_dir.path()).expect("fixture dir");
         let reg = registry::default_tool_registry();
         let request = ToolRequest {
@@ -1046,7 +1575,7 @@ done
 
     #[test]
     fn registry_executes_glob_with_fuzzy_query() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         fs::create_dir_all(temp_dir.path().join("src/runtime/config")).expect("fixture dir");
         fs::write(temp_dir.path().join("src/runtime/config/mod.rs"), "mod").expect("fixture");
         let reg = registry::default_tool_registry();
@@ -1094,7 +1623,7 @@ done
 
     #[test]
     fn registry_executes_glob_with_truncated_kind() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         fs::create_dir_all(temp_dir.path().join("src")).expect("fixture dir");
         fs::write(temp_dir.path().join("src/alpha.rs"), "alpha").expect("fixture");
         fs::write(temp_dir.path().join("src/bravo.rs"), "bravo").expect("fixture");
@@ -1118,7 +1647,7 @@ done
 
     #[test]
     fn registry_executes_builtin_tool_by_registered_name() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         fs::write(temp_dir.path().join("note.txt"), "hello registry\n").expect("fixture");
         let reg = registry::default_tool_registry();
         let request = ToolRequest {

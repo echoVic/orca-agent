@@ -2685,6 +2685,29 @@ impl RuntimeThreadStartRequest {
     }
 
     fn prepare(mut self) -> Result<PreparedRuntimeThreadStart, RuntimeHostError> {
+        let cwd = self
+            .config
+            .cwd
+            .clone()
+            .map_or_else(std::env::current_dir, Ok)
+            .and_then(|cwd| {
+                // Hosted agents receive the parent's config for this cwd.
+                if self.agent_type.is_none()
+                    || self.config.cwd.is_none()
+                    || self.config.tools.workspace_read_root.is_none()
+                {
+                    crate::command::config::accept_workspace(&mut self.config, &cwd)?;
+                }
+                Ok(cwd)
+            })
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("cannot resolve workspace: {error}"),
+            })?;
+        self.config.cwd = Some(cwd);
+        if self.config.workflows.user_directory.is_none() {
+            self.config.workflows.user_directory =
+                crate::command::config::user_workflow_directory();
+        }
         if self.inherited_conversation.is_some() {
             if !matches!(self.config.history_mode, HistoryMode::Disabled) {
                 return Err(RuntimeHostError::ThreadStartFailed {
@@ -8017,12 +8040,12 @@ fn reconcile_durable_workflow_outcomes_on_start(
             message: "workflow recovery requires a working directory".to_string(),
         })?;
     let task_registry = thread.session().task_registry().clone();
-    let session_dir = task_registry.workflow_session_dir(&cwd).map_err(|error| {
-        RuntimeHostError::ThreadStartFailed {
-            message: format!("failed to resolve workflow runtime storage: {error}"),
-        }
-    })?;
-    let runner = WorkflowRunner::new(config.clone(), task_registry, session_dir);
+    let runner =
+        WorkflowRunner::for_session(config.clone(), task_registry, &cwd).map_err(|error| {
+            RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to resolve workflow runtime storage: {error}"),
+            }
+        })?;
     loop {
         let snapshot = coordinator.state().snapshot().clone();
         let mut durable_outcome = None;
@@ -12354,6 +12377,8 @@ fn apply_runtime_settings_patch(
             settings.active_permission_profile = None;
         }
         surface::RuntimeSettingsPatch::SetCwd { cwd } => {
+            crate::command::config::accept_workspace(config, cwd.as_path())
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
             config.cwd = Some(cwd.as_path().to_path_buf());
             settings.cwd = cwd.clone();
         }
@@ -12482,13 +12507,17 @@ pub fn hydrate_run_config_from_surface_settings(
         }
     };
     apply_runtime_settings_patch(config, &mut restored, &approval_patch)?;
-    apply_runtime_settings_patch(
-        config,
-        &mut restored,
-        &surface::RuntimeSettingsPatch::SetCwd {
-            cwd: settings.cwd.clone(),
-        },
-    )?;
+    if config.cwd.as_deref() != Some(settings.cwd.as_path())
+        || config.tools.workspace_read_root.is_none()
+    {
+        apply_runtime_settings_patch(
+            config,
+            &mut restored,
+            &surface::RuntimeSettingsPatch::SetCwd {
+                cwd: settings.cwd.clone(),
+            },
+        )?;
+    }
     apply_runtime_settings_patch(
         config,
         &mut restored,
@@ -20732,9 +20761,21 @@ impl ThreadActor {
                 let initial_generation = GenerationFence::initial(operation_id);
                 let completion = OperationCompletion::new();
                 let mut request = *request;
-                let mut config = config
-                    .map(|config| *config)
-                    .unwrap_or_else(|| self.config.clone());
+                let mut config = if let Some(mut config) = config {
+                    let cwd = config.cwd.clone().map_or_else(std::env::current_dir, Ok);
+                    if let Err(error) = cwd.and_then(|cwd| {
+                        crate::command::config::inherit_workspace(&mut config, &self.config, &cwd)
+                    }) {
+                        self.state = Some(state);
+                        let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
+                            message: format!("cannot resolve workspace: {error}"),
+                        }));
+                        return;
+                    }
+                    *config
+                } else {
+                    self.config.clone()
+                };
                 if request.operation_kind() == &HostedOperationKind::GoalRun {
                     request.task_description = None;
                     request.task_id = None;
@@ -25791,6 +25832,44 @@ mod tests {
         );
         assert!(!child.config.computer_use.interactive);
         assert_eq!(child.config.startup_approval_mode, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_started_after_a_link_swap_keeps_the_parents_root() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let replacement = fixture.path().join("replacement");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let config = RunConfig {
+            cwd: Some(workspace.clone()),
+            history_mode: HistoryMode::Disabled,
+            ..Default::default()
+        };
+        let parent = RuntimeThreadStartRequest::new(config, "parent")
+            .prepare()
+            .unwrap();
+        let accepted_root = workspace.canonicalize().unwrap();
+
+        fs::rename(&workspace, fixture.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&replacement, &workspace).unwrap();
+        let child = RuntimeThreadStartRequest::new(parent.request.config, "child")
+            .with_agent_parent(
+                "parent",
+                "parent",
+                1,
+                orca_core::subagent_types::SubagentType::General,
+                "task".to_owned(),
+                TaskRegistry::new("parent".to_owned()),
+            )
+            .prepare()
+            .unwrap();
+
+        assert_eq!(
+            child.request.config.tools.workspace_read_root,
+            Some(accepted_root)
+        );
     }
 
     #[test]
@@ -39805,6 +39884,77 @@ mod tests {
             thread.shutdown().unwrap();
             host.shutdown().unwrap();
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hydrated_process_workspace_refuses_a_later_link_swap() {
+        const CHILD: &str = "ORCA_TEST_HYDRATED_PROCESS_WORKSPACE";
+        if std::env::var_os(CHILD).is_none() {
+            // Changing the working directory here would affect the other tests.
+            let fixture = tempfile::tempdir().unwrap();
+            let cwd = fixture.path().join("workspace");
+            std::fs::create_dir(&cwd).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .current_dir(cwd)
+                .env(CHILD, "1")
+                .args([
+                    "--exact",
+                    concat!(
+                        module_path!(),
+                        "::hydrated_process_workspace_refuses_a_later_link_swap"
+                    )
+                    .split_once("::")
+                    .unwrap()
+                    .1,
+                ])
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}"
+            );
+            return;
+        }
+
+        let cwd = std::env::current_dir().unwrap();
+        let saved = surface_test_config(cwd.clone(), HistoryMode::Disabled);
+        let snapshot = initial_surface_snapshot(
+            surface::SurfaceThreadId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+            surface::SurfaceIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+            surface::ThreadOwnerEpoch::new(1),
+            surface::ThreadPersistence::EphemeralAttached,
+            &saved,
+            "restored workspace",
+            None,
+        )
+        .unwrap();
+        let mut config = RunConfig::default();
+        hydrate_run_config_from_surface_settings(&mut config, &snapshot.settings.effective)
+            .unwrap();
+
+        let moved = cwd.with_file_name("moved");
+        std::fs::rename(&cwd, &moved).unwrap();
+        std::fs::write(moved.join("notes.txt"), "original").unwrap();
+        std::os::unix::fs::symlink(&moved, &cwd).unwrap();
+        let request = orca_core::tool_types::ToolRequest {
+            id: "read-notes".into(),
+            name: orca_core::tool_types::ToolName::ReadFile,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: Some("notes.txt".into()),
+            raw_arguments: Some(r#"{"path":"notes.txt"}"#.into()),
+        };
+        let context = orca_tools::ToolContext::new(config.cwd.as_deref().unwrap())
+            .with_workspace_read_root(config.tools.workspace_read_root.as_deref());
+        let result = orca_tools::registry::default_tool_registry().execute(&request, &context);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("workspace path changed")),
+            "{result:?}"
+        );
     }
 
     #[test]

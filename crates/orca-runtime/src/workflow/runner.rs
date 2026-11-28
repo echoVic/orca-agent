@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -61,7 +61,8 @@ use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost, WorkflowHostIpcPaths};
 use super::ipc::WorkflowIpcContext;
 use super::script::{
-    ResolvedWorkflowScript, resolve_workflow_script_to_path, validate_workflow_args,
+    ResolvedWorkflowScript, ScriptPathAccess, resolve_workflow_script_for_launch,
+    validate_workflow_args,
 };
 use super::state::{
     WorkflowAgentRecord, WorkflowAgentStatusCounts, WorkflowStateStore, WorkflowWorkerRecord,
@@ -813,6 +814,24 @@ impl WorkflowRunner {
         }
     }
 
+    pub(crate) fn for_session(
+        config: RunConfig,
+        tasks: TaskRegistry,
+        cwd: &Path,
+    ) -> io::Result<Self> {
+        let workspace = config
+            .tools
+            .workspace_read_root
+            .clone()
+            .map_or_else(|| cwd.canonicalize(), Ok)?;
+        let session_dir = tasks.workflow_session_dir(&workspace)?;
+        let mut config = config;
+        config.tools.workspace_read_root = Some(workspace.clone());
+        let mut runner = Self::new(config, tasks.clone(), session_dir);
+        runner.state = runner.state.with_session(tasks, workspace);
+        Ok(runner)
+    }
+
     pub(crate) fn with_parent_budget(
         mut self,
         reservation: Option<crate::child_budget_ledger::ChildBudgetReservation>,
@@ -885,13 +904,13 @@ impl WorkflowRunner {
     }
 
     pub fn launch(&self, request: WorkflowLaunchRequest) -> io::Result<WorkflowLaunchResult> {
-        let prepared = self.prepare_launch(request)?;
+        let prepared = self.prepare_launch(request, ScriptPathAccess::User)?;
         self.activate_prepared_run(&prepared)?;
         self.execute_prepared(prepared)
     }
 
     pub fn resume(&self, request: WorkflowLaunchRequest) -> io::Result<WorkflowLaunchResult> {
-        let prepared = self.prepare_launch(request)?;
+        let prepared = self.prepare_launch(request, ScriptPathAccess::User)?;
         self.activate_prepared_run(&prepared)?;
         self.execute_prepared(prepared)
     }
@@ -908,7 +927,22 @@ impl WorkflowRunner {
         &self,
         request: WorkflowLaunchRequest,
     ) -> io::Result<PreparedWorkflowBackgroundLaunch> {
-        let prepared = self.prepare_launch(request)?;
+        self.prepare_background_with_access(request, ScriptPathAccess::User)
+    }
+
+    pub(crate) fn prepare_model_background(
+        &self,
+        request: WorkflowLaunchRequest,
+    ) -> io::Result<PreparedWorkflowBackgroundLaunch> {
+        self.prepare_background_with_access(request, ScriptPathAccess::Model)
+    }
+
+    fn prepare_background_with_access(
+        &self,
+        request: WorkflowLaunchRequest,
+        access: ScriptPathAccess<'_>,
+    ) -> io::Result<PreparedWorkflowBackgroundLaunch> {
+        let prepared = self.prepare_launch(request, access)?;
         let task_id = prepared.task_id.clone();
         let run_id = prepared.run_id.clone();
         let workflow_name = prepared.resolved.meta.name.clone();
@@ -1163,7 +1197,7 @@ impl WorkflowRunner {
         {
             return Ok(());
         }
-        WorkflowIpcContext::reconcile_dead_claims(&self.state.task_lists_path(run_id))?;
+        self.reconcile_task_list_claims(run_id)?;
         state.status = WorkflowRunStatus::Failed;
         state.final_summary = None;
         state.error = Some("Workflow interrupted by runtime restart".to_string());
@@ -1174,22 +1208,49 @@ impl WorkflowRunner {
         Ok(())
     }
 
-    fn prepare_launch(&self, request: WorkflowLaunchRequest) -> io::Result<PreparedWorkflowRun> {
+    fn prepare_launch(
+        &self,
+        request: WorkflowLaunchRequest,
+        access: ScriptPathAccess<'_>,
+    ) -> io::Result<PreparedWorkflowRun> {
         let mut request = request;
-        let cwd = match self.config.cwd.clone() {
-            Some(cwd) => cwd,
-            None => std::env::current_dir()?,
+        let cwd = match &self.config.tools.workspace_read_root {
+            Some(cwd) => cwd.clone(),
+            None => self
+                .config
+                .cwd
+                .clone()
+                .map_or_else(std::env::current_dir, Ok)?
+                .canonicalize()?,
         };
-        fs::create_dir_all(&self.session_dir)?;
+        let draft_session;
+        let access = if let Some(draft) = request.input.draft_id.as_deref() {
+            super::draft::validate_draft_id(draft)?;
+            if matches!(access, ScriptPathAccess::Model) {
+                orca_tools::open_workspace_root(&cwd)?;
+            }
+            draft_session = self.state.open_session()?;
+            ScriptPathAccess::Draft(&self.session_dir, &draft_session)
+        } else {
+            access
+        };
 
-        if request.input.token_budget.is_none()
-            && let Some(resume_from_run_id) = request.input.resume_from_run_id.as_deref()
-        {
-            request.input.token_budget = self
-                .state
-                .load_launch_input(resume_from_run_id)
-                .ok()
-                .and_then(|input| input.token_budget);
+        if let Some(source) = request.input.resume_from_run_id.as_deref() {
+            let launch = match self.state.load_launch_input(source) {
+                Ok(input) => Some(input),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            if request.input.token_budget.is_none() {
+                request.input.token_budget = launch.and_then(|input| input.token_budget);
+            }
+            for name in ["task-lists.json", "agent-cache.json"] {
+                match self.state.open_artifact(source, name) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
         }
         if request.input.token_budget == Some(0) {
             return Err(io::Error::new(
@@ -1201,8 +1262,14 @@ impl WorkflowRunner {
         let run_id = format!("workflow-run-{}", uuid::Uuid::new_v4());
         let persisted_script_path = self.state.run_dir(&run_id).join("script.js");
         let resolved_input = self.resolve_launch_input(&request.input)?;
-        let resolved =
-            resolve_workflow_script_to_path(&resolved_input, &cwd, &persisted_script_path)?;
+        let _session = self.state.ensure_session()?;
+        let resolved = resolve_workflow_script_for_launch(
+            &resolved_input,
+            &cwd,
+            &persisted_script_path,
+            self.config.workflows.user_directory.as_deref(),
+            access,
+        )?;
         let normalized_args =
             validate_workflow_args(resolved_input.args.clone(), &resolved.args_schema)?;
         request.input.args = Some(normalized_args);
@@ -1266,13 +1333,10 @@ impl WorkflowRunner {
     }
 
     fn resolve_launch_input(&self, input: &WorkflowInput) -> io::Result<WorkflowInput> {
-        let Some(draft_id) = input
-            .draft_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        else {
+        let Some(draft_id) = input.draft_id.as_deref() else {
             return Ok(input.clone());
         };
+        super::draft::validate_draft_id(draft_id)?;
 
         if input.script.is_some() || input.script_path.is_some() || input.name.is_some() {
             return Err(io::Error::new(
@@ -1286,13 +1350,6 @@ impl WorkflowRunner {
             .join("workflow-drafts")
             .join(draft_id)
             .join("script.js");
-        if !script_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("workflow draft `{draft_id}` not found"),
-            ));
-        }
-
         Ok(WorkflowInput {
             draft_id: None,
             script_path: Some(script_path.display().to_string()),
@@ -1319,7 +1376,7 @@ impl WorkflowRunner {
         let resume_from = request.input.resume_from_run_id.clone();
         let restart_phase = request.input.restart_phase.clone();
         if let Some(source) = &resume_from {
-            WorkflowIpcContext::reconcile_dead_claims(&self.state.task_lists_path(source))?;
+            self.reconcile_task_list_claims(source)?;
         }
         let cached_agents = Arc::new(AtomicU32::new(0));
         let mut failed_error = None;
@@ -1360,7 +1417,11 @@ impl WorkflowRunner {
         let mut phase_agent_baselines = std::collections::HashMap::new();
         let mut agent_events_seen = 0u32;
         match WorkflowHost::run_with_agent_event_control_and_ipc_paths(
-            &resolved.persisted_path,
+            (
+                &resolved.persisted_path,
+                &resolved.script,
+                &resolved.script_digest,
+            ),
             args,
             (&ipc_paths, &workflow_ipc),
             workflow_limits.max_concurrent_agents,
@@ -1523,6 +1584,17 @@ impl WorkflowRunner {
         })
     }
 
+    fn reconcile_task_list_claims(&self, run_id: &str) -> io::Result<()> {
+        match self.state.open_artifact(run_id, "task-lists.json") {
+            Ok(_) => WorkflowIpcContext::reconcile_verified_claims(
+                &self.state.task_lists_path(run_id),
+                || self.state.open_artifact(run_id, "task-lists.json"),
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn resumed_spent_tokens(&self, resume_from: Option<&str>) -> io::Result<u64> {
         resume_from
             .map(|run_id| {
@@ -1592,7 +1664,7 @@ impl WorkflowRunner {
         {
             if let Some(cached_value) =
                 self.state
-                    .find_cached_agent_value(resume_run_id, &call.call_path, &hash)
+                    .find_cached_agent_value(resume_run_id, &call.call_path, &hash)?
             {
                 cached_agents.fetch_add(1, Ordering::Relaxed);
                 let normalized_cached_value = normalize_cached_agent_result(&call, cached_value);
@@ -1673,10 +1745,12 @@ impl WorkflowRunner {
 
         let mut continuation_selector = resume_from
             .filter(|_| !call_path_matches_phase(&call.call_path, restart_phase))
-            .and_then(|resume_run_id| {
+            .map(|resume_run_id| {
                 self.state
                     .find_agent_record(resume_run_id, &call.call_path, &hash)
             })
+            .transpose()?
+            .flatten()
             .and_then(|record| record.continuation);
         if continuation_selector
             .as_ref()
@@ -4452,6 +4526,71 @@ mod tests {
                 wall_time_ms: 0,
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_restart_refuses_linked_task_lists() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(cwd.clone());
+        let tasks = TaskRegistry::new("workflow-restart-files".into());
+        let runner = WorkflowRunner::for_session(config, tasks, &cwd).unwrap();
+        let prepared = runner.prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+            script: Some("export const meta = { name: 'fixture', description: 'Fixture', phases: [] }; export default 'done';".into()),
+            ..Default::default()
+        })).unwrap();
+        runner.activate_prepared_run(&prepared.prepared).unwrap();
+        let outside = cwd.join("task-lists.json");
+        fs::write(&outside, r#"{"nextTaskSeq":0,"lists":{}}"#).unwrap();
+        link_workflow_artifact(&outside, &runner.state.task_lists_path(&prepared.run_id));
+        let result = runner
+            .settle_runtime_restart_without_durable_outcome(&prepared.task_id, &prepared.run_id);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("path changed while it was opened")
+        );
+    }
+
+    #[cfg(unix)]
+    fn link_workflow_artifact(source: &std::path::Path, path: &std::path::Path) {
+        std::os::unix::fs::symlink(source, path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_resume_refuses_linked_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(cwd.clone());
+        let tasks = TaskRegistry::new("workflow-resume-files".into());
+        let runner = WorkflowRunner::for_session(config, tasks, &cwd).unwrap();
+        let request = WorkflowLaunchRequest::from(WorkflowInput {
+            script: Some("export const meta = { name: 'fixture', description: 'Fixture', phases: [] }; export default 'done';".into()),
+            ..Default::default()
+        });
+        let source = runner.prepare_background(request.clone()).unwrap();
+        for (name, value) in [
+            ("launch-input.json", "{\"tokenBudget\":321}"),
+            ("task-lists.json", "{}"),
+            ("agent-cache.json", "{}"),
+        ] {
+            let path = runner.state.run_dir(&source.run_id).join(name);
+            let outside = cwd.join(name);
+            fs::write(&outside, value).unwrap();
+            if path.exists() {
+                fs::remove_file(&path).unwrap();
+            }
+            link_workflow_artifact(&outside, &path);
+            let result = runner
+                .prepare_model_background(request.clone().with_resume_from(source.run_id.clone()));
+            assert!(result.is_err(), "resumed with linked {name}");
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

@@ -264,14 +264,14 @@ impl<'a> RuntimeToolRouter<'a> {
                 self.runtime.execute_workflow_draft_tool_with_registry(
                     execution_request,
                     config.workflows.enabled,
-                    cwd,
+                    config.tools.workspace_read_root.as_deref().unwrap_or(cwd),
                     task_registry,
                     config.workflows.max_concurrent_agents,
                 )
             }
             RuntimeSpecialToolDispatch::WorkflowDraftAction => execute_workflow_draft_action_tool(
                 config,
-                cwd,
+                config.tools.workspace_read_root.as_deref().unwrap_or(cwd),
                 events,
                 sink,
                 execution_request,
@@ -285,7 +285,7 @@ impl<'a> RuntimeToolRouter<'a> {
             ),
             RuntimeSpecialToolDispatch::Workflow => execute_workflow_tool(
                 config,
-                cwd,
+                config.tools.workspace_read_root.as_deref().unwrap_or(cwd),
                 events,
                 sink,
                 execution_request,

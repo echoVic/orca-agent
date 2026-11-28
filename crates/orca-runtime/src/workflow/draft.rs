@@ -1,21 +1,37 @@
 use std::fs;
-use std::io;
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use orca_platform::fs::VerifiedDirectory;
 
 use orca_core::workflow_types::{WorkflowDraft, WorkflowSourceMutationRisk};
 
-use super::script::{parse_workflow_meta, validate_workflow_runtime_contract};
+use super::script::{
+    parse_workflow_meta, single_workflow_component, validate_workflow_runtime_contract,
+};
 use super::state::WorkflowStateStore;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WorkflowDraftStore {
     root: PathBuf,
+    session: Option<Arc<VerifiedDirectory>>,
 }
 
 impl WorkflowDraftStore {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            session: None,
+        }
+    }
+
+    pub(crate) fn in_session(root: PathBuf, session: Arc<VerifiedDirectory>) -> Self {
+        Self {
+            root,
+            session: Some(session),
+        }
     }
 
     pub fn draft_dir(&self, draft_id: &str) -> PathBuf {
@@ -76,9 +92,30 @@ impl WorkflowDraftStore {
     }
 
     pub fn load(&self, draft_id: &str) -> io::Result<WorkflowDraft> {
-        let raw = fs::read_to_string(self.draft_path(draft_id))?;
-        serde_json::from_str(&raw)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        validate_draft_id(draft_id)?;
+        let session = self
+            .root
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let path = self.draft_path(draft_id);
+        let relative = path.strip_prefix(session).unwrap_or(&path);
+        let file = match &self.session {
+            Some(root) => orca_tools::open_relative_file(root, relative)?,
+            None => {
+                let root = session.canonicalize()?;
+                orca_tools::open_workspace_file(&root, &root.join(relative))?
+            }
+        };
+        let draft: WorkflowDraft = serde_json::from_reader(BufReader::new(file))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if draft.draft_id != draft_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workflow draft ID does not match its directory",
+            ));
+        }
+        Ok(draft)
     }
 
     pub fn edit_script(
@@ -156,6 +193,16 @@ impl WorkflowDraftStore {
         self.write(&draft)?;
         Ok(draft)
     }
+}
+
+pub(crate) fn validate_draft_id(id: &str) -> io::Result<()> {
+    if !single_workflow_component(id) || id.contains([':', '\0']) || id.ends_with(['.', ' ']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "draftId must be a workflow draft ID",
+        ));
+    }
+    Ok(())
 }
 
 fn estimate_agent_count(script: &str) -> Option<u32> {

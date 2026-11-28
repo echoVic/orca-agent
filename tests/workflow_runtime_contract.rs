@@ -375,6 +375,53 @@ fn workflow_resume_uses_completed_agent_cache() {
     assert!(second.summary.contains("cached 1 agent"));
 }
 
+#[cfg(unix)]
+#[test]
+fn workflow_resume_stops_when_an_agent_cache_cannot_be_verified() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
+    let temp = tempdir().unwrap();
+    let script = temp.path().join("workflow.js");
+    fs::write(
+        &script,
+        "export const meta = { name: 'cache', description: 'Cache test', phases: [] };\nexport default await agent('inspect repo');",
+    )
+    .unwrap();
+    let session = temp.path().join("session");
+    let runner = WorkflowRunner::new(
+        mock_run_config(temp.path()),
+        TaskRegistry::new("session-1".to_string()),
+        session.clone(),
+    );
+    let first = runner
+        .launch(WorkflowLaunchRequest::from_script_path(
+            script.display().to_string(),
+        ))
+        .unwrap();
+    let run_id = first.output.run_id.unwrap();
+    let store = WorkflowStateStore::new(session.join("workflow-runs"));
+    let cache = store.run_dir(&run_id).join("agent-cache.json");
+    let moved = temp.path().join("moved-cache.json");
+    fs::rename(&cache, &moved).unwrap();
+    std::os::unix::fs::symlink(moved, &cache).unwrap();
+
+    let result = runner.launch(
+        WorkflowLaunchRequest::from_script_path(script.display().to_string())
+            .with_resume_from(run_id.clone()),
+    );
+    let error = result
+        .err()
+        .expect("resume must stop before starting a fresh agent");
+    assert!(error.to_string().contains("agent-cache.json"), "{error}");
+    assert!(
+        store
+            .cached_agent_result(&run_id, "root:1", &input_hash("inspect repo", &json!({})))
+            .is_err()
+    );
+}
+
 #[test]
 fn workflow_respects_configured_concurrency_in_evidence() {
     if !orca_runtime::workflow::host::WorkflowHost::node_available() {

@@ -277,7 +277,7 @@ impl AppState {
         }
         let configured_workspace = self.edit_highlights.workspace_root.as_ref()?;
         let resolved_path =
-            orca_tools::resolve_workspace_path(configured_workspace, Some(target)).ok()?;
+            orca_tools::resolve_workspace_write_path(configured_workspace, target).ok()?;
         let display_path = resolved_path
             .strip_prefix(configured_workspace)
             .ok()?

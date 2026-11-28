@@ -262,6 +262,7 @@ struct ScriptedExecutor {
     task_states: Mutex<Vec<(String, RuntimeTaskStatus)>>,
     cancelled_on_entry: Mutex<Vec<bool>>,
     approval_modes: Mutex<Vec<ApprovalMode>>,
+    workspace_read_roots: Mutex<Vec<Option<PathBuf>>>,
 }
 
 impl ScriptedExecutor {
@@ -276,6 +277,7 @@ impl ScriptedExecutor {
             task_states: Mutex::new(Vec::new()),
             cancelled_on_entry: Mutex::new(Vec::new()),
             approval_modes: Mutex::new(Vec::new()),
+            workspace_read_roots: Mutex::new(Vec::new()),
         }
     }
 
@@ -323,6 +325,10 @@ impl ThreadOperationExecutor for ScriptedExecutor {
         cancel: &CancelToken,
     ) -> io::Result<ThreadOperationOutcome> {
         self.calls.fetch_add(1, Ordering::AcqRel);
+        self.workspace_read_roots
+            .lock()
+            .unwrap()
+            .push(generation.config().tools.workspace_read_root.clone());
         self.cancelled_on_entry
             .lock()
             .unwrap()
@@ -1690,6 +1696,32 @@ fn foreground_interrupt_does_not_stop_registered_async_subagent_worker() {
         .fail(&task.id, "test cleanup".to_string())
         .expect("mark fixture terminal");
     host.shutdown().expect("shutdown runtime host");
+}
+
+#[test]
+fn hosted_turn_selects_its_own_workspace_for_reads() {
+    let executor = Arc::new(ScriptedExecutor::new([TestBehavior::EmitEvent {
+        message: "done".into(),
+        status: RunStatus::Success,
+    }]));
+    let (parent, host, thread) = start_scripted_thread(Arc::clone(&executor));
+    let other = tempfile::tempdir().unwrap();
+    let mut config = test_config(other.path().to_path_buf());
+    config.tools.workspace_read_root = Some(parent.path().canonicalize().unwrap());
+    thread
+        .start_turn_with_config(
+            HostedTurnRequest::new("read in other workspace"),
+            io::sink(),
+            config,
+        )
+        .unwrap()
+        .wait_timeout(TEST_TIMEOUT)
+        .unwrap();
+    assert_eq!(
+        *executor.workspace_read_roots.lock().unwrap(),
+        vec![Some(other.path().canonicalize().unwrap())]
+    );
+    host.shutdown().unwrap();
 }
 
 #[test]

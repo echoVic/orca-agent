@@ -1,5 +1,5 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 
 const scriptPath = process.argv[2];
@@ -7,6 +7,7 @@ const argsJson = process.argv[3] ?? "null";
 const mailboxPath = process.argv[4] || null;
 const taskListReplyPath = process.argv[5];
 const maxFrameBytes = Number(process.argv[6]);
+const scriptDigest = process.argv[7];
 JSON.parse(argsJson);
 
 // The source scan below turns the obvious ways out of a workflow script into a
@@ -1149,10 +1150,15 @@ function isIdentifierPart(char) {
   return isIdentifierStart(char) || (char >= "0" && char <= "9");
 }
 
-try {
-  startWorkflow(await readFile(scriptPath, "utf8"));
-} catch (error) {
-  workflowTerminal = true;
-  emit({ type: "workflow_failed", error: error?.stack ?? String(error) });
-  process.exitCode = 1;
+export function run(script) {
+  try {
+    if (scriptDigest && createHash("sha256").update(script).digest("hex") !== scriptDigest) {
+      throw new Error("workflow script changed after preparation");
+    }
+    startWorkflow(script.toString("utf8"));
+  } catch (error) {
+    HOST_OPERATIONS.failed({ error: error?.stack ?? String(error) });
+  }
 }
+
+//# sourceURL=orca-workflow-host.mjs

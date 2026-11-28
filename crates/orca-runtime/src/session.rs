@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use orca_core::config::{HistoryMode, RunConfig};
 use orca_core::conversation::{
@@ -53,6 +53,8 @@ pub(crate) struct TurnStart {
 
 pub struct InteractiveSession {
     store: SessionStore,
+    pub(crate) workspace_read_root: PathBuf,
+    pub(crate) user_workflow_directory: Option<PathBuf>,
     conversation: Conversation,
     writer: Option<SessionWriter>,
     session_id: Option<String>,
@@ -495,6 +497,15 @@ impl InteractiveSession {
             .cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let workspace_read_root = match &config.tools.workspace_read_root {
+            Some(root) => root.clone(),
+            None => cwd.canonicalize()?,
+        };
+        let user_workflow_directory = config
+            .workflows
+            .user_directory
+            .clone()
+            .or_else(crate::command::config::user_workflow_directory);
         let store = SessionStore::new();
         let instructions = instructions::load_for_cwd_or_default(&cwd);
         let memory = memory::load_for_cwd(&cwd);
@@ -717,6 +728,8 @@ impl InteractiveSession {
         let cost_tracker = CostTracker::new(None);
         let session = Self {
             store,
+            workspace_read_root,
+            user_workflow_directory,
             conversation,
             writer,
             session_id,

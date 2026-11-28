@@ -10,7 +10,11 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// On Unix the leaf is opened nonblocking before its type is checked again.
 pub fn open_confined_regular(path: &Path) -> io::Result<File> {
     let (parent, name) = split(path)?;
-    platform::Directory::open(parent, false)?.open_regular(name)
+    #[cfg(unix)]
+    let file = platform::Directory::open(parent, false)?.open_regular(name)?;
+    #[cfg(windows)]
+    let file = super::VerifiedDirectory::open(parent)?.open_file(name, super::FileAccess::Read)?;
+    Ok(file)
 }
 
 /// Publish a private file in a confined directory. A retry may reuse an

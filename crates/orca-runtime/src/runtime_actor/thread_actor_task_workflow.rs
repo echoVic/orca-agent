@@ -53,7 +53,7 @@ impl ThreadActor {
             ),
         );
 
-        let config = config.unwrap_or_else(|| self.config.clone());
+        let mut config = config.unwrap_or_else(|| self.config.clone());
         if !config.workflows.enabled {
             let message = "workflows are disabled".to_string();
             let failed =
@@ -72,13 +72,18 @@ impl ThreadActor {
                     message: error.to_string(),
                 }
             })?);
+        crate::command::config::inherit_workspace(&mut config, &self.config, &cwd).map_err(
+            |error| RuntimeHostError::WorkflowLaunchFailed {
+                message: format!("cannot resolve workspace: {error}"),
+            },
+        )?;
         let task_registry = state.thread.session().task_registry().clone();
-        let session_dir = task_registry.workflow_session_dir(&cwd).map_err(|error| {
-            RuntimeHostError::WorkflowLaunchFailed {
-                message: format!("failed to resolve workflow runtime storage: {error}"),
-            }
-        })?;
-        let runner = WorkflowRunner::new(config, task_registry.clone(), session_dir);
+        let runner =
+            WorkflowRunner::for_session(config, task_registry.clone(), &cwd).map_err(|error| {
+                RuntimeHostError::WorkflowLaunchFailed {
+                    message: format!("failed to resolve workflow runtime storage: {error}"),
+                }
+            })?;
         let launch = match runner.launch_background(WorkflowLaunchRequest::from(WorkflowInput {
             name: Some(name),
             args,

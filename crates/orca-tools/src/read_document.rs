@@ -17,10 +17,9 @@ use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, ToolService
 use crate::deepseek_web::{
     self, DeepSeekWebAccess, DeepSeekWebError, OcrResult, OcrUpload, OcrUploadError,
 };
-use crate::file_admission::open_regular_file;
 use crate::ocr_disk_cache;
 use crate::read_file::render_lines;
-use crate::resolve_workspace_path;
+use crate::resolve_workspace_read_path;
 
 /// The largest file DeepSeek OCR accepts.
 const MAX_OCR_BYTES: u64 = 100 * 1024 * 1024;
@@ -67,11 +66,12 @@ pub fn execute_or_cancel(
         .and_then(|raw| serde_json::from_str::<ReadDocumentArgs>(raw).ok())
         .unwrap_or_default();
     let target = args.path.as_deref().or(request.target.as_deref());
-    let path = match resolve_workspace_path(cwd, target) {
+    let workspace = match resolve_workspace_read_path(cwd, target) {
         Ok(path) => path,
         Err(error) => return ToolResult::failed(request, error, None),
     };
-    let Some(kind) = document_kind(&path) else {
+    let path = &workspace.path;
+    let Some(kind) = document_kind(path) else {
         return ToolResult::failed(
             request,
             format!(
@@ -98,7 +98,7 @@ pub fn execute_or_cancel(
             None,
         )
     };
-    let (mut file, size) = match open_regular_file(&path) {
+    let (mut file, size) = match crate::workspace_read::open_read_file(&workspace) {
         Ok(opened) => opened,
         Err(error) => return failed(&error),
     };
@@ -120,7 +120,7 @@ pub fn execute_or_cancel(
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     let key = OcrKey {
-        path: path.canonicalize().unwrap_or_else(|_| path.clone()),
+        path: workspace.canonical,
         size,
         modified: file
             .metadata()
@@ -459,7 +459,7 @@ mod tests {
 
     /// A workspace holding one file, `name`, with `bytes`.
     fn workspace_with(name: &str, bytes: &[u8]) -> tempfile::TempDir {
-        let cwd = tempfile::tempdir().expect("temp workspace");
+        let cwd = crate::workspace_tempdir().expect("temp workspace");
         fs::write(cwd.path().join(name), bytes).expect("write document fixture");
         cwd
     }
@@ -469,6 +469,43 @@ mod tests {
             200,
             json!({"object": "ocr.result", "pages": pages}).to_string(),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_workspace_links_still_read() {
+        let cwd = workspace_with("report.pdf", b"%PDF-1.4 linked fixture");
+        fs::write(cwd.path().join("notes.txt"), "linked text\n").unwrap();
+        use std::os::unix::fs::symlink;
+
+        symlink("report.pdf", cwd.path().join("linked.pdf")).unwrap();
+        symlink("notes.txt", cwd.path().join("linked.txt")).unwrap();
+
+        let mut request = read_request("linked", r#"{"path":"linked.txt"}"#);
+        request.name = ToolName::ReadFile;
+        request.action = ActionKind::Read;
+        let result = crate::read_file::execute(&request, cwd.path(), 4096);
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        assert!(result.output.unwrap().contains("linked text"));
+
+        let fixture = crate::test_http::serve(vec![ocr_reply(json!([
+            {"index": 0, "text": "linked document", "finish_reason": "stop"},
+        ]))]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+        let result = execute_or_cancel(
+            &read_request("linked", r#"{"path":"linked.pdf"}"#),
+            cwd.path(),
+            4096,
+            Some(&access),
+            || false,
+        );
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        assert!(result.output.unwrap().contains("linked document"));
+
+        request.name = ToolName::Grep;
+        request.raw_arguments = Some(r#"{"path":"linked.txt","pattern":"linked text"}"#.into());
+        let result = crate::grep::execute(&request, cwd.path(), 4096);
+        assert_eq!(result.output.as_deref(), Some("linked.txt:1:linked text"));
     }
 
     #[test]
@@ -541,7 +578,7 @@ mod tests {
 
     #[test]
     fn read_document_reports_the_pages_deepseek_bills() {
-        let cwd = tempfile::tempdir().expect("temp workspace");
+        let cwd = crate::workspace_tempdir().expect("temp workspace");
         fs::write(cwd.path().join("counted.pdf"), b"%PDF counted").expect("a document");
         fs::write(cwd.path().join("listed.pdf"), b"%PDF listed").expect("a document");
         let fixture = crate::test_http::serve(vec![
@@ -996,7 +1033,7 @@ mod tests {
         // does not rely on what it still holds.)
         let cwd = workspace_with("partial.pdf", b"%PDF partial");
         fs::write(cwd.path().join("blank.png"), b"\x89PNG blank").expect("write the image");
-        let cache = tempfile::tempdir().expect("a cache dir");
+        let cache = crate::workspace_tempdir().expect("a cache dir");
         crate::ocr_disk_cache::set_test_cache_root(Some(cache.path().to_path_buf()));
         let fixture = crate::test_http::serve(vec![
             (
@@ -1038,7 +1075,7 @@ mod tests {
     fn a_corrupt_disk_entry_is_recognized_again() {
         let bytes = b"%PDF corrupt entry";
         let cwd = workspace_with("report.pdf", bytes);
-        let cache = tempfile::tempdir().expect("a cache dir");
+        let cache = crate::workspace_tempdir().expect("a cache dir");
         crate::ocr_disk_cache::set_test_cache_root(Some(cache.path().to_path_buf()));
         let entry = crate::ocr_disk_cache::entry_path(
             cache.path(),
@@ -1195,7 +1232,7 @@ mod tests {
 
     #[test]
     fn read_document_reports_a_missing_file_as_missing() {
-        let cwd = tempfile::tempdir().expect("temp workspace");
+        let cwd = crate::workspace_tempdir().expect("temp workspace");
 
         let result = execute_or_cancel(
             &read_request("missing", r#"{"path":"missing.pdf"}"#),
@@ -1238,7 +1275,7 @@ mod tests {
 
     #[test]
     fn read_document_refuses_files_over_100_mib() {
-        let cwd = tempfile::tempdir().expect("temp workspace");
+        let cwd = crate::workspace_tempdir().expect("temp workspace");
         // Sparse: only the length is set, so nothing is written.
         fs::File::create(cwd.path().join("big.pdf"))
             .and_then(|file| file.set_len(100 * 1024 * 1024 + 1))
