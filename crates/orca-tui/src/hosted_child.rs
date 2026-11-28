@@ -1700,6 +1700,222 @@ pub(crate) mod live_child_for_test {
     }
 
     #[test]
+    fn a_reply_interrupted_during_a_child_visit_is_kept_once_on_return() {
+        use orca_core::conversation::CutShort;
+
+        let fixture = ViewOnChild::start();
+        let marker = fixture._home.path().join("keep-interrupted-reply");
+        let events = fixture.enqueue(format!("mock_stream_release_marker {}", marker.display()));
+        let prefix = "Mock release-marker stream started.";
+        let deadline = std::time::Instant::now() + super::Duration::from_secs(10);
+        let mut live = MainDisplay::new();
+        let mut kept = 0;
+        let mut completed = 0;
+        let completion = loop {
+            let event = events.recv_deadline(deadline).unwrap();
+            let started = matches!(&event, TuiEvent::SurfaceDelivery(delivery)
+                if matches!(&delivery.1, TuiEvent::MessageDelta(text) if text.contains(prefix)));
+            live.send(event);
+            if started {
+                break fixture
+                    .parent
+                    .interrupt_active_with_completion()
+                    .unwrap()
+                    .unwrap();
+            }
+        };
+        loop {
+            let event = events.recv_deadline(deadline).unwrap();
+            let (is_kept, is_completion) = match &event {
+                TuiEvent::SurfaceDelivery(delivery) => (
+                    matches!(
+                        delivery.1,
+                        TuiEvent::AssistantReplyKept(CutShort::Interrupted)
+                    ),
+                    delivery.2.is_some()
+                        && matches!(&delivery.1, TuiEvent::SessionCompleted { .. }),
+                ),
+                _ => (false, false),
+            };
+            let accepted = live.send(event);
+            kept += usize::from(is_kept && accepted);
+            completed += usize::from(is_completion && accepted);
+            if is_completion {
+                break;
+            }
+        }
+        completion
+            .wait_timeout(super::Duration::from_secs(10))
+            .expect("interrupted main settles");
+        assert_eq!((kept, completed), (1, 1));
+        let mut returned = fresh_state();
+        returned.active_session_attachment = Some(SessionAttachmentId::new(2));
+        fixture
+            .view
+            .handle(super::HostedChildAction::Return, &fixture.control);
+        for event in fixture._events.try_iter() {
+            if let Some(event) =
+                crate::attachment_routing::accept_attached_tui_event(&mut returned, event).unwrap()
+            {
+                returned.update(event);
+            }
+        }
+        for mut state in [live.state, returned, returned_state(&fixture)] {
+            let frame = crate::test_support::frame_string(&mut state, 120, 40);
+            assert_eq!(state.status, crate::types::AppStatus::Idle, "{frame}");
+            assert_eq!(frame.matches(prefix).count(), 1, "{frame}");
+            assert_eq!(frame.matches("(interrupted)").count(), 1, "{frame}");
+            assert!(
+                !frame.contains("Mock release-marker stream completed."),
+                "{frame}"
+            );
+        }
+        assert!(
+            events.try_iter().all(|event| !matches!(
+                event.into_test_payload(),
+                TuiEvent::SessionCompleted { .. }
+            ))
+        );
+        fixture.shutdown();
+    }
+
+    pub(super) struct StagedRetry {
+        prompt: &'static str,
+        started: crossbeam_channel::Sender<()>,
+        publish: crossbeam_channel::Receiver<()>,
+        finish: crossbeam_channel::Receiver<()>,
+    }
+
+    pub(super) struct RetryControls {
+        pub(super) started: crossbeam_channel::Receiver<()>,
+        pub(super) publish: crossbeam_channel::Sender<()>,
+        pub(super) finish: crossbeam_channel::Sender<()>,
+    }
+
+    impl StagedRetry {
+        pub(super) fn new(prompt: &'static str) -> (Self, RetryControls) {
+            let (started, observed) = crossbeam_channel::bounded(1);
+            let (publish, publishing) = crossbeam_channel::bounded(1);
+            let (finish, finishing) = crossbeam_channel::bounded(1);
+            (
+                Self {
+                    prompt,
+                    started,
+                    publish: publishing,
+                    finish: finishing,
+                },
+                RetryControls {
+                    started: observed,
+                    publish,
+                    finish,
+                },
+            )
+        }
+    }
+
+    impl orca_runtime::runtime_host::ThreadOperationExecutor for StagedRetry {
+        fn run_turn(
+            &self,
+            thread: &mut orca_runtime::thread::RuntimeThread,
+            request: &orca_runtime::runtime_host::HostedTurnRequest,
+            generation: &orca_runtime::runtime_host::GenerationContext,
+            events: &mut orca_core::event_schema::EventFactory,
+            writer: &mut (dyn std::io::Write + Send),
+            cancel: &orca_core::cancel::CancelToken,
+        ) -> std::io::Result<orca_runtime::runtime_host::ThreadOperationOutcome> {
+            use orca_core::provider_types::{ProviderErrorKind, ProviderRetry, ProviderStep};
+            use orca_core::thread_item_projection::ModelResponseIdentity;
+            use orca_runtime::runtime_host::RuntimeHost;
+
+            if request.prompt() == self.prompt {
+                let timeout = super::Duration::from_secs(10);
+                self.started.send(()).unwrap();
+                self.publish.recv_timeout(timeout).unwrap();
+                request
+                    .thread_turn_request(generation)
+                    .provider_response_ingress()
+                    .unwrap()
+                    .commit_provider_step(
+                        &ModelResponseIdentity::new(request.turn_id().clone()),
+                        &ProviderStep::Retry(Some(ProviderRetry {
+                            attempt: 1,
+                            max_attempts: 3,
+                            delay_ms: 30_000,
+                            kind: ProviderErrorKind::Transport,
+                            reason: "controlled test retry".into(),
+                        })),
+                    )?;
+                self.finish.recv_timeout(timeout).unwrap();
+            }
+            RuntimeHost::default_executor_for_test()
+                .run_turn(thread, request, generation, events, writer, cancel)
+        }
+    }
+
+    #[test]
+    fn a_self_started_retry_changes_neither_cursor_nor_lifecycle() {
+        let prompt = "retry on a queued main turn";
+        let (executor, retry) = StagedRetry::new(prompt);
+        let fixture = ViewOnChild::with_host(
+            || {
+                orca_runtime::runtime_host::RuntimeHost::start_with_executor(std::sync::Arc::new(
+                    executor,
+                ))
+                .unwrap()
+            },
+            |_| {},
+        );
+        let events = fixture.enqueue(prompt);
+        let timeout = super::Duration::from_secs(10);
+        retry.started.recv_timeout(timeout).unwrap();
+        let mut live = MainDisplay::new();
+        let deadline = std::time::Instant::now() + timeout;
+        while live.state.status != crate::types::AppStatus::Running {
+            live.send(events.recv_deadline(deadline).unwrap());
+        }
+        let before = super::read_parent_snapshot(&fixture.parent).unwrap();
+        let lifecycle = live.state.lifecycle_cursor.as_ref().unwrap().clone();
+        retry.publish.send(()).unwrap();
+        loop {
+            let event = events.recv_deadline(deadline).unwrap();
+            let is_retry = matches!(&event, TuiEvent::ProviderRetry(Some(report)) if report.reason == "controlled test retry");
+            assert!(
+                !matches!(&event, TuiEvent::SurfaceDelivery(delivery) if matches!(delivery.1, TuiEvent::ProviderRetry(_)))
+            );
+            live.send(event);
+            if is_retry {
+                break;
+            }
+        }
+        let after = super::read_parent_snapshot(&fixture.parent).unwrap();
+        assert_eq!(before.cursor, after.cursor);
+        assert!(before.tasks == after.tasks);
+        let current = live.state.lifecycle_cursor.as_ref().unwrap();
+        assert_eq!(
+            (
+                &current.owner,
+                &current.cursor,
+                current.delivered,
+                current.live
+            ),
+            (
+                &lifecycle.owner,
+                &lifecycle.cursor,
+                lifecycle.delivered,
+                lifecycle.live
+            )
+        );
+        assert_eq!(live.state.status, crate::types::AppStatus::Running);
+        assert!(live.state.provider_retry.is_some());
+        retry.finish.send(()).unwrap();
+        fixture.wait_for(|snapshot| {
+            crate::surface_client::snapshot_operation_is_terminal(&snapshot, &lifecycle.owner)
+                .then_some(())
+        });
+        fixture.shutdown();
+    }
+
+    #[test]
     fn queued_text_tool_text_and_terminal_follow_one_cursor() {
         let fixture = ViewOnChild::start();
         let marker = fixture._home.path().join("release-tool");
@@ -4262,12 +4478,22 @@ pub(crate) mod tests {
         }
 
         fn configured(configure: impl FnOnce(&mut orca_core::config::RunConfig)) -> Self {
+            Self::with_host(
+                || orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host"),
+                configure,
+            )
+        }
+
+        fn with_host(
+            start_host: impl FnOnce() -> orca_runtime::runtime_host::RuntimeHost,
+            configure: impl FnOnce(&mut orca_core::config::RunConfig),
+        ) -> Self {
             let home = crate::test_support::isolate_orca_home();
             let mut config = crate::test_support::test_run_config();
             config.cwd = Some(home.path().to_path_buf());
             config.history_mode = orca_core::config::HistoryMode::Record;
             configure(&mut config);
-            let host = orca_runtime::runtime_host::RuntimeHost::start().expect("runtime host");
+            let host = start_host();
             let thread = host
                 .start_thread(config.clone(), "child")
                 .expect("child thread");
@@ -4453,6 +4679,101 @@ pub(crate) mod tests {
         });
         parent.host.handle().keep_subagents_in_process();
         parent
+    }
+
+    #[test]
+    fn a_kept_child_retry_is_visible_only_until_its_read_only_view() {
+        use super::live_child_for_test::StagedRetry;
+        use orca_runtime::runtime_host::RuntimeHost;
+
+        let child_prompt = "retry in a kept child";
+        let (executor, retry) = StagedRetry::new(child_prompt);
+        let parent = ChildThread::with_host(
+            || RuntimeHost::start_with_executor(super::Arc::new(executor)).unwrap(),
+            |config| config.approval_mode = orca_core::approval_types::ApprovalMode::FullAuto,
+        );
+        parent.host.handle().keep_subagents_in_process();
+        let (sender, events) = crossbeam_channel::unbounded();
+        let prompt = format!("subagent async {child_prompt}");
+        let thread = parent.thread.clone();
+        let config = parent.config.clone();
+        let worker = std::thread::spawn(move || run_child_turn(&thread, config, &prompt, &sender));
+        let timeout = super::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + timeout;
+        let row = loop {
+            if let super::TuiEvent::SurfaceProjectionSynced(projection) =
+                events.recv_deadline(deadline).unwrap().into_test_payload()
+                && let Some(row) = projection.workflow_tasks.iter().find(|row| {
+                    row.status == TaskStatus::Running && row.subagent_child_thread_id.is_some()
+                })
+            {
+                break row.clone();
+            }
+        };
+        retry.started.recv_deadline(deadline).unwrap();
+        let mut visit = AgentVisit::new(&parent);
+        visit.open(&row);
+        retry.publish.send(()).unwrap();
+        while visit.state.provider_retry.is_none() {
+            let event = visit.events.recv_deadline(deadline).unwrap();
+            if let Ok(Some(payload)) = accept_attached_tui_event(&mut visit.state, event) {
+                visit.state.update(payload);
+            }
+        }
+        let frame = crate::test_support::frame_string(&mut visit.state, 120, 40);
+        assert!(
+            frame.contains("Retrying in") && frame.contains("controlled test retry"),
+            "{frame}"
+        );
+        let bound_thread_id = row.subagent_child_thread_id.clone().unwrap();
+        let attachment = visit.state.active_session_attachment.unwrap();
+        assert!(!visit.state.finished_child);
+        retry.finish.send(()).unwrap();
+        worker.join().unwrap();
+        let deadline = std::time::Instant::now() + timeout;
+        let ended = loop {
+            let current = agent_row(&parent);
+            if current.status == TaskStatus::Completed {
+                break current;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "main did not publish the child's end"
+            );
+            std::thread::sleep(super::Duration::from_millis(10));
+        };
+        assert_eq!(
+            (&ended.id, &ended.name, &ended.subagent_child_thread_id),
+            (&row.id, &row.name, &row.subagent_child_thread_id)
+        );
+        let finished = |attachment| {
+            super::HostedChildAction::Finished(super::FinishedTask {
+                attachment,
+                task_id: row.id.clone(),
+                bound_thread_id: bound_thread_id.clone(),
+            })
+        };
+        visit.view.handle(finished(attachment), &visit.control);
+        visit.apply();
+        assert!(visit.state.finished_child);
+        assert_eq!(
+            visit.state.conversation_target().task_id(),
+            Some(row.id.as_str())
+        );
+        assert!(visit.state.provider_retry.is_none());
+        let frame = crate::test_support::frame_string(&mut visit.state, 120, 40);
+        assert!(!frame.contains("Retrying in"), "{frame}");
+        let static_attachment = visit.state.active_session_attachment.unwrap();
+        visit
+            .view
+            .handle(finished(static_attachment), &visit.control);
+        visit.apply();
+        assert_eq!(
+            visit.state.active_session_attachment,
+            Some(static_attachment)
+        );
+        assert!(visit.view.close().unwrap().interactive.is_none());
+        parent.shutdown();
     }
 
     fn agent_row(parent: &ChildThread) -> BackgroundTaskSummary {
