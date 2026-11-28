@@ -2912,6 +2912,14 @@ pub(crate) struct ChildAgentCoordinator {
 }
 
 impl ChildAgentCoordinator {
+    pub(crate) fn lease_duration_ms(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(duration_ms) = self.task_registry.continuation_lease_duration_ms {
+            return duration_ms;
+        }
+        CONTINUATION_LEASE_DURATION_MS
+    }
+
     /// Creates a cloneable coordinator with one stable runtime owner identity; it returns persistence errors from the registry store lookup and otherwise changes no durable state.
     pub(crate) fn new(task_registry: TaskRegistry) -> Result<Self, AgentContinuationError> {
         let owner_id = format!(
@@ -3466,7 +3474,7 @@ impl ChildAgentCoordinator {
         let expected_revision = prepared.revision;
         let owner_id = self.owner_id.to_string();
         let expires_at_ms = now_ms
-            .checked_add(CONTINUATION_LEASE_DURATION_MS)
+            .checked_add(self.lease_duration_ms())
             .unwrap_or(i64::MAX);
         let (_, committed) = self.store.mutate_record(
             &prepared.continuation_id,
@@ -3587,7 +3595,7 @@ impl ChildAgentCoordinator {
     ) -> Result<ContinuationProjection, AgentContinuationError> {
         let now_ms = continuation_now_ms();
         let expires_at_ms = now_ms
-            .checked_add(CONTINUATION_LEASE_DURATION_MS)
+            .checked_add(self.lease_duration_ms())
             .unwrap_or(i64::MAX);
         let fence = lease.fence(expected_revision);
         let (_, committed) =

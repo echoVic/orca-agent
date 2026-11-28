@@ -2545,19 +2545,25 @@ fn a_fork_childs_first_request_shares_the_parents_prefix() {
 
 #[test]
 fn a_hosted_fork_childs_first_request_has_the_inherited_messages() {
-    let (parent, child) = recorded_hosted_fork(false, false);
+    let (parent, child) = recorded_hosted_fork(false, false, None);
+    assert_hosted_fork_inherits(&parent, &child);
+}
+
+#[test]
+fn a_hosted_fork_that_outlives_its_lease_settles_normally() {
+    let (parent, child) = recorded_hosted_fork(false, false, Some(1_000));
     assert_hosted_fork_inherits(&parent, &child);
 }
 
 #[test]
 fn a_fork_recovered_from_the_queue_still_inherits() {
-    let (parent, child) = recorded_hosted_fork(true, false);
+    let (parent, child) = recorded_hosted_fork(true, false, None);
     assert_hosted_fork_inherits(&parent, &child);
 }
 
 #[test]
 fn a_hosted_fork_without_a_usable_prefix_says_why_it_started_fresh() {
-    let (_, child) = recorded_hosted_fork(false, true);
+    let (_, child) = recorded_hosted_fork(false, true, None);
     let child = std::str::from_utf8(&child).unwrap();
     assert!(child.contains("Fork context unavailable:"), "{child}");
     assert!(
@@ -2582,7 +2588,11 @@ fn assert_hosted_fork_inherits(parent: &[u8], child: &[u8]) {
     assert!(child[cut].get().contains("Report the relevant evidence."));
 }
 
-fn recorded_hosted_fork(restart: bool, remove_prefix: bool) -> (Vec<u8>, Vec<u8>) {
+fn recorded_hosted_fork(
+    restart: bool,
+    remove_prefix: bool,
+    lease_duration_ms: Option<i64>,
+) -> (Vec<u8>, Vec<u8>) {
     use crate::agent_controller::AgentController;
     use crate::runtime_host::RuntimeHost;
     use crate::runtime_subagent_call::{
@@ -2602,13 +2612,20 @@ fn recorded_hosted_fork(restart: bool, remove_prefix: bool) -> (Vec<u8>, Vec<u8>
     let _home = crate::history::redirect_test_orca_home(home.path());
     let tasks = home.path().join("tasks");
     let session = "hosted-fork";
-    let registry = TaskRegistry::new_persistent(session.into(), tasks.clone()).unwrap();
+    let mut registry = TaskRegistry::new_persistent(session.into(), tasks.clone()).unwrap();
+    registry.continuation_lease_duration_ms = lease_duration_ms;
     let (base_url, server) = recorded_provider(
         vec![
             json!({"content": "parent reply"}),
             json!({"content": "child reply"}),
         ],
-        |_, _, _| {},
+        move |index, _, _| {
+            if index == 1
+                && let Some(lease_duration_ms) = lease_duration_ms
+            {
+                std::thread::sleep(Duration::from_millis(lease_duration_ms as u64 + 200));
+            }
+        },
     );
     let mut config = config(Some(PRO_MODEL));
     config.cwd = Some(cwd.path().to_path_buf());

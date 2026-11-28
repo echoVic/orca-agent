@@ -52,6 +52,7 @@ use crate::runtime_surface::{
 use crate::runtime_tool_call::RuntimeToolCallRuntime;
 use crate::schema_validation::validate_json_schema_subset;
 use crate::subagent::{SubagentIsolation, SubagentRequest};
+use crate::subagent_async_worker::SubagentLeaseHeartbeat;
 use crate::tasks::TaskRegistry;
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
@@ -2212,6 +2213,13 @@ fn execute_acquired_sync_subagent(
             emitter: Arc::clone(&activity),
         }),
     );
+    let heartbeat = SubagentLeaseHeartbeat::start(
+        None,
+        coordinator.clone(),
+        lease.clone(),
+        Arc::clone(&shared_revision),
+        None,
+    );
     let child = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
             cwd: &child_cwd,
@@ -2295,6 +2303,7 @@ fn execute_acquired_sync_subagent(
             )
         }
     };
+    drop(heartbeat);
     let mut output = finalize_started_sync_subagent_with_revision(
         output,
         &coordinator,

@@ -225,63 +225,58 @@ impl AsyncLaunchWorktree {
     }
 }
 
-struct AsyncLeaseHeartbeat {
+pub(crate) struct SubagentLeaseHeartbeat {
     stop: mpsc::Sender<()>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 #[cfg(not(test))]
-const ASYNC_LEASE_HEARTBEAT: Duration = Duration::from_secs(5);
+const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(test)]
-const ASYNC_LEASE_HEARTBEAT: Duration = Duration::from_millis(100);
+const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 
-impl AsyncLeaseHeartbeat {
-    /// Keeps the worker's task and continuation leases alive, and ends the run
-    /// through `cancel` once they are lost: the task was stopped (a stop fences
-    /// the lease even when its worker could not be killed), finished, taken
-    /// over, or is gone with its session. No one would read what the run
-    /// produced after that, so it must not go on spending.
-    fn start(
-        task_registry: TaskRegistry,
-        task_lease: crate::tasks::TaskLease,
-        agent_id: String,
+impl SubagentLeaseHeartbeat {
+    /// Renews the continuation and, for a detached worker, its task lease.
+    /// A detached worker also cancels execution when it loses either lease.
+    pub(crate) fn start(
+        task: Option<(TaskRegistry, crate::tasks::TaskLease, String)>,
         coordinator: ChildAgentCoordinator,
         continuation_lease: ContinuationLease,
         continuation_revision: Arc<Mutex<ContinuationRevision>>,
-        cancel: CancelToken,
+        cancel_on_lease_loss: Option<CancelToken>,
     ) -> Self {
         let (stop, receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let task_lease_duration =
                 Duration::from_millis(crate::tasks::TASK_LEASE_DURATION_MS as u64);
-            let continuation_lease_duration = Duration::from_millis(
-                crate::agent_continuation::CONTINUATION_LEASE_DURATION_MS as u64,
-            );
+            let continuation_lease_duration =
+                Duration::from_millis(coordinator.lease_duration_ms() as u64);
             let mut task_renewed_at = Instant::now();
             let mut continuation_renewed_at = Instant::now();
             loop {
-                match receiver.recv_timeout(ASYNC_LEASE_HEARTBEAT) {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                match receiver.recv_timeout(LEASE_HEARTBEAT_INTERVAL) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                match task_registry.renew_task_lease(&task_lease, &agent_id) {
-                    Ok(()) => task_renewed_at = Instant::now(),
-                    Err(error) => {
-                        let storage_error =
-                            matches!(error, crate::tasks::TaskLeaseError::Persistence(_));
-                        if renewal_failure_ends_run(
-                            storage_error,
-                            task_renewed_at.elapsed(),
-                            task_lease_duration,
-                        ) {
-                            cancel.cancel();
-                            break;
+                if let Some((task_registry, task_lease, agent_id)) = &task {
+                    match task_registry.renew_task_lease(task_lease, agent_id) {
+                        Ok(()) => task_renewed_at = Instant::now(),
+                        Err(error) => {
+                            let storage_error =
+                                matches!(error, crate::tasks::TaskLeaseError::Persistence(_));
+                            if renewal_failure_ends_run(
+                                storage_error,
+                                task_renewed_at.elapsed(),
+                                task_lease_duration,
+                            ) {
+                                break;
+                            }
+                            continue;
                         }
-                        continue;
                     }
                 }
                 let Ok(mut revision) = continuation_revision.lock() else {
-                    break;
+                    return;
                 };
                 match coordinator.renew(&continuation_lease, *revision) {
                     Ok(projection) => {
@@ -298,11 +293,13 @@ impl AsyncLeaseHeartbeat {
                             continuation_renewed_at.elapsed(),
                             continuation_lease_duration,
                         ) {
-                            cancel.cancel();
                             break;
                         }
                     }
                 }
+            }
+            if let Some(cancel) = cancel_on_lease_loss {
+                cancel.cancel();
             }
         });
         Self {
@@ -310,8 +307,10 @@ impl AsyncLeaseHeartbeat {
             worker: Some(worker),
         }
     }
+}
 
-    fn stop(mut self) {
+impl Drop for SubagentLeaseHeartbeat {
+    fn drop(&mut self) {
         let _ = self.stop.send(());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -478,14 +477,12 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
     let (checkpoint_observer, shared_revision) =
         build_checkpoint_observer(coordinator.clone(), continuation_lease.clone(), &prepared);
     let cancel = CancelToken::new();
-    let heartbeat = AsyncLeaseHeartbeat::start(
-        task_registry.clone(),
-        task_lease.clone(),
-        agent_id.clone(),
+    let heartbeat = SubagentLeaseHeartbeat::start(
+        Some((task_registry.clone(), task_lease.clone(), agent_id.clone())),
         coordinator.clone(),
         continuation_lease.clone(),
         Arc::clone(&shared_revision),
-        cancel.clone(),
+        Some(cancel.clone()),
     );
     let instructions = instructions::load_for_cwd_or_default(&cwd);
     let memory = memory::load_for_cwd(&cwd);
@@ -602,7 +599,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         });
         crate::agent_child::run_child_agent(&config, &child_request, &mut child_runtime)
     }));
-    heartbeat.stop();
+    drop(heartbeat);
     let (child, child_cost_tracker) = match child {
         Ok((child, cost_tracker)) => (child, cost_tracker),
         Err(payload) => {
@@ -2447,16 +2444,14 @@ mod tests {
         let continuation_lease = coordinator.acquire(&prepared).unwrap();
         let revision = Arc::new(Mutex::new(continuation_lease.revision));
         let cancel = CancelToken::new();
-        let heartbeat = AsyncLeaseHeartbeat::start(
-            registry.clone(),
-            task_lease,
-            task_id.clone(),
+        let heartbeat = SubagentLeaseHeartbeat::start(
+            Some((registry.clone(), task_lease, task_id.clone())),
             coordinator.clone(),
             continuation_lease,
             Arc::clone(&revision),
-            cancel.clone(),
+            Some(cancel.clone()),
         );
-        thread::sleep(ASYNC_LEASE_HEARTBEAT * 2);
+        thread::sleep(LEASE_HEARTBEAT_INTERVAL * 2);
 
         // For a few beats the continuation records' directory is not one, so
         // reading and writing a record fails the way a storage error does.
@@ -2470,7 +2465,7 @@ mod tests {
         std::fs::write(&blocker, b"not a directory").unwrap();
         std::fs::rename(&continuations, &parked).unwrap();
         std::fs::rename(&blocker, &continuations).unwrap();
-        thread::sleep(ASYNC_LEASE_HEARTBEAT * 4);
+        thread::sleep(LEASE_HEARTBEAT_INTERVAL * 4);
         std::fs::rename(&continuations, &blocker).unwrap();
         std::fs::rename(&parked, &continuations).unwrap();
         let before = revision.lock().unwrap().get();
@@ -2483,7 +2478,7 @@ mod tests {
         }
         let cancelled = cancel.is_cancelled();
         let after = revision.lock().unwrap().get();
-        heartbeat.stop();
+        drop(heartbeat);
 
         assert!(!cancelled, "a transient storage error ended a healthy run");
         assert!(
