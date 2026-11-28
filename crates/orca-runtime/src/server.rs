@@ -1080,14 +1080,14 @@ fn run_shell_resize<W: Write>(
 
 fn run_shell_list<W: Write>(state: &mut ServerState, id: Value, writer: &mut W) -> io::Result<()> {
     let command_exec_shell_ids = state.command_exec.active_shell_ids();
-    for output in state.shells.reap_requested_stops()? {
-        write_shell_completed(writer, &id, output)?;
+    for result in state.shells.reap_requested_stops() {
+        write_reaped_shell(state, &id, result, writer)?;
     }
-    for output in state
+    for result in state
         .shells
         .reap_completed_except(&command_exec_shell_ids)?
     {
-        write_shell_completed(writer, &id, output)?;
+        write_reaped_shell(state, &id, result, writer)?;
     }
     let shells = state
         .shells
@@ -1105,6 +1105,27 @@ fn run_shell_list<W: Write>(state: &mut ServerState, id: Value, writer: &mut W) 
     )
 }
 
+fn write_reaped_shell<W: Write>(
+    state: &mut ServerState,
+    id: &Value,
+    result: io::Result<crate::shell_session::ShellSessionOutput>,
+    writer: &mut W,
+) -> io::Result<()> {
+    match result {
+        Ok(output) => write_shell_completed(writer, id, output),
+        Err(error) => {
+            if let Some(failure) = crate::shell_session::ShellSessionFinishError::from_io(&error)
+                && state
+                    .command_exec
+                    .report_finish_failure(&failure.session_id, &error, writer)?
+            {
+                return Ok(());
+            }
+            protocol::write_server_event(writer, id, ServerEvent::error(error.to_string()))
+        }
+    }
+}
+
 fn run_shell_read<W: Write>(
     state: &mut ServerState,
     shell_id: &str,
@@ -1113,11 +1134,24 @@ fn run_shell_read<W: Write>(
     id: Value,
     writer: &mut W,
 ) -> io::Result<()> {
-    for output in state.shells.reap_requested_stops()? {
-        if output.id == shell_id {
-            return write_shell_completed_with_cap(writer, &id, output, output_bytes_cap);
+    let mut target = None;
+    for result in state.shells.reap_requested_stops() {
+        let matches_target = match &result {
+            Ok(output) => output.id == shell_id,
+            Err(error) => crate::shell_session::ShellSessionFinishError::from_io(error)
+                .is_some_and(|failure| failure.session_id == shell_id),
+        };
+        if matches_target {
+            target = Some(result);
+        } else {
+            write_reaped_shell(state, &id, result, writer)?;
         }
-        write_shell_completed(writer, &id, output)?;
+    }
+    if let Some(result) = target {
+        return match result {
+            Ok(output) => write_shell_completed_with_cap(writer, &id, output, output_bytes_cap),
+            Err(error) => write_reaped_shell(state, &id, Err(error), writer),
+        };
     }
     let Some(result) = state
         .shells
@@ -1128,11 +1162,7 @@ fn run_shell_read<W: Write>(
     let output = match result {
         Ok(output) => output,
         Err(error) => {
-            return protocol::write_server_event(
-                writer,
-                &id,
-                ServerEvent::error(error.to_string()),
-            );
+            return write_reaped_shell(state, &id, Err(error), writer);
         }
     };
     if output.status == orca_core::task_types::TaskStatus::Running {
@@ -1169,17 +1199,7 @@ fn run_shell_kill<W: Write>(
     let Some(result) = state.shells.kill(shell_id) else {
         return unknown_shell(writer, &id, shell_id);
     };
-    let output = match result {
-        Ok(output) => output,
-        Err(error) => {
-            return protocol::write_server_event(
-                writer,
-                &id,
-                ServerEvent::error(error.to_string()),
-            );
-        }
-    };
-    write_shell_completed(writer, &id, output)
+    write_reaped_shell(state, &id, result, writer)
 }
 
 fn run_command_exec<W: Write>(
@@ -3553,6 +3573,94 @@ mod tests {
                 allow_global_read: false
             }
         );
+    }
+
+    #[test]
+    fn command_exec_finish_failure_answers_the_original_command_once() {
+        use std::time::Instant;
+
+        with_orca_home(|home| {
+            let cwd = tempdir().expect("tempdir");
+            let mut state = ServerState::default();
+            let handle = state
+                .shells
+                .spawn(
+                    cwd.path(),
+                    ShellSessionCommand {
+                        command: test_shell_script("printf done", "[Console]::Out.Write('done')"),
+                        argv: None,
+                        cwd: cwd.path().to_path_buf(),
+                        additional_readable_directories: Vec::new(),
+                        additional_working_directories: Vec::new(),
+                        denied_working_directories: Vec::new(),
+                        allowed_unix_socket_roots: Vec::new(),
+                        metadata_read_only_paths: Vec::new(),
+                        env: Default::default(),
+                        description: "command exec finish failure".to_string(),
+                        terminal: crate::shell_session::ShellTerminalMode::pipe(),
+                        sandbox: ShellSandboxMode::DangerFullAccess,
+                    },
+                    None,
+                )
+                .expect("spawn command exec shell");
+            state
+                .command_exec
+                .insert("process".to_string(), command_exec_process(&handle.id))
+                .expect("insert command exec process");
+            let manager = state.shells.sessions_mut().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !manager.has_exited_for_test(&handle.id).expect("poll exit") {
+                assert!(Instant::now() < deadline, "command did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let records = home.join("task-sessions/server-shell/tasks.json");
+            assert!(
+                records.is_file(),
+                "expected persistent server-shell records"
+            );
+            std::fs::write(records, b"{").expect("inject registry update failure");
+
+            let config = ServerConfig {
+                run_config: test_run_config(),
+            };
+            let mut output = Vec::new();
+            for id in ["first-list", "next-list"] {
+                handle_line_for_test(
+                    &config,
+                    &mut state,
+                    &json!({"id": id, "method": "command/exec/list", "params": {}}).to_string(),
+                    &mut output,
+                )
+                .expect("list command processes");
+            }
+
+            let events = parse_jsonl(&output);
+            let command_events = events
+                .iter()
+                .filter(|event| event["id"] == "cmd")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                command_events.len(),
+                1,
+                "expected one terminal answer: {events:?}"
+            );
+            assert_eq!(command_events[0]["event"], "error");
+            assert!(
+                command_events[0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("EOF while parsing"),
+                "{events:?}"
+            );
+            for id in ["first-list", "next-list"] {
+                let listed = events
+                    .iter()
+                    .find(|event| event["id"] == id)
+                    .expect("list response");
+                assert_eq!(listed["event"], "command_exec_listed");
+                assert_eq!(listed["processes"], json!([]));
+            }
+        });
     }
 
     #[test]

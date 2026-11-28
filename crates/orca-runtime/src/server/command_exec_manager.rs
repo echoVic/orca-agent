@@ -18,7 +18,7 @@ use crate::runtime_permission::{
     RuntimePermissionPolicy, RuntimePermissionRequestKind,
 };
 use crate::sandbox_denial::diagnose_sandbox_denial;
-use crate::shell_session::RuntimeShellSessionManager;
+use crate::shell_session::{RuntimeShellSessionManager, ShellSessionFinishError};
 
 pub(super) struct CommandExecProcess {
     pub(super) shell_id: Option<String>,
@@ -444,6 +444,10 @@ impl CommandExecManager {
                 let mut output =
                     match manager.read_preserving_output(&shell_id, Duration::from_millis(1)) {
                         Ok(output) => output,
+                        Err(error) if ShellSessionFinishError::from_io(&error).is_some() => {
+                            self.report_finish_failure(&shell_id, &error, writer)?;
+                            continue;
+                        }
                         Err(_) => continue,
                     };
                 let Some(process) = self.get(&process_id) else {
@@ -640,9 +644,32 @@ impl CommandExecManager {
                 )
             }
             Err(error) => {
+                if ShellSessionFinishError::from_io(&error).is_some() {
+                    self.report_finish_failure(&shell_id, &error, writer)?;
+                }
                 protocol::write_server_event(writer, id, ServerEvent::error(error.to_string()))
             }
         }
+    }
+
+    pub(super) fn report_finish_failure<W: Write>(
+        &mut self,
+        shell_id: &str,
+        error: &io::Error,
+        writer: &mut W,
+    ) -> io::Result<bool> {
+        let process_id = self.processes.iter().find_map(|(process_id, process)| {
+            (process.shell_id.as_deref() == Some(shell_id)).then(|| process_id.clone())
+        });
+        let Some(process) = process_id.and_then(|process_id| self.remove(&process_id)) else {
+            return Ok(false);
+        };
+        protocol::write_server_event(
+            writer,
+            &process.command_event_id,
+            ServerEvent::error(error.to_string()),
+        )?;
+        Ok(true)
     }
 
     pub(super) fn terminate_all(
