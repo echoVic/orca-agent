@@ -1,7 +1,7 @@
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use orca_core::cancel::CancelToken;
@@ -9,7 +9,7 @@ use orca_core::config::{DelegationSnapshot, RunConfig};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventEnvelope, EventFactory, EventType, RunStatus};
 use orca_core::event_sink::{EventObserver, EventSink};
-use orca_core::subagent_types::SubagentType;
+use orca_core::subagent_types::{RoleContextPolicy, SubagentType};
 use orca_core::thread_identity::TurnId;
 use orca_core::tool_types::{ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
@@ -52,6 +52,7 @@ use crate::runtime_surface::{
 use crate::runtime_tool_call::RuntimeToolCallRuntime;
 use crate::schema_validation::validate_json_schema_subset;
 use crate::subagent::{SubagentIsolation, SubagentRequest};
+use crate::subagent_async_worker::SubagentLeaseHeartbeat;
 use crate::tasks::{SUBAGENT_STOPPED_BY_PERSON, TaskRegistry};
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
@@ -771,10 +772,25 @@ impl RuntimeSubagentBatch {
         let panic_request = tool_request.clone();
         let panic_description = description.clone();
         let panic_task = started_task.clone();
-        let worker_cancel = if invocation.agent_controller.is_some() {
-            let worker_cancel = CancelToken::new();
+        let hosted = invocation.agent_controller.is_some();
+        let threaded = gets_a_thread_of_its_own(&invocation);
+        if invocation.request.resume_from.is_some() {
+            invocation.agent_controller = None;
+        }
+        let threaded_cancel = threaded.then(CancelToken::new);
+        let (worker_cancel, parent_watcher_stop) = if hosted {
+            // The threaded route attaches the task token after marking it running.
+            // A continuation worker uses the admitted child's token directly.
+            let worker_cancel = threaded_cancel.clone().unwrap_or_else(|| {
+                self.registry
+                    .get(&task_id)
+                    .expect("admitted subagent task exists")
+                    .control
+                    .cancel
+            });
             let parent_cancel = self.cancel.clone();
             let worker_cancel_bridge = worker_cancel.clone();
+            let (stop, worker_done) = mpsc::channel::<()>();
             let watcher = thread::Builder::new()
                 .name(format!("orca-subagent-parent-cancel-{}", tool_request.id))
                 .spawn(move || {
@@ -783,7 +799,12 @@ impl RuntimeSubagentBatch {
                             worker_cancel_bridge.cancel();
                             break;
                         }
-                        thread::sleep(std::time::Duration::from_millis(10));
+                        if !matches!(
+                            worker_done.recv_timeout(std::time::Duration::from_millis(10)),
+                            Err(mpsc::RecvTimeoutError::Timeout)
+                        ) {
+                            break;
+                        }
                     }
                 });
             if let Err(error) = watcher {
@@ -804,16 +825,10 @@ impl RuntimeSubagentBatch {
                     event_error: None,
                 };
             }
-            worker_cancel
+            (worker_cancel, Some(stop))
         } else {
-            self.cancel.clone()
+            (self.cancel.clone(), None)
         };
-        let worker_cancel_for_thread = worker_cancel.clone();
-        let watcher_cancel = worker_cancel.clone();
-        let worker_cleanup = invocation
-            .agent_controller
-            .as_ref()
-            .map(|_| worker_cancel.clone());
         // The worker adopts the record this batch submitted instead of
         // creating its own, so capacity accounting and the model's view of the
         // task describe the same task.
@@ -821,20 +836,20 @@ impl RuntimeSubagentBatch {
         let join = match thread::Builder::new()
             .name(format!("orca-subagent-{}", tool_request.id))
             .spawn(move || {
-                let output = run_subagent_worker(
-                    invocation,
-                    lifecycle,
-                    started_task,
-                    worker_cancel_for_thread.clone(),
-                );
-                if let Some(worker_cleanup) = worker_cleanup {
-                    worker_cleanup.cancel();
+                // Disconnect the parent watcher when the worker exits.
+                let _parent_watcher_stop = parent_watcher_stop;
+                let output =
+                    run_subagent_worker(invocation, lifecycle, started_task, worker_cancel);
+                if let Some(cancel) = threaded_cancel {
+                    cancel.cancel();
                 }
                 output
             }) {
             Ok(join) => join,
             Err(error) => {
-                watcher_cancel.cancel();
+                if !hosted {
+                    self.cancel.cancel();
+                }
                 let message = format!("failed to start subagent worker: {error}");
                 let _ = self.registry.fail(&task_id, message.clone());
                 return SpawnOutcome {
@@ -1675,7 +1690,7 @@ fn threaded_sync_surface_activity(
 /// a checkpoint (the hosted path refuses `resume_from`), and has no finite
 /// budget (a budgeted child is run without the controller).
 ///
-/// This rule must stay at least as strict as `runs_through_the_controller`,
+/// This rule must stay at least as strict as `request_for_controller`,
 /// the test by which a worker runs a child on a thread: every child it lets
 /// through must be one that test also runs on a thread, or a child placed
 /// here for a thread of its own would run without one.
@@ -1696,11 +1711,9 @@ fn has_accepted_fork(request: &SubagentRequest) -> bool {
     request.captured_fork_prefix.is_some() || request.fork_prefix_ref.is_some()
 }
 
-/// Whether a worker runs `invocation` through the agent controller, on a
-/// hosted thread, rather than within the call that started it: there is a
-/// controller to host it, and the child has no isolation, is not a custom
-/// agent, does not continue a custom agent, and does not inherit a fork prefix.
-fn runs_through_the_controller(invocation: &RuntimeSubagentInvocation) -> bool {
+/// The request to run on a hosted thread, including the fresh-start note
+/// when a fork cannot inherit its saved history.
+fn request_for_controller(invocation: &RuntimeSubagentInvocation) -> Option<SubagentRequest> {
     let resumes_custom = invocation
         .request
         .resume_from
@@ -1710,11 +1723,60 @@ fn runs_through_the_controller(invocation: &RuntimeSubagentInvocation) -> bool {
                 .and_then(|coordinator| coordinator.prepared(selector))
                 .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
         });
-    invocation.agent_controller.is_some()
-        && invocation.request.isolation == SubagentIsolation::None
-        && !matches!(invocation.request.subagent_type, SubagentType::Custom(_))
+    let mut request = invocation.request.clone();
+    let fallback = if request.context == RoleContextPolicy::Fork {
+        match validate_saved_fork_prefix(invocation) {
+            Ok(()) => return None,
+            Err(reason) => Some(reason),
+        }
+    } else {
+        None
+    };
+    request.captured_fork_prefix = None;
+    request.fork_prefix_ref = None;
+    if !request_runs_through_the_controller(
+        &request,
+        invocation.agent_controller.is_some(),
+        resumes_custom,
+    ) {
+        return None;
+    }
+    if let Some(reason) = fallback {
+        request.prompt = crate::subagent::fresh_fork_prompt(&request.prompt, &reason);
+        request.context = RoleContextPolicy::Fresh;
+    }
+    Some(request)
+}
+
+fn validate_saved_fork_prefix(invocation: &RuntimeSubagentInvocation) -> Result<(), String> {
+    let prefix = match &invocation.request.captured_fork_prefix {
+        Some(prefix) => Arc::clone(prefix),
+        None => {
+            let reference = invocation
+                .request
+                .fork_prefix_ref
+                .ok_or_else(|| "no parent history was saved for this child".to_string())?;
+            invocation
+                .task_registry
+                .continuation_store()?
+                .load_fork_prefix(reference)
+                .map_err(|error| error.to_string())?
+        }
+    };
+    crate::subagent::validate_fork_prefix(&invocation.config, &prefix)
+}
+
+fn request_runs_through_the_controller(
+    request: &SubagentRequest,
+    has_controller: bool,
+    resumes_custom: bool,
+) -> bool {
+    has_controller
+        && request.isolation == SubagentIsolation::None
+        && !matches!(request.subagent_type, SubagentType::Custom(_))
+        && request.resume_from.is_none()
         && !resumes_custom
-        && !has_accepted_fork(&invocation.request)
+        && !has_accepted_fork(request)
 }
 
 /// Whether the worker that runs `invocation` gives the child's turn a
@@ -1728,16 +1790,17 @@ fn runs_through_the_controller(invocation: &RuntimeSubagentInvocation) -> bool {
 fn gets_a_thread_of_its_own(invocation: &RuntimeSubagentInvocation) -> bool {
     invocation.request.resume_from.is_none()
         && invocation.activity_ingress.is_some()
-        && runs_through_the_controller(invocation)
+        && request_for_controller(invocation).is_some()
 }
 
 fn run_subagent_worker(
-    invocation: RuntimeSubagentInvocation,
+    mut invocation: RuntimeSubagentInvocation,
     lifecycle: RuntimeSessionLifecycle,
     started_task: RuntimeTaskLifecycle,
     cancel: CancelToken,
 ) -> RuntimeSubagentCallOutput {
-    if runs_through_the_controller(&invocation) {
+    if let Some(request) = request_for_controller(&invocation) {
+        invocation.request = request;
         return run_threaded_agent_worker(invocation, lifecycle, started_task, cancel);
     }
     let RuntimeSubagentInvocation {
@@ -1765,11 +1828,11 @@ fn run_subagent_worker(
     let SubagentRequest {
         budget_reservation,
         description,
-        prompt,
+        mut prompt,
         subagent_type: requested_subagent_type,
         model: requested_model,
-        context: _,
-        fork_prefix_ref,
+        mut context,
+        mut fork_prefix_ref,
         captured_fork_prefix,
         mode: _,
         isolation: requested_isolation,
@@ -1994,9 +2057,28 @@ fn run_subagent_worker(
                 prompt_id,
                 compatibility,
             };
-            coordinator
-                .create_with_fork(input.clone(), fork_prefix_ref)
-                .or_else(|_| coordinator.create_with_fork(input, fork_prefix_ref))
+            let mut create = |input| {
+                coordinator.create_with_fork_policy(input, fork_prefix_ref, |loaded| {
+                    if context == RoleContextPolicy::Fresh {
+                        return loaded;
+                    }
+                    let reason = match loaded {
+                        Ok(Some(prefix)) => {
+                            match crate::subagent::validate_fork_prefix(&child_config, &prefix) {
+                                Ok(()) => return Ok(Some(prefix)),
+                                Err(reason) => reason,
+                            }
+                        }
+                        Ok(None) => "no parent history was saved for this child".to_string(),
+                        Err(error) => error.to_string(),
+                    };
+                    prompt = crate::subagent::fresh_fork_prompt(&prompt, &reason);
+                    context = RoleContextPolicy::Fresh;
+                    fork_prefix_ref = None;
+                    Ok(None)
+                })
+            };
+            create(input.clone()).or_else(|_| create(input))
         }
     };
     let mut prepared = match prepared {
@@ -2016,7 +2098,9 @@ fn run_subagent_worker(
             );
         }
     };
-    if let Some(prefix) = captured_fork_prefix {
+    if prepared.fork_prefix.is_some()
+        && let Some(prefix) = captured_fork_prefix
+    {
         prepared.fork_prefix = Some(prefix);
     }
     let lease = match coordinator
@@ -2141,6 +2225,31 @@ fn execute_acquired_sync_subagent(
     output_format: orca_core::config::OutputFormat,
     durable_reservation: Option<crate::child_budget_ledger::ChildBudgetReservation>,
 ) -> RuntimeSubagentCallOutput {
+    match coordinator.validate_live_lease(&lease) {
+        Ok(()) => {}
+        Err(error) => {
+            let worktree = worktree_execution.finish();
+            let _ = coordinator.fail_before_execution(
+                &lease,
+                continuation_error("failed to validate child continuation lease", &error),
+            );
+            return sync_setup_failure_with_worktree(
+                tool_request,
+                description,
+                lifecycle,
+                started_task,
+                &child_config,
+                &task_registry,
+                &registry_task_id,
+                continuation_error("failed to validate child continuation lease", &error),
+                worktree,
+            );
+        }
+    }
+    let child_cancel = task_registry
+        .get(&registry_task_id)
+        .map(|task| task.control.cancel)
+        .unwrap_or_else(CancelToken::new);
     let continuation_start = if is_resume {
         let Some(checkpoint) = prepared.checkpoint.clone() else {
             let output = continuation_started_failure(
@@ -2333,6 +2442,31 @@ fn execute_acquired_sync_subagent(
             emitter: Arc::clone(&activity),
         }),
     );
+    let (cancel_watch_stop, cancel_watch_receiver) = mpsc::channel();
+    let parent_cancel = cancel;
+    let child_cancel_watch = child_cancel.clone();
+    let cancel_watcher = thread::spawn(move || {
+        loop {
+            match cancel_watch_receiver.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if parent_cancel.is_cancelled() {
+                child_cancel_watch.cancel();
+                return;
+            }
+            if child_cancel_watch.is_cancelled() {
+                return;
+            }
+        }
+    });
+    let heartbeat = SubagentLeaseHeartbeat::start(
+        None,
+        coordinator.clone(),
+        lease.clone(),
+        Arc::clone(&shared_revision),
+        Some(child_cancel.clone()),
+    );
     let child = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
             cwd: &child_cwd,
@@ -2342,7 +2476,7 @@ fn execute_acquired_sync_subagent(
             memory: &memory,
             mcp_registry: &mcp_registry,
             hooks: &hooks,
-            cancel: &cancel,
+            cancel: &child_cancel,
             lifecycle: Some(&mut lifecycle),
             task_registry: Some(&task_registry),
             root_task_id: root_task_id.as_deref(),
@@ -2354,6 +2488,8 @@ fn execute_acquired_sync_subagent(
         });
         run_child_agent(&child_config, &child_request, &mut runtime)
     }));
+    let _ = cancel_watch_stop.send(());
+    let _ = cancel_watcher.join();
     let claim_cleanup_error = child_request
         .workflow_ipc
         .as_ref()
@@ -2416,6 +2552,7 @@ fn execute_acquired_sync_subagent(
             )
         }
     };
+    drop(heartbeat);
     let mut output = finalize_started_sync_subagent_with_revision(
         output,
         &coordinator,
@@ -3440,6 +3577,20 @@ mod tests {
     }
 
     #[test]
+    fn an_immediate_resume_and_a_queued_resume_take_the_same_route() {
+        let request = SubagentRequest {
+            resume_from: Some("checkpoint".to_string()),
+            ..plain_request()
+        };
+
+        let immediate_route = request_runs_through_the_controller(&request, true, false);
+        let queued_route = request_runs_through_the_controller(&request, false, false);
+
+        assert_eq!(immediate_route, queued_route);
+        assert!(!immediate_route);
+    }
+
+    #[test]
     fn a_child_with_a_finite_budget_does_not_qualify() {
         assert!(!child_qualifies_for_thread(&plain_request(), true, false));
     }
@@ -3463,11 +3614,242 @@ mod tests {
     }
 
     use super::*;
+    use crate::agent_child::ChildAgentResult;
     use crate::agent_continuation::{AgentAttemptId, ToolBoundary};
     use crate::runtime_surface::RuntimeSubagentActivityIngress;
     use crate::runtime_surface::TaskRevision;
     use orca_core::approval_types::ActionKind;
     use orca_core::tool_types::ToolName;
+
+    fn run_sync_child_for_lease_test(
+        cwd: &Path,
+        registry: &TaskRegistry,
+        cancel: &CancelToken,
+        resume_from: Option<&str>,
+        executor: ChildAgentExecutor<io::Sink>,
+    ) -> RuntimeSubagentCallOutput {
+        let tool_request = ToolRequest {
+            id: "sync-lease".into(),
+            name: ToolName::Subagent,
+            action: ActionKind::Agent,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": "Inspect", "prompt": "Inspect", "mode": "sync",
+                    "resume_from": resume_from,
+                })
+                .to_string(),
+            ),
+        };
+        let request = crate::subagent::create_subagent_request(&tool_request);
+        let config = crate::runtime_tool_call::tests::test_config();
+        let invocation = RuntimeSubagentInvocation::snapshot(
+            tool_request,
+            request,
+            &config,
+            cwd,
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &McpRegistry::default(),
+            &HookRunner::default(),
+            None,
+            1,
+            executor,
+            None,
+            None,
+            registry,
+            None,
+            None,
+            "sync-lease".into(),
+            1,
+        );
+        RuntimeToolCallRuntime::for_normal_execution()
+            .execute_subagent(invocation, cancel, |_| Ok(()))
+            .output
+    }
+
+    #[test]
+    fn a_synchronous_child_does_not_start_on_an_expired_lease() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut registry = TaskRegistry::new("sync-expired-lease".into());
+        registry.continuation_lease_duration_ms = Some(0);
+        let output = run_sync_child_for_lease_test(
+            cwd.path(),
+            &registry,
+            &CancelToken::new(),
+            None,
+            |_, _, runtime, _| {
+                std::fs::write(runtime.cwd.join("child-started"), [])?;
+                Err(io::Error::other("child started on an expired lease"))
+            },
+        );
+
+        assert!(!cwd.path().join("child-started").exists());
+        assert_eq!(output.status, RunStatus::Failed);
+        assert!(
+            output
+                .result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("lease has expired")
+        );
+    }
+
+    #[test]
+    fn a_child_refused_before_start_can_be_resumed() {
+        use crate::child_agent_types::ChildAgentCheckpointObservation;
+        use orca_core::conversation::Conversation;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut registry = TaskRegistry::new("sync-resume-after-refusal".into());
+        let cancel = CancelToken::new();
+        let original = run_sync_child_for_lease_test(
+            cwd.path(),
+            &registry,
+            &cancel,
+            None,
+            |_, _, runtime, _| {
+                let mut conversation = Conversation::new();
+                conversation.add_user("Inspect the workspace.".into());
+                conversation.add_assistant(Some("Inspection complete.".into()), None, vec![]);
+                runtime
+                    .checkpoint_observer
+                    .unwrap()
+                    .checkpoint(ChildAgentCheckpointObservation {
+                        conversation: &conversation,
+                        turn: 1,
+                        usage: Default::default(),
+                        last_tool_boundary: None,
+                    })
+                    .unwrap();
+                Ok(ChildAgentResult {
+                    status: RunStatus::Success,
+                    final_message: Some("Inspection complete.".into()),
+                    error: None,
+                    budget_usage: None,
+                })
+            },
+        );
+        assert_eq!(
+            original.status,
+            RunStatus::Success,
+            "{:?}",
+            original.event_error
+        );
+        let task = &registry.list()[0];
+        let source = registry.continuation_projection(&task.id).unwrap().unwrap();
+        let selector = source.continuation_id.as_str();
+        let checkpoint_id = source.checkpoint_id.unwrap();
+
+        registry.continuation_lease_duration_ms = Some(0);
+        let refused = run_sync_child_for_lease_test(
+            cwd.path(),
+            &registry,
+            &cancel,
+            Some(selector),
+            |_, _, runtime, _| {
+                std::fs::write(runtime.cwd.join("child-started"), [])?;
+                Err(io::Error::other("child started on an expired lease"))
+            },
+        );
+        assert_eq!(refused.status, RunStatus::Failed);
+        assert!(refused.event_error.unwrap().contains("lease has expired"));
+        assert!(!cwd.path().join("child-started").exists());
+
+        registry.continuation_lease_duration_ms = None;
+        let resumed = run_sync_child_for_lease_test(
+            cwd.path(),
+            &registry,
+            &cancel,
+            Some(selector),
+            |_, request, _, _| {
+                assert_eq!(request.continuation.as_ref().unwrap().checkpoint().turn, 1);
+                Ok(ChildAgentResult {
+                    status: RunStatus::Success,
+                    final_message: Some("Inspection resumed.".into()),
+                    error: None,
+                    budget_usage: None,
+                })
+            },
+        );
+        assert_eq!(
+            resumed.status,
+            RunStatus::Success,
+            "{:?}",
+            resumed.event_error
+        );
+        let projection = ChildAgentCoordinator::new(registry)
+            .unwrap()
+            .projection(selector)
+            .unwrap();
+        assert_eq!(projection.checkpoint_id, Some(checkpoint_id));
+    }
+
+    #[test]
+    fn a_synchronous_child_stops_when_it_loses_its_lease() {
+        use std::time::{Duration, Instant};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new("sync-lost-lease".into());
+        let parent_cancel = CancelToken::new();
+        run_sync_child_for_lease_test(
+            cwd.path(),
+            &registry,
+            &parent_cancel,
+            None,
+            |_, _, runtime, _| {
+                let registry = runtime.task_registry.unwrap();
+                let task_id = runtime.child_task_id.unwrap();
+                let store = registry.continuation_store().unwrap();
+                let id = registry
+                    .continuation_projection(task_id)
+                    .unwrap()
+                    .unwrap()
+                    .continuation_id;
+                assert!(!runtime.cancel.is_cancelled());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let record = store.load_record(&id).unwrap().unwrap();
+                    match store.mutate_record(&id, record.revision, |record| {
+                        record.current_attempt.lease_expires_at_ms = Some(0);
+                        Ok(())
+                    }) {
+                        Ok(_) => break,
+                        Err(AgentContinuationError::RevisionConflict { .. }) => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "could not expire the child's lease"
+                            );
+                        }
+                        Err(error) => panic!("could not expire the child's lease: {error}"),
+                    }
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !runtime.cancel.is_cancelled() {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::other(
+                            "child did not stop after losing its lease",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                std::fs::write(runtime.cwd.join("child-stopped"), [])?;
+                Ok(ChildAgentResult {
+                    status: RunStatus::Cancelled,
+                    final_message: None,
+                    error: None,
+                    budget_usage: None,
+                })
+            },
+        );
+
+        assert!(
+            cwd.path().join("child-stopped").exists(),
+            "child did not stop after losing its lease"
+        );
+        assert!(!parent_cancel.is_cancelled());
+    }
 
     #[derive(Debug, Default)]
     struct RecordingActivityIngress {

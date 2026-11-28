@@ -142,6 +142,8 @@ pub struct TaskRegistry {
     cancelled_roots: Arc<Mutex<HashSet<String>>>,
     typed_provider_outcomes: Arc<Mutex<HashMap<String, DurableTypedProviderOutcome>>>,
     continuation_store: AgentContinuationStore,
+    #[cfg(test)]
+    pub(crate) continuation_lease_duration_ms: Option<i64>,
     /// Durable actor-issued capabilities for detached child surface writes.
     /// This is deliberately separate from the task mirror: task records can
     /// be imported by id, while a binding is scoped to this session and the
@@ -1742,6 +1744,8 @@ impl TaskRegistry {
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(HashMap::new())),
             continuation_store,
+            #[cfg(test)]
+            continuation_lease_duration_ms: None,
             detached_bindings: Arc::new(Mutex::new(HashMap::new())),
             detached_permission_requests: Arc::new(Mutex::new(HashMap::new())),
             detached_permission_signers: Arc::new(Mutex::new(HashMap::new())),
@@ -1824,6 +1828,8 @@ impl TaskRegistry {
             cancelled_roots: Arc::new(Mutex::new(HashSet::new())),
             typed_provider_outcomes: Arc::new(Mutex::new(typed_provider_outcomes)),
             continuation_store,
+            #[cfg(test)]
+            continuation_lease_duration_ms: None,
             detached_bindings: Arc::new(Mutex::new(detached_bindings)),
             detached_permission_requests: Arc::new(Mutex::new(detached_permission_requests)),
             detached_permission_signers: Arc::new(Mutex::new(HashMap::new())),

@@ -1720,7 +1720,7 @@ mod tests {
         })
     }
 
-    fn cancelling_child_executor<W: io::Write>(
+    fn started_child_executor<W: io::Write>(
         _config: &RunConfig,
         request: &ChildAgentRequest,
         runtime: &mut ChildAgentRuntime<'_, W>,
@@ -1730,11 +1730,10 @@ mod tests {
             .cwd
             .join(format!("{}.started", request.prompt.replace(' ', "-")));
         std::fs::write(marker, "started\n")?;
-        runtime.cancel.cancel();
         Ok(ChildAgentResult {
-            status: RunStatus::Cancelled,
-            final_message: None,
-            error: Some("child cancelled parent batch".to_string()),
+            status: RunStatus::Success,
+            final_message: Some("child finished".to_string()),
+            error: None,
             budget_usage: None,
         })
     }
@@ -1808,6 +1807,15 @@ mod tests {
         let task_registry = TaskRegistry::new("subagent-batch-hook-cancel".to_string());
         let mut conversation = orca_core::conversation::Conversation::new();
         let started = Instant::now();
+        let parent_cancel = cancel.clone();
+        let first_child_started = cwd.path().join("inspect-first.started");
+        let cancel_parent = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !first_child_started.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            parent_cancel.cancel();
+        });
 
         let (batch_result, _receipts) =
             super::run_subagent_batch_tool_turn(super::RuntimeSubagentBatchToolTurnContext {
@@ -1843,8 +1851,9 @@ mod tests {
                     permission_handler: None,
                     agent_controller: None,
                 },
-                child_executor: cancelling_child_executor::<std::io::Sink>,
+                child_executor: started_child_executor::<std::io::Sink>,
             });
+        cancel_parent.join().unwrap();
         let outcome = batch_result.expect("cancel subagent batch");
 
         assert!(started.elapsed() < platform_test_deadline(2, 4));

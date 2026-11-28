@@ -1640,6 +1640,7 @@ pub(crate) struct PreparedContinuation {
     /// Compatibility and workspace identity the child loop must retain.
     pub(crate) compatibility: ContinuationCompatibility,
     pub(crate) fork_prefix: Option<Arc<ProviderForkPrefix>>,
+    fork_prefix_ref: Option<Sha256Digest>,
     /// Source checkpoint for resume, or the latest checkpoint after settlement.
     pub(crate) checkpoint: Option<AgentCheckpoint>,
     /// Current durable revision to use when acquiring or committing.
@@ -1670,6 +1671,7 @@ impl From<&AgentContinuationRecord> for PreparedContinuation {
                 compatibility_hash: record.compatibility_hash,
             },
             fork_prefix: None,
+            fork_prefix_ref: None,
             checkpoint: record.checkpoint.clone(),
             revision: record.revision,
             source_task_id: record.source_task_id.clone(),
@@ -1800,6 +1802,38 @@ impl AgentContinuationStore {
         }
     }
 
+    fn resolve_fork_prefix_ref(
+        &self,
+        record: &AgentContinuationRecord,
+    ) -> Result<Option<Sha256Digest>, AgentContinuationError> {
+        let AgentContinuationStoreBackend::Persistent { root, .. } = &self.backend else {
+            return Ok(record.fork_prefix_ref);
+        };
+        let id = &record.continuation_id;
+        let association = read_fork_child(&fork_child_path(root, &self.parent_session_id, id))
+            .map_err(|error| error.with_fork_history_context(id))?;
+        if let (Some(inline), Some(associated)) = (record.fork_prefix_ref, association)
+            && inline != associated
+        {
+            return Err(
+                corrupt_record("fork prefix association does not match its continuation")
+                    .with_fork_history_context(id),
+            );
+        }
+        Ok(record.fork_prefix_ref.or(association))
+    }
+
+    fn load_child_fork_prefix(
+        &self,
+        continuation_id: &AgentContinuationId,
+        reference: Option<Sha256Digest>,
+    ) -> Result<Option<Arc<ProviderForkPrefix>>, AgentContinuationError> {
+        reference
+            .map(|digest| self.load_fork_prefix(digest))
+            .transpose()
+            .map_err(|error| error.with_fork_history_context(continuation_id))
+    }
+
     /// Creates one new revision-zero continuation after validating all durable invariants.
     pub(crate) fn create_record(
         &self,
@@ -1854,8 +1888,9 @@ impl AgentContinuationStore {
                             actual: parent_session_id.clone(),
                         });
                     }
-                    let existing =
+                    let mut existing =
                         read_record(root, &self.parent_session_id, &record.continuation_id)?;
+                    existing.fork_prefix_ref = self.resolve_fork_prefix_ref(&existing)?;
                     if existing != record {
                         return Err(AgentContinuationError::AlreadyExists {
                             continuation_id: record.continuation_id,
@@ -1871,8 +1906,9 @@ impl AgentContinuationStore {
                 );
                 match fs::symlink_metadata(&record_path) {
                     Ok(metadata) if metadata.is_file() => {
-                        let existing =
+                        let mut existing =
                             read_record(root, &self.parent_session_id, &record.continuation_id)?;
+                        existing.fork_prefix_ref = self.resolve_fork_prefix_ref(&existing)?;
                         if existing != record {
                             return Err(corrupt_record(
                                 "unindexed continuation record conflicts with requested creation",
@@ -2596,18 +2632,9 @@ fn read_record(
             found: schema_version,
         });
     }
-    let mut record: AgentContinuationRecord = serde_json::from_value(value)
+    let record: AgentContinuationRecord = serde_json::from_value(value)
         .map_err(|_| corrupt_record("continuation record does not match its schema"))?;
     validate_record(&record, Some(continuation_id), Some(parent_session_id))?;
-    let association = read_fork_child(&fork_child_path(root, parent_session_id, continuation_id))?;
-    if let (Some(inline), Some(associated)) = (record.fork_prefix_ref, association)
-        && inline != associated
-    {
-        return Err(corrupt_record(
-            "fork prefix association does not match its continuation",
-        ));
-    }
-    record.fork_prefix_ref = record.fork_prefix_ref.or(association);
     Ok(record)
 }
 
@@ -2882,6 +2909,14 @@ pub(crate) struct ChildAgentCoordinator {
 }
 
 impl ChildAgentCoordinator {
+    pub(crate) fn lease_duration_ms(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(duration_ms) = self.task_registry.continuation_lease_duration_ms {
+            return duration_ms;
+        }
+        CONTINUATION_LEASE_DURATION_MS
+    }
+
     /// Creates a cloneable coordinator with one stable runtime owner identity; it returns persistence errors from the registry store lookup and otherwise changes no durable state.
     pub(crate) fn new(task_registry: TaskRegistry) -> Result<Self, AgentContinuationError> {
         let owner_id = format!(
@@ -2930,31 +2965,56 @@ impl ChildAgentCoordinator {
         input: CreateContinuationInput,
         fork_prefix_ref: Option<Sha256Digest>,
     ) -> Result<PreparedContinuation, AgentContinuationError> {
+        self.create_with_fork_policy(input, fork_prefix_ref, |prefix| prefix)
+    }
+
+    pub(crate) fn create_with_fork_policy(
+        &self,
+        input: CreateContinuationInput,
+        fork_prefix_ref: Option<Sha256Digest>,
+        prepare_prefix: impl FnOnce(
+            Result<Option<Arc<ProviderForkPrefix>>, AgentContinuationError>,
+        )
+            -> Result<Option<Arc<ProviderForkPrefix>>, AgentContinuationError>,
+    ) -> Result<PreparedContinuation, AgentContinuationError> {
         validate_task_binding(&input.parent_task_id, &input.task_id)?;
         validate_compatibility_shape(&input.compatibility)?;
         let continuation_id = input
             .continuation_id
             .unwrap_or_else(AgentContinuationId::new);
         if let Some(record) = self.store.load_record(&continuation_id)? {
+            let existing_fork_prefix_ref = self.store.resolve_fork_prefix_ref(&record)?;
             let duplicate = record.parent_task_id == input.parent_task_id
                 && record.source_task_id == input.task_id
                 && record.latest_task_id == input.task_id
                 && record.current_attempt.prompt_id == input.prompt_id
                 && record.subagent_type == input.compatibility.subagent_type
                 && record.frozen_agent == input.compatibility.frozen_agent
-                && record.fork_prefix_ref == fork_prefix_ref
+                && existing_fork_prefix_ref == fork_prefix_ref
                 && record.model == input.compatibility.model
                 && record.isolation == input.compatibility.isolation
                 && record.effective_cwd == input.compatibility.effective_cwd
                 && record.worktree == input.compatibility.worktree
                 && record.compatibility_hash == input.compatibility.compatibility_hash;
             if duplicate {
+                let fork_prefix = self
+                    .store
+                    .load_child_fork_prefix(&continuation_id, existing_fork_prefix_ref)?;
                 self.install_projection(&record)?;
-                return self.prepare_record(&record);
+                return Ok(PreparedContinuation {
+                    fork_prefix,
+                    fork_prefix_ref: existing_fork_prefix_ref,
+                    ..PreparedContinuation::from(&record)
+                });
             }
             return Err(AgentContinuationError::AlreadyExists { continuation_id });
         }
 
+        let fork_prefix = prepare_prefix(
+            self.store
+                .load_child_fork_prefix(&continuation_id, fork_prefix_ref),
+        )?;
+        let fork_prefix_ref = fork_prefix_ref.filter(|_| fork_prefix.is_some());
         let now_ms = continuation_now_ms();
         let record = AgentContinuationRecord {
             schema_version: AGENT_CONTINUATION_SCHEMA_VERSION,
@@ -2992,19 +3052,26 @@ impl ChildAgentCoordinator {
         };
         let record = self.store.create_record(record)?;
         self.install_projection(&record)?;
-        self.prepare_record(&record)
+        Ok(PreparedContinuation {
+            fork_prefix,
+            fork_prefix_ref,
+            ..PreparedContinuation::from(&record)
+        })
     }
 
     fn prepare_record(
         &self,
         record: &AgentContinuationRecord,
     ) -> Result<PreparedContinuation, AgentContinuationError> {
-        let mut prepared = PreparedContinuation::from(record);
-        prepared.fork_prefix = record
-            .fork_prefix_ref
-            .map(|digest| self.store.load_fork_prefix(digest))
-            .transpose()?;
-        Ok(prepared)
+        let reference = self.store.resolve_fork_prefix_ref(record)?;
+        let fork_prefix = self
+            .store
+            .load_child_fork_prefix(&record.continuation_id, reference)?;
+        Ok(PreparedContinuation {
+            fork_prefix,
+            fork_prefix_ref: reference,
+            ..PreparedContinuation::from(record)
+        })
     }
 
     /// Resolves a UUIDv7 continuation directly or a compatibility task/agent selector through the task registry; it returns stable not-found or persistence errors and performs no writes.
@@ -3124,6 +3191,7 @@ impl ChildAgentCoordinator {
         let expected_revision = record.revision;
         let previous = self.prepare_record(&record)?;
         let fork_prefix = previous.fork_prefix.clone();
+        let fork_prefix_ref = previous.fork_prefix_ref;
         let prompt_id = input.prompt_id;
         let task_id = input.task_id;
         let parent_task_id = input.parent_task_id;
@@ -3160,6 +3228,7 @@ impl ChildAgentCoordinator {
                     };
                     record.latest_task_id = task_id;
                     record.parent_task_id = parent_task_id;
+                    record.fork_prefix_ref = record.fork_prefix_ref.or(fork_prefix_ref);
                     record.active_tool_boundary = None;
                     record.terminal = None;
                     record.updated_at_ms = now_ms;
@@ -3168,6 +3237,7 @@ impl ChildAgentCoordinator {
         self.install_projection(&committed)?;
         Ok(PreparedContinuation {
             fork_prefix,
+            fork_prefix_ref,
             ..PreparedContinuation::from(&committed)
         })
     }
@@ -3401,7 +3471,7 @@ impl ChildAgentCoordinator {
         let expected_revision = prepared.revision;
         let owner_id = self.owner_id.to_string();
         let expires_at_ms = now_ms
-            .checked_add(CONTINUATION_LEASE_DURATION_MS)
+            .checked_add(self.lease_duration_ms())
             .unwrap_or(i64::MAX);
         let (_, committed) = self.store.mutate_record(
             &prepared.continuation_id,
@@ -3431,6 +3501,7 @@ impl ChildAgentCoordinator {
                 record.current_attempt.owner_id = Some(owner_id);
                 record.current_attempt.lease_expires_at_ms = Some(expires_at_ms);
                 record.current_attempt.started_at_ms = Some(now_ms);
+                record.fork_prefix_ref = record.fork_prefix_ref.or(prepared.fork_prefix_ref);
                 record.updated_at_ms = now_ms;
                 Ok(())
             },
@@ -3480,6 +3551,37 @@ impl ChildAgentCoordinator {
         Ok(ContinuationProjection::from(&committed))
     }
 
+    /// Settles a worker that could not load its saved history, using its
+    /// detached launch binding and the current record revision.
+    pub(crate) fn fail_unstarted_worker(
+        &self,
+        task_id: &str,
+        attempt_id: &AgentAttemptId,
+        error: String,
+    ) -> Result<ContinuationProjection, AgentContinuationError> {
+        let continuation_id = self.resolve_selector(task_id)?;
+        let record = self
+            .store
+            .load_record(&continuation_id)?
+            .ok_or(AgentContinuationError::NotFound)?;
+        if record.latest_task_id != task_id {
+            return Err(AgentContinuationError::TaskBindingMismatch {
+                expected: record.latest_task_id,
+                actual: task_id.to_owned(),
+            });
+        }
+        if &record.current_attempt.attempt_id != attempt_id {
+            return Err(AgentContinuationError::AttemptMismatch {
+                expected: record.current_attempt.attempt_id,
+                actual: attempt_id.clone(),
+            });
+        }
+        self.commit_prepared_terminal(
+            &PreparedContinuation::from(&record),
+            AgentTerminal::Failed { error },
+        )
+    }
+
     /// Renews a live attempt lease under the same identity, epoch, and revision
     /// fence used by checkpoint and terminal commits. The returned projection
     /// carries the next revision that the owner must use for its next write.
@@ -3490,7 +3592,7 @@ impl ChildAgentCoordinator {
     ) -> Result<ContinuationProjection, AgentContinuationError> {
         let now_ms = continuation_now_ms();
         let expires_at_ms = now_ms
-            .checked_add(CONTINUATION_LEASE_DURATION_MS)
+            .checked_add(self.lease_duration_ms())
             .unwrap_or(i64::MAX);
         let fence = lease.fence(expected_revision);
         let (_, committed) =
@@ -3514,6 +3616,29 @@ impl ChildAgentCoordinator {
                 })?;
         self.install_projection(&committed)?;
         Ok(ContinuationProjection::from(&committed))
+    }
+
+    pub(crate) fn validate_live_lease(
+        &self,
+        lease: &ContinuationLease,
+    ) -> Result<(), AgentContinuationError> {
+        let record = self
+            .store
+            .load_record(&lease.continuation_id)?
+            .ok_or(AgentContinuationError::NotFound)?;
+        lease.fence(lease.revision).validate(&record)?;
+        validate_live_lease(&record, lease, continuation_now_ms())?;
+        if record.current_attempt.state != AttemptState::Running
+            || !matches!(
+                record.status,
+                ContinuationStatus::Running | ContinuationStatus::Checkpointed
+            )
+        {
+            return Err(AgentContinuationError::NotResumable {
+                status: record.status,
+            });
+        }
+        Ok(())
     }
 
     /// Commits one digest-valid monotonically sequenced checkpoint under the full live lease fence; it keeps the attempt Running, advances the record revision, and installs the task projection after durable store success.
@@ -3632,22 +3757,39 @@ impl ChildAgentCoordinator {
                             status: record.status,
                         });
                     }
-                    let next_status = terminal_status(&terminal);
-                    record.status.transition_to(next_status)?;
-                    record
-                        .current_attempt
-                        .state
-                        .transition_to(AttemptState::Terminal)?;
-                    record.current_attempt.owner_id = None;
-                    record.current_attempt.lease_expires_at_ms = None;
-                    record.current_attempt.completed_at_ms = Some(now_ms);
-                    record.active_tool_boundary = None;
-                    record.terminal = Some(terminal);
-                    record.updated_at_ms = now_ms;
-                    Ok(())
+                    settle_running_attempt(record, terminal, now_ms)
                 })?;
         self.install_projection(&committed)?;
         Ok(ContinuationProjection::from(&committed))
+    }
+
+    /// Records a refusal before the executor ran, preserving any inherited
+    /// checkpoint. An expired lease can settle only the acquisition it names.
+    pub(crate) fn fail_before_execution(
+        &self,
+        lease: &ContinuationLease,
+        error: String,
+    ) -> Result<(), AgentContinuationError> {
+        let now_ms = continuation_now_ms();
+        let fence = lease.fence(lease.revision);
+        let (_, committed) =
+            self.store
+                .mutate_record(&lease.continuation_id, lease.revision, move |record| {
+                    fence.validate(record)?;
+                    if record.current_attempt.owner_id.as_deref() != Some(lease.owner_id.as_str()) {
+                        return Err(AgentContinuationError::LeaseExpired);
+                    }
+                    if record.status != ContinuationStatus::Running
+                        || record.current_attempt.state != AttemptState::Running
+                        || record.active_tool_boundary.is_some()
+                    {
+                        return Err(AgentContinuationError::NotResumable {
+                            status: record.status,
+                        });
+                    }
+                    settle_running_attempt(record, AgentTerminal::Failed { error }, now_ms)
+                })?;
+        self.install_projection(&committed)
     }
 
     /// Persists the replay disposition before a child tool is invoked. This
@@ -3997,6 +4139,25 @@ fn terminal_status(terminal: &AgentTerminal) -> ContinuationStatus {
     }
 }
 
+fn settle_running_attempt(
+    record: &mut AgentContinuationRecord,
+    terminal: AgentTerminal,
+    now_ms: i64,
+) -> Result<(), AgentContinuationError> {
+    record.status.transition_to(terminal_status(&terminal))?;
+    record
+        .current_attempt
+        .state
+        .transition_to(AttemptState::Terminal)?;
+    record.current_attempt.owner_id = None;
+    record.current_attempt.lease_expires_at_ms = None;
+    record.current_attempt.completed_at_ms = Some(now_ms);
+    record.active_tool_boundary = None;
+    record.terminal = Some(terminal);
+    record.updated_at_ms = now_ms;
+    Ok(())
+}
+
 fn task_binding_label(task_id: Option<&str>) -> String {
     task_id.unwrap_or("<none>").to_string()
 }
@@ -4160,6 +4321,13 @@ pub(crate) enum AgentContinuationError {
 }
 
 impl AgentContinuationError {
+    fn with_fork_history_context(mut self, continuation_id: &AgentContinuationId) -> Self {
+        if let Self::CorruptRecord { message } | Self::Persistence { message } = &mut self {
+            *message = format!("continuation {continuation_id}: {message}");
+        }
+        self
+    }
+
     /// Returns the stable machine-readable category for this error.
     pub(crate) const fn code(&self) -> AgentContinuationErrorCode {
         match self {
@@ -4845,6 +5013,17 @@ mod tests {
             .unwrap()
     }
 
+    fn assert_corrupt_fork_history(
+        error: AgentContinuationError,
+        child: &AgentContinuationId,
+        problem: &str,
+    ) {
+        assert_eq!(error.code(), AgentContinuationErrorCode::CorruptRecord);
+        let message = error.to_string();
+        assert!(message.contains(child.as_str()), "{message}");
+        assert!(message.contains(problem), "{message}");
+    }
+
     #[test]
     fn a_failed_fork_creation_does_not_bind_a_later_fresh_child() {
         let root = tempfile::tempdir().unwrap();
@@ -4864,6 +5043,66 @@ mod tests {
         let restored = coordinator.prepared(id.as_str()).unwrap();
         assert!(restored.fork_prefix.is_none());
         assert!(!association.exists());
+    }
+
+    #[test]
+    fn a_missing_prefix_blob_publishes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let input = test_continuation_input(&registry);
+        let id = input.continuation_id.clone().unwrap();
+        let task_id = input.task_id.clone();
+        let digest = coordinator
+            .store
+            .store_fork_prefix(test_fork_prefix())
+            .unwrap();
+        fs::remove_file(fork_prefix_path(root.path(), "parent", digest)).unwrap();
+
+        let error = coordinator
+            .create_with_fork(input, Some(digest))
+            .unwrap_err();
+        assert!(coordinator.store.load_record(&id).unwrap().is_none());
+        assert!(!continuation_record_path(root.path(), "parent", &id).exists());
+        assert!(
+            registry
+                .continuation_projection(&task_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!fork_child_path(root.path(), "parent", &id).exists());
+        assert_corrupt_fork_history(error, &id, "referenced fork prefix is missing");
+    }
+
+    #[test]
+    fn a_fresh_retry_with_the_same_id_succeeds_after_a_failed_fork_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let input = test_continuation_input(&registry);
+        let id = input.continuation_id.clone().unwrap();
+        let digest = coordinator
+            .store
+            .store_fork_prefix(test_fork_prefix())
+            .unwrap();
+        fs::remove_file(fork_prefix_path(root.path(), "parent", digest)).unwrap();
+        let error = coordinator
+            .create_with_fork(input, Some(digest))
+            .unwrap_err();
+
+        let fresh = test_continuation_input(&registry);
+        let task_id = fresh.task_id.clone();
+        let prepared = coordinator
+            .create(CreateContinuationInput {
+                continuation_id: Some(id.clone()),
+                ..fresh
+            })
+            .unwrap();
+        assert_eq!(prepared.continuation_id, id);
+        assert_eq!(prepared.latest_task_id, task_id);
+        assert!(prepared.fork_prefix.is_none());
+        assert!(!fork_child_path(root.path(), "parent", &id).exists());
+        assert_corrupt_fork_history(error, &id, "referenced fork prefix is missing");
     }
 
     #[test]
@@ -4913,11 +5152,12 @@ mod tests {
 
         let other_digest = Sha256Digest::digest(b"another prefix");
         write_json_pretty(&association, &other_digest, "write test association").unwrap();
-        assert_eq!(
+        assert_corrupt_fork_history(
             coordinator
                 .prepared(child.continuation_id.as_str())
                 .unwrap_err(),
-            corrupt_record("fork prefix association does not match its continuation")
+            &child.continuation_id,
+            "fork prefix association does not match its continuation",
         );
     }
 
@@ -4960,12 +5200,169 @@ mod tests {
             assert!(reopened.get(&other.latest_task_id).is_some());
             let coordinator = ChildAgentCoordinator::new(reopened).unwrap();
             assert!(coordinator.prepared(other.continuation_id.as_str()).is_ok());
-            assert_eq!(
+            assert_corrupt_fork_history(
                 coordinator
                     .validate_resume_admission(broken.continuation_id.as_str(), None, None)
                     .unwrap_err(),
-                corrupt_record(problem)
+                &broken.continuation_id,
+                problem,
             );
+        }
+    }
+
+    #[test]
+    fn a_corrupt_fork_association_does_not_block_the_registry() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let child = create_test_fork(&registry);
+        let other = ChildAgentCoordinator::new(registry.clone())
+            .unwrap()
+            .create(test_continuation_input(&registry))
+            .unwrap();
+        fs::write(
+            fork_child_path(root.path(), "parent", &child.continuation_id),
+            b"[",
+        )
+        .unwrap();
+        drop(registry);
+
+        let reopened = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        assert!(reopened.get(&child.latest_task_id).is_some());
+        let coordinator = ChildAgentCoordinator::new(reopened).unwrap();
+        let prepared = coordinator
+            .prepared(other.continuation_id.as_str())
+            .unwrap();
+        coordinator.acquire(&prepared).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_fork_association_fails_only_that_childs_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let broken = create_test_fork(&registry);
+        let healthy = create_test_fork(&registry);
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        for child in [&broken, &healthy] {
+            let lease = coordinator.acquire(child).unwrap();
+            let saved = coordinator
+                .commit_checkpoint(
+                    &lease,
+                    lease.revision,
+                    checkpoint(lease.attempt_id.clone(), 0, 0),
+                )
+                .unwrap();
+            coordinator
+                .commit_terminal(
+                    &lease,
+                    saved.revision,
+                    AgentTerminal::Completed { result: None },
+                )
+                .unwrap();
+        }
+        let resume_input = |child: &PreparedContinuation| {
+            let task = test_continuation_input(&registry);
+            ResumeContinuationInput {
+                selector: child.continuation_id.to_string(),
+                parent_task_id: task.parent_task_id,
+                task_id: task.task_id,
+                prompt_id: task.prompt_id,
+                compatibility: child.compatibility.clone(),
+            }
+        };
+        let before = coordinator
+            .store
+            .load_record(&broken.continuation_id)
+            .unwrap();
+        let damaged_contents = r#"["truncated fixture"#;
+        fs::write(
+            fork_child_path(root.path(), "parent", &broken.continuation_id),
+            damaged_contents,
+        )
+        .unwrap();
+
+        let error = coordinator
+            .prepare_resume(resume_input(&broken))
+            .unwrap_err();
+        assert!(!error.to_string().contains("truncated fixture"));
+        assert_corrupt_fork_history(error, &broken.continuation_id, "fork prefix association");
+        assert_eq!(
+            coordinator
+                .store
+                .load_record(&broken.continuation_id)
+                .unwrap(),
+            before
+        );
+
+        let resumed = coordinator.prepare_resume(resume_input(&healthy)).unwrap();
+        assert_ne!(resumed.attempt_id, healthy.attempt_id);
+        assert_eq!(resumed.fork_prefix, healthy.fork_prefix);
+    }
+
+    #[test]
+    fn conflicting_fork_references_fail_only_that_child() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let child = create_test_fork(&registry);
+        let sibling = create_test_fork(&registry);
+        let association = fork_child_path(root.path(), "parent", &child.continuation_id);
+        let other_digest = Sha256Digest::digest(b"another prefix");
+        write_json_pretty(&association, &other_digest, "write test association").unwrap();
+        drop(registry);
+
+        let reopened = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let coordinator = ChildAgentCoordinator::new(reopened).unwrap();
+        let error = coordinator
+            .prepared(child.continuation_id.as_str())
+            .unwrap_err();
+        assert_corrupt_fork_history(
+            error,
+            &child.continuation_id,
+            "fork prefix association does not match",
+        );
+        let prepared = coordinator
+            .prepared(sibling.continuation_id.as_str())
+            .unwrap();
+        assert_eq!(prepared.fork_prefix, sibling.fork_prefix);
+    }
+
+    #[test]
+    fn reconciliation_reads_no_fork_history() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let children: Vec<_> = (0..8)
+            .map(|index| {
+                let mut prefix = test_fork_prefix();
+                prefix.messages.push(
+                    serde_json::json!({"role": "user", "content": format!("history {index}")})
+                        .to_string(),
+                );
+                let digest = coordinator.store.store_fork_prefix(prefix).unwrap();
+                let child = coordinator
+                    .create_with_fork(test_continuation_input(&registry), Some(digest))
+                    .unwrap();
+                (child, digest)
+            })
+            .collect();
+        drop(coordinator);
+        drop(registry);
+        for (child, digest) in &children {
+            for path in [
+                fork_prefix_path(root.path(), "parent", *digest),
+                fork_child_path(root.path(), "parent", &child.continuation_id),
+            ] {
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(&path).unwrap();
+            }
+        }
+
+        let reopened = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        for (child, _) in children {
+            let projection = reopened
+                .continuation_projection(&child.latest_task_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(projection.continuation_id, child.continuation_id);
         }
     }
 
@@ -5006,9 +5403,10 @@ mod tests {
             compatibility: child.compatibility,
         };
 
-        assert_eq!(
+        assert_corrupt_fork_history(
             coordinator.prepare_resume(input.clone()).unwrap_err(),
-            corrupt_record("referenced fork prefix is missing")
+            &child.continuation_id,
+            "referenced fork prefix is missing",
         );
         assert_eq!(
             coordinator
@@ -5058,6 +5456,71 @@ mod tests {
             Some(test_fork_prefix().messages.as_slice())
         );
     }
+
+    #[test]
+    fn resuming_a_legacy_fork_record_restores_its_inline_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let child = create_test_fork(&registry);
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let lease = coordinator.acquire(&child).unwrap();
+        let saved = coordinator
+            .commit_checkpoint(
+                &lease,
+                lease.revision,
+                checkpoint(lease.attempt_id.clone(), 0, 0),
+            )
+            .unwrap();
+        coordinator
+            .commit_terminal(
+                &lease,
+                saved.revision,
+                AgentTerminal::Completed { result: None },
+            )
+            .unwrap();
+
+        let id = &child.continuation_id;
+        let path = continuation_record_path(root.path(), "parent", id);
+        let association = fork_child_path(root.path(), "parent", id);
+        let associated_digest = fs::read(&association).unwrap();
+        let rewrite_as_older_release = || {
+            let older: legacy_v0_5_25::AgentContinuationRecord =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            fs::write(&path, serde_json::to_vec(&older).unwrap()).unwrap();
+        };
+        rewrite_as_older_release();
+        let task = test_continuation_input(&registry);
+        let resumed = coordinator
+            .prepare_resume(ResumeContinuationInput {
+                selector: id.to_string(),
+                parent_task_id: task.parent_task_id,
+                task_id: task.task_id,
+                prompt_id: task.prompt_id,
+                compatibility: child.compatibility,
+            })
+            .unwrap();
+        assert_eq!(resumed.fork_prefix, child.fork_prefix);
+        fs::remove_file(&association).unwrap();
+        let prepared = coordinator.prepared(id.as_str()).unwrap();
+        assert!(
+            prepared.fork_prefix.is_some(),
+            "resume lost the inline fork reference"
+        );
+        assert_eq!(prepared.fork_prefix, child.fork_prefix);
+
+        fs::write(&association, associated_digest).unwrap();
+        rewrite_as_older_release();
+        let prepared = coordinator.prepared(id.as_str()).unwrap();
+        coordinator.acquire(&prepared).unwrap();
+        fs::remove_file(&association).unwrap();
+        let prepared = coordinator.prepared(id.as_str()).unwrap();
+        assert!(
+            prepared.fork_prefix.is_some(),
+            "acquire lost the inline fork reference"
+        );
+        assert_eq!(prepared.fork_prefix, child.fork_prefix);
+    }
+
     #[test]
     fn delegated_child_context_matches_the_role_prefix_but_not_the_task() {
         let prefix = crate::agent_controller::DELEGATED_CHILD_CONTEXT;
@@ -5144,6 +5607,7 @@ mod tests {
                 compatibility_hash: legacy_hash,
             },
             fork_prefix: None,
+            fork_prefix_ref: None,
             checkpoint: None,
             revision: ContinuationRevision::ZERO,
             source_task_id: "task-source".to_string(),

@@ -2544,6 +2544,451 @@ fn a_fork_childs_first_request_shares_the_parents_prefix() {
 }
 
 #[test]
+fn a_hosted_fork_childs_first_request_has_the_inherited_messages() {
+    let (parent, child) = recorded_hosted_fork(false, false, None);
+    assert_hosted_fork_inherits(&parent, &child);
+}
+
+#[test]
+fn a_hosted_fork_that_outlives_its_lease_settles_normally() {
+    let (parent, child) = recorded_hosted_fork(false, false, Some(1_000));
+    assert_hosted_fork_inherits(&parent, &child);
+}
+
+#[test]
+fn a_fork_recovered_from_the_queue_still_inherits() {
+    let (parent, child) = recorded_hosted_fork(true, false, None);
+    assert_hosted_fork_inherits(&parent, &child);
+}
+
+#[test]
+fn a_recovered_fork_with_a_missing_prefix_file_says_why_it_started_fresh() {
+    let (_, child) = recorded_hosted_fork(true, true, None);
+    let child = std::str::from_utf8(&child).unwrap();
+    assert!(child.contains("Fork context unavailable:"), "{child}");
+    assert!(
+        child.contains("referenced fork prefix is missing"),
+        "{child}"
+    );
+    assert!(child.contains("Starting fresh."), "{child}");
+    assert!(child.contains("Report the relevant evidence."), "{child}");
+    assert!(!child.contains("Earlier parent evidence."));
+}
+
+#[test]
+fn a_hosted_fork_without_a_usable_prefix_says_why_it_started_fresh() {
+    let (_, child) = recorded_hosted_fork(false, true, None);
+    let child = std::str::from_utf8(&child).unwrap();
+    assert!(child.contains("Fork context unavailable:"), "{child}");
+    assert!(
+        child.contains("referenced fork prefix is missing"),
+        "{child}"
+    );
+    assert!(child.contains("Starting fresh."), "{child}");
+    assert!(!child.contains("Earlier parent evidence."));
+}
+
+#[test]
+fn task_stop_stops_a_hosted_fork_child() {
+    assert_hosted_fork_stop(false);
+}
+
+#[test]
+fn stopping_a_hosted_fork_does_not_cancel_its_parent_or_siblings() {
+    assert_hosted_fork_stop(true);
+}
+
+fn assert_hosted_fork_stop(with_sibling: bool) {
+    use crate::agent_controller::AgentController;
+    use crate::runtime_host::RuntimeHost;
+    use crate::runtime_subagent_call::RuntimeSubagentInvocation;
+    use crate::runtime_tool_actor::RuntimeToolActorContext;
+    use crate::runtime_tool_call::RuntimeToolCallRuntime;
+    use crate::subagent::create_subagent_request;
+    use crate::tasks::TaskRegistry;
+    use orca_core::conversation::ProviderForkPrefix;
+    use orca_core::task_types::TaskStatus;
+    use std::time::{Duration, Instant};
+
+    let cwd = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let _home = crate::history::redirect_test_orca_home(home.path());
+    let registry = TaskRegistry::new("hosted-fork-stop".into());
+    let parent = registry.create_main_session("fork parent".into());
+    registry.mark_running(&parent.id).unwrap();
+    let parent_cancel = registry.get(&parent.id).unwrap().control.cancel;
+    let mut config = config(Some(FLASH_MODEL));
+    config.cwd = Some(cwd.path().to_path_buf());
+    config.provider = ProviderKind::DeepSeek;
+    let endpoint = "http://127.0.0.1:0";
+    config.base_url = Some(endpoint.into());
+    let prefix_ref = registry
+        .continuation_store()
+        .unwrap()
+        .store_fork_prefix(ProviderForkPrefix {
+            model: FLASH_MODEL.into(),
+            endpoint: endpoint.into(),
+            reasoning_effort: config.reasoning_effort,
+            messages: vec![r#"{"role":"user","content":"Earlier parent evidence."}"#.into()],
+            tools: vec![],
+            estimated_tokens: 5,
+            system_messages: vec![],
+            redacted: false,
+        })
+        .unwrap();
+
+    let host = RuntimeHost::start().unwrap();
+    let thread = host.start_thread(config.clone(), "Fork parent").unwrap();
+    let controller = Arc::new(AgentController::new(
+        host.handle(),
+        thread.thread_id().into(),
+        thread.thread_id().into(),
+        0,
+    ));
+    let runtime = RuntimeToolCallRuntime::for_normal_execution();
+    let mut batch = runtime.start_subagent_batch(
+        &parent_cancel,
+        &registry,
+        config.subagents.limits,
+        None,
+        Some(&parent.id),
+    );
+    let batch_size = if with_sibling { 2 } else { 1 };
+    if with_sibling {
+        std::fs::write(cwd.path().join("require-sibling"), []).unwrap();
+    }
+    for (index, name) in ["stop-target", "sibling"]
+        .into_iter()
+        .take(batch_size)
+        .enumerate()
+    {
+        let mut tool_request = fork_tool_request(Some("fork"));
+        tool_request.id = name.into();
+        let mut request = create_subagent_request(&tool_request);
+        request.description = name.into();
+        request.prompt = name.into();
+        request.fork_prefix_ref = Some(prefix_ref);
+        let invocation = RuntimeSubagentInvocation::snapshot(
+            tool_request,
+            request,
+            &config,
+            cwd.path(),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &McpRegistry::default(),
+            &HookRunner::default(),
+            None,
+            1,
+            |_, request, runtime, _| {
+                assert!(request.fork_prefix.is_some());
+                std::fs::write(runtime.cwd.join(&request.prompt), [])?;
+                let release_sibling = runtime.cwd.join("release-sibling");
+                let is_target = request.prompt == "stop-target";
+                std::fs::write(runtime.cwd.join(format!("ready-{}", request.prompt)), [])?;
+                let readiness_deadline = Instant::now() + Duration::from_secs(10);
+                while runtime.cwd.join("require-sibling").exists()
+                    && (!runtime.cwd.join("ready-stop-target").exists()
+                        || !runtime.cwd.join("ready-sibling").exists())
+                {
+                    if Instant::now() >= readiness_deadline {
+                        return Err(io::Error::other(
+                            "sibling did not reach the readiness barrier",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let deadline = Instant::now() + Duration::from_secs(if is_target { 3 } else { 10 });
+                while !runtime.cancel.is_cancelled() && (is_target || !release_sibling.exists()) {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::other("fork did not observe the stop or release"));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(ChildAgentResult {
+                    status: if runtime.cancel.is_cancelled() {
+                        RunStatus::Cancelled
+                    } else {
+                        RunStatus::Success
+                    },
+                    final_message: Some("fork finished".into()),
+                    error: None,
+                    budget_usage: None,
+                })
+            },
+            None,
+            None,
+            &registry,
+            Some(&parent.id),
+            Some(Arc::clone(&controller)),
+            "fork-stop-batch".into(),
+            batch_size as u32,
+        );
+        let admission = batch.admit(index, invocation, |_| Ok(()));
+        assert!(admission.immediate.is_none());
+        assert!(admission.event_error.is_none());
+    }
+
+    let wait_for = |condition: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for a fork");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let target = cwd.path().join("stop-target");
+    wait_for(&|| target.exists() && (!with_sibling || cwd.path().join("sibling").exists()));
+    let task_id = registry
+        .list()
+        .into_iter()
+        .find(|task| task.description == "stop-target")
+        .unwrap()
+        .id;
+    let stop = RuntimeToolActorContext::new("fork-parent").execute_task_stop_tool(
+        &ToolRequest {
+            id: "stop-fork".into(),
+            name: ToolName::TaskStop,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(serde_json::json!({"task_id": task_id}).to_string()),
+        },
+        &registry,
+    );
+    assert_eq!(stop.status, ToolStatus::Completed, "{:?}", stop.error);
+    wait_for(&|| !registry.get(&task_id).unwrap().status.is_active());
+    std::fs::write(cwd.path().join("release-sibling"), []).unwrap();
+    let (mut outputs, event_error) = batch.finish(&mut |_, _, _, _| Ok(()));
+    host.shutdown().unwrap();
+
+    assert!(event_error.is_none());
+    outputs.sort_by_key(|(index, _)| *index);
+    let stopped = &outputs[0].1;
+    assert_eq!(
+        stopped.status,
+        RunStatus::Cancelled,
+        "{:?}",
+        stopped.event_error
+    );
+    assert_eq!(registry.get(&task_id).unwrap().status, TaskStatus::Stopped);
+    if with_sibling {
+        let sibling = &outputs[1].1;
+        assert_eq!(
+            sibling.status,
+            RunStatus::Success,
+            "{:?}",
+            sibling.event_error
+        );
+        assert!(!parent_cancel.is_cancelled());
+        assert_eq!(
+            registry.get(&parent.id).unwrap().status,
+            TaskStatus::Running
+        );
+    }
+}
+
+fn assert_hosted_fork_inherits(parent: &[u8], child: &[u8]) {
+    let parent = recorded_wire_messages(parent);
+    let child = recorded_wire_messages(child);
+    let cut = parent
+        .iter()
+        .position(|message| message.get().contains("Active parent turn."))
+        .unwrap();
+    assert!(cut < child.len(), "first child request: {child:?}");
+    for (expected, inherited) in parent[..cut].iter().zip(&child[..cut]) {
+        assert_eq!(inherited.get(), expected.get());
+    }
+    assert!(child[cut].get().contains("Report the relevant evidence."));
+}
+
+fn recorded_hosted_fork(
+    restart: bool,
+    remove_prefix: bool,
+    lease_duration_ms: Option<i64>,
+) -> (Vec<u8>, Vec<u8>) {
+    use crate::agent_controller::AgentController;
+    use crate::runtime_host::RuntimeHost;
+    use crate::runtime_subagent_call::{
+        RuntimeSubagentInvocation, recover_queued_subagent_launches,
+    };
+    use crate::runtime_tool_call::RuntimeToolCallRuntime;
+    use crate::subagent::{SubagentMode, create_subagent_request, prepare_fork_request};
+    use crate::tasks::{QueuedSubagentLaunchIntent, TaskRegistry};
+    use orca_core::config::DelegationSnapshot;
+    use orca_core::conversation::Conversation;
+    use orca_core::task_types::TaskStatus;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    let cwd = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let _home = crate::history::redirect_test_orca_home(home.path());
+    let tasks = home.path().join("tasks");
+    let session = "hosted-fork";
+    let mut registry = TaskRegistry::new_persistent(session.into(), tasks.clone()).unwrap();
+    registry.continuation_lease_duration_ms = lease_duration_ms;
+    let (base_url, server) = recorded_provider(
+        vec![
+            json!({"content": "parent reply"}),
+            json!({"content": "child reply"}),
+        ],
+        move |index, _, _| {
+            if index == 1
+                && let Some(lease_duration_ms) = lease_duration_ms
+            {
+                std::thread::sleep(Duration::from_millis(lease_duration_ms as u64 + 200));
+            }
+        },
+    );
+    let mut config = config(Some(PRO_MODEL));
+    config.cwd = Some(cwd.path().to_path_buf());
+    config.provider = ProviderKind::DeepSeek;
+    config.approval_mode = ApprovalMode::FullAuto;
+    config.api_key = Some("local-fixture".into());
+    config.base_url = Some(base_url);
+    let mut parent = Conversation::new();
+    parent.add_system("Hosted parent system prompt.".into());
+    parent.add_user("Earlier parent evidence.".into());
+    parent.add_assistant(Some("Earlier parent report.".into()), None, vec![]);
+    parent.add_user("Active parent turn.".into());
+    parent.start_provider_turn("hosted-parent-turn");
+    let cancel = CancelToken::new();
+    let recorded = orca_provider::call_streaming(
+        ProviderKind::DeepSeek,
+        &parent,
+        &orca_provider::ProviderConfig {
+            api_key: config.api_key.clone(),
+            base_url: config.base_url.clone(),
+            model: Some(PRO_MODEL.into()),
+            reasoning_effort: orca_core::config::ReasoningEffort::High,
+            tools_override: Some(vec![]),
+            mcp_registry: None,
+            external_tools: vec![],
+            max_output_tokens: None,
+        },
+        &cancel,
+        &mut |_| {},
+    );
+    assert_eq!(recorded.assistant_content.as_deref(), Some("parent reply"));
+    let tool_request = fork_tool_request(Some("fork"));
+    let mut request = create_subagent_request(&tool_request);
+    request.mode = SubagentMode::Sync;
+    request.delegation = Some(DelegationSnapshot::from_config(&config));
+    assert_eq!(
+        prepare_fork_request(&mut request, &config, Some(&parent), &registry).unwrap(),
+        None
+    );
+    assert!(request.fork_prefix_ref.is_some());
+    if remove_prefix {
+        let prefix_dir = tasks.join(session).join("fork-prefixes");
+        let mut entries = std::fs::read_dir(prefix_dir).unwrap();
+        std::fs::remove_file(entries.next().unwrap().unwrap().path()).unwrap();
+        assert!(entries.next().is_none());
+    }
+
+    let host = RuntimeHost::start().unwrap();
+    let thread = host.start_thread(config.clone(), "Fork parent").unwrap();
+    let controller = Arc::new(AgentController::new(
+        host.handle(),
+        thread.thread_id().into(),
+        thread.thread_id().into(),
+        0,
+    ));
+    let mcp = McpRegistry::default();
+    let hooks = HookRunner::default();
+    let executor = crate::agent_loop::execute_child_agent_loop;
+    if restart {
+        let submission = registry
+            .execution_scope(&config.subagents.limits)
+            .submit_subagent_with_intent(
+                request.description.clone(),
+                Some("explorer".into()),
+                None,
+                0,
+                Some(QueuedSubagentLaunchIntent {
+                    schema_version: QueuedSubagentLaunchIntent::SCHEMA_VERSION,
+                    tool_request,
+                    request,
+                    cwd: cwd.path().to_path_buf(),
+                    child_depth: 1,
+                    batch_id: "fork-batch".into(),
+                    batch_size: 1,
+                }),
+                false,
+            )
+            .unwrap();
+        drop(registry);
+        let registry = TaskRegistry::new_persistent(session.into(), tasks).unwrap();
+        let queued = registry.queued_subagent_launches(None).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(queued[0].1.request.fork_prefix_ref.is_some());
+        assert!(queued[0].1.request.captured_fork_prefix.is_none());
+        assert_eq!(
+            recover_queued_subagent_launches(
+                &config,
+                &mcp,
+                &hooks,
+                executor,
+                None,
+                None,
+                &registry,
+                None,
+                Some(controller),
+            )
+            .unwrap(),
+            1
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let task = registry.get(&submission.task_id).unwrap();
+            if !task.status.is_active() {
+                assert_eq!(task.status, TaskStatus::Completed, "{:?}", task.error);
+                break;
+            }
+            assert!(Instant::now() < deadline, "recovered fork did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    } else {
+        let invocation = RuntimeSubagentInvocation::snapshot(
+            tool_request,
+            request,
+            &config,
+            cwd.path(),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &mcp,
+            &hooks,
+            None,
+            1,
+            executor,
+            None,
+            None,
+            &registry,
+            None,
+            Some(controller),
+            "fork-batch".into(),
+            1,
+        );
+        let result = RuntimeToolCallRuntime::for_normal_execution().execute_subagent(
+            invocation,
+            &cancel,
+            |_| Ok(()),
+        );
+        assert_eq!(
+            result.output.status,
+            RunStatus::Success,
+            "{:?}",
+            result.output.result.error
+        );
+    }
+    host.shutdown().unwrap();
+    let [parent, child] = server
+        .join()
+        .unwrap()
+        .try_into()
+        .expect("parent and first child requests");
+    (parent, child)
+}
+
+#[test]
 fn the_in_flight_turn_is_not_inherited() {
     let (bodies, _) = run_recorded_fork(Some("fork"), RecordedHistory::Ordinary, false);
     let child = std::str::from_utf8(&bodies[1]).unwrap();

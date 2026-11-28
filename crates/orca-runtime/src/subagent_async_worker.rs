@@ -225,65 +225,68 @@ impl AsyncLaunchWorktree {
     }
 }
 
-struct AsyncLeaseHeartbeat {
+pub(crate) struct SubagentLeaseHeartbeat {
     stop: mpsc::Sender<()>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 #[cfg(not(test))]
-const ASYNC_LEASE_HEARTBEAT: Duration = Duration::from_secs(5);
+const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(test)]
-const ASYNC_LEASE_HEARTBEAT: Duration = Duration::from_millis(100);
+const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 
-impl AsyncLeaseHeartbeat {
-    /// Keeps the worker's task and continuation leases alive, and ends the run
-    /// through `cancel` once they are lost: the task was stopped (a stop fences
-    /// the lease even when its worker could not be killed), finished, taken
-    /// over, or is gone with its session. No one would read what the run
-    /// produced after that, so it must not go on spending.
-    fn start(
-        task_registry: TaskRegistry,
-        task_lease: crate::tasks::TaskLease,
-        agent_id: String,
+impl SubagentLeaseHeartbeat {
+    /// Renews the continuation and, for a detached worker, its task lease.
+    /// A detached worker also cancels execution when it loses either lease.
+    pub(crate) fn start(
+        task: Option<(TaskRegistry, crate::tasks::TaskLease, String)>,
         coordinator: ChildAgentCoordinator,
         continuation_lease: ContinuationLease,
         continuation_revision: Arc<Mutex<ContinuationRevision>>,
-        cancel: CancelToken,
+        cancel_on_lease_loss: Option<CancelToken>,
     ) -> Self {
         let (stop, receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let task_lease_duration =
                 Duration::from_millis(crate::tasks::TASK_LEASE_DURATION_MS as u64);
-            let continuation_lease_duration = Duration::from_millis(
-                crate::agent_continuation::CONTINUATION_LEASE_DURATION_MS as u64,
-            );
+            let continuation_lease_duration =
+                Duration::from_millis(coordinator.lease_duration_ms() as u64);
             let mut task_renewed_at = Instant::now();
             let mut continuation_renewed_at = Instant::now();
             loop {
-                match receiver.recv_timeout(ASYNC_LEASE_HEARTBEAT) {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                match receiver.recv_timeout(LEASE_HEARTBEAT_INTERVAL) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                match task_registry.renew_task_lease(&task_lease, &agent_id) {
-                    Ok(()) => task_renewed_at = Instant::now(),
-                    Err(error) => {
-                        let storage_error =
-                            matches!(error, crate::tasks::TaskLeaseError::Persistence(_));
-                        if renewal_failure_ends_run(
-                            storage_error,
-                            task_renewed_at.elapsed(),
-                            task_lease_duration,
-                        ) {
-                            cancel.cancel();
-                            break;
+                if let Some((task_registry, task_lease, agent_id)) = &task {
+                    match task_registry.renew_task_lease(task_lease, agent_id) {
+                        Ok(()) => task_renewed_at = Instant::now(),
+                        Err(error) => {
+                            let storage_error =
+                                matches!(error, crate::tasks::TaskLeaseError::Persistence(_));
+                            if renewal_failure_ends_run(
+                                storage_error,
+                                task_renewed_at.elapsed(),
+                                task_lease_duration,
+                            ) {
+                                break;
+                            }
+                            continue;
                         }
-                        continue;
                     }
                 }
                 let Ok(mut revision) = continuation_revision.lock() else {
-                    break;
+                    return;
                 };
-                match coordinator.renew(&continuation_lease, *revision) {
+                let renewal = coordinator.renew(&continuation_lease, *revision);
+                let renewal = match renewal {
+                    Err(crate::agent_continuation::AgentContinuationError::RevisionConflict {
+                        actual,
+                        ..
+                    }) => coordinator.renew(&continuation_lease, actual),
+                    result => result,
+                };
+                match renewal {
                     Ok(projection) => {
                         *revision = projection.revision;
                         continuation_renewed_at = Instant::now();
@@ -298,11 +301,13 @@ impl AsyncLeaseHeartbeat {
                             continuation_renewed_at.elapsed(),
                             continuation_lease_duration,
                         ) {
-                            cancel.cancel();
                             break;
                         }
                     }
                 }
+            }
+            if let Some(cancel) = cancel_on_lease_loss {
+                cancel.cancel();
             }
         });
         Self {
@@ -310,8 +315,10 @@ impl AsyncLeaseHeartbeat {
             worker: Some(worker),
         }
     }
+}
 
-    fn stop(mut self) {
+impl Drop for SubagentLeaseHeartbeat {
+    fn drop(&mut self) {
         let _ = self.stop.send(());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -379,23 +386,6 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             return 1;
         }
     };
-    let prepared = match coordinator.prepared(&agent_id) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let mut message = continuation_error("failed to load async continuation", &error);
-            let worktree = finish_async_worker_worktree(worktree, owns_worktree);
-            append_worktree_outcome(&mut message, worktree.as_ref());
-            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
-            return 1;
-        }
-    };
-    if let Err(error) = restore_worker_agent(&mut config, &request, &prepared) {
-        let worktree = finish_async_worker_worktree(worktree, owns_worktree);
-        let mut error = error;
-        append_worktree_outcome(&mut error, worktree.as_ref());
-        let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, None);
-        return 1;
-    }
     let detached_binding = match task_registry.detached_subagent_binding(&agent_id) {
         Ok(Some(binding)) => binding,
         Ok(None) => {
@@ -419,6 +409,33 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
             message.to_string(),
             None,
         );
+        return 1;
+    }
+    let prepared = match coordinator.prepared(&agent_id) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let mut message = continuation_error("failed to load async continuation", &error);
+            let worktree = finish_async_worker_worktree(worktree, owns_worktree);
+            append_worktree_outcome(&mut message, worktree.as_ref());
+            let message = match coordinator.fail_unstarted_worker(
+                &agent_id,
+                &detached_binding.attempt_id,
+                message.clone(),
+            ) {
+                Ok(projection) => append_projection_footer(message, Some(&projection)),
+                Err(error) => {
+                    format!("{message}\n\nfailed to commit async continuation terminal: {error}")
+                }
+            };
+            let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, message, None);
+            return 1;
+        }
+    };
+    if let Err(error) = restore_worker_agent(&mut config, &request, &prepared) {
+        let worktree = finish_async_worker_worktree(worktree, owns_worktree);
+        let mut error = error;
+        append_worktree_outcome(&mut error, worktree.as_ref());
+        let _ = task_registry.fail_with_usage_and_lease(&task_lease, &agent_id, error, None);
         return 1;
     }
     let continuation_lease = match coordinator
@@ -468,14 +485,12 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
     let (checkpoint_observer, shared_revision) =
         build_checkpoint_observer(coordinator.clone(), continuation_lease.clone(), &prepared);
     let cancel = CancelToken::new();
-    let heartbeat = AsyncLeaseHeartbeat::start(
-        task_registry.clone(),
-        task_lease.clone(),
-        agent_id.clone(),
+    let heartbeat = SubagentLeaseHeartbeat::start(
+        Some((task_registry.clone(), task_lease.clone(), agent_id.clone())),
         coordinator.clone(),
         continuation_lease.clone(),
         Arc::clone(&shared_revision),
-        cancel.clone(),
+        Some(cancel.clone()),
     );
     let instructions = instructions::load_for_cwd_or_default(&cwd);
     let memory = memory::load_for_cwd(&cwd);
@@ -592,7 +607,7 @@ pub(crate) fn run_async_subagent_worker_with_executor(context: AsyncSubagentWork
         });
         crate::agent_child::run_child_agent(&config, &child_request, &mut child_runtime)
     }));
-    heartbeat.stop();
+    drop(heartbeat);
     let (child, child_cost_tracker) = match child {
         Ok((child, cost_tracker)) => (child, cost_tracker),
         Err(payload) => {
@@ -2002,6 +2017,160 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn a_worker_that_finds_damaged_history_leaves_the_child_resumable() {
+        use crate::child_agent_types::ChildAgentCheckpointObservation;
+        use crate::runtime_surface::{
+            Sha256Digest, SurfaceGenerationId, SurfaceOperationId, SurfaceThreadId,
+            ThreadOwnerEpoch,
+        };
+        use orca_core::conversation::{Conversation, ProviderForkPrefix};
+        use orca_core::task_types::TaskStatus;
+
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let session = uuid::Uuid::now_v7();
+        let registry = TaskRegistry::new_for_cwd(session.to_string(), cwd.path());
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let store = registry.continuation_store().unwrap();
+        let prefix = ProviderForkPrefix {
+            model: orca_core::model::PRO_MODEL.into(),
+            endpoint: "https://api.deepseek.com".into(),
+            reasoning_effort: ReasoningEffort::High,
+            messages: vec![r#"{"role":"user","content":"Earlier parent evidence"}"#.into()],
+            tools: vec![],
+            estimated_tokens: 10,
+            system_messages: vec![],
+            redacted: false,
+        };
+        let digest = store.store_fork_prefix(prefix.clone()).unwrap();
+        let initial_task = registry.create_subagent("Inspect".into(), Some("general".into()));
+        let child = coordinator
+            .create_with_fork(
+                CreateContinuationInput {
+                    continuation_id: None,
+                    parent_task_id: None,
+                    task_id: initial_task.id,
+                    prompt_id: AgentPromptId::new(),
+                    compatibility: ContinuationCompatibility {
+                        subagent_type: "general".into(),
+                        frozen_agent: None,
+                        model: Some(prefix.model.clone()),
+                        isolation: SubagentIsolation::None,
+                        effective_cwd: cwd.path().display().to_string(),
+                        worktree: None,
+                        compatibility_hash: Sha256Digest::new([5; 32]),
+                    },
+                },
+                Some(digest),
+            )
+            .unwrap();
+        let lease = coordinator.acquire(&child).unwrap();
+        let (observer, revision) =
+            build_checkpoint_observer(coordinator.clone(), lease.clone(), &child);
+        let mut conversation = Conversation::new();
+        conversation.add_user("Inspect the evidence.".into());
+        conversation.add_assistant(Some("Initial report.".into()), None, vec![]);
+        observer
+            .checkpoint(ChildAgentCheckpointObservation {
+                conversation: &conversation,
+                turn: 1,
+                usage: Default::default(),
+                last_tool_boundary: None,
+            })
+            .unwrap();
+        coordinator
+            .commit_terminal(
+                &lease,
+                *revision.lock().unwrap(),
+                AgentTerminal::Completed { result: None },
+            )
+            .unwrap();
+
+        let resume = || {
+            let task = registry.create_subagent("Continue".into(), Some("general".into()));
+            coordinator.prepare_resume(ResumeContinuationInput {
+                selector: child.continuation_id.to_string(),
+                parent_task_id: None,
+                task_id: task.id,
+                prompt_id: AgentPromptId::new(),
+                compatibility: child.compatibility.clone(),
+            })
+        };
+        let prepared = resume().unwrap();
+        let task_id = &prepared.latest_task_id;
+        let binding = registry
+            .register_detached_subagent_binding(
+                task_id,
+                task_id,
+                prepared.attempt_id.clone(),
+                TaskRevision::try_new(1).unwrap(),
+                Some(SurfaceOperationFence {
+                    thread_id: SurfaceThreadId::try_from_bytes(*session.as_bytes()).unwrap(),
+                    thread_owner_epoch: ThreadOwnerEpoch::new(1),
+                    operation_id: SurfaceOperationId::try_from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    )
+                    .unwrap(),
+                    generation_id: SurfaceGenerationId::new(1),
+                }),
+            )
+            .unwrap();
+        registry
+            .mark_worker_spawned(task_id, std::process::id())
+            .unwrap();
+        let prefix_dir = home
+            .path()
+            .join("task-sessions")
+            .join(session.to_string())
+            .join("fork-prefixes");
+        let mut entries = std::fs::read_dir(prefix_dir).unwrap();
+        std::fs::remove_file(entries.next().unwrap().unwrap().path()).unwrap();
+        assert!(entries.next().is_none());
+
+        let request = subagent::create_subagent_request(&ToolRequest {
+            id: "resume-damaged-fork".into(),
+            name: ToolName::Subagent,
+            action: ActionKind::Agent,
+            target: None,
+            raw_arguments: Some(
+                serde_json::json!({"resume_from": child.continuation_id}).to_string(),
+            ),
+        });
+        let code = run_async_subagent_worker_with_executor(AsyncSubagentWorkerContext {
+            input: AsyncSubagentWorkerInput {
+                config: async_test_config(cwd.path().to_path_buf()),
+                cwd: cwd.path().to_path_buf(),
+                child_cwd: cwd.path().to_path_buf(),
+                task_session_id: session.to_string(),
+                agent_id: task_id.clone(),
+                request,
+                child_depth: 1,
+                worktree: None,
+                permission_response_public_key: binding.permission_response_public_key,
+                child_turn_id: TurnId::new(),
+                activity_start_precommitted: true,
+            },
+            child_executor: |_, _, _, _| panic!("child ran without its saved history"),
+        });
+        assert_eq!(code, 1);
+        let task = registry.settled_subagent_record(task_id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(
+            task.error
+                .unwrap()
+                .contains("referenced fork prefix is missing")
+        );
+        assert_eq!(store.store_fork_prefix(prefix).unwrap(), digest);
+
+        let retried = resume().expect("the repaired fork can be resumed");
+        assert_ne!(retried.attempt_id, prepared.attempt_id);
+        assert_eq!(retried.checkpoint, prepared.checkpoint);
+        assert_eq!(retried.fork_prefix, prepared.fork_prefix);
+        coordinator.acquire(&retried).unwrap();
+    }
+
+    #[test]
     fn custom_agent_detached_worker_process_entry() {
         let Some(fixture) = std::env::var_os("ORCA_CUSTOM_AGENT_WORKER_FIXTURE") else {
             return;
@@ -2322,6 +2491,182 @@ mod tests {
     }
 
     #[test]
+    fn a_heartbeat_recovers_after_a_projection_write_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let PreparedDetachedSubagent {
+            session,
+            registry,
+            task_id,
+            coordinator,
+            prepared,
+            ..
+        } = prepare_detached_subagent(cwd.path(), "Renew after storage recovers");
+        let lease = coordinator.acquire(&prepared).unwrap();
+        let store = registry.continuation_store().unwrap();
+
+        // Make only the task projection unavailable during renewal.
+        let tasks = home
+            .path()
+            .join("task-sessions")
+            .join(session)
+            .join("tasks.json");
+        let parked = tasks.with_file_name("tasks.parked");
+        std::fs::rename(&tasks, &parked).unwrap();
+        std::fs::create_dir(&tasks).unwrap();
+        let failure = coordinator.renew(&lease, lease.revision).unwrap_err();
+        std::fs::remove_dir(&tasks).unwrap();
+        std::fs::rename(&parked, &tasks).unwrap();
+        assert!(matches!(
+            failure,
+            crate::agent_continuation::AgentContinuationError::Persistence { .. }
+        ));
+        let committed = store.load_record(&lease.continuation_id).unwrap().unwrap();
+        assert_eq!(committed.revision.get(), lease.revision.get() + 1);
+        assert_eq!(
+            registry
+                .continuation_projection(&task_id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            lease.revision
+        );
+
+        // The failed renewal leaves the heartbeat holding the old revision.
+        let revision = Arc::new(Mutex::new(lease.revision));
+        let cancel = CancelToken::new();
+        let heartbeat = SubagentLeaseHeartbeat::start(
+            None,
+            coordinator,
+            lease.clone(),
+            Arc::clone(&revision),
+            Some(cancel.clone()),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while *revision.lock().unwrap() == lease.revision
+            && !cancel.is_cancelled()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(heartbeat);
+
+        assert!(!cancel.is_cancelled(), "a projection failure ended the run");
+        let renewed = store.load_record(&lease.continuation_id).unwrap().unwrap();
+        assert!(renewed.revision > committed.revision);
+        assert_eq!(renewed.revision, *revision.lock().unwrap());
+        assert_eq!(renewed.current_attempt.attempt_id, lease.attempt_id);
+        assert_eq!(
+            renewed.current_attempt.owner_id.as_deref(),
+            Some(lease.owner_id.as_str())
+        );
+        assert_eq!(renewed.current_attempt.lease_epoch, lease.lease_epoch);
+        assert!(
+            renewed.current_attempt.lease_expires_at_ms
+                > committed.current_attempt.lease_expires_at_ms
+        );
+        assert_eq!(
+            registry
+                .continuation_projection(&task_id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            renewed.revision
+        );
+    }
+
+    #[test]
+    fn a_stale_worker_cannot_renew_a_replacement_lease() {
+        use crate::agent_continuation::AgentContinuationError;
+        use crate::child_agent_types::ChildAgentCheckpointObservation;
+        use orca_core::conversation::Conversation;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let PreparedDetachedSubagent {
+            registry,
+            coordinator,
+            prepared,
+            ..
+        } = prepare_detached_subagent(cwd.path(), "Original worker");
+        let old_lease = coordinator.acquire(&prepared).unwrap();
+        let (observer, revision) =
+            build_checkpoint_observer(coordinator.clone(), old_lease.clone(), &prepared);
+        let mut conversation = Conversation::new();
+        conversation.add_user("Inspect the workspace.".into());
+        conversation.add_assistant(Some("Inspection complete.".into()), None, vec![]);
+        observer
+            .checkpoint(ChildAgentCheckpointObservation {
+                conversation: &conversation,
+                turn: 1,
+                usage: Default::default(),
+                last_tool_boundary: None,
+            })
+            .unwrap();
+        coordinator
+            .commit_terminal(
+                &old_lease,
+                *revision.lock().unwrap(),
+                AgentTerminal::Completed { result: None },
+            )
+            .unwrap();
+
+        let replacement =
+            ChildAgentCoordinator::with_owner_id(registry.clone(), "replacement-worker".into())
+                .unwrap();
+        let task = registry.create_subagent("Continue inspection".into(), None);
+        let resumed = replacement
+            .prepare_resume(ResumeContinuationInput {
+                selector: old_lease.continuation_id.to_string(),
+                parent_task_id: None,
+                task_id: task.id,
+                prompt_id: AgentPromptId::new(),
+                compatibility: prepared.compatibility,
+            })
+            .unwrap();
+        let new_lease = replacement.acquire(&resumed).unwrap();
+        assert_ne!(old_lease.attempt_id, new_lease.attempt_id);
+        assert_ne!(old_lease.owner_id, new_lease.owner_id);
+        assert!(new_lease.lease_epoch > old_lease.lease_epoch);
+        assert!(matches!(
+            coordinator.renew(&old_lease, *revision.lock().unwrap()),
+            Err(AgentContinuationError::RevisionConflict { .. })
+        ));
+
+        let cancel = CancelToken::new();
+        let heartbeat = SubagentLeaseHeartbeat::start(
+            None,
+            coordinator,
+            old_lease,
+            revision,
+            Some(cancel.clone()),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cancel.is_cancelled() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(heartbeat);
+
+        let current = registry
+            .continuation_store()
+            .unwrap()
+            .load_record(&new_lease.continuation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.revision, new_lease.revision,
+            "the stale worker renewed the replacement lease"
+        );
+        assert_eq!(
+            current.current_attempt.lease_expires_at_ms,
+            Some(new_lease.expires_at_ms)
+        );
+        assert!(cancel.is_cancelled(), "the stale worker kept running");
+    }
+
+    #[test]
     fn a_storage_hiccup_while_renewing_the_continuation_lease_keeps_the_run_going() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
@@ -2340,16 +2685,14 @@ mod tests {
         let continuation_lease = coordinator.acquire(&prepared).unwrap();
         let revision = Arc::new(Mutex::new(continuation_lease.revision));
         let cancel = CancelToken::new();
-        let heartbeat = AsyncLeaseHeartbeat::start(
-            registry.clone(),
-            task_lease,
-            task_id.clone(),
+        let heartbeat = SubagentLeaseHeartbeat::start(
+            Some((registry.clone(), task_lease, task_id.clone())),
             coordinator.clone(),
             continuation_lease,
             Arc::clone(&revision),
-            cancel.clone(),
+            Some(cancel.clone()),
         );
-        thread::sleep(ASYNC_LEASE_HEARTBEAT * 2);
+        thread::sleep(LEASE_HEARTBEAT_INTERVAL * 2);
 
         // For a few beats the continuation records' directory is not one, so
         // reading and writing a record fails the way a storage error does.
@@ -2371,7 +2714,7 @@ mod tests {
             std::fs::rename(&continuations, &parked).unwrap();
             std::fs::rename(&blocker, &continuations).unwrap();
         }
-        thread::sleep(ASYNC_LEASE_HEARTBEAT * 4);
+        thread::sleep(LEASE_HEARTBEAT_INTERVAL * 4);
         {
             let _store_waits = ExclusiveFileLock::acquire(&session_lock).unwrap();
             std::fs::rename(&continuations, &blocker).unwrap();
@@ -2387,7 +2730,7 @@ mod tests {
         }
         let cancelled = cancel.is_cancelled();
         let after = revision.lock().unwrap().get();
-        heartbeat.stop();
+        drop(heartbeat);
 
         assert!(!cancelled, "a transient storage error ended a healthy run");
         assert!(
