@@ -477,13 +477,20 @@
       "runtime-host-inline-test-unix-api",
       "crates/orca-runtime/src/runtime_host.rs",
       "unix_std_api",
-      1,
+      2,
       "windows-test-portability"
     ],
     [
       "runtime-host-inline-test-unix-process",
       "crates/orca-runtime/src/runtime_host.rs",
       "unix_libc_process",
+      1,
+      "windows-test-portability"
+    ],
+    [
+      "workflow-cache-resume-link-fixture",
+      "tests/workflow_runtime_contract.rs",
+      "unix_std_api",
       1,
       "windows-test-portability"
     ],
