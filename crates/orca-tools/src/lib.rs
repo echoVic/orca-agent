@@ -680,6 +680,7 @@ mod tests {
         assert!(
             result
                 .error
+                .as_deref()
                 .unwrap()
                 .contains("workspace path changed while Orca was running")
         );
