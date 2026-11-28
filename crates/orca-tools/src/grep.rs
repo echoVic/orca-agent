@@ -25,7 +25,8 @@ use crate::workspace_read::{open_directory, open_file_in};
 const DEFAULT_GREP_HEAD_LIMIT: usize = 250;
 const MAX_GREP_HEAD_LIMIT: usize = 1_000;
 const MIN_GREP_LINE_BYTES: usize = 8 * 1024;
-const MAX_GREP_LINE_BYTES: usize = 1024 * 1024;
+const MAX_GREP_DISPLAY_BYTES: usize = 1024 * 1024;
+const MAX_GREP_LINE_BYTES: usize = 16 * 1024 * 1024;
 const GREP_TIMEOUT: Duration = Duration::from_secs(120);
 const GREP_CANCELLED: &str = "grep was cancelled";
 
@@ -106,7 +107,7 @@ fn execute_search(
         observed
     };
     let stop = || is_cancelled() || started.elapsed() >= GREP_TIMEOUT;
-    let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
+    let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_DISPLAY_BYTES);
     let result = match target {
         ReadTarget::Spill(_, file) => {
             search_file(file, None, &regex, max_line_bytes, &mut page, &stop)
@@ -372,6 +373,7 @@ fn search_file(
         page.lines.len(),
         page.retained_bytes,
         page.selection_truncated,
+        page.skipped_lines,
     );
     let mut reader = BufReader::with_capacity(32 * 1024, file);
     let prefix = reader.fill_buf()?;
@@ -389,7 +391,9 @@ fn search_file(
     };
     let path = path.map(|path| path.to_string_lossy().replace('\\', "/"));
     let mut visit = |number, line: &[u8], length| {
-        if regex.is_match(&String::from_utf8_lossy(line)) {
+        if length > MAX_GREP_LINE_BYTES {
+            page.skipped_lines += 1;
+        } else if regex.is_match(&String::from_utf8_lossy(line)) {
             page.push(path.as_deref(), number, line, length, max_line_bytes);
         }
     };
@@ -403,6 +407,7 @@ fn search_file(
             _,
             page.retained_bytes,
             page.selection_truncated,
+            page.skipped_lines,
         ) = saved;
         page.lines.truncate(saved.1);
     }
@@ -498,9 +503,10 @@ struct SearchLine {
 
 impl SearchLine {
     fn extend(&mut self, bytes: &[u8]) {
+        // Leave room for the CR in a max-sized CRLF line.
         let keep = bytes
             .len()
-            .min(MAX_GREP_LINE_BYTES.saturating_sub(self.bytes.len()));
+            .min((MAX_GREP_LINE_BYTES + 1).saturating_sub(self.bytes.len()));
         self.bytes.extend_from_slice(&bytes[..keep]);
         self.length = self.length.saturating_add(bytes.len());
         self.last = bytes.last().copied().or(self.last);
@@ -537,17 +543,30 @@ fn render_search(
     max_bytes: usize,
 ) -> ToolResult {
     let no_matches = collector.total_lines == 0;
+    let skipped_lines = collector.skipped_lines;
     let (output, page_truncated) = collector.render();
-    if no_matches {
-        return ToolResult::completed_kind(
-            request,
-            "(no matches)".to_string(),
-            false,
-            ToolResultKind::NoMatches,
-        );
+    let (mut output, truncated) = if no_matches {
+        ("(no matches)".to_string(), false)
+    } else {
+        truncate_output(output, max_bytes)
+    };
+    if skipped_lines > 0 {
+        output.push_str(&format!(
+            "\n{skipped_lines} lines longer than 16 MiB were not searched"
+        ));
     }
-    let (output, truncated) = truncate_output(output, max_bytes);
-    ToolResult::completed(request, output, page_truncated || truncated)
+    ToolResult::completed_kind(
+        request,
+        output,
+        page_truncated || truncated || skipped_lines > 0,
+        if no_matches {
+            ToolResultKind::NoMatches
+        } else if page_truncated || truncated || skipped_lines > 0 {
+            ToolResultKind::Truncated
+        } else {
+            ToolResultKind::Success
+        },
+    )
 }
 
 fn parse_args(request: &ToolRequest) -> GrepArgs {
@@ -573,6 +592,7 @@ struct GrepPageCollector {
     retained_budget: usize,
     lines: Vec<StoredLine>,
     selection_truncated: bool,
+    skipped_lines: usize,
 }
 
 struct StoredLine {
@@ -590,6 +610,7 @@ impl GrepPageCollector {
             retained_budget,
             lines: Vec::new(),
             selection_truncated: false,
+            skipped_lines: 0,
         }
     }
 
@@ -610,7 +631,10 @@ impl GrepPageCollector {
         if index < self.offset || index - self.offset >= self.limit {
             return;
         }
-        let keep = line.len().min(max_line_bytes);
+        let mut keep = line.len().min(max_line_bytes);
+        while keep < line.len() && keep > 0 && line[keep] & 0xc0 == 0x80 {
+            keep -= 1;
+        }
         let omitted = length.saturating_sub(keep);
         let line = String::from_utf8_lossy(&line[..keep]);
         let text = match path {
@@ -624,20 +648,16 @@ impl GrepPageCollector {
         });
     }
 
+    // Retain original records through the first one that exceeds the page budget.
+    // A worker's budget starts at zero, so the final page can only need fewer.
     fn retain(&mut self, line: StoredLine) {
         let separator = usize::from(!self.lines.is_empty());
-        let remaining = self
-            .retained_budget
-            .saturating_sub(self.retained_bytes.saturating_add(separator));
-        if remaining == 0 {
+        if self.retained_bytes.saturating_add(separator) >= self.retained_budget {
             self.selection_truncated = true;
             return;
         }
-        let (text, truncated) = truncate_output(line.text, remaining);
-        let truncated = truncated || line.truncated;
-        self.selection_truncated |= truncated;
-        self.retained_bytes += separator + text.len();
-        self.lines.push(StoredLine { text, truncated });
+        self.retained_bytes += separator + line.text.len();
+        self.lines.push(line);
     }
 
     fn append_first_page(&mut self, page: Self) {
@@ -648,6 +668,7 @@ impl GrepPageCollector {
             .min(page.total_lines);
         self.selection_truncated |= selected > page.lines.len();
         self.total_lines = self.total_lines.saturating_add(page.total_lines);
+        self.skipped_lines += page.skipped_lines;
         for line in page.lines.into_iter().take(selected) {
             self.retain(line);
         }
@@ -656,12 +677,20 @@ impl GrepPageCollector {
         let next_offset = (self.total_lines.saturating_sub(self.offset) > self.limit)
             .then_some(self.offset.saturating_add(self.limit));
 
-        let mut output = self
-            .lines
-            .into_iter()
-            .map(|line| line.text)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut output = String::new();
+        let mut truncated = self.selection_truncated;
+        for line in self.lines {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            let remaining = self.retained_budget - output.len();
+            let (text, shortened) = truncate_output(line.text, remaining);
+            output.push_str(&text);
+            truncated |= line.truncated || shortened;
+            if shortened {
+                break;
+            }
+        }
         if let Some(next_offset) = next_offset {
             let notice = if self.offset == 0 {
                 format!(
@@ -683,7 +712,7 @@ impl GrepPageCollector {
                 output.push_str(&notice);
             }
         }
-        (output, self.selection_truncated)
+        (output, truncated)
     }
 }
 
@@ -696,6 +725,72 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolResultKind, ToolStatus};
 
     use super::*;
+
+    #[test]
+    fn grep_matches_the_whole_line_without_matching_a_cut() {
+        let workspace = crate::workspace_tempdir().unwrap();
+        for (pattern, text, matched) in [
+            (
+                "needle",
+                format!("{}needle\n", "x".repeat(1024 * 1024)),
+                true,
+            ),
+            ("x$", format!("{}needle\n", "x".repeat(1024 * 1024)), false),
+            (
+                "�",
+                format!("{}界needle\n", "x".repeat(1024 * 1024 - 1)),
+                false,
+            ),
+        ] {
+            fs::write(workspace.path().join("long.txt"), text).unwrap();
+            let request = grep_request(&serde_json::json!({"pattern": pattern}).to_string());
+            let result = execute(&request, workspace.path(), 4096);
+            assert_eq!(
+                result.output.as_deref() != Some("(no matches)"),
+                matched,
+                "{pattern}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grep_notes_each_line_over_sixteen_mib_once() {
+        let workspace = crate::workspace_tempdir().unwrap();
+        let oversized = format!("needle{}\n", "x".repeat(16 * 1024 * 1024));
+        for name in ["a.txt", "b.txt"] {
+            fs::write(workspace.path().join(name), &oversized).unwrap();
+        }
+        let request = grep_request(r#"{"pattern":"needle"}"#);
+        let result = execute(&request, workspace.path(), 4096);
+        assert_eq!(
+            result.output.as_deref(),
+            Some("(no matches)\n2 lines longer than 16 MiB were not searched")
+        );
+    }
+
+    #[test]
+    fn grep_compacts_records_once_across_chunk_and_batch_boundaries() {
+        for boundary in [16, 128] {
+            let workspace = crate::workspace_tempdir().unwrap();
+            let first = format!("needle{}", "a".repeat(47));
+            let second = format!("needle{}", "b".repeat(120));
+            for index in 0..=boundary {
+                let content = match index {
+                    0 => first.as_str(),
+                    index if index == boundary => second.as_str(),
+                    _ => "miss",
+                };
+                fs::write(workspace.path().join(format!("{index:03}.txt")), content).unwrap();
+            }
+            let request = grep_request(r#"{"pattern":"needle","head_limit":2}"#);
+            let result = execute(&request, workspace.path(), 100);
+            let expected = format!(
+                "000.txt:1:{first}\n{boundary:03}.txt:1:needle{}",
+                "b".repeat(20)
+            );
+            assert_eq!(result.output.as_deref(), Some(expected.as_str()));
+        }
+    }
 
     #[test]
     fn directory_search_keeps_matches_in_utf8_files_with_a_bom() {
