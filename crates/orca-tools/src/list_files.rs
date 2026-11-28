@@ -4,9 +4,15 @@ use std::path::Path;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 
-use crate::resolve_workspace_path;
+use crate::{resolve_workspace_path, workspace_read::listing_entry};
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
+    let root = match cwd.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            return ToolResult::failed(request, format!("cannot resolve cwd: {error}"), None);
+        }
+    };
     let path = match resolve_workspace_path(cwd, request.target.as_deref()) {
         Ok(p) => p,
         Err(error) => return ToolResult::failed(request, error, None),
@@ -33,7 +39,11 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
     let mut names = Vec::new();
     for entry in entries {
         match entry {
-            Ok(entry) => names.push(entry.file_name().to_string_lossy().to_string()),
+            Ok(entry) => {
+                if listing_entry(&root, &entry.path()).is_some() {
+                    names.push(entry.file_name().to_string_lossy().to_string());
+                }
+            }
             Err(error) => {
                 return ToolResult::failed(request, format!("failed to read entry: {error}"), None);
             }
@@ -64,6 +74,19 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolResultKind, ToolStatus};
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn list_files_skips_entries_whose_real_location_is_outside() {
+        let workspace = tempfile::tempdir().unwrap();
+        let neighbor = tempfile::tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        let linked = root.join("linked");
+        fs::create_dir(neighbor.path().join("notes")).unwrap();
+        crate::tests::symlink(neighbor.path(), &linked).unwrap();
+
+        assert_eq!(listing_entry(&root, &linked.join("notes")), None);
+    }
 
     #[test]
     fn missing_directory_completes_with_empty_listing() {

@@ -5,7 +5,7 @@ use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_ou
 use serde::Deserialize;
 use walkdir::WalkDir;
 
-use crate::resolve_workspace_path;
+use crate::{resolve_workspace_path, workspace_read::listing_entry};
 
 #[derive(Deserialize)]
 struct GlobArgs {
@@ -45,23 +45,37 @@ pub fn execute_or_cancel(
         Ok(args) => args,
         Err(error) => return ToolResult::failed(request, error, None),
     };
+    let root = match cwd.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            return ToolResult::failed(request, format!("cannot resolve cwd: {error}"), None);
+        }
+    };
     let base = args.path.as_deref().unwrap_or(".");
     let search_root = match resolve_workspace_path(cwd, Some(base)) {
         Ok(path) => path,
         Err(error) => return ToolResult::failed(request, error, None),
     };
-    if !search_root.exists() {
+    let Some(is_directory) = listing_entry(&root, &search_root) else {
         return ToolResult::completed_kind(
             request,
             "(no matches)".to_string(),
             false,
             ToolResultKind::NoMatches,
         );
-    }
+    };
 
     if matches!(args.mode, Some(GlobMode::Fuzzy)) {
-        return execute_fuzzy(request, cwd, &search_root, &args, max_bytes, should_cancel)
-            .unwrap_or_else(cancelled);
+        return execute_fuzzy(
+            request,
+            cwd,
+            &root,
+            &search_root,
+            &args,
+            max_bytes,
+            should_cancel,
+        )
+        .unwrap_or_else(cancelled);
     }
 
     let pattern = args
@@ -72,13 +86,13 @@ pub fn execute_or_cancel(
         Ok(matcher) => matcher,
         Err(error) => return ToolResult::failed(request, error, None),
     };
-    let mut matches = if search_root.is_file() {
-        match_file(cwd, &search_root, &matcher)
-    } else {
-        match match_tree(cwd, &search_root, &matcher, should_cancel) {
+    let mut matches = if is_directory {
+        match match_tree(cwd, &root, &search_root, &matcher, should_cancel) {
             Some(matches) => matches,
             None => return cancelled(),
         }
+    } else {
+        match_file(cwd, &search_root, &matcher)
     };
 
     matches.sort();
@@ -145,6 +159,7 @@ fn parse_args(request: &ToolRequest) -> Result<GlobArgs, String> {
 fn execute_fuzzy(
     request: &ToolRequest,
     cwd: &Path,
+    root: &Path,
     search_root: &Path,
     args: &GlobArgs,
     max_bytes: usize,
@@ -159,6 +174,7 @@ fn execute_fuzzy(
     let mut visited = 0;
     collect_fuzzy_matches(
         cwd,
+        root,
         search_root,
         query,
         &mut matches,
@@ -258,6 +274,7 @@ fn build_matcher(pattern: &str) -> Result<globset::GlobSet, String> {
 /// The paths under `search_root` that match, or `None` when told to stop.
 fn match_tree(
     cwd: &Path,
+    root: &Path,
     search_root: &Path,
     matcher: &globset::GlobSet,
     should_cancel: &dyn Fn() -> bool,
@@ -277,7 +294,7 @@ fn match_tree(
         let Ok(relative_to_root) = path.strip_prefix(search_root) else {
             continue;
         };
-        if matcher.is_match(relative_to_root) {
+        if matcher.is_match(relative_to_root) && listing_entry(root, path).is_some() {
             matches.push(relative_to_workspace(cwd, path));
         }
     }
@@ -295,6 +312,7 @@ fn match_file(cwd: &Path, path: &Path, matcher: &globset::GlobSet) -> Vec<String
 
 fn collect_fuzzy_matches(
     cwd: &Path,
+    root: &Path,
     search_root: &Path,
     query: &str,
     scored: &mut Vec<(usize, String)>,
@@ -324,7 +342,10 @@ fn collect_fuzzy_matches(
         }
         *visited += 1;
         let candidate = relative_to_workspace(cwd, path);
-        let candidate = if path.is_dir() {
+        let Some(is_directory) = listing_entry(root, path) else {
+            continue;
+        };
+        let candidate = if is_directory {
             format!("{candidate}/")
         } else {
             candidate
@@ -389,6 +410,19 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_skips_entries_whose_real_location_is_outside() {
+        let workspace = tempdir().unwrap();
+        let neighbor = tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        let linked = root.join("linked");
+        fs::write(neighbor.path().join("notes.txt"), "outside listing").unwrap();
+        crate::tests::symlink(neighbor.path(), &linked).unwrap();
+
+        assert_eq!(listing_entry(&root, &linked.join("notes.txt")), None);
+    }
 
     #[test]
     fn a_walk_told_to_stop_is_cancelled() {

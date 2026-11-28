@@ -353,7 +353,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[cfg(unix)]
-    use std::os::unix::fs::symlink;
+    pub(crate) use std::os::unix::fs::symlink;
 
     #[cfg(unix)]
     #[test]
