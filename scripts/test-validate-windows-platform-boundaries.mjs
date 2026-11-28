@@ -396,10 +396,7 @@ for (const [relativePath, marker] of atomicJobSpawnContracts) {
     `${relativePath} must enter the execution broker before creating its Windows child`,
   );
 }
-const grepSource = readFileSync(
-  path.join(repoRoot, "crates/orca-tools/src/grep.rs"),
-  "utf8",
-).split("\n#[cfg(test)]\nmod tests")[0];
+const grepSource = readNormalizedSource("crates/orca-tools/src/grep.rs").split("\n#[cfg(test)]\nmod tests")[0];
 assert.match(grepSource, /open_file_in\(/, "grep must use verified file handles");
 assert.doesNotMatch(
   grepSource,
