@@ -112,10 +112,12 @@ pub fn resolve_workflow_script_with_user_dir_and_config_dir(
         .join("workflows")
         .join("scripts")
         .join("script.js");
+    let user_dir =
+        crate::command::config::canonicalize_config_path(&std::path::absolute(user_workflow_dir)?)?;
     resolve_workflow_script_with_dirs_to_path(
         input,
         cwd,
-        user_workflow_dir,
+        &user_dir,
         Some(config_dir),
         &persisted_path,
         ScriptPathAccess::User,
@@ -129,9 +131,8 @@ pub fn resolve_workflow_script_with_user_dir_to_path(
     persisted_path: &Path,
 ) -> io::Result<ResolvedWorkflowScript> {
     let config_dir = orca_core::config::folder_trust::config_dir();
-    let user_dir = user_workflow_dir
-        .canonicalize()
-        .unwrap_or_else(|_| user_workflow_dir.to_path_buf());
+    let user_dir =
+        crate::command::config::canonicalize_config_path(&std::path::absolute(user_workflow_dir)?)?;
     resolve_workflow_script_with_dirs_to_path(
         input,
         cwd,

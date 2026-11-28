@@ -1559,6 +1559,50 @@ export const meta = {
         assert_eq!(resolved.original_path, Some(saved.canonicalize().unwrap()));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn the_user_workflow_root_swapped_for_a_link_is_refused() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().canonicalize().unwrap();
+        let home = cwd.join("config");
+        let user = home.join("workflows");
+        let other = cwd.join("other");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("fixture.js"), startup_failure_script()).unwrap();
+        let _home = crate::history::redirect_test_orca_home(&home);
+        let mut config = config();
+        config.workflows.user_directory = crate::command::config::user_workflow_directory();
+        std::fs::rename(&user, home.join("previous")).unwrap();
+        link_draft_fixture(&other, &user);
+        let request = tool_request(
+            "run",
+            ToolName::Workflow,
+            serde_json::json!({"name":"fixture"}),
+        );
+        let result = execute_workflow_tool(
+            &config,
+            &cwd,
+            &mut EventFactory::new("fixture".into()),
+            &mut EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl),
+            &request,
+            false,
+            &TaskRegistry::new("fixture".into()),
+            &mut Vec::new(),
+            unused_child_executor,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!(
+                "workspace path changed while Orca was running: {}",
+                user.display()
+            )
+        );
+    }
+
     #[test]
     fn a_model_script_path_outside_the_workspace_is_refused() {
         let _guard = crate::history::lock_test_env();

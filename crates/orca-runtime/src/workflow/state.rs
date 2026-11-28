@@ -179,6 +179,7 @@ impl Serialize for AgentOutputField {
 #[derive(Clone, Debug)]
 pub struct WorkflowStateStore {
     root: PathBuf,
+    session_path: PathBuf,
     session: Option<(crate::tasks::TaskRegistry, PathBuf)>,
     agent_cache_write_lock: Arc<Mutex<()>>,
     run_mutation_lock: Arc<Mutex<()>>,
@@ -214,8 +215,27 @@ struct WorkflowControlRequest {
 
 impl WorkflowStateStore {
     pub fn new(root: PathBuf) -> Self {
+        let session = root
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let session_path = if let Some(name) = session.file_name() {
+            let parent = session
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            parent
+                .canonicalize()
+                .map(|parent| parent.join(name))
+                .unwrap_or_else(|_| session.to_path_buf())
+        } else {
+            session
+                .canonicalize()
+                .unwrap_or_else(|_| session.to_path_buf())
+        };
         Self {
             root,
+            session_path,
             session: None,
             agent_cache_write_lock: Arc::new(Mutex::new(())),
             run_mutation_lock: Arc::new(Mutex::new(())),
@@ -225,6 +245,13 @@ impl WorkflowStateStore {
     pub(crate) fn with_session(mut self, tasks: crate::tasks::TaskRegistry, cwd: PathBuf) -> Self {
         self.session = Some((tasks, cwd));
         self
+    }
+
+    pub(crate) fn open_session(&self) -> io::Result<Arc<orca_platform::fs::VerifiedDirectory>> {
+        match &self.session {
+            Some((tasks, cwd)) => tasks.open_workflow_session(cwd),
+            None => orca_tools::open_workspace_root(&self.session_path).map(Arc::new),
+        }
     }
 
     pub(crate) fn open_artifact(&self, run_id: &str, name: &str) -> io::Result<File> {
@@ -237,21 +264,7 @@ impl WorkflowStateStore {
                 "expected a workflow run ID",
             ));
         }
-        if let Some((tasks, cwd)) = &self.session {
-            let session = tasks.open_workflow_session(cwd)?;
-            return orca_tools::open_relative_file(
-                &session,
-                &Path::new("workflow-runs").join(run_id).join(name),
-            );
-        }
-        let session = self.root.parent().ok_or(io::ErrorKind::InvalidInput)?;
-        let parent = session
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(Path::new("."))
-            .canonicalize()?;
-        let path = parent.join(session.file_name().ok_or(io::ErrorKind::InvalidInput)?);
-        let root = orca_tools::open_workspace_root(&path)?;
+        let root = self.open_session()?;
         let runs = self.root.file_name().ok_or(io::ErrorKind::InvalidInput)?;
         orca_tools::open_relative_file(&root, &Path::new(runs).join(run_id).join(name))
     }

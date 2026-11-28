@@ -102,17 +102,6 @@ impl WorkflowIpcContext {
         self.for_sender(self.sender.clone())
     }
 
-    pub(crate) fn reconcile_dead_claims(path: &Path) -> io::Result<()> {
-        if !path.try_exists()? {
-            return Ok(());
-        }
-        match WorkflowTaskLists::durable(path.to_owned()) {
-            Ok(store) => store.release_claims(None).map_err(io::Error::other),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-
     pub(crate) fn reconcile_verified_claims(
         path: &Path,
         open: impl FnOnce() -> io::Result<fs::File>,

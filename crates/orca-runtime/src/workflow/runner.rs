@@ -1197,7 +1197,7 @@ impl WorkflowRunner {
         {
             return Ok(());
         }
-        WorkflowIpcContext::reconcile_dead_claims(&self.state.task_lists_path(run_id))?;
+        self.reconcile_task_list_claims(run_id)?;
         state.status = WorkflowRunStatus::Failed;
         state.final_summary = None;
         state.error = Some("Workflow interrupted by runtime restart".to_string());
@@ -1229,7 +1229,7 @@ impl WorkflowRunner {
             if matches!(access, ScriptPathAccess::Model) {
                 orca_tools::open_workspace_root(&cwd)?;
             }
-            draft_session = self.tasks.open_workflow_session(&cwd)?;
+            draft_session = self.state.open_session()?;
             ScriptPathAccess::Draft(&self.session_dir, &draft_session)
         } else {
             access
@@ -1376,17 +1376,7 @@ impl WorkflowRunner {
         let resume_from = request.input.resume_from_run_id.clone();
         let restart_phase = request.input.restart_phase.clone();
         if let Some(source) = &resume_from {
-            match self.state.open_artifact(source, "task-lists.json") {
-                Ok(file) => {
-                    drop(file);
-                    WorkflowIpcContext::reconcile_verified_claims(
-                        &self.state.task_lists_path(source),
-                        || self.state.open_artifact(source, "task-lists.json"),
-                    )?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+            self.reconcile_task_list_claims(source)?;
         }
         let cached_agents = Arc::new(AtomicU32::new(0));
         let mut failed_error = None;
@@ -1592,6 +1582,17 @@ impl WorkflowRunner {
             summary,
             status_line,
         })
+    }
+
+    fn reconcile_task_list_claims(&self, run_id: &str) -> io::Result<()> {
+        match self.state.open_artifact(run_id, "task-lists.json") {
+            Ok(_) => WorkflowIpcContext::reconcile_verified_claims(
+                &self.state.task_lists_path(run_id),
+                || self.state.open_artifact(run_id, "task-lists.json"),
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn resumed_spent_tokens(&self, resume_from: Option<&str>) -> io::Result<u64> {
@@ -4527,6 +4528,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn workflow_restart_refuses_linked_task_lists() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(cwd.clone());
+        let tasks = TaskRegistry::new("workflow-restart-files".into());
+        let runner = WorkflowRunner::for_session(config, tasks, &cwd).unwrap();
+        let prepared = runner.prepare_background(WorkflowLaunchRequest::from(WorkflowInput {
+            script: Some("export const meta = { name: 'fixture', description: 'Fixture', phases: [] }; export default 'done';".into()),
+            ..Default::default()
+        })).unwrap();
+        runner.activate_prepared_run(&prepared.prepared).unwrap();
+        let outside = cwd.join("task-lists.json");
+        fs::write(&outside, r#"{"nextTaskSeq":0,"lists":{}}"#).unwrap();
+        link_workflow_artifact(&outside, &runner.state.task_lists_path(&prepared.run_id));
+        let result = runner
+            .settle_runtime_restart_without_durable_outcome(&prepared.task_id, &prepared.run_id);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("path changed while it was opened")
+        );
+    }
+
+    #[cfg(unix)]
+    fn link_workflow_artifact(source: &std::path::Path, path: &std::path::Path) {
+        std::os::unix::fs::symlink(source, path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn workflow_resume_refuses_linked_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
@@ -4550,7 +4583,7 @@ mod tests {
             if path.exists() {
                 fs::remove_file(&path).unwrap();
             }
-            std::os::unix::fs::symlink(outside, &path).unwrap();
+            link_workflow_artifact(&outside, &path);
             let result = runner
                 .prepare_model_background(request.clone().with_resume_from(source.run_id.clone()));
             assert!(result.is_err(), "resumed with linked {name}");
