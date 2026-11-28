@@ -52,6 +52,75 @@ fn state() -> AppState {
     )
 }
 
+#[test]
+fn shift_tab_refusal_preserves_the_running_side_and_agent() {
+    for visiting in [false, true] {
+        let fixture = crate::hosted_child::live_child_for_test::ViewOnChild::start();
+        if !visiting {
+            fixture.view.handle(
+                crate::hosted_child::HostedChildAction::Return,
+                &fixture.control,
+            );
+            fixture.view.set_side_active(true);
+        }
+        let (actions, source) = mpsc::unbounded();
+        let (sender, events) = mpsc::unbounded();
+        let (_dispatcher, _commands) = crate::action_dispatcher::TuiActionDispatcher::spawn(
+            source,
+            sender,
+            fixture.control.clone(),
+            4,
+            4,
+        )
+        .unwrap();
+        let mut state = state();
+        if visiting {
+            state.set_conversation_target(ConversationTarget::subagent("agent"));
+        }
+        state.approval_mode = orca_core::approval_types::ApprovalMode::Suggest;
+        state.enter_running();
+        state.update(TuiEvent::MessageDelta("still writing\n".into()));
+        let tail = state.transcript.assistant_stream_tail.expect("open tail");
+        let dialog = crate::user_input_dialog::UserInputDialog::new(
+            crate::protocol::TuiUserInputQuestionnaire::single("which?", vec![]),
+        );
+        crate::key_event_actions::handle_key_event_preflight(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::BackTab,
+                crossterm::event::KeyModifiers::SHIFT,
+            ),
+            &mut state,
+            &crate::test_support::test_run_config(),
+            &actions,
+            &mut crate::vim::VimState::new(false),
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        state.user_input_dialog = Some(dialog.clone());
+        state.update(
+            events
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+        );
+        assert_eq!(state.status, AppStatus::Running);
+        assert_eq!(state.user_input_dialog, Some(dialog));
+        state.update(TuiEvent::MessageDelta("more\n".into()));
+        assert!(
+            matches!(&state.transcript.messages[tail], ChatMessage::Assistant(text) if text.contains("still writing\nmore"))
+        );
+        assert_eq!(state.transcript.assistant_stream_tail, Some(tail));
+        let place = if visiting {
+            "an agent's conversation"
+        } else {
+            "a side conversation"
+        };
+        let sentence = format!("this command is unavailable in {place}; return to main first");
+        assert!(format!("{:?}", state.transcript.messages.last()).contains(&sentence));
+        fixture.shutdown();
+    }
+}
+
 /// Matches `ui.rs`'s test `tool_call` helper field-for-field.
 fn tool_call(
     name: &str,
@@ -491,6 +560,7 @@ fn history_loaded_replaces_legacy_prefix_and_freezes_snapshot() {
     state.push_message(ChatMessage::User("legacy".to_string()));
 
     state.update(TuiEvent::HistoryLoaded {
+        agent_lines: Default::default(),
         messages: vec![
             ChatMessage::User("restored".to_string()),
             ChatMessage::Assistant("answer".to_string()),
@@ -688,6 +758,7 @@ fn workflow_task_summary(id: &str, name: &str) -> BackgroundTaskSummary {
         lifetime: TaskLifetime::Task,
         description: name.to_string(),
         created_at_ms: 1_000,
+        sequence: 0,
         started_at_ms: Some(1_000),
         completed_at_ms: None,
         command: None,
@@ -719,6 +790,1132 @@ fn workflow_task_summary(id: &str, name: &str) -> BackgroundTaskSummary {
         retry_count: 0,
         output_truncated: false,
         publication_revision: None,
+    }
+}
+
+mod agent_visit {
+    use super::*;
+    use crate::hosted_child::tests::{snapshot_with_child, with_streaming_main};
+    use orca_runtime::runtime_host::RuntimeThreadHandle;
+    use orca_runtime::surface::{SurfaceSnapshot, SurfaceTaskType, UnixMillis};
+
+    fn parent_of_child() -> SurfaceSnapshot {
+        let mut snapshot = snapshot_with_child(1, 5);
+        snapshot.tasks[0].started_at = Some(UnixMillis::new(
+            chrono::Utc::now().timestamp_millis() - 30_000,
+        ));
+        snapshot
+    }
+
+    fn apply_attached(state: &mut AppState, events: mpsc::Receiver<TuiEvent>) -> Option<u64> {
+        let mut start = None;
+        for event in events.try_iter() {
+            let TuiEvent::Attached(attached) = event else {
+                panic!("unfenced event")
+            };
+            if let TuiEvent::TurnStarted { started_at_ms, .. } = &attached.event {
+                start = *started_at_ms;
+            }
+            state.update(attached.event);
+        }
+        start
+    }
+
+    fn focus(state: &mut AppState, id: &str, main: &SurfaceSnapshot, child: &SurfaceSnapshot) {
+        let (sender, events) = mpsc::unbounded();
+        crate::hosted_child::project_hosted_child_attached(
+            id.into(),
+            main,
+            SurfaceProjectionState::from_surface_snapshot(child),
+            crate::hosted_session::HostedConversation::from_snapshot(
+                child,
+                crate::hosted_session::HistoryTarget::Conversation,
+                &SurfaceProjectionState::from_surface_snapshot(child),
+            ),
+            crate::protocol::SessionAttachmentId::new(2),
+            &sender,
+        )
+        .unwrap();
+        apply_attached(state, events);
+        for event in crate::hosted_child::FocusedAgent::from_parent(id, main)
+            .projection(child)
+            .hydrate_open_streams()
+        {
+            state.update(event);
+        }
+    }
+
+    fn return_to_main(
+        state: &mut AppState,
+        thread: &RuntimeThreadHandle,
+        snapshot: &SurfaceSnapshot,
+    ) -> Option<u64> {
+        let (sender, events) = mpsc::unbounded();
+        crate::hosted_child::project_returned_main(
+            thread,
+            snapshot,
+            crate::protocol::SessionAttachmentId::new(1),
+            &sender,
+            &crate::operation_controller::TuiSurfaceTaskControl::new(),
+            &std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+        )
+        .unwrap();
+        let start = apply_attached(state, events);
+        state.update(TuiEvent::ChildFocusChanged { task_id: None });
+        start
+    }
+
+    fn assert_running_seconds(frame: &str, minimum: u64) {
+        let seconds = frame
+            .split_once("Running ")
+            .and_then(|(_, tail)| tail.split_once('s'))
+            .and_then(|(seconds, _)| seconds.parse::<u64>().ok());
+        assert!(seconds.is_some_and(|value| value >= minimum), "{frame}");
+    }
+
+    fn assert_no_label(state: &AppState) {
+        assert!(!state.transcript.messages.iter().any(|message| matches!(message, ChatMessage::System { text, .. } if text == "Inherited conversation context.")));
+    }
+
+    fn agent_notes(state: &AppState) -> Vec<&str> {
+        state
+            .transcript
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::System { text, .. }
+                    if text.starts_with("Delegating to") || text.starts_with("Agent ") =>
+                {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn snapshot_update(state: &mut AppState, main: &SurfaceSnapshot) {
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState::from_surface_snapshot(main),
+        )));
+    }
+
+    #[test]
+    fn the_agent_on_screen_is_marked_in_the_dock() {
+        with_streaming_main(|thread, mut main| {
+            let mut state = state();
+            let fixture = parent_of_child();
+            main.tasks.extend(fixture.tasks);
+            main.subagents.extend(fixture.subagents);
+            snapshot_update(&mut state, &main);
+            let mut child = snapshot_with_child(1, 5);
+            child.tasks.clear();
+            child.subagents.clear();
+            focus(&mut state, "child", &main, &child);
+            assert!(
+                crate::test_support::frame_string(&mut state, 100, 40)
+                    .contains("› child · running")
+            );
+            return_to_main(&mut state, thread, &main);
+            assert!(state.agent_dock_selected_task_id.is_none());
+            let frame = crate::test_support::frame_string(&mut state, 100, 40);
+            assert!(
+                frame.contains("child · running") && !frame.contains("› child"),
+                "{frame}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_read_only_view_marks_its_agent() {
+        let mut main = parent_of_child();
+        main.tasks[0].status = orca_runtime::surface::SurfaceTaskStatus::Completed;
+        main.subagents[0].status = orca_runtime::surface::SurfaceSubagentStatus::Completed;
+        let mut child = main.clone();
+        child.tasks.clear();
+        child.subagents.clear();
+        for projection in [
+            None,
+            Some(Box::new(SurfaceProjectionState::from_surface_snapshot(
+                &child,
+            ))),
+        ] {
+            let mut state = state();
+            snapshot_update(&mut state, &main);
+            assert!(
+                !crate::test_support::frame_string(&mut state, 100, 40)
+                    .contains("child · completed")
+            );
+            state.update(TuiEvent::FinishedChildProjection {
+                task_id: "child".into(),
+                main_status: crate::types::SideParentStatus::Idle,
+                projection,
+            });
+            let frame = crate::test_support::frame_string(&mut state, 100, 40);
+            assert!(
+                frame.contains("› child · completed") && frame.contains("Agents 0 active"),
+                "{frame}"
+            );
+            let mut tasks = crate::surface_projection::workflow_task_summaries(&main);
+            let mut approval = tasks[0].clone();
+            approval.status = orca_core::task_types::TaskStatus::ApprovalRequired;
+            for index in 0..5 {
+                approval.id = format!("approval-{index}");
+                tasks.push(approval.clone());
+            }
+            state.update(TuiEvent::BackgroundTasksUpdated(tasks));
+            let frame = crate::test_support::frame_string(&mut state, 100, 40);
+            assert!(
+                frame.contains("› child · completed"),
+                "attention rows filled the dock: {frame}"
+            );
+            state.update(TuiEvent::ChildFocusChanged { task_id: None });
+            assert!(state.agent_dock_selected_task_id.is_none());
+            assert!(
+                !crate::test_support::frame_string(&mut state, 100, 40)
+                    .contains("child · completed")
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_that_ends_on_screen_adds_nothing_to_its_own_conversation() {
+        let mut state = state();
+        let mut main = parent_of_child();
+        snapshot_update(&mut state, &main);
+        let mut child = main.clone();
+        child.tasks.clear();
+        child.subagents.clear();
+        focus(&mut state, "child", &main, &child);
+        main.tasks[0].status = orca_runtime::surface::SurfaceTaskStatus::Completed;
+        state.update(TuiEvent::BackgroundTasksUpdated(
+            crate::surface_projection::workflow_task_summaries(&main),
+        ));
+        assert!(agent_notes(&state).is_empty(), "{:?}", agent_notes(&state));
+    }
+
+    #[test]
+    fn the_return_to_main_shows_what_its_agents_did_while_away() {
+        with_streaming_main(|thread, mut main| {
+            use orca_runtime::surface::{
+                DisplayText, SurfaceItem, SurfaceItemId, SurfaceSubagentOwner,
+            };
+            let mut fixture = parent_of_child();
+            let owner = main.foreground_operation.as_ref().unwrap();
+            fixture.tasks[0].parent_operation = Some(owner.operation_id.clone());
+            fixture.subagents[0].owner = SurfaceSubagentOwner::Generation {
+                fence: owner.generations[0].fence.clone(),
+            };
+            main.items.push(SurfaceItem::AssistantMessage {
+                id: SurfaceItemId::new(),
+                turn_id: owner.agent_loop_turns[0].turn_id.clone(),
+                text: DisplayText::new("owner's last item"),
+                pinned: false,
+                cut_short: None,
+            });
+            main.items.push(SurfaceItem::SystemMessage {
+                id: SurfaceItemId::new(),
+                content: DisplayText::new("after owner"),
+                pinned: false,
+                origin: orca_runtime::surface::SurfaceItemOrigin::RuntimeContext,
+            });
+            main.tasks.extend(fixture.tasks.clone());
+            main.subagents.extend(fixture.subagents.clone());
+            let mut state = state();
+            focus(&mut state, "child", &main, &fixture);
+            main.tasks.last_mut().unwrap().status =
+                orca_runtime::surface::SurfaceTaskStatus::Completed;
+            return_to_main(&mut state, thread, &main);
+            assert_eq!(
+                agent_notes(&state),
+                ["Delegating to 1 agent", "Agent completed: child"]
+            );
+            assert_eq!(state.status, AppStatus::Running);
+            assert!(state.transcript.messages.windows(4).any(|rows| matches!(rows, [ChatMessage::Assistant(before),ChatMessage::System{text:launch,..},ChatMessage::System{text:end,..}, ChatMessage::System{text:after,..}] if before == "owner's last item" && launch == "Delegating to 1 agent" && end == "Agent completed: child" && after == "after owner")), "{:?}", state.transcript.messages);
+        });
+    }
+
+    #[test]
+    fn a_visited_agent_shows_its_nested_end_live_and_when_reopened() {
+        use orca_runtime::surface::{
+            DisplayText, NonEmptyText, SequenceNumber, SurfaceSubagentId, SurfaceTaskId,
+            SurfaceTaskStatus,
+        };
+        with_streaming_main(|thread, _| {
+            let mut main = parent_of_child();
+            let mut child = parent_of_child();
+            let id = SurfaceTaskId::try_new("nested").unwrap();
+            let agent = SurfaceSubagentId::try_new("agent-nested").unwrap();
+            child.tasks[0].task_id = id.clone();
+            child.tasks[0].description = DisplayText::new("nested");
+            child.tasks[0].subagent_id = Some(agent.clone());
+            child.subagents[0].task_id = id;
+            child.subagents[0].subagent_id = agent;
+            child.subagents[0].batch_id = NonEmptyText::try_new("nested-batch").unwrap();
+            let mut state = state();
+            snapshot_update(&mut state, &main);
+            state.update(TuiEvent::ChildFocusChanged {
+                task_id: Some("child".into()),
+            });
+            let mut empty = child.clone();
+            empty.tasks.clear();
+            empty.subagents.clear();
+            focus(&mut state, "child", &main, &empty);
+            child.cursor.next_seq = SequenceNumber::new(1);
+            snapshot_update(&mut state, &child);
+            main.tasks[0].status = SurfaceTaskStatus::Completed;
+            state.update(TuiEvent::BackgroundTasksUpdated(
+                crate::surface_projection::workflow_task_summaries(&main),
+            ));
+            child.tasks[0].status = SurfaceTaskStatus::Stopped;
+            child.cursor.next_seq = SequenceNumber::new(2);
+            snapshot_update(&mut state, &child);
+            snapshot_update(&mut state, &child);
+            let expected = ["Delegating to 1 agent", "Agent stopped: nested"];
+            assert_eq!(agent_notes(&state), expected, "live child, not merged dock");
+            return_to_main(&mut state, thread, &main);
+            assert_eq!(
+                agent_notes(&state),
+                ["Delegating to 1 agent", "Agent completed: child"]
+            );
+            child
+                .items
+                .push(orca_runtime::surface::SurfaceItem::SystemMessage {
+                    id: orca_runtime::surface::SurfaceItemId::new(),
+                    content: DisplayText::new("child history"),
+                    pinned: false,
+                    origin: orca_runtime::surface::SurfaceItemOrigin::RuntimeContext,
+                });
+            focus(&mut state, "child", &main, &child);
+            snapshot_update(&mut state, &child);
+            assert_eq!(agent_notes(&state), expected, "reopened child");
+            assert!(
+                matches!(state.transcript.messages.as_slice(), [ChatMessage::System {text: first,..}, ChatMessage::System {text: launch,..}, ChatMessage::System {text: end,..}] if first == "child history" && launch == expected[0] && end == expected[1])
+            );
+        });
+    }
+
+    #[test]
+    fn resume_side_close_and_return_seed_only_the_notices_already_shown() {
+        use orca_runtime::surface::{SequenceNumber, SurfaceTaskStatus};
+        with_streaming_main(|thread, _| {
+            for route in ["resume", "side close", "agent return"] {
+                let mut main = parent_of_child();
+                let mut sibling = main.tasks[0].clone();
+                sibling.task_id = orca_runtime::surface::SurfaceTaskId::try_new("ended").unwrap();
+                sibling.subagent_id = None;
+                sibling.status = SurfaceTaskStatus::Completed;
+                sibling.description = orca_runtime::surface::DisplayText::new("earlier");
+                main.tasks.push(sibling);
+                let mut state = state();
+                let projection = SurfaceProjectionState::from_surface_snapshot(&main);
+                let (sender, events) = mpsc::unbounded();
+                if route == "resume" {
+                    state.update(TuiEvent::HistoryLoaded {
+                        agent_lines: crate::subagent_lines::AnnouncedAgentLines::from_tasks(
+                            &projection.workflow_tasks,
+                        ),
+                        messages: crate::surface_projection::history_messages_from_surface_snapshot(
+                            &main,
+                        ),
+                        plan: None,
+                        label: "Resumed saved conversation.".into(),
+                    });
+                } else {
+                    state.side_conversation_visible = route == "side close";
+                    crate::hosted_child::project_returned_main_with_label(
+                        thread,
+                        &main,
+                        crate::protocol::SessionAttachmentId::new(1),
+                        &sender,
+                        &crate::operation_controller::TuiSurfaceTaskControl::new(),
+                        &Default::default(),
+                        (route == "side close").then_some("Inherited conversation context."),
+                    )
+                    .unwrap();
+                    for event in events.try_iter() {
+                        let event = event.into_test_payload();
+                        if matches!(event, TuiEvent::ReturnedMainProjection(..)) {
+                            state.update(event);
+                            assert!(
+                                agent_notes(&state).is_empty(),
+                                "{route} wrote discarded rows"
+                            );
+                        } else {
+                            state.update(event);
+                        }
+                    }
+                    state.side_conversation_visible = false;
+                }
+                let baseline = [
+                    "Delegating to 1 agent",
+                    "Delegating to 1 agent",
+                    "Agent completed: earlier",
+                ];
+                assert_eq!(agent_notes(&state), baseline, "{route} baseline");
+                snapshot_update(&mut state, &main);
+                assert_eq!(agent_notes(&state), baseline, "{route} repeated baseline");
+                main.tasks[0].status = SurfaceTaskStatus::Stopped;
+                main.cursor.next_seq = SequenceNumber::new(2);
+                snapshot_update(&mut state, &main);
+                assert_eq!(
+                    agent_notes(&state),
+                    [&baseline[..], &["Agent stopped: child"]].concat(),
+                    "{route} new end"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_stopped_agent_is_announced_in_main() {
+        use orca_runtime::surface::{SequenceNumber, SurfaceTaskStatus, TaskRevision};
+        let mut main = parent_of_child();
+        let mut state = state();
+        state.set_status(AppStatus::Running);
+        snapshot_update(&mut state, &main);
+        main.cursor.next_seq = SequenceNumber::new(2);
+        main.tasks[0].revision = TaskRevision::try_new(2).unwrap();
+        main.tasks[0].status = SurfaceTaskStatus::Stopped;
+        snapshot_update(&mut state, &main);
+        assert_eq!(
+            agent_notes(&state),
+            ["Delegating to 1 agent", "Agent stopped: child"]
+        );
+        assert_eq!(state.status, AppStatus::Running);
+        state.update(TuiEvent::ConversationReprojected {
+            agent_lines: crate::subagent_lines::AnnouncedAgentLines::from_tasks(
+                &SurfaceProjectionState::from_surface_snapshot(&main).workflow_tasks,
+            ),
+            messages: crate::surface_projection::history_messages_from_surface_snapshot(&main),
+            plan: None,
+        });
+        assert_eq!(
+            agent_notes(&state),
+            ["Delegating to 1 agent", "Agent stopped: child"]
+        );
+        assert_eq!(state.status, AppStatus::Running);
+    }
+
+    #[test]
+    fn a_rebuild_does_not_repeat_a_line() {
+        with_streaming_main(|thread, _| {
+            let mut main = parent_of_child();
+            main.tasks[0].status = orca_runtime::surface::SurfaceTaskStatus::Completed;
+            let mut state = state();
+            for _ in 0..2 {
+                focus(&mut state, "child", &main, &main);
+                return_to_main(&mut state, thread, &main);
+                snapshot_update(&mut state, &main);
+                assert_eq!(
+                    agent_notes(&state),
+                    ["Delegating to 1 agent", "Agent completed: child"]
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn an_agents_mcp_panel_keeps_mains_catalog_after_child_updates() {
+        use orca_runtime::surface::{NonEmptyText, SurfaceMcpServer, SurfaceMcpServerStatus};
+        let server = |name| SurfaceMcpServer {
+            name: NonEmptyText::try_new(name).unwrap(),
+            status: SurfaceMcpServerStatus::Disabled,
+            prompts_error: None,
+        };
+        let mut main = parent_of_child();
+        main.mcp_catalog.servers.push(server("main_archive"));
+        let mut child = snapshot_with_child(1, 2);
+        child.mcp_catalog.servers.push(server("child_archive"));
+        let mut state = state();
+        focus(&mut state, "child", &main, &child);
+        state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+            SurfaceProjectionState::from_surface_snapshot(&child),
+        )));
+        let mut config = crate::test_support::test_run_config();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(config.clone()));
+        let actions = state.event_tx.clone();
+        for status in [AppStatus::Idle, AppStatus::Running] {
+            state.set_status(status);
+            crate::slash_command_actions::handle_slash_command(
+                "/mcp",
+                &mut config,
+                &shared,
+                &mut state,
+                &actions,
+            );
+            let frame = crate::test_support::frame_string(&mut state, 120, 40);
+            assert!(
+                frame.contains("main_archive") && !frame.contains("child_archive"),
+                "{frame}"
+            );
+            state.mcp_dialog = None;
+        }
+    }
+
+    #[test]
+    fn a_rebuilt_agent_view_uses_mains_status_for_quit_and_signals() {
+        use crate::global_actions::{handle_global_shortcut, quit_on_termination_signal};
+        use crate::shortcuts::GlobalShortcut;
+        use orca_runtime::termination_signals::TerminationSignal;
+        with_streaming_main(|_, main| {
+            let mut state = state();
+            let (send, actions) = mpsc::unbounded();
+            focus(&mut state, "child", &main, &parent_of_child());
+            assert_eq!(state.status, AppStatus::Idle);
+            assert_eq!(state.main_behind_child, Some(SideParentStatus::Running));
+            assert!(
+                crate::test_support::frame_string(&mut state, 120, 40).contains("Main is running")
+            );
+            for signal in [TerminationSignal::Terminate, TerminationSignal::Hangup] {
+                assert_eq!(
+                    quit_on_termination_signal(signal, &mut state, &send),
+                    signal.exit_code()
+                );
+                assert!(matches!(actions.try_recv(), Ok(UserAction::Interrupt)));
+                assert!(matches!(actions.try_recv(), Ok(UserAction::Cancel)));
+            }
+            for status in [
+                SideParentStatus::NeedsApproval,
+                SideParentStatus::NeedsInput,
+            ] {
+                state.update(TuiEvent::SideParentStatusChanged(status));
+                handle_global_shortcut(GlobalShortcut::Cancel, &mut state, &send, || Ok(()))
+                    .unwrap();
+                assert!(matches!(actions.try_recv(), Ok(UserAction::Interrupt)));
+                assert!(state.last_ctrl_c.is_none());
+            }
+            state.update(TuiEvent::SideParentStatusChanged(SideParentStatus::Idle));
+            handle_global_shortcut(GlobalShortcut::Cancel, &mut state, &send, || Ok(())).unwrap();
+            assert!(actions.try_recv().is_err());
+            assert!(
+                crate::test_support::frame_string(&mut state, 120, 40)
+                    .contains("Press Ctrl+C again to quit")
+            );
+        });
+    }
+
+    #[test]
+    fn returning_from_an_agent_keeps_a_running_main_running() {
+        with_streaming_main(|thread, mut snapshot| {
+            let mut state = state();
+            let mut main = parent_of_child();
+            main.foreground_operation = snapshot.foreground_operation.clone();
+            state.update(TuiEvent::TurnStarted {
+                turn: 0,
+                task: None,
+                started_at_ms: None,
+            });
+            state.update(TuiEvent::MessageDelta("before".into()));
+            state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+                SurfaceProjectionState::from_surface_snapshot(&main),
+            )));
+            focus(&mut state, "child", &main, &snapshot);
+            let admitted = snapshot
+                .foreground_operation
+                .as_ref()
+                .unwrap()
+                .agent_loop_turns[0]
+                .admitted_main_task_id
+                .clone()
+                .unwrap();
+            let mut timed_task = snapshot_with_child(1, 2).tasks.remove(0);
+            timed_task.task_id = admitted;
+            timed_task.task_type = SurfaceTaskType::MainSession;
+            timed_task.subagent_id = None;
+            timed_task.started_at = Some(UnixMillis::new(
+                chrono::Utc::now().timestamp_millis() - 40_000,
+            ));
+            snapshot.tasks.push(timed_task);
+            let stream = snapshot
+                .assistant_streams
+                .iter_mut()
+                .find(|stream| stream.channel == orca_runtime::surface::AssistantChannel::Message)
+                .unwrap();
+            stream.text = orca_runtime::surface::DisplayText::new("before and during");
+            stream.next_offset = orca_runtime::surface::ByteOffset::new(17);
+            return_to_main(&mut state, thread, &snapshot);
+            assert_eq!(state.status, AppStatus::Running);
+            assert!(state.running_started_at.unwrap().elapsed().as_secs() >= 40);
+            assert_eq!(state.main_behind_child, None);
+            assert_no_label(&state);
+            let frame = crate::test_support::frame_string(&mut state, 120, 40);
+            assert_running_seconds(&frame, 40);
+            assert!(
+                frame.contains("before and during") && frame.contains("Esc interrupt"),
+                "{frame}"
+            );
+            state.update(TuiEvent::MessageDelta(" and after\n".into()));
+            state.update(TuiEvent::SessionCompleted {
+                status: "success".into(),
+            });
+            let frame = crate::test_support::frame_string(&mut state, 120, 40);
+            assert_eq!(
+                frame.matches("before and during and after").count(),
+                1,
+                "{frame}"
+            );
+            assert_eq!(frame.matches("before and during").count(), 1, "{frame}");
+        });
+    }
+
+    #[test]
+    fn a_late_queue_update_cannot_revive_the_turn_restored_on_return() {
+        with_streaming_main(|thread, snapshot| {
+            let mut state = state();
+            let mut running = crate::test_support::runtime_queue_running_the_first(&["queued"]);
+            let turn = &snapshot
+                .foreground_operation
+                .as_ref()
+                .unwrap()
+                .generations
+                .last()
+                .unwrap()
+                .logical_turn_id;
+            running.items[0].client_user_message_id =
+                orca_runtime::prompt_queue::ClientUserMessageId::parse(
+                    turn.as_str().strip_prefix("turn_").unwrap(),
+                )
+                .unwrap();
+            return_to_main(&mut state, thread, &snapshot);
+            state.update(TuiEvent::SessionCompleted {
+                status: "success".into(),
+            });
+            state.update(TuiEvent::PromptQueueUpdated(running));
+            assert_eq!(state.status, AppStatus::Idle);
+        });
+    }
+
+    #[test]
+    fn return_fences_the_stream_delta_already_in_the_snapshot() {
+        use crate::attachment_routing::AttachmentRouting;
+        with_streaming_main(|thread, snapshot| {
+            let parent = crate::protocol::SessionAttachmentId::new(1);
+            let routing =
+                std::sync::Arc::new(std::sync::Mutex::new(AttachmentRouting::new(parent)));
+            let (sender, events) = mpsc::unbounded();
+            AttachmentRouting::switch_attachment_deferred(&routing, &sender, parent, None);
+            let text = snapshot
+                .assistant_streams
+                .iter()
+                .find(|stream| stream.channel == orca_runtime::surface::AssistantChannel::Message)
+                .unwrap()
+                .text
+                .as_str();
+            let delivery = TuiEvent::SurfaceDelivery(Box::new((
+                snapshot.cursor.clone(),
+                TuiEvent::MessageDelta(text.into()),
+                None,
+            )));
+            routing
+                .lock()
+                .unwrap()
+                .route(&sender, parent, delivery.clone());
+            crate::hosted_child::project_returned_main(
+                thread,
+                &snapshot,
+                parent,
+                &sender,
+                &crate::operation_controller::TuiSurfaceTaskControl::new(),
+                &routing,
+            )
+            .unwrap();
+            AttachmentRouting::release_deferred_parent_events(&routing, &sender);
+            routing.lock().unwrap().route(&sender, parent, delivery);
+            let mut later = snapshot.cursor.clone();
+            later.next_seq = orca_runtime::surface::SequenceNumber::new(later.next_seq.get() + 1);
+            routing.lock().unwrap().route(
+                &sender,
+                parent,
+                TuiEvent::MessageDelta(" continues".into()).at_surface_cursor(true, &later),
+            );
+            let mut state = state();
+            apply_attached(&mut state, events);
+            let frame = crate::test_support::frame_string(&mut state, 120, 40);
+            assert_eq!(frame.matches(text).count(), 1, "{frame}");
+            assert!(frame.contains(&format!("{text} continues")), "{frame}");
+        });
+    }
+
+    #[test]
+    fn a_same_id_worker_round_restores_running_without_repeating_the_intro() {
+        let mut state = state();
+        let start = TuiEvent::RuntimeTurnStarted {
+            turn_id: "same".into(),
+        };
+        state.update(start.clone());
+        let count = state.transcript.messages.len();
+        state.set_status(AppStatus::WaitingApproval);
+        state.update(start);
+        assert_eq!(state.status, AppStatus::Running);
+        assert_eq!(state.transcript.messages.len(), count);
+    }
+
+    #[test]
+    fn a_failed_return_read_keeps_delivering_the_childs_events() {
+        use crate::attachment_routing::{AttachmentRouting, accept_attached_tui_event};
+        let parent = crate::protocol::SessionAttachmentId::new(1);
+        let child = parent.next();
+        let routing = std::sync::Arc::new(std::sync::Mutex::new(AttachmentRouting::new(parent)));
+        let (sender, events) = mpsc::unbounded();
+        AttachmentRouting::switch_attachment(&routing, &sender, child, Some(parent), false);
+        let result = crate::hosted_child::snapshot_for_return(&routing, &sender, parent, || {
+            routing.lock().unwrap().route(
+                &sender,
+                child,
+                TuiEvent::MessageDelta("during read".into()),
+            );
+            Err("read failed".into())
+        });
+        assert!(result.is_err());
+        let mut state = state();
+        let delivered = events
+            .try_iter()
+            .filter_map(|event| accept_attached_tui_event(&mut state, event).ok().flatten())
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(delivered.as_slice(), [TuiEvent::MessageDelta(text)] if text == "during read")
+        );
+        assert_eq!(state.active_session_attachment, Some(child));
+    }
+
+    #[test]
+    fn completion_between_return_snapshot_and_reset_still_ends_the_row() {
+        use crate::attachment_routing::AttachmentRouting;
+        with_streaming_main(|thread, snapshot| {
+            let parent = crate::protocol::SessionAttachmentId::new(1);
+            let routing =
+                std::sync::Arc::new(std::sync::Mutex::new(AttachmentRouting::new(parent)));
+            let (sender, events) = mpsc::unbounded();
+            AttachmentRouting::switch_attachment(
+                &routing,
+                &sender,
+                parent.next(),
+                Some(parent),
+                false,
+            );
+            let snapshot =
+                crate::hosted_child::snapshot_for_return(&routing, &sender, parent, || {
+                    let mut terminal_cursor = snapshot.cursor.clone();
+                    terminal_cursor.next_seq = orca_runtime::surface::SequenceNumber::new(
+                        terminal_cursor.next_seq.get() + 1,
+                    );
+                    routing.lock().unwrap().route(
+                        &sender,
+                        parent,
+                        TuiEvent::SessionCompleted {
+                            status: "success".into(),
+                        }
+                        .at_surface_cursor(true, &terminal_cursor),
+                    );
+                    Ok(snapshot)
+                })
+                .unwrap();
+            crate::hosted_child::project_returned_main(
+                thread,
+                &snapshot,
+                parent,
+                &sender,
+                &crate::operation_controller::TuiSurfaceTaskControl::new(),
+                &routing,
+            )
+            .unwrap();
+            AttachmentRouting::release_deferred_parent_events(&routing, &sender);
+            let mut state = state();
+            for event in events.try_iter() {
+                if let Ok(Some(event)) =
+                    crate::attachment_routing::accept_attached_tui_event(&mut state, event)
+                {
+                    state.update(event)
+                }
+            }
+            assert_eq!(state.status, AppStatus::Idle);
+        });
+    }
+
+    #[test]
+    fn main_clock_spans_generations_including_one_not_yet_admitted() {
+        use orca_runtime::surface::{SurfaceGenerationId, SurfaceTaskId};
+        with_streaming_main(|thread, mut snapshot| {
+            let operation = snapshot.foreground_operation.as_mut().unwrap();
+            let mut next = operation.generations.last().unwrap().clone();
+            next.fence.generation_id = SurfaceGenerationId::new(next.fence.generation_id.get() + 1);
+            let mut next_turn = operation.agent_loop_turns[0].clone();
+            let mut first = snapshot_with_child(1, 2).tasks.remove(0);
+            first.task_type = SurfaceTaskType::MainSession;
+            first.task_id = next_turn.admitted_main_task_id.clone().unwrap();
+            let start = chrono::Utc::now().timestamp_millis() - 40_000;
+            first.started_at = Some(UnixMillis::new(start));
+            let mut second = first.clone();
+            second.task_id = SurfaceTaskId::try_new("next-main").unwrap();
+            second.started_at = Some(UnixMillis::new(start + 30_000));
+            next_turn.fence = next.fence.clone();
+            next_turn.admitted_main_task_id = Some(second.task_id.clone());
+            operation.generations.push(next);
+            snapshot.tasks.extend([first, second]);
+            for admitted in [false, true] {
+                if admitted {
+                    snapshot
+                        .foreground_operation
+                        .as_mut()
+                        .unwrap()
+                        .agent_loop_turns
+                        .push(next_turn.clone());
+                }
+                let mut state = state();
+                assert_eq!(
+                    return_to_main(&mut state, thread, &snapshot),
+                    Some(start as u64),
+                    "admitted={admitted}"
+                );
+                assert_running_seconds(&crate::test_support::frame_string(&mut state, 120, 40), 40);
+            }
+            let operation = snapshot.foreground_operation.as_mut().unwrap();
+            operation.agent_loop_turns[0].admitted_main_task_id = None;
+            let mut unadmitted = operation.generations.last().unwrap().clone();
+            unadmitted.fence.generation_id =
+                SurfaceGenerationId::new(unadmitted.fence.generation_id.get() + 1);
+            operation.generations.push(unadmitted);
+            assert_eq!(
+                return_to_main(&mut state(), thread, &snapshot),
+                Some((start + 30_000) as u64)
+            );
+        });
+    }
+
+    #[test]
+    fn return_reseeds_main_queue_before_another_update() {
+        with_streaming_main(|thread, snapshot| {
+            thread
+                .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::Add {
+                    input: "later".into(),
+                })
+                .unwrap();
+            let mut state = state();
+            return_to_main(&mut state, thread, &snapshot);
+            let frame = crate::test_support::frame_string(&mut state, 120, 40);
+            assert!(frame.contains("Queued 1"), "{frame}");
+        });
+    }
+
+    #[test]
+    fn a_terminal_main_return_cannot_be_revived_by_its_queued_start() {
+        use orca_runtime::surface::{
+            OperationTerminal, OperationTerminalRecord, SurfaceFinalizeIntentId,
+        };
+        with_streaming_main(|thread, mut snapshot| {
+            let operation = snapshot.foreground_operation.as_mut().unwrap();
+            let turn = operation
+                .generations
+                .last()
+                .unwrap()
+                .logical_turn_id
+                .clone();
+            operation.terminal = Some(OperationTerminalRecord {
+                operation_id: operation.operation_id.clone(),
+                finalize_intent_id: SurfaceFinalizeIntentId::try_from_bytes(
+                    *operation.operation_id.as_bytes(),
+                )
+                .unwrap(),
+                terminal: OperationTerminal::Succeeded {
+                    usage: Default::default(),
+                },
+                usage: Default::default(),
+                source_diagnostic_digest: None,
+                settlement_receipts: vec![],
+                completion_proof: Default::default(),
+                committed_at: UnixMillis::new(1),
+            });
+            let mut state = state();
+            return_to_main(&mut state, thread, &snapshot);
+            let mut running = crate::test_support::runtime_queue_running_the_first(&["queued"]);
+            running.items[0].client_user_message_id =
+                orca_runtime::prompt_queue::ClientUserMessageId::parse(
+                    turn.as_str().strip_prefix("turn_").unwrap(),
+                )
+                .unwrap();
+            state.update(TuiEvent::PromptQueueUpdated(running));
+            assert_eq!(state.status, AppStatus::Idle);
+        });
+    }
+
+    #[test]
+    fn restored_text_remains_visible_at_response_completion() {
+        let mut state = state();
+        state.enter_running();
+        state.update(TuiEvent::OpenMessageRestored("prefix".into()));
+        state.update(TuiEvent::AssistantResponseCompleted(
+            Some("prefix and tail".into()),
+            None,
+        ));
+        let frame = crate::test_support::frame_string(&mut state, 120, 40);
+        assert_eq!(frame.matches("prefix and tail").count(), 1, "{frame}");
+    }
+
+    #[test]
+    fn child_focus_does_not_invent_a_parent_status() {
+        let mut state = state();
+        state.enter_running();
+        state.update(TuiEvent::ChildFocusChanged {
+            task_id: Some("child".into()),
+        });
+        assert_eq!(state.main_behind_child, None);
+    }
+
+    #[test]
+    fn the_live_main_clock_uses_its_admitted_task_even_before_reconciliation() {
+        with_streaming_main(|thread, snapshot| {
+            let turn = &snapshot
+                .foreground_operation
+                .as_ref()
+                .unwrap()
+                .agent_loop_turns[0];
+            let admitted = turn.admitted_main_task_id.as_ref().unwrap();
+            assert_ne!(admitted, &turn.task_id);
+            assert!(!snapshot.tasks.iter().any(|row| &row.task_id == admitted));
+            let started = thread
+                .task_registry()
+                .get_cached(admitted.as_str())
+                .unwrap()
+                .started_at_ms
+                .unwrap();
+            let mut state = state();
+            let hydrated_start = return_to_main(&mut state, thread, &snapshot);
+            assert_eq!(state.status, AppStatus::Running);
+            assert_eq!(hydrated_start, Some(started.try_into().unwrap()));
+            let until_second = (started + 1000 - chrono::Utc::now().timestamp_millis()).max(0);
+            std::thread::sleep(std::time::Duration::from_millis(until_second as u64 + 1));
+            assert_running_seconds(&crate::test_support::frame_string(&mut state, 120, 40), 1);
+        });
+    }
+
+    #[test]
+    fn an_agents_view_has_no_inherited_context_line() {
+        let mut state = state();
+        focus(
+            &mut state,
+            "child",
+            &parent_of_child(),
+            &snapshot_with_child(1, 6),
+        );
+        assert_no_label(&state);
+    }
+
+    #[test]
+    fn opening_a_sibling_keeps_main_shown_as_running() {
+        with_streaming_main(|thread, snapshot| {
+            let mut state = state();
+            let mut main = parent_of_child();
+            main.foreground_operation = snapshot.foreground_operation.clone();
+            state.enter_running();
+            focus(&mut state, "child", &main, &snapshot);
+            return_to_main(&mut state, thread, &snapshot);
+            state.set_status(AppStatus::Idle);
+            let mut sibling = main.tasks[0].clone();
+            sibling.task_id = orca_runtime::surface::SurfaceTaskId::try_new("sibling").unwrap();
+            main.tasks.push(sibling);
+            focus(&mut state, "sibling", &main, &snapshot);
+            assert_eq!(state.main_behind_child, Some(SideParentStatus::Running));
+            assert!(
+                crate::test_support::frame_string(&mut state, 120, 40)
+                    .contains("Main is running · Esc return")
+            );
+        });
+    }
+
+    #[test]
+    fn an_agents_timer_counts_from_its_start_however_often_it_is_opened() {
+        with_streaming_main(|thread, snapshot| {
+            let mut state = state();
+            let main = parent_of_child();
+            for _ in 0..2 {
+                focus(&mut state, "child", &main, &snapshot);
+                assert!(state.running_started_at.unwrap().elapsed().as_secs() >= 30);
+                assert_running_seconds(&crate::test_support::frame_string(&mut state, 120, 40), 30);
+                return_to_main(&mut state, thread, &snapshot);
+            }
+        });
+    }
+
+    #[test]
+    fn a_snapshot_clock_in_the_future_starts_now() {
+        let mut state = state();
+        let before = Instant::now();
+        state.update(TuiEvent::TurnStarted {
+            turn: 0,
+            task: None,
+            started_at_ms: Some(u64::MAX),
+        });
+        let start = state.running_started_at.unwrap();
+        assert!((before..=Instant::now()).contains(&start));
+    }
+
+    #[test]
+    fn a_child_view_reports_the_interaction_main_is_waiting_for() {
+        use orca_runtime::surface::{
+            DisplayText, InteractionRevision, InteractionUnavailableDisposition, NonEmptyText,
+            ResponseRouteEpoch, SurfaceInteractionId, SurfaceInteractionKind,
+            SurfaceInteractionLifecycle, SurfaceInteractionRequest, SurfaceInteractionRoute,
+            SurfaceInteractionView, SurfaceMcpElicitationRequest,
+        };
+
+        with_streaming_main(|thread, mut main| {
+            let child = parent_of_child();
+            let mut state = state();
+            let question = NonEmptyText::try_new("Continue?").unwrap();
+            for (kind, request, status) in [
+                (
+                    SurfaceInteractionKind::McpElicitation,
+                    SurfaceInteractionRequest::McpElicitation {
+                        server_name: NonEmptyText::try_new("mock").unwrap(),
+                        server_request_id: NonEmptyText::try_new("1").unwrap(),
+                        message: DisplayText::new("Continue?"),
+                        request: SurfaceMcpElicitationRequest::Form {
+                            requested_schema: None,
+                            supported_schema: None,
+                        },
+                    },
+                    SideParentStatus::NeedsApproval,
+                ),
+                (
+                    SurfaceInteractionKind::UserInput,
+                    SurfaceInteractionRequest::UserInput {
+                        question,
+                        suggestions: vec![],
+                    },
+                    SideParentStatus::NeedsInput,
+                ),
+            ] {
+                main.interactions = vec![SurfaceInteractionView {
+                    interaction_id: SurfaceInteractionId::try_from_bytes([
+                        0x01, 0x8f, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 3,
+                    ])
+                    .unwrap(),
+                    revision: InteractionRevision::try_new(1).unwrap(),
+                    fence: main
+                        .foreground_operation
+                        .as_ref()
+                        .unwrap()
+                        .generations
+                        .last()
+                        .unwrap()
+                        .fence
+                        .clone(),
+                    kind,
+                    request,
+                    route: SurfaceInteractionRoute::Unassigned {
+                        epoch: ResponseRouteEpoch::try_new(1).unwrap(),
+                    },
+                    lifecycle: SurfaceInteractionLifecycle::Requested,
+                    recovery_disposition: InteractionUnavailableDisposition::FailOperation,
+                }];
+                focus(&mut state, "child", &main, &child);
+                assert_eq!(state.main_behind_child, Some(status));
+                use orca_runtime::surface::{
+                    AttachResult, FreshAttachRequest, SurfaceAttachmentRole, SurfaceRequestId,
+                };
+                let control = crate::operation_controller::TuiSurfaceTaskControl::new();
+                let AttachResult::FreshAttached { attachment } =
+                    thread.surface().attach_fresh(FreshAttachRequest {
+                        request_id: SurfaceRequestId::new(),
+                        role: SurfaceAttachmentRole::Tui,
+                        requested_capabilities: [
+                            orca_runtime::surface::SurfaceCapability::ReadSnapshot,
+                        ]
+                        .into(),
+                        interaction_capabilities: Default::default(),
+                    })
+                else {
+                    panic!("attach")
+                };
+                control
+                    .install_surface(
+                        attachment.client,
+                        main.interactions[0].fence.operation_id.clone(),
+                    )
+                    .unwrap();
+                let parent = crate::protocol::SessionAttachmentId::new(1);
+                let (sender, events) = mpsc::unbounded();
+                let routing = std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::attachment_routing::AttachmentRouting::new(parent),
+                ));
+                crate::attachment_routing::AttachmentRouting::switch_attachment_deferred(
+                    &routing, &sender, parent, None,
+                );
+                let duplicate = control
+                    .register_surface_interaction(&main.interactions[0])
+                    .unwrap();
+                crate::hosted_child::project_returned_main(
+                    thread, &main, parent, &sender, &control, &routing,
+                )
+                .unwrap();
+                apply_attached(&mut state, events.clone());
+                assert_eq!(state.status, AppStatus::WaitingUserInput);
+                assert!(
+                    crate::test_support::frame_string(&mut state, 120, 40).contains("Continue?")
+                );
+                routing.lock().unwrap().route(&sender, parent, duplicate);
+                crate::attachment_routing::AttachmentRouting::release_deferred_parent_events(
+                    &routing, &sender,
+                );
+                assert_eq!(events.try_iter().count(), 0, "request replayed twice");
+            }
+        });
+    }
+
+    #[test]
+    fn returning_to_an_idle_main_does_not_keep_the_child_running() {
+        with_streaming_main(|thread, child| {
+            let main = parent_of_child();
+            let mut state = state();
+            focus(&mut state, "child", &main, &child);
+            assert_eq!(state.status, AppStatus::Running);
+            return_to_main(&mut state, thread, &main);
+            assert_eq!(state.status, AppStatus::Idle);
+            assert!(state.running_started_at.is_none());
+            assert_no_label(&state);
+        });
+    }
+
+    #[test]
+    fn reprojection_replaces_the_plan_without_ending_the_turn() {
+        let mut state = state();
+        state.enter_running();
+        for explanation in [Some("current plan"), None] {
+            state.update(TuiEvent::ConversationReprojected {
+                agent_lines: Default::default(),
+                messages: vec![],
+                plan: explanation.map(|text| (Some(text.to_owned()), vec![])),
+            });
+            assert_eq!(
+                state.current_plan().and_then(|(text, _)| text.as_deref()),
+                explanation
+            );
+            assert_eq!(state.status, AppStatus::Running);
+            assert!(state.transcript.messages.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_side_conversation_keeps_its_label() {
+        let mut state = state();
+        let (sender, events) = mpsc::unbounded();
+        crate::hosted_session::project_hosted_thread_attached(
+            SurfaceProjectionState::from_surface_snapshot(&parent_of_child()),
+            crate::hosted_session::HostedConversation {
+                agent_lines: Default::default(),
+                messages: vec![],
+                plan: None,
+            },
+            Some("Inherited conversation context."),
+            crate::protocol::SessionAttachmentId::new(3),
+            &sender,
+        )
+        .unwrap();
+        apply_attached(&mut state, events);
+        assert!(
+            matches!(state.transcript.messages.last(), Some(ChatMessage::System { text, .. }) if text == "Inherited conversation context.")
+        );
+        assert_eq!(state.status, AppStatus::Idle);
     }
 }
 
@@ -1191,6 +2388,7 @@ fn child_projection_reset_preserves_parent_agent_dock() {
     projection.cursor = crate::surface_projection::test_surface_cursor(2);
     state.update(TuiEvent::ChildProjectionReset {
         task_id: child.id.clone(),
+        main_status: Some(SideParentStatus::Running),
         projection: Box::new(projection),
     });
 
@@ -1999,6 +3197,34 @@ fn submission_rejection_removes_optimistic_user_and_returns_idle() {
 }
 
 #[test]
+fn a_follow_up_refused_elsewhere_leaves_the_running_conversation_as_it_is() {
+    let (action_tx, _action_rx) = crossbeam_channel::unbounded();
+    let mut state = AppState::new(
+        action_tx,
+        "test".to_string(),
+        "mock".to_string(),
+        "/tmp".to_string(),
+    );
+    state.push_message(ChatMessage::User("hi".to_string()));
+    state.push_message(ChatMessage::Assistant("working".to_string()));
+    state.enter_running();
+
+    state.update(TuiEvent::RefusedElsewhere {
+        prompt: Some("more".to_string()),
+        bindings: Default::default(),
+        images: Vec::new(),
+        message: "why".to_string(),
+    });
+
+    assert_eq!(state.status, AppStatus::Running);
+    assert!(matches!(
+        state.transcript.messages.as_slice(),
+        [ChatMessage::User(a), ChatMessage::Assistant(b), ChatMessage::Diagnostic(_)]
+            if a == "hi" && b == "working"
+    ));
+}
+
+#[test]
 fn generic_error_does_not_end_a_running_turn() {
     let mut state = state();
     state.enter_running();
@@ -2062,6 +3288,115 @@ fn failed_terminal_without_an_error_explains_the_missing_diagnostic() {
             if diagnostic.code() == "runtime.missing_diagnostic"
                 && diagnostic.detail().contains("without an accompanying cause")
                 && diagnostic.action().is_some()
+    ));
+}
+
+/// Plays a turn the user ends by denying its approval with the events a real
+/// run sends, in their order: the mock provider in a terminal, `bash pwd` in
+/// suggest mode, answered Deny, each event the reducer received written to a
+/// file (the projection syncs between them carry no message and are left
+/// out). The runtime ends the turn as failed for want of an approval.
+fn end_a_turn_with_your_denial(state: &mut AppState) {
+    let (action_tx, _action_rx) = mpsc::unbounded();
+    state.push_message(ChatMessage::User("bash pwd".to_string()));
+    state.enter_running();
+    state.update(TuiEvent::TurnStarted {
+        started_at_ms: None,
+        turn: 0,
+        task: Some(crate::protocol::TuiTaskLifecycle {
+            id: "typed-user-turn-1".to_string(),
+            kind: "agent".to_string(),
+            status: "running".to_string(),
+            turn: 0,
+        }),
+    });
+    state.update(TuiEvent::ReasoningDelta(
+        "Mock runtime is preserving the DeepSeek reasoning channel.".to_string(),
+    ));
+    state.update(TuiEvent::ToolRequested {
+        id: "mock-tool-1".to_string(),
+        name: "bash".to_string(),
+        target: Some("pwd".to_string()),
+    });
+    state.update(TuiEvent::ApprovalNeeded {
+        key: interaction_key(TuiInteractionKind::Approval, "approval"),
+        tool: "bash".to_string(),
+        target: Some("pwd".to_string()),
+        preview: Some("bash requested shell".to_string()),
+    });
+    crate::approval_actions::resolve_approval_option(state, &action_tx, ApprovalOption::Deny);
+    state.update(TuiEvent::ToolCompleted {
+        id: "mock-tool-1".to_string(),
+        name: "bash".to_string(),
+        status: "denied".to_string(),
+        output: "denied through runtime surface".to_string(),
+        diff: None,
+        kind: None,
+    });
+    state.update(TuiEvent::Diagnostic(
+        crate::diagnostics::TuiDiagnostic::from_surface_terminal(
+            &orca_runtime::surface::OperationTerminal::Failed {
+                class: orca_runtime::surface::FailureClass::LegacyApprovalRequired,
+                message: orca_runtime::surface::SafeDiagnosticText::try_new(
+                    "permission request denied by the client",
+                )
+                .unwrap(),
+            },
+        )
+        .unwrap(),
+    ));
+    state.update(TuiEvent::SessionCompleted {
+        status: "failed".to_string(),
+    });
+}
+
+/// After the user's own "no", the turn's failed status is their answer, not a
+/// failure without a cause: the turn ends with the notice alone.
+#[test]
+fn a_turn_ended_by_your_denial_shows_the_notice_and_no_failure_line() {
+    let mut state = state();
+
+    end_a_turn_with_your_denial(&mut state);
+
+    assert_eq!(state.status, AppStatus::Idle);
+    let notices = state
+        .transcript
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(message, ChatMessage::System { text, .. }
+                if text == "Denied. Tell Orca what to do instead.")
+        })
+        .count();
+    assert_eq!(notices, 1, "{:?}", state.transcript.messages);
+    assert!(
+        !state.transcript.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::Diagnostic(diagnostic)
+                if diagnostic.code() == "runtime.missing_diagnostic"
+                    || diagnostic.code() == "permission.approval_unavailable"
+        )),
+        "{:?}",
+        state.transcript.messages
+    );
+}
+
+/// The notice explains the turn the user denied, not the next one.
+#[test]
+fn the_turn_after_your_denial_that_fails_without_a_cause_still_says_so() {
+    let mut state = state();
+    end_a_turn_with_your_denial(&mut state);
+    state.push_message(ChatMessage::User("run it".to_string()));
+    state.enter_running();
+
+    state.update(TuiEvent::SessionCompleted {
+        status: "failed".to_string(),
+    });
+
+    assert!(matches!(
+        state.transcript.messages.last(),
+        Some(ChatMessage::Diagnostic(diagnostic))
+            if diagnostic.code() == "runtime.missing_diagnostic"
     ));
 }
 
@@ -2182,12 +3517,14 @@ fn recovery_projection_is_not_overwritten_by_lifecycle_events() {
     assert!(state.recovery_prompt_visible);
 
     state.update(TuiEvent::TurnStarted {
+        started_at_ms: None,
         turn: 2,
         task: None,
     });
     assert_eq!(state.recoverable_operation_id(), Some(&operation_id));
 
     state.update(TuiEvent::HistoryLoaded {
+        agent_lines: Default::default(),
         messages: Vec::new(),
         plan: None,
         label: "Resumed saved conversation.".to_string(),
@@ -2203,6 +3540,217 @@ fn recovery_projection_is_not_overwritten_by_lifecycle_events() {
     ))));
     assert!(state.recoverable_operation_id().is_none());
     assert!(!state.recovery_prompt_visible);
+}
+
+#[test]
+fn fix5_late_compacted_keeps_only_its_notice() {
+    let mut state = state();
+    let op = || SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+    let compact = op();
+    let next = op();
+    state.update(
+        TuiEvent::RuntimeTurnStarted {
+            turn_id: "next".into(),
+        }
+        .at_operation_cursor(
+            true,
+            &crate::surface_projection::test_surface_cursor(4),
+            &next,
+        ),
+    );
+    state.update(TuiEvent::OpenMessageRestored("still streaming".into()));
+    let tail = state.transcript.assistant_stream_tail.unwrap();
+    state.update(
+        TuiEvent::Compacted {
+            reason: "manual".into(),
+            strategy: "none".into(),
+            before_messages: 3,
+            after_messages: 3,
+            collapsed_messages: 0,
+            status_text: String::new(),
+        }
+        .at_operation_cursor(
+            true,
+            &crate::surface_projection::test_surface_cursor(3),
+            &compact,
+        ),
+    );
+    assert_eq!(state.status, AppStatus::Running);
+    assert_eq!(state.transcript.assistant_stream_tail, Some(tail));
+    assert_eq!(state.transcript.messages.iter().filter(|row| matches!(row, ChatMessage::System {text,..} if text.contains("3 messages unchanged"))).count(),1);
+}
+
+#[test]
+fn fix4_late_failure_keeps_its_line_without_finishing_the_new_stream() {
+    let mut state = state();
+    let op = || SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+    let first = op();
+    let second = op();
+    let send = |state: &mut AppState, seq, owner, event: TuiEvent| {
+        state.update(event.at_operation_cursor(
+            true,
+            &crate::surface_projection::test_surface_cursor(seq),
+            owner,
+        ))
+    };
+    send(
+        &mut state,
+        1,
+        &first,
+        TuiEvent::TurnStarted {
+            turn: 1,
+            started_at_ms: None,
+            task: None,
+        },
+    );
+    send(
+        &mut state,
+        3,
+        &second,
+        TuiEvent::RuntimeTurnStarted {
+            turn_id: "next".into(),
+        },
+    );
+    state.update(TuiEvent::OpenMessageRestored("not finished".into()));
+    let tail = state
+        .transcript
+        .assistant_stream_tail
+        .expect("second operation is streaming");
+    let failure = TuiDiagnostic::from_message(
+        crate::diagnostics::DiagnosticContext::Runtime,
+        "first provider failed",
+    );
+    send(&mut state, 2, &first, TuiEvent::Diagnostic(failure));
+    send(
+        &mut state,
+        2,
+        &first,
+        TuiEvent::SessionCompleted {
+            status: "failed".into(),
+        },
+    );
+    assert_eq!(state.transcript.assistant_stream_tail, Some(tail));
+    assert!(!state.current_turn_has_diagnostic());
+    assert!(state.last_completed_at.is_none());
+    assert_eq!(state.status, AppStatus::Running);
+    assert_eq!(state.transcript.messages.iter().filter(|row| matches!(row, ChatMessage::Diagnostic(diag) if diag.detail().contains("first provider failed"))).count(), 1);
+}
+
+#[test]
+fn fix4_recovery_closes_the_owners_approval() {
+    let mut state = state();
+    let owner = SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+    let cursor = crate::surface_projection::test_surface_cursor(3);
+    state.update(
+        TuiEvent::ApprovalNeeded {
+            key: interaction_key(TuiInteractionKind::Approval, "request"),
+            tool: "edit".into(),
+            target: None,
+            preview: None,
+        }
+        .at_operation_cursor(true, &cursor, &owner),
+    );
+    assert!(state.approval_dialog.is_some());
+    state.update(
+        TuiEvent::TerminalRecoveryNeeded("typed TUI terminal commit requires recovery".into())
+            .at_operation_cursor(true, &cursor, &owner),
+    );
+    assert_eq!(state.status, AppStatus::Idle);
+    assert!(state.approval_dialog.is_none());
+}
+
+#[test]
+fn committed_lifecycle_keeps_the_newer_operations_dialog() {
+    for submitted in [false, true] {
+        let mut state = state();
+        let operation =
+            || SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let first = operation();
+        let second = operation();
+        let deliver = |state: &mut AppState, seq, owner, event: TuiEvent| {
+            state.update(event.at_operation_cursor(
+                true,
+                &crate::surface_projection::test_surface_cursor(seq),
+                owner,
+            ))
+        };
+        let queued_start = || TuiEvent::RuntimeTurnStarted {
+            turn_id: "B".into(),
+        };
+        deliver(
+            &mut state,
+            1,
+            &first,
+            if submitted {
+                TuiEvent::TurnStarted {
+                    started_at_ms: None,
+                    task: None,
+                    turn: 1,
+                }
+            } else {
+                TuiEvent::RuntimeTurnStarted {
+                    turn_id: "A".into(),
+                }
+            },
+        );
+        deliver(&mut state, 3, &second, queued_start());
+        deliver(
+            &mut state,
+            2,
+            &first,
+            TuiEvent::SessionCompleted {
+                status: "success".into(),
+            },
+        );
+        assert_eq!(
+            state.status,
+            AppStatus::Running,
+            "late terminal after B started"
+        );
+        deliver(
+            &mut state,
+            4,
+            &second,
+            TuiEvent::ApprovalNeeded {
+                key: interaction_key(TuiInteractionKind::Approval, "B-request"),
+                tool: "edit".into(),
+                target: None,
+                preview: None,
+            },
+        );
+        deliver(
+            &mut state,
+            2,
+            &first,
+            TuiEvent::SessionCompleted {
+                status: "success".into(),
+            },
+        );
+        assert_eq!(
+            state.status,
+            AppStatus::WaitingApproval,
+            "submitted A: {submitted}"
+        );
+        deliver(&mut state, 3, &second, queued_start());
+        assert_eq!(state.status, AppStatus::WaitingApproval);
+        assert_eq!(state.approval_dialog.unwrap().id, "B-request");
+        state.approval_dialog = None;
+        deliver(
+            &mut state,
+            5,
+            &second,
+            TuiEvent::UserInputRequested {
+                key: interaction_key(TuiInteractionKind::UserInput, "B-input"),
+                questionnaire: crate::protocol::TuiUserInputQuestionnaire::single(
+                    "choice?",
+                    vec!["yes".into()],
+                ),
+            },
+        );
+        deliver(&mut state, 6, &second, queued_start());
+        assert_eq!(state.status, AppStatus::WaitingUserInput);
+        assert!(state.user_input_dialog.is_some());
+    }
 }
 
 #[test]
@@ -4095,6 +5643,7 @@ fn show_workflows_preserves_available_selection() {
             lifetime: TaskLifetime::Task,
             description: "demo".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
             command: None,
@@ -4407,6 +5956,7 @@ fn workflow_events_update_panel_and_queue_model_notification() {
         lifetime: TaskLifetime::Task,
         description: "demo".to_string(),
         created_at_ms: 1_000,
+        sequence: 0,
         started_at_ms: Some(1_000),
         completed_at_ms: Some(2_000),
         command: None,
@@ -4542,9 +6092,10 @@ fn pending_workflow_notification_queue_owns_unique_drain_and_notification_pop() 
 }
 
 #[test]
-fn workflow_task_updates_sort_actionable_active_then_recent_terminal_tasks() {
+fn workflow_task_updates_keep_the_order_tasks_were_started_in() {
     let mut state = state();
     let mut completed = workflow_task_summary("task-completed", "completed");
+    completed.sequence = 1;
     completed.status = TaskStatus::Completed;
     completed.completed_at_ms = Some(9_000);
     completed.last_activity_at_ms = Some(9_000);
@@ -4552,8 +6103,10 @@ fn workflow_task_updates_sort_actionable_active_then_recent_terminal_tasks() {
     let mut running = workflow_task_summary("task-running", "running");
     running.status = TaskStatus::Running;
     running.last_activity_at_ms = Some(5_000);
+    running.sequence = 2;
 
     let mut approval = workflow_task_summary("task-approval", "approval");
+    approval.sequence = 3;
     approval.task_type = TaskType::MainSession;
     approval.status = TaskStatus::ApprovalRequired;
     approval.is_backgrounded = true;
@@ -4567,7 +6120,7 @@ fn workflow_task_updates_sort_actionable_active_then_recent_terminal_tasks() {
             .iter()
             .map(|task| task.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["task-approval", "task-running", "task-completed"]
+        vec!["task-completed", "task-running", "task-approval"]
     );
 }
 
@@ -4575,9 +6128,11 @@ fn workflow_task_updates_sort_actionable_active_then_recent_terminal_tasks() {
 fn workflow_task_updates_preserve_selected_task_id_after_sorting() {
     let mut state = state();
     let mut running = workflow_task_summary("task-running", "running");
+    running.sequence = 1;
     running.status = TaskStatus::Running;
     running.last_activity_at_ms = Some(5_000);
     let mut completed = workflow_task_summary("task-completed", "completed");
+    completed.sequence = 2;
     completed.status = TaskStatus::Completed;
     completed.completed_at_ms = Some(9_000);
     completed.last_activity_at_ms = Some(9_000);
@@ -4597,9 +6152,11 @@ fn workflow_task_updates_preserve_selected_task_id_after_sorting() {
 fn workflow_task_update_preserves_owner_selection() {
     let mut state = state();
     let mut running = workflow_task_summary("task-running", "running");
+    running.sequence = 1;
     running.status = TaskStatus::Running;
     running.last_activity_at_ms = Some(5_000);
     let mut completed = workflow_task_summary("task-completed", "completed");
+    completed.sequence = 2;
     completed.status = TaskStatus::Completed;
     completed.completed_at_ms = Some(9_000);
     completed.last_activity_at_ms = Some(9_000);
@@ -4730,6 +6287,7 @@ fn backgrounded_main_session_suppresses_foreground_output_until_completion() {
         lifetime: TaskLifetime::Task,
         description: "long answer".to_string(),
         created_at_ms: 1_000,
+        sequence: 0,
         started_at_ms: Some(1_000),
         completed_at_ms: None,
         command: None,
@@ -4772,6 +6330,7 @@ fn backgrounded_main_session_suppresses_foreground_output_until_completion() {
         status: "success".to_string(),
     });
     state.update(TuiEvent::TurnStarted {
+        started_at_ms: None,
         turn: 2,
         task: None,
     });
@@ -4859,6 +6418,7 @@ fn backgrounded_main_session_completion_adds_system_notice() {
         lifetime: TaskLifetime::Task,
         description: "long answer".to_string(),
         created_at_ms: 1_000,
+        sequence: 0,
         started_at_ms: Some(1_000),
         completed_at_ms: None,
         command: None,
@@ -5126,6 +6686,7 @@ fn running_timer_starts_and_stops_with_running_status() {
     assert!(state.running_started_at.is_none());
 
     state.update(TuiEvent::TurnStarted {
+        started_at_ms: None,
         turn: 1,
         task: None,
     });
@@ -5142,6 +6703,7 @@ fn running_timer_starts_and_stops_with_running_status() {
 fn approval_round_trip_preserves_running_timer() {
     let mut state = state();
     state.update(TuiEvent::TurnStarted {
+        started_at_ms: None,
         turn: 1,
         task: None,
     });
@@ -7560,4 +9122,18 @@ fn disconnected_job_sender_drops_runtime_without_noise_or_extra_revision() {
     assert_eq!(state.pending_edit_highlight_count(), 0);
     assert_eq!(state.successful_edit_highlight_submit_count(), 0);
     assert!(!state.edit_highlight_runtime_started());
+}
+#[test]
+fn a_finished_agents_view_says_it_is_read_only_and_hands_a_message_back() {
+    crate::hosted_child::tests::check_finished_submit();
+}
+
+#[test]
+fn an_agent_that_finishes_on_screen_becomes_read_only() {
+    crate::hosted_child::tests::check_finished_edge();
+}
+
+#[test]
+fn a_finished_agent_returns_to_running_main_with_only_its_own_reader() {
+    crate::hosted_child::tests::check_finished_return();
 }

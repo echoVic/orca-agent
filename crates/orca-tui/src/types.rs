@@ -653,6 +653,7 @@ pub struct AppState {
     pub(crate) side_conversation: Option<SideConversationUiState>,
     pub(crate) side_conversation_visible: bool,
     pub(crate) active_session_attachment: Option<SessionAttachmentId>,
+    pub(crate) lifecycle_cursor: Option<crate::protocol::LifecycleDelivery>,
     pub(crate) workspace_git: Option<GitIdentity>,
     #[allow(dead_code)]
     pub event_tx: mpsc::Sender<UserAction>,
@@ -786,6 +787,10 @@ pub struct AppState {
     pub(crate) workflow_panel: WorkflowPanelState,
     pub(crate) agent_workspace: AgentWorkspaceState,
     pub(crate) agent_dock_selected_task_id: Option<String>,
+    /// What the main conversation is doing while a child's is on screen;
+    /// `None` when main itself is on screen.
+    pub(crate) main_behind_child: Option<SideParentStatus>,
+    pub(crate) finished_child: bool,
     /// Whether `/tasks` has expanded the background-task dock in the
     /// activity area above the composer. Distinct from `panel_mode`: the
     /// dock stays layered above the transcript instead of replacing it.
@@ -799,7 +804,8 @@ pub struct AppState {
     pub pending_workflow_notifications: VecDeque<PendingWorkflowNotification>,
     pub suppress_background_main_session_output: bool,
     /// The turn under way, or the one that just ended, has shown a diagnostic
-    /// the runtime reported, so its end needs no generic one (see
+    /// the runtime reported, or the notice shown for it after the user denied
+    /// an approval, so its end needs no generic one (see
     /// `TuiEvent::SessionCompleted`). An error the TUI shows for something the
     /// user did (`ChatMessage::Error`) is not one. Cleared when a turn starts
     /// and when one ends.
@@ -857,6 +863,7 @@ impl AppState {
     }
 
     pub(crate) fn set_conversation_target(&mut self, target: ConversationTarget) {
+        self.finished_child = false;
         self.conversation_target = target;
     }
 
@@ -1129,6 +1136,7 @@ impl AppState {
             side_conversation: None,
             side_conversation_visible: false,
             active_session_attachment: None,
+            lifecycle_cursor: None,
             workspace_git: None,
             event_tx,
             approval_dialog: None,
@@ -1199,6 +1207,8 @@ impl AppState {
             workflow_panel: WorkflowPanelState::default(),
             agent_workspace: AgentWorkspaceState::default(),
             agent_dock_selected_task_id: None,
+            main_behind_child: None,
+            finished_child: false,
             tasks_dock_expanded: false,
             announced_startup_warnings: std::collections::HashSet::new(),
             announced_subagent_batches: std::collections::HashSet::new(),
@@ -1551,6 +1561,7 @@ impl AppState {
         self.queued_submission = QueuedSubmissionState::default();
         self.runtime_turn_id = None;
         self.surface_session.reset();
+        self.lifecycle_cursor = None;
         self.task_transcript = None;
         self.clear_messages();
         self.clear_plan_panel();
@@ -1766,13 +1777,26 @@ impl AppState {
     }
 
     pub fn enter_running(&mut self) {
+        self.enter_running_at(None);
+    }
+
+    pub(crate) fn enter_running_at(&mut self, started_at_ms: Option<u64>) {
         self.plan_approval_dialog = None;
         self.config_dialog = None;
         self.mcp_dialog = None;
         self.rewind = None;
         if self.running_started_at.is_none() {
-            self.running_started_at = Some(Instant::now());
             self.turn_diagnostic_seen = false;
+        }
+        if self.running_started_at.is_none() || started_at_ms.is_some() {
+            let now = Instant::now();
+            let elapsed = started_at_ms.map_or(0, |start| {
+                (chrono::Utc::now().timestamp_millis().max(0) as u64).saturating_sub(start)
+            });
+            self.running_started_at = Some(
+                now.checked_sub(std::time::Duration::from_millis(elapsed))
+                    .unwrap_or(now),
+            );
         }
         self.status = AppStatus::Running;
     }

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crossbeam_channel as mpsc;
 
 use crate::protocol::SessionAttachmentId;
-use crate::protocol::{AttachedTuiEvent, TuiEvent};
+use crate::protocol::{AttachedTuiEvent, TuiEvent, TuiInteractionKey};
 use crate::types::{AppState, SideParentStatus};
 
 #[derive(Default)]
@@ -14,9 +14,102 @@ pub(crate) struct AttachmentRouting {
     pending_parent_interactions: Vec<(SessionAttachmentId, TuiEvent)>,
     deferred_parent_attachment: Option<SessionAttachmentId>,
     deferred_parent_events: Vec<TuiEvent>,
+    restored: Option<RestoredParent>,
+    parent_lifecycle: Option<crate::protocol::LifecycleDelivery>,
+    parent_waiting: std::collections::BTreeSet<String>,
+}
+
+struct RestoredParent {
+    attachment: SessionAttachmentId,
+    cursor: orca_runtime::surface::SurfaceCursor,
+    recovery: Option<orca_runtime::surface::SurfaceOperationId>,
+    // Kept until the next return; request identities are unique per operation.
+    requests: Vec<TuiInteractionKey>,
 }
 
 impl AttachmentRouting {
+    fn covered(&self, attachment: SessionAttachmentId, event: &TuiEvent) -> bool {
+        let restored = self
+            .restored
+            .as_ref()
+            .filter(|parent| parent.attachment == attachment);
+        let event = match event {
+            TuiEvent::SurfaceDelivery(delivery) => {
+                let (cursor, event, owner) = delivery.as_ref();
+                if restored.is_some_and(|parent| {
+                    let releases_reader = matches!(event, TuiEvent::OperationReleased);
+                    let needs_recovery = matches!(event, TuiEvent::TerminalRecoveryNeeded(_))
+                        && owner.is_some() && owner != &parent.recovery;
+                    !releases_reader && !needs_recovery && parent.cursor.thread_id == cursor.thread_id
+                        && parent.cursor.incarnation == cursor.incarnation
+                        // Hydration delivers at the baseline cursor itself.
+                        && cursor.next_seq <= parent.cursor.next_seq
+                }) {
+                    return true;
+                }
+                event
+            }
+            event => event,
+        };
+        interaction_key(event)
+            .is_some_and(|key| restored.is_some_and(|parent| parent.requests.contains(key)))
+    }
+
+    pub(crate) fn snapshot_projected(
+        &mut self,
+        attachment: SessionAttachmentId,
+        snapshot: &orca_runtime::surface::SurfaceSnapshot,
+        requests: &[TuiEvent],
+        recovery: Option<orca_runtime::surface::SurfaceOperationId>,
+        reader_live: bool,
+    ) -> Option<crate::protocol::LifecycleDelivery> {
+        self.parent_lifecycle =
+            snapshot
+                .foreground_operation
+                .as_ref()
+                .map(|op| crate::protocol::LifecycleDelivery {
+                    owner: op.operation_id.clone(),
+                    cursor: snapshot.cursor.clone(),
+                    delivered: self
+                        .parent_lifecycle
+                        .as_ref()
+                        .filter(|previous| {
+                            previous.owner == op.operation_id
+                                && previous.cursor.thread_id == snapshot.cursor.thread_id
+                                && previous.cursor.incarnation == snapshot.cursor.incarnation
+                        })
+                        .and_then(|previous| previous.delivered),
+                    live: reader_live
+                        && op.terminal.is_none()
+                        && recovery.as_ref() != Some(&op.operation_id),
+                });
+        self.parent_waiting = requests
+            .iter()
+            .filter_map(interaction_key)
+            .filter(|key| {
+                snapshot.interactions.iter().any(|interaction| {
+                    self.parent_lifecycle.as_ref().is_some_and(|parent| {
+                        parent.live && parent.owner == interaction.fence.operation_id
+                    }) && format!("{:?}", interaction.interaction_id) == key.request_id
+                })
+            })
+            .map(|key| key.request_id.clone())
+            .collect();
+        self.pending_parent_interactions
+            .retain(|(source, _)| *source != attachment);
+        self.restored = Some(RestoredParent {
+            attachment,
+            cursor: snapshot.cursor.clone(),
+            recovery,
+            requests: requests
+                .iter()
+                .filter_map(interaction_key)
+                .cloned()
+                .collect(),
+        });
+        self.parent_lifecycle.clone()
+    }
+
     pub(crate) fn new(active: SessionAttachmentId) -> Self {
         Self {
             active: Some(active),
@@ -25,6 +118,9 @@ impl AttachmentRouting {
             pending_parent_interactions: Vec::new(),
             deferred_parent_attachment: None,
             deferred_parent_events: Vec::new(),
+            restored: None,
+            parent_lifecycle: None,
+            parent_waiting: Default::default(),
         }
     }
 
@@ -71,7 +167,7 @@ impl AttachmentRouting {
         }
         if replay_parent_interactions {
             for (_, event) in std::mem::take(&mut routing.pending_parent_interactions) {
-                if send_attached_event(root_event_tx, attachment, event).is_err() {
+                if send_attached_event(root_event_tx, attachment, unpack(event)).is_err() {
                     break;
                 }
             }
@@ -94,6 +190,13 @@ impl AttachmentRouting {
             .retain(|(source, _)| *source != attachment);
         if routing.parent_while_side == Some(attachment) {
             routing.parent_while_side = None;
+        }
+        if routing
+            .restored
+            .as_ref()
+            .is_some_and(|parent| parent.attachment == attachment)
+        {
+            routing.restored = None;
         }
     }
 
@@ -121,8 +224,14 @@ impl AttachmentRouting {
         }
         routing.active = Some(attachment);
         routing.parent_while_side = parent_while_side;
-        routing.deferred_parent_attachment = Some(attachment);
-        routing.deferred_parent_events.clear();
+        routing.defer_parent(attachment);
+    }
+
+    pub(crate) fn defer_parent(&mut self, attachment: SessionAttachmentId) {
+        if self.deferred_parent_attachment != Some(attachment) {
+            self.deferred_parent_events.clear();
+            self.deferred_parent_attachment = Some(attachment);
+        }
     }
 
     pub(crate) fn release_deferred_parent_events(
@@ -135,12 +244,19 @@ impl AttachmentRouting {
         let Some(attachment) = routing.deferred_parent_attachment.take() else {
             return;
         };
-        for (_, event) in std::mem::take(&mut routing.pending_parent_interactions) {
-            if send_attached_event(root_event_tx, attachment, event).is_err() {
+        for (source, event) in std::mem::take(&mut routing.pending_parent_interactions) {
+            if routing.covered(source, &event) {
+                continue;
+            }
+            if send_attached_event(root_event_tx, attachment, unpack(event)).is_err() {
                 return;
             }
         }
         for event in std::mem::take(&mut routing.deferred_parent_events) {
+            if routing.covered(attachment, &event) || !routing.accept_parent_delivery(&event) {
+                continue;
+            }
+            let event = unpack(event);
             if send_attached_event(root_event_tx, attachment, event.clone()).is_err() {
                 return;
             }
@@ -150,9 +266,7 @@ impl AttachmentRouting {
         }
     }
 
-    /// Abort a deferred projection and retain only parent interactions that
-    /// must be replayed when the parent is visible again. Ordinary parent
-    /// events are reconstructed from the next surface snapshot instead.
+    /// Replay the deferred events as if the parent had remained hidden.
     pub(crate) fn cancel_deferred_parent_events(
         routing: &Arc<Mutex<Self>>,
         root_event_tx: &mpsc::Sender<TuiEvent>,
@@ -160,31 +274,43 @@ impl AttachmentRouting {
         let Ok(mut routing) = routing.lock() else {
             return;
         };
-        routing.deferred_parent_attachment = None;
+        let Some(source) = routing
+            .deferred_parent_attachment
+            .take()
+            .or(routing.parent_while_side)
+        else {
+            return;
+        };
         for event in std::mem::take(&mut routing.deferred_parent_events) {
-            if is_tui_interaction_event(&event) {
-                let source = routing
-                    .parent_while_side
-                    .unwrap_or_else(|| routing.active.unwrap_or(SessionAttachmentId::new(1)));
-                routing
-                    .pending_parent_interactions
-                    .push((source, event.clone()));
-            }
-            if let Some(status) = side_parent_status_for_event(&event) {
-                let _ = root_event_tx.send(TuiEvent::SideParentStatusChanged(status));
+            if !routing.route(root_event_tx, source, event) {
+                break;
             }
         }
     }
 }
 
-fn is_tui_interaction_event(event: &TuiEvent) -> bool {
-    matches!(
-        event,
-        TuiEvent::ApprovalNeeded { .. }
-            | TuiEvent::PermissionApprovalNeeded { .. }
-            | TuiEvent::UserInputRequested { .. }
-            | TuiEvent::McpElicitationRequested { .. }
-    )
+fn unpack(event: TuiEvent) -> TuiEvent {
+    match event {
+        TuiEvent::SurfaceDelivery(delivery) if delivery.2.is_none() => delivery.1,
+        event => event,
+    }
+}
+
+fn payload(event: &TuiEvent) -> &TuiEvent {
+    match event {
+        TuiEvent::SurfaceDelivery(delivery) => &delivery.1,
+        event => event,
+    }
+}
+
+fn interaction_key(event: &TuiEvent) -> Option<&TuiInteractionKey> {
+    match event {
+        TuiEvent::ApprovalNeeded { key, .. }
+        | TuiEvent::PermissionApprovalNeeded { key, .. }
+        | TuiEvent::UserInputRequested { key, .. }
+        | TuiEvent::McpElicitationRequested { key, .. } => Some(key),
+        _ => None,
+    }
 }
 
 fn background_tasks_from_event(
@@ -202,7 +328,7 @@ pub(crate) fn accept_attached_tui_event(
     event: TuiEvent,
 ) -> Result<Option<TuiEvent>, ()> {
     let TuiEvent::Attached(attached) = event else {
-        return Ok(Some(event));
+        return Ok(state.accept_surface_delivery(event));
     };
     let AttachedTuiEvent { attachment, event } = *attached;
     if matches!(event, TuiEvent::SessionAttachmentActivated) {
@@ -212,7 +338,7 @@ pub(crate) fn accept_attached_tui_event(
     if attachment.is_some() && attachment != state.active_session_attachment {
         return Err(());
     }
-    Ok(Some(event))
+    Ok(state.accept_surface_delivery(event))
 }
 
 #[cfg(test)]
@@ -280,34 +406,104 @@ pub(crate) fn spawn_attached_event_sender_with_routing(
                     let Ok(mut routing) = routing.lock() else {
                         break;
                     };
-                    if routing.deferred_parent_attachment == Some(attachment) {
-                        routing.deferred_parent_events.push(event);
-                    } else if routing.parent_while_side == Some(attachment)
-                        && routing.active != Some(attachment)
-                    {
-                        if let Some(tasks) = background_tasks_from_event(&event) {
-                            let _ = root_event_tx.send(TuiEvent::BackgroundTasksUpdated(tasks));
-                        }
-                        if is_tui_interaction_event(&event) {
-                            routing
-                                .pending_parent_interactions
-                                .push((attachment, event.clone()));
-                        }
-                        if let Some(status) = side_parent_status_for_event(&event) {
-                            let _ = root_event_tx.send(TuiEvent::SideParentStatusChanged(status));
-                        }
-                    } else if send_attached_event(&root_event_tx, attachment, event).is_err() {
+                    if !routing.route(&root_event_tx, attachment, event) {
                         break;
                     }
-                    continue;
-                }
-                if send_attached_event(&root_event_tx, attachment, event).is_err() {
+                } else if send_attached_event(&root_event_tx, attachment, event).is_err() {
                     break;
                 }
             }
         })
         .expect("spawn TUI attachment relay");
     event_tx
+}
+
+impl AttachmentRouting {
+    fn accept_parent_delivery(&mut self, event: &TuiEvent) -> bool {
+        if let TuiEvent::SurfaceRequestSettled(request) = payload(event) {
+            self.parent_waiting.remove(request);
+            self.pending_parent_interactions.retain(|(_, pending)| {
+                interaction_key(payload(pending)).is_none_or(|key| &key.request_id != request)
+            });
+            return false;
+        }
+        if let TuiEvent::SurfaceDelivery(delivery) = event
+            && let (cursor, event, Some(owner)) = delivery.as_ref()
+            && !matches!(event, TuiEvent::Diagnostic(_) | TuiEvent::Compacted { .. })
+        {
+            if !event.accepts_lifecycle(
+                self.parent_lifecycle.as_ref(),
+                owner,
+                cursor,
+                !self.parent_waiting.is_empty(),
+            ) {
+                return false;
+            }
+            let delivery = event.lifecycle_delivery(
+                owner.clone(),
+                cursor.clone(),
+                self.parent_lifecycle.as_ref(),
+            );
+            if !delivery.live
+                || self
+                    .parent_lifecycle
+                    .as_ref()
+                    .is_none_or(|previous| previous.owner != *owner)
+            {
+                self.parent_waiting.clear();
+            }
+            if let Some(key) = interaction_key(event) {
+                self.parent_waiting.insert(key.request_id.clone());
+            }
+            self.parent_lifecycle = Some(delivery);
+        }
+        true
+    }
+
+    pub(crate) fn route(
+        &mut self,
+        root_event_tx: &mpsc::Sender<TuiEvent>,
+        attachment: SessionAttachmentId,
+        event: TuiEvent,
+    ) -> bool {
+        if self.deferred_parent_attachment == Some(attachment) {
+            self.deferred_parent_events.push(event);
+            return true;
+        }
+        if self.covered(attachment, &event) {
+            return true;
+        }
+        if (self.parent_while_side == Some(attachment)
+            || self.parent_while_side.is_none() && self.active == Some(attachment))
+            && !self.accept_parent_delivery(&event)
+        {
+            return true;
+        }
+        if self.parent_while_side == Some(attachment) && self.active != Some(attachment) {
+            if let Some(tasks) = background_tasks_from_event(payload(&event)) {
+                let _ = root_event_tx.send(TuiEvent::BackgroundTasksUpdated(tasks));
+            }
+            if interaction_key(payload(&event)).is_some() {
+                self.pending_parent_interactions
+                    .push((attachment, event.clone()));
+            }
+            if let Some(status) = side_parent_status_for_event(payload(&event)) {
+                let _ = root_event_tx.send(TuiEvent::SideParentStatusChanged(status));
+            }
+            // The background key acts on main's turn from any
+            // view, so its answer goes to the view on screen.
+            // An answer that comes later (see the reducer's
+            // arm) goes to the view on screen when it arrives,
+            // and restores only that view's status; stage 2's
+            // work on returning to main is to revisit this.
+            if let TuiEvent::TurnKeptInForeground(notice) = event {
+                let _ = root_event_tx.send(TuiEvent::TurnKeptInForeground(notice));
+            }
+        } else if send_attached_event(root_event_tx, attachment, unpack(event)).is_err() {
+            return false;
+        }
+        true
+    }
 }
 
 pub(crate) fn send_attached_event(
@@ -321,8 +517,9 @@ pub(crate) fn send_attached_event(
     })))
 }
 
-fn side_parent_status_for_event(event: &TuiEvent) -> Option<SideParentStatus> {
-    match event {
+pub(crate) fn side_parent_status_for_event(event: &TuiEvent) -> Option<SideParentStatus> {
+    match payload(event) {
+        TuiEvent::TerminalRecoveryNeeded(_) => Some(SideParentStatus::Failed),
         TuiEvent::TurnStarted { .. } | TuiEvent::RuntimeTurnStarted { .. } => {
             Some(SideParentStatus::Running)
         }
@@ -341,7 +538,7 @@ fn side_parent_status_for_event(event: &TuiEvent) -> Option<SideParentStatus> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Duration;
 
     use orca_core::cancel::OperationIdAllocator;
@@ -369,6 +566,74 @@ mod tests {
             .expect("routed TUI event")
     }
 
+    pub(crate) fn assert_settlement_releases(key: &str, settlement: TuiEvent) {
+        let mut route = AttachmentRouting::new(SessionAttachmentId::new(1));
+        let owner = orca_runtime::surface::SurfaceOperationId::try_from_bytes(
+            *uuid::Uuid::now_v7().as_bytes(),
+        )
+        .unwrap();
+        let deliver = |route: &mut AttachmentRouting, event: TuiEvent| {
+            route.accept_parent_delivery(&event.at_operation_cursor(
+                true,
+                &crate::surface_projection::test_surface_cursor(3),
+                &owner,
+            ))
+        };
+        let start = || TuiEvent::RuntimeTurnStarted {
+            turn_id: "round".into(),
+        };
+        assert!(deliver(&mut route, approval(key)));
+        assert!(!deliver(&mut route, start()));
+        assert!(!deliver(&mut route, settlement));
+        assert!(deliver(&mut route, start()));
+    }
+
+    #[test]
+    fn fix6_old_releases_do_not_end_a_new_delivery_or_a_different_owner() {
+        let mut route = AttachmentRouting::new(SessionAttachmentId::new(1));
+        let mut state = AppState::new(
+            mpsc::unbounded().0,
+            "test".into(),
+            "mock".into(),
+            "/tmp".into(),
+        );
+        let operation = || {
+            orca_runtime::surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap()
+        };
+        let first = operation();
+        let second = operation();
+        let start = || TuiEvent::RuntimeTurnStarted {
+            turn_id: "reader".into(),
+        };
+        for (event, seq, owner, expected, live) in [
+            (start(), 1, &first, true, true),
+            (TuiEvent::OperationReleased, 1, &first, true, false),
+            (start(), 3, &first, true, true),
+            (TuiEvent::OperationReleased, 1, &first, false, true),
+            (start(), 4, &second, true, true),
+            (TuiEvent::OperationReleased, 5, &first, false, true),
+        ] {
+            let delivery = event.at_operation_cursor(
+                true,
+                &crate::surface_projection::test_surface_cursor(seq),
+                owner,
+            );
+            assert_eq!(route.accept_parent_delivery(&delivery), expected);
+            state.accept_surface_delivery(delivery);
+            let routed = route.parent_lifecycle.as_ref().unwrap();
+            let reduced = state.lifecycle_cursor.as_ref().unwrap();
+            assert_eq!(routed.live, live);
+            assert_eq!(reduced.live, live);
+            assert_eq!(
+                (&routed.owner, &routed.cursor),
+                (&reduced.owner, &reduced.cursor)
+            );
+        }
+    }
+
     fn approval_request_id(event: TuiEvent) -> String {
         let TuiEvent::Attached(attached) = event else {
             panic!("expected attached event");
@@ -377,6 +642,168 @@ mod tests {
             panic!("expected approval event");
         };
         key.request_id
+    }
+
+    #[test]
+    fn fix5_both_restored_requests_must_settle_before_the_next_round() {
+        crate::hosted_child::tests::with_streaming_main(|_, mut snapshot| {
+            use orca_runtime::surface::*;
+            let main = SessionAttachmentId::new(1);
+            let mut route = AttachmentRouting::new(main);
+            let owner = &snapshot.foreground_operation.as_ref().unwrap().operation_id;
+            let keys = ["first", "second"].map(|question| {
+                let id =
+                    SurfaceInteractionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+                let key = format!("{id:?}");
+                snapshot.interactions.push(SurfaceInteractionView {
+                    interaction_id: id,
+                    revision: InteractionRevision::try_new(1).unwrap(),
+                    fence: snapshot
+                        .foreground_operation
+                        .as_ref()
+                        .unwrap()
+                        .generations
+                        .last()
+                        .unwrap()
+                        .fence
+                        .clone(),
+                    kind: SurfaceInteractionKind::UserInput,
+                    request: SurfaceInteractionRequest::UserInput {
+                        question: NonEmptyText::try_new(question).unwrap(),
+                        suggestions: vec![],
+                    },
+                    route: SurfaceInteractionRoute::Unassigned {
+                        epoch: ResponseRouteEpoch::try_new(1).unwrap(),
+                    },
+                    lifecycle: SurfaceInteractionLifecycle::Requested,
+                    recovery_disposition: InteractionUnavailableDisposition::FailOperation,
+                });
+                key
+            });
+            let ui_operation = OperationIdAllocator::new().allocate();
+            let restored = keys.each_ref().map(|key| TuiEvent::UserInputRequested {
+                key: TuiInteractionKey::new(
+                    ui_operation,
+                    key.clone(),
+                    TuiInteractionKind::UserInput,
+                ),
+                questionnaire: crate::protocol::TuiUserInputQuestionnaire::single(
+                    "Question",
+                    vec![],
+                ),
+            });
+            route.snapshot_projected(main, &snapshot, &restored, None, true);
+            let mut cursor = snapshot.cursor.clone();
+            let mut deliver = |event: TuiEvent| {
+                cursor.next_seq =
+                    orca_runtime::surface::SequenceNumber::new(cursor.next_seq.get() + 1);
+                route.accept_parent_delivery(&event.at_operation_cursor(true, &cursor, owner))
+            };
+            let start = || TuiEvent::RuntimeTurnStarted {
+                turn_id: "round".into(),
+            };
+            assert!(!deliver(TuiEvent::SurfaceRequestSettled(keys[0].clone())));
+            assert!(!deliver(start()), "second request is still pending");
+            assert!(!deliver(TuiEvent::SurfaceRequestSettled(keys[1].clone())));
+            assert!(deliver(start()));
+        });
+    }
+
+    #[test]
+    fn fix4_answered_approval_allows_the_same_operations_next_round_at_the_route() {
+        let main = SessionAttachmentId::new(1);
+        let mut route = AttachmentRouting::new(main.next());
+        route.parent_while_side = Some(main);
+        let (sender, events) = mpsc::unbounded();
+        let operation = orca_runtime::surface::SurfaceOperationId::try_from_bytes(
+            *uuid::Uuid::now_v7().as_bytes(),
+        )
+        .unwrap();
+        for (seq, event) in [
+            (1, approval("current")),
+            (2, TuiEvent::SurfaceRequestSettled("other".into())),
+            (
+                3,
+                TuiEvent::RuntimeTurnStarted {
+                    turn_id: "blocked".into(),
+                },
+            ),
+            (4, TuiEvent::SurfaceRequestSettled("current".into())),
+            (
+                5,
+                TuiEvent::RuntimeTurnStarted {
+                    turn_id: "next".into(),
+                },
+            ),
+        ] {
+            route.route(
+                &sender,
+                main,
+                event.at_operation_cursor(
+                    true,
+                    &crate::surface_projection::test_surface_cursor(seq),
+                    &operation,
+                ),
+            );
+        }
+        let statuses: Vec<_> = events
+            .try_iter()
+            .map(|event| match event {
+                TuiEvent::SideParentStatusChanged(status) => status,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            [SideParentStatus::NeedsApproval, SideParentStatus::Running]
+        );
+    }
+
+    #[test]
+    fn fix4_route_accepts_an_unstarted_terminal_only_after_the_live_owner_ends() {
+        let parent = SessionAttachmentId::new(1);
+        let mut route = AttachmentRouting::new(parent.next());
+        route.parent_while_side = Some(parent);
+        let (sender, events) = mpsc::unbounded();
+        let mut send = |seq, owner, event: TuiEvent| {
+            route.route(
+                &sender,
+                parent,
+                event.at_operation_cursor(
+                    true,
+                    &crate::surface_projection::test_surface_cursor(seq),
+                    owner,
+                ),
+            );
+            events.try_recv().ok().map(|event| match event {
+                TuiEvent::SideParentStatusChanged(status) => status,
+                other => panic!("{other:?}"),
+            })
+        };
+        let op = || {
+            orca_runtime::surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap()
+        };
+        let prior = op();
+        let next = op();
+        let start = || TuiEvent::RuntimeTurnStarted {
+            turn_id: "prior".into(),
+        };
+        let end = || TuiEvent::SessionCompleted {
+            status: "success".into(),
+        };
+        assert_eq!(send(2, &prior, start()), Some(SideParentStatus::Running));
+        assert_eq!(
+            send(3, &prior, approval("pending")),
+            Some(SideParentStatus::NeedsApproval)
+        );
+        assert_eq!(send(4, &prior, start()), None);
+        assert_eq!(send(5, &next, end()), None);
+        assert_eq!(send(6, &prior, end()), Some(SideParentStatus::Finished));
+        assert_eq!(send(1, &next, end()), None);
+        assert_eq!(send(7, &next, end()), Some(SideParentStatus::Finished));
     }
 
     #[test]
@@ -416,6 +843,35 @@ mod tests {
         ));
         assert_eq!(approval_request_id(receive(&root_rx)), "older");
         assert_eq!(approval_request_id(receive(&root_rx)), "newer");
+    }
+
+    /// The background key acts on main's turn from an agent's view too, so
+    /// the answer that main's turn stays reaches the view on screen.
+    #[test]
+    fn a_turn_kept_in_the_foreground_is_shown_while_main_is_behind_another_view() {
+        const STAYS: &str =
+            "This turn cannot move to the background while its subagents are running.";
+        let (root_tx, root_rx) = mpsc::unbounded();
+        let parent = SessionAttachmentId::new(1);
+        let child = parent.next();
+        let routing = Arc::new(Mutex::new(AttachmentRouting::new(parent)));
+        let parent_tx = spawn_attached_event_sender_with_routing(
+            root_tx.clone(),
+            parent,
+            Some(routing.clone()),
+        );
+        AttachmentRouting::switch_attachment(&routing, &root_tx, child, Some(parent), false);
+        let _ = receive(&root_rx);
+
+        parent_tx
+            .send(TuiEvent::TurnKeptInForeground(STAYS.to_string()))
+            .unwrap();
+
+        assert!(matches!(
+            receive(&root_rx),
+            TuiEvent::TurnKeptInForeground(message) if message == STAYS
+        ));
+        assert!(root_rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 
     #[test]

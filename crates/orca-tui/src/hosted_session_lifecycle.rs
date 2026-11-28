@@ -254,6 +254,11 @@ fn install_hosted_session(
         pending_workflow_notifications.clear();
         previous
     });
+    if let Some(view) = control.view()
+        && let Some(runtime_thread) = thread.as_ref()
+    {
+        view.note_main_thread(runtime_thread);
+    }
     if let Some(previous) = previous {
         reap_hosted_thread(previous);
     }

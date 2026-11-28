@@ -70,10 +70,10 @@ impl AgentTurnAdmission {
                 "agent task is absent from its owning execution scope",
             ));
         }
-        if current
-            .as_ref()
-            .is_some_and(|record| record.stop_requested || record.control.cancel.is_cancelled())
-        {
+        if current.as_ref().is_some_and(|record| {
+            record.status.is_active()
+                && (record.stop_requested || record.control.cancel.is_cancelled())
+        }) {
             return Err(io::Error::other(
                 "agent continuation stopped before execution",
             ));
@@ -297,6 +297,10 @@ impl AgentController {
         }
     }
 
+    pub(crate) fn keeps_subagents_in_process(&self) -> bool {
+        self.registry.keeps_subagents_in_process()
+    }
+
     pub(crate) fn launch(&self, request: AgentLaunchRequest) -> io::Result<AgentLaunchResult> {
         let surface_activity = request.surface_activity;
         let batch_id = surface_activity
@@ -360,9 +364,23 @@ impl AgentController {
             }
         };
         let thread_id = child.thread_id().to_string();
+        let kept_in_process = self.keeps_subagents_in_process();
+        if kept_in_process
+            && let Err(error) = request
+                .task_registry
+                .bind_subagent_thread(&request.agent_id, &thread_id)
+        {
+            tracing::warn!(task_id = %request.agent_id, %thread_id, %error, "could not bind the running subagent's thread");
+        }
+        // A child the host keeps is told that it asks nobody.
+        let unattended = if kept_in_process {
+            crate::child_refusal::UNATTENDED_CHILD_CONTEXT
+        } else {
+            ""
+        };
         if let Err(error) = child.mutate(
             crate::runtime_host::RuntimeThreadMutation::AddPinnedContext(format!(
-                "{DELEGATED_CHILD_CONTEXT}{}",
+                "{DELEGATED_CHILD_CONTEXT}{}{unattended}",
                 request.subagent_type.system_prompt_suffix()
             )),
         ) {
@@ -403,21 +421,57 @@ impl AgentController {
                 )),
             });
         }
-        let mut turn = HostedTurnRequest::new(request.prompt)
-            .with_headless_root(child_config.tools.headless_exec)
-            .with_event_observer(publisher.clone());
-        if let Some(handler) = request.approval_handler {
-            turn = turn.with_approval_handler(handler);
-        }
-        if let Some(handler) = request.permission_handler {
-            turn = turn.with_permission_handler(Arc::new(AgentPermissionHandler {
-                inner: handler,
-                publisher: publisher.clone(),
-            }));
-        }
-        let operation = match child
-            .start_turn_with_output(turn, AgentOutputWriter::new(publisher.clone()))
-        {
+        // A kept child's handler refuses at once; its row must not show it
+        // waiting for a permission nobody is asked for.
+        let permission_handler = if kept_in_process {
+            request.permission_handler
+        } else {
+            request.permission_handler.map(|handler| {
+                Arc::new(AgentPermissionHandler {
+                    inner: handler,
+                    publisher: publisher.clone(),
+                }) as Arc<dyn RuntimePermissionRequestHandler + Send + Sync>
+            })
+        };
+        // Only a host that keeps its children starts their turns on their
+        // surfaces, where a view can follow them. Another host starts them
+        // raw, as it did before: a turn on the surface has an activity
+        // ingress and a parent fence, which decide where the child's own
+        // subagents run.
+        let on_surface = if kept_in_process {
+            child
+                .start_delegated_turn_on_surface(
+                    crate::runtime_host::DelegatedTurnStart {
+                        prompt: request.prompt.clone(),
+                        headless_root: child_config.tools.headless_exec,
+                        observer: publisher.clone(),
+                        approval: request.approval_handler.clone(),
+                        permission: permission_handler.clone(),
+                    },
+                    AgentOutputWriter::new(publisher.clone()),
+                )
+                .ok()
+        } else {
+            None
+        };
+        let started = match on_surface {
+            Some(operation) => Ok(operation),
+            // The child still does its work; it only has no conversation a
+            // view can follow.
+            None => {
+                let mut turn = HostedTurnRequest::new(request.prompt)
+                    .with_headless_root(child_config.tools.headless_exec)
+                    .with_event_observer(publisher.clone());
+                if let Some(handler) = request.approval_handler {
+                    turn = turn.with_approval_handler(handler);
+                }
+                if let Some(handler) = permission_handler {
+                    turn = turn.with_permission_handler(handler);
+                }
+                child.start_turn_with_output(turn, AgentOutputWriter::new(publisher.clone()))
+            }
+        };
+        let operation = match started {
             Ok(operation) => operation,
             Err(error) => {
                 let terminal_error = publisher.publish_surface_terminal(
@@ -443,6 +497,9 @@ impl AgentController {
                 .name(format!("orca-agent-wait-{}", request.agent_id))
                 .spawn(move || {
                     let result = settle_operation(&completion_child, operation, None);
+                    if kept_in_process {
+                        close_settled_childs_mcp_servers(&completion_child);
+                    }
                     let _ = watcher_publisher.publish_surface_terminal(
                         result.status,
                         result.final_message.clone(),
@@ -477,9 +534,26 @@ impl AgentController {
             });
         }
 
-        Ok(settle_operation(&child, operation, Some(&request.cancel)))
+        let result = settle_operation(&child, operation, Some(&request.cancel));
+        if kept_in_process {
+            close_settled_childs_mcp_servers(&child);
+        }
+        Ok(result)
     }
 }
+
+/// Stops the MCP servers a kept child started for its task, once that task
+/// has settled. The child's thread stays for its conversation, which a view
+/// can read, but nothing runs on it again in stage 1, so its servers would
+/// only run on until the host ends. Other hosts leave them to the child's
+/// thread, as they always have. A later turn on this thread (stage 3) will
+/// need the servers again, and must start them before it runs.
+fn close_settled_childs_mcp_servers(child: &RuntimeThreadHandle) {
+    child.mcp_registry().close();
+}
+
+/// The error a child's own end reports when its turn was cancelled.
+pub(crate) const AGENT_CANCELLED: &str = "agent cancelled";
 
 fn failure_after_started_message(
     surface_activity: Option<&AgentSurfaceActivity>,
@@ -905,12 +979,12 @@ fn settle_operation(
     let (status, error) = if cancellation_requested
         || matches!(terminal.outcome(), OperationOutcome::Stopped(_))
     {
-        (RunStatus::Cancelled, Some("agent cancelled".to_string()))
+        (RunStatus::Cancelled, Some(AGENT_CANCELLED.to_string()))
     } else {
         match terminal.outcome() {
             OperationOutcome::Completed(RunStatus::Success) => (RunStatus::Success, None),
             OperationOutcome::Completed(RunStatus::Cancelled) => {
-                (RunStatus::Cancelled, Some("agent cancelled".to_string()))
+                (RunStatus::Cancelled, Some(AGENT_CANCELLED.to_string()))
             }
             OperationOutcome::Completed(RunStatus::ApprovalRequired) => (
                 RunStatus::ApprovalRequired,
@@ -949,6 +1023,48 @@ fn settle_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_continuation_rejects_a_still_active_task_with_a_stop_requested() {
+        let registry = crate::tasks::TaskRegistry::new("ui-stopped-attempt".into());
+        let limits = orca_core::subagent_config::SubagentLimits::default();
+        let scope = registry.execution_scope(&limits);
+        let original = scope
+            .submit_subagent("first".into(), None, None, 1)
+            .unwrap();
+        let task_id = original.task_id;
+        assert_eq!(
+            registry.get(&task_id).unwrap().status,
+            orca_core::task_types::TaskStatus::Running
+        );
+        registry.request_stop(&task_id).unwrap();
+        let stopped = registry.get(&task_id).unwrap();
+        assert!(stopped.status.is_active());
+        assert!(stopped.stop_requested);
+
+        let policy = AgentThreadPolicy {
+            subagent_type: SubagentType::General,
+            depth: 1,
+            task_id: Some(task_id),
+            continued_task: Default::default(),
+        };
+        let error = AgentTurnAdmission::acquire(
+            &policy,
+            &registry,
+            limits,
+            "continue",
+            None,
+            &CancelToken::new(),
+        )
+        .err()
+        .expect("an unsettled task with a stop requested must not continue");
+        assert_eq!(
+            error.to_string(),
+            "agent continuation stopped before execution"
+        );
+        assert!(policy.continued_task.lock().unwrap().is_none());
+    }
+
     #[test]
     fn ui_continuation_queues_in_shared_scope_and_creates_a_new_attempt() {
         let registry = crate::tasks::TaskRegistry::new("ui-shared-scope".into());

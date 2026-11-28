@@ -32,6 +32,7 @@ pub(crate) struct RendererRuntimeEventOwner {
     mention_search: MentionSearchManager,
     pending_initial_prompt: Option<String>,
     local_shell_readiness: bool,
+    finished_tx: Option<mpsc::Sender<crate::hosted_child::FinishedTask>>,
     /// The MCP servers in view when the mention catalog last looked at
     /// them.
     mcp_servers_seen: Vec<McpServerView>,
@@ -46,6 +47,7 @@ impl RendererRuntimeEventOwner {
             mention_search,
             pending_initial_prompt,
             local_shell_readiness: true,
+            finished_tx: None,
             mcp_servers_seen: Vec::new(),
         }
     }
@@ -53,6 +55,13 @@ impl RendererRuntimeEventOwner {
     pub(crate) fn with_local_shell_readiness(mut self, enabled: bool) -> Self {
         self.local_shell_readiness = enabled;
         self
+    }
+
+    pub(crate) fn connect_finished_view(
+        &mut self,
+        runtime: &crate::agent_runtime::TuiAgentRuntime,
+    ) {
+        self.finished_tx = runtime.finished_sender();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -78,6 +87,12 @@ impl RendererRuntimeEventOwner {
             Ok(Some(tui_event)) => tui_event,
             Ok(None) | Err(()) => return,
         };
+        if let TuiEvent::BackgroundTasksUpdated(rows) = &tui_event
+            && let Some(sender) = &self.finished_tx
+            && let Some(notice) = crate::hosted_child::FinishedTask::for_view(state, rows)
+        {
+            let _ = sender.send(notice);
+        }
         match tui_event {
             // The wait for the history of the conversation resumed at launch
             // ends when it loads, and when a new conversation takes its place
@@ -293,7 +308,7 @@ impl RendererRuntimeEventOwner {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     use crossbeam_channel as mpsc;
@@ -491,6 +506,7 @@ mod tests {
             attached(
                 stale,
                 TuiEvent::HistoryLoaded {
+                    agent_lines: Default::default(),
                     messages: vec![ChatMessage::Assistant("stale".to_string())],
                     plan: None,
                     label: "stale history".to_string(),
@@ -514,6 +530,7 @@ mod tests {
             attached(
                 active,
                 TuiEvent::HistoryLoaded {
+                    agent_lines: Default::default(),
                     messages: vec![ChatMessage::Assistant("hydrated".to_string())],
                     plan: None,
                     label: "loaded history".to_string(),
@@ -551,6 +568,7 @@ mod tests {
             attached(
                 active,
                 TuiEvent::HistoryLoaded {
+                    agent_lines: Default::default(),
                     messages: vec![ChatMessage::Assistant("hydrated again".to_string())],
                     plan: None,
                     label: "loaded again".to_string(),
@@ -781,6 +799,18 @@ mod tests {
         presentation: TerminalPresentation,
     }
 
+    pub(crate) fn deliver_to_hosted_view(
+        runtime: &crate::agent_runtime::TuiAgentRuntime,
+        state: &mut AppState,
+        event: TuiEvent,
+    ) {
+        let mut tui = ResumingTui::waiting_for_history(None);
+        tui.owner.connect_finished_view(runtime);
+        std::mem::swap(&mut tui.state, state);
+        tui.receive(event);
+        std::mem::swap(&mut tui.state, state);
+    }
+
     impl ResumingTui {
         fn waiting_for_history(prompt: Option<&str>) -> Self {
             let root = tempfile::tempdir().expect("temp root");
@@ -901,6 +931,7 @@ mod tests {
 
     fn history_loaded(history: Option<&str>, label: &str) -> TuiEvent {
         TuiEvent::HistoryLoaded {
+            agent_lines: Default::default(),
             messages: history
                 .map(|text| ChatMessage::Assistant(text.to_string()))
                 .into_iter()

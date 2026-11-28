@@ -2882,6 +2882,7 @@ fn recorded_hosted_fork(
                     batch_id: "fork-batch".into(),
                     batch_size: 1,
                 }),
+                false,
             )
             .unwrap();
         drop(registry);

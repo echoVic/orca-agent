@@ -5,12 +5,27 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crossterm::event::KeyCode;
-use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
+use orca_core::task_types::{BackgroundTaskSummary, TaskType};
 
 use crate::agent_workspace::AgentWorkspaceRow;
 use crate::protocol::{PendingWorkflowNotification, TaskTranscriptRequest, UserAction};
 use crate::transcript_state::ChatMessage;
 use crate::types::{AppState, AppStatus, ApprovalDialog, PanelMode};
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AgentDockFocus<'a> {
+    pub selected: Option<&'a str>,
+    pub viewed: Option<&'a str>,
+}
+
+impl AgentDockFocus<'_> {
+    pub(crate) fn includes(self, task: &BackgroundTaskSummary) -> bool {
+        task.task_type == TaskType::Subagent
+            && (task.status.is_active()
+                || task.status.requires_attention()
+                || self.viewed == Some(task.id.as_str()))
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkflowPanelState {
@@ -373,26 +388,35 @@ impl AppState {
             .as_deref()
             .and_then(|selected| visible.iter().position(|task_id| task_id == selected))
             .and_then(|index| index.checked_sub(1))
-            .and_then(|index| visible.get(index).cloned());
+            .and_then(|index| visible.get(index).cloned())
+            .or_else(|| {
+                self.conversation_target()
+                    .task_id()
+                    .and_then(|_| visible.first().cloned())
+            });
+    }
+
+    pub(crate) fn agent_dock_focus(&self) -> AgentDockFocus<'_> {
+        AgentDockFocus {
+            selected: self.agent_dock_selected_task_id.as_deref(),
+            viewed: self.conversation_target().task_id(),
+        }
     }
 
     pub(crate) fn selected_agent_dock_task(&self) -> Option<&BackgroundTaskSummary> {
-        let selected = self.agent_dock_selected_task_id.as_deref()?;
-        self.workflow_panel.tasks().iter().find(|task| {
-            task.id == selected
-                && task.task_type == TaskType::Subagent
-                && (task.status.is_active() || task.status.requires_attention())
-        })
+        let focus = self.agent_dock_focus();
+        let selected = focus.selected?;
+        self.workflow_panel
+            .tasks()
+            .iter()
+            .find(|task| task.id == selected && focus.includes(task))
     }
 
     fn agent_dock_ids(&self) -> Vec<String> {
         self.workflow_panel
             .tasks()
             .iter()
-            .filter(|task| {
-                task.task_type == TaskType::Subagent
-                    && (task.status.is_active() || task.status.requires_attention())
-            })
+            .filter(|task| self.agent_dock_focus().includes(task))
             .map(|task| task.id.clone())
             .collect()
     }
@@ -537,7 +561,11 @@ impl AppState {
     }
 
     pub(crate) fn apply_workflow_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
-        let previous = self.workflow_panel.tasks().to_vec();
+        self.update_workflow_panel(tasks);
+        self.announce_visible_agent_lines();
+    }
+
+    pub(crate) fn update_workflow_panel(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         // Only update the parent snapshot when Main is focused. While a child
         // is attached the background_workflow_tasks holds the parent baseline
         // used by apply_surface_projection_state for dock merging; overwriting
@@ -567,10 +595,7 @@ impl AppState {
             .selected_workflow_task()
             .is_some_and(is_backgrounded_running_main_session);
         let selected_task_id = self.selected_workflow_task().map(|task| task.id.clone());
-        self.workflow_panel.replace_tasks(tasks);
-        self.agent_workspace.reconcile(self.workflow_panel.tasks());
-        self.sync_subagent_transcript_messages();
-        self.emit_subagent_terminal_notices(&previous);
+        self.replace_dock_tasks(tasks);
         self.refresh_open_task_transcript();
         if should_reveal_background_approval {
             // A background approval must surface without stealing the
@@ -608,42 +633,31 @@ impl AppState {
         self.learn_command_ends_from_tasks();
     }
 
-    fn emit_subagent_terminal_notices(&mut self, previous: &[BackgroundTaskSummary]) {
+    pub(crate) fn announce_visible_agent_lines(&mut self) {
+        if !self.side_conversation_visible {
+            self.sync_subagent_transcript_messages();
+            self.emit_subagent_terminal_notices();
+        }
+    }
+
+    pub(crate) fn visible_conversation_tasks(&self) -> &[BackgroundTaskSummary] {
+        if self.conversation_target().task_id().is_some() {
+            &self.focused_workflow_tasks
+        } else {
+            self.workflow_tasks()
+        }
+    }
+
+    fn emit_subagent_terminal_notices(&mut self) {
         let notices = self
-            .workflow_tasks()
+            .visible_conversation_tasks()
             .iter()
             .filter(|task| task.task_type == TaskType::Subagent)
             .filter_map(|task| {
-                let old = previous.iter().find(|old| old.id == task.id)?;
-                if old.status == task.status
-                    || !matches!(
-                        task.status,
-                        TaskStatus::Completed
-                            | TaskStatus::Failed
-                            | TaskStatus::Blocked
-                            | TaskStatus::Cancelled
-                    )
-                {
-                    return None;
-                }
                 if self.announced_subagent_terminals.contains(&task.id) {
                     return None;
                 }
-                let name = task.name.as_deref().unwrap_or(task.description.as_str());
-                Some((
-                    task.id.clone(),
-                    match task.status {
-                        TaskStatus::Completed => format!("Agent completed: {name}"),
-                        TaskStatus::Blocked => {
-                            format!("Agent blocked: {}", task.error.as_deref().unwrap_or(name))
-                        }
-                        TaskStatus::Failed => {
-                            format!("Agent failed: {}", task.error.as_deref().unwrap_or(name))
-                        }
-                        TaskStatus::Cancelled => format!("Agent cancelled: {name}"),
-                        _ => unreachable!(),
-                    },
-                ))
+                Some((task.id.clone(), crate::subagent_lines::ended(task)?))
             })
             .collect::<Vec<_>>();
         for (id, notice) in notices {
@@ -661,18 +675,23 @@ impl AppState {
     pub(crate) fn apply_background_tasks_update(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         if self.conversation_target().task_id().is_some() {
             self.background_workflow_tasks = tasks.clone();
-            self.apply_workflow_tasks_update(
-                crate::state_reducer::merge_background_task_snapshots(
-                    &tasks,
-                    &self.focused_workflow_tasks,
-                ),
-            );
+            self.update_workflow_panel(crate::state_reducer::merge_background_task_snapshots(
+                &tasks,
+                &self.focused_workflow_tasks,
+            ));
             return;
         }
         self.background_workflow_tasks = tasks.clone();
+        self.replace_dock_tasks(tasks);
+        self.learn_command_ends_from_tasks();
+    }
+
+    fn replace_dock_tasks(&mut self, tasks: Vec<BackgroundTaskSummary>) {
         self.workflow_panel.replace_tasks(tasks);
         self.agent_workspace.reconcile(self.workflow_panel.tasks());
-        self.learn_command_ends_from_tasks();
+        if self.selected_agent_dock_task().is_none() {
+            self.agent_dock_selected_task_id = None;
+        }
     }
 
     #[cfg(test)]
@@ -730,11 +749,17 @@ pub(crate) fn push_pending_workflow_notification_unique(
 pub(crate) fn sort_workflow_tasks_for_panel(
     mut tasks: Vec<BackgroundTaskSummary>,
 ) -> Vec<BackgroundTaskSummary> {
+    // A row keeps its place whatever it does. Summaries that carry the
+    // order their tasks were submitted in (`sequence`) come first, in that
+    // order; the rest follow by creation, then task id. The hosted TUI's
+    // rows all come from the surface projection, which carries no sequence
+    // (`workflow_task_summaries` sets 0), so there they are in creation
+    // order, and two created in the same millisecond are in task id order.
     tasks.sort_by(|left, right| {
-        workflow_task_panel_group(left)
-            .cmp(&workflow_task_panel_group(right))
-            .then_with(|| workflow_task_activity_ms(right).cmp(&workflow_task_activity_ms(left)))
-            .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+        (left.sequence == 0)
+            .cmp(&(right.sequence == 0))
+            .then_with(|| left.sequence.cmp(&right.sequence))
+            .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
             .then_with(|| left.id.cmp(&right.id))
     });
     tasks
@@ -767,28 +792,6 @@ fn is_foregrounded_running_main_session(task: &BackgroundTaskSummary) -> bool {
         && !task.is_backgrounded
 }
 
-fn workflow_task_panel_group(task: &BackgroundTaskSummary) -> u8 {
-    match task.status {
-        orca_core::task_types::TaskStatus::ApprovalRequired => 0,
-        orca_core::task_types::TaskStatus::Queued
-        | orca_core::task_types::TaskStatus::Running
-        | orca_core::task_types::TaskStatus::Paused
-        | orca_core::task_types::TaskStatus::Stopping => 1,
-        orca_core::task_types::TaskStatus::Stopped
-        | orca_core::task_types::TaskStatus::Completed
-        | orca_core::task_types::TaskStatus::Failed
-        | orca_core::task_types::TaskStatus::Blocked
-        | orca_core::task_types::TaskStatus::Cancelled => 2,
-    }
-}
-
-fn workflow_task_activity_ms(task: &BackgroundTaskSummary) -> i64 {
-    task.last_activity_at_ms
-        .or(task.completed_at_ms)
-        .or(task.started_at_ms)
-        .unwrap_or(task.created_at_ms)
-}
-
 #[cfg(test)]
 mod tests {
     use orca_core::task_types::TaskLifetime;
@@ -807,6 +810,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: id.to_string(),
             created_at_ms: activity_at_ms,
+            sequence: 0,
             started_at_ms: Some(activity_at_ms),
             completed_at_ms: None,
             command: None,
@@ -841,17 +845,65 @@ mod tests {
         }
     }
 
+    fn sequenced_task(
+        id: &str,
+        sequence: u64,
+        status: TaskStatus,
+        activity_at_ms: i64,
+    ) -> BackgroundTaskSummary {
+        let mut task = workflow_task(id, activity_at_ms);
+        task.sequence = sequence;
+        task.status = status;
+        task
+    }
+
+    fn ids(tasks: &[BackgroundTaskSummary]) -> Vec<&str> {
+        tasks.iter().map(|task| task.id.as_str()).collect()
+    }
+
+    #[test]
+    fn agents_keep_the_order_they_were_started_in() {
+        let a = sequenced_task("a", 1, TaskStatus::Running, 10);
+        let b = sequenced_task("b", 2, TaskStatus::Completed, 99);
+        let c = sequenced_task("c", 3, TaskStatus::ApprovalRequired, 50);
+        let sorted = super::sort_workflow_tasks_for_panel(vec![c.clone(), b.clone(), a.clone()]);
+        assert_eq!(ids(&sorted), ["a", "b", "c"]);
+
+        // Activity does not move a row.
+        let mut a_later = a.clone();
+        a_later.last_activity_at_ms = Some(500);
+        let sorted = super::sort_workflow_tasks_for_panel(vec![b, c, a_later]);
+        assert_eq!(ids(&sorted), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn tasks_with_no_sequence_follow_in_creation_order() {
+        let mut x = sequenced_task("x", 0, TaskStatus::Running, 5);
+        x.created_at_ms = 5;
+        let mut y = sequenced_task("y", 0, TaskStatus::Running, 3);
+        y.created_at_ms = 3;
+        let mut a = sequenced_task("a", 1, TaskStatus::Running, 9);
+        a.created_at_ms = 9;
+        let sorted = super::sort_workflow_tasks_for_panel(vec![x, y, a]);
+        assert_eq!(ids(&sorted), ["a", "y", "x"]);
+    }
+
     #[test]
     fn workflow_panel_owner_sorts_preserves_selection_and_clears() {
         let mut panel = WorkflowPanelState::default();
-        panel.replace_tasks(vec![workflow_task("later", 20), workflow_task("first", 10)]);
-        panel.select_index(0);
+        let started = |id: &str, sequence: u64, activity_at_ms: i64| {
+            let mut task = workflow_task(id, activity_at_ms);
+            task.sequence = sequence;
+            task
+        };
+        panel.replace_tasks(vec![started("later", 2, 20), started("first", 1, 10)]);
+        panel.select_index(1);
         assert_eq!(
             panel.selected_task().map(|task| task.id.as_str()),
             Some("later")
         );
 
-        panel.replace_tasks(vec![workflow_task("later", 30), workflow_task("new", 40)]);
+        panel.replace_tasks(vec![started("later", 2, 30), started("new", 3, 40)]);
         assert_eq!(
             panel.selected_task().map(|task| task.id.as_str()),
             Some("later")
@@ -861,7 +913,7 @@ mod tests {
         assert_eq!(panel.selected(), 1);
         assert_eq!(
             panel.selected_task().map(|task| task.id.as_str()),
-            Some("later")
+            Some("new")
         );
 
         panel.reset_for_session();

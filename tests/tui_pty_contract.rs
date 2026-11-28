@@ -406,6 +406,72 @@ fn tui_permission_round_trips_through_the_runtime_surface() {
     assert_eq!(status.code(), Some(130), "TUI exited with {status}");
 }
 
+/// A person who denies the approval a turn waits on reads Orca's notice and
+/// nothing that looks like a crash. The runtime ends that turn as failed for
+/// want of an approval, which used to put "Task failed without diagnostic
+/// details" under the notice. The next prompt then runs as usual.
+#[test]
+fn tui_denied_approval_ends_the_turn_with_the_notice_and_no_failure_line() {
+    const NOTICE: &str = "Denied. Tell Orca what to do instead.";
+    let home = tempfile::tempdir().expect("temporary ORCA_HOME");
+    let cwd = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(home.path().join("config.toml"), "mode = \"suggest\"\n")
+        .expect("configure explicit suggest mode");
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "bash pwd")
+        .expect("spawn denied-approval TUI in PTY");
+
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    receive_until(
+        &process,
+        &mut output,
+        "requested shell",
+        Duration::from_secs(20),
+        "TUI did not ask to approve bash",
+    );
+    process.write(b"4").expect("deny bash");
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        NOTICE,
+        "TUI did not answer the denial with its notice",
+    );
+    // Typed the way a person types it: the prompt shows in the composer
+    // before it is sent.
+    process
+        .write(PROMPT.as_bytes())
+        .expect("type the next prompt");
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        PROMPT,
+        "the composer did not take the next prompt after the denial",
+    );
+    process.write(b"\r").expect("send the next prompt");
+    assert_screen_shows(
+        &process,
+        &mut output,
+        ASSISTANT_SENTINEL,
+        "the prompt after the denial did not run",
+    );
+
+    let screen = reconstruct_screen(&output);
+    assert_eq!(screen.matches(NOTICE).count(), 1, "screen=\n{screen}");
+    assert!(
+        !screen.contains("Task failed without diagnostic details"),
+        "screen=\n{screen}"
+    );
+    assert!(
+        !contains_rendered_text(&output, "runtime.missing_diagnostic"),
+        "a failure line was drawn at some point; screen=\n{screen}"
+    );
+
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
 #[test]
 fn tui_cancel_returns_to_idle_through_the_runtime_surface() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
@@ -548,12 +614,12 @@ fn a_queued_message_leaves_the_strip_once_it_is_sent() {
 }
 
 #[test]
-fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
+fn tui_tasks_workspace_stops_one_subagent_without_terminal_spam() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");
     std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n")
         .expect("configure full-auto mode");
-    let release_marker = cwd.path().join("release-detached-subagent");
+    let release_marker = cwd.path().join("release-subagent");
     let mut process = PtyProcess::spawn_with_prompt(
         home.path(),
         cwd.path(),
@@ -562,14 +628,14 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
             release_marker.display()
         ),
     )
-    .expect("spawn detached-subagent TUI in PTY");
+    .expect("spawn subagent TUI in PTY");
     let mut output = Vec::new();
     accept_new_workspace(&mut process, &mut output);
     assert_screen_shows(
         &process,
         &mut output,
         "Agents 1 active",
-        "parent did not expose the running detached child",
+        "parent did not expose the running child",
     );
 
     process.write(b"/agents\r").expect("open Tasks workspace");
@@ -583,7 +649,7 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
         &process,
         &mut output,
         "mock_stream_release_marker",
-        "Tasks workspace did not expose the detached child",
+        "Tasks workspace did not expose the child",
     );
     process.write(b"s").expect("stop selected subagent");
     assert_screen_shows(
@@ -603,6 +669,15 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
             .is_none(),
         "stopping a child must keep the parent TUI alive"
     );
+    // The child never finishes on its own: its release marker is never
+    // written. Main's reply after the stopped call shows that the stop did
+    // not end main's turn: the turn went on to its reply.
+    assert_screen_shows(
+        &process,
+        &mut output,
+        "Mock completed after tool execution.",
+        "stopping one subagent ended the parent's turn instead of letting it go on",
+    );
     let rendered = String::from_utf8_lossy(&output);
     assert!(
         rendered.matches("Stopping ").count() <= 3,
@@ -613,6 +688,146 @@ fn tui_tasks_workspace_stops_one_detached_subagent_without_terminal_spam() {
     let status = process.wait_for_exit(Duration::from_secs(5));
     process.close_io_and_join();
     assert_eq!(status.code(), Some(130), "TUI exited with {status}");
+}
+
+#[test]
+fn tui_esc_closes_agents_before_returning_from_the_running_child() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n").unwrap();
+    let marker = cwd.path().join("release-agents");
+    let prompt = format!(
+        "subagent async_then_sync mock_stream_release_marker {}",
+        marker.display()
+    );
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), &prompt).unwrap();
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    let dock = wait_for_screen(
+        &process,
+        &mut output,
+        |frame| {
+            frame.contains("Agents 2 active")
+                && frame.contains(" sync child · running")
+                && frame.matches("thinking, turn 1").count() == 2
+        },
+        "both children must be running in the dock",
+    );
+    let row = dock
+        .lines()
+        .position(|line| line.contains(" sync child · running"))
+        .unwrap()
+        + 1;
+    process
+        .write(format!("\x1b[<0;6;{row}M\x1b[<0;6;{row}m").as_bytes())
+        .unwrap();
+    let child_text = |frame: &str| {
+        user_lines_showing(frame, "mock_stream_release_marker") == 1
+            && user_lines_showing(frame, "subagent async_then_sync") == 0
+    };
+    let child = wait_for_screen(
+        &process,
+        &mut output,
+        |frame| {
+            child_text(frame)
+                && frame.contains("Main is running · Esc return")
+                && frame.contains("Running ")
+        },
+        "did not visit the sync child's own conversation",
+    );
+    assert!(!child.contains("Esc interrupt"), "{child}");
+    process.write(b"/agents\r").unwrap();
+    let sibling_selected = |frame: &str| {
+        frame.lines().any(|line| {
+            line.starts_with('│') && line.contains('›') && line.contains("async child · running")
+        })
+    };
+    let panel = wait_for_screen(
+        &process,
+        &mut output,
+        |frame| {
+            frame.contains("Tasks Workspace")
+                && frame.contains("s stop")
+                && frame.contains("Focus ")
+                && frame.contains("async child · running")
+                && frame.contains(" sync child · running")
+        },
+        "child did not open the agents panel",
+    );
+    if !sibling_selected(&panel) {
+        let rows: Vec<_> = panel
+            .lines()
+            .filter(|line| line.starts_with('│') && line.contains("child · running"))
+            .collect();
+        let async_index = rows
+            .iter()
+            .position(|row| row.contains("async child"))
+            .unwrap();
+        let selected = rows.iter().position(|row| row.contains('›')).unwrap();
+        process
+            .write(if async_index < selected {
+                b"\x1b[A"
+            } else {
+                b"\x1b[B"
+            })
+            .unwrap();
+        wait_for_screen(
+            &process,
+            &mut output,
+            sibling_selected,
+            "sibling was not selected",
+        );
+    }
+    process.write(b"s").unwrap();
+    wait_for_screen(
+        &process,
+        &mut output,
+        |frame| {
+            frame.contains("Tasks Workspace")
+                && frame.contains("async child · stopped")
+                && frame.contains(" sync child · running")
+        },
+        "s did not stop only the sibling",
+    );
+    process.write(b"\x1b").unwrap();
+    let child = wait_for_screen(
+        &process,
+        &mut output,
+        |frame| {
+            !frame.contains("Tasks Workspace")
+                && child_text(frame)
+                && frame.contains("Main is running · Esc return")
+                && frame.contains("Stopping \"async child\".")
+        },
+        "first Esc must reveal the child and its stop notice",
+    );
+    assert_eq!(
+        child.matches("Stopping \"async child\".").count(),
+        1,
+        "{child}"
+    );
+    process.write(b"\x1b").unwrap();
+    let main = wait_for_screen(
+        &process,
+        &mut output,
+        |frame| {
+            !frame.contains("Esc return")
+                && user_lines_showing(frame, "subagent async_then_sync") == 1
+                && frame.contains("Running ")
+                && frame.contains("Esc interrupt")
+                && frame.contains("Agents 1 active")
+        },
+        "second Esc must restore running main",
+    );
+    assert!(
+        !main.contains("Task cancelled") && !main.contains("Agent cancelled"),
+        "{main}"
+    );
+    std::fs::write(marker, b"release").unwrap();
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130));
 }
 
 #[test]
@@ -705,6 +920,462 @@ fn tui_shows_a_background_agents_progress_while_the_parent_turn_waits_on_it() {
 }
 
 #[test]
+fn tui_return_from_an_agent_keeps_the_running_main() {
+    return_from_marker_held_agent(ReturnScenario::Running);
+}
+
+#[test]
+fn tui_return_from_an_agent_restores_the_queued_turns_open_text() {
+    return_from_marker_held_agent(ReturnScenario::Queued);
+}
+
+#[test]
+fn tui_return_from_an_agent_restores_mains_pending_approval() {
+    return_from_marker_held_agent(ReturnScenario::Approval);
+}
+
+#[test]
+fn tui_return_from_an_agent_restores_the_queued_approval() {
+    return_from_marker_held_agent(ReturnScenario::QueuedApproval);
+}
+
+#[test]
+fn tui_return_from_an_agent_orders_queued_text_and_tool() {
+    return_from_marker_held_agent(ReturnScenario::QueuedTool { visit: true });
+}
+
+#[test]
+fn tui_live_main_orders_queued_text_and_tool() {
+    return_from_marker_held_agent(ReturnScenario::QueuedTool { visit: false });
+}
+
+#[test]
+fn tui_ctrl_c_from_a_finished_agent_interrupts_mains_queued_turn() {
+    return_from_marker_held_agent(ReturnScenario::Interrupt);
+}
+
+#[test]
+fn tui_quit_with_a_running_agent_and_main_by_sigterm() {
+    return_from_marker_held_agent(ReturnScenario::QuitBySignal);
+}
+
+#[test]
+fn tui_quit_with_a_running_agent_and_main_by_keyboard() {
+    return_from_marker_held_agent(ReturnScenario::QuitByKeyboard);
+}
+
+enum ReturnScenario {
+    QuitBySignal,
+    QuitByKeyboard,
+    Running,
+    Queued,
+    Interrupt,
+    Approval,
+    QueuedApproval,
+    QueuedTool { visit: bool },
+}
+
+fn return_from_marker_held_agent(scenario: ReturnScenario) {
+    let interrupt = matches!(scenario, ReturnScenario::Interrupt);
+    let queue_next_turn = !matches!(
+        scenario,
+        ReturnScenario::Running
+            | ReturnScenario::Approval
+            | ReturnScenario::QuitBySignal
+            | ReturnScenario::QuitByKeyboard
+    );
+    let approval = matches!(scenario, ReturnScenario::Approval);
+    let queued_approval = matches!(scenario, ReturnScenario::QueuedApproval);
+    let queued_tool = matches!(scenario, ReturnScenario::QueuedTool { .. });
+    let visit = !matches!(scenario, ReturnScenario::QueuedTool { visit: false });
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let marker = cwd.path().join("release");
+    let mode = if approval || queued_approval {
+        "suggest"
+    } else {
+        "full-auto"
+    };
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!("mode = \"{mode}\"\n"),
+    )
+    .unwrap();
+    let mut prompt = format!(
+        "subagent async mock_stream_release_marker {}",
+        marker.display()
+    );
+    let ask = cwd.path().join("ask");
+    if approval || queued_approval || queued_tool {
+        std::fs::write(cwd.path().join("witness.txt"), "before").unwrap();
+    }
+    if approval {
+        prompt = format!(
+            "mock_stream_tool_release_marker {}",
+            serde_json::json!({"marker":ask, "toolPrompt":"edit witness.txt :: before => after", "firstToolPrompt":prompt})
+        );
+    }
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), &prompt).unwrap();
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    if approval || queued_approval {
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Approve · subagent",
+            "main did not ask to start the agent",
+        );
+        process.write(b"1").unwrap();
+    }
+    if !approval {
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Delegating to 1 agent",
+            "missing live delegation",
+        );
+    }
+    assert_screen_has_text(&process, &mut output, "thinking,", "child has not started");
+    if queue_next_turn {
+        let prompt = if queued_approval {
+            format!(
+                "mock_stream_tool_release_marker {}\r",
+                serde_json::json!({"marker":ask,"toolPrompt":"edit witness.txt :: before => after"})
+            )
+        } else if queued_tool {
+            format!(
+                "mock_stream_tool_release_marker {}\r",
+                serde_json::json!({"marker":ask,"toolPrompt":"read witness.txt", "retainText":true})
+            )
+        } else if interrupt {
+            "mock_stream_delay_ms 30000\r".to_owned()
+        } else {
+            "mock_stream_delay_ms 4000\r".to_owned()
+        };
+        process.write(prompt.as_bytes()).unwrap();
+        assert_screen_shows(&process, &mut output, "Queued", "main prompt not queued");
+    }
+    if visit {
+        let frame = reconstruct_screen(&output);
+        let row = frame
+            .lines()
+            .position(|line| {
+                line.contains("mock_stream_release_marker") && !line.contains("subagent")
+            })
+            .unwrap()
+            + 1;
+        process
+            .write(format!("\x1b[<0;6;{row}M\x1b[<0;6;{row}m").as_bytes())
+            .unwrap();
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Main is running · Esc return",
+            "did not enter the live child",
+        );
+    }
+    if matches!(
+        scenario,
+        ReturnScenario::QuitBySignal | ReturnScenario::QuitByKeyboard
+    ) {
+        assert!(!marker.exists());
+        let (started, trigger, code) = if matches!(scenario, ReturnScenario::QuitByKeyboard) {
+            process.write(b"\x03").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let frame = reconstruct_screen(&output);
+                if !frame.contains("Main is running") && !frame.contains("Esc interrupt") {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "turns did not settle: {frame}");
+                if let Some(chunk) = process.receive_output(Duration::from_millis(100)) {
+                    output.extend_from_slice(&chunk);
+                }
+            }
+            process.write(b"\x03").unwrap();
+            assert_screen_has_text(
+                &process,
+                &mut output,
+                "Press Ctrl+C again to quit",
+                "keyboard quit was not armed",
+            );
+            let started = Instant::now();
+            process.write(b"\x03").unwrap();
+            (started, "keyboard (last Ctrl+C)", 130)
+        } else {
+            let started = Instant::now();
+            process.sigterm();
+            (started, "SIGTERM", 143)
+        };
+        let status = process.wait_for_exit(Duration::from_secs(10));
+        eprintln!(
+            "running agent and main: {trigger} to exit {:.3} s",
+            started.elapsed().as_secs_f64()
+        );
+        assert_eq!(status.code(), Some(code));
+        process.close_io_and_join();
+        return;
+    }
+    if queue_next_turn {
+        std::fs::write(&marker, b"").unwrap();
+    }
+    if queued_approval {
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "This agent has finished. Its conversation is read-only.",
+            "the agent did not settle before the queued approval",
+        );
+        process.write(b"/side\r").unwrap();
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "side conversations are unavailable while a child is focused",
+            "controller did not answer in the finished agent's view",
+        );
+    }
+    if approval || queued_approval {
+        std::fs::write(&ask, b"").unwrap();
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Main needs your approval",
+            "main did not ask during the visit",
+        );
+        process.write(b"\x1b").unwrap();
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Approve · edit",
+            "Esc did not restore main's request",
+        );
+        process.write(b"4").unwrap();
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Denied. Tell Orca what to do instead.",
+            "returned approval did not take the answer",
+        );
+        std::fs::write(&marker, b"").unwrap();
+        arm_idle_exit(&mut process, &mut output);
+        let status = process.wait_for_exit(Duration::from_secs(5));
+        process.close_io_and_join();
+        assert_eq!(status.code(), Some(130));
+        assert_eq!(
+            std::fs::read_to_string(cwd.path().join("witness.txt")).unwrap(),
+            "before"
+        );
+        return;
+    }
+    if queued_tool {
+        let prefix = "Mock slow tool stream started.";
+        if visit {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !session_contains(
+                &home.path().join("sessions"),
+                &format!(r#""text":"{prefix}\n""#),
+            ) {
+                assert!(Instant::now() < deadline, "queued tool turn did not stream");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            std::fs::write(&ask, b"").unwrap();
+            while !session_contains(
+                &home.path().join("sessions"),
+                r#""name":"read_file","terminal":{"kind":"Success""#,
+            ) {
+                assert!(
+                    Instant::now() < deadline,
+                    "queued tool did not finish during visit"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            process.write(b"\x1b").unwrap();
+        }
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            prefix,
+            "missing open text before tool",
+        );
+        std::fs::write(&ask, b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(chunk) = process.receive_output(Duration::from_millis(100)) {
+                output.extend_from_slice(&chunk);
+            }
+            let frame = reconstruct_screen(&output);
+            if let Some((_, after)) = frame.split_once(prefix)
+                && let Some((tool_rows, _)) =
+                    after.split_once("Mock completed after tool execution.")
+                && tool_rows
+                    .lines()
+                    .any(|row| row.contains("✓ read") && row.contains("witness.txt"))
+            {
+                assert_eq!(frame.matches(prefix).count(), 1, "{frame}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "queued text/tool/tail not in order:\n{frame}"
+            );
+        }
+        arm_idle_exit(&mut process, &mut output);
+        let status = process.wait_for_exit(Duration::from_secs(5));
+        process.close_io_and_join();
+        assert_eq!(status.code(), Some(130));
+        return;
+    }
+    if queue_next_turn {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !session_contains(
+            &home.path().join("sessions"),
+            r#""text":"Mock slow stream started.""#,
+        ) {
+            assert!(
+                Instant::now() < deadline,
+                "queued main turn did not stream while visiting"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    if interrupt {
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Main is running · Esc return",
+            "queued main is not running behind the finished child",
+        );
+        process.drain_output(&mut output);
+        let queued_record = std::fs::read_dir(home.path().join("operations"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension().is_some_and(|ext| ext == "jsonl")
+                    && std::fs::read_to_string(path).is_ok_and(|record| {
+                        record.contains(r#""type":"turn_started""#)
+                            && !record.contains(r#""type":"operation_terminal""#)
+                    })
+            })
+            .expect("the queued turn is the remaining open operation");
+        process.write(b"\x03").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Some(chunk) = process.receive_output(Duration::from_millis(100)) {
+                output.extend_from_slice(&chunk);
+            }
+            let frame = reconstruct_screen(&output);
+            assert!(!frame.contains("Press Ctrl+C again"), "{frame}");
+            if std::fs::read_to_string(&queued_record)
+                .unwrap()
+                .contains(r#""terminal":{"cancelled""#)
+                && !frame.contains("Main is running")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{frame}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        process.write(b"\x1b").unwrap();
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Task cancelled",
+            "Esc did not rebuild the interrupted main turn",
+        );
+        let frame = reconstruct_screen(&output);
+        assert!(
+            !frame.contains("Esc interrupt") && !frame.contains("Mock slow stream completed."),
+            "{frame}"
+        );
+        arm_idle_exit(&mut process, &mut output);
+        let status = process.wait_for_exit(Duration::from_secs(5));
+        process.close_io_and_join();
+        assert_eq!(status.code(), Some(130));
+        return;
+    }
+    process.write(b"\x1b").unwrap();
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Mock completed after tool execution.",
+        "did not return to main",
+    );
+    if queue_next_turn {
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Mock slow stream started.",
+            "main's open text did not return",
+        );
+    }
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Esc interrupt",
+        "main's running row did not return",
+    );
+    let frame = reconstruct_screen(&output);
+    assert!(
+        !frame.contains("Inherited conversation context."),
+        "{frame}"
+    );
+    assert!(
+        frame.lines().any(|line| line.contains("Running")
+            && line.contains("Esc interrupt")
+            && !line.contains("Main is running")),
+        "{frame}"
+    );
+    if queue_next_turn {
+        assert!(
+            frame.contains("Mock slow stream started.")
+                && frame.contains("Esc interrupt")
+                && !frame.contains("Mock slow stream completed."),
+            "{frame}"
+        );
+        assert_screen_has_text(
+            &process,
+            &mut output,
+            "Mock slow stream started.Mock slow stream completed.",
+            "the restored reply did not continue",
+        );
+        let frame = reconstruct_screen(&output);
+        assert_eq!(
+            frame
+                .matches("Mock slow stream started.Mock slow stream completed.")
+                .count(),
+            1,
+            "{frame}"
+        );
+        assert_eq!(
+            frame.matches("Mock slow stream started.").count(),
+            1,
+            "{frame}"
+        );
+    } else {
+        assert!(frame.contains("Agents 1 active"), "{frame}");
+        assert_eq!(frame.matches("Delegating to 1 agent").count(), 1, "{frame}");
+        std::fs::write(&marker, b"").unwrap();
+    }
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130));
+}
+
+fn session_contains(path: &std::path::Path, needle: &str) -> bool {
+    std::fs::read_dir(path).unwrap().flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            session_contains(&path, needle)
+        } else {
+            path.extension().is_some_and(|ext| ext == "jsonl")
+                && std::fs::read_to_string(path).unwrap().contains(needle)
+        }
+    })
+}
+
+#[test]
 fn tui_click_on_a_running_background_agent_opens_its_transcript() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");
@@ -740,20 +1411,31 @@ fn tui_click_on_a_running_background_agent_opens_its_transcript() {
     process
         .write(format!("\x1b[<0;6;{row}M\x1b[<0;6;{row}m").as_bytes())
         .expect("click the running agent");
-    assert_screen_shows(
-        &process,
-        &mut output,
-        "Agent Transcript",
-        "clicking the running agent did not open its transcript",
-    );
-    // The parent turn keeps waiting on the agent, and the panel is answered
-    // anyway: the agent is still in its first step, so its live activity.
-    assert_screen_shows(
-        &process,
-        &mut output,
-        "No transcript checkpoint yet",
-        "the running agent's panel was not answered while the parent turn ran",
-    );
+    // The parent turn keeps waiting on the agent, and the click is answered
+    // anyway. The agent runs on a thread of this process, and its row names
+    // that thread once the thread has started: a click after that takes the
+    // view to the agent's live conversation. A click that lands first opens
+    // the agent's panel, which says a checkpoint is still to come until the
+    // row names the thread and then shows the agent's live activity.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if screen_contains(&output, "Esc return")
+            || (screen_contains(&output, "Agent Transcript")
+                && screen_contains(&output, "Live activity"))
+        {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "clicking the running agent did not show its live work while the parent turn ran; \
+             reconstructed screen=\n{}",
+            reconstruct_screen(&output)
+        );
+        if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
+            output.extend_from_slice(&chunk);
+        }
+    }
 
     std::fs::write(&release_marker, b"release").expect("release background agent");
     arm_idle_exit(&mut process, &mut output);
@@ -880,6 +1562,172 @@ fn tui_bracketed_image_path_paste_materializes_an_atomic_attachment() {
 }
 
 #[test]
+fn tui_a_finished_agent_opens_its_conversation_now_and_after_a_resume() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n").unwrap();
+    for resumed in [false, true] {
+        let mut output = Vec::new();
+        let mut process = if resumed {
+            let process =
+                PtyProcess::spawn_resumed_without_prompt(home.path(), cwd.path(), "latest")
+                    .unwrap();
+            assert_screen_has_text(
+                &process,
+                &mut output,
+                "Resumed saved conversation.",
+                "main did not resume",
+            );
+            process
+        } else {
+            let mut process =
+                PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "subagent sync mock_usage")
+                    .unwrap();
+            accept_new_workspace(&mut process, &mut output);
+            wait_for_screen(
+                &process,
+                &mut output,
+                |frame| {
+                    frame.contains("Agent completed:")
+                        && frame.contains("Mock completed after tool execution.")
+                        && !frame.contains("Esc interrupt")
+                },
+                "main did not finish the delegation",
+            );
+            process
+        };
+        process.write(b"/agents\r").unwrap();
+        wait_for_screen(
+            &process,
+            &mut output,
+            |frame| frame.contains("Tasks Workspace") && frame.contains("mock_usage"),
+            "agent row not ready",
+        );
+        process.write(b"\r").unwrap();
+        let frame = wait_for_screen(
+            &process,
+            &mut output,
+            |frame| {
+                frame.contains("This agent has finished. Its conversation is read-only.")
+                    && frame.contains("Main is idle · Esc return")
+            },
+            "ended agent did not open",
+        );
+        if resumed {
+            assert!(
+                !frame.contains("You are a delegated child agent"),
+                "{frame}"
+            );
+            assert_eq!(
+                frame
+                    .lines()
+                    .filter_map(|line| line.trim_start().strip_prefix('›'))
+                    .map(str::trim)
+                    .find(|text| !text.is_empty()),
+                Some("mock_usage"),
+                "{frame}"
+            );
+        }
+        assert!(
+            frame.contains("Mock runtime completed with usage accounting."),
+            "{frame}"
+        );
+        assert!(frame.contains("Main is idle · Esc return"), "{frame}");
+        assert!(
+            !frame.contains("Showing its last checkpoint") && !frame.contains("Esc interrupt"),
+            "{frame}"
+        );
+        process.write(b"keep this draft\r").unwrap();
+        let frame = wait_for_screen(
+            &process,
+            &mut output,
+            |frame| {
+                frame.contains(
+                    "this agent has finished: return to the main conversation to send a message",
+                )
+            },
+            "finished message not handed back",
+        );
+        assert!(frame.contains("keep this draft"), "{frame}");
+        process.write(&[0x1b]).unwrap();
+        wait_for_screen(
+            &process,
+            &mut output,
+            |frame| {
+                frame.contains("Delegating to 1 agent")
+                    && !frame.contains("Its conversation is read-only.")
+            },
+            "Esc did not return to main",
+        );
+        process.write(&[0x15]).unwrap();
+        arm_idle_exit(&mut process, &mut output);
+        assert_eq!(
+            process.wait_for_exit(Duration::from_secs(5)).code(),
+            Some(130)
+        );
+        process.close_io_and_join();
+    }
+}
+
+#[test]
+fn tui_resume_shows_what_the_agents_did() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "mode = \"full-auto\"\n").unwrap();
+    let prompt = "subagent batch async mock_stream_delay_ms 500";
+    let mut process = PtyProcess::spawn_with_prompt(home.path(), cwd.path(), prompt).unwrap();
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    let ended = "Agent completed: mock_stream_delay_ms 500";
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while reconstruct_screen(&output).matches(ended).count() < 2 {
+        assert!(Instant::now() < deadline, "{}", reconstruct_screen(&output));
+        if let Some(chunk) = process.receive_output(Duration::from_millis(100)) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+    arm_idle_exit(&mut process, &mut output);
+    assert_eq!(
+        process.wait_for_exit(Duration::from_secs(5)).code(),
+        Some(130)
+    );
+    process.close_io_and_join();
+    let mut resumed =
+        PtyProcess::spawn_resumed_without_prompt(home.path(), cwd.path(), "latest").unwrap();
+    let mut output = Vec::new();
+    assert_screen_has_text(
+        &resumed,
+        &mut output,
+        "Resumed saved conversation.",
+        "main was not resumed",
+    );
+    let check_restored = |frame: String| {
+        let (history, later) = frame
+            .split_once("Resumed saved conversation.")
+            .expect("resume label");
+        for line in ["Delegating to 1 agent", ended] {
+            assert_eq!(history.matches(line).count(), 2, "{frame}");
+            assert!(!later.contains(line), "{frame}");
+        }
+    };
+    check_restored(reconstruct_screen(&output));
+    resumed.write(b"mock_history_echo\r").unwrap();
+    assert_screen_has_text(
+        &resumed,
+        &mut output,
+        "Mock history users:",
+        "post-resume turn did not answer",
+    );
+    check_restored(reconstruct_screen(&output));
+    arm_idle_exit(&mut resumed, &mut output);
+    assert_eq!(
+        resumed.wait_for_exit(Duration::from_secs(5)).code(),
+        Some(130)
+    );
+    resumed.close_io_and_join();
+}
+
+#[test]
 fn tui_restart_recovers_history_from_the_runtime_snapshot() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");
@@ -917,6 +1765,108 @@ fn tui_restart_recovers_history_from_the_runtime_snapshot() {
 }
 
 #[test]
+fn tui_side_close_restores_running_main_and_stream_once() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let mut process =
+        PtyProcess::spawn_with_prompt(home.path(), cwd.path(), "side close seed").unwrap();
+    let mut output = Vec::new();
+    accept_new_workspace(&mut process, &mut output);
+    assert_screen_has_text(&process, &mut output, ASSISTANT_SENTINEL, "main seed");
+    process.write(b"/side\r").unwrap();
+    assert_screen_has_text(&process, &mut output, "Ctrl+/ back", "open side");
+    process.write(b"\x1b[47;5u").unwrap();
+    assert_screen_has_text(&process, &mut output, "Side · Ctrl+/", "back on main");
+    let first = cwd.path().join("first");
+    let second = cwd.path().join("second");
+    std::fs::write(cwd.path().join("witness.txt"), "hello").unwrap();
+    process
+        .write(format!("mock_stream_release_marker {}\r", first.display()).as_bytes())
+        .unwrap();
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Esc interrupt",
+        "first main turn running",
+    );
+    process.write(format!("mock_stream_tool_release_marker {}\r",serde_json::json!({"marker":second,"toolPrompt":"read witness.txt","retainText":true})).as_bytes()).unwrap();
+    assert_screen_has_text(&process, &mut output, "Queued 1", "second turn queued");
+    std::fs::write(first, "").unwrap();
+    let prefix = "Mock slow tool stream started.";
+    assert_screen_has_text(&process, &mut output, prefix, "queued turn streaming");
+    process.write(b"\x1b[47;5u").unwrap();
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Ctrl+/ back",
+        "side visible while main runs",
+    );
+    let inherited = "Inherited conversation context.";
+    let side = wait_for_screen(
+        &process,
+        &mut output,
+        |screen| screen.contains(inherited) && screen.contains("Ctrl+/ back"),
+        "side inherited history",
+    );
+    assert_eq!(side.matches(inherited).count(), 1);
+    let assert_main = |frame: &str| {
+        assert!(!frame.contains(inherited), "{frame}");
+        let (_, after_prompt) = frame
+            .rsplit_once("mock_stream_tool_release_marker")
+            .expect("queued prompt visible");
+        let (before_reply, _) = after_prompt.split_once(prefix).expect("reply after prompt");
+        let (_, between) = before_reply.rsplit_once('}').expect("end of queued input");
+        assert!(
+            between.chars().all(|ch| ch.is_whitespace() || ch == '●'),
+            "{frame}"
+        );
+        assert_eq!(frame.matches(prefix).count(), 1, "{frame}");
+    };
+    process.write(b"\x1b[47;5u").unwrap();
+    let returned = wait_for_screen(
+        &process,
+        &mut output,
+        |screen| {
+            screen.contains("Side · Ctrl+/")
+                && screen.contains(prefix)
+                && screen.contains("Esc interrupt")
+        },
+        "toggle back to streaming main",
+    );
+    assert_main(&returned);
+    process.write(b"\x1b[47;5u").unwrap();
+    wait_for_screen(
+        &process,
+        &mut output,
+        |screen| screen.contains("Ctrl+/ back") && screen.contains(inherited),
+        "side restored before closing",
+    );
+    process.write(&[0x03]).unwrap();
+    let frame = wait_for_screen(
+        &process,
+        &mut output,
+        |screen| {
+            screen.contains("Running ")
+                && screen.contains("Esc interrupt")
+                && !screen.contains("Ctrl+/ back")
+        },
+        "side close did not restore running main",
+    );
+    assert_main(&frame);
+    std::fs::write(second, "").unwrap();
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Mock completed after tool execution.",
+        "main finished",
+    );
+    arm_idle_exit(&mut process, &mut output);
+    let status = process.wait_for_exit(Duration::from_secs(5));
+    process.close_io_and_join();
+    assert_eq!(status.code(), Some(130));
+}
+
+#[test]
 fn tui_side_conversation_is_separate_disposable_and_returns_to_parent() {
     let home = tempfile::tempdir().expect("temporary ORCA_HOME");
     let cwd = tempfile::tempdir().expect("temporary workspace");
@@ -943,6 +1893,12 @@ fn tui_side_conversation_is_separate_disposable_and_returns_to_parent() {
         "Ctrl+/ back",
         Duration::from_secs(5),
         "TUI did not open Side",
+    );
+    assert_screen_has_text(
+        &process,
+        &mut output,
+        "Inherited conversation context.",
+        "Side lost its inherited history label",
     );
     process
         .write(b"mock_history_echo\r")
@@ -2042,7 +2998,7 @@ fn tui_sigterm_during_a_turn_interrupts_it() {
     let turn = wait_for_a_turn_record(home.path(), "\"type\":\"turn_started\"");
     process.drain_output(&mut output);
     let signalled_at = output.len();
-    process.signal(libc::SIGTERM);
+    process.sigterm();
     let status = process.wait_for_exit(Duration::from_secs(5));
     process.close_io_and_join();
     process.drain_output(&mut output);
@@ -2236,6 +3192,29 @@ fn assert_screen_shows(process: &PtyProcess, output: &mut Vec<u8>, expected: &st
                 reconstruct_screen(output)
             );
         }
+        if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
+            output.extend_from_slice(&chunk);
+        }
+    }
+}
+
+fn wait_for_screen(
+    process: &PtyProcess,
+    output: &mut Vec<u8>,
+    matches: impl Fn(&str) -> bool,
+    failure: &str,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let screen = reconstruct_screen(output);
+        if matches(&screen) {
+            return screen;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{failure}; reconstructed screen=\n{screen}"
+        );
         if let Some(chunk) = process.receive_output(remaining.min(Duration::from_millis(250))) {
             output.extend_from_slice(&chunk);
         }
@@ -2613,6 +3592,10 @@ impl PtyProcess {
 
     fn pid(&self) -> u32 {
         self.child.as_ref().expect("PTY child remains owned").id()
+    }
+
+    fn sigterm(&self) {
+        self.signal(libc::SIGTERM);
     }
 
     /// Sends `signal` to the TUI, as `kill` does.

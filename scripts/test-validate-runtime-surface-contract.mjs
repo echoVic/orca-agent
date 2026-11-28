@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -613,6 +613,29 @@ expectReviewedDrift("source ACP dispositions cannot authorize themselves", (mani
         ]),
       }),
     "entrypoint validation ignores checkout line endings when a reviewed line drifts",
+  );
+}
+
+{
+  // A Windows checkout turns every line ending into CRLF, including the ones
+  // that end a comment inside a hashed function.
+  const sourceOverrides = new Map();
+  const visit = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(absolute);
+      else if (entry.isFile() && entry.name.endsWith(".rs")) {
+        sourceOverrides.set(
+          path.relative(repoRoot, absolute).split(path.sep).join("/"),
+          readFileSync(absolute, "utf8").replace(/\r?\n/g, "\r\n"),
+        );
+      }
+    }
+  };
+  visit(path.join(repoRoot, "crates/orca-tui/src"));
+  assert.doesNotThrow(
+    () => validateCurrentInventories(cloneManifest(), { repoRoot, sourceOverrides }),
+    "reviewed TUI function hashes ignore a CRLF checkout of every TUI source",
   );
 }
 

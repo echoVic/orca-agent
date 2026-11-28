@@ -259,6 +259,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: id.to_string(),
             created_at_ms,
+            sequence: 0,
             started_at_ms: Some(created_at_ms),
             completed_at_ms: None,
             command: None,

@@ -21,6 +21,7 @@ use super::reducer::canonical_batch_encoded_bytes;
 use orca_core::provider_types::ProviderRetry;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{
     Receiver as SyncReceiver, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
@@ -101,7 +102,8 @@ struct SurfaceSubscriber {
     queued_events: u64,
     queued_bytes: u64,
     claimed: bool,
-    gapped: bool,
+    origin_only: bool,
+    gapped: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -317,6 +319,7 @@ enum QueuedSubscriptionItem {
 }
 
 pub struct SurfaceSubscriptionReceiver {
+    gapped: Arc<AtomicBool>,
     hub: Weak<Mutex<SurfaceHubState>>,
     attachment_id: SurfaceAttachmentId,
     dispatcher: Option<Arc<dyn RuntimeSurfaceCommandDispatcher>>,
@@ -324,6 +327,10 @@ pub struct SurfaceSubscriptionReceiver {
 }
 
 impl SurfaceSubscriptionReceiver {
+    pub(crate) fn gap_signal(&self) -> Arc<AtomicBool> {
+        self.gapped.clone()
+    }
+
     pub fn try_recv(&mut self) -> Option<SurfaceSubscriptionItem> {
         let hub = self.hub.upgrade()?;
         let item = {
@@ -682,6 +689,21 @@ impl SurfaceHub {
         &self,
         handle: &SurfaceSubscriptionHandle,
     ) -> Option<SurfaceSubscriptionReceiver> {
+        self.claim_for_route(handle, false)
+    }
+
+    pub(crate) fn claim_origin_subscription(
+        &self,
+        handle: &SurfaceSubscriptionHandle,
+    ) -> Option<SurfaceSubscriptionReceiver> {
+        self.claim_for_route(handle, true)
+    }
+
+    fn claim_for_route(
+        &self,
+        handle: &SurfaceSubscriptionHandle,
+        origin_only: bool,
+    ) -> Option<SurfaceSubscriptionReceiver> {
         let attachment_id = handle.attachment_id();
         let mut state = lock(&self.inner);
         let subscriber = subscriber_mut(&mut state, attachment_id)?;
@@ -689,7 +711,9 @@ impl SurfaceHub {
             return None;
         }
         subscriber.claimed = true;
+        subscriber.origin_only = origin_only;
         Some(SurfaceSubscriptionReceiver {
+            gapped: subscriber.gapped.clone(),
             hub: Arc::downgrade(&self.inner),
             attachment_id: attachment_id.clone(),
             dispatcher: self.dispatcher.clone(),
@@ -1081,7 +1105,7 @@ impl SurfaceHub {
     ) {
         let mut state = lock(&self.inner);
         for subscriber in state.subscriptions.values_mut() {
-            if subscriber.gapped {
+            if subscriber.gapped.load(Ordering::Acquire) {
                 continue;
             }
             let previous_len = subscriber.queue.len();
@@ -1365,7 +1389,7 @@ impl SurfaceHub {
                     .subscriptions
                     .iter()
                     .filter(|(attachment_id, _)| excluded != Some(*attachment_id))
-                    .filter(|(_, subscriber)| eligible(subscriber))
+                    .filter(|(_, subscriber)| !subscriber.origin_only && eligible(subscriber))
                     .min_by_key(|(attachment_id, subscriber)| {
                         (
                             interaction_role_priority(subscriber.grant.role),
@@ -1554,7 +1578,8 @@ impl SurfaceHub {
                 queued_events: 0,
                 queued_bytes: 0,
                 claimed: false,
-                gapped: false,
+                origin_only: false,
+                gapped: Default::default(),
             },
         );
         (attachment_id, client, subscription, capabilities)
@@ -1773,7 +1798,7 @@ fn publish_batch(
         .map(|retained| retained.batch.cursor_before.clone());
     let mut overflowed = Vec::new();
     for (attachment_id, subscriber) in &mut state.subscriptions {
-        if subscriber.gapped {
+        if subscriber.gapped.load(Ordering::Acquire) {
             continue;
         }
         if !enqueue_batch(subscriber, batch.clone(), config) {
@@ -1784,7 +1809,7 @@ fn publish_batch(
                     retained_from: retained_from.clone(),
                     head: batch.batch.cursor_after.clone(),
                 }));
-            subscriber.gapped = true;
+            subscriber.gapped.store(true, Ordering::Release);
             overflowed.push(attachment_id.clone());
         }
     }
@@ -1857,7 +1882,7 @@ fn signal_gap(
                 retained_from: retained_from.clone(),
                 head: head.clone(),
             }));
-        subscriber.gapped = true;
+        subscriber.gapped.store(true, Ordering::Release);
         gapped.push(attachment_id.clone());
     }
     retire_subscriptions(state, &gapped);
@@ -1989,7 +2014,8 @@ mod tests {
             queued_events: 0,
             queued_bytes: 0,
             claimed: false,
-            gapped: false,
+            origin_only: false,
+            gapped: Default::default(),
         }
     }
 
@@ -2370,6 +2396,52 @@ mod tests {
                 Some(&attachment.attachment_id),
             ),
             Some(attachment.attachment_id)
+        );
+    }
+
+    #[test]
+    fn fix4_follow_accepts_its_own_request_but_never_a_foreign_fallback() {
+        let snapshot = reducer_snapshot();
+        let capabilities = NonEmptySet::try_new(BTreeSet::from([
+            SurfaceCapability::ReadSnapshot,
+            SurfaceCapability::RespondGrantedInteraction,
+        ]))
+        .unwrap();
+        let kind = SurfaceInteractionKind::UserInput;
+        let authority = SurfaceAttachAuthority::new(
+            HostIncarnation::try_from_bytes(uuid_v7_bytes(223)).unwrap(),
+            snapshot.thread.thread_id.clone(),
+            SurfaceAttachmentRole::Tui,
+            capabilities.clone(),
+            NonEmptySet::try_new(BTreeSet::from([SurfaceCapability::ReadSnapshot])).unwrap(),
+            BTreeSet::from([kind]),
+        );
+        let hub =
+            SurfaceHub::from_authority(snapshot.clone(), authority, Default::default()).unwrap();
+        hub.repair_committed(Arc::new(snapshot), &[]);
+        let attach = || match hub.attach_fresh(FreshAttachRequest {
+            request_id: SurfaceRequestId::new(),
+            role: SurfaceAttachmentRole::Tui,
+            requested_capabilities: capabilities.as_set().clone(),
+            interaction_capabilities: BTreeSet::from([kind]),
+        }) {
+            AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("attach failed"),
+        };
+        let followed = attach();
+        let _origin = hub
+            .claim_origin_subscription(&followed.subscription)
+            .unwrap();
+        assert_eq!(
+            hub.select_interaction_attachment_for(kind, Some(&followed.attachment_id)),
+            Some(followed.attachment_id.clone())
+        );
+        assert_eq!(hub.select_interaction_attachment_for(kind, None), None);
+        let ordinary = attach();
+        let _receiver = hub.claim_subscription(&ordinary.subscription).unwrap();
+        assert_eq!(
+            hub.select_interaction_attachment_for(kind, None),
+            Some(ordinary.attachment_id)
         );
     }
 

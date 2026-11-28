@@ -784,9 +784,19 @@ impl<'a> ExecutionScope<'a> {
         parent_task_id: Option<String>,
         now_ms: i64,
     ) -> Result<Submission, AdmissionRefusal> {
-        self.submit_subagent_with_intent(description, agent_type, parent_task_id, now_ms, None)
+        self.submit_subagent_with_intent(
+            description,
+            agent_type,
+            parent_task_id,
+            now_ms,
+            None,
+            false,
+        )
     }
 
+    /// Submits a subagent recorded with `launch_intent`, and as getting a
+    /// thread of its own in this process when `gets_a_thread_of_its_own`
+    /// (see `TaskRegistry::create_subagent_with_parent_and_intent`).
     pub(crate) fn submit_subagent_with_intent(
         &self,
         description: String,
@@ -794,6 +804,7 @@ impl<'a> ExecutionScope<'a> {
         parent_task_id: Option<String>,
         now_ms: i64,
         launch_intent: Option<crate::tasks::QueuedSubagentLaunchIntent>,
+        gets_a_thread_of_its_own: bool,
     ) -> Result<Submission, AdmissionRefusal> {
         let _lock = self
             .registry
@@ -808,6 +819,7 @@ impl<'a> ExecutionScope<'a> {
                 agent_type,
                 parent_task_id,
                 launch_intent,
+                gets_a_thread_of_its_own,
             );
             let record = self.registry.get(&handle.id);
             // A child submitted into an already-cancelled tree is recorded as

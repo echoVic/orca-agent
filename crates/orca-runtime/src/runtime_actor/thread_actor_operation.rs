@@ -2041,15 +2041,43 @@ impl ThreadActor {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        let next_revision =
-            surface::TaskRevision::try_new(surfaced.revision.get().saturating_add(1))
-                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        self.commit_running_task_refresh(
+            request_id,
+            surface::MutationTarget::Task {
+                thread_id: snapshot.thread.thread_id,
+                task_id: surfaced.task_id.clone(),
+            },
+            &surfaced,
+        )
+    }
+
+    /// Commits `task` as running at its next revision and answers
+    /// `request_id` with it. The task was running and still is, so nothing
+    /// reads this as news; it is how a task control is answered while what
+    /// it asked for is under way, and it lands in the single-event
+    /// running-to-running arm of the actor's permit.
+    fn commit_running_task_refresh(
+        &mut self,
+        request_id: surface::SurfaceRequestId,
+        target: surface::MutationTarget,
+        task: &surface::SurfaceTask,
+    ) -> Result<
+        surface::MutationReply<surface::TaskControlOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let next_revision = surface::TaskRevision::try_new(
+            task.revision
+                .get()
+                .checked_add(1)
+                .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?,
+        )
+        .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         let batch = self.surface_event_batch_with_commit_id(
             vec![(
                 surface::SurfaceScope::Thread,
                 surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
-                    task_id: surfaced.task_id.clone(),
-                    expected_revision: surfaced.revision,
+                    task_id: task.task_id.clone(),
+                    expected_revision: task.revision,
                     next_revision,
                     status: surface::SurfaceTaskStatus::Running,
                     completed_at: None,
@@ -2067,16 +2095,13 @@ impl ThreadActor {
             .snapshot()
             .tasks
             .iter()
-            .find(|task| task.task_id == surfaced.task_id)
+            .find(|candidate| candidate.task_id == task.task_id)
             .cloned()
             .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
         Ok(surface::MutationReply::Committed {
             mutation: surface::CommittedMutation {
                 request_id,
-                target: surface::MutationTarget::Task {
-                    thread_id: snapshot.thread.thread_id,
-                    task_id: committed_task.task_id.clone(),
-                },
+                target,
                 disposition: surface::MutationDisposition::Accepted,
                 acknowledgements: surface::NonEmptyVec::try_new(vec![
                     surface::MutationCommitAck::ThreadLocalCursor {
@@ -2086,7 +2111,7 @@ impl ThreadActor {
                         commit_class: batch.commit_class.clone(),
                     },
                 ])
-                .expect("child continuation commit has one acknowledgement"),
+                .expect("a running task refresh commits one acknowledgement"),
             },
             value: surface::TaskControlOutput {
                 task: committed_task,
@@ -2095,11 +2120,118 @@ impl ThreadActor {
         })
     }
 
+    /// Whether a person's stop names a child, running on this surface, that
+    /// the turn `active` keeps on a thread of this process; see
+    /// [`is_running_kept_subagent`].
+    fn is_running_kept_subagent(
+        &self,
+        active: &ActiveOperation,
+        subagent: &surface::SurfaceSubagent,
+    ) -> bool {
+        is_running_kept_subagent(
+            active.surface_operation.as_ref(),
+            subagent,
+            self.agent_controller
+                .as_ref()
+                .is_some_and(|controller| controller.keeps_subagents_in_process()),
+            active.task_registry.get(subagent.task_id.as_str()).as_ref(),
+        )
+    }
+
+    /// Stops one child the running turn keeps on a thread of this process.
+    ///
+    /// The registry marks the child stopping and cancels its turn, and
+    /// returns at once; this actor does not wait for the child, whose end
+    /// reaches the parent through this same actor. That end, the child's own
+    /// cancelled completion, is what writes the parent's surface, and is
+    /// shown as stopped because the task is remembered here as stopped by a
+    /// person. What is committed now only answers the request: the task is
+    /// still running until the child has ended.
+    ///
+    /// A child already being stopped, by the `task_stop` tool or by its
+    /// parent's interrupt, is answered the same way but not remembered: that
+    /// stop is not a person's, and its end stays cancelled. A child whose
+    /// record has ended is answered as ended. The stop is remembered before
+    /// the answer is committed and the registry asked, and forgotten if
+    /// either fails, so a failure leaves the child running and not
+    /// remembered, or stopping and remembered.
+    fn stop_kept_subagent(
+        &mut self,
+        active: &ActiveOperation,
+        request_id: surface::SurfaceRequestId,
+        target: surface::MutationTarget,
+        task: &surface::SurfaceTask,
+        current_revision: Option<surface::SurfaceMutationRevision>,
+    ) -> Result<
+        surface::MutationReply<surface::TaskControlOutput>,
+        surface::SurfaceClientCommandError,
+    > {
+        let task_id = task.task_id.as_str();
+        let record = active
+            .task_registry
+            .get(task_id)
+            .ok_or(surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        if !record.status.is_active() {
+            return Ok(subagent_already_terminal(
+                request_id,
+                target,
+                current_revision,
+            ));
+        }
+        let remember = !record.stop_requested;
+        // The record's control carries the stop to the child's worker, which
+        // tells the parent that the person stopped it.
+        if remember {
+            self.subagents_stopped_by_person.insert(task_id.to_string());
+            record.control.mark_stopped_by_person();
+        }
+        let reply = match self.commit_running_task_refresh(request_id.clone(), target.clone(), task)
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                if remember {
+                    self.subagents_stopped_by_person.remove(task_id);
+                    record.control.forget_stopped_by_person();
+                }
+                return Err(error);
+            }
+        };
+        if remember && active.task_registry.request_stop(task_id).is_err() {
+            self.subagents_stopped_by_person.remove(task_id);
+            record.control.forget_stopped_by_person();
+            let ended = active
+                .task_registry
+                .get(task_id)
+                .is_none_or(|record| !record.status.is_active());
+            if !ended {
+                return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
+            }
+            let snapshot = self.resident_surface.coordinator.state().snapshot();
+            let current_revision = snapshot
+                .tasks
+                .iter()
+                .find(|candidate| candidate.task_id == task.task_id)
+                .map(|candidate| surface::SurfaceMutationRevision::Task {
+                    thread_id: snapshot.thread.thread_id.clone(),
+                    revision: candidate.revision,
+                });
+            return Ok(subagent_already_terminal(
+                request_id,
+                target,
+                current_revision,
+            ));
+        }
+        Ok(reply)
+    }
+
+    /// `active` is the turn running on this thread, if one is: a child it
+    /// keeps on a thread of this process can be stopped only while it runs.
     pub(super) fn control_surface_task(
         &mut self,
         client: &surface::RuntimeSurfaceClientHandle,
         request_id: surface::SurfaceRequestId,
         action: surface::TaskControlAction,
+        active: Option<&ActiveOperation>,
     ) -> Result<
         surface::MutationReply<surface::TaskControlOutput>,
         surface::SurfaceClientCommandError,
@@ -2202,18 +2334,11 @@ impl ThreadActor {
                     | surface::SurfaceTaskStatus::Blocked
                     | surface::SurfaceTaskStatus::Cancelled
             ) {
-                return Ok(surface::MutationReply::Uncommitted {
-                    mutation: surface::UncommittedMutation::Invalid {
-                        request_id,
-                        target: Some(target),
-                        error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
-                            code: surface::SurfaceMutationErrorCode::IllegalState,
-                            message: surface::DisplayText::new("subagent task is already terminal"),
-                            winning_request_id: None,
-                            current_revision,
-                        }),
-                    },
-                });
+                return Ok(subagent_already_terminal(
+                    request_id,
+                    target,
+                    current_revision,
+                ));
             }
             let Some(subagent_id) = task.subagent_id.as_ref() else {
                 return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
@@ -2226,6 +2351,17 @@ impl ThreadActor {
             else {
                 return Err(surface::SurfaceClientCommandError::RuntimeUnavailable);
             };
+            if let Some(active) = active
+                && self.is_running_kept_subagent(active, &subagent)
+            {
+                return self.stop_kept_subagent(
+                    active,
+                    request_id,
+                    target,
+                    &task,
+                    current_revision,
+                );
+            }
             if !matches!(
                 subagent.owner,
                 surface::SurfaceSubagentOwner::DetachedTask { .. }
@@ -2238,7 +2374,7 @@ impl ThreadActor {
                         error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
                             code: surface::SurfaceMutationErrorCode::IllegalState,
                             message: surface::DisplayText::new(
-                                "only a running detached subagent can be stopped independently",
+                                "this subagent cannot be stopped independently",
                             ),
                             winning_request_id: None,
                             current_revision,
@@ -3903,16 +4039,60 @@ impl ThreadActor {
     /// a wake for finished agents) as an operation of the surface, so the
     /// conversation holds the turn when a surface reads it back: after a
     /// switch to another view and back, and after a resume. It is admitted
-    /// the way a turn typed into the terminal is, under an attachment of its
-    /// own that no client holds.
+    /// the way a turn typed into the terminal is, with the follow attachment
+    /// as its interaction responder when the TUI observes it.
     ///
-    /// `Err` means no turn was started and nothing of one is left waiting:
-    /// the caller starts it the way a thread with no surface does.
+    /// On refusal a surface-observed queue rolls back and pauses rather
+    /// than running the input a second time outside the surface.
     pub(super) fn start_runtime_turn_on_surface(
         &mut self,
         prompt: &str,
         images: &[orca_core::conversation::ImageInput],
         runtime_started: RuntimeStartedTurn,
+    ) -> Result<OperationId, surface::SurfaceClientCommandError> {
+        self.start_runtime_turn_on_surface_with_output(prompt, images, runtime_started, None)
+    }
+
+    /// A delegated child turn, started as an operation of the child's
+    /// surface so a view of the child can follow it. Gives back the handle
+    /// the delegating controller settles on.
+    pub(super) fn start_delegated_turn_on_surface(
+        &mut self,
+        prompt: &str,
+        runtime_started: RuntimeStartedTurn,
+        writer: Box<dyn HostedOperationWriter>,
+    ) -> Result<OperationHandle, RuntimeHostError> {
+        // Seam for a_delegated_turn_that_the_surface_refuses_still_runs; cf. RuntimeSurfaceBackgroundControl::for_canonical_input.
+        #[cfg(test)]
+        if prompt == REFUSE_DELEGATED_SURFACE_TURN_FOR_TEST {
+            return Err(RuntimeHostError::ThreadStartFailed {
+                message: "the child's surface was told to refuse the turn".to_string(),
+            });
+        }
+        let operation_id = self
+            .start_runtime_turn_on_surface_with_output(prompt, &[], runtime_started, Some(writer))
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("the child's surface did not admit the turn: {error:?}"),
+            })?;
+        let active = self
+            .active
+            .as_ref()
+            .filter(|active| active.operation_id == operation_id)
+            .ok_or(RuntimeHostError::ThreadUnavailable)?;
+        Ok(OperationHandle {
+            operation_id: active.operation_id,
+            initial_generation: GenerationFence::initial(active.operation_id),
+            thread: self.handle.clone(),
+            completion: active.completion.clone(),
+        })
+    }
+
+    fn start_runtime_turn_on_surface_with_output(
+        &mut self,
+        prompt: &str,
+        images: &[orca_core::conversation::ImageInput],
+        runtime_started: RuntimeStartedTurn,
+        output_writer: Option<Box<dyn HostedOperationWriter>>,
     ) -> Result<OperationId, surface::SurfaceClientCommandError> {
         const UNAVAILABLE: surface::SurfaceClientCommandError =
             surface::SurfaceClientCommandError::RuntimeUnavailable;
@@ -3943,8 +4123,42 @@ impl ThreadActor {
                 expected_policy_epoch: settings.effective.policy_epoch,
             },
         };
-        let origin = surface::SurfaceAttachmentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
-            .expect("generated UUID is v7");
+        let followed = if let Some(sender) = &runtime_started.surface_observers {
+            let surface = self.handle.surface();
+            let surface::AttachResult::FreshAttached { attachment } =
+                surface.attach_fresh(surface::FreshAttachRequest {
+                    request_id: surface::SurfaceRequestId::new(),
+                    role: surface::SurfaceAttachmentRole::Tui,
+                    requested_capabilities: BTreeSet::from([
+                        surface::SurfaceCapability::ReadSnapshot,
+                        surface::SurfaceCapability::RespondGrantedInteraction,
+                    ]),
+                    interaction_capabilities: BTreeSet::from([
+                        surface::SurfaceInteractionKind::ToolApproval,
+                        surface::SurfaceInteractionKind::PermissionRequest,
+                        surface::SurfaceInteractionKind::UserInput,
+                        surface::SurfaceInteractionKind::McpElicitation,
+                    ]),
+                })
+            else {
+                return Err(UNAVAILABLE);
+            };
+            let subscription = self
+                .resident_surface
+                .hub
+                .claim_origin_subscription(&attachment.subscription)
+                .ok_or(UNAVAILABLE)?;
+            Some((sender, attachment, subscription))
+        } else {
+            None
+        };
+        let origin = followed
+            .as_ref()
+            .map(|(_, attachment, _)| attachment.attachment_id.clone())
+            .unwrap_or_else(|| {
+                surface::SurfaceAttachmentId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                    .expect("generated UUID is v7")
+            });
         let reserved = match self.reserve_surface_operation(
             surface::SurfaceRequestId::new(),
             intent,
@@ -3958,13 +4172,41 @@ impl ThreadActor {
             }
         };
         let operation_id = reserved.operation_id;
+        if let Some((follows, attachment, subscription)) = followed {
+            let (failure, terminal_failure) = mpsc::channel();
+            let gapped = subscription.gap_signal();
+            let follow = QueueSurfaceFollow {
+                operation: operation_id.clone(),
+                client: attachment.client,
+                baseline: attachment.baseline,
+                subscription,
+                terminal_failure,
+            };
+            if follows.send(follow).is_err() {
+                let _ = self.terminalize_surface_reservation(
+                    operation_id,
+                    surface::ReservationFinalizerReason::AdmissionRejected {
+                        reason: surface::AdmissionRejectionReason::ConfigurationConflict,
+                    },
+                    surface::NotAdmittedReason::ConfigurationConflict,
+                );
+                return Err(UNAVAILABLE);
+            }
+            self.operation_recovery.followed = Some(
+                crate::runtime_actor::operation_recovery::ActiveSurfaceFollow {
+                    operation: operation_id.clone(),
+                    failure,
+                    gapped,
+                },
+            );
+        }
         let prepared = self
             .prepare_surface_admission_from(
                 &origin,
                 surface::SurfaceRequestId::new(),
                 operation_id.clone(),
                 reserved.lease.lease_id,
-                None,
+                output_writer,
                 Some(runtime_started),
             )
             .and_then(|(prepared, goal_work)| match goal_work {
@@ -4615,7 +4857,17 @@ impl ThreadActor {
 
         // Record the registry root under the admitted generation before execution.
         // StartTurn consumes this same task; the loop task remains a separate ID.
-        let main_session_task = if goal_identity.is_none() {
+        // A hosted child's delegated task is its execution identity. A
+        // main-session record for it would sit in the shared registry and
+        // never be settled.
+        let hosted_child = self.state.as_ref().is_some_and(|state| {
+            state
+                .thread
+                .thread_extensions()
+                .get::<crate::agent_controller::AgentThreadPolicy>()
+                .is_some()
+        });
+        let main_session_task = if goal_identity.is_none() && !hosted_child {
             let registry = self
                 .state
                 .as_ref()
@@ -4673,9 +4925,21 @@ impl ThreadActor {
 
         let interaction_command_tx = self.handle.command_tx.clone();
         let interaction_fence = fence.clone();
-        let background_control = Arc::new(RuntimeSurfaceBackgroundControl::for_canonical_input(
+        let mut background_control = RuntimeSurfaceBackgroundControl::for_canonical_input(
             resolved_input.canonical_text.as_str(),
-        ));
+        );
+        // The turn's subagents that this host keeps in its process are
+        // recorded under its main-session task.
+        if self
+            .agent_controller
+            .as_ref()
+            .is_some_and(|controller| controller.keeps_subagents_in_process())
+            && let Some((registry, task_id)) = &main_session_task
+        {
+            background_control = background_control
+                .refused_while_kept_subagents_run(registry.clone(), task_id.clone());
+        }
+        let background_control = Arc::new(background_control);
         let generation_background_control = Arc::clone(&background_control);
         #[cfg(test)]
         let provider_input = resolved_input
@@ -4701,7 +4965,9 @@ impl ThreadActor {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let answered_by_the_surface = runtime_started.is_none();
+        let answered_by_the_surface = runtime_started
+            .as_ref()
+            .is_none_or(|started| started.surface_observers.is_some());
         let mut hosted_request =
             if matches!(operation.intent.origin, surface::OperationOrigin::Headless) {
                 HostedTurnRequest::headless_session(provider_input)
@@ -4742,9 +5008,6 @@ impl ThreadActor {
                             fence: interaction_fence.clone(),
                         },
                     ));
-                // Whoever shows the thread answers what a turn the thread
-                // started on its own asks: no surface client admitted it, so
-                // none is there to answer.
                 if answered_by_the_surface {
                     handlers
                         .with_approval_handler(Arc::new(RuntimeSurfaceApprovalHandler {
@@ -4774,7 +5037,7 @@ impl ThreadActor {
                 }
             });
         if let Some(started) = runtime_started {
-            hosted_request = started.apply(hosted_request);
+            hosted_request = started.apply_on_surface(hosted_request);
         }
         if let Some((_, task_id)) = &main_session_task {
             hosted_request = hosted_request.with_task_id(task_id.clone());
@@ -5424,6 +5687,14 @@ impl ThreadActor {
 
     pub(super) fn cache_surface_terminal(&mut self, value: surface::OperationTerminalAtCursor) {
         let operation_id = value.operation_id.clone();
+        if self
+            .operation_recovery
+            .followed
+            .as_ref()
+            .is_some_and(|follow| follow.operation == operation_id)
+        {
+            self.operation_recovery.followed = None;
+        }
         self.clear_ephemeral_reservation_expiry(&operation_id);
         self.operation_recovery
             .live_input_capsules
@@ -5501,6 +5772,15 @@ impl ThreadActor {
     pub(super) fn cache_surface_terminal_failure(&mut self, pending: PendingSurfaceTerminalCommit) {
         let operation_id = pending.value.operation_id.clone();
         let failure = pending.failure.clone();
+        if self
+            .operation_recovery
+            .followed
+            .as_ref()
+            .is_some_and(|follow| follow.operation == operation_id)
+            && let Some(follow) = self.operation_recovery.followed.take()
+        {
+            let _ = follow.failure.send(failure.clone());
+        }
         self.operation_recovery.terminal_blocked =
             Some("typed surface terminal commit failed and requires cold recovery".to_string());
         self.resident_surface
@@ -5987,33 +6267,14 @@ impl ThreadActor {
                         status: RunStatus::Cancelled,
                         ..
                     }),
-                ) => {
-                    let cause = active
-                        .surface_terminalization
-                        .unwrap_or(surface::TerminalizationCause::UserCancel);
-                    let terminal = match cause {
-                        surface::TerminalizationCause::HostShutdown => {
-                            surface::OperationTerminal::Shutdown {
-                                reason: surface::SurfaceShutdownReason::HostShutdown,
-                            }
-                        }
-                        surface::TerminalizationCause::ThreadClose => {
-                            surface::OperationTerminal::Shutdown {
-                                reason: surface::SurfaceShutdownReason::ThreadClose,
-                            }
-                        }
-                        surface::TerminalizationCause::GoalPause => {
-                            surface::OperationTerminal::Cancelled {
-                                reason: surface::CancelReason::GoalPause,
-                            }
-                        }
-                        surface::TerminalizationCause::UserCancel => {
-                            surface::OperationTerminal::Cancelled {
-                                reason: surface::CancelReason::User,
-                            }
-                        }
-                    };
-                    (surface::GenerationStopReason::Cancelled { cause }, terminal)
+                ) => Self::surface_cancellation_stop(active),
+                // The generation's own error, after a shutdown closed the
+                // mailbox under it: taken as the closed mailbox's doing (see
+                // `ActiveOperation::mailbox_closed_under_generation`).
+                (OperationOutcome::ExecutionFailed { .. }, _)
+                    if active.mailbox_closed_under_generation =>
+                {
+                    Self::surface_cancellation_stop(active)
                 }
                 (
                     OperationOutcome::Completed(RunStatus::Blocked { blocker }),
@@ -6505,6 +6766,29 @@ impl ThreadActor {
         }
         self.cache_surface_terminal(value.clone());
         Ok(Some(value))
+    }
+
+    fn surface_cancellation_stop(
+        active: &ActiveOperation,
+    ) -> (surface::GenerationStopReason, surface::OperationTerminal) {
+        let cause = active
+            .surface_terminalization
+            .unwrap_or(surface::TerminalizationCause::UserCancel);
+        let terminal = match cause {
+            surface::TerminalizationCause::HostShutdown => surface::OperationTerminal::Shutdown {
+                reason: surface::SurfaceShutdownReason::HostShutdown,
+            },
+            surface::TerminalizationCause::ThreadClose => surface::OperationTerminal::Shutdown {
+                reason: surface::SurfaceShutdownReason::ThreadClose,
+            },
+            surface::TerminalizationCause::GoalPause => surface::OperationTerminal::Cancelled {
+                reason: surface::CancelReason::GoalPause,
+            },
+            surface::TerminalizationCause::UserCancel => surface::OperationTerminal::Cancelled {
+                reason: surface::CancelReason::User,
+            },
+        };
+        (surface::GenerationStopReason::Cancelled { cause }, terminal)
     }
 
     pub(super) fn surface_completion_proof(
@@ -9372,12 +9656,71 @@ impl ThreadActor {
     }
 }
 
+/// The answer to a control of a subagent task that has already ended.
+fn subagent_already_terminal(
+    request_id: surface::SurfaceRequestId,
+    target: surface::MutationTarget,
+    current_revision: Option<surface::SurfaceMutationRevision>,
+) -> surface::MutationReply<surface::TaskControlOutput> {
+    surface::MutationReply::Uncommitted {
+        mutation: surface::UncommittedMutation::Invalid {
+            request_id,
+            target: Some(target),
+            error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                code: surface::SurfaceMutationErrorCode::IllegalState,
+                message: surface::DisplayText::new("subagent task is already terminal"),
+                winning_request_id: None,
+                current_revision,
+            }),
+        },
+    }
+}
+
+/// Whether a person's stop names a child, running on this surface, that the
+/// turn whose fence is `running` keeps on a thread of this process.
+///
+/// The child must be owned by this very turn: a child of another parent
+/// reports to that parent's thread, and a child of an earlier turn to that
+/// turn, so neither carries this fence. Its task, `record`, must be a
+/// subagent's with no worker process, so neither a child in a worker
+/// process nor a workflow's agent, whose task is the workflow's, can match.
+/// And its turn must run on a thread of its own that the record's stop
+/// ends: a child that runs in this process without one (a sync child with a
+/// custom type or an isolation) also reports as the
+/// turn's, but watches only its parent's cancel, so it would run on. The
+/// record says so from before the child's row is shown; the row names the
+/// thread only once it has started, and a stop in between is taken. And the
+/// host must keep its children here (`keeps`), so a host that does not
+/// refuses as it always has. Whether its record has ended already is the
+/// stop's to answer.
+fn is_running_kept_subagent(
+    running: Option<&surface::SurfaceOperationFence>,
+    subagent: &surface::SurfaceSubagent,
+    keeps: bool,
+    record: Option<&crate::tasks::TaskRecord>,
+) -> bool {
+    let surface::SurfaceSubagentOwner::Generation { fence } = &subagent.owner else {
+        return false;
+    };
+    running == Some(fence)
+        && subagent.status == surface::SurfaceSubagentStatus::Running
+        && keeps
+        && record.is_some_and(|record| {
+            record.task_type == orca_core::task_types::TaskType::Subagent
+                && record.worker_pid.is_none()
+                && record.control.runs_on_its_own_thread()
+        })
+}
+
 #[cfg(test)]
 mod jsonl_resume_generation_regression_tests {
     use super::*;
+    use orca_core::conversation::CutShort;
+    use orca_core::provider_types::PartialReply;
     use std::sync::mpsc::{Receiver, Sender};
 
     const GATE_TIMEOUT: Duration = Duration::from_secs(30);
+    const REPLY_PREFIX: &str = "Keep the part already published.";
 
     struct GatedJsonlResumeExecutor {
         entered: Sender<(GenerationFence, bool, CancelToken)>,
@@ -9434,6 +9777,107 @@ mod jsonl_resume_generation_regression_tests {
         }
     }
 
+    struct GatedShutdownExecutor {
+        entered: Sender<CancelToken>,
+        release: Mutex<Receiver<()>>,
+        exit: ShutdownGenerationExit,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ShutdownGenerationExit {
+        RefusedSend,
+        UnrelatedFailure,
+        InterruptedReply,
+        ReplyAppendFailure,
+        ReplyCheckpointFailure,
+    }
+
+    impl ThreadOperationExecutor for GatedShutdownExecutor {
+        fn run_turn(
+            &self,
+            _thread: &mut RuntimeThread,
+            request: &HostedTurnRequest,
+            generation: &GenerationContext,
+            _events: &mut EventFactory,
+            _writer: &mut (dyn io::Write + Send),
+            cancel: &CancelToken,
+        ) -> io::Result<ThreadOperationOutcome> {
+            let ingress = generation
+                .handlers
+                .provider_response_ingress
+                .as_deref()
+                .expect("generation has semantic ingress");
+            let identity = ModelResponseIdentity::new(request.turn_id().clone());
+            if matches!(
+                self.exit,
+                ShutdownGenerationExit::InterruptedReply
+                    | ShutdownGenerationExit::ReplyAppendFailure
+                    | ShutdownGenerationExit::ReplyCheckpointFailure
+            ) {
+                ingress.publish_provider_steps(
+                    &identity,
+                    &[ProviderStep::MessageDelta(REPLY_PREFIX.to_string())],
+                )?;
+            }
+            self.entered
+                .send(cancel.clone())
+                .map_err(|_| io::Error::other("shutdown entry receiver closed"))?;
+            self.release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(GATE_TIMEOUT)
+                .map_err(|_| io::Error::other("shutdown generation was not released"))?;
+            if matches!(self.exit, ShutdownGenerationExit::UnrelatedFailure) {
+                return Err(io::Error::other(
+                    "generation failed independently of shutdown",
+                ));
+            }
+            let refusal = refused_shutdown_tool_results(ingress);
+            if matches!(self.exit, ShutdownGenerationExit::RefusedSend) {
+                return Err(refusal);
+            }
+            let mut reply = crate::provider_turn::cut_short_response(
+                PartialReply {
+                    content: REPLY_PREFIX.to_string(),
+                    reasoning: None,
+                },
+                &identity,
+                CutShort::Interrupted,
+            )
+            .expect("published reply has visible text");
+            let acknowledgement = ingress.commit_response(&mut reply);
+            if matches!(self.exit, ShutdownGenerationExit::InterruptedReply) {
+                acknowledgement?;
+                return Err(refusal);
+            }
+            let error = acknowledgement.expect_err("reply save should exhaust its retries");
+            let expected_fault = if matches!(self.exit, ShutdownGenerationExit::ReplyAppendFailure)
+            {
+                "AppendFailed"
+            } else {
+                "CheckpointFailed"
+            };
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(
+                error.to_string(),
+                format!("failed to commit provider semantic batch: Ledger({expected_fault})")
+            );
+            let _ = refused_shutdown_tool_results(ingress);
+            Err(error)
+        }
+    }
+
+    fn refused_shutdown_tool_results(
+        ingress: &dyn surface::RuntimeProviderResponseIngress,
+    ) -> io::Error {
+        let error = ingress
+            .commit_tool_results(&[])
+            .expect_err("shutdown must refuse the generation's tool results");
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(error.to_string(), "runtime thread is shutting down");
+        error
+    }
+
     fn request_id() -> surface::SurfaceRequestId {
         surface::SurfaceRequestId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap()
     }
@@ -9483,6 +9927,324 @@ mod jsonl_resume_generation_regression_tests {
     #[test]
     fn jsonl_current_generation_interrupt_resume_is_not_replayed_from_predecessor() {
         run_gated_jsonl_resume(true);
+    }
+
+    /// A host shutdown that finds a turn's interrupt committed and its
+    /// generation still running ends the turn as the interrupt does, even
+    /// when shutdown refuses the generation's final send.
+    #[test]
+    fn host_shutdown_after_a_committed_interrupt_ends_the_turn_cancelled() {
+        let terminals =
+            run_shutdown_after_a_committed_interrupt(ShutdownGenerationExit::RefusedSend);
+        assert_eq!(
+            terminals,
+            vec![surface::OperationTerminal::Cancelled {
+                reason: surface::CancelReason::User,
+            }],
+            "the turn must end as its interrupt did"
+        );
+    }
+
+    #[test]
+    fn committed_interrupt_shutdown_keeps_reply_after_refusing_own_send() {
+        assert_eq!(
+            run_shutdown_after_a_committed_interrupt(ShutdownGenerationExit::InterruptedReply),
+            vec![surface::OperationTerminal::Cancelled {
+                reason: surface::CancelReason::User
+            }]
+        );
+    }
+
+    #[test]
+    fn committed_interrupt_shutdown_keeps_reply_save_failure_over_own_refusals() {
+        let terminals =
+            run_shutdown_after_a_committed_interrupt(ShutdownGenerationExit::ReplyAppendFailure);
+        assert!(
+            matches!(
+                terminals.as_slice(),
+                [surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::RuntimeInvariant,
+                    message,
+                }] if message.as_str() == "failed to commit provider semantic batch: Ledger(AppendFailed)"
+            ),
+            "unexpected terminals: {terminals:?}"
+        );
+    }
+
+    #[test]
+    fn committed_interrupt_shutdown_reports_reply_checkpoint_exhaustion() {
+        let terminals = run_shutdown_after_a_committed_interrupt(
+            ShutdownGenerationExit::ReplyCheckpointFailure,
+        );
+        assert!(
+            terminals.is_empty(),
+            "an uncheckpointed reply blocks finalization: {terminals:?}"
+        );
+    }
+
+    #[test]
+    fn committed_interrupt_shutdown_probe_does_not_hide_an_unrelated_failure() {
+        let terminals =
+            run_shutdown_after_a_committed_interrupt(ShutdownGenerationExit::UnrelatedFailure);
+        assert!(
+            matches!(
+                terminals.as_slice(),
+                [surface::OperationTerminal::Failed {
+                    class: surface::FailureClass::RuntimeInvariant,
+                    message,
+                }] if message.as_str() == "generation failed independently of shutdown"
+            ),
+            "unexpected terminals: {terminals:?}"
+        );
+    }
+
+    fn run_shutdown_after_a_committed_interrupt(
+        exit: ShutdownGenerationExit,
+    ) -> Vec<surface::OperationTerminal> {
+        let _ = crate::history::claim_isolated_test_orca_home_if_unset();
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let host = RuntimeHost::start_with_executor(Arc::new(GatedShutdownExecutor {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            exit,
+        }))
+        .expect("start gated shutdown host");
+        let gates = ReleaseGenerationGates(vec![release_tx]);
+        let thread = host
+            .start_thread(
+                RunConfig {
+                    cwd: Some(cwd.path().to_path_buf()),
+                    provider: orca_core::config::ProviderKind::Mock,
+                    output_format: orca_core::config::OutputFormat::Jsonl,
+                    history_mode: HistoryMode::Record,
+                    tools: orca_core::config::ToolConfig {
+                        shell_enforcement_decision: Some(
+                            orca_core::capability::SandboxEnforcementDecision::new(
+                                orca_core::capability::EnforcementState::Enforced,
+                                "test-sandbox",
+                                Vec::new(),
+                            ),
+                        ),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                "shut down after a committed JSONL interrupt",
+            )
+            .expect("start recorded JSONL thread");
+        let connection_id =
+            surface::SurfaceConnectionId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let handle = thread
+            .jsonl_surface_for_connection(connection_id)
+            .expect("bind JSONL connection");
+        let attachment = attach_jsonl(&handle);
+        let mut subscription = handle
+            .claim_subscription(&attachment.subscription)
+            .expect("claim JSONL subscription");
+        let snapshot = &attachment.baseline.snapshot;
+        let legacy_turn_id =
+            surface::LegacyTurnId(surface::DisplayText::new(TurnId::new().to_string()));
+        let reserved = committed(
+            attachment
+                .client
+                .reserve_operation(
+                    request_id(),
+                    surface::OperationRequestIntent {
+                        correlation: surface::OperationIngressCorrelation::JsonlThreadTurn {
+                            rpc_id_digest: surface::Sha256Digest::new(
+                                Sha256::digest(b"shutdown-after-interrupt").into(),
+                            ),
+                            legacy_turn_id: legacy_turn_id.clone(),
+                        },
+                        kind: surface::OperationKind::UserTurn,
+                        input: Some(surface::SurfaceInputRequest {
+                            blocks: surface::NonEmptyVec::try_new(vec![
+                                surface::SurfaceInputRequestBlock::Text {
+                                    text: surface::DisplayText::new("run until shut down"),
+                                },
+                            ])
+                            .unwrap(),
+                        }),
+                        replayability: surface::ReplayabilityRequest::CaptureReplayableCapsule,
+                        settings_preparation: surface::OperationSettingsPreparation::UseCurrent {
+                            expected_settings_revision: snapshot.settings.thread_revision,
+                            expected_policy_epoch: snapshot.settings.effective.policy_epoch,
+                        },
+                    },
+                )
+                .expect("reserve JSONL turn"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        assert!(matches!(
+            committed(
+                attachment
+                    .client
+                    .admit_reserved(request_id(), operation_id.clone(), reserved.lease.lease_id)
+                    .expect("admit JSONL turn")
+            ),
+            surface::AdmissionOutput::Admitted { .. }
+        ));
+        let cancel = entered_rx
+            .recv_timeout(GATE_TIMEOUT)
+            .expect("generation entry");
+        let (_, interrupt) = resolved_control(
+            host.handle()
+                .control_jsonl_turn(
+                    attachment.client.clone(),
+                    request_id(),
+                    Some(attachment.client.thread_id().clone()),
+                    legacy_turn_id.clone(),
+                    surface::JsonlTurnControlAction::Interrupt,
+                )
+                .expect("interrupt the running generation"),
+        );
+        assert_eq!(
+            interrupt.echo.status,
+            surface::JsonlResolvedTurnControlStatus::Interrupted
+        );
+        assert!(cancel.is_cancelled());
+        assert!(matches!(
+            attach_jsonl(&handle)
+                .baseline
+                .snapshot
+                .foreground_operation
+                .as_ref()
+                .and_then(|operation| operation.pending_control.as_ref()),
+            Some(surface::PendingControlIntent::Interrupt { .. })
+        ));
+
+        let transcript_path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .expect("load runtime transcript")
+            .path;
+        match exit {
+            ShutdownGenerationExit::ReplyAppendFailure => {
+                surface::JsonlSurfaceCommitLedger::inject_provider_response_append_failures(
+                    &transcript_path,
+                    SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS,
+                );
+            }
+            ShutdownGenerationExit::ReplyCheckpointFailure => {
+                surface::JsonlSurfaceCommitLedger::inject_provider_response_checkpoint_failures(
+                    &transcript_path,
+                    SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS,
+                );
+            }
+            _ => {}
+        }
+
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(host.shutdown());
+        });
+        wait_for_shutdown_refusal(&thread);
+        gates.0[0].send(()).expect("release the generation");
+        let shutdown = shutdown_rx
+            .recv_timeout(GATE_TIMEOUT)
+            .expect("host shutdown hung");
+
+        let ledger =
+            surface::JsonlSurfaceCommitLedger::new(transcript_path, snapshot.cursor.clone());
+        if matches!(exit, ShutdownGenerationExit::ReplyCheckpointFailure) {
+            let error =
+                shutdown.expect_err("the prepared reply blocks a different finalization batch");
+            assert!(
+                matches!(error, RuntimeHostError::ThreadStartFailed { message }
+                if message.contains("typed surface generation stop and finalization start failed: CursorRangeAlreadyConsumed"))
+            );
+            let recovered = ledger
+                .recover_batches()
+                .expect("recover recorded surface batches");
+            assert!(
+                recovered
+                    .prepared
+                    .is_some_and(|batch| batch.events.as_slice().iter().any(|event| {
+                        matches!(
+                            &event.event,
+                            surface::SurfaceEvent::Assistant(
+                                surface::AssistantPatch::ResponseKept {
+                                    reason: CutShort::Interrupted,
+                                    ..
+                                }
+                            )
+                        )
+                    }))
+            );
+        } else {
+            shutdown.expect("host completes shutdown");
+        }
+
+        if matches!(exit, ShutdownGenerationExit::InterruptedReply) {
+            let recovered = ledger
+                .recover_batches()
+                .expect("recover recorded surface batches");
+            let replies = recovered
+                .committed
+                .iter()
+                .flat_map(|batch| batch.events.as_slice())
+                .filter_map(|event| match &event.event {
+                    surface::SurfaceEvent::Assistant(surface::AssistantPatch::ResponseKept {
+                        response,
+                        reason,
+                    }) => Some((
+                        response
+                            .message_item
+                            .as_ref()
+                            .map(|item| item.text.as_str()),
+                        *reason,
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(replies, [(Some(REPLY_PREFIX), CutShort::Interrupted)]);
+        }
+
+        let mut terminals = Vec::new();
+        while let Some(item) = subscription.try_recv() {
+            let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                continue;
+            };
+            for envelope in batch.events.as_slice() {
+                if let surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                    record,
+                }) = &envelope.event
+                    && record.operation_id == operation_id
+                {
+                    terminals.push(record.terminal.clone());
+                }
+            }
+        }
+        terminals
+    }
+
+    fn wait_for_shutdown_refusal(thread: &RuntimeThreadHandle) {
+        let deadline = std::time::Instant::now() + GATE_TIMEOUT;
+        loop {
+            let (reply, response) = mpsc::sync_channel(1);
+            match thread
+                .command_tx
+                .try_send(ThreadCommand::ReadState { reply })
+            {
+                Ok(()) => {
+                    if matches!(
+                        response.recv_timeout(
+                            deadline.saturating_duration_since(std::time::Instant::now())
+                        ),
+                        Ok(Err(RuntimeHostError::ThreadUnavailable))
+                    ) {
+                        return;
+                    }
+                }
+                Err(TrySendError::Full(_)) => std::thread::yield_now(),
+                Err(TrySendError::Closed(_)) => panic!("mailbox closed before shutdown refusal"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown did not refuse ReadState"
+            );
+        }
     }
 
     fn run_gated_jsonl_resume(interrupt_successor: bool) {
@@ -9830,4 +10592,126 @@ fn surface_image_request_block(
         },
     };
     Some(surface::SurfaceInputRequestBlock::Image { source, detail })
+}
+
+#[cfg(test)]
+mod kept_subagent_stop_tests {
+    use super::is_running_kept_subagent;
+    use crate::runtime_surface as surface;
+
+    fn uuid_v7() -> [u8; 16] {
+        *uuid::Uuid::now_v7().as_bytes()
+    }
+
+    fn fence() -> surface::SurfaceOperationFence {
+        surface::SurfaceOperationFence {
+            thread_id: surface::SurfaceThreadId::try_from_bytes(uuid_v7()).unwrap(),
+            thread_owner_epoch: surface::ThreadOwnerEpoch::new(1),
+            operation_id: surface::SurfaceOperationId::try_from_bytes(uuid_v7()).unwrap(),
+            generation_id: surface::SurfaceGenerationId::new(0),
+        }
+    }
+
+    /// A child running under the turn whose fence is `fence`, on a thread
+    /// of its own when `child_thread_id` is given.
+    fn running_child(
+        task_id: &str,
+        fence: &surface::SurfaceOperationFence,
+        child_thread_id: Option<surface::SurfaceThreadId>,
+    ) -> surface::SurfaceSubagent {
+        surface::SurfaceSubagent {
+            subagent_id: surface::SurfaceSubagentId::try_new(task_id).unwrap(),
+            task_id: surface::SurfaceTaskId::try_new(task_id).unwrap(),
+            revision: surface::SubagentRevision::try_new(3).unwrap(),
+            description: surface::DisplayText::new("explore the provider"),
+            batch_id: surface::NonEmptyText::try_new("batch").unwrap(),
+            batch_size: 1,
+            child_thread_id,
+            status: surface::SurfaceSubagentStatus::Running,
+            activity: None,
+            subagent_activity_history: Vec::new(),
+            turn: Some(1),
+            usage: None,
+            output: None,
+            error: None,
+            continuation: None,
+            owner: surface::SurfaceSubagentOwner::Generation {
+                fence: fence.clone(),
+            },
+            source: surface::SurfaceSubagentSource::new(
+                surface::SurfaceTaskAttemptId::try_new("attempt-1").unwrap(),
+                orca_core::thread_identity::TurnId::new(),
+                3,
+                surface::UnixMillis::new(2),
+                surface::SurfaceCommitId::try_from_bytes(uuid_v7()).unwrap(),
+                surface::Sha256Digest::new([8; 32]),
+            ),
+        }
+    }
+
+    /// Only a child with a thread of its own is stopped as one the turn
+    /// keeps: a child that runs in the process without one reports as the
+    /// turn's too, but its stop would not reach it. A child with one is
+    /// stopped from the moment its row is shown, before the row names its
+    /// thread.
+    #[test]
+    fn only_a_child_with_a_thread_of_its_own_is_stopped_as_kept() {
+        let registry = crate::tasks::TaskRegistry::new("kept-stop".to_string());
+        let on_a_thread = registry.create_subagent("explore the provider".to_string(), None);
+        let without = registry.create_subagent("explore the docs".to_string(), None);
+        registry
+            .get(&on_a_thread.id)
+            .expect("the child's record")
+            .control
+            .mark_runs_on_its_own_thread();
+        let threaded_record = registry.get(&on_a_thread.id).expect("the child's record");
+        let threadless_record = registry.get(&without.id).expect("the other child's record");
+        let fence = fence();
+        let threaded = running_child(
+            &on_a_thread.id,
+            &fence,
+            Some(surface::SurfaceThreadId::try_from_bytes(uuid_v7()).unwrap()),
+        );
+        let not_yet_bound = running_child(&on_a_thread.id, &fence, None);
+        let threadless = running_child(&without.id, &fence, None);
+
+        assert!(is_running_kept_subagent(
+            Some(&fence),
+            &threaded,
+            true,
+            Some(&threaded_record)
+        ));
+        assert!(is_running_kept_subagent(
+            Some(&fence),
+            &not_yet_bound,
+            true,
+            Some(&threaded_record)
+        ));
+        assert!(!is_running_kept_subagent(
+            Some(&fence),
+            &threadless,
+            true,
+            Some(&threadless_record)
+        ));
+        // With a thread, the rest still holds: the very turn, a keeping
+        // host, and a subagent's record.
+        assert!(!is_running_kept_subagent(
+            Some(&self::fence()),
+            &threaded,
+            true,
+            Some(&threaded_record)
+        ));
+        assert!(!is_running_kept_subagent(
+            Some(&fence),
+            &threaded,
+            false,
+            Some(&threaded_record)
+        ));
+        assert!(!is_running_kept_subagent(
+            Some(&fence),
+            &threaded,
+            true,
+            None
+        ));
+    }
 }

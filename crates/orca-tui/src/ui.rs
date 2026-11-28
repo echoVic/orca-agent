@@ -2240,7 +2240,7 @@ fn render_agents_panel(frame: &mut Frame, area: Rect, state: &mut AppState, them
     let selected_index = state.agent_selected_index().min(rows.len() - 1);
     let selected = rows[selected_index];
     let summary = agent_workspace_summary_line(&rows, theme);
-    let hint = agent_workspace_action_hint(selected, theme, state.status == AppStatus::Idle);
+    let hint = agent_workspace_action_hint(selected, theme, state);
     let focus_lines =
         agent_workspace_focus_lines(selected, theme, inner.width as usize, state.tick);
     let fixed_height = 2_u16;
@@ -2511,13 +2511,15 @@ fn agent_workspace_summary_line<'a>(rows: &[AgentWorkspaceRow<'_>], theme: &Them
 fn agent_workspace_action_hint<'a>(
     row: AgentWorkspaceRow<'_>,
     theme: &Theme,
-    idle: bool,
+    state: &AppState,
 ) -> Line<'a> {
     let mut text = " Esc close · ↑↓ select".to_string();
     match row {
         AgentWorkspaceRow::Subagent { task, .. } => {
             if task.publication_revision.is_some() {
-                if crate::agent_workspace_actions::opens_live_conversation(task, idle) {
+                if crate::agent_workspace_actions::agent_open_target(state, task)
+                    != crate::agent_workspace_actions::AgentOpenTarget::Panel
+                {
                     text.push_str(" · Enter open conversation");
                 } else {
                     text.push_str(" · Enter transcript");
@@ -2779,9 +2781,7 @@ fn workflow_metadata_row_count(task: &BackgroundTaskSummary) -> u16 {
             .as_deref()
             .map(task_detail_line_count)
             .unwrap_or_default() as u16
-        + task
-            .error
-            .as_deref()
+        + visible_task_error(task)
             .map(task_detail_line_count)
             .unwrap_or_default() as u16
 }
@@ -2836,7 +2836,7 @@ fn workflow_metadata_rows<'a>(task: &BackgroundTaskSummary, theme: &Theme) -> Ve
             Style::default().fg(theme.text),
         ));
     }
-    if let Some(error) = &task.error {
+    if let Some(error) = visible_task_error(task) {
         rows.extend(task_detail_text_rows(
             "error",
             error,
@@ -2849,6 +2849,12 @@ fn workflow_metadata_rows<'a>(task: &BackgroundTaskSummary, theme: &Theme) -> Ve
 
 fn task_detail_line_count(text: &str) -> usize {
     text.lines().count().max(1).min(TASK_DETAIL_MAX_LINES)
+}
+
+fn visible_task_error(task: &BackgroundTaskSummary) -> Option<&str> {
+    task.error
+        .as_deref()
+        .filter(|_| task.task_type != TaskType::Subagent || task.status != TaskStatus::Cancelled)
 }
 
 fn task_detail_text_rows<'a>(
@@ -4460,9 +4466,11 @@ fn task_status_color(status: TaskStatus, theme: &Theme) -> Color {
     match status {
         TaskStatus::Running | TaskStatus::Stopping => theme.warning,
         TaskStatus::Completed => theme.success,
-        TaskStatus::Failed | TaskStatus::Blocked | TaskStatus::Cancelled => theme.error,
+        TaskStatus::Failed | TaskStatus::Blocked => theme.error,
         TaskStatus::ApprovalRequired => theme.warning,
-        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Stopped => theme.muted,
+        TaskStatus::Queued | TaskStatus::Paused | TaskStatus::Stopped | TaskStatus::Cancelled => {
+            theme.muted
+        }
     }
 }
 
@@ -5547,6 +5555,9 @@ fn activity_rows(
     } else if let Some(line) = foreground_activity_line(state, theme) {
         rows.push((line, None));
     }
+    if let Some(line) = main_behind_child_line(state, theme) {
+        rows.push((line, Some(AgentHitTarget::Main)));
+    }
 
     if matches!(
         state.panel_mode,
@@ -5556,7 +5567,7 @@ fn activity_rows(
             state.workflow_tasks(),
             theme,
             state.tick,
-            state.agent_dock_selected_task_id.as_deref(),
+            state.agent_dock_focus(),
             state.tasks_dock_visible(),
             state.status == AppStatus::Idle,
             width,
@@ -5628,6 +5639,27 @@ fn turn_has_model_output(state: &AppState) -> bool {
         })
 }
 
+/// Under a child's conversation: what the main conversation is doing, when
+/// that matters to what the user can do here. A click on it returns.
+fn main_behind_child_line(state: &AppState, theme: &Theme) -> Option<Line<'static>> {
+    state.conversation_target().task_id()?;
+    let (text, color) = match state.main_behind_child? {
+        crate::types::SideParentStatus::Running => ("Main is running · Esc return", theme.warning),
+        crate::types::SideParentStatus::NeedsApproval => {
+            ("Main needs your approval · Esc return", theme.approval)
+        }
+        crate::types::SideParentStatus::NeedsInput => {
+            ("Main needs your answer · Esc return", theme.approval)
+        }
+        _ if state.finished_child => ("Main is idle · Esc return", theme.muted),
+        _ => return None,
+    };
+    Some(Line::from(Span::styled(
+        format!(" ● {text}"),
+        Style::default().fg(color),
+    )))
+}
+
 fn foreground_activity_line(state: &AppState, theme: &Theme) -> Option<Line<'static>> {
     let spinner = spinner_frame(state.tick);
     match &state.status {
@@ -5646,14 +5678,17 @@ fn foreground_activity_line(state: &AppState, theme: &Theme) -> Option<Line<'sta
                 format_elapsed_compact(persisted_goal_elapsed.saturating_add(live_elapsed));
             let detail =
                 current_tool_label(state).unwrap_or_else(|| stream_phase_label(state).to_string());
-            Some(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!(" {spinner} Running {elapsed}"),
                     Style::default().fg(theme.warning),
                 ),
                 Span::styled(format!(" · {detail}"), theme.muted_style()),
-                Span::styled(" · Esc interrupt".to_string(), theme.dim_style()),
-            ]))
+            ];
+            if state.conversation_target().task_id().is_none() {
+                spans.push(Span::styled(" · Esc interrupt", theme.dim_style()));
+            }
+            Some(Line::from(spans))
         }
         AppStatus::Compacting => Some(Line::from(Span::styled(
             format!(" {spinner} Compacting context…"),
@@ -5679,10 +5714,51 @@ fn background_task_activity_lines(
     expanded: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
-    background_task_activity_rows(tasks, theme, tick, selected_task_id, expanded, true, width)
-        .into_iter()
-        .map(|(line, _)| line)
-        .collect()
+    background_task_activity_rows(
+        tasks,
+        theme,
+        tick,
+        crate::workflow_panel::AgentDockFocus {
+            selected: selected_task_id,
+            viewed: None,
+        },
+        expanded,
+        true,
+        width,
+    )
+    .into_iter()
+    .map(|(line, _)| line)
+    .collect()
+}
+
+/// The subagent rows the dock draws when there are more than it has room for:
+/// In a visit the mark stays visible; otherwise attention takes priority.
+/// The rows come back in list (start) order, never priority order.
+fn dock_rows<'a>(
+    visible: &[&'a BackgroundTaskSummary],
+    focus: crate::workflow_panel::AgentDockFocus<'_>,
+    cap: usize,
+) -> Vec<&'a BackgroundTaskSummary> {
+    if visible.len() <= cap {
+        return visible.to_vec();
+    }
+    let priority = |task: &BackgroundTaskSummary| -> u8 {
+        if focus.viewed.is_some() && focus.selected == Some(task.id.as_str()) {
+            0
+        } else if task.status.requires_attention() {
+            1
+        } else if focus.selected == Some(task.id.as_str()) {
+            2
+        } else {
+            3
+        }
+    };
+    let mut picked = (0..visible.len()).collect::<Vec<_>>();
+    // Stable: ties keep list order.
+    picked.sort_by_key(|&index| priority(visible[index]));
+    picked.truncate(cap);
+    picked.sort_unstable();
+    picked.into_iter().map(|index| visible[index]).collect()
 }
 
 /// `idle` is whether Enter can open a background approval now: opening one
@@ -5691,7 +5767,7 @@ fn background_task_activity_rows(
     tasks: &[BackgroundTaskSummary],
     theme: &Theme,
     tick: u64,
-    selected_task_id: Option<&str>,
+    focus: crate::workflow_panel::AgentDockFocus<'_>,
     expanded: bool,
     idle: bool,
     width: u16,
@@ -5727,10 +5803,7 @@ fn background_task_activity_rows(
 
     let visible_subagents = tasks
         .iter()
-        .filter(|task| {
-            task.task_type == TaskType::Subagent
-                && (task.status.is_active() || task.status.requires_attention())
-        })
+        .filter(|task| focus.includes(task))
         .collect::<Vec<_>>();
     if !visible_subagents.is_empty() {
         let subagent_cap = if expanded {
@@ -5769,8 +5842,8 @@ fn background_task_activity_rows(
             Some(AgentHitTarget::Main),
         ));
 
-        for task in visible_subagents.iter().take(subagent_cap) {
-            let selected = selected_task_id == Some(task.id.as_str());
+        for task in dock_rows(&visible_subagents, focus, subagent_cap) {
+            let selected = focus.selected == Some(task.id.as_str());
             let selection = if selected { "›" } else { "○" };
             let status = task_status_label(task.status);
             let name = task.name.as_deref().unwrap_or(task.description.as_str());
@@ -5867,7 +5940,8 @@ fn background_task_activity_rows(
     // keys that do something now: Shift+Up/Down picks an agent, and Enter
     // opens the picked agent, or else the first background approval.
     if expanded {
-        let agent_selected = selected_task_id
+        let agent_selected = focus
+            .selected
             .is_some_and(|selected| visible_subagents.iter().any(|task| task.id == selected));
         let mut keys = Vec::with_capacity(3);
         if !visible_subagents.is_empty() {
@@ -11223,6 +11297,41 @@ mod tests {
         )
     }
 
+    #[test]
+    fn main_behind_child_line_says_main_runs_without_offering_to_send() {
+        let theme = Theme::named(ThemeName::Dark);
+        let mut state = test_state();
+        state.set_conversation_target(orca_core::conversation::ConversationTarget::subagent(
+            "child",
+        ));
+        state.main_behind_child = Some(crate::types::SideParentStatus::Running);
+        let line = main_behind_child_line(&state, &theme).expect("a row under the agent");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, " ● Main is running · Esc return");
+
+        state.main_behind_child = Some(crate::types::SideParentStatus::NeedsApproval);
+        let line = main_behind_child_line(&state, &theme).expect("a row under the agent");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, " ● Main needs your approval · Esc return");
+
+        state.main_behind_child = Some(crate::types::SideParentStatus::NeedsInput);
+        let line = main_behind_child_line(&state, &theme).expect("a row under the agent");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, " ● Main needs your answer · Esc return");
+    }
+
     /// A path under the host's temp directory, so the first-run fixtures stay
     /// portable to Windows.
     fn platform_temp_path(relative: &str) -> std::path::PathBuf {
@@ -13626,6 +13735,58 @@ mod tests {
     }
 
     #[test]
+    fn running_child_activity_line_after_live_turn_start_does_not_offer_interrupt() {
+        let mut state = test_state();
+        state.update(crate::protocol::TuiEvent::ChildFocusChanged {
+            task_id: Some("child".into()),
+        });
+        state.update(crate::protocol::TuiEvent::SideParentStatusChanged(
+            crate::types::SideParentStatus::Running,
+        ));
+        state.update(crate::protocol::TuiEvent::TurnStarted {
+            turn: 1,
+            task: None,
+            started_at_ms: None,
+        });
+        assert_running_child_escape_hints(&state);
+    }
+
+    #[test]
+    fn running_child_activity_line_after_projection_rebuild_does_not_offer_interrupt() {
+        use crate::protocol::TuiEvent;
+        use crate::surface_projection::{SurfaceProjectionState, TuiSurfaceProjection};
+
+        crate::hosted_child::tests::with_streaming_main(|_, snapshot| {
+            let mut state = test_state();
+            let projection = SurfaceProjectionState::from_surface_snapshot(&snapshot);
+            assert!(projection.foreground_operation_id.is_some());
+            state.update(TuiEvent::ChildProjectionReset {
+                task_id: "child".into(),
+                main_status: Some(crate::types::SideParentStatus::Running),
+                projection: Box::new(projection),
+            });
+            for event in
+                TuiSurfaceProjection::for_conversation(&snapshot, None).hydrate_open_streams()
+            {
+                state.update(event);
+            }
+            assert_running_child_escape_hints(&state);
+        });
+    }
+
+    fn assert_running_child_escape_hints(state: &AppState) {
+        let theme = Theme::named(ThemeName::Dark);
+        assert_eq!(state.conversation_target().task_id(), Some("child"));
+        assert_eq!(state.status, AppStatus::Running);
+        assert_eq!(
+            main_behind_child_line(state, &theme).unwrap().to_string(),
+            " ● Main is running · Esc return"
+        );
+        let row = activity_line(state, &theme).expect("running child activity row");
+        assert!(row.contains("Running ") && !row.contains("Esc"), "{row}");
+    }
+
+    #[test]
     fn running_activity_line_for_computer_names_the_app() {
         let mut state = test_state();
         state.status = AppStatus::Running;
@@ -13783,6 +13944,7 @@ mod tests {
             13 * 60 + 20,
         )));
         state.update(TuiEvent::TurnStarted {
+            started_at_ms: None,
             turn: 2,
             task: None,
         });
@@ -14043,6 +14205,110 @@ mod tests {
         assert!(lines.iter().all(|line| !line.contains("agent 5")));
     }
 
+    /// A kept agent whose row ended with its parent's turn is drawn as ended:
+    /// it leaves the dock, and the Agents panel counts it as not active and
+    /// draws it with no spinner, no stale activity and no stop.
+    #[test]
+    fn an_agent_stopped_with_its_parent_turn_leaves_the_dock_and_offers_no_stop() {
+        let theme = Theme::named(orca_core::config::ThemeName::Dark);
+        let kept = |status| {
+            let mut task = workflow_task_for_agent_dashboard(
+                "kept agent",
+                "kept",
+                orca_core::workflow_types::WorkflowAgentStatus::Running,
+            );
+            task.task_type = TaskType::Subagent;
+            task.workflow_agents.clear();
+            task.workflow_run_id = None;
+            task.status = status;
+            task.subagent_child_thread_id = Some("thread-kept".to_string());
+            task.subagent_current_activity = Some("thinking".to_string());
+            task.publication_revision = Some(5);
+            if status != TaskStatus::Running {
+                task.completed_at_ms = Some(4_000);
+                // What the parent's surface gives the row after an interrupt.
+                task.error = Some("agent cancelled".to_string());
+            }
+            task
+        };
+        let dock = |tasks: &[BackgroundTaskSummary]| -> Vec<String> {
+            background_task_activity_lines(tasks, &theme, 0, None, false, 100)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+        assert_eq!(
+            dock(&[kept(TaskStatus::Running)])
+                .first()
+                .map(String::as_str),
+            Some(" ● Agents 1 active · /agents view")
+        );
+        let ended = dock(&[kept(TaskStatus::Cancelled)]);
+        assert!(
+            ended
+                .iter()
+                .all(|line| !line.contains("Agents") && !line.contains("kept agent")),
+            "{ended:?}"
+        );
+
+        let panel = |task: BackgroundTaskSummary| -> String {
+            let mut state = test_state();
+            state.panel_mode = PanelMode::Agents;
+            state.replace_workflow_tasks_for_test(vec![task]);
+            let textarea = TextArea::default();
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24))
+                .expect("test backend");
+            terminal
+                .draw(|frame| render(frame, &mut state, &textarea, &theme))
+                .expect("draw");
+            format!("{:?}", terminal.backend().buffer())
+        };
+        let spinning = |rendered: &str| {
+            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+                .iter()
+                .any(|frame| rendered.contains(frame))
+        };
+        // Control: the same agent while it runs has all three.
+        let running_panel = panel(kept(TaskStatus::Running));
+        assert!(running_panel.contains("1 task · 1 active"));
+        assert!(running_panel.contains("thinking"));
+        assert!(running_panel.contains("s stop"));
+        assert!(spinning(&running_panel), "a running agent has a spinner");
+
+        let ended_panel = panel(kept(TaskStatus::Cancelled));
+        assert_eq!(
+            task_status_color(TaskStatus::Cancelled, &theme),
+            theme.muted
+        );
+        assert!(!ended_panel.contains("agent cancelled"), "{ended_panel}");
+        let failed = kept(TaskStatus::Failed);
+        let cancelled = kept(TaskStatus::Cancelled);
+        assert!(
+            workflow_metadata_rows(&failed, &theme)
+                .iter()
+                .any(|row| row.to_string().contains("error agent cancelled"))
+        );
+        assert!(
+            !workflow_metadata_rows(&cancelled, &theme)
+                .iter()
+                .any(|row| row.to_string().contains("agent cancelled"))
+        );
+        assert_eq!(
+            workflow_metadata_row_count(&failed),
+            workflow_metadata_row_count(&cancelled) + 1
+        );
+        assert!(ended_panel.contains("1 task · 0 active"));
+        assert!(ended_panel.contains("kept agent · cancelled"));
+        assert!(!ended_panel.contains("thinking"));
+        assert!(!ended_panel.contains("s stop"));
+        assert!(!spinning(&ended_panel), "an ended agent has no spinner");
+    }
+
     #[test]
     fn expanded_dock_raises_the_subagent_cap_and_appends_the_close_hint() {
         let theme = Theme::named(orca_core::config::ThemeName::Dark);
@@ -14131,10 +14397,18 @@ mod tests {
             " Shift+↑↓ select · Enter approve · Esc close"
         );
         // During a running turn Enter leaves the approval for later.
-        let running = background_task_activity_rows(&[approval], &theme, 0, None, true, false, 100)
-            .into_iter()
-            .map(|(line, _)| line)
-            .collect::<Vec<_>>();
+        let running = background_task_activity_rows(
+            &[approval],
+            &theme,
+            0,
+            Default::default(),
+            true,
+            false,
+            100,
+        )
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect::<Vec<_>>();
         assert_eq!(lines_text(&running).pop().unwrap(), " Esc close");
     }
 
@@ -14218,6 +14492,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: "Audit".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
             command: None,
@@ -14324,6 +14599,7 @@ mod tests {
                 indeterminate: false,
             }),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
             result: None,
@@ -14419,6 +14695,7 @@ mod tests {
             last_activity_at_ms: None,
             continuation: None,
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: Some(2_000),
             result: None,
@@ -14812,14 +15089,23 @@ mod tests {
         child.publication_revision = Some(3);
         child.subagent_child_thread_id = Some("child-thread".to_string());
         let hint = |task: &BackgroundTaskSummary, idle: bool| {
+            let mut state = test_state();
+            state.status = if idle {
+                AppStatus::Idle
+            } else {
+                AppStatus::Running
+            };
             let row = AgentWorkspaceRow::Subagent { task, parent: None };
-            agent_workspace_action_hint(row, &theme, idle).to_string()
+            agent_workspace_action_hint(row, &theme, &state).to_string()
         };
 
         assert!(hint(&child, true).contains("Enter open conversation"));
-        assert!(hint(&child, false).contains("Enter transcript"));
+        assert!(hint(&child, false).contains("Enter open conversation"));
         let mut finished = child.clone();
         finished.status = TaskStatus::Completed;
+        assert!(hint(&finished, true).contains("Enter open conversation"));
+        assert!(hint(&finished, false).contains("Enter open conversation"));
+        finished.subagent_child_thread_id = None;
         assert!(hint(&finished, true).contains("Enter transcript"));
     }
 
@@ -14834,6 +15120,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: "Summarize architecture".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: Some(4_000),
             command: None,
@@ -14882,6 +15169,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: "Summarize architecture".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
             command: None,
@@ -14929,6 +15217,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: "Summarize architecture".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: Some(4_000),
             command: None,
@@ -14981,6 +15270,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: "Summarize architecture".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: Some(4_000),
             command: None,
@@ -15040,6 +15330,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: "Summarize architecture".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: Some(4_000),
             command: None,
@@ -15100,6 +15391,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: "Summarize architecture".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: Some(4_000),
             command: None,
@@ -15149,6 +15441,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: "Summarize architecture".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: Some(4_000),
             command: None,
@@ -15254,6 +15547,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: "Summarize architecture".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
             command: None,
@@ -15350,6 +15644,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: "Long answer".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
             command: None,
@@ -15408,6 +15703,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: "Needs approval".to_string(),
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
             command: None,
@@ -15458,6 +15754,73 @@ mod tests {
 
         assert!(rendered.contains("Enter approve"));
         assert!(rendered.contains("s stop"));
+    }
+
+    fn dock_agent(id: &str, status: TaskStatus) -> BackgroundTaskSummary {
+        let mut task = workflow_task_for_agent_dashboard(
+            id,
+            id,
+            orca_core::workflow_types::WorkflowAgentStatus::Running,
+        );
+        task.id = id.to_string();
+        task.task_type = TaskType::Subagent;
+        task.status = status;
+        task
+    }
+
+    fn dock_ids(rows: &[&BackgroundTaskSummary]) -> Vec<String> {
+        rows.iter().map(|task| task.id.clone()).collect()
+    }
+
+    #[test]
+    fn the_dock_keeps_an_agent_that_needs_approval_past_the_cap() {
+        let cap = 4;
+        let mut tasks: Vec<_> = (0..cap + 2)
+            .map(|i| dock_agent(&format!("a{i}"), TaskStatus::Running))
+            .collect();
+        tasks[cap + 1].status = TaskStatus::ApprovalRequired;
+        let visible: Vec<_> = tasks.iter().collect();
+        let rows = super::dock_rows(&visible, Default::default(), cap);
+        assert_eq!(rows.len(), cap);
+        assert_eq!(dock_ids(&rows), ["a0", "a1", "a2", "a5"]);
+    }
+
+    #[test]
+    fn the_dock_keeps_the_selected_agent_past_the_cap() {
+        let cap = 4;
+        let tasks: Vec<_> = (0..cap + 2)
+            .map(|i| dock_agent(&format!("a{i}"), TaskStatus::Running))
+            .collect();
+        let visible: Vec<_> = tasks.iter().collect();
+        let rows = super::dock_rows(
+            &visible,
+            crate::workflow_panel::AgentDockFocus {
+                selected: Some("a5"),
+                ..Default::default()
+            },
+            cap,
+        );
+        assert_eq!(rows.len(), cap);
+        assert_eq!(dock_ids(&rows), ["a0", "a1", "a2", "a5"]);
+    }
+
+    #[test]
+    fn the_dock_draws_every_agent_in_start_order_under_the_cap() {
+        let cap = 4;
+        let mut tasks: Vec<_> = (0..cap)
+            .map(|i| dock_agent(&format!("a{i}"), TaskStatus::Running))
+            .collect();
+        tasks[cap - 1].status = TaskStatus::ApprovalRequired;
+        let visible: Vec<_> = tasks.iter().collect();
+        let rows = super::dock_rows(
+            &visible,
+            crate::workflow_panel::AgentDockFocus {
+                selected: Some("a1"),
+                ..Default::default()
+            },
+            cap,
+        );
+        assert_eq!(dock_ids(&rows), ["a0", "a1", "a2", "a3"]);
     }
 
     fn workflow_task_for_agent_dashboard(
@@ -15518,6 +15881,7 @@ mod tests {
             last_activity_at_ms: None,
             continuation: None,
             created_at_ms: 1_000,
+            sequence: 0,
             started_at_ms: Some(1_000),
             completed_at_ms: None,
             result: None,
@@ -17312,6 +17676,7 @@ mod tests {
             .messages
             .push(ChatMessage::User("流式输出一篇长文".to_string()));
         state.update(TuiEvent::TurnStarted {
+            started_at_ms: None,
             turn: 1,
             task: None,
         });
@@ -17354,6 +17719,7 @@ mod tests {
             .messages
             .push(ChatMessage::User("流式输出一篇长文".to_string()));
         state.update(TuiEvent::TurnStarted {
+            started_at_ms: None,
             turn: 1,
             task: None,
         });
@@ -17396,6 +17762,7 @@ mod tests {
             .messages
             .push(ChatMessage::User("流式输出一篇长文".to_string()));
         state.update(TuiEvent::TurnStarted {
+            started_at_ms: None,
             turn: 1,
             task: None,
         });

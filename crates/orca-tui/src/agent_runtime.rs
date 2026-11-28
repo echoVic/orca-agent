@@ -60,6 +60,7 @@ impl TuiAgentRuntime {
     ) -> io::Result<Self> {
         let host = RuntimeHost::start_with_background_capacity(task_capacity)
             .map_err(runtime_host_error)?;
+        host.handle().keep_subagents_in_process();
         Self::spawn_with_dispatch_capacities(
             action_rx,
             event_tx,
@@ -114,6 +115,14 @@ impl TuiAgentRuntime {
     #[cfg(test)]
     pub(crate) fn controller(&self) -> &TuiSurfaceTaskControl {
         &self.controller
+    }
+
+    pub(crate) fn finished_sender(
+        &self,
+    ) -> Option<crossbeam_channel::Sender<crate::hosted_child::FinishedTask>> {
+        self.dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.finished_tx.clone())
     }
 
     pub(crate) fn interaction_ack_receiver(&self) -> Receiver<InteractionResponseAck> {
@@ -233,6 +242,34 @@ mod tests {
             },
         )
         .expect("hosted agent runtime spawned")
+    }
+
+    #[test]
+    fn a_hosted_tui_runtime_keeps_subagents_in_process() {
+        let _home = crate::test_support::isolate_orca_home();
+        let (_action_tx, action_rx) = crossbeam_channel::bounded(1);
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let (flag_tx, flag_rx) = crossbeam_channel::bounded(1);
+
+        let mut runtime = TuiAgentRuntime::spawn_hosted(
+            action_rx,
+            event_tx,
+            1,
+            TuiSurfaceTaskControl::isolated_for_test(),
+            move |_control, _commands, host| {
+                flag_tx
+                    .send(host.keeps_subagents_in_process())
+                    .expect("report the host flag");
+            },
+        )
+        .expect("hosted agent runtime spawned");
+
+        assert!(
+            flag_rx
+                .recv_timeout(TEST_OPERATION_START_TIMEOUT)
+                .expect("host flag reported")
+        );
+        runtime.shutdown().expect("runtime shuts down");
     }
 
     #[test]

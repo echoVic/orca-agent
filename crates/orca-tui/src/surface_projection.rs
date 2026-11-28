@@ -706,7 +706,24 @@ impl AppState {
 pub(crate) fn history_messages_from_surface_snapshot(
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
 ) -> Vec<crate::transcript_state::ChatMessage> {
-    history_messages_from_surface_items(&snapshot.items, &snapshot.tools)
+    let mut start = 0;
+    let mut messages = Vec::new();
+    for (boundary, text) in crate::subagent_lines::positioned_lines(snapshot) {
+        messages.extend(history_messages_from_surface_items(
+            &snapshot.items[start..boundary],
+            &snapshot.tools,
+        ));
+        messages.push(crate::transcript_state::ChatMessage::System {
+            text,
+            expanded: false,
+        });
+        start = boundary;
+    }
+    messages.extend(history_messages_from_surface_items(
+        &snapshot.items[start..],
+        &snapshot.tools,
+    ));
+    messages
 }
 
 #[cfg(test)]
@@ -730,7 +747,7 @@ pub(crate) fn test_surface_cursor(next_seq: u64) -> SurfaceCursor {
     }
 }
 
-fn history_messages_from_surface_items(
+pub(crate) fn history_messages_from_surface_items(
     items: &[SurfaceItem],
     tools: &[orca_runtime::surface::SurfaceToolView],
 ) -> Vec<crate::transcript_state::ChatMessage> {
@@ -1059,6 +1076,11 @@ impl SurfaceProjectionState {
     }
 }
 
+struct PendingTurnStart {
+    task: Option<TuiTaskLifecycle>,
+    started_at_ms: Option<u64>,
+}
+
 pub(crate) struct TuiSurfaceProjection {
     cursor: SurfaceCursor,
     assistant_streams: BTreeMap<SurfaceStreamId, SurfaceAssistantStream>,
@@ -1066,7 +1088,7 @@ pub(crate) struct TuiSurfaceProjection {
     completed_items: Vec<SurfaceItem>,
     operation_turn_ids: BTreeMap<SurfaceOperationId, Vec<orca_runtime::surface::SurfaceTurnId>>,
     focused_operation: Option<SurfaceOperationId>,
-    pending_turn_started: Option<TuiTaskLifecycle>,
+    pending_turn_started: Option<PendingTurnStart>,
     goal: Option<SurfaceGoal>,
     reducer_state: Option<SurfaceReducerState>,
 }
@@ -1093,6 +1115,21 @@ impl TuiSurfaceProjection {
     }
 
     pub(crate) fn from_surface_snapshot(snapshot: &orca_runtime::surface::SurfaceSnapshot) -> Self {
+        Self::from_surface_snapshot_with_clock(snapshot, None, false)
+    }
+
+    pub(crate) fn for_conversation(
+        snapshot: &orca_runtime::surface::SurfaceSnapshot,
+        started_at_ms: Option<u64>,
+    ) -> Self {
+        Self::from_surface_snapshot_with_clock(snapshot, started_at_ms, true)
+    }
+
+    fn from_surface_snapshot_with_clock(
+        snapshot: &orca_runtime::surface::SurfaceSnapshot,
+        started_at_ms: Option<u64>,
+        include_unadmitted: bool,
+    ) -> Self {
         let mut projection = Self::from_snapshot(
             snapshot.cursor.clone(),
             snapshot.assistant_streams.as_slice(),
@@ -1105,12 +1142,20 @@ impl TuiSurfaceProjection {
             .foreground_operation
             .as_ref()
             .filter(|operation| operation.terminal.is_none())
-            .and_then(|operation| operation.agent_loop_turns.last())
-            .map(|turn| TuiTaskLifecycle {
-                id: turn.task_id.as_str().to_string(),
-                kind: "agent".to_string(),
-                status: "running".to_string(),
-                turn: turn.ordinal,
+            .and_then(|operation| {
+                let task = operation
+                    .agent_loop_turns
+                    .last()
+                    .map(|turn| TuiTaskLifecycle {
+                        id: turn.task_id.as_str().to_string(),
+                        kind: "agent".to_string(),
+                        status: "running".to_string(),
+                        turn: turn.ordinal,
+                    });
+                (include_unadmitted || task.is_some()).then_some(PendingTurnStart {
+                    task,
+                    started_at_ms,
+                })
             });
         projection.goal = snapshot.goal.clone();
         projection.completed_items = snapshot.items.clone();
@@ -1142,16 +1187,22 @@ impl TuiSurfaceProjection {
     }
 
     pub(crate) fn hydrate_open_streams(&mut self) -> Vec<TuiEvent> {
-        let mut projected = self
-            .pending_turn_started
-            .take()
-            .map(|task| {
-                vec![TuiEvent::TurnStarted {
-                    turn: task.turn,
-                    task: Some(task),
-                }]
-            })
-            .unwrap_or_default();
+        self.hydrate_streams(TuiEvent::MessageDelta)
+    }
+
+    pub(crate) fn hydrate_conversation(&mut self) -> Vec<TuiEvent> {
+        self.hydrate_streams(TuiEvent::OpenMessageRestored)
+    }
+
+    fn hydrate_streams(&mut self, message: fn(String) -> TuiEvent) -> Vec<TuiEvent> {
+        let mut projected = Vec::new();
+        if let Some(start) = self.pending_turn_started.take() {
+            projected.push(TuiEvent::TurnStarted {
+                turn: start.task.as_ref().map_or(0, |task| task.turn),
+                task: start.task,
+                started_at_ms: start.started_at_ms,
+            });
+        }
         projected.extend(
             self.assistant_stream_order
                 .iter()
@@ -1161,9 +1212,7 @@ impl TuiSurfaceProjection {
                         && !stream.text.as_str().is_empty()
                 })
                 .map(|stream| match stream.channel {
-                    AssistantChannel::Message => {
-                        TuiEvent::MessageDelta(stream.text.as_str().to_string())
-                    }
+                    AssistantChannel::Message => message(stream.text.as_str().to_string()),
                     AssistantChannel::Reasoning => {
                         TuiEvent::ReasoningDelta(stream.text.as_str().to_string())
                     }
@@ -1479,17 +1528,7 @@ impl TuiSurfaceProjection {
                     stream.next_offset = orca_runtime::surface::ByteOffset::new(
                         offset.get().saturating_add(text.as_str().len() as u64),
                     );
-                    match stream.channel {
-                        AssistantChannel::Message => {
-                            projected.push(TuiEvent::MessageDelta(text.as_str().to_string()));
-                        }
-                        AssistantChannel::Reasoning => {
-                            projected.push(TuiEvent::ReasoningDelta(text.as_str().to_string()));
-                        }
-                        AssistantChannel::Plan => {
-                            projected.push(TuiEvent::ProposedPlanDelta(text.as_str().to_string()));
-                        }
-                    }
+                    projected.push(assistant_delta(stream.channel, text.as_str()));
                 }
                 SurfaceEvent::Assistant(AssistantPatch::StreamDiscarded { stream_id, .. }) => {
                     if let Some(stream) = assistant_streams.get_mut(stream_id) {
@@ -1648,6 +1687,7 @@ impl TuiSurfaceProjection {
                     if focused_operation.as_ref() == Some(&turn.fence.operation_id) =>
                 {
                     projected.push(TuiEvent::TurnStarted {
+                        started_at_ms: None,
                         turn: turn.ordinal,
                         task: Some(TuiTaskLifecycle {
                             id: turn.task_id.as_str().to_string(),
@@ -1885,12 +1925,10 @@ pub(crate) fn workflow_task_summaries(
         .tasks
         .iter()
         .map(|task| {
-            let subagent = task.subagent_id.as_ref().and_then(|subagent_id| {
-                snapshot
-                    .subagents
-                    .iter()
-                    .find(|subagent| &subagent.subagent_id == subagent_id)
-            });
+            let subagent = snapshot
+                .subagents
+                .iter()
+                .find(|subagent| subagent.task_id == task.task_id);
             let workflow = task.workflow_run_id.as_ref().and_then(|run_id| {
                 snapshot
                     .workflows
@@ -1910,6 +1948,7 @@ pub(crate) fn workflow_task_summaries(
                 lifetime: TaskLifetime::Task,
                 description: task.description.as_str().to_string(),
                 created_at_ms: task.created_at.get(),
+                sequence: 0,
                 started_at_ms: task.started_at.map(UnixMillis::get),
                 completed_at_ms: task.completed_at.map(UnixMillis::get),
                 command: None,
@@ -1995,7 +2034,8 @@ pub(crate) fn workflow_task_summaries(
                         .as_ref()
                         .map(|thread_id| uuid::Uuid::from_bytes(*thread_id.as_bytes()).to_string())
                 }),
-                subagent_batch_id: subagent.map(|subagent| subagent.batch_id.as_str().to_string()),
+                subagent_batch_id: subagent
+                    .map(|subagent| crate::subagent_lines::batch_identity(task, subagent)),
                 subagent_batch_size: subagent.map(|subagent| subagent.batch_size),
                 subagent_turn: subagent.and_then(|subagent| subagent.turn),
                 last_activity_at_ms: subagent
@@ -2144,7 +2184,7 @@ fn task_type(task_type: orca_runtime::surface::SurfaceTaskType) -> TaskType {
     }
 }
 
-fn task_status(status: SurfaceTaskStatus) -> TaskStatus {
+pub(crate) fn task_status(status: SurfaceTaskStatus) -> TaskStatus {
     match status {
         SurfaceTaskStatus::Queued => TaskStatus::Queued,
         SurfaceTaskStatus::Running => TaskStatus::Running,
@@ -2358,9 +2398,12 @@ pub(crate) fn operation_terminal_events(terminal: &OperationTerminal) -> Vec<Tui
     events
 }
 
-pub(crate) fn latest_terminal_diagnostic(
+/// How the latest finished turn of `snapshot` ended, for a conversation
+/// rebuilt from it: the runtime's diagnostic, or, for a turn the user stopped
+/// by denying an approval, the notice the live turn showed in its place.
+pub(crate) fn latest_terminal_message(
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
-) -> Option<crate::diagnostics::TuiDiagnostic> {
+) -> Option<crate::transcript_state::ChatMessage> {
     if snapshot
         .foreground_operation
         .as_ref()
@@ -2368,20 +2411,58 @@ pub(crate) fn latest_terminal_diagnostic(
     {
         return None;
     }
-    snapshot
+    let operation = snapshot
         .foreground_operation
-        .as_ref()
-        .and_then(|operation| operation.terminal.as_ref())
-        .or_else(|| {
-            snapshot
-                .operation_history
-                .iter()
-                .rev()
-                .find_map(|operation| operation.terminal.as_ref())
-        })
-        .and_then(|record| {
-            crate::diagnostics::TuiDiagnostic::from_surface_terminal(&record.terminal)
-        })
+        .iter()
+        .chain(snapshot.operation_history.iter().rev())
+        .find(|operation| operation.terminal.is_some())?;
+    let terminal = &operation.terminal.as_ref()?.terminal;
+    if stopped_by_a_denied_approval(snapshot, operation, terminal) {
+        return Some(crate::transcript_state::ChatMessage::System {
+            text: crate::approval_actions::DENIED_APPROVAL_NOTICE.to_string(),
+            expanded: false,
+        });
+    }
+    crate::diagnostics::TuiDiagnostic::from_surface_terminal(terminal)
+        .map(crate::transcript_state::ChatMessage::Diagnostic)
+}
+
+/// The operation ended for want of an approval after the user answered one of
+/// its approvals no. Only an operation the TUI started counts: a headless run
+/// that fails closed answers no for nobody.
+fn stopped_by_a_denied_approval(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+    operation: &orca_runtime::surface::OperationRecord,
+    terminal: &OperationTerminal,
+) -> bool {
+    use orca_runtime::surface::{
+        FailureClass, OperationOrigin, SurfaceAllowDeny, SurfaceInteractionLifecycle,
+        SurfaceInteractionSafeProjection,
+    };
+    matches!(
+        terminal,
+        OperationTerminal::Failed {
+            class: FailureClass::LegacyApprovalRequired,
+            ..
+        }
+    ) && matches!(
+        operation.intent.origin,
+        OperationOrigin::TuiUser | OperationOrigin::TuiWorkflowNotification { .. }
+    ) && snapshot.interactions.iter().any(|interaction| {
+        interaction.fence.operation_id == operation.operation_id
+            && matches!(
+                &interaction.lifecycle,
+                SurfaceInteractionLifecycle::Resolved { receipt }
+                    if matches!(
+                        receipt.safe_projection,
+                        SurfaceInteractionSafeProjection::ToolApproval { allowed: false }
+                            | SurfaceInteractionSafeProjection::PermissionRequest {
+                                decision: SurfaceAllowDeny::Deny,
+                                ..
+                            }
+                    )
+            )
+    })
 }
 
 pub(crate) fn operation_terminal_status(terminal: &OperationTerminal) -> Option<&'static str> {
@@ -2399,6 +2480,14 @@ pub(crate) fn operation_terminal_status(terminal: &OperationTerminal) -> Option<
         | OperationTerminal::AbortedByRuntimeRestart { .. } => Some("failed"),
         OperationTerminal::Blocked { .. } => Some("blocked"),
         OperationTerminal::Shutdown { .. } => Some("cancelled"),
+    }
+}
+
+fn assistant_delta(channel: AssistantChannel, text: &str) -> TuiEvent {
+    match channel {
+        AssistantChannel::Message => TuiEvent::MessageDelta(text.to_owned()),
+        AssistantChannel::Reasoning => TuiEvent::ReasoningDelta(text.to_owned()),
+        AssistantChannel::Plan => TuiEvent::ProposedPlanDelta(text.to_owned()),
     }
 }
 
@@ -2678,6 +2767,232 @@ mod tests {
                 closed: false,
             },
         }
+    }
+
+    #[test]
+    fn a_batch_of_two_has_one_launch_and_two_positioned_ends() {
+        use crate::transcript_state::ChatMessage;
+        use orca_runtime::surface::{
+            SurfaceItemId, SurfaceSubagentId, SurfaceTaskId, SurfaceTaskType, SurfaceTurnId,
+        };
+        crate::hosted_child::tests::with_streaming_main(|_, mut snapshot| {
+            let first = snapshot.foreground_operation.take().unwrap();
+            let mut second = first.clone();
+            second.operation_id = SurfaceOperationId::try_from_bytes(uuid_v7_bytes(43)).unwrap();
+            let turn_one = first.agent_loop_turns[0].turn_id.clone();
+            let turn_two = SurfaceTurnId::new();
+            let root_one = first.agent_loop_turns[0]
+                .admitted_main_task_id
+                .clone()
+                .unwrap();
+            let root_two = SurfaceTaskId::try_new("admitted-second").unwrap();
+            second.initial_logical_turn_id = Some(turn_two.clone());
+            second.generations[0].logical_turn_id = turn_two.clone();
+            second.agent_loop_turns[0].turn_id = turn_two.clone();
+            second.agent_loop_turns[0].fence.operation_id = second.operation_id.clone();
+            second.agent_loop_turns[0].admitted_main_task_id = Some(root_two.clone());
+            assert_ne!(root_one, first.agent_loop_turns[0].task_id);
+            assert_ne!(root_two, second.agent_loop_turns[0].task_id);
+            snapshot.items = [(turn_one, "first"), (turn_two, "second")]
+                .into_iter()
+                .map(|(turn_id, text)| SurfaceItem::AssistantMessage {
+                    id: SurfaceItemId::new(),
+                    turn_id,
+                    text: DisplayText::new(text),
+                    pinned: false,
+                    cut_short: None,
+                })
+                .collect();
+            let template = crate::hosted_child::tests::snapshot_with_child(1, 5);
+            snapshot.tasks = [(root_one, 10), (root_two, 20)]
+                .map(|(id, time)| {
+                    let mut task = template.tasks[0].clone();
+                    task.task_id = id;
+                    task.task_type = SurfaceTaskType::MainSession;
+                    task.subagent_id = None;
+                    task.started_at = Some(UnixMillis::new(time));
+                    task
+                })
+                .into();
+            for (name, status, ended) in [
+                ("scout", SurfaceTaskStatus::Completed, 15),
+                ("writer", SurfaceTaskStatus::Stopped, 25),
+            ] {
+                let mut task = template.tasks[0].clone();
+                task.task_id = SurfaceTaskId::try_new(name).unwrap();
+                task.subagent_id = Some(SurfaceSubagentId::try_new(name).unwrap());
+                task.description = DisplayText::new(name);
+                task.started_at = Some(UnixMillis::new(12));
+                task.completed_at = Some(UnixMillis::new(ended));
+                task.status = status;
+                task.parent_operation = Some(first.operation_id.clone());
+                let mut agent = template.subagents[0].clone();
+                agent.subagent_id = task.subagent_id.clone().unwrap();
+                agent.task_id = task.task_id.clone();
+                agent.batch_size = 2;
+                snapshot.tasks.push(task);
+                snapshot.subagents.push(agent);
+            }
+            snapshot.operation_history = vec![first, second];
+            let lines = |messages: Vec<ChatMessage>| {
+                messages
+                    .into_iter()
+                    .filter_map(|message| match message {
+                        ChatMessage::Assistant(text) | ChatMessage::System { text, .. } => {
+                            Some(text)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let launch = "Delegating to 2 agents in parallel";
+            let completed = "Agent completed: scout";
+            let stopped = "Agent stopped: writer";
+            assert_eq!(
+                lines(history_messages_from_surface_snapshot(&snapshot)),
+                ["first", launch, completed, "second", stopped]
+            );
+            let (sender, _) = crossbeam_channel::unbounded();
+            let mut state = AppState::new(sender, "test".into(), "mock".into(), "/tmp".into());
+            state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+                SurfaceProjectionState::from_surface_snapshot(&snapshot),
+            )));
+            assert_eq!(
+                lines(state.transcript.messages.clone()),
+                [launch, completed, stopped]
+            );
+            snapshot
+                .tasks
+                .retain(|task| task.task_type != SurfaceTaskType::MainSession);
+            assert_eq!(
+                lines(history_messages_from_surface_snapshot(&snapshot)),
+                ["first", launch, completed, stopped, "second"]
+            );
+        });
+    }
+
+    #[test]
+    fn an_async_acceptance_precedes_launch_but_not_the_end_of_an_undated_turn() {
+        use crate::transcript_state::ChatMessage;
+        crate::hosted_child::tests::with_streaming_main(|thread, mut snapshot| {
+            let current = snapshot.foreground_operation.as_ref().unwrap().clone();
+            let turn = current.agent_loop_turns[0].turn_id.clone();
+            let template = crate::hosted_child::tests::snapshot_with_child(1, 5);
+            snapshot.tasks.clear();
+            snapshot.items.clear();
+            let reply = |turn_id, text| SurfaceItem::AssistantMessage {
+                id: SurfaceItemId::new(),
+                turn_id,
+                text: DisplayText::new(text),
+                pinned: false,
+                cut_short: None,
+            };
+            let root = |task_id, start| {
+                let mut task = template.tasks[0].clone();
+                task.task_id = task_id;
+                task.task_type = SurfaceTaskType::MainSession;
+                task.subagent_id = None;
+                task.started_at = Some(UnixMillis::new(start));
+                task
+            };
+            for ordinal in 1..=3 {
+                let mut older = current.clone();
+                older.operation_id =
+                    SurfaceOperationId::try_from_bytes(uuid_v7_bytes(ordinal)).unwrap();
+                let logical = SurfaceTurnId::new();
+                let admitted = SurfaceTaskId::try_new(format!("admitted-{ordinal}")).unwrap();
+                older.initial_logical_turn_id = Some(logical.clone());
+                older.generations[0].logical_turn_id = logical.clone();
+                older.generations[0].fence.operation_id = older.operation_id.clone();
+                older.agent_loop_turns[0].turn_id = logical.clone();
+                older.agent_loop_turns[0].fence.operation_id = older.operation_id.clone();
+                older.agent_loop_turns[0].admitted_main_task_id = Some(admitted.clone());
+                snapshot.operation_history.push(older);
+                snapshot.tasks.push(root(admitted, i64::from(ordinal)));
+                snapshot.items.push(reply(logical, "older"));
+            }
+            let mut tool = completed_tool_view("async-accept", "subagent", "child", None);
+            tool.request.turn_id = turn.clone();
+            snapshot.items.push(SurfaceItem::ToolResultMessage {
+                id: SurfaceItemId::new(),
+                turn_id: turn.clone(),
+                tool_call_id: tool.request.tool_call_id.clone(),
+                content: DisplayText::new("accepted"),
+                terminal: tool.result.as_ref().unwrap().terminal.clone(),
+                pinned: false,
+            });
+            snapshot.tools.push(tool);
+            let mut agent = template.subagents[0].clone();
+            agent.batch_id = NonEmptyText::try_new("async-accept").unwrap();
+            agent.owner = SurfaceSubagentOwner::Generation {
+                fence: current.generations[0].fence.clone(),
+            };
+            snapshot.subagents.push(agent);
+            let mut task = template.tasks[0].clone();
+            task.parent_operation = Some(current.operation_id.clone());
+            snapshot.tasks.push(task);
+            let (sender, _) = crossbeam_channel::unbounded();
+            let mut live = AppState::new(sender, "test".into(), "mock".into(), "/tmp".into());
+            let sync = |state: &mut AppState, snapshot: &SurfaceSnapshot| {
+                state.update(TuiEvent::SurfaceProjectionSynced(Box::new(
+                    SurfaceProjectionState::from_surface_snapshot(snapshot),
+                )))
+            };
+            sync(&mut live, &snapshot);
+            live.update(TuiEvent::AssistantResponseCompleted(
+                Some("later work".into()),
+                None,
+            ));
+            snapshot.items.push(reply(turn, "later work"));
+            let task = snapshot.tasks.last_mut().unwrap();
+            task.status = SurfaceTaskStatus::Completed;
+            task.completed_at = Some(UnixMillis::new(8));
+            snapshot.cursor.next_seq = SequenceNumber::new(snapshot.cursor.next_seq.get() + 1);
+            sync(&mut live, &snapshot);
+            let notes = |messages: &[ChatMessage]| {
+                messages
+                    .iter()
+                    .filter_map(|message| match message {
+                        ChatMessage::System { text, .. }
+                            if text.starts_with("Agent ") || text.starts_with("Delegating") =>
+                        {
+                            Some(text.clone())
+                        }
+                        ChatMessage::Assistant(text) if text == "later work" => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let expected = [
+                "Delegating to 1 agent",
+                "later work",
+                "Agent completed: child",
+            ];
+            assert_eq!(notes(&live.transcript.messages), expected, "live");
+            let (_, returned) = crate::hosted_session::hosted_projection_batch_from_snapshot(
+                thread,
+                &snapshot,
+                crate::hosted_session::HistoryTarget::Conversation,
+            );
+            assert_eq!(notes(&returned.messages), expected, "undated return");
+            snapshot.tasks.push(root(
+                current.agent_loop_turns[0]
+                    .admitted_main_task_id
+                    .clone()
+                    .unwrap(),
+                4,
+            ));
+            assert_eq!(
+                notes(&history_messages_from_surface_snapshot(&snapshot)),
+                expected,
+                "dated resume"
+            );
+            assert_eq!(
+                crate::subagent_lines::positioned_lines(&snapshot)[0].0,
+                4,
+                "immediately after acceptance"
+            );
+        });
     }
 
     fn goal_projection_goal() -> SurfaceGoal {
@@ -2968,6 +3283,52 @@ mod tests {
                 .iter()
                 .all(|task| task.id != "task-shell-1"),
             "the task panel does not list it"
+        );
+    }
+
+    /// The rows the panel lists from a surface snapshot carry no sequence,
+    /// so they are in creation order, then task id order, whatever order
+    /// the snapshot holds the tasks in.
+    #[test]
+    fn rows_from_a_surface_snapshot_are_listed_in_creation_order() {
+        let mut snapshot = goal_projection_snapshot();
+        let task = |id: &str, created_at: i64| SurfaceTask {
+            task_id: SurfaceTaskId::try_new(id).unwrap(),
+            revision: TaskRevision::try_new(1).unwrap(),
+            task_type: SurfaceTaskType::Subagent,
+            status: orca_runtime::surface::SurfaceTaskStatus::Running,
+            backgrounded: false,
+            description: DisplayText::new(id),
+            created_at: UnixMillis::new(created_at),
+            started_at: Some(UnixMillis::new(created_at)),
+            completed_at: None,
+            parent_operation: None,
+            parent_task_id: None,
+            background_fence: None,
+            workflow_run_id: None,
+            subagent_id: None,
+            pending_interaction_id: None,
+            usage: None,
+            result: None,
+            error: None,
+            retry_count: 0,
+            output_truncated: false,
+        };
+        snapshot.tasks = vec![
+            task("task-c", 3_000),
+            task("task-b", 1_000),
+            task("task-e", 2_000),
+            task("task-a", 2_000),
+        ];
+
+        let rows = crate::workflow_panel::sort_workflow_tasks_for_panel(workflow_task_summaries(
+            &snapshot,
+        ));
+
+        assert!(rows.iter().all(|row| row.sequence == 0));
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["task-b", "task-a", "task-e", "task-c"]
         );
     }
 
@@ -4716,11 +5077,14 @@ mod tests {
             completed_items: Vec::new(),
             operation_turn_ids: BTreeMap::new(),
             focused_operation: None,
-            pending_turn_started: Some(TuiTaskLifecycle {
-                id: "task-1".to_string(),
-                kind: "agent".to_string(),
-                status: "running".to_string(),
-                turn: 4,
+            pending_turn_started: Some(PendingTurnStart {
+                started_at_ms: None,
+                task: Some(TuiTaskLifecycle {
+                    id: "task-1".to_string(),
+                    kind: "agent".to_string(),
+                    status: "running".to_string(),
+                    turn: 4,
+                }),
             }),
             goal: None,
             reducer_state: None,
@@ -4729,6 +5093,7 @@ mod tests {
         assert!(matches!(
             projection.hydrate_open_streams().as_slice(),
             [TuiEvent::TurnStarted {
+                started_at_ms: None,
                 turn: 4,
                 task: Some(TuiTaskLifecycle { id, status, .. }),
             }] if id == "task-1" && status == "running"

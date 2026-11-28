@@ -1244,6 +1244,15 @@ const BASELINE_DIRECT_TUI_MUTATION_SITES = new Map([
 const RETIRABLE_DIRECT_TUI_MUTATION_SITE_MAX_COUNTS = new Map([]);
 
 const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
+  // The route tracks pending display request IDs locally; none of these settles a runtime request.
+  ["crates/orca-tui/src/attachment_routing.rs:accept_parent_delivery:self.parent_waiting.insert", 1],
+  ["crates/orca-tui/src/attachment_routing.rs:accept_parent_delivery:self.parent_waiting.clear", 1],
+  // Function-local collections in a pure read of a &SurfaceSnapshot, not runtime mutations.
+  ["crates/orca-tui/src/subagent_lines.rs:positioned_lines:tool_results.insert", 1],
+  ["crates/orca-tui/src/subagent_lines.rs:positioned_lines:last_item.insert", 1],
+  ["crates/orca-tui/src/subagent_lines.rs:positioned_lines:batches.insert", 1],
+  // The TUI's local map of followed operations, not a runtime mutation.
+  ["crates/orca-tui/src/operation_controller.rs:bind_followed_surface:self.lock_hosted().followed_surfaces.insert", 1],
   [
     "crates/orca-tui/src/background_approval_actions.rs:continue_allowed_background_approvals:state.continued_background_approvals.insert",
     1,
@@ -1266,8 +1275,9 @@ const BASELINE_HARMLESS_SAME_NAME_METHOD_SITES = new Map([
     "crates/orca-tui/src/types.rs:reset_session_projection:self.announced_startup_warnings.clear",
     1,
   ],
-  ["crates/orca-tui/src/hosted_child.rs:return_to_parent:child_focus.event_bridge.stop", 1],
-  ["crates/orca-tui/src/attachment_routing.rs:switch_attachment_deferred:routing.deferred_parent_events.clear", 1],
+  ["crates/orca-tui/src/hosted_child.rs:return_to_parent:bridge.stop", 1],
+  // Each deferral starts with an empty local Vec; clearing it is not a runtime mutation.
+  ["crates/orca-tui/src/attachment_routing.rs:defer_parent:self.deferred_parent_events.clear", 1],
   ["crates/orca-tui/src/app.rs:run_tui_inner:pending_terminal_session.activate", 1],
   // The stderr capture's own lifecycle and buffers, not runtime mutations.
   ["crates/orca-tui/src/app.rs:run_tui_inner:stderr_capture.stop", 1],
@@ -1485,7 +1495,7 @@ const BASELINE_HARMLESS_ASSOCIATED_FUNCTION_SHA256 = new Map([
   ],
   [
     "crates/orca-tui/src/surface_client.rs:stop_task",
-    "98a77f87b1079206cac72eb205055e0bcc67ee2e481efa2bb8a1caa74e6078e3",
+    "636e61f32223e3ac2c6e5141eb0e05aeb04c35268ca22cae1c70a976aed301da",
   ],
 ]);
 const BASELINE_UNRESOLVED_USER_ACTION_SEND_FUNCTION_SHA256 = new Map([]);
@@ -3588,6 +3598,13 @@ function cfgTestExternalModulePaths(repoRoot, sourcePaths, sourceOverrides) {
   return excluded;
 }
 
+// Masking keeps every line ending as it was, CR included: a CR blanked to a
+// space leaves " \n" where the source had "\r\n", and a hash taken over
+// masked text would then tell a CRLF checkout from an LF one.
+function lineEndingOrBlank(character) {
+  return character === "\n" || character === "\r" ? character : " ";
+}
+
 function maskRustNonCode(source) {
   const cached = rustNonCodeMaskCache.get(source);
   if (cached !== undefined) return cached;
@@ -3597,7 +3614,7 @@ function maskRustNonCode(source) {
   let blockDepth = 0;
   let escaped = false;
   let rawTerminator = "";
-  const masked = (text) => text.replace(/[^\n]/g, " ");
+  const masked = (text) => text.replace(/[^\r\n]/g, " ");
 
   while (index < source.length) {
     const character = source[index];
@@ -3644,7 +3661,7 @@ function maskRustNonCode(source) {
       continue;
     }
     if (state === "line-comment") {
-      output += character === "\n" ? "\n" : " ";
+      output += lineEndingOrBlank(character);
       index += 1;
       if (character === "\n") state = "code";
       continue;
@@ -3660,7 +3677,7 @@ function maskRustNonCode(source) {
         blockDepth -= 1;
         if (blockDepth === 0) state = "code";
       } else {
-        output += character === "\n" ? "\n" : " ";
+        output += lineEndingOrBlank(character);
         index += 1;
       }
       continue;
@@ -3671,12 +3688,12 @@ function maskRustNonCode(source) {
         index += rawTerminator.length;
         state = "code";
       } else {
-        output += character === "\n" ? "\n" : " ";
+        output += lineEndingOrBlank(character);
         index += 1;
       }
       continue;
     }
-    output += character === "\n" ? "\n" : " ";
+    output += lineEndingOrBlank(character);
     index += 1;
     if (escaped) escaped = false;
     else if (character === "\\") escaped = true;
@@ -3753,7 +3770,7 @@ function maskCfgTestItems(source) {
   const characters = code.split("");
   for (const [start, end] of ranges) {
     for (let index = start; index < end; index += 1) {
-      if (characters[index] !== "\n") characters[index] = " ";
+      characters[index] = lineEndingOrBlank(characters[index]);
     }
   }
   return characters.join("");
@@ -3788,7 +3805,7 @@ function maskRustUseDeclarations(source) {
   const characters = source.split("");
   for (const declaration of rustUseDeclarations(source)) {
     for (let index = declaration.start; index < declaration.end; index += 1) {
-      if (characters[index] !== "\n") characters[index] = " ";
+      characters[index] = lineEndingOrBlank(characters[index]);
     }
   }
   return characters.join("");

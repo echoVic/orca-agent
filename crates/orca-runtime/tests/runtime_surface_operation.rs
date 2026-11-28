@@ -28,7 +28,6 @@ use orca_runtime::thread_store::{SessionStore, ThreadStore};
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const RESTART_CHILD_ENV: &str = "ORCA_SURFACE_OPERATION_RESTART_CHILD";
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
 struct ExecutionGate {
@@ -764,27 +763,17 @@ fn assert_generation_stop_and_finalizer_are_atomic(
     )
 }
 
+/// Runs `body` with the Orca home the hosts in this process resolve: the
+/// process's `ORCA_HOME`, which in a test build is the process-wide temporary
+/// home orca-core publishes there on first use. Every test shares it, and
+/// nothing here ever points `ORCA_HOME` elsewhere: when a test switched it to
+/// a home of its own, the hosts other tests were starting in parallel saw it
+/// change or vanish under them ("task was not found", "no saved session
+/// matches", or a terminal wait that never returned). A restart child is
+/// given the same home explicitly.
 fn with_orca_home<T>(body: impl FnOnce(&Path) -> T) -> T {
-    let _guard = ORCA_HOME_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let home = tempfile::tempdir().unwrap();
-    let previous = std::env::var_os("ORCA_HOME");
-    // SAFETY: this integration test is run with one test thread and serialized by the lock.
-    unsafe { std::env::set_var("ORCA_HOME", home.path()) };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(home.path())));
-    // SAFETY: the same process-wide lock still guards restoration.
-    unsafe {
-        if let Some(previous) = previous {
-            std::env::set_var("ORCA_HOME", previous);
-        } else {
-            std::env::remove_var("ORCA_HOME");
-        }
-    }
-    match result {
-        Ok(value) => value,
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
+    let home = orca_core::home::orca_home().expect("a test build always resolves an Orca home");
+    body(&home)
 }
 
 #[cfg(unix)]

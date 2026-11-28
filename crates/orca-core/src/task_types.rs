@@ -188,6 +188,10 @@ pub struct BackgroundTaskSummary {
     pub lifetime: TaskLifetime,
     pub description: String,
     pub created_at_ms: i64,
+    /// Submission order within the task registry; `0` when not known.
+    /// Rows are listed by it, so a row keeps its place.
+    #[serde(default)]
+    pub sequence: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]

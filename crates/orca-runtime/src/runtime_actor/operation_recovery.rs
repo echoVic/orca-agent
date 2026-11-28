@@ -7,6 +7,12 @@ pub(crate) struct EphemeralReservationExpiry {
     pub(crate) expires_at: tokio::time::Instant,
 }
 
+pub(crate) struct ActiveSurfaceFollow {
+    pub(crate) operation: surface::SurfaceOperationId,
+    pub(crate) gapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) failure: std::sync::mpsc::Sender<surface::WaitOperationTerminalResult>,
+}
+
 pub(crate) struct OperationRecoveryController<ManualCompaction, ProviderTransfer> {
     pub(crate) pending_manual_compaction: Option<ManualCompaction>,
     pub(crate) pending_provider_transfer: Option<ProviderTransfer>,
@@ -14,6 +20,7 @@ pub(crate) struct OperationRecoveryController<ManualCompaction, ProviderTransfer
         HashMap<surface::SurfaceOperationId, surface::SurfaceInputRequest>,
     pub(crate) ephemeral_reservation_expiry: Option<EphemeralReservationExpiry>,
     pub(crate) terminal_blocked: Option<String>,
+    pub(crate) followed: Option<ActiveSurfaceFollow>,
 }
 
 impl<ManualCompaction, ProviderTransfer>
@@ -26,6 +33,7 @@ impl<ManualCompaction, ProviderTransfer>
             live_input_capsules: HashMap::new(),
             ephemeral_reservation_expiry: None,
             terminal_blocked: None,
+            followed: None,
         }
     }
 }

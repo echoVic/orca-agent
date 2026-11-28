@@ -43,7 +43,7 @@ pub(crate) struct ArchivedShell {
     pub cursor: usize,
 }
 
-pub(super) struct OutputArchive {
+pub(crate) struct OutputArchive {
     connection: Connection,
     root: PathBuf,
     #[cfg(unix)]
@@ -52,13 +52,21 @@ pub(super) struct OutputArchive {
     database: File,
     #[cfg(windows)]
     _database: File,
-    _owner: ExclusiveFileLock,
+    owner: Option<ExclusiveFileLock>,
     limits: ArchiveLimits,
     write_failure: Option<String>,
 }
 
-type SharedArchive = Arc<Mutex<OutputArchive>>;
+pub(crate) type SharedArchive = Arc<Mutex<OutputArchive>>;
 type ArchiveCache = Mutex<HashMap<PathBuf, Weak<Mutex<OutputArchive>>>>;
+static OPEN_ARCHIVES: OnceLock<ArchiveCache> = OnceLock::new();
+
+#[derive(Clone, Copy, PartialEq)]
+enum OpenMode {
+    Create,
+    Recover,
+    LegacyRead,
+}
 
 impl std::fmt::Debug for OutputArchive {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -71,7 +79,6 @@ impl std::fmt::Debug for OutputArchive {
 
 impl OutputArchive {
     pub(super) fn open(root: &Path, session_id: &str) -> io::Result<SharedArchive> {
-        static OPEN_ARCHIVES: OnceLock<ArchiveCache> = OnceLock::new();
         // Same-process managers for bash and exec share the owner. A second host
         // cannot take over a live archive and mistake its processes for survivors.
         let mut cache = OPEN_ARCHIVES
@@ -101,6 +108,58 @@ impl OutputArchive {
     }
 
     fn open_exclusive(root: &Path, session_id: &str, limits: ArchiveLimits) -> io::Result<Self> {
+        Self::open_mode(root, session_id, limits, OpenMode::Create)
+    }
+
+    pub(super) fn remove_empty_directory(root: &Path) -> io::Result<bool> {
+        check_components(root)?;
+        check_private(&fs::symlink_metadata(root)?, true)?;
+        let mut entries = fs::read_dir(root)?;
+        if let Some(entry) = entries.next().transpose()? {
+            if entry.file_name() != "owner.lock" || entries.next().is_some() {
+                return Ok(false);
+            }
+            let path = entry.path();
+            let lock = ExclusiveFileLock::try_acquire_file(&path, existing_private_file(&path)?)
+                .map_err(io::Error::other)?;
+            drop(lock);
+            fs::remove_file(path)?;
+        }
+        drop(entries);
+        fs::remove_dir(root)?;
+        Ok(true)
+    }
+
+    pub(super) fn cached(root: &Path) -> io::Result<Option<SharedArchive>> {
+        check_components(root)?;
+        let path = fs::canonicalize(root)?;
+        Ok(OPEN_ARCHIVES
+            .get_or_init(Mutex::default)
+            .lock()
+            .map_err(poisoned)?
+            .get(&path)
+            .and_then(Weak::upgrade))
+    }
+
+    pub(super) fn existing(root: &Path, session_id: &str, legacy: bool) -> io::Result<Self> {
+        Self::open_mode(
+            root,
+            session_id,
+            ArchiveLimits::default(),
+            if legacy {
+                OpenMode::LegacyRead
+            } else {
+                OpenMode::Recover
+            },
+        )
+    }
+
+    fn open_mode(
+        root: &Path,
+        session_id: &str,
+        limits: ArchiveLimits,
+        mode: OpenMode,
+    ) -> io::Result<Self> {
         if limits.task_bytes == 0
             || limits.session_bytes == 0
             || limits.tasks == 0
@@ -108,25 +167,45 @@ impl OutputArchive {
         {
             return Err(invalid("archive limits must be positive"));
         }
-        prepare_directory(root)
-            .map_err(|error| io_context("prepare task output archive directory", error))?;
+        if mode == OpenMode::Create {
+            prepare_directory(root)
+                .map_err(|error| io_context("prepare task output archive directory", error))?;
+        } else {
+            check_components(root)?;
+            check_private(&fs::symlink_metadata(root)?, true)?;
+        }
         let root = fs::canonicalize(root)
             .map_err(|error| io_context("canonicalize task output archive directory", error))?;
         #[cfg(unix)]
         let directory = open_directory(&root)
             .map_err(|error| io_context("open task output archive directory", error))?;
         let lock_path = root.join("owner.lock");
-        let owner_file = private_file(&lock_path)
-            .map_err(|error| io_context("open task output archive owner file", error))?;
-        let owner = ExclusiveFileLock::try_acquire_file(&lock_path, owner_file)
-            .map_err(|error| io::Error::other(format!("task output archive owner: {error}")))?;
+        let file = if mode == OpenMode::Create {
+            private_file
+        } else {
+            existing_private_file
+        };
+        let owner = if mode == OpenMode::LegacyRead {
+            None
+        } else {
+            let owner_file = file(&lock_path)
+                .map_err(|error| io_context("open task output archive owner file", error))?;
+            Some(
+                ExclusiveFileLock::try_acquire_file(&lock_path, owner_file).map_err(|error| {
+                    io::Error::other(format!("task output archive owner: {error}"))
+                })?,
+            )
+        };
         let path = root.join(DATABASE);
-        let database = private_file(&path)
-            .map_err(|error| io_context("open task output archive database", error))?;
+        let database =
+            file(&path).map_err(|error| io_context("open task output archive database", error))?;
         check_sidecars(&root)
             .map_err(|error| io_context("verify task output archive sidecars", error))?;
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        let flags = (if mode == OpenMode::LegacyRead {
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+        } else {
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+        }) | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let connection = Connection::open_with_flags(&path, flags).map_err(sql_error)?;
         connection
@@ -134,9 +213,10 @@ impl OutputArchive {
             .map_err(sql_error)?;
         // DELETE journaling bounds sidecars by the database size. FULL sync
         // commits each observed chunk before it can be evicted from RAM.
-        connection
-            .execute_batch(
-                "PRAGMA journal_mode = DELETE;
+        if mode == OpenMode::Create {
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode = DELETE;
              PRAGMA synchronous = FULL;
              PRAGMA auto_vacuum = FULL;
              PRAGMA cache_size = -2048;
@@ -144,17 +224,17 @@ impl OutputArchive {
              PRAGMA temp_store = MEMORY;
              PRAGMA foreign_keys = ON;
              PRAGMA trusted_schema = OFF;",
-            )
-            .map_err(sql_error)?;
-        let max_pages = (limits.session_bytes.saturating_mul(2)
-            + limits.chunks.saturating_mul(512)
-            + limits.tasks.saturating_mul(4096)
-            + 1024 * 1024)
-            / 4096;
-        connection
-            .pragma_update(None, "max_page_count", max_pages)
-            .map_err(sql_error)?;
-        connection.execute_batch(
+                )
+                .map_err(sql_error)?;
+            let max_pages = (limits.session_bytes.saturating_mul(2)
+                + limits.chunks.saturating_mul(512)
+                + limits.tasks.saturating_mul(4096)
+                + 1024 * 1024)
+                / 4096;
+            connection
+                .pragma_update(None, "max_page_count", max_pages)
+                .map_err(sql_error)?;
+            connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS archive_meta (
                 id INTEGER PRIMARY KEY CHECK(id = 1),
                 version INTEGER NOT NULL,
@@ -199,12 +279,17 @@ impl OutputArchive {
                 UPDATE shells SET retained_start = MAX(retained_start, OLD.end) WHERE task_id = OLD.task_id;
              END;",
         ).map_err(sql_error)?;
-        connection
-            .execute(
-                "INSERT OR IGNORE INTO archive_meta VALUES(1, 1, ?1)",
-                [session_id],
-            )
-            .map_err(sql_error)?;
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO archive_meta VALUES(1, 1, ?1)",
+                    [session_id],
+                )
+                .map_err(sql_error)?;
+        } else {
+            connection
+                .execute_batch("PRAGMA trusted_schema = OFF; PRAGMA temp_store = MEMORY;")
+                .map_err(sql_error)?;
+        }
         let archive = Self {
             connection,
             root,
@@ -214,21 +299,41 @@ impl OutputArchive {
             database,
             #[cfg(windows)]
             _database: database,
-            _owner: owner,
+            owner,
             limits,
             write_failure: None,
         };
         archive
             .verify_session(session_id)
             .map_err(|error| io_context("initialize task output archive", error))?;
-        archive
+        if mode != OpenMode::LegacyRead {
+            archive
             .connection
             .execute(
                 "UPDATE shells SET state = 'interrupted', exit_code = NULL WHERE state = 'running'",
                 [],
             )
             .map_err(sql_error)?;
+        }
         Ok(archive)
+    }
+
+    pub(super) fn footprint(&self) -> io::Result<(Vec<String>, usize)> {
+        self.check_files()?;
+        let mut query = self
+            .connection
+            .prepare("SELECT task_id FROM shells")
+            .map_err(sql_error)?;
+        let ids = query
+            .query_map([], |row| row.get(0))
+            .map_err(sql_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sql_error)?;
+        let bytes = self
+            .connection
+            .query_row("SELECT bytes FROM usage WHERE id = 1", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        Ok((ids, bytes))
     }
 
     fn verify_session(&self, session_id: &str) -> io::Result<()> {
@@ -264,15 +369,19 @@ impl OutputArchive {
                 .map_err(|error| io_context("verify task output archive directory", error))?;
             verify_identity(&self.root.join(DATABASE), &self.database, false)
                 .map_err(|error| io_context("verify task output archive database", error))?;
-            verify_identity(&self.root.join("owner.lock"), self._owner.file(), false)
-                .map_err(|error| io_context("verify task output archive owner file", error))?;
+            if let Some(owner) = &self.owner {
+                verify_identity(&self.root.join("owner.lock"), owner.file(), false)
+                    .map_err(|error| io_context("verify task output archive owner file", error))?;
+            }
         }
         #[cfg(windows)]
         {
             verify_named_path(&self.root.join(DATABASE), false)
                 .map_err(|error| io_context("verify task output archive database", error))?;
-            verify_named_path(&self.root.join("owner.lock"), false)
-                .map_err(|error| io_context("verify task output archive owner file", error))?;
+            if self.owner.is_some() {
+                verify_named_path(&self.root.join("owner.lock"), false)
+                    .map_err(|error| io_context("verify task output archive owner file", error))?;
+            }
         }
         check_sidecars(&self.root)
             .map_err(|error| io_context("verify task output archive sidecars", error))
@@ -677,7 +786,7 @@ fn validate_id(value: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn prepare_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
     check_components(path)?;
     if !path.exists() {
         let mut builder = fs::DirBuilder::new();
@@ -693,7 +802,7 @@ fn prepare_directory(path: &Path) -> io::Result<()> {
     check_private(&fs::symlink_metadata(path)?, true)
 }
 
-fn check_components(path: &Path) -> io::Result<()> {
+pub(crate) fn check_components(path: &Path) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(invalid("task output root must be absolute"));
     }
@@ -747,6 +856,13 @@ fn private_file(path: &Path) -> io::Result<File> {
         }
         Err(error) => return Err(error),
     };
+    verify_identity(path, &file, false)?;
+    Ok(file)
+}
+
+fn existing_private_file(path: &Path) -> io::Result<File> {
+    check_private(&fs::symlink_metadata(path)?, false)?;
+    let file = open_nofollow_nonblocking(path).map_err(io::Error::other)?;
     verify_identity(path, &file, false)?;
     Ok(file)
 }
@@ -843,7 +959,7 @@ fn io_context(operation: &str, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{operation}: {error}"))
 }
 
-fn missing() -> io::Error {
+pub(super) fn missing() -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
         "task output archive entry is missing or expired in this session",

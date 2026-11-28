@@ -942,6 +942,7 @@ mod tests {
     /// for it.
     fn history_loads(state: &mut AppState) {
         state.update(crate::protocol::TuiEvent::HistoryLoaded {
+            agent_lines: Default::default(),
             messages: Vec::new(),
             plan: None,
             label: "Resumed saved conversation.".to_string(),

@@ -562,6 +562,10 @@ struct PendingSubagentActivity {
     pending: Option<SubagentActivityEvent>,
 }
 
+fn is_end(payload: &SubagentActivityPayload) -> bool {
+    matches!(payload, SubagentActivityPayload::Completed { .. })
+}
+
 /// Assigns source sequence, commit id, timestamp, and digest before calling a
 /// typed sink. A failed delivery remains pending so an explicit retry uses the
 /// exact same durable source identity instead of reconstructing a new event.
@@ -571,6 +575,9 @@ pub(crate) struct ChildAgentActivityEmitter {
     pending: Mutex<PendingSubagentActivity>,
     last_streaming: Mutex<Option<Instant>>,
     published_revision: Arc<AtomicU64>,
+    /// Whether the child's end may take the place of a report that was
+    /// refused again when sent before it. See `end_takes_a_refused_reports_place`.
+    end_takes_a_refused_reports_place: bool,
 }
 
 impl ChildAgentActivityEmitter {
@@ -612,7 +619,20 @@ impl ChildAgentActivityEmitter {
             }),
             last_streaming: Mutex::new(None),
             published_revision,
+            end_takes_a_refused_reports_place: false,
         }
+    }
+
+    /// For a child kept in its host's process. Once that child's parent turn
+    /// is over, its parent takes its end and refuses anything else it
+    /// reports, so a report made in between is refused each time it is sent.
+    /// Sent first, as a refused report always is, it would keep the end from
+    /// ever being sent. With this, the end takes that report's place: the
+    /// report is dropped and the end goes out in its sequence, which the
+    /// refused report never used.
+    pub(crate) fn end_takes_a_refused_reports_place(mut self) -> Self {
+        self.end_takes_a_refused_reports_place = true;
+        self
     }
 
     pub(crate) fn revision_source(&self) -> Arc<AtomicU64> {
@@ -630,14 +650,30 @@ impl ChildAgentActivityEmitter {
         // the activity that the parent surface is meant to observe.
         if let Some(event) = pending.pending.clone() {
             if event.payload != payload {
-                self.sink.publish(event.clone())?;
-                self.published_revision
-                    .store(event.source_sequence, Ordering::Release);
-                pending.next_sequence = event
-                    .source_sequence
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("child activity source sequence overflow"))?;
-                pending.pending = None;
+                match self.sink.publish(event.clone()) {
+                    Ok(()) => {
+                        self.published_revision
+                            .store(event.source_sequence, Ordering::Release);
+                        pending.next_sequence =
+                            event.source_sequence.checked_add(1).ok_or_else(|| {
+                                io::Error::other("child activity source sequence overflow")
+                            })?;
+                        pending.pending = None;
+                    }
+                    // Refused again, and this is a kept child's end: the end
+                    // goes in the report's place (see
+                    // `end_takes_a_refused_reports_place`). The pending report
+                    // never advanced the sequence, so the end takes the
+                    // report's own and leaves no gap.
+                    Err(_)
+                        if self.end_takes_a_refused_reports_place
+                            && is_end(&payload)
+                            && !is_end(&event.payload) =>
+                    {
+                        pending.pending = None;
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 self.sink.publish(event)?;
                 self.published_revision
@@ -959,6 +995,282 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source_sequence, 2);
         assert_eq!(events[0].turn_id, turn_id);
+    }
+
+    /// Stands in for a kept child's parent. Once `turn_over` is set it takes
+    /// only an end and refuses anything else, as the parent does after its
+    /// turn is over. With `refuses_ends` set it refuses an end too.
+    struct ParentTakingOnlyAnEnd {
+        turn_over: AtomicBool,
+        refuses_ends: AtomicBool,
+        sent: Mutex<Vec<SubagentActivityEvent>>,
+        taken: Mutex<Vec<SubagentActivityEvent>>,
+    }
+
+    impl ParentTakingOnlyAnEnd {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                turn_over: AtomicBool::new(false),
+                refuses_ends: AtomicBool::new(false),
+                sent: Mutex::new(Vec::new()),
+                taken: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn taken(&self) -> Vec<(u64, SubagentActivityPayload)> {
+            self.taken
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|event| (event.source_sequence, event.payload.clone()))
+                .collect()
+        }
+
+        fn sent(&self) -> Vec<(u64, SubagentActivityPayload)> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|event| (event.source_sequence, event.payload.clone()))
+                .collect()
+        }
+    }
+
+    impl ChildAgentActivitySink for ParentTakingOnlyAnEnd {
+        fn publish(&self, event: SubagentActivityEvent) -> io::Result<()> {
+            self.sent.lock().unwrap().push(event.clone());
+            let refused = if is_end(&event.payload) {
+                self.refuses_ends.load(Ordering::SeqCst)
+            } else {
+                self.turn_over.load(Ordering::SeqCst)
+            };
+            if refused {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                ));
+            }
+            self.taken.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    fn emitter_reporting_to(sink: Arc<ParentTakingOnlyAnEnd>) -> ChildAgentActivityEmitter {
+        ChildAgentActivityEmitter::new(
+            SubagentActivityIdentity {
+                task_id: SurfaceTaskId::try_new("task-kept").unwrap(),
+                subagent_id: SurfaceSubagentId::try_new("subagent-kept").unwrap(),
+                attempt_id: AgentAttemptId::new(),
+                turn_id: TurnId::new(),
+                owner: SubagentActivityOwner::Generation {
+                    operation_id: SurfaceOperationId::try_from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    )
+                    .unwrap(),
+                },
+            },
+            sink,
+        )
+    }
+
+    fn a_report() -> SubagentActivityPayload {
+        SubagentActivityPayload::ToolStarted {
+            call_id: SurfaceToolCallId::try_new("call-1").unwrap(),
+            name: "bash".to_string(),
+            target: Some(DisplayText::new("sleep 30")),
+        }
+    }
+
+    fn another_report() -> SubagentActivityPayload {
+        SubagentActivityPayload::ToolCompleted {
+            call_id: SurfaceToolCallId::try_new("call-1").unwrap(),
+            status: SurfaceToolTerminalStatus::Cancelled,
+            summary: None,
+        }
+    }
+
+    fn an_end() -> SubagentActivityPayload {
+        SubagentActivityPayload::Completed {
+            status: SurfaceSubagentTerminalStatus::Cancelled,
+            output: None,
+            error: None,
+            usage: None,
+        }
+    }
+
+    fn a_failed_end() -> SubagentActivityPayload {
+        SubagentActivityPayload::Completed {
+            status: SurfaceSubagentTerminalStatus::Failed,
+            output: None,
+            error: Some(DisplayText::new("the child failed")),
+            usage: None,
+        }
+    }
+
+    fn thinking() -> SubagentActivityPayload {
+        SubagentActivityPayload::PhaseChanged {
+            phase: SurfaceSubagentPhase::Thinking,
+            turn: Some(1),
+        }
+    }
+
+    #[test]
+    fn a_kept_childs_end_goes_out_in_the_place_of_a_report_refused_again() {
+        let parent = ParentTakingOnlyAnEnd::new();
+        let emitter = emitter_reporting_to(parent.clone()).end_takes_a_refused_reports_place();
+        emitter.publish_payload(thinking()).unwrap();
+        parent.turn_over.store(true, Ordering::SeqCst);
+
+        assert!(emitter.publish_payload(a_report()).is_err());
+        emitter.publish_payload(an_end()).unwrap();
+
+        // The report was sent again before the end and refused again; the
+        // end then went out in the sequence the report never used.
+        let sent = parent.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.iter()
+                .map(|event| (event.source_sequence, event.payload.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, thinking()),
+                (2, a_report()),
+                (2, a_report()),
+                (2, an_end())
+            ]
+        );
+        assert_eq!(sent[1].surface_commit_id, sent[2].surface_commit_id);
+        assert_ne!(sent[3].surface_commit_id, sent[2].surface_commit_id);
+        assert!(sent[3].verify_digest());
+        assert_eq!(emitter.revision_source().load(Ordering::Acquire), 2);
+
+        // Whatever comes after the end continues from it: no gap, and no
+        // sequence used twice.
+        parent.turn_over.store(false, Ordering::SeqCst);
+        emitter.publish_payload(thinking()).unwrap();
+        assert_eq!(
+            parent.taken(),
+            vec![(1, thinking()), (2, an_end()), (3, thinking())]
+        );
+        assert_eq!(emitter.revision_source().load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn an_end_refused_after_taking_a_reports_place_stays_waiting() {
+        let parent = ParentTakingOnlyAnEnd::new();
+        let emitter = emitter_reporting_to(parent.clone()).end_takes_a_refused_reports_place();
+        parent.turn_over.store(true, Ordering::SeqCst);
+        parent.refuses_ends.store(true, Ordering::SeqCst);
+        assert!(emitter.publish_payload(a_report()).is_err());
+
+        // The end takes the report's place, and is refused too.
+        assert!(emitter.publish_payload(an_end()).is_err());
+        assert_eq!(
+            parent.sent(),
+            vec![(1, a_report()), (1, a_report()), (1, an_end())]
+        );
+
+        // Now the end is what waits. A report after it sends the end again,
+        // and when the end is refused the report is not sent in its place.
+        assert!(emitter.publish_payload(another_report()).is_err());
+        assert_eq!(
+            parent.sent(),
+            vec![
+                (1, a_report()),
+                (1, a_report()),
+                (1, an_end()),
+                (1, an_end())
+            ]
+        );
+        assert!(parent.taken().is_empty());
+        assert_eq!(emitter.revision_source().load(Ordering::Acquire), 0);
+
+        // Once the parent takes an end, the same end goes out, once, in the
+        // sequence the dropped report never used.
+        parent.refuses_ends.store(false, Ordering::SeqCst);
+        emitter.publish_payload(an_end()).unwrap();
+        assert_eq!(parent.taken(), vec![(1, an_end())]);
+        let sent = parent.sent.lock().unwrap().clone();
+        assert_eq!(sent[2].surface_commit_id, sent[4].surface_commit_id);
+        assert_eq!(emitter.revision_source().load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_waiting_end_is_not_replaced_by_a_different_end() {
+        let parent = ParentTakingOnlyAnEnd::new();
+        let emitter = emitter_reporting_to(parent.clone()).end_takes_a_refused_reports_place();
+        parent.turn_over.store(true, Ordering::SeqCst);
+        parent.refuses_ends.store(true, Ordering::SeqCst);
+        assert!(emitter.publish_payload(an_end()).is_err());
+
+        // A different end does not take a refused end's place: the first is
+        // sent again, refused again, and the second is not sent.
+        assert!(emitter.publish_payload(a_failed_end()).is_err());
+        assert_eq!(parent.sent(), vec![(1, an_end()), (1, an_end())]);
+
+        // Once the parent takes ends, the first goes out before the second.
+        parent.refuses_ends.store(false, Ordering::SeqCst);
+        emitter.publish_payload(a_failed_end()).unwrap();
+        assert_eq!(parent.taken(), vec![(1, an_end()), (2, a_failed_end())]);
+        assert_eq!(emitter.revision_source().load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn a_report_taken_when_sent_again_still_goes_before_the_end() {
+        let parent = ParentTakingOnlyAnEnd::new();
+        let emitter = emitter_reporting_to(parent.clone()).end_takes_a_refused_reports_place();
+        parent.turn_over.store(true, Ordering::SeqCst);
+        assert!(emitter.publish_payload(a_report()).is_err());
+
+        parent.turn_over.store(false, Ordering::SeqCst);
+        emitter.publish_payload(an_end()).unwrap();
+
+        assert_eq!(parent.taken(), vec![(1, a_report()), (2, an_end())]);
+    }
+
+    #[test]
+    fn a_report_behind_a_refused_report_still_waits_for_it() {
+        let parent = ParentTakingOnlyAnEnd::new();
+        let emitter = emitter_reporting_to(parent.clone()).end_takes_a_refused_reports_place();
+        parent.turn_over.store(true, Ordering::SeqCst);
+        assert!(emitter.publish_payload(a_report()).is_err());
+
+        // Not an end: the refused report is sent again, refused again, and
+        // this one is not sent at all.
+        assert!(emitter.publish_payload(another_report()).is_err());
+        let sent = parent.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.iter()
+                .map(|event| (event.source_sequence, event.payload.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, a_report()), (1, a_report())]
+        );
+
+        // The refused report is still the one waiting.
+        parent.turn_over.store(false, Ordering::SeqCst);
+        emitter.publish_payload(another_report()).unwrap();
+        assert_eq!(parent.taken(), vec![(1, a_report()), (2, another_report())]);
+    }
+
+    #[test]
+    fn any_other_childs_end_still_waits_for_a_refused_report() {
+        let parent = ParentTakingOnlyAnEnd::new();
+        let emitter = emitter_reporting_to(parent.clone());
+        parent.turn_over.store(true, Ordering::SeqCst);
+        assert!(emitter.publish_payload(a_report()).is_err());
+
+        let refused = emitter
+            .publish_payload(an_end())
+            .expect_err("the refused report is sent first and refused again");
+        assert_eq!(refused.to_string(), "runtime generation is not active");
+        assert!(parent.taken().is_empty());
+        assert!(
+            parent
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| event.payload == a_report())
+        );
     }
 
     #[test]

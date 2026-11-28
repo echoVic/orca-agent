@@ -178,7 +178,11 @@ fn platform_command(unix: &str, windows: &str) -> Vec<String> {
     #[cfg(not(windows))]
     {
         let _ = windows;
-        vec!["sh".to_string(), "-lc".to_string(), unix.to_string()]
+        // Not a login shell (`-lc`): that reads the host's profile, which on
+        // a developer's machine can take seconds (nvm.sh alone took 2.6 s on
+        // one) before the command runs, and these tests' waits are for the
+        // command. Like `-NoProfile` above.
+        vec!["sh".to_string(), "-c".to_string(), unix.to_string()]
     }
 }
 
@@ -5966,6 +5970,159 @@ fn server_mode_command_exec_list_returns_active_process_snapshots() {
     let output = child.wait_with_output().expect("wait for server");
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
+}
+
+// Two hosts on one ORCA_HOME (an IDE and a CLI server, two windows): each
+// `--mode server` keeps its shell tasks in the one fixed task session
+// "server-shell", with each host owning its live commands and their output.
+#[test]
+fn server_mode_two_servers_on_one_home_each_run_command_exec() {
+    if host_refuses_restricted_shells() {
+        return;
+    }
+    let home = tempdir().expect("shared orca home");
+    let first_workspace = tempdir().expect("first workspace");
+    let second_workspace = tempdir().expect("second workspace");
+    let started_marker = first_workspace.path().join("command-started");
+    let release_marker = first_workspace.path().join("command-release");
+    let completed_marker = first_workspace.path().join("command-completed");
+    let first_command = platform_fixture_command_with_args(
+        "touch $1; while test ! -e $2; do sleep 0.05; done; printf first-done; touch $3",
+        &format!(
+            "const fs = require('fs'); fs.writeFileSync({}, ''); const poll = setInterval(() => {{ if (fs.existsSync({})) {{ clearInterval(poll); process.stdout.write('first-done'); fs.writeFileSync({}, ''); }} }}, 50);",
+            javascript_path(&started_marker),
+            javascript_path(&release_marker),
+            javascript_path(&completed_marker)
+        ),
+        &[
+            started_marker.to_str().expect("started marker path"),
+            release_marker.to_str().expect("release marker path"),
+            completed_marker.to_str().expect("completed marker path"),
+        ],
+    );
+    let spawn_server = |workspace: &Path| {
+        orca_command()
+            .env("ORCA_HOME", home.path())
+            .args([
+                "--mode",
+                "server",
+                "--provider",
+                "mock",
+                "--cwd",
+                workspace.to_str().unwrap(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn orca server")
+    };
+
+    // The first server is running a command: it has opened "server-shell".
+    let mut first = spawn_server(first_workspace.path());
+    {
+        let stdin = first.stdin_mut();
+        let request = serde_json::json!({
+            "id": "first-cmd",
+            "method": "command/exec",
+            "params": {
+                "command": first_command,
+                "processId": "first-1",
+                "cwd": first_workspace.path().to_str().unwrap(),
+            }
+        });
+        writeln!(stdin, "{request}").expect("write first command/exec");
+        stdin.flush().expect("flush first command/exec");
+    }
+    first.expect_event("first-cmd", "command_exec_started");
+    wait_for_path(&started_marker);
+    let store = home.path().join("task-sessions/server-shell/tasks.json");
+    let records = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(&store).expect("read server-shell tasks")).unwrap()
+    };
+    let snapshot = records();
+    let running = snapshot
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(_, task)| task["status"] == "running")
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    let [first_id] = running.as_slice() else {
+        panic!("expected exactly one running command: {snapshot}")
+    };
+
+    // A second server on the same home runs a command of its own.
+    let mut second = spawn_server(second_workspace.path());
+    {
+        let stdin = second.stdin_mut();
+        let request = serde_json::json!({
+            "id": "second-cmd",
+            "method": "command/exec",
+            "params": {
+                "command": platform_fixture_command(
+                    "printf second-ok",
+                    "process.stdout.write('second-ok')"
+                ),
+                "cwd": second_workspace.path().to_str().unwrap(),
+            }
+        });
+        writeln!(stdin, "{request}").expect("write second command/exec");
+        stdin.flush().expect("flush second command/exec");
+    }
+    let second_events =
+        second.drain_events_until_event_or_error("second-cmd", "command_exec_completed");
+    let second_result = second_events
+        .iter()
+        .find(|event| event["id"] == "second-cmd")
+        .expect("second command/exec result");
+    assert_eq!(
+        second_result["event"], "command_exec_completed",
+        "a second server on the home could not run a command while the first ran one: {second_result}"
+    );
+    assert_eq!(second_result["stdout"], "second-ok");
+    assert_eq!(
+        records()[*first_id]["status"],
+        "running",
+        "the second server rewrote the first server's running record"
+    );
+
+    // And the first server's command still completes for its own client.
+    std::fs::write(&release_marker, "release").expect("write release marker");
+    wait_for_path(&completed_marker);
+    {
+        let stdin = first.stdin_mut();
+        writeln!(
+            stdin,
+            r#"{{"id":"first-list","method":"command/exec/list","params":{{}}}}"#
+        )
+        .expect("write command/exec/list");
+        stdin.flush().expect("flush command/exec/list");
+    }
+    first.expect_event("first-list", "command_exec_listed");
+    let first_result = first.expect_event("first-cmd", "command_exec_completed");
+    assert_eq!(first_result["event"], "command_exec_completed");
+    assert_eq!(first_result["exitCode"], 0);
+    assert_eq!(first_result["stdout"], "first-done");
+
+    second.close_stdin();
+    assert_eq!(
+        second
+            .wait_with_output()
+            .expect("second server")
+            .status
+            .code(),
+        Some(0)
+    );
+    first.close_stdin();
+    assert_eq!(
+        first
+            .wait_with_output()
+            .expect("first server")
+            .status
+            .code(),
+        Some(0)
+    );
 }
 
 #[test]

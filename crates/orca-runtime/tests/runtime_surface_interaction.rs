@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use orca_core::approval_types::{
@@ -43,7 +43,6 @@ use orca_runtime::thread::RuntimeThread;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static ORCA_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
 const INTERACTION_RESTART_CHILD: &str = "ORCA_INTERACTION_RESTART_CHILD";
 const RESOLVED_INTERACTION_RESTART_CHILD: &str = "ORCA_RESOLVED_INTERACTION_RESTART_CHILD";
 const EFFECT_APPROVAL_RESTART_CHILD: &str = "ORCA_EFFECT_APPROVAL_RESTART_CHILD";
@@ -3172,17 +3171,18 @@ fn run_interaction_restart_child() -> ! {
     std::process::exit(0)
 }
 
+/// Runs `body` with the Orca home the hosts in this process resolve: the
+/// process's `ORCA_HOME`, which in a test build is the process-wide temporary
+/// home orca-core publishes there on first use. Every test shares it, and
+/// nothing here ever points `ORCA_HOME` elsewhere: when a test switched it to
+/// a home of its own, the hosts other tests were starting in parallel saw it
+/// change under them ("prepared surface owner identity changed"), wrote their
+/// ledgers into that home, or published the shared home over it mid-test. A
+/// test finds its own ledger by thread id ([`find_thread_ledger`]), and gives
+/// a restart child the same home explicitly.
 fn with_orca_home<T>(body: impl FnOnce(&Path) -> T) -> T {
-    let _guard = ORCA_HOME_TEST_LOCK.lock().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let previous = std::env::var_os("ORCA_HOME");
-    unsafe { std::env::set_var("ORCA_HOME", home.path()) };
-    let result = body(home.path());
-    match previous {
-        Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
-        None => unsafe { std::env::remove_var("ORCA_HOME") },
-    }
-    result
+    let home = orca_core::home::orca_home().expect("a test build always resolves an Orca home");
+    body(&home)
 }
 
 #[test]
@@ -4022,7 +4022,7 @@ fn detach_route_append_failure_keeps_fallback_transition_retryable() {
         let detach_request = DetachRequest {
             request_id: request_id(),
         };
-        let ledger = find_only_jsonl(home);
+        let ledger = find_thread_ledger(home, thread.thread_id());
         let backup = ledger.with_extension("jsonl.detach-route-backup");
         fs::rename(&ledger, &backup).unwrap();
         fs::create_dir(&ledger).unwrap();
@@ -4213,7 +4213,7 @@ fn detach_cancellation_append_failure_keeps_no_fallback_settlement_retryable() {
         let detach_request = DetachRequest {
             request_id: request_id(),
         };
-        let ledger = find_only_jsonl(home);
+        let ledger = find_thread_ledger(home, thread.thread_id());
         let backup = ledger.with_extension("jsonl.detach-cancel-backup");
         fs::rename(&ledger, &backup).unwrap();
         fs::create_dir(&ledger).unwrap();
@@ -4348,7 +4348,7 @@ fn append_failure_retains_private_first_winner_until_exact_batch_retry() {
                 .unwrap(),
         );
         let interaction = collect_requested_interaction(&mut subscription);
-        let ledger = find_only_jsonl(home);
+        let ledger = find_thread_ledger(home, thread.thread_id());
         let backup = ledger.with_extension("jsonl.private-winner-backup");
         fs::rename(&ledger, &backup).unwrap();
         fs::create_dir(&ledger).unwrap();
@@ -4451,7 +4451,7 @@ fn tool_approval_allow_wakes_only_after_exact_resolution_batch_commits() {
             SurfaceInteractionKind::ToolApproval,
             "effect-1",
         );
-        let ledger = find_only_jsonl(home);
+        let ledger = find_thread_ledger(home, thread.thread_id());
         let backup = ledger.with_extension("jsonl.effect-approval-winner-backup");
         fs::rename(&ledger, &backup).unwrap();
         fs::create_dir(&ledger).unwrap();
@@ -4564,7 +4564,7 @@ fn permission_allow_wakes_only_after_exact_resolution_batch_commits() {
             SurfaceInteractionRequest::PermissionRequest { permissions, .. } => permissions.clone(),
             _ => unreachable!(),
         };
-        let ledger = find_only_jsonl(home);
+        let ledger = find_thread_ledger(home, thread.thread_id());
         let backup = ledger.with_extension("jsonl.effect-permission-winner-backup");
         fs::rename(&ledger, &backup).unwrap();
         fs::create_dir(&ledger).unwrap();
@@ -4643,27 +4643,38 @@ fn permission_allow_wakes_only_after_exact_resolution_batch_commits() {
     });
 }
 
-fn find_only_jsonl(root: &Path) -> PathBuf {
-    fn visit(directory: &Path, found: &mut Vec<PathBuf>) {
-        for entry in fs::read_dir(directory).unwrap() {
-            let path = entry.unwrap().path();
+/// The session ledger `thread_id` recorded under `home`, whose file name
+/// carries the thread id. Other tests record theirs in the same home, and
+/// may swap one for a directory and back while this walks, so an entry that
+/// vanishes mid-walk is skipped.
+fn find_thread_ledger(home: &Path, thread_id: &str) -> PathBuf {
+    fn visit(directory: &Path, thread_id: &str, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
             if path.is_dir() {
-                visit(&path, found);
-            } else if path.parent().is_some_and(|parent| {
-                parent
-                    .components()
-                    .any(|component| component.as_os_str() == "sessions")
-            }) && path
+                visit(&path, thread_id, found);
+            } else if path
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(thread_id))
             {
                 found.push(path);
             }
         }
     }
     let mut found = Vec::new();
-    visit(root, &mut found);
-    assert_eq!(found.len(), 1, "expected one recorded session ledger");
+    visit(&home.join("sessions"), thread_id, &mut found);
+    assert_eq!(
+        found.len(),
+        1,
+        "expected one recorded session ledger for thread {thread_id}"
+    );
     found.pop().unwrap()
 }
 

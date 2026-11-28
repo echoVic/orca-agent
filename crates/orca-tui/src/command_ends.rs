@@ -366,6 +366,7 @@ mod tests {
 
     fn restore(state: &mut AppState, messages: Vec<ChatMessage>) {
         state.update(TuiEvent::HistoryLoaded {
+            agent_lines: Default::default(),
             messages,
             plan: None,
             label: "Resumed saved conversation.".to_string(),

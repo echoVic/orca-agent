@@ -4,11 +4,10 @@ use orca_core::task_types::{BackgroundTaskSummary, TaskStatus, TaskType};
 
 use crate::agent_workspace::AgentWorkspaceRow;
 use crate::protocol::{TaskTranscriptRequest, UserAction};
-use crate::types::{AppState, AppStatus, PanelMode};
+use crate::types::{AppState, PanelMode};
 
-/// Opens a subagent the way Enter on it does: a child on a thread of this
-/// process takes over the conversation view, any other one opens its
-/// transcript in the Agents panel. `false` when there is nothing to open yet,
+/// Opens a bound child's conversation, or an unbound task's transcript
+/// in the Agents panel. `false` when there is nothing to open yet,
 /// because the surface has not published the task.
 pub(crate) fn open_agent_task(
     state: &mut AppState,
@@ -25,7 +24,7 @@ pub(crate) fn open_agent_task(
     let Some(expected_revision) = task.publication_revision else {
         return false;
     };
-    if opens_live_conversation(task, state.status == AppStatus::Idle) {
+    if agent_open_target(state, task) != AgentOpenTarget::Panel {
         let _ = action_tx.send(UserAction::FocusChildThread {
             task_id: task_id.to_string(),
             expected_revision,
@@ -43,13 +42,29 @@ pub(crate) fn open_agent_task(
     true
 }
 
-/// Whether opening this agent switches the view to its live conversation:
-/// only a child still running on a thread of this process, and only while no
-/// turn runs here. The switch belongs to the controller a running turn
-/// holds, so it would wait for the turn and then find the child finished;
-/// any other agent opens its panel, which a running turn does not hold up.
-pub(crate) fn opens_live_conversation(task: &BackgroundTaskSummary, idle: bool) -> bool {
-    task.subagent_child_thread_id.is_some() && task.status.is_active() && idle
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentOpenTarget {
+    Panel,
+    Interactive,
+    Finished,
+}
+
+pub(crate) fn agent_open_target(state: &AppState, task: &BackgroundTaskSummary) -> AgentOpenTarget {
+    if task.subagent_child_thread_id.is_none()
+        || (state.conversation_target().task_id().is_some()
+            && state
+                .focused_workflow_tasks
+                .iter()
+                .any(|nested| nested.id == task.id))
+    {
+        AgentOpenTarget::Panel
+    } else if task.status.is_active() {
+        AgentOpenTarget::Interactive
+    } else if crate::hosted_child::ended(task.status) {
+        AgentOpenTarget::Finished
+    } else {
+        AgentOpenTarget::Panel
+    }
 }
 
 /// Leaves whatever agent is open for the main conversation: a focused child
@@ -198,6 +213,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: id.to_string(),
             created_at_ms,
+            sequence: 0,
             started_at_ms: Some(created_at_ms),
             completed_at_ms: None,
             command: None,
@@ -322,6 +338,50 @@ mod tests {
         let mut completed = task("completed", 2_000);
         completed.status = TaskStatus::Completed;
         state.replace_workflow_tasks_for_test(vec![completed]);
+        assert!(handle_agent_workspace_key(
+            KeyCode::Char('s'),
+            &mut state,
+            &tx,
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// An agent the TUI keeps on a thread of its own process is stopped by
+    /// the same key as one that runs in a worker process.
+    #[test]
+    fn stop_targets_a_running_agent_kept_on_a_thread_of_this_process() {
+        let (mut state, rx) = state(vec![{
+            let mut kept = task("kept", 1_000);
+            kept.subagent_child_thread_id = Some("thread-kept".to_string());
+            kept
+        }]);
+        let tx = state.event_tx.clone();
+
+        assert!(handle_agent_workspace_key(
+            KeyCode::Char('s'),
+            &mut state,
+            &tx,
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserAction::StopTask { task_id }) if task_id == "kept"
+        ));
+    }
+
+    /// A kept agent that ended with its parent's turn is shown cancelled, its
+    /// last report still "thinking"; there is nothing left for `s` to stop.
+    #[test]
+    fn a_kept_agent_ended_with_its_parents_turn_is_not_offered_a_stop() {
+        let (mut state, rx) = state(vec![{
+            let mut kept = task("kept", 1_000);
+            kept.status = TaskStatus::Cancelled;
+            kept.completed_at_ms = Some(2_000);
+            kept.subagent_child_thread_id = Some("thread-kept".to_string());
+            kept.subagent_current_activity = Some("thinking".to_string());
+            kept
+        }]);
+        let tx = state.event_tx.clone();
+
         assert!(handle_agent_workspace_key(
             KeyCode::Char('s'),
             &mut state,
@@ -475,6 +535,206 @@ mod tests {
         let (mut state, rx) = state(tasks);
         state.show_conversation();
         (state, rx)
+    }
+
+    fn dock_visit() -> (
+        AppState,
+        mpsc::Receiver<UserAction>,
+        Vec<BackgroundTaskSummary>,
+    ) {
+        let tasks: Vec<_> = ["first", "second", "third"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut agent = task(id, index as i64 + 1);
+                agent.subagent_child_thread_id = Some(format!("thread-{id}"));
+                agent
+            })
+            .collect();
+        let (mut state, events) = conversation_with(Vec::new());
+        state.update(crate::protocol::TuiEvent::BackgroundTasksUpdated(
+            tasks.clone(),
+        ));
+        project_agent(&mut state, "first");
+        (state, events, tasks)
+    }
+
+    fn project_agent(state: &mut AppState, id: &str) {
+        let mut snapshot = crate::hosted_child::tests::snapshot_with_child(1, 5);
+        snapshot.tasks.clear();
+        snapshot.subagents.clear();
+        state.update(crate::protocol::TuiEvent::ChildProjectionReset {
+            task_id: id.into(),
+            main_status: Some(crate::types::SideParentStatus::Running),
+            projection: Box::new(
+                crate::surface_projection::SurfaceProjectionState::from_surface_snapshot(&snapshot),
+            ),
+        });
+    }
+
+    #[test]
+    fn a_bound_attention_row_opens_only_its_transcript() {
+        let mut row = task("bound", 1);
+        row.subagent_child_thread_id = Some("child".into());
+        row.publication_revision = Some(3);
+        for (status, conversation) in [
+            (TaskStatus::Running, true),
+            (TaskStatus::Completed, true),
+            (TaskStatus::ApprovalRequired, false),
+        ] {
+            row.status = status;
+            let (mut state, rx) = state(vec![row.clone()]);
+            let actions = state.event_tx.clone();
+            assert!(open_agent_task(&mut state, &actions, &row.id));
+            match rx.try_recv().unwrap() {
+                UserAction::FocusChildThread { .. } => assert!(conversation),
+                UserAction::ReadTaskTranscript(_) => assert!(!conversation),
+                _ => panic!("unexpected open action"),
+            }
+        }
+    }
+
+    fn dock_key(
+        state: &mut AppState,
+        key: crossterm::event::KeyEvent,
+        draft: bool,
+    ) -> crate::key_event_actions::KeyEventFlow {
+        let actions = state.event_tx.clone();
+        crate::key_event_actions::handle_key_event_preflight(
+            key,
+            state,
+            &crate::test_support::test_run_config(),
+            &actions,
+            &mut crate::vim::VimState::new(false),
+            draft,
+            || Ok(()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn shift_down_in_an_agents_view_moves_the_mark() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+        for (panel, by_click) in [(false, true), (false, false), (true, true), (true, false)] {
+            let (mut state, events, _) = dock_visit();
+            let actions = state.event_tx.clone();
+            if panel {
+                state.show_agents();
+                handle_agent_workspace_key(KeyCode::Down, &mut state, &actions);
+            }
+            if by_click {
+                render_once(&mut state);
+                let target = if panel {
+                    AgentHitTarget::WorkspaceRow(1)
+                } else {
+                    AgentHitTarget::DockAgent("second".into())
+                };
+                let row = clicks_on(&state, &target)[0];
+                let MouseFlow::OpenAgent(id) = click(&mut state, row) else {
+                    panic!("click must open the sibling")
+                };
+                assert!(open_agent_task(&mut state, &actions, &id));
+            } else if panel {
+                assert!(handle_agent_workspace_key(
+                    KeyCode::Enter,
+                    &mut state,
+                    &actions
+                ));
+            } else {
+                dock_key(&mut state, down, false);
+                dock_key(
+                    &mut state,
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    false,
+                );
+            }
+            assert!(
+                matches!(events.try_recv(), Ok(UserAction::FocusChildThread { task_id, .. }) if task_id == "second")
+            );
+            project_agent(&mut state, "second");
+            assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("second"));
+            dock_key(&mut state, down, false);
+            let frame = crate::test_support::frame_string(&mut state, 100, 40);
+            assert!(frame.contains("› third · running"), "{frame}");
+            assert_eq!(state.conversation_target().task_id(), Some("second"));
+        }
+    }
+
+    #[test]
+    fn finishing_the_visible_agent_preserves_the_sibling_mark() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let (mut state, events, mut tasks) = dock_visit();
+        dock_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            false,
+        );
+        assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("second"));
+        tasks[0].status = TaskStatus::Completed;
+        state.update(crate::protocol::TuiEvent::BackgroundTasksUpdated(tasks));
+        state.update(crate::protocol::TuiEvent::FinishedChildProjection {
+            task_id: "first".into(),
+            main_status: crate::types::SideParentStatus::Idle,
+            projection: None,
+        });
+        assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("second"));
+        dock_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            false,
+        );
+        assert!(
+            matches!(events.try_recv(), Ok(UserAction::FocusChildThread {task_id,..}) if task_id=="second")
+        );
+    }
+
+    #[test]
+    fn a_reorder_keeps_the_mark_but_removing_its_row_clears_it() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let (mut state, _, mut tasks) = dock_visit();
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
+        dock_key(&mut state, up, false);
+        assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("first"));
+        tasks[0].created_at_ms = 4;
+        state.update(crate::protocol::TuiEvent::BackgroundTasksUpdated(
+            tasks.clone(),
+        ));
+        assert_eq!(state.workflow_tasks().last().unwrap().id, "first");
+        assert!(
+            crate::test_support::frame_string(&mut state, 100, 40).contains("› first · running")
+        );
+        state.update(crate::protocol::TuiEvent::BackgroundTasksUpdated(
+            tasks[1..].to_vec(),
+        ));
+        assert!(state.agent_dock_selected_task_id.is_none());
+        state.update(crate::protocol::TuiEvent::BackgroundTasksUpdated(tasks));
+        assert!(state.agent_dock_selected_task_id.is_none());
+        dock_key(&mut state, up, false);
+        assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("second"));
+        project_agent(&mut state, "first");
+        assert_eq!(
+            state.agent_dock_selected_task_id.as_deref(),
+            Some("second"),
+            "a same-agent refresh is not a new open"
+        );
+    }
+
+    #[test]
+    fn a_draft_leaves_the_dock_alone_and_selects_composer_text() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let (mut state, _, _) = dock_visit();
+        state.agent_dock_selected_task_id = Some("second".into());
+        let key = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+        let mut textarea = ratatui_textarea::TextArea::from(["top", "bottom"]);
+        assert!(matches!(
+            dock_key(&mut state, key, !textarea.is_empty()),
+            crate::key_event_actions::KeyEventFlow::Unhandled
+        ));
+        crate::composer_textarea::composer_input(&mut textarea, key.into());
+        assert_eq!(textarea.cursor().0, 1);
+        assert!(textarea.is_selecting());
+        assert_eq!(state.agent_dock_selected_task_id.as_deref(), Some("second"));
     }
 
     fn with_ready_recap(state: &mut AppState, text: &str) {
@@ -667,10 +927,9 @@ mod tests {
     }
 
     #[test]
-    fn a_child_the_running_turn_waits_on_opens_its_activity_right_away() {
-        // Switching the view to the child needs the controller the running
-        // turn holds; queued behind the turn, the switch would only find the
-        // child finished.
+    fn a_live_child_opens_its_conversation_while_the_main_agent_runs() {
+        // The dispatcher shows a child without the controller, so a running
+        // turn no longer holds the switch up.
         let mut child = task("child", 1_000);
         child.subagent_child_thread_id = Some("child-thread".to_string());
         let (mut state, rx) = conversation_with(vec![child]);
@@ -679,19 +938,55 @@ mod tests {
 
         assert!(open_agent_task(&mut state, &tx, "child"));
 
-        assert_eq!(state.panel_mode, PanelMode::Agents);
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
         assert!(matches!(
             rx.try_recv(),
-            Ok(UserAction::ReadTaskTranscript(TaskTranscriptRequest {
+            Ok(UserAction::FocusChildThread {
                 task_id,
                 expected_revision: 7,
-            })) if task_id == "child"
+            }) if task_id == "child"
         ));
-        assert!(rx.try_recv().is_err(), "no child focus is queued");
+        assert!(rx.try_recv().is_err(), "no transcript checkpoint is read");
     }
 
     #[test]
-    fn a_finished_child_opens_its_panel_not_a_conversation_that_is_gone() {
+    fn a_running_main_shows_under_a_childs_conversation_and_a_click_returns() {
+        let mut child = task("child", 1_000);
+        child.subagent_child_thread_id = Some("child-thread".to_string());
+        let (mut state, _rx) = conversation_with(vec![child]);
+        state.update(crate::protocol::TuiEvent::ChildProjectionReset {
+            task_id: "child".to_string(),
+            main_status: Some(crate::types::SideParentStatus::Running),
+            projection: Box::new(
+                crate::surface_projection::SurfaceProjectionState::from_surface_snapshot(
+                    &crate::hosted_child::tests::snapshot_with_child(1, 6),
+                ),
+            ),
+        });
+        assert_eq!(
+            state.main_behind_child,
+            Some(crate::types::SideParentStatus::Running)
+        );
+
+        render_once(&mut state);
+        let main = clicks_on(&state, &AgentHitTarget::Main);
+        assert!(!main.is_empty(), "the row saying main runs returns to main");
+        assert_eq!(click(&mut state, main[0]), MouseFlow::ReturnToMain);
+
+        state.update(crate::protocol::TuiEvent::SideParentStatusChanged(
+            crate::types::SideParentStatus::NeedsApproval,
+        ));
+        assert_eq!(
+            state.main_behind_child,
+            Some(crate::types::SideParentStatus::NeedsApproval)
+        );
+
+        state.update(crate::protocol::TuiEvent::ChildFocusChanged { task_id: None });
+        assert_eq!(state.main_behind_child, None);
+    }
+
+    #[test]
+    fn a_finished_agent_with_a_thread_opens_its_conversation() {
         let mut child = task("child", 1_000);
         child.subagent_child_thread_id = Some("child-thread".to_string());
         child.status = TaskStatus::Completed;
@@ -700,6 +995,19 @@ mod tests {
 
         assert!(open_agent_task(&mut state, &tx, "child"));
 
+        assert_eq!(state.panel_mode, PanelMode::Conversation);
+        assert!(
+            matches!(rx.try_recv(), Ok(UserAction::FocusChildThread { task_id, expected_revision: 7 }) if task_id == "child")
+        );
+    }
+
+    #[test]
+    fn a_finished_agent_without_a_thread_opens_the_panel() {
+        let mut child = task("child", 1_000);
+        child.status = TaskStatus::Completed;
+        let (mut state, rx) = conversation_with(vec![child]);
+        let tx = state.event_tx.clone();
+        assert!(open_agent_task(&mut state, &tx, "child"));
         assert_eq!(state.panel_mode, PanelMode::Agents);
         assert!(matches!(
             rx.try_recv(),

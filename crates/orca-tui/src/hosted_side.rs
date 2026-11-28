@@ -10,7 +10,8 @@ use crossbeam_channel as mpsc;
 use crate::attachment_routing::{AttachmentRouting, spawn_attached_event_sender_with_routing};
 use crate::bridge;
 use crate::hosted_session::{
-    announce_runtime_ready, project_hosted_thread_attached, read_hosted_projection_batch,
+    HistoryTarget, announce_runtime_ready, project_hosted_thread_attached,
+    read_hosted_projection_batch,
 };
 use crate::hosted_session_lifecycle::{preflight_started_session, reap_hosted_thread};
 use crate::hosted_submission::handle_hosted_submitted_turn;
@@ -153,8 +154,8 @@ pub(crate) fn handle_hosted_side_action(
                         return;
                     }
                 };
-            let side_messages = match read_hosted_projection_batch(&started) {
-                Ok((_, messages)) => messages,
+            let conversation = match read_hosted_projection_batch(&started, HistoryTarget::Side) {
+                Ok((_, conversation)) => conversation,
                 Err(error) => {
                     reap_hosted_thread(started);
                     *thread = Some(parent);
@@ -165,6 +166,9 @@ pub(crate) fn handle_hosted_side_action(
                 }
             };
             let parent_event_tx = event_tx.clone();
+            if let Some(view) = control.view() {
+                view.note_main_thread(&parent);
+            }
             let parent_attachment = *session_attachment;
             let side_config = Arc::new(Mutex::new(side_config));
             let side_attachment = AttachmentRouting::allocate_next(attachment_routing);
@@ -208,7 +212,8 @@ pub(crate) fn handle_hosted_side_action(
             );
             if let Err(error) = project_hosted_thread_attached(
                 side_projection,
-                side_messages,
+                conversation,
+                Some("Inherited conversation context."),
                 *session_attachment,
                 root_event_tx,
             ) {
@@ -251,50 +256,38 @@ pub(crate) fn handle_hosted_side_action(
                 let side_active = thread
                     .as_ref()
                     .is_some_and(|current| current.thread_id() == side.side_thread.thread_id());
-                let (target_thread, target_event_tx, target_attachment, target_batch) =
-                    if side_active {
-                        let batch = match read_hosted_projection_batch(&side.thread) {
-                            Ok(batch) => batch,
-                            Err(error) => {
-                                let _ = event_tx.send(TuiEvent::OperationRejected(format!(
-                                    "failed to switch to the main conversation: {error}"
-                                )));
-                                return;
+                let target_thread = if side_active {
+                    &side.thread
+                } else {
+                    &side.side_thread
+                };
+                if side_active {
+                    attachment_routing
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .defer_parent(side.attachment);
+                }
+                let snapshot =
+                    match TuiSurfaceActions::new(target_thread.typed_surface()).read_snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            if side_active {
+                                AttachmentRouting::cancel_deferred_parent_events(
+                                    attachment_routing,
+                                    root_event_tx,
+                                );
                             }
-                        };
-                        (
-                            side.thread.clone(),
-                            side.event_tx.clone(),
-                            side.attachment,
-                            batch,
-                        )
-                    } else {
-                        let batch = match read_hosted_projection_batch(&side.side_thread) {
-                            Ok(batch) => batch,
-                            Err(error) => {
-                                let _ = event_tx.send(TuiEvent::OperationRejected(format!(
-                                    "failed to switch to the side conversation: {error}"
-                                )));
-                                return;
-                            }
-                        };
-                        let side_event_tx = rotate_side_event_sender(
-                            root_event_tx,
-                            &mut side.side_attachment,
-                            attachment_routing,
-                        );
-                        side.side_event_tx = side_event_tx.clone();
-                        (
-                            side.side_thread.clone(),
-                            side_event_tx,
-                            side.side_attachment,
-                            batch,
-                        )
+                            let target = if side_active { "main" } else { "side" };
+                            let _ = event_tx.send(TuiEvent::OperationRejected(format!(
+                                "failed to switch to the {target} conversation: {error}"
+                            )));
+                            return;
+                        }
                     };
                 *thread = Some(target_thread.clone());
-                *event_tx = target_event_tx;
-                *session_attachment = target_attachment;
                 if side_active {
+                    *event_tx = side.event_tx.clone();
+                    *session_attachment = side.attachment;
                     AttachmentRouting::switch_attachment_deferred(
                         attachment_routing,
                         root_event_tx,
@@ -302,6 +295,13 @@ pub(crate) fn handle_hosted_side_action(
                         Some(side.attachment),
                     );
                 } else {
+                    side.side_event_tx = rotate_side_event_sender(
+                        root_event_tx,
+                        &mut side.side_attachment,
+                        attachment_routing,
+                    );
+                    *event_tx = side.side_event_tx.clone();
+                    *session_attachment = side.side_attachment;
                     AttachmentRouting::switch_attachment(
                         attachment_routing,
                         root_event_tx,
@@ -310,12 +310,36 @@ pub(crate) fn handle_hosted_side_action(
                         false,
                     );
                 }
-                if let Err(error) = project_hosted_thread_attached(
-                    target_batch.0,
-                    target_batch.1,
-                    *session_attachment,
-                    root_event_tx,
-                ) {
+                let projected = if side_active && snapshot.foreground_operation.is_some() {
+                    crate::hosted_child::project_returned_main(
+                        target_thread,
+                        &snapshot,
+                        *session_attachment,
+                        root_event_tx,
+                        control,
+                        attachment_routing,
+                    )
+                } else {
+                    let (target, label) = if side_active {
+                        (HistoryTarget::Conversation, None)
+                    } else {
+                        (HistoryTarget::Side, Some("Inherited conversation context."))
+                    };
+                    let (projection, conversation) =
+                        crate::hosted_session::hosted_projection_batch_from_snapshot(
+                            target_thread,
+                            &snapshot,
+                            target,
+                        );
+                    project_hosted_thread_attached(
+                        projection,
+                        conversation,
+                        label,
+                        *session_attachment,
+                        root_event_tx,
+                    )
+                };
+                if let Err(error) = projected {
                     let _ = event_tx.send(TuiEvent::Error(format!(
                         "failed to project switched conversation: {error}"
                     )));
@@ -371,10 +395,18 @@ pub(crate) fn handle_hosted_side_action(
                 let side_active = thread
                     .as_ref()
                     .is_some_and(|current| current.thread_id() == side.side_thread.thread_id());
-                let parent_batch = if side_active {
-                    match read_hosted_projection_batch(&side.thread) {
-                        Ok(batch) => Some(batch),
+                let parent_snapshot = if side_active {
+                    attachment_routing
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .defer_parent(side.attachment);
+                    match TuiSurfaceActions::new(side.thread.typed_surface()).read_snapshot() {
+                        Ok(snapshot) => Some(snapshot),
                         Err(error) => {
+                            AttachmentRouting::cancel_deferred_parent_events(
+                                attachment_routing,
+                                root_event_tx,
+                            );
                             let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                                 "failed to return to the main conversation: {error}"
                             )));
@@ -387,6 +419,12 @@ pub(crate) fn handle_hosted_side_action(
                 };
                 let side_thread = side.side_thread;
                 if let Err(error) = side_thread.shutdown_with_timeout(Duration::from_secs(5)) {
+                    if side_active {
+                        AttachmentRouting::cancel_deferred_parent_events(
+                            attachment_routing,
+                            root_event_tx,
+                        );
+                    }
                     let _ = event_tx.send(TuiEvent::OperationRejected(format!(
                         "failed to close side conversation: {error}"
                     )));
@@ -406,12 +444,13 @@ pub(crate) fn handle_hosted_side_action(
                         *session_attachment,
                         Some(side.attachment),
                     );
-                    let (parent_projection, parent_messages) = parent_batch.expect("parent batch");
-                    if let Err(error) = project_hosted_thread_attached(
-                        parent_projection,
-                        parent_messages,
+                    if let Err(error) = crate::hosted_child::project_returned_main(
+                        &side.thread,
+                        &parent_snapshot.expect("parent snapshot"),
                         *session_attachment,
                         root_event_tx,
+                        control,
+                        attachment_routing,
                     ) {
                         let _ = event_tx.send(TuiEvent::Error(format!(
                             "failed to project main conversation: {error}"
@@ -448,6 +487,183 @@ pub(crate) fn handle_hosted_side_action(
 mod tests {
     use super::*;
     use orca_core::config::HistoryMode;
+
+    #[test]
+    fn fix6_failed_side_close_read_routes_deferred_events_once() {
+        failed_close(true);
+    }
+
+    #[test]
+    fn fix6_failed_side_shutdown_routes_deferred_events_once() {
+        failed_close(false);
+    }
+
+    fn failed_close(fail_read: bool) {
+        let home = crate::test_support::isolate_orca_home();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_owned());
+        config.history_mode = HistoryMode::Record;
+        let runtime = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let parent = runtime.start_thread(config.clone(), "main").unwrap();
+        let main = SessionAttachmentId::new(1);
+        let routing = Arc::new(Mutex::new(AttachmentRouting::new(main)));
+        let (root, events) = mpsc::unbounded();
+        let mut attachment = main;
+        let mut sender = root.clone();
+        let mut thread = Some(parent.clone());
+        let mut side = None;
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let config = Arc::new(Mutex::new(config));
+        let act = |action, thread: &mut _, side: &mut _, attachment: &mut _, sender: &mut _| {
+            handle_hosted_side_action(
+                action,
+                thread,
+                side,
+                &runtime.handle(),
+                &config,
+                &Default::default(),
+                &root,
+                sender,
+                attachment,
+                &routing,
+                &control,
+                &Default::default(),
+            )
+        };
+        act(
+            HostedSideAction::Start { prompt: None },
+            &mut thread,
+            &mut side,
+            &mut attachment,
+            &mut sender,
+        );
+        let visible = attachment;
+        let doomed = if fail_read {
+            &parent
+        } else {
+            thread.as_ref().unwrap()
+        };
+        doomed.shutdown().unwrap();
+        let (errors, rejected) = mpsc::unbounded();
+        sender = errors;
+        let task = serde_json::from_value(serde_json::json!({"id":"deferred dock","type":"subagent","description":"child","status":"running","createdAtMs":1})).unwrap();
+        {
+            let mut routing = routing.lock().unwrap();
+            routing.defer_parent(main);
+            routing.route(&root, main, TuiEvent::WorkflowTasksUpdated(vec![task]));
+            routing.route(
+                &root,
+                main,
+                TuiEvent::TurnKeptInForeground("deferred keep".into()),
+            );
+        }
+        act(
+            HostedSideAction::Close,
+            &mut thread,
+            &mut side,
+            &mut attachment,
+            &mut sender,
+        );
+        let expected = if fail_read {
+            "failed to return"
+        } else {
+            "failed to close"
+        };
+        assert!(
+            matches!(rejected.try_recv(), Ok(TuiEvent::OperationRejected(reason)) if reason.contains(expected))
+        );
+        assert!(side.is_some());
+        assert_eq!(attachment, visible);
+        let effects: Vec<_> = events
+            .try_iter()
+            .filter_map(|event| match event {
+                TuiEvent::BackgroundTasksUpdated(rows)
+                    if rows.iter().any(|task| task.id == "deferred dock") =>
+                {
+                    Some("dock")
+                }
+                TuiEvent::TurnKeptInForeground(text) if text == "deferred keep" => Some("notice"),
+                _ => None,
+            })
+            .collect();
+        control.shutdown();
+        runtime.shutdown().unwrap();
+        assert_eq!(effects, ["dock", "notice"]);
+    }
+
+    #[test]
+    fn fix5_closing_side_reseeds_mains_stale_owner() {
+        let home = crate::test_support::isolate_orca_home();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_owned());
+        config.history_mode = HistoryMode::Record;
+        let runtime = orca_runtime::runtime_host::RuntimeHost::start().unwrap();
+        let parent = runtime
+            .start_thread(config.clone(), "side-close parent")
+            .unwrap();
+        let config = Arc::new(Mutex::new(config));
+        let mut thread = Some(parent.clone());
+        let (root, events) = mpsc::unbounded();
+        let mut sender = root.clone();
+        let main = SessionAttachmentId::new(1);
+        let mut attachment = main;
+        let routing = Arc::new(Mutex::new(AttachmentRouting::new(main)));
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let mut side = None;
+        let mut action = |action| {
+            handle_hosted_side_action(
+                action,
+                &mut thread,
+                &mut side,
+                &runtime.handle(),
+                &config,
+                &Arc::new(Mutex::new(None)),
+                &root,
+                &mut sender,
+                &mut attachment,
+                &routing,
+                &control,
+                &Default::default(),
+            )
+        };
+        action(HostedSideAction::Start { prompt: None });
+        let mut cursor = crate::surface_client::read_snapshot(&parent.typed_surface())
+            .unwrap()
+            .cursor;
+        let op = || {
+            orca_runtime::surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap()
+        };
+        routing.lock().unwrap().route(
+            &root,
+            main,
+            TuiEvent::RuntimeTurnStarted {
+                turn_id: "stale".into(),
+            }
+            .at_operation_cursor(true, &cursor, &op()),
+        );
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            TuiEvent::SideParentStatusChanged(SideParentStatus::Running)
+        )));
+        action(HostedSideAction::Close);
+        assert!(side.is_none());
+        cursor.next_seq = orca_runtime::surface::SequenceNumber::new(cursor.next_seq.get() + 1);
+        routing.lock().unwrap().route(
+            &root,
+            main,
+            TuiEvent::SessionCompleted {
+                status: "cancelled".into(),
+            }
+            .at_operation_cursor(true, &cursor, &op()),
+        );
+        let accepted = events.try_iter().any(|event| matches!(event.into_test_payload(),TuiEvent::SessionCompleted {status} if status=="cancelled"));
+        control.shutdown();
+        runtime.shutdown().unwrap();
+        assert!(accepted, "stale owner survived the side close");
+    }
 
     #[test]
     fn start_without_parent_uses_focused_side_action_owner() {

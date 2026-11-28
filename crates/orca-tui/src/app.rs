@@ -345,6 +345,7 @@ fn run_tui_inner(
     let mut renderer_runtime =
         RendererRuntimeEventOwner::new(mention_search, pending_initial_prompt)
             .with_local_shell_readiness(local_runtime);
+    renderer_runtime.connect_finished_view(&agent_runtime);
 
     let renderer_result = match pending_terminal_session.activate() {
         Ok(terminal_session) => terminal_session.run(
@@ -443,17 +444,10 @@ fn spawn_unwrapped_tui_test_event_sender(
         .name("orca-tui-test-event-unwrapper".to_string())
         .spawn(move || {
             while let Ok(event) = event_rx.recv() {
-                let event = match event {
-                    TuiEvent::Attached(attached) => {
-                        let AttachedTuiEvent { event, .. } = *attached;
-                        if matches!(event, TuiEvent::SessionAttachmentActivated) {
-                            continue;
-                        }
-                        event
-                    }
-                    TuiEvent::SessionAttachmentActivated => continue,
-                    event => event,
-                };
+                let event = TuiEvent::into_test_payload(event);
+                if matches!(event, TuiEvent::SessionAttachmentActivated) {
+                    continue;
+                }
                 if output_tx.send(event).is_err() {
                     break;
                 }
