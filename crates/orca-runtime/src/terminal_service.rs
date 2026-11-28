@@ -16,8 +16,8 @@ use crate::network_proxy::{
     RuntimeNetworkPolicy, RuntimeNetworkProxy, runtime_network_permission_gate_channel,
 };
 use crate::shell_session::{
-    RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellSessionHandle,
-    ShellSessionOutput, ShellSessionTermination, ShellTerminalMode,
+    RuntimeShellSessionManager, ShellSandboxMode, ShellSessionCommand, ShellSessionFinishError,
+    ShellSessionHandle, ShellSessionOutput, ShellSessionTermination, ShellTerminalMode,
 };
 use crate::tasks::TaskRegistry;
 
@@ -61,6 +61,7 @@ struct TerminalSessionState {
     requested_terminal: ShellTerminalMode,
     effective_terminal: ShellTerminalMode,
     terminal: Option<TerminalState>,
+    finish_error: Option<String>,
     background_notifiable: bool,
     completion_observed: bool,
     completion_queued: bool,
@@ -914,6 +915,14 @@ impl TerminalServiceState {
         observe_completion: bool,
     ) -> io::Result<TerminalServiceOutput> {
         self.reap()?;
+        if let Some(error) = self
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.finish_error.clone())
+        {
+            self.observe_completion(session_id);
+            return Err(io::Error::other(error));
+        }
         let (task_id, cursor, requested_terminal, effective_terminal, terminal) =
             if let Some(session) = self.sessions.get(session_id) {
                 (
@@ -1054,7 +1063,15 @@ impl TerminalServiceState {
                 .get(&session_id)
                 .and_then(|session| session.deadline)
                 .map(|(_deadline, source)| source);
-            let mut output = self.manager.stop_for_deadline(&session_id)?;
+            let mut output = match self.manager.stop_for_deadline(&session_id) {
+                Ok(output) => output,
+                Err(error) => {
+                    if !self.record_finish_failure(&error, source) {
+                        return Err(error);
+                    }
+                    continue;
+                }
+            };
             output.status = TaskStatus::Failed;
             // Stamp the terminal before it is recorded: the recorded state is
             // what every later poll reports, and the first response the caller
@@ -1125,15 +1142,37 @@ impl TerminalServiceState {
             self.observe_completion(&session_id);
             return Ok(false);
         }
-        let output = self.manager.kill_preserving_output(&session_id)?;
+        let output = match self.manager.kill_preserving_output(&session_id) {
+            Ok(output) => output,
+            Err(error) => {
+                if self.record_finish_failure(&error, None) {
+                    self.observe_completion(&session_id);
+                }
+                return Err(error);
+            }
+        };
         self.observe_completion(&session_id);
         self.record_terminal(&output);
         Ok(true)
     }
 
     fn reap(&mut self) -> io::Result<()> {
-        let mut outputs = self.manager.reap_requested_stops_preserving_output()?;
-        outputs.extend(self.manager.reap_completed_preserving_output()?);
+        let stopped = self.manager.reap_requested_stops_preserving_output();
+        let (completed, mut poll_error) = match self.manager.reap_completed_preserving_output() {
+            Ok(completed) => (completed, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let mut outputs = Vec::new();
+        for result in stopped.into_iter().chain(completed) {
+            match result {
+                Ok(output) => outputs.push(output),
+                Err(error) => {
+                    if !self.record_finish_failure(&error, None) {
+                        poll_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
         let reaped_at = Instant::now();
         outputs.sort_by(|left, right| {
             (left.exited_at.unwrap_or(reaped_at), &left.task_id)
@@ -1142,7 +1181,29 @@ impl TerminalServiceState {
         for output in outputs {
             self.record_terminal(&output);
         }
-        Ok(())
+        poll_error.map_or(Ok(()), Err)
+    }
+
+    fn record_finish_failure(
+        &mut self,
+        error: &io::Error,
+        deadline_source: Option<&'static str>,
+    ) -> bool {
+        let Some(failure) = ShellSessionFinishError::from_io(error) else {
+            return false;
+        };
+        if let Some(session) = self.sessions.get_mut(&failure.session_id) {
+            session.finish_error = Some(error.to_string());
+            let terminal = TerminalState {
+                exit_code: None,
+                status: TaskStatus::Failed,
+                termination: "finish_failed",
+                deadline_reached: deadline_source.is_some(),
+                deadline_source,
+            };
+            self.record_terminal_state(&failure.session_id, terminal, Instant::now());
+        }
+        true
     }
 
     fn mark_background(&mut self, session_id: &str) {
@@ -1162,24 +1223,37 @@ impl TerminalServiceState {
         output: &ShellSessionOutput,
         deadline_source: Option<&'static str>,
     ) {
-        if let Some(session) = self.sessions.get_mut(&output.id)
+        let mut terminal = TerminalState::from_output(output);
+        if let Some(source) = deadline_source {
+            terminal.deadline_reached = true;
+            terminal.deadline_source = Some(source);
+        }
+        self.record_terminal_state(
+            &output.id,
+            terminal,
+            output.exited_at.unwrap_or_else(Instant::now),
+        );
+    }
+
+    fn record_terminal_state(
+        &mut self,
+        session_id: &str,
+        terminal: TerminalState,
+        exited_at: Instant,
+    ) {
+        if let Some(session) = self.sessions.get_mut(session_id)
             && session.terminal.is_none()
         {
-            let mut terminal = TerminalState::from_output(output);
-            if let Some(source) = deadline_source {
-                terminal.deadline_reached = true;
-                terminal.deadline_source = Some(source);
-            }
             session.terminal = Some(terminal);
-            session.completed_at = Some(output.exited_at.unwrap_or_else(Instant::now));
+            session.completed_at = Some(exited_at);
             if let Some(request) = session.pending_network_block.take() {
                 let _ = request.resolve(RuntimeNetworkBlockDecision::Deny);
             }
             session.network_block_receiver.take();
             session.network_proxy.take();
         }
-        self.queue_completion(&output.id);
-        self.report_end(&output.id);
+        self.queue_completion(session_id);
+        self.report_end(session_id);
     }
 
     /// Leaves the end of a command that outlived its call in the end sink,
@@ -1230,22 +1304,25 @@ impl TerminalServiceState {
             return;
         }
         let task_id = session.task_id.clone();
-        let store = self.manager.output_store();
-        let output = store.read_delta(&task_id, 0, 0).and_then(|metadata| {
-            let start = metadata
-                .bytes_total
-                .saturating_sub(COMPLETION_OUTPUT_MAX_BYTES);
-            let page = store.read_delta(&task_id, start, COMPLETION_OUTPUT_MAX_BYTES)?;
-            Ok((page, metadata.omitted_prefix_bytes))
-        });
-        let (output, omitted_bytes, first_retained_cursor) = match output {
-            Ok((page, first_retained_cursor)) => {
-                // The archive advances a read that begins inside a character.
-                let start = page.next_offset - page.combined.len();
-                (page.combined, start as u64, first_retained_cursor)
-            }
-            Err(error) => (format!("[task output archive unavailable: {error}]"), 0, 0),
-        };
+        let (output, omitted_bytes, first_retained_cursor) =
+            if let Some(error) = &session.finish_error {
+                (error.clone(), 0, 0)
+            } else {
+                let store = self.manager.output_store();
+                match store.read_delta(&task_id, 0, 0).and_then(|metadata| {
+                    let start = metadata
+                        .bytes_total
+                        .saturating_sub(COMPLETION_OUTPUT_MAX_BYTES);
+                    let page = store.read_delta(&task_id, start, COMPLETION_OUTPUT_MAX_BYTES)?;
+                    Ok((page, metadata.omitted_prefix_bytes))
+                }) {
+                    Ok((page, first_retained_cursor)) => {
+                        let start = page.next_offset - page.combined.len();
+                        (page.combined, start as u64, first_retained_cursor)
+                    }
+                    Err(error) => (format!("[task output archive unavailable: {error}]"), 0, 0),
+                }
+            };
         let completion = TerminalCompletion {
             session_id: session_id.to_string(),
             task_id,
@@ -1334,6 +1411,7 @@ impl TerminalSessionState {
             requested_terminal: handle.requested_terminal,
             effective_terminal: handle.effective_terminal,
             terminal: None,
+            finish_error: None,
             background_notifiable: false,
             completion_observed: false,
             completion_queued: false,
@@ -1665,6 +1743,7 @@ mod tests {
                 requested_terminal: ShellTerminalMode::pipe(),
                 effective_terminal: ShellTerminalMode::pipe(),
                 terminal: None,
+                finish_error: None,
                 background_notifiable: false,
                 completion_observed: false,
                 completion_queued: false,
@@ -2525,6 +2604,46 @@ mod tests {
     }
 
     #[test]
+    fn a_background_finish_failure_reports_the_cause_once() {
+        let cwd = tempfile::tempdir().unwrap();
+        let root = cwd.path().join("tasks");
+        let registry = TaskRegistry::new_persistent("finish-failure".into(), root.clone()).unwrap();
+        let mut state = TerminalServiceState::new(registry, None);
+        let handle = start_gated_command(&mut state, cwd.path());
+        state.manager.write_stdin(&handle.id, "finish\n").unwrap();
+        wait_for_process_exits(&mut state, 1);
+        std::fs::write(root.join("finish-failure/tasks.json"), b"{").unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let (response, first) = mpsc::sync_channel(1);
+        let (next_response, next) = mpsc::sync_channel(1);
+        sender
+            .send(TerminalCommand::ReadCompletions {
+                drain: true,
+                response,
+            })
+            .unwrap();
+        sender
+            .send(TerminalCommand::ReadCompletions {
+                drain: true,
+                response: next_response,
+            })
+            .unwrap();
+        drop(sender);
+        run_terminal_supervisor(state, receiver);
+
+        let completions = first.recv().unwrap();
+        assert_eq!(completions.len(), 1, "{completions:?}");
+        assert_eq!(completions[0].task_id, handle.task_id);
+        assert_eq!(completions[0].status, "failed");
+        assert!(
+            completions[0].output.contains("EOF while parsing"),
+            "{completions:?}"
+        );
+        assert!(next.recv().unwrap().is_empty());
+    }
+
+    #[test]
     fn a_command_that_exited_before_the_boundary_is_delivered_there() {
         let cwd = tempfile::tempdir().unwrap();
         let mut state = TerminalServiceState::new(TaskRegistry::new("boundary".into()), None);
@@ -3144,11 +3263,10 @@ mod tests {
             io::ErrorKind::InvalidInput,
         );
         drop(service);
-        let reopened_registry = TaskRegistry::new_persistent(
-            registry.session_id().to_string(),
-            temp.path().join("tasks"),
-        )
-        .unwrap();
+        let session_id = registry.session_id().to_string();
+        drop(registry);
+        let reopened_registry =
+            TaskRegistry::new_persistent(session_id, temp.path().join("tasks")).unwrap();
         let reopened = TerminalService::new(reopened_registry);
         assert_eq!(first, explicit_page(&reopened, &started.session_id, 0, 2));
         assert!(
@@ -3246,28 +3364,30 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let registry =
             TaskRegistry::new_persistent("recover".to_string(), temp.path().join("tasks")).unwrap();
+        let task = registry.create_shell("recovered".into(), "echo".into());
+        registry.mark_running(&task.id).unwrap();
+        let database = registry
+            .output_storage_root()
+            .unwrap()
+            .unwrap()
+            .join("archive.sqlite3");
         {
             let store = crate::task_output::TaskOutputStore::for_tasks(&registry);
             store
-                .register_shell("shell-recovered", "task-recovered", false, false)
+                .register_shell("shell-recovered", &task.id, false, false)
                 .unwrap();
-            store
-                .append_stdout("task-recovered", "before-restart")
-                .unwrap();
+            store.append_stdout(&task.id, "before-restart").unwrap();
         }
-        let service = TerminalService::new(registry.clone());
+        drop(registry);
+        let service = TerminalService::new(
+            TaskRegistry::new_persistent("recover".into(), temp.path().join("tasks")).unwrap(),
+        );
         let page = explicit_page(&service, "shell-recovered", 0, 99);
         assert_eq!(page.status, "interrupted");
         assert_eq!(page.termination, "interrupted");
         assert!(page.eof);
         assert_eq!(page.output, "before-restart");
         assert_eq!(page.exit_code, None);
-        let database = registry
-            .output_storage_root()
-            .unwrap()
-            .unwrap()
-            .join("archive.sqlite3");
-        #[cfg(unix)]
         {
             std::fs::remove_file(database).unwrap();
             assert!(
@@ -3281,14 +3401,6 @@ mod tests {
                         || false
                     )
                     .is_err()
-            );
-        }
-        #[cfg(windows)]
-        {
-            assert!(std::fs::remove_file(database).is_err());
-            assert_eq!(
-                explicit_page(&service, "shell-recovered", 0, 99).output,
-                "before-restart"
             );
         }
     }

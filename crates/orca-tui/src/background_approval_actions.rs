@@ -84,6 +84,7 @@ mod tests {
             lifetime: TaskLifetime::Task,
             description: "deploy".to_string(),
             created_at_ms: 1,
+            sequence: 0,
             started_at_ms: Some(1),
             completed_at_ms: None,
             command: None,

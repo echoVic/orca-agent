@@ -52,7 +52,7 @@ use crate::runtime_surface::{
 use crate::runtime_tool_call::RuntimeToolCallRuntime;
 use crate::schema_validation::validate_json_schema_subset;
 use crate::subagent::{SubagentIsolation, SubagentRequest};
-use crate::tasks::TaskRegistry;
+use crate::tasks::{SUBAGENT_STOPPED_BY_PERSON, TaskRegistry};
 use crate::workflow::ipc::WorkflowIpcContext;
 use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 
@@ -361,7 +361,15 @@ fn enqueue_accepted_subagent(
             let mut lifecycle = RuntimeSessionLifecycle::new(format!("subagent-{worker_id}"));
             let started = lifecycle.start_task(RuntimeTaskKind::Subagent).clone();
             let output = run_subagent_worker(invocation, lifecycle, started, cancel);
-            if let Some(error) = output.event_error {
+            // A child that was asked to stop and settled as stopped stays
+            // stopped: the reason it gives, or a parent turn that has ended
+            // before it could be told, does not make the stop a failure.
+            let stopped = worker_registry
+                .get(&worker_id)
+                .is_some_and(|task| task.status == orca_core::task_types::TaskStatus::Stopped);
+            if let Some(error) = output.event_error
+                && !stopped
+            {
                 let _ = worker_registry.fail(&worker_id, error);
             }
         })
@@ -472,6 +480,9 @@ impl RuntimeToolCallRuntime {
             batch_id: invocation.batch_id.clone(),
             batch_size: invocation.batch_size,
         };
+        // The queue runs it without the controller when it is a resume,
+        // which `gets_a_thread_of_its_own` already answers no for.
+        let gets_a_thread_of_its_own = gets_a_thread_of_its_own(&invocation);
         let submission = registry
             .execution_scope(&limits)
             .submit_subagent_with_intent(
@@ -480,6 +491,7 @@ impl RuntimeToolCallRuntime {
                 invocation.root_task_id.clone(),
                 now_unix_ms(),
                 Some(launch_intent),
+                gets_a_thread_of_its_own,
             );
         let result = match submission {
             Err(error) => ToolResult::failed_before_start(&tool_request, error.message(), None),
@@ -642,6 +654,7 @@ impl RuntimeSubagentBatch {
             parent,
             now_unix_ms(),
             Some(launch_intent),
+            gets_a_thread_of_its_own(&invocation),
         ) {
             Ok(submission) => submission,
             Err(refusal) => {
@@ -1138,6 +1151,37 @@ fn cancelled_task_output(
     }
 }
 
+/// Marks, when dropped, that a child whose turn ran on a thread of its own
+/// is done saying how it ended; see `TaskControl::end_reported`.
+struct EndReportedWhenDone(crate::tasks::TaskControl);
+
+impl Drop for EndReportedWhenDone {
+    fn drop(&mut self) {
+        self.0.mark_end_reported();
+    }
+}
+
+fn relay_threaded_agent_cancellation(
+    registry: &TaskRegistry,
+    task_id: &str,
+    parent_cancel: &CancelToken,
+    task_cancel: &CancelToken,
+) {
+    loop {
+        if parent_cancel.is_cancelled() {
+            task_cancel.cancel();
+            break;
+        }
+        let terminal = registry
+            .get(task_id)
+            .is_none_or(|task| !task.status.is_active() && !task.status.requires_attention());
+        if terminal {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn run_threaded_agent_worker(
     invocation: RuntimeSubagentInvocation,
     _lifecycle: RuntimeSessionLifecycle,
@@ -1160,11 +1204,15 @@ fn run_threaded_agent_worker(
         ..
     } = invocation;
     let controller = agent_controller.expect("threaded agent branch requires controller");
+    let kept_in_process = controller.keeps_subagents_in_process();
     let description = request.description.clone();
     let mode = match request.mode {
         crate::subagent::SubagentMode::Sync => AgentRunMode::Sync,
         crate::subagent::SubagentMode::Async => AgentRunMode::Async,
     };
+    // Held until this worker is done, whichever way it ends: until then the
+    // child's row may still show it running after its record has ended.
+    let mut _end_reported = None;
     let (surface_activity, permission_handler, registry_task_id, launch_cancel) = if mode
         == AgentRunMode::Sync
         && activity_ingress.is_some()
@@ -1223,11 +1271,16 @@ fn run_threaded_agent_worker(
         // Execute against the canonical task's own cancel token. `task_stop`
         // flips this exact token, so there is no polling race between marking
         // the task running and installing a cancellation watcher.
-        let task_cancel = task_registry
+        let task_control = task_registry
             .get(&registry_task_id)
             .expect("threaded subagent task exists after mark_running")
-            .control
-            .cancel;
+            .control;
+        // Said before the launch shows the child's row, which names the
+        // child's thread only once it has started: a person's stop of that
+        // row reaches the turn through this token from the start.
+        task_control.mark_runs_on_its_own_thread();
+        _end_reported = Some(EndReportedWhenDone(task_control.clone()));
+        let task_cancel = task_control.cancel;
         // Parent cancellation remains a separate one-way edge. Stopping this
         // child must never cancel its parent or a sibling.
         let registry_for_cancel = task_registry.clone();
@@ -1237,22 +1290,12 @@ fn run_threaded_agent_worker(
         let watcher = std::thread::Builder::new()
             .name(format!("orca-agent-cancel-{}", task_id_for_cancel))
             .spawn(move || {
-                loop {
-                    if parent_cancel.is_cancelled() {
-                        watcher_task_cancel.cancel();
-                        break;
-                    }
-                    let terminal =
-                        registry_for_cancel
-                            .get(&task_id_for_cancel)
-                            .is_none_or(|task| {
-                                !task.status.is_active() && !task.status.requires_attention()
-                            });
-                    if terminal {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
+                relay_threaded_agent_cancellation(
+                    &registry_for_cancel,
+                    &task_id_for_cancel,
+                    &parent_cancel,
+                    &watcher_task_cancel,
+                );
             });
         if let Err(error) = watcher {
             let message = format!("failed to watch child cancellation: {error}");
@@ -1272,11 +1315,11 @@ fn run_threaded_agent_worker(
         match threaded_sync_surface_activity(
             &registry_task_id,
             &registry_task_id,
-            crate::agent_continuation::AgentAttemptId::new(),
             &description,
             &batch_id,
             batch_size,
             activity_ingress.as_ref().cloned(),
+            kept_in_process,
         ) {
             Ok(activity) => {
                 let permission_handler = permission_handler.map(|parent| {
@@ -1319,6 +1362,26 @@ fn run_threaded_agent_worker(
         });
         (None, permission_handler, registry_task_id, cancel.clone())
     };
+    // A child the host keeps in its process asks nobody: there is no one
+    // it could ask from here, so what would need an approval or a grant is
+    // refused, and the child says in its reply what it could not do.
+    //
+    // Any other child never inherits an interactive approval handler. The
+    // parent's `RuntimeApprovalHandler` exists only as a non-'static borrow
+    // scoped to the parent turn, so it cannot cross this worker boundary; the
+    // legacy sync child path is identical. Such a child resolves per-tool
+    // approvals from its own RunConfig (RuntimeConfigApprovalHandler), while
+    // user-facing escalations flow through the scoped permission handler.
+    let approval_handler = kept_in_process.then(|| {
+        Arc::new(crate::child_refusal::RefusingApprovalHandler)
+            as Arc<dyn crate::lifecycle::RuntimeApprovalHandler + Send + Sync>
+    });
+    let permission_handler = if kept_in_process {
+        Some(Arc::new(crate::child_refusal::RefusingPermissionHandler)
+            as Arc<dyn RuntimePermissionRequestHandler + Send + Sync>)
+    } else {
+        permission_handler
+    };
     let launch_surface_activity = surface_activity.clone();
     let registry_agent_id = registry_task_id
         .clone()
@@ -1333,13 +1396,8 @@ fn run_threaded_agent_worker(
         mode,
         config: config.clone(),
         cancel: launch_cancel,
-        // Subagents never inherit an interactive approval handler. The parent's
-        // `RuntimeApprovalHandler` exists only as a non-'static borrow scoped to
-        // the parent turn, so it cannot cross this worker boundary; the legacy
-        // sync child path is identical. A child resolves per-tool approvals from
-        // its own RunConfig (RuntimeConfigApprovalHandler), while user-facing
-        // escalations flow through the scoped permission_handler below.
-        approval_handler: None,
+        // Refusing for a child the host keeps, `None` for any other (see above).
+        approval_handler,
         permission_handler,
         surface_activity,
         batch_id: batch_id.clone(),
@@ -1352,6 +1410,21 @@ fn run_threaded_agent_worker(
                 let _ = task_registry.bind_subagent_thread(id, &launch.thread_id);
             }
             let mut status = launch.status;
+            // Only a person's stop of this one child marks its record, and
+            // only in a host that keeps its children here. An interrupt, a
+            // quit, a `deadline_ms` expiry and the `task_stop` tool do not:
+            // their child ends cancelled, as it always has.
+            let stopped_by_person = kept_in_process
+                && !launch.running
+                && status == RunStatus::Cancelled
+                && registry_task_id
+                    .as_deref()
+                    .and_then(|task_id| task_registry.get(task_id))
+                    .is_some_and(|record| record.control.stopped_by_person());
+            // A person's stop ends the child and not the turn waiting on it:
+            // the turn is told it was stopped and goes on. A stop that came
+            // with the parent's own cancel is the turn's, and still ends it.
+            let stopped_alone = stopped_by_person && !cancel.is_cancelled();
             let mut output = if launch.running {
                 let agent_id = registry_task_id
                     .as_deref()
@@ -1426,10 +1499,14 @@ fn run_threaded_agent_worker(
                     }
                     (RunStatus::Cancelled, Some(task_id)) => task_registry.stop_with_usage(
                         task_id,
-                        launch
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "subagent cancelled".to_string()),
+                        if stopped_by_person {
+                            SUBAGENT_STOPPED_BY_PERSON.to_string()
+                        } else {
+                            launch
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "subagent cancelled".to_string())
+                        },
                         Some(usage),
                     ),
                     (RunStatus::Blocked { blocker }, Some(task_id)) => task_registry
@@ -1482,6 +1559,16 @@ fn run_threaded_agent_worker(
                 }
             };
             let task = Some(started_task.with_status(task_status));
+            // Its record and its row end as stopped above, and its task as
+            // cancelled; only what the turn reads of it says it may go on.
+            if stopped_alone && status == RunStatus::Cancelled {
+                status = RunStatus::Success;
+                result = ToolResult::completed(
+                    &tool_request,
+                    SUBAGENT_STOPPED_BY_PERSON.to_string(),
+                    false,
+                );
+            }
             RuntimeSubagentCallOutput {
                 tool_request,
                 description,
@@ -1522,11 +1609,11 @@ struct ThreadedSyncSurfaceActivity {
 fn threaded_sync_surface_activity(
     task_id: &str,
     subagent_id: &str,
-    attempt_id: crate::agent_continuation::AgentAttemptId,
     description: &str,
     batch_id: &str,
     batch_size: u32,
     activity_ingress: Option<Arc<dyn RuntimeSubagentActivityIngress>>,
+    kept_in_process: bool,
 ) -> io::Result<ThreadedSyncSurfaceActivity> {
     let Some(activity_ingress) = activity_ingress else {
         return Err(io::Error::new(
@@ -1547,18 +1634,26 @@ fn threaded_sync_surface_activity(
         )
     })?;
     let turn_id = TurnId::new();
-    let emitter = Arc::new(ChildAgentActivityEmitter::new(
+    let emitter = ChildAgentActivityEmitter::new(
         SubagentActivityIdentity {
             task_id: task_id.clone(),
             subagent_id: subagent_id.clone(),
-            attempt_id,
+            attempt_id: crate::agent_continuation::AgentAttemptId::new(),
             turn_id: turn_id.clone(),
             owner: activity_ingress.owner(),
         },
         Arc::new(RuntimeSubagentActivitySink {
             ingress: activity_ingress,
         }),
-    ));
+    );
+    // A kept child's end is taken after its parent's turn is over, when
+    // anything else it reports is refused; see the emitter's
+    // `end_takes_a_refused_reports_place`.
+    let emitter = Arc::new(if kept_in_process {
+        emitter.end_takes_a_refused_reports_place()
+    } else {
+        emitter
+    });
     Ok(ThreadedSyncSurfaceActivity {
         permission_identity: ChildPermissionIdentity::new(
             task_id,
@@ -1575,12 +1670,37 @@ fn threaded_sync_surface_activity(
     })
 }
 
-fn run_subagent_worker(
-    invocation: RuntimeSubagentInvocation,
-    lifecycle: RuntimeSessionLifecycle,
-    started_task: RuntimeTaskLifecycle,
-    cancel: CancelToken,
-) -> RuntimeSubagentCallOutput {
+/// A child runs on a hosted thread of its own when there is a controller to
+/// host it, it has no isolation, is not a custom agent, is not continued from
+/// a checkpoint (the hosted path refuses `resume_from`), and has no finite
+/// budget (a budgeted child is run without the controller).
+///
+/// This rule must stay at least as strict as `runs_through_the_controller`,
+/// the test by which a worker runs a child on a thread: every child it lets
+/// through must be one that test also runs on a thread, or a child placed
+/// here for a thread of its own would run without one.
+pub(crate) fn child_qualifies_for_thread(
+    request: &SubagentRequest,
+    has_controller: bool,
+    budget_unlimited: bool,
+) -> bool {
+    has_controller
+        && budget_unlimited
+        && request.isolation == SubagentIsolation::None
+        && !matches!(request.subagent_type, SubagentType::Custom(_))
+        && request.resume_from.is_none()
+        && !has_accepted_fork(request)
+}
+
+fn has_accepted_fork(request: &SubagentRequest) -> bool {
+    request.captured_fork_prefix.is_some() || request.fork_prefix_ref.is_some()
+}
+
+/// Whether a worker runs `invocation` through the agent controller, on a
+/// hosted thread, rather than within the call that started it: there is a
+/// controller to host it, and the child has no isolation, is not a custom
+/// agent, does not continue a custom agent, and does not inherit a fork prefix.
+fn runs_through_the_controller(invocation: &RuntimeSubagentInvocation) -> bool {
     let resumes_custom = invocation
         .request
         .resume_from
@@ -1590,11 +1710,34 @@ fn run_subagent_worker(
                 .and_then(|coordinator| coordinator.prepared(selector))
                 .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
         });
-    if invocation.agent_controller.is_some()
+    invocation.agent_controller.is_some()
         && invocation.request.isolation == SubagentIsolation::None
         && !matches!(invocation.request.subagent_type, SubagentType::Custom(_))
         && !resumes_custom
-    {
+        && !has_accepted_fork(&invocation.request)
+}
+
+/// Whether the worker that runs `invocation` gives the child's turn a
+/// thread of its own that its record's stop ends, which
+/// `run_threaded_agent_worker` marks once that thread starts: the child
+/// runs through the controller, reports to a surface, and is not a
+/// resume, which that path refuses before it starts (a worker runs every
+/// child in sync mode). It is asked when the child is accepted, of the
+/// invocation its worker will run, so the child's record says so before
+/// any thread exists, a child queued for capacity included.
+fn gets_a_thread_of_its_own(invocation: &RuntimeSubagentInvocation) -> bool {
+    invocation.request.resume_from.is_none()
+        && invocation.activity_ingress.is_some()
+        && runs_through_the_controller(invocation)
+}
+
+fn run_subagent_worker(
+    invocation: RuntimeSubagentInvocation,
+    lifecycle: RuntimeSessionLifecycle,
+    started_task: RuntimeTaskLifecycle,
+    cancel: CancelToken,
+) -> RuntimeSubagentCallOutput {
+    if runs_through_the_controller(&invocation) {
         return run_threaded_agent_worker(invocation, lifecycle, started_task, cancel);
     }
     let RuntimeSubagentInvocation {
@@ -3206,6 +3349,102 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn ui_continuation_survives_sync_worker_cleanup_after_completion() {
+        use crate::agent_controller::{AgentThreadPolicy, AgentTurnAdmission};
+        use orca_core::task_types::TaskStatus;
+
+        let registry = TaskRegistry::new("sync-worker-cleanup".into());
+        let limits = orca_core::subagent_config::SubagentLimits::default();
+        let original = registry
+            .execution_scope(&limits)
+            .submit_subagent("first".into(), None, None, 1)
+            .unwrap();
+        let task_id = original.task_id;
+        let task_cancel = registry.get(&task_id).unwrap().control.cancel;
+        let worker_cancel = CancelToken::new();
+        registry
+            .complete_with_usage(&task_id, "done".into(), None)
+            .unwrap();
+        assert!(!task_cancel.is_cancelled());
+        worker_cancel.cancel();
+        relay_threaded_agent_cancellation(&registry, &task_id, &worker_cancel, &task_cancel);
+        let completed = registry.get(&task_id).unwrap();
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert!(!completed.stop_requested);
+        assert!(completed.control.cancel.is_cancelled());
+
+        let policy = AgentThreadPolicy {
+            subagent_type: SubagentType::General,
+            depth: 1,
+            task_id: Some(task_id.clone()),
+            continued_task: Default::default(),
+        };
+        let admitted = AgentTurnAdmission::acquire(
+            &policy,
+            &registry,
+            limits,
+            "continue",
+            None,
+            &CancelToken::new(),
+        )
+        .expect("the finished worker's cleanup must not veto the next attempt");
+        assert_ne!(admitted.task_id, task_id);
+    }
+
+    fn plain_request() -> SubagentRequest {
+        SubagentRequest {
+            budget_reservation: None,
+            description: "d".to_string(),
+            prompt: "p".to_string(),
+            subagent_type: SubagentType::Explorer,
+            model: None,
+            context: orca_core::subagent_types::RoleContextPolicy::Fresh,
+            fork_prefix_ref: None,
+            captured_fork_prefix: None,
+            mode: crate::subagent::SubagentMode::Async,
+            isolation: SubagentIsolation::None,
+            schema: None,
+            resume_from: None,
+            deadline_ms: None,
+            delegation: None,
+            frozen_agent: None,
+        }
+    }
+
+    #[test]
+    fn a_plain_child_with_a_controller_qualifies_for_a_thread() {
+        assert!(child_qualifies_for_thread(&plain_request(), true, true));
+    }
+
+    #[test]
+    fn isolation_a_custom_type_or_a_resume_do_not_qualify() {
+        let isolated = SubagentRequest {
+            isolation: SubagentIsolation::Worktree,
+            ..plain_request()
+        };
+        let custom = SubagentRequest {
+            subagent_type: SubagentType::Custom("mine".to_string()),
+            ..plain_request()
+        };
+        let resumed = SubagentRequest {
+            resume_from: Some("checkpoint".to_string()),
+            ..plain_request()
+        };
+        for request in [isolated, custom, resumed] {
+            assert!(
+                !child_qualifies_for_thread(&request, true, true),
+                "{request:?}"
+            );
+        }
+        assert!(!child_qualifies_for_thread(&plain_request(), false, true));
+    }
+
+    #[test]
+    fn a_child_with_a_finite_budget_does_not_qualify() {
+        assert!(!child_qualifies_for_thread(&plain_request(), true, false));
+    }
+
+    #[test]
     fn report_blocker_subagent_output_includes_optional_question() {
         for question in [None, Some("Use port 8080?")] {
             let blocker = serde_json::from_value(serde_json::json!({
@@ -3325,11 +3564,11 @@ mod tests {
         let activity = threaded_sync_surface_activity(
             &task.id,
             &task.id,
-            AgentAttemptId::new(),
             "inspect identity",
             "batch-identity",
             1,
             Some(ingress.clone()),
+            false,
         )
         .expect("threaded activity");
         activity

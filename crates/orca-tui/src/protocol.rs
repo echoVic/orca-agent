@@ -232,6 +232,136 @@ pub struct AcpMetricsSnapshot {
     pub context_limit_tokens: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct LifecycleDelivery {
+    pub(crate) owner: orca_runtime::surface::SurfaceOperationId,
+    pub(crate) cursor: orca_runtime::surface::SurfaceCursor,
+    pub(crate) delivered: Option<orca_runtime::surface::SequenceNumber>,
+    pub(crate) live: bool,
+}
+
+impl TuiEvent {
+    #[cfg(test)]
+    pub(crate) fn into_test_payload(self) -> Self {
+        match self {
+            Self::Attached(attached) => attached.event.into_test_payload(),
+            Self::SurfaceDelivery(delivery) => delivery.1,
+            event => event,
+        }
+    }
+
+    pub(crate) fn accepts_lifecycle(
+        &self,
+        previous: Option<&LifecycleDelivery>,
+        owner: &orca_runtime::surface::SurfaceOperationId,
+        cursor: &orca_runtime::surface::SurfaceCursor,
+        waiting: bool,
+    ) -> bool {
+        let Some(previous) = previous.filter(|previous| {
+            previous.cursor.thread_id == cursor.thread_id
+                && previous.cursor.incarnation == cursor.incarnation
+        }) else {
+            return !matches!(self, Self::OperationReleased);
+        };
+        if matches!(self, Self::OperationReleased) {
+            return previous.owner == *owner
+                && previous
+                    .delivered
+                    .is_none_or(|last| last <= cursor.next_seq);
+        }
+        if previous.cursor.next_seq > cursor.next_seq {
+            return false;
+        }
+        match self {
+            Self::SessionCompleted { .. }
+            | Self::TerminalRecoveryNeeded(_)
+            | Self::Compacted { .. }
+            | Self::Diagnostic(_) => !previous.live || previous.owner == *owner,
+            Self::TurnStarted { .. } | Self::RuntimeTurnStarted { .. }
+                if previous.owner == *owner =>
+            {
+                !waiting
+            }
+            _ => true,
+        }
+    }
+
+    pub(crate) fn lifecycle_delivery(
+        &self,
+        owner: orca_runtime::surface::SurfaceOperationId,
+        cursor: orca_runtime::surface::SurfaceCursor,
+        previous: Option<&LifecycleDelivery>,
+    ) -> LifecycleDelivery {
+        if matches!(self, Self::OperationReleased)
+            && let Some(previous) = previous
+        {
+            return LifecycleDelivery {
+                cursor: if cursor.next_seq > previous.cursor.next_seq {
+                    cursor
+                } else {
+                    previous.cursor.clone()
+                },
+                live: false,
+                ..previous.clone()
+            };
+        }
+        LifecycleDelivery {
+            owner,
+            delivered: Some(cursor.next_seq),
+            cursor,
+            live: !matches!(
+                self,
+                Self::SessionCompleted { .. }
+                    | Self::TerminalRecoveryNeeded(_)
+                    | Self::OperationReleased
+            ),
+        }
+    }
+
+    pub(crate) fn at_operation_cursor(
+        self,
+        routed: bool,
+        cursor: &orca_runtime::surface::SurfaceCursor,
+        operation: &orca_runtime::surface::SurfaceOperationId,
+    ) -> Self {
+        if routed
+            && (self.owns_operation_status()
+                || matches!(self, Self::Diagnostic(_) | Self::Compacted { .. }))
+        {
+            Self::SurfaceDelivery(Box::new((cursor.clone(), self, Some(operation.clone()))))
+        } else {
+            self.at_surface_cursor(routed, cursor)
+        }
+    }
+
+    fn owns_operation_status(&self) -> bool {
+        matches!(
+            self,
+            Self::TurnStarted { .. }
+                | Self::RuntimeTurnStarted { .. }
+                | Self::SessionCompleted { .. }
+                | Self::ApprovalNeeded { .. }
+                | Self::PermissionApprovalNeeded { .. }
+                | Self::McpElicitationRequested { .. }
+                | Self::UserInputRequested { .. }
+                | Self::TerminalRecoveryNeeded(_)
+                | Self::OperationReleased
+        )
+    }
+
+    pub(crate) fn at_surface_cursor(
+        self,
+        routed: bool,
+        cursor: &orca_runtime::surface::SurfaceCursor,
+    ) -> Self {
+        if routed {
+            Self::SurfaceDelivery(Box::new((cursor.clone(), self, None)))
+        } else {
+            self
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TuiEvent {
@@ -241,6 +371,15 @@ pub enum TuiEvent {
     },
     #[doc(hidden)]
     Attached(Box<AttachedTuiEvent>),
+    #[doc(hidden)]
+    SurfaceDelivery(
+        Box<(
+            orca_runtime::surface::SurfaceCursor,
+            TuiEvent,
+            Option<orca_runtime::surface::SurfaceOperationId>,
+        )>,
+    ),
+    TerminalRecoveryNeeded(String),
     #[doc(hidden)]
     SessionAttachmentActivated,
     SideConversationChanged {
@@ -263,6 +402,7 @@ pub enum TuiEvent {
     TurnStarted {
         turn: u32,
         task: Option<TuiTaskLifecycle>,
+        started_at_ms: Option<u64>,
     },
     QueuedSubmissionStarted {
         id: u64,
@@ -296,6 +436,8 @@ pub enum TuiEvent {
     },
     ReasoningDelta(String),
     MessageDelta(String),
+    OpenMessageRestored(String),
+    RuntimeTurnRestored(orca_runtime::surface::SurfaceTurnId),
     /// Text of the plan the model proposes, which the runtime streams apart
     /// from its message; in Plan mode, a completed turn's plan opens the
     /// plan approval.
@@ -375,6 +517,8 @@ pub enum TuiEvent {
         target: Option<String>,
         preview: Option<String>,
     },
+    SurfaceRequestSettled(String),
+    OperationReleased,
     PermissionApprovalNeeded {
         key: TuiInteractionKey,
         tool: String,
@@ -395,9 +539,15 @@ pub enum TuiEvent {
         requested_schema_json: Option<String>,
     },
     HistoryLoaded {
+        agent_lines: crate::subagent_lines::AnnouncedAgentLines,
         messages: Vec<ChatMessage>,
         plan: Option<(Option<String>, Vec<PlanItem>)>,
         label: String,
+    },
+    ConversationReprojected {
+        agent_lines: crate::subagent_lines::AnnouncedAgentLines,
+        messages: Vec<ChatMessage>,
+        plan: Option<(Option<String>, Vec<PlanItem>)>,
     },
     /// Authoritative ACP replica replacement; preserves live interaction state.
     AcpTranscriptSynced {
@@ -406,11 +556,22 @@ pub enum TuiEvent {
     AcpMetricsUpdated(AcpMetricsSnapshot),
     NewSessionStarted,
     SessionProjectionReset(Box<crate::surface_projection::SurfaceProjectionState>),
+    ReturnedMainProjection(
+        Box<crate::surface_projection::SurfaceProjectionState>,
+        Option<LifecycleDelivery>,
+    ),
+    /// Opens a finished task's read-only view without a live child subscription.
+    FinishedChildProjection {
+        task_id: String,
+        main_status: crate::types::SideParentStatus,
+        projection: Option<Box<crate::surface_projection::SurfaceProjectionState>>,
+    },
     /// A focused child recovered its subscription from a fresh snapshot. The
     /// reducer resets its visible projection but retains the child focus so
     /// Escape continues to return to the parent.
     ChildProjectionReset {
         task_id: String,
+        main_status: Option<SideParentStatus>,
         projection: Box<crate::surface_projection::SurfaceProjectionState>,
     },
     SavedSessionsUpdated {
@@ -422,6 +583,9 @@ pub enum TuiEvent {
     SavedSessionActionFailed(String),
     StartupWarning(String),
     Notice(String),
+    /// The runtime would not move the running turn to the background: the
+    /// turn goes on in the foreground, and the text says why.
+    TurnKeptInForeground(String),
     /// A round of a turn the runtime started by itself (the next queued
     /// message, or a wake for background agents that finished); `turn_id`
     /// names the turn, the same for each of its rounds.
@@ -452,7 +616,19 @@ pub enum TuiEvent {
         images: Vec<ComposerImageAttachment>,
         message: String,
     },
+    /// A follow-up or a queue edit that was not delivered because the
+    /// controller runs a turn on another conversation than the one on
+    /// screen. Unlike `SubmissionRejected` and `OperationRejected` it leaves
+    /// the conversation in view, which may be running, as it is: it gives
+    /// the text back, when there is any, and says why.
+    RefusedElsewhere {
+        prompt: Option<String>,
+        bindings: MentionBindings,
+        images: Vec<ComposerImageAttachment>,
+        message: String,
+    },
     OperationRejected(String),
+    CommandRefused(String),
     Diagnostic(TuiDiagnostic),
     Error(String),
     /// The ACP attachment behind the TUI ended for good: it could not attach,
@@ -556,6 +732,7 @@ pub enum TuiEvent {
     /// thread has taken them: once a thread's catalog is in view, it is the
     /// one `/mcp` shows.
     McpCatalogPrestart(crate::surface_projection::McpCatalogView),
+    MainMcpCatalogWhileVisiting(crate::surface_projection::McpCatalogView),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

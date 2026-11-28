@@ -108,6 +108,7 @@ fn background_task_summary_matches_sdk_names() {
         name: Some("audit".to_string()),
         workflow_run_id: Some("workflow-run-1".to_string()),
         created_at_ms: 1_000,
+        sequence: 0,
         started_at_ms: Some(1_000),
         completed_at_ms: None,
         phase_count: Some(2),

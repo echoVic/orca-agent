@@ -13,10 +13,7 @@ use orca_runtime::surface::RuntimeSurfaceHostHandle;
 use crate::attachment_routing::{AttachmentRouting, spawn_attached_event_sender_with_routing};
 use crate::background_tasks::{HostedTaskAction, handle_hosted_task_action};
 use crate::bridge;
-use crate::hosted_child::{
-    HostedChildAction, HostedChildFocus, handle_hosted_child_action,
-    shutdown_attached_child_on_controller_exit,
-};
+use crate::hosted_child::{HostedChildAction, shutdown_attached_child_on_controller_exit};
 use crate::hosted_context::{HostedContextAction, handle_hosted_context_action};
 use crate::hosted_goal::{HostedGoalAction, handle_hosted_goal_action};
 use crate::hosted_operation::{HostedOperationAction, handle_hosted_operation_action};
@@ -34,6 +31,7 @@ use crate::hosted_side::{
     shutdown_attached_side_on_controller_exit,
 };
 use crate::hosted_submission::{handle_hosted_queued_prompt, handle_hosted_submitted_turn};
+use crate::hosted_view::{Adoption, HostedView};
 use crate::hosted_workflow::{HostedWorkflowAction, handle_hosted_workflow_action};
 use crate::operation_controller::TuiSurfaceTaskControl;
 use crate::prestart_mcp::start_prestart_mcp;
@@ -42,8 +40,6 @@ use crate::protocol::{
 };
 use crate::slash_command_actions::decode_settings_intent;
 use crate::submitted_turn::SubmittedTurn;
-use crate::surface_client;
-use crate::surface_projection::SurfaceProjectionState;
 
 const IDLE_SURFACE_PROJECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -56,17 +52,13 @@ fn poll_idle_surface_projection(
         *last_cursor = None;
         return;
     };
-    let actions = crate::surface_actions::TuiSurfaceActions::new(thread.typed_surface());
-    let Ok(snapshot) = actions.read_snapshot() else {
+    let Ok(Some(projection)) =
+        crate::surface_client::changed_projection(&thread.typed_surface(), last_cursor.as_ref())
+    else {
         return;
     };
-    if last_cursor.as_ref() == Some(&snapshot.cursor) {
-        return;
-    }
-    *last_cursor = Some(snapshot.cursor.clone());
-    let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(
-        SurfaceProjectionState::from_surface_snapshot(&snapshot),
-    )));
+    *last_cursor = Some(projection.cursor.clone());
+    let _ = event_tx.send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
 }
 
 /// Bridge a runtime-owned recap worker to the renderer as typed, attachment-
@@ -302,6 +294,41 @@ fn resume_startup_conversation(
     }
 }
 
+/// Moves what the controller operates on to what is on screen, and binds
+/// the prompt queue to it. Only between actions: a running turn keeps the
+/// thread it started on. `true` when the operating thread changed.
+/// `on_child` is whether the controller now operates on a child: its own
+/// state, which cannot change under the loop.
+fn follow_view(
+    view: &HostedView,
+    thread: &mut Option<RuntimeThreadHandle>,
+    event_tx: &mut mpsc::Sender<TuiEvent>,
+    session_attachment: &mut SessionAttachmentId,
+    side_active: bool,
+    control: &TuiSurfaceTaskControl,
+    active_recap_request_id: &mut Option<orca_runtime::recap::RecapRequestId>,
+    on_child: &mut bool,
+) -> bool {
+    let previous = thread.clone();
+    match view.adopt(thread, event_tx, session_attachment, side_active) {
+        Adoption::Unchanged => return false,
+        Adoption::Child => *on_child = true,
+        Adoption::Main => *on_child = false,
+    }
+    // A recap still being written describes the conversation that left the
+    // screen; withdrawing it also stops the provider call.
+    if let Some(request_id) = active_recap_request_id.take()
+        && let Some(previous) = previous.as_ref()
+    {
+        let _ = crate::surface_actions::TuiSurfaceActions::new(previous.typed_surface())
+            .cancel_recap(request_id);
+    }
+    if let Some(runtime_thread) = thread.as_ref() {
+        announce_runtime_ready(runtime_thread, event_tx, control);
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hosted_tui_controller_loop(
     config: Arc<Mutex<RunConfig>>,
@@ -329,9 +356,18 @@ pub(crate) fn hosted_tui_controller_loop(
     );
     let mut thread: Option<RuntimeThreadHandle> = None;
     let mut side_parent: Option<HostedSideParent> = None;
-    let mut child_focus: Option<HostedChildFocus> = None;
+    let view = HostedView::new(
+        host.clone(),
+        root_event_tx.clone(),
+        attachment_routing.clone(),
+        event_tx.clone(),
+        session_attachment,
+    );
+    control.bind_view(view.clone());
+    let mut on_child = false;
     control.bind_hosted_settings_config(config.clone());
     let mut last_idle_projection_cursor = None;
+    let mut last_parent_projection_cursor = None;
     let mut next_recap_request_id = 1_u64;
     let mut active_recap_request_id = None;
     let (recap_completion_tx, recap_completion_rx) = mpsc::unbounded();
@@ -364,13 +400,33 @@ pub(crate) fn hosted_tui_controller_loop(
     }
 
     loop {
-        control.restrict_hosted_settings(side_parent.is_some() || child_focus.is_some());
+        if follow_view(
+            &view,
+            &mut thread,
+            &mut event_tx,
+            &mut session_attachment,
+            side_parent.is_some(),
+            &control,
+            &mut active_recap_request_id,
+            &mut on_child,
+        ) {
+            last_idle_projection_cursor = None;
+            last_parent_projection_cursor = None;
+        }
+        control.restrict_hosted_settings(side_parent.is_some() || on_child || view.has_focus());
         let action: Result<UserAction, ()> = if control.is_shutdown() {
             Ok(UserAction::Cancel)
         } else {
             match action_rx.recv_timeout(IDLE_SURFACE_PROJECTION_POLL_INTERVAL) {
                 Ok(action) => Ok(action),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if on_child {
+                        poll_idle_surface_projection(
+                            view.main_runtime(&control).as_ref(),
+                            &view.main_sender(),
+                            &mut last_parent_projection_cursor,
+                        );
+                    }
                     poll_idle_surface_projection(
                         thread.as_ref(),
                         &event_tx,
@@ -381,43 +437,31 @@ pub(crate) fn hosted_tui_controller_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
             }
         };
+        if follow_view(
+            &view,
+            &mut thread,
+            &mut event_tx,
+            &mut session_attachment,
+            side_parent.is_some(),
+            &control,
+            &mut active_recap_request_id,
+            &mut on_child,
+        ) {
+            last_idle_projection_cursor = None;
+            last_parent_projection_cursor = None;
+        }
         while let Ok(completed_request_id) = recap_completion_rx.try_recv() {
             clear_completed_recap_request(&mut active_recap_request_id, completed_request_id);
         }
-        let side_disallowed = (side_parent.is_some() || child_focus.is_some())
-            && matches!(
-                &action,
-                Ok(UserAction::NewSession
-                    | UserAction::ForkCurrentSession { .. }
-                    | UserAction::RenameCurrentSession { .. }
-                    | UserAction::ResumeSavedSession { .. }
-                    | UserAction::ForkSavedSession { .. }
-                    | UserAction::RenameSavedSession { .. }
-                    | UserAction::ArchiveSavedSession { .. }
-                    | UserAction::DeleteSavedSession { .. }
-                    | UserAction::SetModel(_)
-                    | UserAction::Remember { .. }
-                    | UserAction::Compact
-                    | UserAction::GoalShow
-                    | UserAction::GoalSet(_)
-                    | UserAction::GoalEdit(_)
-                    | UserAction::GoalClear
-                    | UserAction::GoalPause
-                    | UserAction::GoalResume
-                    | UserAction::RunWorkflow { .. }
-                    | UserAction::StopTask { .. }
-                    | UserAction::ResumeTask { .. }
-                    | UserAction::RetryTask { .. }
-                    | UserAction::FollowUpTask { .. }
-                    | UserAction::ListRewindCheckpoints
-                    | UserAction::RewindToCheckpoint { .. }
-                    | UserAction::Backtrack)
-            );
-        if side_disallowed {
-            let _ = event_tx.send(TuiEvent::OperationRejected(
-                "this command is unavailable in a side conversation; return to main first"
-                    .to_string(),
-            ));
+        if let Some(reason) = action.as_ref().ok().and_then(|action| {
+            restricted_command(action, side_parent.is_some(), on_child || view.has_focus())
+        }) {
+            let _ = view
+                .focused_sender()
+                .as_ref()
+                .unwrap_or(&event_tx)
+                .send(TuiEvent::CommandRefused(reason.to_string()));
+            control.cancel_surface_activation_if_idle();
             continue;
         }
         // These handlers can start a turn before returning to this loop.
@@ -428,7 +472,15 @@ pub(crate) fn hosted_tui_controller_loop(
         ) {
             control.restrict_hosted_settings(true);
         }
-        if child_focus.is_some()
+        // Said before the check below, so that a child focused from another
+        // thread either is already on screen here or is refused there.
+        if matches!(
+            &action,
+            Ok(UserAction::StartSideConversation { .. } | UserAction::ToggleSideConversation)
+        ) {
+            view.set_side_active(true);
+        }
+        if (on_child || view.has_focus())
             && matches!(
                 &action,
                 Ok(UserAction::StartSideConversation { .. }
@@ -436,7 +488,7 @@ pub(crate) fn hosted_tui_controller_loop(
                     | UserAction::CloseSideConversation)
             )
         {
-            let _ = event_tx.send(TuiEvent::OperationRejected(
+            let _ = view.focused_sender().as_ref().unwrap_or(&event_tx).send(TuiEvent::OperationRejected(
                 "side conversations are unavailable while a child is focused; return to parent first"
                     .to_string(),
             ));
@@ -450,55 +502,23 @@ pub(crate) fn hosted_tui_controller_loop(
                 .cancel_recap(request_id);
         }
         match action {
+            // The dispatcher shows a child without coming here; these only
+            // arrive when it found no view bound yet. The loop follows the
+            // view at its next pass.
             Ok(UserAction::FocusChildThread {
                 task_id,
                 expected_revision,
             }) => {
-                if child_focus.is_some() {
-                    handle_hosted_child_action(
-                        HostedChildAction::Return,
-                        &mut thread,
-                        &mut child_focus,
-                        side_parent.is_some(),
-                        &host,
-                        &root_event_tx,
-                        &mut event_tx,
-                        &mut session_attachment,
-                        &attachment_routing,
-                        &control,
-                    );
-                }
-                handle_hosted_child_action(
+                view.handle(
                     HostedChildAction::Focus {
                         task_id,
                         expected_revision,
                     },
-                    &mut thread,
-                    &mut child_focus,
-                    side_parent.is_some(),
-                    &host,
-                    &root_event_tx,
-                    &mut event_tx,
-                    &mut session_attachment,
-                    &attachment_routing,
                     &control,
                 );
-                last_idle_projection_cursor = None;
             }
             Ok(UserAction::ReturnToParentThread) => {
-                handle_hosted_child_action(
-                    HostedChildAction::Return,
-                    &mut thread,
-                    &mut child_focus,
-                    side_parent.is_some(),
-                    &host,
-                    &root_event_tx,
-                    &mut event_tx,
-                    &mut session_attachment,
-                    &attachment_routing,
-                    &control,
-                );
-                last_idle_projection_cursor = None;
+                view.handle(HostedChildAction::Return, &control);
             }
             Ok(UserAction::StartSideConversation { prompt }) => {
                 handle_hosted_side_action(
@@ -1074,9 +1094,10 @@ pub(crate) fn hosted_tui_controller_loop(
                 );
             }
             Ok(UserAction::StopTask { task_id }) => {
+                let main = control.main_runtime();
                 handle_hosted_task_action(
                     HostedTaskAction::Stop { task_id },
-                    thread.as_ref(),
+                    main.as_ref(),
                     &control,
                     &event_tx,
                 );
@@ -1127,22 +1148,18 @@ pub(crate) fn hosted_tui_controller_loop(
                 });
             }
             Ok(UserAction::ReadTaskTranscript(request)) => {
-                let result = thread
-                    .as_ref()
-                    .map(|thread| {
-                        surface_client::read_task_transcript(&thread.typed_surface(), &request)
-                    })
-                    .unwrap_or_else(|| {
-                        TaskTranscriptResult::unavailable(
-                            "cannot read task transcript before a session exists",
-                        )
-                    });
+                let result = control.read_task_transcript(&request).unwrap_or_else(|| {
+                    TaskTranscriptResult::unavailable(
+                        "cannot read task transcript before a session exists",
+                    )
+                });
                 let _ = event_tx.send(TuiEvent::TaskTranscriptResult { request, result });
             }
             Ok(UserAction::ResolveBackgroundApproval { id, approved }) => {
+                let owner = control.main_or_side_runtime();
                 handle_hosted_task_action(
                     HostedTaskAction::ResolveBackgroundApproval { id, approved },
-                    thread.as_ref(),
+                    owner.as_ref(),
                     &control,
                     &event_tx,
                 );
@@ -1196,13 +1213,19 @@ pub(crate) fn hosted_tui_controller_loop(
                 );
             }
             Ok(UserAction::GoalPause) => {
+                let mut main = on_child.then(|| (control.main_runtime(), view.main_sender()));
+                let (owner, sender) = main
+                    .as_mut()
+                    .map_or((&mut thread, &event_tx), |(thread, sender)| {
+                        (thread, &*sender)
+                    });
                 handle_hosted_goal_action(
                     HostedGoalAction::Pause,
-                    &mut thread,
+                    owner,
                     &host,
                     &config,
                     &preloaded,
-                    &event_tx,
+                    sender,
                     &control,
                     &pending_workflow_notifications,
                 );
@@ -1224,7 +1247,15 @@ pub(crate) fn hosted_tui_controller_loop(
         }
     }
 
-    if let Some(focus) = child_focus {
+    // The agents this TUI started run on its threads and end with it: stop
+    // them so their tasks are recorded as stopped, not left as running.
+    // The controller's shutdown already interrupts main, including a turn
+    // its thread started from the queue while a child was on screen.
+    // An attached session never runs this loop. The wait lets a stopping agent report its end
+    // to the conversation before that conversation's thread ends.
+    let _ = host.stop_kept_subagents(Duration::from_secs(5));
+    control.unbind_view();
+    if let Some(focus) = view.close() {
         shutdown_attached_child_on_controller_exit(focus);
     } else if let Some(side) = side_parent {
         shutdown_attached_side_on_controller_exit(side);
@@ -1236,6 +1267,50 @@ pub(crate) fn hosted_tui_controller_loop(
     // them as it ends.
     control.close_prestart_mcp();
     control.release_runtime_thread();
+}
+
+pub(crate) fn restricted_command(
+    action: &UserAction,
+    side: bool,
+    child: bool,
+) -> Option<&'static str> {
+    if !side && !child {
+        return None;
+    }
+    let restricted = (side
+        && matches!(action, UserAction::StopTask { .. } | UserAction::GoalPause))
+        || (child && matches!(action, UserAction::ForegroundTask { .. }))
+        || matches!(
+            action,
+            UserAction::NewSession
+                | UserAction::ForkCurrentSession { .. }
+                | UserAction::RenameCurrentSession { .. }
+                | UserAction::ResumeSavedSession { .. }
+                | UserAction::ForkSavedSession { .. }
+                | UserAction::RenameSavedSession { .. }
+                | UserAction::ArchiveSavedSession { .. }
+                | UserAction::DeleteSavedSession { .. }
+                | UserAction::SetModel(_)
+                | UserAction::Remember { .. }
+                | UserAction::Compact
+                | UserAction::GoalShow
+                | UserAction::GoalSet(_)
+                | UserAction::GoalEdit(_)
+                | UserAction::GoalClear
+                | UserAction::GoalResume
+                | UserAction::RunWorkflow { .. }
+                | UserAction::ResumeTask { .. }
+                | UserAction::RetryTask { .. }
+                | UserAction::FollowUpTask { .. }
+                | UserAction::ListRewindCheckpoints
+                | UserAction::RewindToCheckpoint { .. }
+                | UserAction::Backtrack
+        );
+    restricted.then_some(if side {
+        "this command is unavailable in a side conversation; return to main first"
+    } else {
+        "this command is unavailable in an agent's conversation; return to main first"
+    })
 }
 
 #[cfg(test)]
@@ -1250,26 +1325,58 @@ mod tests {
     use crate::agent_runtime::TuiAgentRuntime;
     use crate::bridge;
     use crate::operation_controller::TuiSurfaceTaskControl;
-    use crate::protocol::{
-        AttachedTuiEvent, SubmitToken, TaskTranscriptResult, TuiEvent, UserAction,
-    };
+    use crate::protocol::{SubmitToken, TaskTranscriptResult, TuiEvent, UserAction};
 
     fn next_controller_event(event_rx: &mpsc::Receiver<TuiEvent>) -> TuiEvent {
         loop {
             let event = event_rx
                 .recv_timeout(Duration::from_secs(10))
-                .expect("hosted controller event");
-            let event = match event {
-                TuiEvent::Attached(attached) => {
-                    let AttachedTuiEvent { event, .. } = *attached;
-                    event
-                }
-                event => event,
-            };
+                .expect("hosted controller event")
+                .into_test_payload();
             if !matches!(event, TuiEvent::SessionAttachmentActivated) {
                 return event;
             }
         }
+    }
+
+    #[test]
+    fn a_refused_command_in_an_agents_view_says_so_in_its_own_words() {
+        let side = Some("this command is unavailable in a side conversation; return to main first");
+        let child =
+            Some("this command is unavailable in an agent's conversation; return to main first");
+        for action in [
+            UserAction::NewSession,
+            UserAction::Compact,
+            UserAction::GoalResume,
+            UserAction::SetModel("mock".into()),
+            UserAction::ListRewindCheckpoints,
+        ] {
+            assert_eq!(super::restricted_command(&action, true, false), side);
+            assert_eq!(super::restricted_command(&action, false, true), child);
+        }
+        let stop = UserAction::StopTask {
+            task_id: "main-task".into(),
+        };
+        assert_eq!(super::restricted_command(&stop, true, false), side);
+        assert_eq!(super::restricted_command(&stop, false, true), None);
+        assert_eq!(
+            super::restricted_command(&UserAction::GoalPause, true, false),
+            side
+        );
+        assert_eq!(
+            super::restricted_command(&UserAction::GoalPause, false, true),
+            None
+        );
+        assert_eq!(
+            super::restricted_command(
+                &UserAction::ForegroundTask {
+                    task_id: "parent".into()
+                },
+                false,
+                true
+            ),
+            child
+        );
     }
 
     #[test]
@@ -1393,9 +1500,20 @@ mod tests {
         mpsc::Receiver<TuiEvent>,
         TuiAgentRuntime,
     ) {
+        spawn_controller_configured(|config| config.history_mode = history_mode)
+    }
+
+    fn spawn_controller_configured(
+        configure: impl FnOnce(&mut orca_core::config::RunConfig),
+    ) -> (
+        crate::test_support::OrcaHomeGuard,
+        mpsc::Sender<UserAction>,
+        mpsc::Receiver<TuiEvent>,
+        TuiAgentRuntime,
+    ) {
         let _home = crate::test_support::isolate_orca_home();
         let mut config = crate::test_support::test_run_config();
-        config.history_mode = history_mode;
+        configure(&mut config);
         let config = Arc::new(Mutex::new(config));
         let preloaded = Arc::new(Mutex::new(None));
         let (action_tx, action_rx) = mpsc::bounded(8);
@@ -1424,6 +1542,220 @@ mod tests {
         )
         .expect("hosted controller runtime");
         (_home, action_tx, event_rx, runtime)
+    }
+
+    #[test]
+    fn the_controller_binds_the_view_and_lets_it_go_as_it_ends() {
+        let _home = crate::test_support::isolate_orca_home();
+        let config = Arc::new(Mutex::new(crate::test_support::test_run_config()));
+        let preloaded = Arc::new(Mutex::new(None));
+        let (action_tx, action_rx) = mpsc::bounded(8);
+        let (event_tx, _event_rx) = mpsc::unbounded();
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
+        let observed = controller.clone();
+        let pending = bridge::PendingWorkflowNotifications::new();
+        let mut runtime = TuiAgentRuntime::spawn_hosted(
+            action_rx,
+            event_tx.clone(),
+            8,
+            controller,
+            move |controller, commands, host| {
+                hosted_tui_controller_loop(
+                    config, preloaded, event_tx, commands, controller, pending, host,
+                );
+            },
+        )
+        .expect("hosted controller runtime");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while observed.view().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the controller binds the view as it starts"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        action_tx.send(UserAction::Cancel).expect("cancel action");
+        runtime.shutdown().expect("hosted controller shutdown");
+        assert!(observed.view().is_none(), "the view is let go at the end");
+    }
+
+    /// The first running agent with a thread of its own, whose own turn has
+    /// started, that an event shows.
+    fn kept_running_agent(event: TuiEvent) -> Option<String> {
+        let tasks = match event.into_test_payload() {
+            TuiEvent::SurfaceProjectionSynced(projection) => projection.workflow_tasks,
+            TuiEvent::WorkflowTasksUpdated(tasks) | TuiEvent::BackgroundTasksUpdated(tasks) => {
+                tasks
+            }
+            TuiEvent::TaskStatusUpdated(task) => vec![task],
+            _ => return None,
+        };
+        tasks
+            .into_iter()
+            .find(|task| {
+                task.task_type == orca_core::task_types::TaskType::Subagent
+                    && task.status.is_active()
+                    && task.subagent_child_thread_id.is_some()
+                    && task.subagent_turn.is_some()
+            })
+            .map(|task| task.id)
+    }
+
+    /// The last status of each task that the saved conversations under
+    /// `home` record, as a resume reads them back.
+    fn saved_task_statuses(home: &std::path::Path) -> std::collections::HashMap<String, String> {
+        fn visit(
+            value: &serde_json::Value,
+            statuses: &mut std::collections::HashMap<String, String>,
+        ) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    if let Some(task) = fields.get("Task") {
+                        let (task_id, status) =
+                            match (task.get("Upserted"), task.get("StatusChanged")) {
+                                (Some(upserted), _) => {
+                                    (&upserted["task"]["task_id"], &upserted["task"]["status"])
+                                }
+                                (None, Some(changed)) => (&changed["task_id"], &changed["status"]),
+                                (None, None) => {
+                                    (&serde_json::Value::Null, &serde_json::Value::Null)
+                                }
+                            };
+                        if let (Some(task_id), Some(status)) = (task_id.as_str(), status.as_str()) {
+                            statuses.insert(task_id.to_string(), status.to_string());
+                        }
+                    }
+                    fields.values().for_each(|value| visit(value, statuses));
+                }
+                serde_json::Value::Array(values) => {
+                    values.iter().for_each(|value| visit(value, statuses));
+                }
+                _ => {}
+            }
+        }
+        let mut statuses = std::collections::HashMap::new();
+        let mut dirs = vec![home.join("sessions")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for line in text.lines() {
+                    let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    if record["type"] == "runtime.surface_commit.prepared" {
+                        visit(&record, &mut statuses);
+                    }
+                }
+            }
+        }
+        statuses
+    }
+
+    /// The agents the TUI keeps on its threads end with it: after a quit
+    /// their tasks are recorded as stopped, not left running, failed or
+    /// queued, and the main conversation's turn has ended with them. The
+    /// quit waits for an agent that takes a few seconds to end, so its end
+    /// is in the saved conversation and a resume does not show it running.
+    #[test]
+    fn quitting_stops_the_agents_the_tui_keeps() {
+        let (_home, action_tx, event_rx, mut runtime) = spawn_controller_configured(|config| {
+            config.history_mode = HistoryMode::Record;
+            config.subagents.limits.max_running = 1;
+        });
+        // The mock starts two async agents whose own turns stream until they
+        // are cancelled and then take 3 s to end: one runs, the other waits
+        // for capacity. The main conversation's turn waits for their results.
+        action_tx
+            .send(UserAction::Submit(
+                "subagent batch async mock_stream_slow_cancel_ms 3000".to_string(),
+            ))
+            .expect("submit action");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let running = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let event = event_rx
+                .recv_timeout(remaining)
+                .expect("an agent is shown running with a thread of its own")
+                .into_test_payload();
+            // In suggest the person approves the call that starts the agent.
+            if let TuiEvent::ApprovalNeeded { key, .. } = event {
+                action_tx
+                    .send(UserAction::RespondToInteraction {
+                        key,
+                        response: crate::protocol::TuiInteractionResponse::Approval(true),
+                    })
+                    .expect("approve the agent's start");
+                continue;
+            }
+            if let Some(task_id) = kept_running_agent(event) {
+                break task_id;
+            }
+        };
+        let registry = runtime
+            .controller()
+            .runtime_thread()
+            .expect("the main conversation's thread")
+            .task_registry();
+        let agents = |registry: &orca_runtime::tasks::TaskRegistry| {
+            registry
+                .list()
+                .into_iter()
+                .filter(|task| task.task_type == orca_core::task_types::TaskType::Subagent)
+                .collect::<Vec<_>>()
+        };
+        let queued = agents(&registry)
+            .into_iter()
+            .find(|task| task.id != running)
+            .expect("the second agent");
+        assert_eq!(
+            queued.status,
+            orca_core::task_types::TaskStatus::Queued,
+            "{queued:?}"
+        );
+
+        // The cancel alone, without the interrupt a quit from main's view
+        // sends first: the agents still end, and end stopped.
+        action_tx.send(UserAction::Cancel).expect("cancel action");
+        runtime.shutdown().expect("hosted controller shutdown");
+
+        let agents = agents(&registry);
+        assert_eq!(agents.len(), 2, "{agents:?}");
+        for agent in &agents {
+            assert_eq!(
+                agent.status,
+                orca_core::task_types::TaskStatus::Stopped,
+                "{agent:?}"
+            );
+            assert!(agent.completed_at_ms.is_some());
+            assert_eq!(agent.error, None);
+        }
+        let main_turns: Vec<_> = registry
+            .list()
+            .into_iter()
+            .filter(|task| task.task_type == orca_core::task_types::TaskType::MainSession)
+            .collect();
+        assert!(!main_turns.is_empty(), "the main conversation's turn");
+        assert!(
+            main_turns.iter().all(|turn| !turn.status.is_active()),
+            "the main conversation's turn has ended: {main_turns:?}"
+        );
+        // The running agent's end reached the main conversation before its
+        // thread ended, so a resume does not show the agent running.
+        let saved = saved_task_statuses(_home.path());
+        let shown = saved.get(&running).map(String::as_str);
+        assert!(
+            shown.is_some_and(|status| !matches!(status, "Queued" | "Running" | "Stopping")),
+            "the saved conversation shows the agent {running} as {shown:?}"
+        );
     }
 
     #[test]
@@ -1523,10 +1855,7 @@ mod tests {
         runtime.shutdown().expect("hosted controller shutdown");
         let mut events = Vec::new();
         while let Ok(event) = event_rx.recv_timeout(Duration::from_millis(500)) {
-            match event {
-                TuiEvent::Attached(attached) => events.push(attached.event),
-                event => events.push(event),
-            }
+            events.push(event.into_test_payload());
         }
         events
     }

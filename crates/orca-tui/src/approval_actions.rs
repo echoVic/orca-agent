@@ -10,6 +10,10 @@ use crate::protocol::{
 use crate::transcript_state::ChatMessage;
 use crate::types::{AppState, AppStatus, ApprovalOption};
 
+/// How a turn the user stopped by denying its approval ends, in place of the
+/// runtime's "approval required" diagnostic.
+pub(crate) const DENIED_APPROVAL_NOTICE: &str = "Denied. Tell Orca what to do instead.";
+
 /// Resolve the approval dialog by the chosen option. The "always allow"
 /// options record a session allowlist entry so later matching approvals are
 /// auto-granted by the app event loop; the "(saved)" options additionally

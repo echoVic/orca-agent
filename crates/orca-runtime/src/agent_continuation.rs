@@ -886,6 +886,10 @@ pub(crate) fn project_checkpoint_transcript(
     Ok(items)
 }
 
+pub fn is_delegated_child_context(content: &str) -> bool {
+    content.starts_with(crate::agent_controller::DELEGATED_CHILD_CONTEXT)
+}
+
 /// Projects the recorded conversation of an agent that ran on its own child
 /// thread without a continuation (a sync agent) into bounded display items.
 /// Its session is the only record of what it did.
@@ -894,8 +898,7 @@ pub(crate) fn project_conversation_transcript(messages: &[Message]) -> Vec<Child
     for message in messages {
         match message {
             Message::System { .. } => {}
-            Message::User { content, .. }
-                if content.starts_with(crate::agent_controller::DELEGATED_CHILD_CONTEXT) => {}
+            Message::User { content, .. } if is_delegated_child_context(content) => {}
             Message::User { content, .. } => items.push(ChildTranscriptItem::User {
                 content: bound_transcript_text(content),
             }),
@@ -1695,21 +1698,6 @@ enum AgentContinuationStoreBackend {
     },
 }
 
-pub(crate) struct ContinuationReconciliation {
-    projections: Vec<ContinuationProjection>,
-    _session_lock: Option<ExclusiveFileLock>,
-}
-
-impl ContinuationReconciliation {
-    pub(crate) fn projections(&self) -> &[ContinuationProjection] {
-        &self.projections
-    }
-
-    fn into_projections(self) -> Vec<ContinuationProjection> {
-        self.projections
-    }
-}
-
 #[derive(Default)]
 struct ProcessLocalContinuationState {
     index: HashMap<AgentContinuationId, String>,
@@ -2085,16 +2073,29 @@ impl AgentContinuationStore {
     pub(crate) fn reconcile_expired_owners(
         &self,
     ) -> Result<Vec<ContinuationProjection>, AgentContinuationError> {
-        self.reconcile_expired_owners_locked()
-            .map(ContinuationReconciliation::into_projections)
+        let _lock = match &self.backend {
+            AgentContinuationStoreBackend::Persistent { root, .. } => Some(acquire_lock(
+                &session_lock_path(root, &self.parent_session_id),
+                "acquire continuation session lock",
+            )?),
+            AgentContinuationStoreBackend::ProcessLocal { .. } => None,
+        };
+        self.reconcile_expired_owners_matching(|_| true)
     }
 
-    /// Reconciles expired owners while retaining the persistent session lock.
-    /// Callers may apply the returned projections to task records before this
-    /// guard is dropped, keeping recovery on one authoritative snapshot.
-    pub(crate) fn reconcile_expired_owners_locked(
+    /// The caller holds the persistent session lock through task projection.
+    pub(crate) fn reconcile_expired_owners_under_session_lock(
         &self,
-    ) -> Result<ContinuationReconciliation, AgentContinuationError> {
+        _session_lock: &ExclusiveFileLock,
+        recover: impl Fn(&str) -> bool,
+    ) -> Result<Vec<ContinuationProjection>, AgentContinuationError> {
+        self.reconcile_expired_owners_matching(recover)
+    }
+
+    fn reconcile_expired_owners_matching(
+        &self,
+        recover: impl Fn(&str) -> bool,
+    ) -> Result<Vec<ContinuationProjection>, AgentContinuationError> {
         let now_ms = continuation_now_ms();
         match &self.backend {
             AgentContinuationStoreBackend::ProcessLocal { state } => {
@@ -2114,7 +2115,10 @@ impl AgentContinuationStore {
                     .collect::<Result<Vec<_>, AgentContinuationError>>()?;
                 sort_records(&mut records);
                 let mut projections = Vec::with_capacity(records.len());
-                for record in records {
+                for record in records
+                    .into_iter()
+                    .filter(|record| recover(&record.latest_task_id))
+                {
                     let (record, changed) = reconcile_expired_record(record, now_ms)?;
                     if changed {
                         state
@@ -2123,19 +2127,15 @@ impl AgentContinuationStore {
                     }
                     projections.push(ContinuationProjection::from(&record));
                 }
-                Ok(ContinuationReconciliation {
-                    projections,
-                    _session_lock: None,
-                })
+                Ok(projections)
             }
             AgentContinuationStoreBackend::Persistent { root, cache } => {
-                let session_lock = acquire_lock(
-                    &session_lock_path(root, &self.parent_session_id),
-                    "acquire continuation session lock",
-                )?;
                 let records = load_parent_records_unlocked(root, &self.parent_session_id)?;
                 let mut reconciled_records = Vec::with_capacity(records.len());
-                for record in records {
+                for record in records
+                    .into_iter()
+                    .filter(|record| recover(&record.latest_task_id))
+                {
                     let (record, changed) = reconcile_expired_record(record, now_ms)?;
                     if changed {
                         write_json_pretty(
@@ -2155,10 +2155,7 @@ impl AgentContinuationStore {
                     .iter()
                     .map(ContinuationProjection::from)
                     .collect();
-                Ok(ContinuationReconciliation {
-                    projections,
-                    _session_lock: Some(session_lock),
-                })
+                Ok(projections)
             }
         }
     }
@@ -5062,6 +5059,18 @@ mod tests {
         );
     }
     #[test]
+    fn delegated_child_context_matches_the_role_prefix_but_not_the_task() {
+        let prefix = crate::agent_controller::DELEGATED_CHILD_CONTEXT;
+        assert!(is_delegated_child_context(&format!(
+            "{prefix}## General Role"
+        )));
+        assert!(!is_delegated_child_context("subagent sync mock_usage"));
+        assert!(!is_delegated_child_context(&format!(
+            "Summarize this: {prefix}"
+        )));
+    }
+
+    #[test]
     fn custom_agent_snapshot_does_not_change_legacy_builtin_hash_or_record_shape() {
         let delegation = DelegationSnapshot::default();
         let expected_payload = serde_json::json!({
@@ -5190,7 +5199,18 @@ mod tests {
         PreparedContinuation,
         ContinuationLease,
     ) {
-        let registry = TaskRegistry::new(session.to_string());
+        prepare_with_registry(TaskRegistry::new(session.to_string()))
+    }
+
+    fn prepare_with_registry(
+        registry: TaskRegistry,
+    ) -> (
+        TaskRegistry,
+        ChildAgentCoordinator,
+        PreparedContinuation,
+        ContinuationLease,
+    ) {
+        let session = registry.session_id();
         let task = registry.create_subagent_with_parent(
             "continuation test".to_string(),
             Some("general".to_string()),
@@ -5536,6 +5556,39 @@ mod tests {
         assert_eq!(transcript.task_id, prepared.latest_task_id);
         assert_eq!(transcript.checkpoint_revision, 2);
         assert!(transcript.items.is_empty());
+    }
+
+    #[test]
+    fn resume_preserves_an_ineligible_continuation_while_recovering_an_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(dir.path());
+        let session = "continuation-live-owner";
+        let gone = TaskRegistry::new_for_cwd(session.into(), dir.path());
+        let orphan = gone.create_subagent("orphan".into(), None);
+        gone.mark_running(&orphan.id).unwrap();
+        let live = TaskRegistry::attach_for_cwd(session.into(), dir.path());
+        let (_live, coordinator, prepared, lease) = prepare_with_registry(live);
+        drop(gone);
+        let (_, expired) = coordinator
+            .store
+            .mutate_record(&prepared.continuation_id, lease.revision, |record| {
+                record.current_attempt.lease_expires_at_ms = Some(0);
+                Ok(())
+            })
+            .unwrap();
+        let resumed = TaskRegistry::resume_for_cwd(session.into(), dir.path());
+        assert_eq!(
+            resumed.get(&orphan.id).unwrap().status,
+            orca_core::task_types::TaskStatus::Failed
+        );
+        let after = resumed
+            .continuation_store()
+            .unwrap()
+            .load_record(&prepared.continuation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.revision, expired.revision);
+        assert_eq!(after.current_attempt.state, AttemptState::Running);
     }
 
     #[test]

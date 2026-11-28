@@ -424,7 +424,25 @@ async fn call_streaming_async_with_output_budget(
             {
                 return provider_worker_error(error);
             }
-            if current_turn_has_tool_results(conversation) {
+            let gated_tool = mock_stream_tool_release_marker(conversation);
+            let results = current_turn_tool_results(conversation).count();
+            let first_tool = gated_tool
+                .as_ref()
+                .and_then(|fixture| fixture.first_tool_prompt.as_deref());
+            if results == 0
+                && let Some(first) = first_tool
+                && let Some(response) = mock_stream_tool_response(
+                    ProviderStep::ReasoningDelta("Mock first tool.".into()),
+                    first,
+                    "mock-tool-1",
+                )
+            {
+                for step in &response.steps {
+                    on_step(step);
+                }
+                return response;
+            }
+            if results > usize::from(first_tool.is_some()) {
                 let response = mock_call(conversation);
                 for step in &response.steps {
                     on_step(step);
@@ -515,24 +533,36 @@ async fn call_streaming_async_with_output_budget(
                     }),
                 };
             }
-            if let Some((release_marker, tool_prompt)) =
-                mock_stream_tool_release_marker(conversation)
-            {
-                let started =
-                    ProviderStep::MessageDelta("Mock slow tool stream started.".to_string());
+            if let Some(fixture) = gated_tool {
+                let text = if fixture.retain_text {
+                    "Mock slow tool stream started.\n"
+                } else {
+                    "Mock slow tool stream started."
+                };
+                let started = ProviderStep::MessageDelta(text.to_owned());
                 on_step(&started);
-                while !release_marker.exists() {
+                while !fixture.marker.exists() {
                     if !sleep_with_cancel(Duration::from_millis(10), cancel).await {
                         return ProviderResponse {
                             steps: vec![started],
-                            assistant_content: Some("Mock slow tool stream started.".to_string()),
+                            assistant_content: Some(text.to_owned()),
                             assistant_reasoning: None,
                             tool_calls: Vec::new(),
                             usage: None,
                         };
                     }
                 }
-                if let Some(response) = mock_stream_tool_response(started, &tool_prompt) {
+                let id = if fixture.first_tool_prompt.is_some() {
+                    "mock-tool-2"
+                } else {
+                    "mock-tool-1"
+                };
+                if let Some(mut response) =
+                    mock_stream_tool_response(started, &fixture.tool_prompt, id)
+                {
+                    if fixture.retain_text {
+                        response.assistant_content = Some(text.to_owned());
+                    }
                     return response;
                 }
             }
@@ -549,7 +579,9 @@ async fn call_streaming_async_with_output_budget(
                         usage: None,
                     };
                 }
-                if let Some(response) = mock_stream_tool_response(started, &tool_prompt) {
+                if let Some(response) =
+                    mock_stream_tool_response(started, &tool_prompt, "mock-tool-1")
+                {
                     return response;
                 }
             }
@@ -576,6 +608,66 @@ async fn call_streaming_async_with_output_budget(
                     assistant_reasoning: None,
                     tool_calls: Vec::new(),
                     usage: None,
+                };
+            }
+            // A stream that is slow to end once cancelled: it runs until it
+            // is cancelled (30 s at most), then takes `delay_ms` more to end.
+            if let Some(delay_ms) = mock_stream_slow_cancel_ms(conversation) {
+                let started =
+                    ProviderStep::MessageDelta("Mock slow-cancel stream started.".to_string());
+                on_step(&started);
+                if !sleep_with_cancel(Duration::from_secs(30), cancel).await {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    return ProviderResponse {
+                        steps: vec![started],
+                        assistant_content: Some("Mock slow-cancel stream started.".to_string()),
+                        assistant_reasoning: None,
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    };
+                }
+                let completed =
+                    ProviderStep::MessageDelta("Mock slow-cancel stream completed.".to_string());
+                on_step(&completed);
+                return ProviderResponse {
+                    steps: vec![started, completed],
+                    assistant_content: Some(
+                        "Mock slow-cancel stream started.Mock slow-cancel stream completed."
+                            .to_string(),
+                    ),
+                    assistant_reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                };
+            }
+            // A stream that, once cancelled, ends with usage, and only once
+            // the marker exists: it runs until it is cancelled (30 s at most),
+            // then waits for the marker (10 s at most) and ends with usage
+            // for its caller to report. A cancelled stream sends no step, so
+            // the usage is the one thing its caller can report after the
+            // cancel.
+            if let Some(marker) = mock_stream_usage_after_cancel_marker(conversation) {
+                let started = ProviderStep::MessageDelta(
+                    "Mock usage-after-cancel stream started.".to_string(),
+                );
+                on_step(&started);
+                let cancelled = !sleep_with_cancel(Duration::from_secs(30), cancel).await;
+                if cancelled {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                    while !marker.exists() && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                return ProviderResponse {
+                    steps: vec![started],
+                    assistant_content: Some("Mock usage-after-cancel stream started.".to_string()),
+                    assistant_reasoning: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(Usage {
+                        input_tokens: 120,
+                        output_tokens: 30,
+                        cache_tokens: 10,
+                    }),
                 };
             }
             if let Some(release_marker) = mock_stream_release_marker(conversation) {
@@ -806,23 +898,36 @@ fn mock_stream_tool_delay_ms(conversation: &Conversation) -> Option<(u64, String
     Some((delay, tool_prompt.trim().to_string()))
 }
 
-fn mock_stream_tool_release_marker(
-    conversation: &Conversation,
-) -> Option<(std::path::PathBuf, String)> {
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MockToolRelease {
+    marker: std::path::PathBuf,
+    tool_prompt: String,
+    first_tool_prompt: Option<String>,
+    #[serde(default)]
+    retain_text: bool,
+}
+
+fn mock_stream_tool_release_marker(conversation: &Conversation) -> Option<MockToolRelease> {
     let payload = conversation
         .last_user_message()
         .unwrap_or("")
         .trim()
         .strip_prefix("mock_stream_tool_release_marker ")?;
-    let payload: serde_json::Value = serde_json::from_str(payload).ok()?;
-    let marker = payload.get("marker")?.as_str()?.trim();
-    let tool_prompt = payload.get("toolPrompt")?.as_str()?.trim();
-    (!marker.is_empty() && !tool_prompt.is_empty())
-        .then(|| (std::path::PathBuf::from(marker), tool_prompt.to_string()))
+    let mut fixture: MockToolRelease = serde_json::from_str(payload).ok()?;
+    fixture.marker = std::path::PathBuf::from(fixture.marker.to_str()?.trim());
+    fixture.tool_prompt = fixture.tool_prompt.trim().to_owned();
+    (!fixture.marker.as_os_str().is_empty() && !fixture.tool_prompt.trim().is_empty())
+        .then_some(fixture)
 }
 
-fn mock_stream_tool_response(started: ProviderStep, tool_prompt: &str) -> Option<ProviderResponse> {
-    let tool_request = parse_mock_prompt(tool_prompt)?;
+fn mock_stream_tool_response(
+    started: ProviderStep,
+    tool_prompt: &str,
+    id: &str,
+) -> Option<ProviderResponse> {
+    let mut tool_request = parse_mock_prompt(tool_prompt)?;
+    tool_request.id = id.to_owned();
     let raw_call = RawToolCall {
         id: tool_request.id.clone(),
         function_name: tool_request.name.as_str().to_string(),
@@ -847,6 +952,28 @@ fn mock_stream_delay_ms(conversation: &Conversation) -> Option<u64> {
         .map(|delay| delay.min(10_000))
 }
 
+fn mock_stream_slow_cancel_ms(conversation: &Conversation) -> Option<u64> {
+    conversation
+        .last_user_message()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("mock_stream_slow_cancel_ms ")
+        .and_then(|delay| delay.trim().parse::<u64>().ok())
+        .map(|delay| delay.min(10_000))
+}
+
+fn mock_stream_usage_after_cancel_marker(
+    conversation: &Conversation,
+) -> Option<std::path::PathBuf> {
+    let marker = conversation
+        .last_user_message()
+        .unwrap_or("")
+        .trim()
+        .strip_prefix("mock_stream_usage_after_cancel_marker ")?
+        .trim();
+    (!marker.is_empty()).then(|| std::path::PathBuf::from(marker))
+}
+
 fn mock_stream_release_marker(conversation: &Conversation) -> Option<std::path::PathBuf> {
     let marker = conversation
         .last_user_message()
@@ -867,13 +994,13 @@ fn mock_stream_usage_delay_ms(conversation: &Conversation) -> Option<u64> {
         .map(|delay| delay.min(10_000))
 }
 
-fn current_turn_has_tool_results(conversation: &Conversation) -> bool {
+fn current_turn_tool_results(conversation: &Conversation) -> impl Iterator<Item = &Message> {
     conversation
         .messages
         .iter()
         .rev()
         .take_while(|message| !matches!(message, Message::User { .. }))
-        .any(|message| matches!(message, Message::Tool { .. }))
+        .filter(|message| matches!(message, Message::Tool { .. }))
 }
 
 fn mock_repeat_read_state(conversation: &Conversation) -> Option<(usize, usize, usize)> {
@@ -948,8 +1075,29 @@ fn mock_offered_tools(
 }
 
 fn mock_call(conversation: &Conversation) -> ProviderResponse {
-    let has_tool_results = current_turn_has_tool_results(conversation);
+    let has_tool_results = current_turn_tool_results(conversation).next().is_some();
     let prompt = conversation.last_user_message().unwrap_or("");
+
+    if prompt == "mock_echo_task_notifications" {
+        let message = conversation
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::System { content, .. } if content.starts_with("<task-notification>") => {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return ProviderResponse {
+            steps: vec![ProviderStep::MessageDelta(message.clone())],
+            assistant_content: Some(message),
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+    }
 
     if conversation.messages.iter().any(|message| {
         matches!(
@@ -1449,6 +1597,63 @@ fn mock_call(conversation: &Conversation) -> ProviderResponse {
         ];
         return ProviderResponse {
             steps,
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls,
+            usage: None,
+        };
+    }
+
+    // Two async children with the same prompt, started in one response.
+    if let Some(child_prompt) = prompt.trim().strip_prefix("subagent batch async ") {
+        let requests = ["mock-tool-1", "mock-tool-2"].map(|id| {
+            let mut request = parse_mock_prompt(&format!("subagent async {child_prompt}"))
+                .expect("async subagent request");
+            request.id = id.to_string();
+            request
+        });
+        let tool_calls = requests
+            .iter()
+            .map(|request| RawToolCall {
+                id: request.id.clone(),
+                function_name: request.name.as_str().to_string(),
+                arguments: request.raw_arguments.clone().unwrap_or_default(),
+            })
+            .collect();
+        return ProviderResponse {
+            steps: requests.into_iter().map(ProviderStep::ToolCall).collect(),
+            assistant_content: None,
+            assistant_reasoning: None,
+            tool_calls,
+            usage: None,
+        };
+    }
+
+    // An async child, then a sync child, with the same prompt, started in
+    // one response; each is described as "<mode> child".
+    if let Some(child_prompt) = prompt.trim().strip_prefix("subagent async_then_sync ") {
+        let requests = [("mock-tool-1", "async"), ("mock-tool-2", "sync")].map(|(id, mode)| {
+            let mut request = parse_mock_prompt(&format!("subagent {mode} {child_prompt}"))
+                .expect("subagent request");
+            let mut arguments: serde_json::Value =
+                serde_json::from_str(request.raw_arguments.as_deref().unwrap_or("{}"))
+                    .expect("subagent arguments");
+            arguments["description"] = serde_json::Value::String(format!("{mode} child"));
+            request.id = id.to_string();
+            request.target = Some(format!("{mode} child"));
+            request.raw_arguments = Some(arguments.to_string());
+            request
+        });
+        let tool_calls = requests
+            .iter()
+            .map(|request| RawToolCall {
+                id: request.id.clone(),
+                function_name: request.name.as_str().to_string(),
+                arguments: request.raw_arguments.clone().unwrap_or_default(),
+            })
+            .collect();
+        return ProviderResponse {
+            steps: requests.into_iter().map(ProviderStep::ToolCall).collect(),
             assistant_content: None,
             assistant_reasoning: None,
             tool_calls,
@@ -2521,6 +2726,114 @@ mod tests {
         assert_eq!(
             response.assistant_content.as_deref(),
             Some("Mock slow stream started.Mock slow stream completed.")
+        );
+    }
+
+    #[test]
+    fn mock_stream_slow_cancel_ms_ends_that_long_after_it_is_cancelled() {
+        let mut conversation = Conversation::new();
+        conversation.add_user("mock_stream_slow_cancel_ms 300".to_string());
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+            max_output_tokens: None,
+        };
+        let cancel = CancelToken::new();
+        let canceller = cancel.clone();
+        let cancelled_at = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            canceller.cancel();
+            std::time::Instant::now()
+        });
+        let mut deltas = Vec::new();
+
+        let response = call_streaming(
+            ProviderKind::Mock,
+            &conversation,
+            &config,
+            &cancel,
+            &mut |step| {
+                if let ProviderStep::MessageDelta(text) = step {
+                    deltas.push(text.clone());
+                }
+            },
+        );
+        let ended_after_cancel = cancelled_at.join().expect("canceller").elapsed();
+
+        assert_eq!(deltas, vec!["Mock slow-cancel stream started.".to_string()]);
+        assert_eq!(
+            response.assistant_content.as_deref(),
+            Some("Mock slow-cancel stream started.")
+        );
+        assert!(
+            ended_after_cancel >= Duration::from_millis(250),
+            "the stream ended {ended_after_cancel:?} after its cancel"
+        );
+    }
+
+    #[test]
+    fn mock_stream_usage_after_cancel_marker_ends_with_usage_once_cancelled_and_marked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("usage");
+        let mut conversation = Conversation::new();
+        conversation.add_user(format!(
+            "mock_stream_usage_after_cancel_marker {}",
+            marker.display()
+        ));
+        let config = ProviderConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            reasoning_effort: ReasoningEffort::Max,
+            tools_override: None,
+            mcp_registry: None,
+            external_tools: Vec::new(),
+            max_output_tokens: None,
+        };
+        let cancel = CancelToken::new();
+        let canceller = cancel.clone();
+        let writer_marker = marker.clone();
+        let marked_at = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            canceller.cancel();
+            std::thread::sleep(Duration::from_millis(300));
+            let marked_at = std::time::Instant::now();
+            std::fs::write(&writer_marker, b"").expect("write marker");
+            marked_at
+        });
+        let mut deltas = Vec::new();
+
+        let response = call_streaming(
+            ProviderKind::Mock,
+            &conversation,
+            &config,
+            &cancel,
+            &mut |step| {
+                if let ProviderStep::MessageDelta(text) = step {
+                    deltas.push(text.clone());
+                }
+            },
+        );
+        let ended_at = std::time::Instant::now();
+        let marked_at = marked_at.join().expect("marker writer");
+
+        assert_eq!(
+            deltas,
+            vec!["Mock usage-after-cancel stream started.".to_string()]
+        );
+        assert!(ended_at >= marked_at, "the stream ended before its marker");
+        assert_eq!(
+            response.usage,
+            Some(Usage {
+                input_tokens: 120,
+                output_tokens: 30,
+                cache_tokens: 10,
+            })
         );
     }
 

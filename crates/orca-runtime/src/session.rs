@@ -696,10 +696,9 @@ impl InteractiveSession {
             .unwrap_or_else(new_run_id);
         let task_registry = if process_local_tasks {
             TaskRegistry::new(task_session_id)
-        } else if matches!(
-            config.history_mode,
-            HistoryMode::Resume(_) | HistoryMode::ResumeAt { .. }
-        ) {
+        } else if matches!(config.history_mode, HistoryMode::Resume(_)) {
+            TaskRegistry::resume_for_cwd(task_session_id, &cwd)
+        } else if matches!(config.history_mode, HistoryMode::ResumeAt { .. }) {
             TaskRegistry::attach_for_cwd(task_session_id, &cwd)
         } else {
             TaskRegistry::new_for_cwd(task_session_id, &cwd)

@@ -21,7 +21,9 @@ use crate::lifecycle::{
     RuntimeTaskLifecycle, RuntimeTaskStatus,
 };
 use crate::memory::MemoryBlock;
-use crate::runtime_subagent_call::{RuntimeSubagentCallOutput, RuntimeSubagentInvocation};
+use crate::runtime_subagent_call::{
+    RuntimeSubagentCallOutput, RuntimeSubagentInvocation, child_qualifies_for_thread,
+};
 use crate::runtime_tool_call::RuntimeToolCallRuntime;
 use crate::session::record_tool_result_for_agent;
 use crate::subagent::{self, SubagentIsolation, SubagentMode};
@@ -851,11 +853,21 @@ pub(crate) fn execute_subagent_tool_with_activity_ingress<W: io::Write>(
         .as_ref()
         .and_then(|ingress| ingress.parent_fence())
         .is_some();
-    if request.mode == SubagentMode::Async
-        && !task_registry.is_process_local()
-        && has_parent_fence
-        && activity_ingress.is_some()
-    {
+    let placement = crate::subagent_placement::ChildPlacement {
+        mode_async: request.mode == SubagentMode::Async,
+        registry_shared: !task_registry.is_process_local(),
+        parent_fence: has_parent_fence,
+        activity_ingress: activity_ingress.is_some(),
+        host_keeps_children: agent_controller
+            .as_ref()
+            .is_some_and(|controller| controller.keeps_subagents_in_process()),
+        qualifies_for_thread: child_qualifies_for_thread(
+            &request,
+            agent_controller.is_some(),
+            child_config.budget.to_spec().is_unlimited(),
+        ),
+    };
+    if crate::subagent_placement::detaches(placement) {
         let mut launch = launch_async_subagent(AsyncSubagentLaunchContext {
             config: &child_config,
             cwd,
@@ -3573,6 +3585,1493 @@ mod tests {
                 .session_id(),
             Some(child_thread_id.as_str())
         );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// Runs one hosted Sync child through the subagent tool, as a parent
+    /// turn does with this controller and config, and gives back the tool's
+    /// result and the child's thread id as the launch bound it.
+    fn launch_hosted_sync_child_with(
+        controller: crate::agent_controller::AgentController,
+        config: RunConfig,
+        cwd: &std::path::Path,
+        label: &str,
+        prompt: &str,
+    ) -> (tool_types::ToolResult, String) {
+        let mut events = EventFactory::new(label.to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = hosted_request(label, "delegated child", prompt);
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let task_registry = TaskRegistry::new(label.to_string());
+        let controller = Arc::new(controller);
+        let activity_ingress = Arc::new(CapturingActivityIngress::default());
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
+            &config,
+            cwd,
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            false,
+            &mut cost_tracker,
+            &cancel,
+            &task_registry,
+            None,
+            None,
+            unexpected_child_executor::<io::Sink>,
+            None,
+            Some(activity_ingress),
+            Some(controller),
+            &mut event_error,
+            None,
+            None,
+        )
+        .expect("hosted sync child result");
+        assert!(event_error.is_none(), "{event_error:?}");
+        // The child's thread shares this registry: a main-session record made
+        // for its turn would be a second record here, never settled.
+        let tasks = task_registry.list();
+        assert_eq!(tasks.len(), 1, "one child, one task record: {tasks:?}");
+        // What lets a person's stop reach it before its row names its thread.
+        assert!(
+            task_registry
+                .get(&tasks[0].id)
+                .expect("the child's record")
+                .control
+                .runs_on_its_own_thread()
+        );
+        let child_thread_id = tasks[0]
+            .subagent_child_thread_id
+            .clone()
+            .expect("the launch bound the child's thread to its task");
+        (result, child_thread_id)
+    }
+
+    /// What a view of the child reads: the child thread resolved from the
+    /// host by its id, and a fresh attachment's snapshot of its surface, as
+    /// the TUI's child bridge takes it.
+    fn child_surface_snapshot(
+        host: &crate::runtime_host::RuntimeHostHandle,
+        child_thread_id: &str,
+    ) -> Arc<crate::surface::SurfaceSnapshot> {
+        let child = host
+            .resolve_live_thread(child_thread_id)
+            .expect("the child thread is live");
+        match child
+            .surface()
+            .attach_fresh(crate::surface::FreshAttachRequest {
+                request_id: crate::surface::SurfaceRequestId::new(),
+                role: crate::surface::SurfaceAttachmentRole::Tui,
+                requested_capabilities: std::collections::BTreeSet::from([
+                    crate::surface::SurfaceCapability::ReadSnapshot,
+                ]),
+                interaction_capabilities: std::collections::BTreeSet::new(),
+            }) {
+            crate::surface::AttachResult::FreshAttached { attachment } => {
+                attachment.baseline.snapshot
+            }
+            _ => panic!("a fresh attachment to the child's surface failed"),
+        }
+    }
+
+    fn surface_operations(
+        snapshot: &crate::surface::SurfaceSnapshot,
+    ) -> Vec<&crate::surface::OperationRecord> {
+        snapshot
+            .foreground_operation
+            .iter()
+            .chain(&snapshot.queued_operations)
+            .chain(&snapshot.operation_history)
+            .collect()
+    }
+
+    fn surface_user_texts(snapshot: &crate::surface::SurfaceSnapshot) -> Vec<&str> {
+        snapshot
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::surface::SurfaceItem::UserMessage {
+                    input:
+                        crate::surface::SurfaceUserInputState::Resolved {
+                            fact: crate::surface::SurfaceResolvedInputFact::Replayable { input, .. },
+                        },
+                    ..
+                } => Some(input.canonical_text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn surface_assistant_texts(snapshot: &crate::surface::SurfaceSnapshot) -> Vec<&str> {
+        snapshot
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::surface::SurfaceItem::AssistantMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The record types of the session the child's thread recorded under
+    /// `home`, in the order they were written.
+    fn child_session_record_types(home: &std::path::Path, child_thread_id: &str) -> Vec<String> {
+        let suffix = format!("-{child_thread_id}.jsonl");
+        let mut directories = vec![home.join("sessions")];
+        let mut session = None;
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory)
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&suffix))
+                {
+                    session = Some(path);
+                }
+            }
+        }
+        let session = session.unwrap_or_else(|| {
+            panic!(
+                "the child {child_thread_id} recorded a session under {}",
+                home.display()
+            )
+        });
+        std::fs::read_to_string(&session)
+            .expect("read the child's session")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|record| record["type"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Under a host that was not asked to keep its subagents, a delegated
+    /// turn starts as it did before the child had a surface to go to: the
+    /// child's surface has no operation and its session no surface commit.
+    #[test]
+    fn a_delegated_turn_of_a_host_that_did_not_ask_is_not_on_the_childs_surface() {
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "delegated-turn-not-kept";
+        let prompt = "mock_stream_delay_ms 1";
+        let reply = "Mock slow stream started.Mock slow stream completed.";
+
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, false),
+            config_in(cwd.path(), SubagentConfig::default()),
+            cwd.path(),
+            label,
+            prompt,
+        );
+
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Completed,
+            "{:?}",
+            result.error
+        );
+        assert_eq!(result.output.as_deref(), Some(reply));
+        let snapshot = child_surface_snapshot(&host_handle, &child_thread_id);
+        assert!(
+            surface_operations(&snapshot).is_empty(),
+            "the child's turn is not an operation of its surface: {:?}",
+            surface_operations(&snapshot)
+        );
+        assert!(surface_user_texts(&snapshot).is_empty());
+        host.shutdown().expect("shutdown runtime host");
+        let records = child_session_record_types(home.path(), &child_thread_id);
+        assert!(
+            records
+                .iter()
+                .any(|record| record == "conversation.message"),
+            "the child recorded its conversation: {records:?}"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.starts_with("runtime.surface_commit")),
+            "the child's session has no surface commit: {records:?}"
+        );
+    }
+
+    /// Under a host that keeps its subagents, a delegated turn is an
+    /// operation of the child's surface, so a view of the child reads the
+    /// conversation the child had while and after it ran.
+    #[test]
+    fn a_delegated_turn_is_recorded_on_the_childs_surface() {
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "delegated-turn-surface";
+        // The mock answers this prompt with two text deltas.
+        let prompt = "mock_stream_delay_ms 1";
+        let reply = "Mock slow stream started.Mock slow stream completed.";
+
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, true),
+            config_in(cwd.path(), SubagentConfig::default()),
+            cwd.path(),
+            label,
+            prompt,
+        );
+
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Completed,
+            "{:?}",
+            result.error
+        );
+        assert_eq!(result.output.as_deref(), Some(reply));
+        let snapshot = child_surface_snapshot(&host_handle, &child_thread_id);
+        let operations = surface_operations(&snapshot);
+        assert_eq!(
+            operations.len(),
+            1,
+            "the delegated turn is the child surface's one operation: {operations:?}"
+        );
+        let operation = operations[0];
+        assert_eq!(
+            operation.intent.kind,
+            crate::surface::OperationKind::UserTurn
+        );
+        assert!(
+            matches!(
+                operation.terminal.as_ref().map(|record| &record.terminal),
+                Some(crate::surface::OperationTerminal::Succeeded { .. })
+            ),
+            "the delegated turn ended on the child's surface: {:?}",
+            operation.terminal
+        );
+        assert_eq!(surface_user_texts(&snapshot), vec![prompt]);
+        assert_eq!(surface_assistant_texts(&snapshot), vec![reply]);
+        host.shutdown().expect("shutdown runtime host");
+        let records = child_session_record_types(home.path(), &child_thread_id);
+        assert!(
+            records
+                .iter()
+                .any(|record| record == "runtime.surface_commit.committed"),
+            "the child's session has the commits of its surface: {records:?}"
+        );
+    }
+
+    /// A kept child whose surface does not take the delegated turn still
+    /// does its work: the turn starts raw, as it does under a host that does
+    /// not keep its subagents, and only the child's conversation is missing
+    /// from that surface.
+    #[test]
+    fn a_delegated_turn_that_the_surface_refuses_still_runs() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "delegated-turn-refused";
+        let prompt = crate::runtime_host::REFUSE_DELEGATED_SURFACE_TURN_FOR_TEST;
+
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, true),
+            config_in(cwd.path(), SubagentConfig::default()),
+            cwd.path(),
+            label,
+            prompt,
+        );
+
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Completed,
+            "{:?}",
+            result.error
+        );
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(
+            result.output.as_deref(),
+            Some("Mock runtime completed the headless harness contract.")
+        );
+        let snapshot = child_surface_snapshot(&host_handle, &child_thread_id);
+        assert!(
+            surface_operations(&snapshot).is_empty(),
+            "a refused turn leaves nothing of itself on the child's surface: {:?}",
+            surface_operations(&snapshot)
+        );
+        assert!(surface_user_texts(&snapshot).is_empty());
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A stdio MCP server that lists no tools and writes its process id to
+    /// `<dir>/<name>.pid` as it starts.
+    #[cfg(unix)]
+    fn pid_writing_mcp_server(
+        name: &str,
+        dir: &std::path::Path,
+    ) -> orca_core::mcp_types::McpServerConfig {
+        let script = dir.join(format!("{name}-mcp.sh"));
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+echo $$ > "$1"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"pid","version":"1"}}}\n'
+      ;;
+    *'"method":"notifications/initialized"'*)
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write the MCP fixture");
+        orca_core::mcp_types::McpServerConfig {
+            name: name.to_string(),
+            command: Some("/bin/sh".to_string()),
+            args: vec![
+                script.to_string_lossy().into_owned(),
+                dir.join(format!("{name}.pid"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            startup_timeout_ms: Some(15_000),
+            tool_timeout_ms: Some(15_000),
+            ..Default::default()
+        }
+    }
+
+    /// Runs one hosted Sync child, of a host asked to keep its subagents or
+    /// not, whose config has one MCP server, `docs`. Gives back how the
+    /// child's thread, which stays, holds that server once the launch has
+    /// returned, and whether the server's process still runs.
+    #[cfg(unix)]
+    fn mcp_server_after_a_hosted_child(
+        keep: bool,
+        label: &str,
+    ) -> (orca_mcp::McpServerState, bool) {
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let mut config = config_in(cwd.path(), SubagentConfig::default());
+        config.mcp_servers = vec![pid_writing_mcp_server("docs", cwd.path())];
+
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, keep),
+            config,
+            cwd.path(),
+            label,
+            "mock_stream_delay_ms 1",
+        );
+
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Completed,
+            "{:?}",
+            result.error
+        );
+        let pid = std::fs::read_to_string(cwd.path().join("docs.pid"))
+            .expect("the child started the server of its config");
+        let statuses = host_handle
+            .resolve_live_thread(&child_thread_id)
+            .expect("the child's thread stays")
+            .mcp_registry()
+            .server_statuses();
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        let running = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .expect("ask whether the server's process runs")
+            .success();
+        host.shutdown().expect("shutdown runtime host");
+        (statuses[0].state.clone(), running)
+    }
+
+    /// Under a host that keeps its subagents, a child's thread stays for its
+    /// conversation once its task has ended, and the MCP servers it started
+    /// for that task are stopped then.
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_childs_mcp_servers_stop_once_its_task_has_ended() {
+        let (state, running) = mcp_server_after_a_hosted_child(true, "kept-child-mcp");
+
+        assert_eq!(
+            state,
+            orca_mcp::McpServerState::Failed {
+                message: "MCP server 'docs' was stopped".to_string()
+            }
+        );
+        assert!(!running, "the server's process still runs");
+    }
+
+    /// Under a host that was not asked, a hosted child's MCP servers are
+    /// left to its thread, as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_childs_mcp_servers_under_a_host_that_did_not_ask_are_left_to_its_thread() {
+        let (state, running) = mcp_server_after_a_hosted_child(false, "not-kept-child-mcp");
+
+        assert_eq!(state, orca_mcp::McpServerState::Ready);
+        assert!(running, "the server's process has ended");
+    }
+
+    /// The mock's reply once a call of the turn has its result.
+    const MOCK_REPLY_AFTER_A_TOOL: &str = "Mock completed after tool execution.";
+
+    /// A parent's controller made from the host's registry, as the host makes
+    /// one; with `keep`, the host was first asked to keep its subagents.
+    fn parent_controller(
+        host: &crate::runtime_host::RuntimeHostHandle,
+        label: &str,
+        keep: bool,
+    ) -> crate::agent_controller::AgentController {
+        if keep {
+            host.keep_subagents_in_process();
+        }
+        crate::agent_controller::AgentController::new_with_registry(
+            host.clone(),
+            host.agent_registry_for_test(),
+            label.to_string(),
+            label.to_string(),
+            0,
+        )
+    }
+
+    /// A parent in suggest whose events are JSONL, so a child that resolves
+    /// an approval from its own config is denied instead of reading stdin.
+    fn suggest_config_in(cwd: &std::path::Path) -> RunConfig {
+        let mut config = config_in(cwd, SubagentConfig::default());
+        config.approval_mode = orca_core::approval_types::ApprovalMode::Suggest;
+        config.output_format = OutputFormat::Jsonl;
+        config
+    }
+
+    fn child_messages(
+        host: &crate::runtime_host::RuntimeHostHandle,
+        child_thread_id: &str,
+    ) -> Vec<orca_core::conversation::Message> {
+        host.resolve_live_thread(child_thread_id)
+            .expect("the child thread is live")
+            .snapshot()
+            .expect("the child's snapshot")
+            .messages()
+            .to_vec()
+    }
+
+    /// The context pinned ahead of the child's task.
+    fn pinned_child_context(messages: &[orca_core::conversation::Message]) -> &str {
+        messages
+            .iter()
+            .find_map(|message| match message {
+                orca_core::conversation::Message::User {
+                    content,
+                    pinned: true,
+                    ..
+                } => Some(content.as_str()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the child has its pinned context: {messages:?}"))
+    }
+
+    /// The result the provider was sent for one call, and where it is.
+    fn tool_result_sent(
+        messages: &[orca_core::conversation::Message],
+        tool_call_id: &str,
+    ) -> (usize, String) {
+        messages
+            .iter()
+            .enumerate()
+            .find_map(|(index, message)| match message {
+                orca_core::conversation::Message::Tool {
+                    tool_call_id: id,
+                    content,
+                    ..
+                } if id == tool_call_id => Some((index, content.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no result for {tool_call_id}: {messages:?}"))
+    }
+
+    /// The child's reply: its last assistant text, and where it is.
+    fn last_reply(messages: &[orca_core::conversation::Message]) -> (usize, &str) {
+        messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| match message {
+                orca_core::conversation::Message::Assistant {
+                    content: Some(content),
+                    ..
+                } => Some((index, content.as_str())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the child replied: {messages:?}"))
+    }
+
+    /// A child the host keeps asks nobody: its call that needs an approval
+    /// is refused, it is told so, and it still replies to its parent.
+    #[test]
+    fn a_kept_child_in_suggest_is_refused_and_still_replies() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "kept-child-refused";
+        // The mock calls bash `echo hi` and, once the call has a result,
+        // replies with MOCK_REPLY_AFTER_A_TOOL.
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, true),
+            suggest_config_in(cwd.path()),
+            cwd.path(),
+            label,
+            "bash echo hi",
+        );
+
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Completed,
+            "{:?}",
+            result.error
+        );
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.output.as_deref(), Some(MOCK_REPLY_AFTER_A_TOOL));
+        let messages = child_messages(&host_handle, &child_thread_id);
+        let (result_at, sent) = tool_result_sent(&messages, "mock-tool-1");
+        assert!(
+            sent.contains(crate::child_refusal::APPROVAL_REFUSED),
+            "the provider was told the call was refused: {sent}"
+        );
+        let (reply_at, reply) = last_reply(&messages);
+        assert_eq!(reply, MOCK_REPLY_AFTER_A_TOOL);
+        assert!(result_at < reply_at, "the reply came after the refusal");
+        let context = pinned_child_context(&messages);
+        assert!(
+            context.starts_with(crate::agent_controller::DELEGATED_CHILD_CONTEXT),
+            "{context}"
+        );
+        assert!(
+            context.contains(crate::child_refusal::UNATTENDED_CHILD_CONTEXT),
+            "{context}"
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A host that did not ask to keep its subagents gives a child what it
+    /// gave before: approvals resolved from the child's config, and no word
+    /// of refusals in its context.
+    #[test]
+    fn a_child_of_a_host_that_did_not_ask_keeps_todays_handlers() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "unkept-child-today";
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, false),
+            suggest_config_in(cwd.path()),
+            cwd.path(),
+            label,
+            "bash echo hi",
+        );
+
+        assert!(!host_handle.keeps_subagents_in_process());
+        let messages = child_messages(&host_handle, &child_thread_id);
+        let context = pinned_child_context(&messages);
+        assert!(
+            context.starts_with(crate::agent_controller::DELEGATED_CHILD_CONTEXT),
+            "{context}"
+        );
+        assert!(
+            !context.contains(crate::child_refusal::UNATTENDED_CHILD_CONTEXT),
+            "{context}"
+        );
+        // Today's handler: the child's config, which denies in JSONL mode
+        // and stops the child for an approval.
+        let (_, sent) = tool_result_sent(&messages, "mock-tool-1");
+        assert!(
+            sent.contains("interactive confirmation unavailable in jsonl mode"),
+            "{sent}"
+        );
+        assert!(
+            !sent.contains(crate::child_refusal::APPROVAL_REFUSED),
+            "{sent}"
+        );
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert_eq!(result.error.as_deref(), Some("agent requires permission"));
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A child the host keeps is a built-in role, and no role offers a way
+    /// to put a question to the user: not `ask_user_question`, not an MCP
+    /// tool (whose server could ask). It is offered its role's tools only.
+    #[test]
+    fn a_kept_child_is_offered_no_way_to_ask_the_user() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "kept-child-tools";
+        let config = suggest_config_in(cwd.path());
+        // Not a headless run: a parent here would be offered the question.
+        assert!(!config.tools.headless_exec);
+        let (result, _child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, true),
+            config,
+            cwd.path(),
+            label,
+            "mock_offered_tools",
+        );
+
+        let output = result.output.as_deref().unwrap_or_default();
+        let offered = output
+            .strip_prefix("Mock offered tools: ")
+            .unwrap_or_else(|| panic!("the child named its tools: {output}"))
+            .split(", ")
+            .collect::<Vec<_>>();
+        assert!(!offered.is_empty(), "{output}");
+        assert!(!offered.contains(&"ask_user_question"), "{output}");
+        assert!(!offered.contains(&"list_mcp_resources"), "{output}");
+        assert!(!offered.contains(&"read_mcp_resource"), "{output}");
+        // The role names some tools by an alias (`list_files` is `glob`).
+        let registry = orca_tools::registry::tool_registry_with_mcp_and_external(None, &[]);
+        let role = crate::child_agent_entrypoints::role_tool_ceiling(
+            &orca_core::subagent_types::SubagentType::General,
+        )
+        .iter()
+        .filter_map(|tool| {
+            registry
+                .resolve(tool)
+                .map(|resolved| resolved.tool.name().to_string())
+        })
+        .collect::<Vec<_>>();
+        for tool in &offered {
+            assert!(
+                role.iter().any(|allowed| allowed == tool),
+                "{tool} is not one of the role's tools: {output}"
+            );
+        }
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// Should the model of a kept child call for a question anyway, nobody
+    /// is asked: the role refuses the call it was not offered, the model is
+    /// sent why, and the child's turn ends there, as it does for any child
+    /// that calls a tool outside its role.
+    #[test]
+    fn a_kept_childs_question_ends_its_turn_without_asking() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "kept-child-question";
+        // The mock calls ask_user_question with this question.
+        let (result, child_thread_id) = launch_hosted_sync_child_with(
+            parent_controller(&host_handle, label, true),
+            suggest_config_in(cwd.path()),
+            cwd.path(),
+            label,
+            "ask Go on?",
+        );
+
+        let refusal = "role 'general' tool policy disallows tool 'ask_user_question'";
+        assert_eq!(result.status, tool_types::ToolStatus::Failed);
+        assert_eq!(result.error.as_deref(), Some(refusal));
+        let messages = child_messages(&host_handle, &child_thread_id);
+        let (_, sent) = tool_result_sent(&messages, "mock-tool-1");
+        assert!(sent.contains(refusal), "{sent}");
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// Records what a kept child reports to its parent. Told to, it refuses
+    /// the child's end as the parent's thread does once the turn that
+    /// started the child is over.
+    #[derive(Debug, Default)]
+    struct KeptChildActivity {
+        refuses_the_end: bool,
+        events: Mutex<Vec<SubagentActivityEvent>>,
+    }
+
+    impl RuntimeSubagentActivityIngress for KeptChildActivity {
+        fn owner(&self) -> SubagentActivityOwner {
+            SubagentActivityOwner::DetachedTask {
+                task_id: SurfaceTaskId::try_new("kept-child-owner").unwrap(),
+                task_revision: TaskRevision::try_new(1).unwrap(),
+                authority_digest: Sha256Digest::new([5; 32]),
+            }
+        }
+
+        fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
+            if self.refuses_the_end
+                && matches!(event.payload, SubagentActivityPayload::Completed { .. })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "runtime generation is not active",
+                ));
+            }
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ForkPlacementIngress {
+        fence: crate::runtime_surface::SurfaceOperationFence,
+        started: std::sync::mpsc::Sender<SubagentActivityEvent>,
+    }
+
+    impl RuntimeSubagentActivityIngress for ForkPlacementIngress {
+        fn owner(&self) -> SubagentActivityOwner {
+            SubagentActivityOwner::Generation {
+                operation_id: self.fence.operation_id.clone(),
+            }
+        }
+
+        fn parent_fence(&self) -> Option<crate::runtime_surface::SurfaceOperationFence> {
+            Some(self.fence.clone())
+        }
+
+        fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
+            assert!(matches!(
+                event.payload,
+                SubagentActivityPayload::Started { .. }
+            ));
+            self.started.send(event).unwrap();
+            Err(io::Error::other("fixture stops before starting a worker"))
+        }
+    }
+
+    #[test]
+    fn accepted_async_fork_uses_the_detached_launcher_under_a_keeping_host() {
+        use crate::runtime_surface::{
+            SurfaceGenerationId, SurfaceOperationFence, SurfaceOperationId, SurfaceThreadId,
+            ThreadOwnerEpoch,
+        };
+        use orca_core::conversation::{
+            CapturedProviderMessage, CapturedProviderRequest, Conversation,
+        };
+
+        let cwd = tempfile::tempdir().unwrap();
+        let registry_dir = tempfile::tempdir().unwrap();
+        let host = crate::runtime_host::RuntimeHost::start().unwrap();
+        let controller = Arc::new(parent_controller(&host.handle(), "fork-placement", true));
+        let mut config = config_in(cwd.path(), SubagentConfig::default());
+        config.provider = ProviderKind::DeepSeek;
+        let endpoint = "https://fixture.invalid";
+        config.base_url = Some(endpoint.into());
+        let parent = Conversation::new();
+        let inherited = r#"{"role":"user","content":"completed parent history"}"#;
+        parent.record_provider_request(CapturedProviderRequest {
+            source_messages: vec![],
+            summary: Default::default(),
+            model: orca_core::model::PRO_MODEL.into(),
+            endpoint: endpoint.into(),
+            reasoning_effort: config.reasoning_effort,
+            messages: vec![CapturedProviderMessage {
+                json: serde_json::value::RawValue::from_string(inherited.into()).unwrap(),
+                estimated_tokens: 5,
+                has_images: false,
+                has_tool_images: false,
+            }],
+            tools: vec![],
+            fork_cut: Ok(1),
+            fork_turn_id: None,
+            fork_system_messages: vec![],
+        });
+
+        for (scenario, context, conversation) in [
+            ("accepted", "fork", Some(&parent)),
+            ("plain", "fresh", Some(&parent)),
+            ("fallback", "fork", None),
+        ] {
+            let registry =
+                TaskRegistry::new_persistent(scenario.into(), registry_dir.path().to_owned())
+                    .unwrap();
+            let request = tool_types::ToolRequest {
+                raw_arguments: Some(
+                    serde_json::json!({"description":scenario,"prompt":"do the task","mode":"async","context":context})
+                        .to_string(),
+                ),
+                ..subagent_request(scenario)
+            };
+            let (started, events) = std::sync::mpsc::channel();
+            let ingress = Arc::new(ForkPlacementIngress {
+                fence: SurfaceOperationFence {
+                    thread_id: SurfaceThreadId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                        .unwrap(),
+                    thread_owner_epoch: ThreadOwnerEpoch::new(1),
+                    operation_id: SurfaceOperationId::try_from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    )
+                    .unwrap(),
+                    generation_id: SurfaceGenerationId::new(1),
+                },
+                started,
+            });
+            let (result, _) = super::execute_subagent_tool_with_activity_ingress(
+                None,
+                &config,
+                cwd.path(),
+                &mut EventFactory::new(scenario.into()),
+                &mut EventSink::new(Vec::new(), OutputFormat::Jsonl),
+                &request,
+                0,
+                &ProjectInstructions::default(),
+                &MemoryBlock::default(),
+                &McpRegistry::default(),
+                &HookRunner::default(),
+                false,
+                &mut CostTracker::new(None),
+                &CancelToken::new(),
+                &registry,
+                None,
+                None,
+                silent_child_executor::<io::Sink>,
+                None,
+                Some(ingress),
+                Some(controller.clone()),
+                &mut None,
+                None,
+                conversation,
+            )
+            .unwrap();
+            let event = events
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|error| {
+                    panic!("no Started for {scenario}: {error}; {:?}", result.error)
+                });
+            let task = settled_task(&registry, event.task_id.as_str());
+            assert_eq!(
+                matches!(event.owner, SubagentActivityOwner::DetachedTask { .. }),
+                scenario == "accepted",
+                "{scenario}: {:?}",
+                event.owner,
+            );
+            if scenario == "accepted" {
+                let store = registry.continuation_store().unwrap();
+                let records = store.list_parent_records().unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].latest_task_id, task.id);
+                let prefix = store
+                    .load_fork_prefix(records[0].fork_prefix_ref.unwrap())
+                    .unwrap();
+                assert_eq!(prefix.messages, [inherited]);
+            } else if scenario == "fallback" {
+                assert!(result.output.as_deref().unwrap().contains("Started fresh."));
+            }
+        }
+        host.shutdown().unwrap();
+    }
+
+    /// Submits an async child of `controller`'s parent as the model's
+    /// `subagent` call does, and gives back its task id.
+    fn submit_async_child(
+        controller: crate::agent_controller::AgentController,
+        cwd: &std::path::Path,
+        task_registry: &TaskRegistry,
+        label: &str,
+        prompt: &str,
+        activity: Arc<KeptChildActivity>,
+    ) -> String {
+        let config = config_in(cwd, SubagentConfig::default());
+        let mut events = EventFactory::new(label.to_string());
+        let mut sink = EventSink::new(Vec::new(), OutputFormat::Jsonl);
+        let request = tool_types::ToolRequest {
+            raw_arguments: Some(
+                serde_json::json!({
+                    "description": label,
+                    "prompt": prompt,
+                    "mode": "async"
+                })
+                .to_string(),
+            ),
+            ..subagent_request(label)
+        };
+        let instructions = ProjectInstructions::default();
+        let memory = MemoryBlock::default();
+        let mcp_registry = McpRegistry::default();
+        let hooks = HookRunner::default();
+        let mut cost_tracker = CostTracker::new(None);
+        let cancel = CancelToken::new();
+        let mut event_error = None;
+
+        let (result, _receipt) = super::execute_subagent_tool_with_activity_ingress(
+            None,
+            &config,
+            cwd,
+            &mut events,
+            &mut sink,
+            &request,
+            0,
+            &instructions,
+            &memory,
+            &mcp_registry,
+            &hooks,
+            false,
+            &mut cost_tracker,
+            &cancel,
+            task_registry,
+            None,
+            None,
+            fake_child_executor::<io::Sink>,
+            None,
+            Some(activity),
+            Some(Arc::new(controller)),
+            &mut event_error,
+            None,
+            None,
+        )
+        .expect("async child accepted");
+        assert_eq!(
+            result.status,
+            tool_types::ToolStatus::Running,
+            "{:?}",
+            result.error
+        );
+        let handle: serde_json::Value =
+            serde_json::from_str(result.output.as_deref().expect("the child's handle"))
+                .expect("a JSON handle");
+        handle["task_id"]
+            .as_str()
+            .expect("the child's task id")
+            .to_string()
+    }
+
+    /// Starts an async child of `controller`'s parent as the model's
+    /// `subagent` call does, with a task the mock keeps streaming for 30 s
+    /// unless it is stopped. Gives back the child's task id and its thread
+    /// id once that thread is up.
+    fn start_streaming_async_child(
+        controller: crate::agent_controller::AgentController,
+        cwd: &std::path::Path,
+        task_registry: &TaskRegistry,
+        label: &str,
+    ) -> (String, String) {
+        start_streaming_async_child_reporting_to(
+            controller,
+            cwd,
+            task_registry,
+            label,
+            Arc::new(KeptChildActivity::default()),
+        )
+    }
+
+    /// `start_streaming_async_child`, with the child reporting to `activity`.
+    fn start_streaming_async_child_reporting_to(
+        controller: crate::agent_controller::AgentController,
+        cwd: &std::path::Path,
+        task_registry: &TaskRegistry,
+        label: &str,
+        activity: Arc<KeptChildActivity>,
+    ) -> (String, String) {
+        let task_id = submit_async_child(
+            controller,
+            cwd,
+            task_registry,
+            label,
+            "mock_stream_delay_ms 30000",
+            activity.clone(),
+        );
+        // The child's turn is under way once it reports a phase: a stop that
+        // came before would end a turn that never ran.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (bound, thinking) = {
+                let events = activity.events.lock().expect("surface activity");
+                let bound = events.iter().find_map(|event| match &event.payload {
+                    SubagentActivityPayload::ChildThreadBound { thread_id } => {
+                        Some(uuid::Uuid::from_bytes(*thread_id.as_bytes()).to_string())
+                    }
+                    _ => None,
+                });
+                let thinking = events.iter().any(|event| {
+                    matches!(event.payload, SubagentActivityPayload::PhaseChanged { .. })
+                });
+                (bound, thinking)
+            };
+            if let Some(thread_id) = bound
+                && thinking
+                && task_registry
+                    .get(&task_id)
+                    .is_some_and(|task| task.status == orca_core::task_types::TaskStatus::Running)
+            {
+                return (task_id, thread_id);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the child's turn never got under way: {:?}",
+                task_registry.get(&task_id)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The child's task once it has ended.
+    fn settled_task(task_registry: &TaskRegistry, task_id: &str) -> crate::tasks::TaskRecord {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let task = task_registry.get(task_id).expect("the child's task");
+            if !task.status.is_active() {
+                return task;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the child's task never ended: {:?}",
+                task.status
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// An async child in this process stopped through the registry call a
+    /// person's stop of an agent ends in is recorded as stopped, with what
+    /// it used, not as failed.
+    #[test]
+    fn a_stopped_async_child_is_recorded_as_stopped() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "async-child-stopped";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let (task_id, _) = start_streaming_async_child(
+            parent_controller(&host_handle, label, true),
+            cwd.path(),
+            &task_registry,
+            label,
+        );
+
+        // The registry call a person's stop of an agent (`StopTask`) ends in.
+        task_registry
+            .request_stop_detached(&task_id)
+            .expect("stop the child");
+
+        let task = settled_task(&task_registry, &task_id);
+        assert_eq!(
+            task.status,
+            orca_core::task_types::TaskStatus::Stopped,
+            "{:?}",
+            task.error
+        );
+        assert!(task.stop_requested);
+        assert_eq!(task.error, None);
+        assert!(task.usage.is_some(), "the child's usage is kept");
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// When the turn that started a kept child is over, its parent refuses
+    /// the child's end. The child stopped at quit is still recorded as
+    /// stopped: the parent not hearing of it does not make the stop fail.
+    #[test]
+    fn a_stopped_async_child_whose_parent_turn_is_over_is_recorded_as_stopped() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "async-child-parent-over";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let activity = Arc::new(KeptChildActivity {
+            refuses_the_end: true,
+            ..KeptChildActivity::default()
+        });
+        let (task_id, _) = start_streaming_async_child_reporting_to(
+            parent_controller(&host_handle, label, true),
+            cwd.path(),
+            &task_registry,
+            label,
+            activity.clone(),
+        );
+
+        let left = host_handle.stop_kept_subagents(Duration::from_secs(5));
+
+        assert_eq!(left, 0, "no kept child is still running");
+        let task = task_registry.get(&task_id).expect("the child's task");
+        assert_eq!(
+            task.status,
+            orca_core::task_types::TaskStatus::Stopped,
+            "{:?}",
+            task.error
+        );
+        assert_eq!(task.error, None);
+        // A quit is not a person's stop of this one child.
+        assert_eq!(
+            task.result.as_deref(),
+            Some(crate::agent_controller::AGENT_CANCELLED)
+        );
+        assert!(task.usage.is_some(), "the child's usage is kept");
+        assert!(
+            !activity
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.payload, SubagentActivityPayload::Completed { .. })),
+            "the parent refused the child's end"
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// An async child whose run fails is still recorded as failed.
+    #[test]
+    fn a_failed_async_child_is_still_recorded_failed() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "async-child-failed";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let task_id = submit_async_child(
+            parent_controller(&host_handle, label, true),
+            cwd.path(),
+            &task_registry,
+            label,
+            "mock_fail",
+            Arc::new(KeptChildActivity::default()),
+        );
+
+        let task = settled_task(&task_registry, &task_id);
+        assert_eq!(
+            task.status,
+            orca_core::task_types::TaskStatus::Failed,
+            "{:?}",
+            task.result
+        );
+        assert!(!task.stop_requested);
+        assert!(
+            task.error
+                .as_deref()
+                .is_some_and(|error| error.contains("mock child failure requested")),
+            "{:?}",
+            task.error
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// The agents a TUI keeps end with it. Asked to stop, a kept child's
+    /// turn is interrupted, as an interrupted parent turn interrupts it, and
+    /// its task is recorded as stopped, not left running.
+    #[test]
+    fn stopping_kept_subagents_leaves_none_running() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "kept-children-stopped";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let (task_id, child_thread_id) = start_streaming_async_child(
+            parent_controller(&host_handle, label, true),
+            cwd.path(),
+            &task_registry,
+            label,
+        );
+
+        let left = host_handle.stop_kept_subagents(Duration::from_secs(5));
+
+        assert_eq!(left, 0, "no kept child is still running");
+        let task = task_registry.get(&task_id).expect("the child's task");
+        // What `request_stop` leaves for a child in this process, the stop
+        // an interrupted parent turn and `task_stop` ask for: stopped, with
+        // nothing left to reconcile.
+        assert_eq!(
+            task.status,
+            orca_core::task_types::TaskStatus::Stopped,
+            "{:?}",
+            task.error
+        );
+        assert!(task.stop_requested);
+        assert!(task.completed_at_ms.is_some());
+        assert_eq!(task.error, None);
+        // The child's own conversation records its turn as cancelled: it
+        // was ended, not cut off where it stood.
+        let snapshot = child_surface_snapshot(&host_handle, &child_thread_id);
+        let operations = surface_operations(&snapshot);
+        assert_eq!(operations.len(), 1, "{operations:?}");
+        assert!(
+            matches!(
+                operations[0]
+                    .terminal
+                    .as_ref()
+                    .map(|record| &record.terminal),
+                Some(crate::surface::OperationTerminal::Cancelled { .. })
+            ),
+            "the child's turn ended cancelled: {:?}",
+            operations[0].terminal
+        );
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A kept child that does not stop within the wait is left to end with
+    /// the process: the call returns when the wait is over and counts it.
+    #[test]
+    fn stopping_kept_subagents_gives_up_when_the_wait_is_over() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        host_handle.keep_subagents_in_process();
+        let label = "kept-child-never-settles";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let task = task_registry.create_subagent("never settles".to_string(), None);
+        task_registry
+            .mark_running(&task.id)
+            .expect("the child's task is running");
+        // A kept child's thread on which nothing runs: nothing settles its
+        // task once it is asked to stop.
+        let child = host_handle
+            .start_agent_thread(
+                label,
+                label,
+                1,
+                orca_core::subagent_types::SubagentType::General,
+                task.id.clone(),
+                task_registry.clone(),
+                config_in(cwd.path(), SubagentConfig::default()),
+                "never settles",
+            )
+            .expect("start the child's thread");
+        let wait = Duration::from_millis(300);
+
+        let started = Instant::now();
+        let left = host_handle.stop_kept_subagents(wait);
+        let elapsed = started.elapsed();
+
+        assert_eq!(left, 1, "the child is still running when the wait is over");
+        assert!(
+            elapsed >= wait,
+            "it waited as long as it was given: {elapsed:?}"
+        );
+        assert!(
+            elapsed < wait + Duration::from_secs(2),
+            "it gave up when the wait was over: {elapsed:?}"
+        );
+        let record = task_registry.get(&task.id).expect("the child's task");
+        assert!(record.stop_requested, "the child was asked to stop");
+        assert_eq!(record.status, orca_core::task_types::TaskStatus::Stopping);
+        task_registry
+            .stop(&task.id, "test cleanup".to_string())
+            .expect("settle the child's task");
+        let _ = child.shutdown();
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// An agent continued after its first task ended runs its later turn
+    /// as a task bound to the same thread: that task is asked to stop too.
+    #[test]
+    fn stopping_kept_subagents_asks_a_continued_agents_task_too() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        host_handle.keep_subagents_in_process();
+        let label = "kept-child-continued";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let first = task_registry.create_subagent("first turn".to_string(), None);
+        task_registry
+            .mark_running(&first.id)
+            .expect("the first task is running");
+        let child = host_handle
+            .start_agent_thread(
+                label,
+                label,
+                1,
+                orca_core::subagent_types::SubagentType::General,
+                first.id.clone(),
+                task_registry.clone(),
+                config_in(cwd.path(), SubagentConfig::default()),
+                "continued",
+            )
+            .expect("start the child's thread");
+        task_registry
+            .complete(&first.id, "first turn done".to_string())
+            .expect("the first task ends");
+        let later = task_registry.create_subagent("later turn".to_string(), None);
+        task_registry
+            .mark_running(&later.id)
+            .expect("the later task is running");
+        task_registry
+            .bind_subagent_thread(&later.id, child.thread_id())
+            .expect("the later task runs on the same thread");
+
+        let left = host_handle.stop_kept_subagents(Duration::from_millis(200));
+
+        assert_eq!(left, 1, "nothing settles the later task here");
+        let later_record = task_registry.get(&later.id).expect("the later task");
+        assert!(
+            later_record.stop_requested,
+            "the later task was asked to stop"
+        );
+        assert_eq!(
+            later_record.status,
+            orca_core::task_types::TaskStatus::Stopping
+        );
+        let first_record = task_registry.get(&first.id).expect("the first task");
+        assert_eq!(
+            first_record.status,
+            orca_core::task_types::TaskStatus::Completed,
+            "an ended task is left as it ended"
+        );
+        assert!(!first_record.stop_requested);
+        task_registry
+            .stop(&later.id, "test cleanup".to_string())
+            .expect("settle the later task");
+        let _ = child.shutdown();
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// Only subagents are stopped: a workflow's task and a command's task
+    /// in the same registry as a kept child go on.
+    #[test]
+    fn stopping_kept_subagents_leaves_workflow_and_shell_tasks_alone() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "kept-child-beside-other-tasks";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let (task_id, _) = start_streaming_async_child(
+            parent_controller(&host_handle, label, true),
+            cwd.path(),
+            &task_registry,
+            label,
+        );
+        let workflow = task_registry.create_workflow(
+            "workflow-run".to_string(),
+            "workflow".to_string(),
+            "a workflow".to_string(),
+            1,
+        );
+        let shell = task_registry.create_shell("a command".to_string(), "sleep 30".to_string());
+        for id in [&workflow.id, &shell.id] {
+            if task_registry
+                .get(id)
+                .is_some_and(|task| task.status != orca_core::task_types::TaskStatus::Running)
+            {
+                task_registry.mark_running(id).expect("the task is running");
+            }
+        }
+
+        let left = host_handle.stop_kept_subagents(Duration::from_secs(5));
+
+        assert_eq!(left, 0);
+        assert_eq!(
+            task_registry
+                .get(&task_id)
+                .expect("the child's task")
+                .status,
+            orca_core::task_types::TaskStatus::Stopped
+        );
+        for id in [&workflow.id, &shell.id] {
+            let task = task_registry.get(id).expect("the task");
+            assert_eq!(task.status, orca_core::task_types::TaskStatus::Running);
+            assert!(
+                !task.stop_requested,
+                "{:?} was asked to stop",
+                task.task_type
+            );
+            assert!(!task.control.cancel.is_cancelled());
+            task_registry
+                .stop(id, "test cleanup".to_string())
+                .expect("settle the task");
+        }
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A detached worker is meant to outlive the TUI: one in the same
+    /// registry as a kept child is not asked to stop, and its process is
+    /// left to it.
+    #[cfg(unix)]
+    #[test]
+    fn stopping_kept_subagents_leaves_a_detached_worker_alone() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "kept-child-beside-a-worker";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let (task_id, _) = start_streaming_async_child(
+            parent_controller(&host_handle, label, true),
+            cwd.path(),
+            &task_registry,
+            label,
+        );
+        let detached = task_registry.create_subagent("detached worker".to_string(), None);
+        let worker = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn the worker's process");
+        let worker_pid = worker.id();
+        task_registry
+            .adopt_subagent_worker(&detached.id, worker)
+            .expect("the task owns its worker");
+
+        let left = host_handle.stop_kept_subagents(Duration::from_secs(5));
+
+        assert_eq!(left, 0);
+        assert_eq!(
+            task_registry
+                .get(&task_id)
+                .expect("the child's task")
+                .status,
+            orca_core::task_types::TaskStatus::Stopped
+        );
+        let worker_task = task_registry.get(&detached.id).expect("the worker's task");
+        assert_eq!(
+            worker_task.status,
+            orca_core::task_types::TaskStatus::Running
+        );
+        assert!(!worker_task.stop_requested);
+        assert!(!worker_task.control.cancel.is_cancelled());
+        assert_eq!(worker_task.worker_pid, Some(worker_pid));
+        task_registry
+            .request_stop_detached(&detached.id)
+            .expect("stop the worker");
+        host.shutdown().expect("shutdown runtime host");
+    }
+
+    /// A host that was not asked to keep its subagents stops none of them,
+    /// not even a child that runs on one of its threads.
+    #[test]
+    fn a_host_that_does_not_keep_its_subagents_stops_none() {
+        let cwd = tempfile::tempdir().expect("temp cwd");
+        let host = crate::runtime_host::RuntimeHost::start().expect("start runtime host");
+        let host_handle = host.handle();
+        let label = "unkept-child-goes-on";
+        let task_registry = TaskRegistry::new(label.to_string());
+        let (task_id, _) = start_streaming_async_child(
+            parent_controller(&host_handle, label, false),
+            cwd.path(),
+            &task_registry,
+            label,
+        );
+        assert!(!host_handle.keeps_subagents_in_process());
+
+        let left = host_handle.stop_kept_subagents(Duration::from_secs(5));
+
+        assert_eq!(left, 0);
+        let task = task_registry.get(&task_id).expect("the child's task");
+        assert_eq!(task.status, orca_core::task_types::TaskStatus::Running);
+        assert!(!task.stop_requested);
+        task_registry
+            .request_stop(&task_id)
+            .expect("stop the child");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while task_registry
+            .get(&task_id)
+            .is_some_and(|task| task.status.is_active())
+        {
+            assert!(Instant::now() < deadline, "the child never settled");
+            thread::sleep(Duration::from_millis(10));
+        }
         host.shutdown().expect("shutdown runtime host");
     }
 

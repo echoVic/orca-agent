@@ -15,7 +15,7 @@ use crate::process_interrupt::ProcessInterruptHandle;
 use crate::protocol::{
     SubmitToken, TuiEvent, TuiInteractionKey, TuiInteractionKind, TuiInteractionResponse,
 };
-use crate::surface_projection::{SurfaceProjectionState, TuiStreamDeliveryWatermark};
+use crate::surface_projection::TuiStreamDeliveryWatermark;
 
 /// Presentation-side correlation for a typed runtime surface operation.
 ///
@@ -62,6 +62,8 @@ struct HostedOperationInner {
     /// conversation. This is separate from the parent's active operation so
     /// focusing a child never steals cancellation/background ownership.
     focused_child_surface: Option<SurfaceActiveOperation>,
+    followed_surfaces: HashMap<orca_runtime::surface::SurfaceOperationId, SurfaceActiveOperation>,
+    follow_recovery: Option<(orca_runtime::surface::SurfaceOperationId, &'static str)>,
     surface_presentation_tasks: Vec<SurfacePresentationTask>,
     surface_activation_armed: bool,
     interrupt_requested: bool,
@@ -75,8 +77,8 @@ struct HostedOperationInner {
     settings_target_thread_id: Option<String>,
     settings_restricted: bool,
     queue_watcher_stop: Option<Arc<AtomicBool>>,
-    queue_interactions:
-        HashMap<TuiInteractionKey, std::sync::mpsc::SyncSender<io::Result<TuiInteractionResponse>>>,
+    queue_interactions: HashMap<TuiInteractionKey, PendingQueueInteraction>,
+    queue_interactions_closed: bool,
     /// The MCP servers that started with the TUI, until a thread takes them.
     prestart_mcp: Option<PrestartedMcp>,
     /// Whether those servers wait for first-run setup to be done before
@@ -85,7 +87,17 @@ struct HostedOperationInner {
     /// Where `/mcp` saves and deletes MCP logins: the config's
     /// `mcp_credentials_path`.
     mcp_credentials_path: Option<PathBuf>,
+    /// What is on screen, once the controller has started. The dispatcher
+    /// changes it without waiting for the controller.
+    view: Option<crate::hosted_view::HostedView>,
     shutdown: bool,
+}
+
+#[derive(Debug)]
+struct PendingQueueInteraction {
+    thread_id: String,
+    event: TuiEvent,
+    response: std::sync::mpsc::SyncSender<io::Result<TuiInteractionResponse>>,
 }
 
 /// A message submitted to the controller, as the thread handling it knows it.
@@ -202,45 +214,12 @@ impl TuiSurfaceTaskControl {
         if cancel_surface_if_active_checked(&mut hosted)? {
             return Ok(true);
         }
-        // With a child in view the queue is bound to the child's thread, and
-        // focusing a child never takes over cancellation: the child is
-        // stopped from the Agents panel, where its task records the stop.
-        let queue_runtime = hosted
-            .focused_child_surface
-            .is_none()
-            .then(|| hosted.queue_runtime.clone())
-            .flatten();
         drop(hosted);
-        let queue_snapshot = queue_runtime.as_ref().and_then(|runtime| {
-            runtime.is_busy().then(|| {
-                runtime
-                    .prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::List)
-                    .ok()
-            })?
-        });
-        if let (Some(runtime), Some(snapshot)) = (queue_runtime, queue_snapshot) {
-            let queued_turn = snapshot.running_item().is_some();
-            if queued_turn && !snapshot.paused {
-                // Persist the pause before waking a blocked interaction. The
-                // interaction may be the last thing keeping the active task
-                // alive; cancelling it first could let the next FIFO item
-                // start before the interrupt command reaches the actor.
-                let _ =
-                    runtime.prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::Pause {
-                        expected_revision: snapshot.revision,
-                    });
-            }
-            // Besides a queued turn, the runtime may be running one it started
-            // itself — finished background agents waking the main thread —
-            // which Esc must reach too. An armed activation is the TUI's own
-            // turn still starting, and is interrupted once it installs below.
-            if queued_turn || !self.lock_hosted().surface_activation_armed {
-                self.cancel_queue_interactions();
-                runtime
-                    .interrupt_active()
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-                return Ok(true);
-            }
+        if self
+            .interrupt_runtime_turn(self.main_or_side_runtime(), false)?
+            .is_some()
+        {
+            return Ok(true);
         }
         let mut hosted = self.lock_hosted();
         if hosted.shutdown || !hosted.surface_activation_armed {
@@ -248,6 +227,41 @@ impl TuiSurfaceTaskControl {
         }
         hosted.interrupt_requested = true;
         Ok(true)
+    }
+
+    fn interrupt_runtime_turn(
+        &self,
+        queue_runtime: Option<orca_runtime::runtime_host::RuntimeThreadHandle>,
+        shutting_down: bool,
+    ) -> io::Result<Option<orca_runtime::runtime_host::OperationCompletion>> {
+        if let Some(runtime) = queue_runtime.filter(|runtime| shutting_down || runtime.is_busy())
+            && (shutting_down
+                || Self::pause_running_queue(&runtime)
+                || !self.lock_hosted().surface_activation_armed)
+        {
+            if !shutting_down {
+                self.cancel_queue_interactions();
+            }
+            return runtime
+                .interrupt_active_with_completion()
+                .map_err(|error| io::Error::other(error.to_string()));
+        }
+        Ok(None)
+    }
+
+    fn pause_running_queue(runtime: &orca_runtime::runtime_host::RuntimeThreadHandle) -> bool {
+        let snapshot = runtime.subscribe_prompt_queue().borrow().clone();
+        let queued_turn = snapshot.running_item().is_some();
+        if queued_turn && !snapshot.paused {
+            // Persist the pause before waking a blocked interaction. The
+            // interaction may be the last thing keeping the active task
+            // alive; cancelling it first could let the next FIFO item
+            // start before the interrupt command reaches the actor.
+            let _ = runtime.prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::Pause {
+                expected_revision: snapshot.revision,
+            });
+        }
+        queued_turn
     }
 
     pub(crate) fn request_background_current(&self) -> bool {
@@ -365,8 +379,9 @@ impl TuiSurfaceTaskControl {
         &self,
         task_id: &str,
         event_tx: &Sender<TuiEvent>,
-    ) -> Result<Option<SurfaceProjectionState>, String> {
-        let runtime = self.lock_hosted().queue_runtime.clone();
+    ) -> Result<Option<crate::surface_client::TaskStopResult>, crate::surface_client::TaskStopError>
+    {
+        let runtime = self.main_runtime();
         let Some(runtime) = runtime else {
             return Ok(None);
         };
@@ -390,11 +405,45 @@ impl TuiSurfaceTaskControl {
         &self,
         request: &crate::protocol::TaskTranscriptRequest,
     ) -> Option<crate::protocol::TaskTranscriptResult> {
-        let runtime = self.lock_hosted().queue_runtime.clone()?;
+        let runtime = self.main_or_side_runtime()?;
         Some(crate::surface_client::read_task_transcript(
             &runtime.typed_surface(),
             request,
         ))
+    }
+
+    /// Called once by the controller as it starts, before it takes its
+    /// first action.
+    pub(crate) fn bind_view(&self, view: crate::hosted_view::HostedView) {
+        self.lock_hosted().view = Some(view);
+    }
+
+    /// Lets go of the view as the controller ends: it holds the runtime
+    /// host's handle.
+    pub(crate) fn unbind_view(&self) {
+        self.lock_hosted().view = None;
+    }
+
+    pub(crate) fn view(&self) -> Option<crate::hosted_view::HostedView> {
+        self.lock_hosted().view.clone()
+    }
+
+    /// Whether a message sent now would miss the conversation on screen: a
+    /// child is on screen, which has nowhere to take a message yet, or the
+    /// controller runs a turn, or is about to, on a child that is not.
+    pub(crate) fn message_would_miss_the_conversation_in_view(
+        &self,
+    ) -> Option<crate::hosted_view::OutOfStep> {
+        let (view, turn_active) = {
+            let hosted = self.lock_hosted();
+            (
+                hosted.view.clone(),
+                hosted.surface_active.is_some() || hosted.surface_activation_armed,
+            )
+        };
+        view?
+            .out_of_step()
+            .filter(|reason| *reason != crate::hosted_view::OutOfStep::AgentRuns || turn_active)
     }
 
     pub(crate) fn bind_hosted_settings_config(
@@ -436,11 +485,13 @@ impl TuiSurfaceTaskControl {
     }
 
     pub(crate) fn stamp_settings_action(&self, encoded: String) -> String {
-        let thread_id = self
-            .lock_hosted()
-            .queue_runtime
-            .as_ref()
-            .map(|runtime| runtime.thread_id().to_string());
+        let thread_id = self.runtime_thread().map(|bound| {
+            self.view()
+                .and_then(|view| view.returned_to_parent_of(&bound))
+                .unwrap_or(bound)
+                .thread_id()
+                .to_owned()
+        });
         crate::hosted_settings::QueuedSettings {
             sequence: self
                 .hosted
@@ -539,6 +590,12 @@ impl TuiSurfaceTaskControl {
         if !runtime.is_busy() {
             return false;
         }
+        if self
+            .view()
+            .is_some_and(|view| view.returned_to_parent_of(&runtime).is_some())
+        {
+            return false;
+        }
         if restricted {
             let _ = event_tx.send(TuiEvent::Error(
                 "this command is unavailable in a side conversation; return to main first"
@@ -556,10 +613,35 @@ impl TuiSurfaceTaskControl {
         true
     }
 
-    /// The runtime thread in view. `None` before the conversation starts.
-    #[cfg(test)]
+    /// The runtime thread the controller operates on. `None` before the
+    /// conversation starts.
     pub(crate) fn runtime_thread(&self) -> Option<orca_runtime::runtime_host::RuntimeThreadHandle> {
         self.lock_hosted().queue_runtime.clone()
+    }
+
+    /// Main's thread, even while visiting an agent or a side conversation.
+    pub(crate) fn main_runtime(&self) -> Option<orca_runtime::runtime_host::RuntimeThreadHandle> {
+        let hosted = self.lock_hosted();
+        let Some(view) = hosted.view.clone() else {
+            return hosted
+                .focused_child_surface
+                .is_none()
+                .then(|| hosted.queue_runtime.clone())
+                .flatten();
+        };
+        drop(hosted);
+        view.main_runtime(self)
+    }
+
+    /// A side conversation owns its own work; visiting an agent still targets main's work.
+    pub(crate) fn main_or_side_runtime(
+        &self,
+    ) -> Option<orca_runtime::runtime_host::RuntimeThreadHandle> {
+        if self.view().is_some_and(|view| view.side_active()) {
+            self.runtime_thread()
+        } else {
+            self.main_runtime()
+        }
     }
 
     /// Lets go of the runtime thread in view, and it of this control, as the
@@ -649,16 +731,13 @@ impl TuiSurfaceTaskControl {
     }
 
     /// The MCP servers `/mcp` and the MCP prompt commands act on now: those
-    /// of the runtime thread in view, or, before a thread has started, those
-    /// that started with the TUI.
+    /// of main while visiting an agent, the side's own in a side conversation,
+    /// or those that started with the TUI before there is a thread.
     pub(crate) fn mcp_servers(&self) -> Option<McpServers> {
-        let hosted = self.lock_hosted();
-        hosted
-            .queue_runtime
-            .clone()
+        self.main_or_side_runtime()
             .map(|runtime| McpServers::Thread(Box::new(runtime)))
             .or_else(|| {
-                hosted
+                self.lock_hosted()
                     .prestart_mcp
                     .as_ref()
                     .map(|prestarted| McpServers::Prestarted(prestarted.registry().clone()))
@@ -704,11 +783,46 @@ impl TuiSurfaceTaskControl {
     pub(crate) fn shutdown(&self) {
         // The MCP servers no thread took stop, with no lock held.
         self.close_prestart_mcp();
+        let main = self.main_runtime();
+        let side = self
+            .view()
+            .filter(|view| view.side_active())
+            .and_then(|_| self.runtime_thread())
+            .filter(|side| {
+                main.as_ref()
+                    .is_none_or(|main| main.thread_id() != side.thread_id())
+            });
         let _transition = self
             .hosted
             .surface_presentation_transition
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.is_shutdown() {
+            return;
+        }
+        self.lock_hosted().queue_interactions_closed = true;
+        for runtime in main.iter().chain(&side) {
+            Self::pause_running_queue(runtime);
+        }
+        self.cancel_queue_interactions();
+        self.process_interrupt.force_kill();
+        let surface_cancelled = cancel_surface_if_active(&mut self.lock_hosted());
+        if side.is_some() || !surface_cancelled {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let completions: Vec<_> = main
+                .into_iter()
+                .chain(side)
+                .filter_map(|runtime| {
+                    self.interrupt_runtime_turn(Some(runtime), true)
+                        .ok()
+                        .flatten()
+                })
+                .collect();
+            for completion in completions {
+                let _ = completion
+                    .wait_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+            }
+        }
         let surface_presentation_tasks = {
             let mut hosted = self.lock_hosted();
             hosted.shutdown = true;
@@ -722,8 +836,7 @@ impl TuiSurfaceTaskControl {
             }
             std::mem::take(&mut hosted.surface_presentation_tasks)
         };
-        self.cancel_surface_and_notify();
-        self.cancel_queue_interactions();
+        self.hosted.changed.notify_all();
         for task in surface_presentation_tasks {
             let _ = task.handle.join();
         }
@@ -818,13 +931,13 @@ impl TuiSurfaceTaskControl {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn bind_prompt_queue_event_sender(&self, event_tx: &Sender<TuiEvent>) {
-        let hosted = self.lock_hosted();
-        *hosted
-            .queue_event_tx
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(event_tx.clone());
+    pub(crate) fn pending_queue_interactions(&self, thread_id: &str) -> Vec<TuiEvent> {
+        self.lock_hosted()
+            .queue_interactions
+            .values()
+            .filter(|pending| pending.thread_id == thread_id)
+            .map(|pending| pending.event.clone())
+            .collect()
     }
 
     pub(crate) fn prompt_queue_event_sender(&self) -> Arc<Mutex<Option<Sender<TuiEvent>>>> {
@@ -833,35 +946,34 @@ impl TuiSurfaceTaskControl {
 
     pub(crate) fn await_queue_interaction(
         &self,
+        thread_id: &str,
+        event_tx: &Sender<TuiEvent>,
         request_id: String,
         kind: TuiInteractionKind,
         event: impl FnOnce(TuiInteractionKey) -> TuiEvent,
     ) -> io::Result<TuiInteractionResponse> {
         let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
-        let (key, event_tx) = {
+        let (key, event) = {
             let mut hosted = self.lock_hosted();
-            if hosted.shutdown {
+            if hosted.queue_interactions_closed || hosted.shutdown {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "TUI surface task control is shutting down",
                 ));
             }
             let key = TuiInteractionKey::new(self.surface_ids.allocate(), request_id, kind);
-            let event_tx = hosted
-                .queue_event_tx
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "queued runtime interaction channel is not installed",
-                    )
-                })?;
-            hosted.queue_interactions.insert(key.clone(), response_tx);
-            (key, event_tx)
+            let event = event(key.clone());
+            hosted.queue_interactions.insert(
+                key.clone(),
+                PendingQueueInteraction {
+                    thread_id: thread_id.to_owned(),
+                    event: event.clone(),
+                    response: response_tx,
+                },
+            );
+            (key, event)
         };
-        if event_tx.send(event(key.clone())).is_err() {
+        if event_tx.send(event).is_err() {
             self.lock_hosted().queue_interactions.remove(&key);
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -886,7 +998,7 @@ impl TuiSurfaceTaskControl {
         let Some(sender) = self.lock_hosted().queue_interactions.remove(key) else {
             return Ok(false);
         };
-        sender.send(Ok(response.clone())).map_err(|_| {
+        sender.response.send(Ok(response.clone())).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "queued runtime interaction waiter closed",
@@ -901,7 +1013,7 @@ impl TuiSurfaceTaskControl {
             hosted
                 .queue_interactions
                 .drain()
-                .map(|(_, sender)| sender)
+                .map(|(_, pending)| pending.response)
                 .collect::<Vec<_>>()
         };
         for sender in waiters {
@@ -1068,11 +1180,6 @@ impl TuiSurfaceTaskControl {
         }
     }
 
-    fn cancel_surface_and_notify(&self) {
-        let _ = cancel_surface_if_active(&mut self.lock_hosted());
-        self.hosted.changed.notify_all();
-    }
-
     pub(crate) fn install_surface(
         &self,
         client: orca_runtime::surface::RuntimeSurfaceClientHandle,
@@ -1118,6 +1225,7 @@ impl TuiSurfaceTaskControl {
             let background_requested = hosted.background_requested;
             hosted.background_requested = false;
             hosted.surface_active = Some(SurfaceActiveOperation {
+                reader: Default::default(),
                 client: client.clone(),
                 operation_id: operation_id.clone(),
                 goal_fence,
@@ -1237,7 +1345,9 @@ impl TuiSurfaceTaskControl {
                 .as_mut()
                 .expect("focused child surface checked")
         } else {
-            return None;
+            hosted
+                .followed_surfaces
+                .get_mut(&interaction.fence.operation_id)?
         };
         let request_id = format!("{:?}", interaction.interaction_id);
         let legacy_user_input = matches!(
@@ -1444,23 +1554,14 @@ impl TuiSurfaceTaskControl {
         key: &TuiInteractionKey,
         response: &TuiInteractionResponse,
     ) -> io::Result<bool> {
-        let (binding, focused_child) = {
+        let binding = {
             let hosted = self.lock_hosted();
-            if let Some(binding) = hosted
+            hosted
                 .surface_active
-                .as_ref()
-                .and_then(|active| active.interactions.get(key).cloned())
-            {
-                (Some(binding), false)
-            } else {
-                (
-                    hosted
-                        .focused_child_surface
-                        .as_ref()
-                        .and_then(|active| active.interactions.get(key).cloned()),
-                    true,
-                )
-            }
+                .iter()
+                .chain(hosted.focused_child_surface.iter())
+                .chain(hosted.followed_surfaces.values())
+                .find_map(|active| active.interactions.get(key).cloned())
         };
         let Some(binding) = binding else {
             return Ok(false);
@@ -1612,19 +1713,15 @@ impl TuiSurfaceTaskControl {
         ) {
             Ok(orca_runtime::surface::MutationReply::Committed { .. }) => {
                 let mut hosted = self.lock_hosted();
-                let interactions = if focused_child {
-                    hosted
-                        .focused_child_surface
-                        .as_mut()
-                        .map(|surface| &mut surface.interactions)
-                } else {
-                    hosted
-                        .surface_active
-                        .as_mut()
-                        .map(|surface| &mut surface.interactions)
-                };
-                if let Some(interactions) = interactions {
-                    interactions.remove(key);
+                let hosted = &mut *hosted;
+                if let Some(surface) = hosted
+                    .surface_active
+                    .iter_mut()
+                    .chain(hosted.focused_child_surface.iter_mut())
+                    .chain(hosted.followed_surfaces.values_mut())
+                    .find(|surface| surface.ui_operation_id == key.operation_id)
+                {
+                    surface.interactions.remove(key);
                 }
                 Ok(true)
             }
@@ -1680,6 +1777,65 @@ impl TuiSurfaceTaskControl {
         hosted.surface_active.is_none()
     }
 
+    pub(crate) fn bind_followed_surface(
+        &self,
+        client: orca_runtime::surface::RuntimeSurfaceClientHandle,
+        operation_id: orca_runtime::surface::SurfaceOperationId,
+    ) {
+        self.lock_hosted().followed_surfaces.insert(
+            operation_id.clone(),
+            SurfaceActiveOperation {
+                reader: Default::default(),
+                client,
+                operation_id,
+                goal_fence: None,
+                ui_operation_id: self.surface_ids.allocate(),
+                interactions: HashMap::new(),
+                background_requested: false,
+                background_handoff_pending: false,
+            },
+        );
+    }
+
+    pub(crate) fn unbind_followed_surface(
+        &self,
+        operation_id: &orca_runtime::surface::SurfaceOperationId,
+    ) {
+        self.lock_hosted().followed_surfaces.remove(operation_id);
+    }
+
+    pub(crate) fn main_reader(
+        &self,
+        operation: &orca_runtime::surface::SurfaceOperationId,
+    ) -> Option<MainReader> {
+        let hosted = self.lock_hosted();
+        hosted
+            .surface_active
+            .as_ref()
+            .filter(|active| &active.operation_id == operation)
+            .or_else(|| hosted.followed_surfaces.get(operation))
+            .map(|active| active.reader.clone())
+    }
+
+    pub(crate) fn note_follow_recovery(
+        &self,
+        operation: orca_runtime::surface::SurfaceOperationId,
+        message: &'static str,
+    ) {
+        self.lock_hosted().follow_recovery = Some((operation, message));
+    }
+
+    pub(crate) fn follow_recovery(
+        &self,
+        operation: &orca_runtime::surface::SurfaceOperationId,
+    ) -> Option<&'static str> {
+        self.lock_hosted()
+            .follow_recovery
+            .as_ref()
+            .filter(|(owner, _)| owner == operation)
+            .map(|(_, message)| *message)
+    }
+
     pub(crate) fn install_focused_child_surface(
         &self,
         client: orca_runtime::surface::RuntimeSurfaceClientHandle,
@@ -1693,6 +1849,7 @@ impl TuiSurfaceTaskControl {
             ));
         }
         hosted.focused_child_surface = Some(SurfaceActiveOperation {
+            reader: Default::default(),
             client,
             operation_id,
             goal_fence: None,
@@ -1722,6 +1879,11 @@ impl TuiSurfaceTaskControl {
         self.lock_hosted().focused_child_surface = None;
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_focused_child_surface(&self) -> bool {
+        self.lock_hosted().focused_child_surface.is_some()
+    }
+
     fn lock_hosted(&self) -> MutexGuard<'_, HostedOperationInner> {
         self.hosted
             .inner
@@ -1732,6 +1894,7 @@ impl TuiSurfaceTaskControl {
 
 #[derive(Clone)]
 struct SurfaceActiveOperation {
+    reader: MainReader,
     client: orca_runtime::surface::RuntimeSurfaceClientHandle,
     operation_id: orca_runtime::surface::SurfaceOperationId,
     goal_fence: Option<orca_runtime::surface::SurfaceGoalFence>,
@@ -1739,6 +1902,39 @@ struct SurfaceActiveOperation {
     interactions: HashMap<TuiInteractionKey, SurfaceInteractionBinding>,
     background_requested: bool,
     background_handoff_pending: bool,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct MainReader(Arc<Mutex<ReaderDelivery>>);
+
+#[derive(Default)]
+struct ReaderDelivery {
+    draining: bool,
+    seeded: Option<orca_runtime::surface::SurfaceCursor>,
+}
+
+impl MainReader {
+    pub(crate) fn begin(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .draining = true;
+    }
+
+    pub(crate) fn seed(&self, cursor: &orca_runtime::surface::SurfaceCursor) -> bool {
+        let mut reader = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        if !reader.draining {
+            return false;
+        }
+        reader.seeded.get_or_insert_with(|| cursor.clone());
+        true
+    }
+
+    pub(crate) fn close(&self) -> Option<orca_runtime::surface::SurfaceCursor> {
+        let mut reader = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        reader.draining = false;
+        reader.seeded.take()
+    }
 }
 
 #[derive(Clone)]
@@ -1891,6 +2087,71 @@ mod tests {
     use orca_runtime::surface::{ByteOffset, SurfaceOperationId, SurfaceStreamId};
 
     use crate::surface_projection::TuiStreamDeliveryWatermark;
+
+    // The refusing result needs a child on screen and a turn the controller
+    // runs, which takes a live child thread; it is checked in a real
+    // terminal, not here.
+    #[test]
+    fn a_message_is_never_refused_while_main_is_on_screen() {
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        assert!(control.view().is_none());
+        assert!(
+            control
+                .message_would_miss_the_conversation_in_view()
+                .is_none(),
+            "no view, no turn: nothing to miss"
+        );
+
+        let host = orca_runtime::runtime_host::RuntimeHost::start_with_background_capacity(1)
+            .expect("runtime host");
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let attachment = crate::protocol::SessionAttachmentId::new(1);
+        control.bind_view(crate::hosted_view::HostedView::new(
+            host.handle(),
+            event_tx.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::attachment_routing::AttachmentRouting::new(attachment),
+            )),
+            event_tx,
+            attachment,
+        ));
+        assert!(control.view().is_some());
+        assert!(
+            control
+                .message_would_miss_the_conversation_in_view()
+                .is_none(),
+            "main is on screen"
+        );
+
+        control.unbind_view();
+        assert!(control.view().is_none());
+    }
+
+    #[test]
+    fn a_message_in_an_agents_view_is_handed_back_whether_or_not_a_turn_runs() {
+        let on_child = crate::hosted_child::live_child_for_test::ViewOnChild::start();
+        let control = &on_child.control;
+        assert!(on_child.view.has_focus(), "a child is on screen");
+        // No surface operation is active and none is armed.
+        assert_eq!(
+            control.message_would_miss_the_conversation_in_view(),
+            Some(crate::hosted_view::OutOfStep::AgentOnScreen)
+        );
+        // A turn the controller runs changes nothing about it.
+        {
+            let mut hosted = control.lock_hosted();
+            hosted.surface_activation_armed = true;
+        }
+        assert_eq!(
+            control.message_would_miss_the_conversation_in_view(),
+            Some(crate::hosted_view::OutOfStep::AgentOnScreen)
+        );
+        {
+            let mut hosted = control.lock_hosted();
+            hosted.surface_activation_armed = false;
+        }
+        on_child.shutdown();
+    }
 
     fn test_surface_operation_id(seed: u8) -> SurfaceOperationId {
         let mut bytes = [seed; 16];
@@ -2176,10 +2437,11 @@ mod tests {
     fn queued_interaction_round_trip_wakes_runtime_waiter() {
         let controller = TuiSurfaceTaskControl::isolated_for_test();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        controller.bind_prompt_queue_event_sender(&event_tx);
         let waiting = controller.clone();
         let waiter = std::thread::spawn(move || {
             waiting.await_queue_interaction(
+                "main",
+                &event_tx,
                 "request-1".to_string(),
                 crate::protocol::TuiInteractionKind::UserInput,
                 |key| crate::protocol::TuiEvent::UserInputRequested {
@@ -2350,6 +2612,111 @@ mod tests {
     /// Counts the turns a thread runs and ends each at once.
     struct CountingExecutor {
         turns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct HeldExecutor {
+        entered: crossbeam_channel::Sender<orca_core::cancel::CancelToken>,
+        release: crossbeam_channel::Receiver<()>,
+    }
+
+    impl orca_runtime::runtime_host::ThreadOperationExecutor for HeldExecutor {
+        fn run_turn(
+            &self,
+            _thread: &mut orca_runtime::thread::RuntimeThread,
+            _request: &orca_runtime::runtime_host::HostedTurnRequest,
+            _generation: &orca_runtime::runtime_host::GenerationContext,
+            _events: &mut orca_core::event_schema::EventFactory,
+            _writer: &mut (dyn std::io::Write + Send),
+            cancel: &orca_core::cancel::CancelToken,
+        ) -> std::io::Result<orca_runtime::runtime_host::ThreadOperationOutcome> {
+            self.entered.send(cancel.clone()).unwrap();
+            let _ = self.release.recv_timeout(Duration::from_secs(12));
+            Ok(orca_core::event_schema::RunStatus::Cancelled.into())
+        }
+    }
+
+    fn with_shutdown_waiting(
+        check: impl FnOnce(&TuiSurfaceTaskControl, &crossbeam_channel::Receiver<()>),
+    ) {
+        let home = crate::test_support::isolate_orca_home();
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().into());
+        let (entered, running) = crossbeam_channel::bounded(1);
+        let (release, gate) = crossbeam_channel::bounded(1);
+        let host =
+            orca_runtime::runtime_host::RuntimeHost::start_with_executor(Arc::new(HeldExecutor {
+                entered,
+                release: gate,
+            }))
+            .unwrap();
+        let main = host.start_thread(config, "main").unwrap();
+        let control = TuiSurfaceTaskControl::isolated_for_test();
+        let (sender, _events) = crossbeam_channel::unbounded();
+        crate::hosted_session::announce_runtime_ready(&main, &sender, &control);
+        main.prompt_queue(PromptQueueAction::Add {
+            input: orca_runtime::prompt_queue::PromptQueueInput::text("held queued turn"),
+        })
+        .unwrap();
+        let cancel = running.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (done, returned) = crossbeam_channel::bounded(1);
+        let shutting_down = control.clone();
+        let worker = std::thread::spawn(move || {
+            shutting_down.shutdown();
+            let _ = done.send(());
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !cancel.is_cancelled() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown did not interrupt main"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        check(&control, &returned);
+        drop(release);
+        worker.join().unwrap();
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_bounds_only_the_tui_wait_for_an_uncooperative_queued_turn() {
+        // This bounds the TUI completion wait, not process exit: the host still joins the worker.
+        with_shutdown_waiting(|_, returned| {
+            returned
+                .recv_timeout(Duration::from_millis(5500))
+                .expect("TUI shutdown is still waiting for the held worker");
+        });
+    }
+
+    #[test]
+    fn shutdown_refuses_a_queue_approval_after_interrupt() {
+        with_shutdown_waiting(|control, _| {
+            let late = control.clone();
+            let (sender, requests) = crossbeam_channel::unbounded();
+            let (done, result) = crossbeam_channel::bounded(1);
+            let waiter = std::thread::spawn(move || {
+                let answer = late.await_queue_interaction(
+                    "main",
+                    &sender,
+                    "late".into(),
+                    crate::protocol::TuiInteractionKind::Approval,
+                    |key| crate::protocol::TuiEvent::ApprovalNeeded {
+                        key,
+                        tool: "edit".into(),
+                        target: None,
+                        preview: None,
+                    },
+                );
+                let _ = done.send(answer);
+            });
+            let refused = result.recv_timeout(Duration::from_secs(1));
+            control.cancel_queue_interactions();
+            waiter.join().unwrap();
+            assert!(
+                matches!(refused, Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted)
+            );
+            assert!(requests.try_recv().is_err());
+        });
     }
 
     impl orca_runtime::runtime_host::ThreadOperationExecutor for CountingExecutor {

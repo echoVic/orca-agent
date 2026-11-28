@@ -12,8 +12,8 @@ use orca_runtime::runtime_host::HostedTurnRequest;
 use orca_runtime::surface::{
     AttachResult, BackgroundTarget, DisplayText, ExpectedGoal, FreshAttachRequest,
     GoalMutationAction, GoalRunInput, GoalTokenBudgetUpdate, MutationCommitAck, MutationReply,
-    NonEmptyText, NonEmptyVec, OperationIngressCorrelation, OperationKind, OperationPatch,
-    OperationRequestIntent, OperationSettingsPreparation, OperationTerminal,
+    MutationTarget, NonEmptyText, NonEmptyVec, OperationIngressCorrelation, OperationKind,
+    OperationPatch, OperationRequestIntent, OperationSettingsPreparation, OperationTerminal,
     OptionalProcessLocalCancel, PinnedContextAction, PinnedContextSourceRevision,
     PinnedUserRevision, ReplayabilityRequest, RuntimeSettingsPatch, RuntimeSurfaceClientHandle,
     RuntimeSurfaceHandle, RuntimeSurfaceThreadHandle, SessionMetadataPatch,
@@ -22,12 +22,13 @@ use orca_runtime::surface::{
     SurfaceClientCommandError, SurfaceClientInteractionAnswer, SurfaceCursor, SurfaceEvent,
     SurfaceFactFamily, SurfaceGoal, SurfaceGoalFence, SurfaceImageDetail, SurfaceImageSource,
     SurfaceInputRequest, SurfaceInputRequestBlock, SurfaceInteractionKind,
-    SurfaceMcpPromptExpansion, SurfaceMcpServerAction, SurfaceMcpServerStatus, SurfaceOperationId,
-    SurfacePinnedContextEntry, SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot,
-    SurfaceSnapshot, SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceTaskId,
-    SurfaceUnavailableReason, SurfaceWorkflowRunId, TaskControlAction, TaskRevision,
-    TransferBackgroundOutput, UncommittedMutation, WaitOperationTerminalResult,
-    WorkflowCatalogRevision, WorkflowControlAction, WorkflowPatch,
+    SurfaceMcpPromptExpansion, SurfaceMcpServerAction, SurfaceMcpServerStatus,
+    SurfaceMutationErrorCode, SurfaceOperationId, SurfacePinnedContextEntry,
+    SurfacePinnedContextKind, SurfaceRequestId, SurfaceSettingsSnapshot, SurfaceSnapshot,
+    SurfaceSubscriptionItem, SurfaceTaskFence, SurfaceTaskId, SurfaceUnavailableReason,
+    SurfaceWorkflowRunId, TaskControlAction, TaskRevision, TransferBackgroundOutput,
+    UncommittedMutation, WaitOperationTerminalResult, WorkflowCatalogRevision,
+    WorkflowControlAction, WorkflowPatch,
 };
 
 use crate::hosted_runtime::TuiHostedOperationOutcome;
@@ -273,7 +274,8 @@ pub(crate) fn manual_compact(
         .ok_or_else(|| io::Error::other("typed TUI surface subscription unavailable"))?;
     let mut projection = TuiSurfaceProjection::from_surface_snapshot(&attachment.baseline.snapshot);
     for event in projection.hydrate_open_streams() {
-        let _ = event_tx.send(event);
+        let _ = event_tx
+            .send(event.at_surface_cursor(controller.view().is_some(), projection.cursor()));
     }
     let output = match attachment
         .client
@@ -378,7 +380,46 @@ pub(crate) fn update_settings(
     }
 }
 
+pub(crate) fn changed_projection(
+    thread: &RuntimeSurfaceThreadHandle,
+    last: Option<&orca_runtime::surface::SurfaceCursor>,
+) -> io::Result<Option<SurfaceProjectionState>> {
+    with_snapshot_attachment(thread, |attachment| {
+        Ok((last != Some(&attachment.baseline.cursor))
+            .then(|| SurfaceProjectionState::from_surface_snapshot(&attachment.baseline.snapshot)))
+    })
+}
+
 pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<SurfaceSnapshot> {
+    with_snapshot_attachment(thread, |attachment| {
+        #[cfg(test)]
+        SNAPSHOT_READS.with_borrow_mut(|reads| {
+            if let Some(reads) = reads {
+                reads.push(attachment.clone());
+            }
+        });
+        Ok((*attachment.baseline.snapshot).clone())
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_READS: std::cell::RefCell<Option<Vec<orca_runtime::surface::FreshSurfaceAttachment>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn trace_snapshot_reads(
+    read: impl FnOnce(),
+) -> Vec<orca_runtime::surface::FreshSurfaceAttachment> {
+    SNAPSHOT_READS.replace(Some(Vec::new()));
+    read();
+    SNAPSHOT_READS.take().unwrap()
+}
+
+fn with_snapshot_attachment<T>(
+    thread: &RuntimeSurfaceThreadHandle,
+    read: impl FnOnce(&orca_runtime::surface::FreshSurfaceAttachment) -> io::Result<T>,
+) -> io::Result<T> {
     let surface = thread.surface();
     let attachment = match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
@@ -408,9 +449,9 @@ pub(crate) fn read_snapshot(thread: &RuntimeSurfaceThreadHandle) -> io::Result<S
             ));
         }
     };
-    let snapshot = (*attachment.baseline.snapshot).clone();
+    let result = read(&attachment);
     detach(&surface, &attachment.client);
-    Ok(snapshot)
+    result
 }
 
 /// Read a child transcript through the runtime-owned typed surface.
@@ -657,14 +698,101 @@ pub(crate) fn update_session_metadata(
     }
 }
 
-pub(crate) fn stop_task(
-    thread: &RuntimeSurfaceThreadHandle,
-    task_id: &str,
-    controller: &TuiSurfaceTaskControl,
-    event_tx: &mpsc::Sender<TuiEvent>,
-) -> Result<SurfaceProjectionState, String> {
-    let surface = thread.surface();
-    let attachment = match surface.attach_fresh(FreshAttachRequest {
+/// Why a stop the TUI sent was not taken.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TaskStopError {
+    /// Every try was refused because the agent's row had moved on since it
+    /// was read. Holds the line a person is shown instead of an error.
+    RowKeptChanging(String),
+    /// Any other refusal or failure, worded as the runtime or the attach
+    /// gave it.
+    Failed(String),
+}
+
+impl From<String> for TaskStopError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl TaskStopError {
+    /// What the TUI shows for it: a plain notice for a row that kept
+    /// changing, the error as it is otherwise.
+    pub(crate) fn into_event(self) -> TuiEvent {
+        match self {
+            Self::RowKeptChanging(line) => TuiEvent::Notice(line),
+            Self::Failed(error) => TuiEvent::Error(error),
+        }
+    }
+}
+
+/// How many stops one press of `s` on an agent's row sends at most. The
+/// row moves on with every step the agent takes, and a stop sent with the
+/// row as it was read a moment before is refused as stale.
+const SUBAGENT_STOP_TRIES: usize = 4;
+
+/// What one try at stopping a subagent came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentStopTry {
+    /// The runtime took the stop.
+    Taken,
+    /// Refused: the task had changed since it was read.
+    Stale,
+    /// Read again, the task has already ended: there is nothing to stop.
+    AlreadyEnded,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TaskStopDisposition {
+    Stopping,
+    AlreadyEnded,
+}
+
+impl TaskStopDisposition {
+    pub(crate) fn notice(&self, label: &str) -> String {
+        match self {
+            Self::Stopping => format!("Stopping {label}."),
+            Self::AlreadyEnded => format!("{label} had already finished."),
+        }
+    }
+}
+
+pub(crate) type TaskStopResult = (SurfaceProjectionState, TaskStopDisposition);
+
+/// Makes tries at stopping a subagent, each by `try_stop`, until one is
+/// not refused as stale, at most `SUBAGENT_STOP_TRIES`. Any other refusal
+/// is `try_stop`'s `Err` and ends the tries as it is. `label` names the
+/// agent in the line shown when every try was refused as stale.
+fn stop_subagent_until_not_stale(
+    label: impl FnOnce() -> String,
+    mut try_stop: impl FnMut() -> Result<SubagentStopTry, String>,
+) -> Result<TaskStopDisposition, TaskStopError> {
+    for _ in 0..SUBAGENT_STOP_TRIES {
+        match try_stop()? {
+            SubagentStopTry::Taken => return Ok(TaskStopDisposition::Stopping),
+            SubagentStopTry::AlreadyEnded => return Ok(TaskStopDisposition::AlreadyEnded),
+            SubagentStopTry::Stale => {}
+        }
+    }
+    Err(TaskStopError::RowKeptChanging(format!(
+        "Could not stop {}. Press s again.",
+        label()
+    )))
+}
+
+/// The fence a stop of `task` is sent with: the task as it was read.
+fn task_stop_fence(task: &orca_runtime::surface::SurfaceTask) -> SurfaceTaskFence {
+    SurfaceTaskFence {
+        task_id: task.task_id.clone(),
+        task_revision: task.revision,
+        background_owner: task.background_fence.clone(),
+    }
+}
+
+fn attach_for_task_stop(
+    surface: &RuntimeSurfaceHandle,
+) -> Result<orca_runtime::surface::FreshSurfaceAttachment, String> {
+    match surface.attach_fresh(FreshAttachRequest {
         request_id: SurfaceRequestId::new(),
         role: SurfaceAttachmentRole::Tui,
         requested_capabilities: BTreeSet::from([
@@ -674,27 +802,32 @@ pub(crate) fn stop_task(
         ]),
         interaction_capabilities: BTreeSet::new(),
     }) {
-        AttachResult::FreshAttached { attachment } => attachment,
+        AttachResult::FreshAttached { attachment } => Ok(attachment),
         AttachResult::Denied { reason } => {
-            return Err(format!("typed TUI task-stop attachment denied: {reason:?}"));
+            Err(format!("typed TUI task-stop attachment denied: {reason:?}"))
         }
-        AttachResult::Unavailable { reason } => {
-            return Err(format!(
-                "typed TUI task-stop attachment unavailable: {reason:?}"
-            ));
-        }
+        AttachResult::Unavailable { reason } => Err(format!(
+            "typed TUI task-stop attachment unavailable: {reason:?}"
+        )),
         AttachResult::ThreadClosed { .. } => {
-            return Err("typed TUI task-stop thread is closed".to_string());
+            Err("typed TUI task-stop thread is closed".to_string())
         }
         AttachResult::CursorAttached { .. }
         | AttachResult::SnapshotRequired { .. }
-        | AttachResult::InvalidCursor { .. } => {
-            return Err(
-                "typed TUI task-stop attachment returned an invalid fresh-attach result"
-                    .to_string(),
-            );
-        }
-    };
+        | AttachResult::InvalidCursor { .. } => Err(
+            "typed TUI task-stop attachment returned an invalid fresh-attach result".to_string(),
+        ),
+    }
+}
+
+pub(crate) fn stop_task(
+    thread: &RuntimeSurfaceThreadHandle,
+    task_id: &str,
+    controller: &TuiSurfaceTaskControl,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<TaskStopResult, TaskStopError> {
+    let surface = thread.surface();
+    let attachment = attach_for_task_stop(&surface)?;
     let Some(task) = attachment
         .baseline
         .snapshot
@@ -703,7 +836,7 @@ pub(crate) fn stop_task(
         .find(|task| task.task_id.as_str() == task_id)
     else {
         detach(&surface, &attachment.client);
-        return Err(format!("surface task '{task_id}' not found"));
+        return Err(format!("surface task '{task_id}' not found").into());
     };
     if task.task_type == orca_runtime::surface::SurfaceTaskType::MainSession {
         let mut activation =
@@ -737,10 +870,11 @@ pub(crate) fn stop_task(
                 return Err(format!(
                     "typed TUI task stop deferred: request={:?} commit={:?}",
                     mutation.request_id, mutation.commit_id
-                ));
+                )
+                .into());
             }
             MutationReply::Uncommitted { mutation } => {
-                return Err(format!("typed TUI task stop did not commit: {mutation:?}"));
+                return Err(format!("typed TUI task stop did not commit: {mutation:?}").into());
             }
         }
         controller
@@ -765,44 +899,79 @@ pub(crate) fn stop_task(
             guard.terminal_observed();
         }
         let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
-        return Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot));
+        return Ok((
+            SurfaceProjectionState::from_surface_snapshot(&snapshot),
+            TaskStopDisposition::Stopping,
+        ));
     }
     if task.task_type == orca_runtime::surface::SurfaceTaskType::Subagent {
-        let result = attachment.client.task_control(
-            SurfaceRequestId::new(),
-            TaskControlAction::Stop {
-                fence: SurfaceTaskFence {
-                    task_id: task.task_id.clone(),
-                    task_revision: task.revision,
-                    background_owner: task.background_fence.clone(),
-                },
-            },
-        );
-        detach(&surface, &attachment.client);
-        match result.map_err(|error| format!("typed TUI subagent stop failed: {error:?}"))? {
-            MutationReply::Committed { .. } => {}
-            MutationReply::Deferred { mutation, .. } => {
-                return Err(format!(
+        if task_has_ended(task.status) {
+            detach(&surface, &attachment.client);
+            return Ok((
+                SurfaceProjectionState::from_surface_snapshot(&attachment.baseline.snapshot),
+                TaskStopDisposition::AlreadyEnded,
+            ));
+        }
+        // An agent's row moves on with every step the agent takes, so a stop
+        // sent with the row as it was read can be refused as stale: each try
+        // after the first reads the task again, from a fresh attachment.
+        let mut first = Some((attachment.client.clone(), task_stop_fence(task)));
+        let label = || {
+            let projection =
+                SurfaceProjectionState::from_surface_snapshot(&attachment.baseline.snapshot);
+            crate::background_tasks::task_notice_label(&projection.workflow_tasks, task_id)
+        };
+        let disposition = stop_subagent_until_not_stale(label, || {
+            let again;
+            let (client, fence) = match first.take() {
+                Some(first) => first,
+                None => {
+                    again = attach_for_task_stop(&surface)?;
+                    let Some(task) = again
+                        .baseline
+                        .snapshot
+                        .tasks
+                        .iter()
+                        .find(|task| task.task_id.as_str() == task_id)
+                    else {
+                        detach(&surface, &again.client);
+                        return Err(format!("surface task '{task_id}' not found"));
+                    };
+                    if task_has_ended(task.status) {
+                        detach(&surface, &again.client);
+                        return Ok(SubagentStopTry::AlreadyEnded);
+                    }
+                    (again.client.clone(), task_stop_fence(task))
+                }
+            };
+            let result =
+                client.task_control(SurfaceRequestId::new(), TaskControlAction::Stop { fence });
+            detach(&surface, &client);
+            match result.map_err(|error| format!("typed TUI subagent stop failed: {error:?}"))? {
+                MutationReply::Committed { .. } => Ok(SubagentStopTry::Taken),
+                MutationReply::Deferred { mutation, .. } => Err(format!(
                     "typed TUI subagent stop deferred: request={:?} commit={:?}",
                     mutation.request_id, mutation.commit_id
-                ));
-            }
-            MutationReply::Uncommitted { mutation } => {
-                return Err(format!(
+                )),
+                MutationReply::Uncommitted {
+                    mutation: UncommittedMutation::Stale { .. },
+                } => Ok(SubagentStopTry::Stale),
+                MutationReply::Uncommitted { mutation } => Err(format!(
                     "typed TUI subagent stop did not commit: {mutation:?}"
-                ));
+                )),
             }
-        }
+        })?;
         let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
-        return Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot));
+        return Ok((
+            SurfaceProjectionState::from_surface_snapshot(&snapshot),
+            disposition,
+        ));
     }
     if task.task_type != orca_runtime::surface::SurfaceTaskType::Workflow
         && task.workflow_run_id.is_none()
     {
         detach(&surface, &attachment.client);
-        return Err(format!(
-            "surface task '{task_id}' has no runtime-owned control"
-        ));
+        return Err(format!("surface task '{task_id}' has no runtime-owned control").into());
     }
     let workflow = task
         .workflow_run_id
@@ -823,9 +992,7 @@ pub(crate) fn stop_task(
         ),
         None => {
             detach(&surface, &attachment.client);
-            return Err(format!(
-                "surface task '{task_id}' has no runtime-owned workflow"
-            ));
+            return Err(format!("surface task '{task_id}' has no runtime-owned workflow").into());
         }
     };
     detach(&surface, &attachment.client);
@@ -836,15 +1003,33 @@ pub(crate) fn stop_task(
             return Err(format!(
                 "typed TUI task stop deferred: request={:?} commit={:?}",
                 mutation.request_id, mutation.commit_id
-            ));
+            )
+            .into());
         }
         MutationReply::Uncommitted { mutation } => {
-            return Err(format!("typed TUI task stop did not commit: {mutation:?}"));
+            return Err(format!("typed TUI task stop did not commit: {mutation:?}").into());
         }
     }
 
     let snapshot = read_snapshot(thread).map_err(|error| error.to_string())?;
-    Ok(SurfaceProjectionState::from_surface_snapshot(&snapshot))
+    Ok((
+        SurfaceProjectionState::from_surface_snapshot(&snapshot),
+        TaskStopDisposition::Stopping,
+    ))
+}
+
+/// Whether a task in this status is over: a stop of it has nothing left to
+/// stop. The statuses the runtime answers "already terminal" for.
+fn task_has_ended(status: orca_runtime::surface::SurfaceTaskStatus) -> bool {
+    use orca_runtime::surface::SurfaceTaskStatus;
+    matches!(
+        status,
+        SurfaceTaskStatus::Stopped
+            | SurfaceTaskStatus::Completed
+            | SurfaceTaskStatus::Failed
+            | SurfaceTaskStatus::Blocked
+            | SurfaceTaskStatus::Cancelled
+    )
 }
 
 pub(crate) fn continue_subagent(
@@ -2097,7 +2282,8 @@ fn run_typed_surface(
         ));
     }
     for event in projection.hydrate_open_streams() {
-        let _ = event_tx.send(event);
+        let _ = event_tx
+            .send(event.at_surface_cursor(controller.view().is_some(), projection.cursor()));
     }
     let mut input_blocks = vec![SurfaceInputRequestBlock::Text {
         text: orca_runtime::surface::DisplayText::new(request.prompt()),
@@ -2255,7 +2441,8 @@ fn control_recovered_operation(
     let mut projection = TuiSurfaceProjection::from_surface_snapshot(&attachment.baseline.snapshot);
     projection.focus_operation(operation_id.clone());
     for event in projection.hydrate_open_streams() {
-        let _ = event_tx.send(event);
+        let _ = event_tx
+            .send(event.at_surface_cursor(controller.view().is_some(), projection.cursor()));
     }
 
     match control {
@@ -2399,7 +2586,36 @@ struct TerminalWaiterGuard {
     waiter: Option<std::thread::JoinHandle<()>>,
 }
 
+type TerminalWaitReceiver =
+    mpsc::Receiver<Result<WaitOperationTerminalResult, SurfaceClientCommandError>>;
+
 impl TerminalWaiterGuard {
+    fn start(
+        client: &RuntimeSurfaceClientHandle,
+        operation: &SurfaceOperationId,
+    ) -> (Self, TerminalWaitReceiver) {
+        let (sender, receiver) = mpsc::bounded(1);
+        let cancellation = OptionalProcessLocalCancel::new();
+        let caller = cancellation.clone();
+        let client = client.clone();
+        let operation = operation.clone();
+        let waiter = std::thread::spawn(move || {
+            let result = client.wait_operation_terminal_with_cancel(
+                SurfaceRequestId::new(),
+                operation,
+                caller,
+            );
+            let _ = sender.send(result);
+        });
+        (
+            Self {
+                cancellation,
+                waiter: Some(waiter),
+            },
+            receiver,
+        )
+    }
+
     fn cancel_and_join(&mut self) {
         self.cancellation.cancel();
         self.join();
@@ -2415,6 +2631,100 @@ impl TerminalWaiterGuard {
 impl Drop for TerminalWaiterGuard {
     fn drop(&mut self) {
         self.cancel_and_join();
+    }
+}
+
+struct OperationDeliveryGuard<'sender> {
+    sender: &'sender mpsc::Sender<TuiEvent>,
+    operation: SurfaceOperationId,
+    routed: bool,
+    release_at: Option<orca_runtime::surface::SurfaceCursor>,
+    reader: Option<crate::operation_controller::MainReader>,
+}
+
+impl<'sender> OperationDeliveryGuard<'sender> {
+    fn new(
+        sender: &'sender mpsc::Sender<TuiEvent>,
+        operation: &SurfaceOperationId,
+        routed: bool,
+    ) -> Self {
+        Self {
+            sender,
+            operation: operation.clone(),
+            routed,
+            release_at: None,
+            reader: None,
+        }
+    }
+
+    fn for_reader(
+        sender: &'sender mpsc::Sender<TuiEvent>,
+        operation: &SurfaceOperationId,
+        controller: &TuiSurfaceTaskControl,
+    ) -> Self {
+        let mut guard = Self::new(sender, operation, controller.view().is_some());
+        guard.reader = controller.main_reader(operation);
+        if let Some(reader) = &guard.reader {
+            reader.begin();
+        }
+        guard
+    }
+
+    fn send(&mut self, event: TuiEvent, cursor: &orca_runtime::surface::SurfaceCursor) -> bool {
+        let terminal = matches!(
+            event,
+            TuiEvent::SessionCompleted { .. } | TuiEvent::TerminalRecoveryNeeded(_)
+        );
+        let event = event.at_operation_cursor(self.routed, cursor, &self.operation);
+        let owned = matches!(&event, TuiEvent::SurfaceDelivery(delivery) if delivery.2.is_some());
+        if terminal && let Some(reader) = self.reader.take() {
+            reader.close();
+        }
+        if self.sender.send(event).is_err() {
+            return false;
+        }
+        if terminal {
+            self.release_at = None;
+        } else if owned || self.release_at.is_some() {
+            self.release_at = Some(cursor.clone());
+        }
+        true
+    }
+
+    fn failed(&mut self, cursor: &orca_runtime::surface::SurfaceCursor) {
+        self.send(
+            TuiEvent::SessionCompleted {
+                status: "failed".into(),
+            },
+            cursor,
+        );
+    }
+
+    fn error(&mut self, message: String, cursor: &orca_runtime::surface::SurfaceCursor) {
+        let event = if self.routed {
+            TuiEvent::Diagnostic(crate::diagnostics::TuiDiagnostic::from_message(
+                crate::diagnostics::DiagnosticContext::Runtime,
+                message,
+            ))
+        } else {
+            TuiEvent::Error(message)
+        };
+        self.send(event, cursor);
+    }
+}
+
+impl Drop for OperationDeliveryGuard<'_> {
+    fn drop(&mut self) {
+        let seeded = self.reader.take().and_then(|reader| reader.close());
+        if let Some(cursor) = self.release_at.take().or(seeded) {
+            let _ = self
+                .sender
+                .send(TuiEvent::OperationReleased.at_operation_cursor(
+                    true,
+                    &cursor,
+                    &self.operation,
+                ));
+        }
     }
 }
 
@@ -2436,29 +2746,14 @@ fn drain_operation_with_boundary(
     let _ = event_tx.send(TuiEvent::OperationActive {
         token: controller.submit_token(),
     });
-    let (wait_tx, wait_rx) = mpsc::bounded(1);
-    let waiter_cancellation = OptionalProcessLocalCancel::new();
-    let waiter_cancellation_for_thread = waiter_cancellation.clone();
-    let waiter_client = client.clone();
-    let waiter_operation_id = operation_id.clone();
-    let waiter = std::thread::spawn(move || {
-        let result = waiter_client.wait_operation_terminal_with_cancel(
-            SurfaceRequestId::new(),
-            waiter_operation_id,
-            waiter_cancellation_for_thread,
-        );
-        let _ = wait_tx.send(result);
-    });
-    let mut waiter_guard = TerminalWaiterGuard {
-        cancellation: waiter_cancellation,
-        waiter: Some(waiter),
-    };
+    let (mut waiter_guard, wait_rx) = TerminalWaiterGuard::start(client, operation_id);
     let mut terminal_seen = false;
     let mut sealed = false;
     let mut terminal_receipt = None;
     let mut failure: Option<io::Error> = None;
     let mut projected_terminal_event = None;
     let mut projected_compacted_event = None;
+    let mut delivery = OperationDeliveryGuard::for_reader(event_tx, operation_id, controller);
     while (!terminal_seen || terminal_receipt.is_none()) && !sealed {
         if projection.active_generation_fence(operation_id).is_some()
             && controller.begin_surface_background_handoff(operation_id)
@@ -2526,6 +2821,21 @@ fn drain_operation_with_boundary(
                     )));
                     sealed = true;
                 }
+                // The runtime keeps the turn in the foreground while it
+                // runs subagents: the person reads why, and the turn goes on.
+                MutationReply::Uncommitted {
+                    mutation:
+                        UncommittedMutation::Invalid {
+                            target: Some(MutationTarget::Generation { .. }),
+                            error,
+                            ..
+                        },
+                } if error.error().code == SurfaceMutationErrorCode::IllegalState => {
+                    controller.rollback_surface_background_handoff(operation_id);
+                    let _ = event_tx.send(TuiEvent::TurnKeptInForeground(
+                        error.error().message.as_str().to_string(),
+                    ));
+                }
                 MutationReply::Uncommitted { mutation } => {
                     controller.rollback_surface_background_handoff(operation_id);
                     failure = Some(io::Error::other(format!(
@@ -2535,10 +2845,11 @@ fn drain_operation_with_boundary(
                 }
             }
         }
-        let mut next_item = subscription.try_recv();
-        if next_item.is_none() && !sealed {
-            next_item = subscription.recv_timeout(Duration::from_millis(25));
-        }
+        let mut next_item = if terminal_seen || sealed {
+            None
+        } else {
+            subscription.recv_timeout(Duration::from_millis(25))
+        };
         while let Some(item) = next_item {
             match item {
                 SurfaceSubscriptionItem::Batch { batch } => {
@@ -2549,18 +2860,7 @@ fn drain_operation_with_boundary(
                                 if &record.operation_id == operation_id
                         )
                     });
-                    for envelope in batch.events.as_slice() {
-                        if let SurfaceEvent::Interaction(
-                            orca_runtime::surface::InteractionPatch::Requested { interaction },
-                        ) = &envelope.event
-                        {
-                            if let Some(event) =
-                                controller.register_surface_interaction(interaction)
-                            {
-                                let _ = event_tx.send(event);
-                            }
-                        }
-                    }
+                    send_operation_requests(&batch, operation_id, controller, &mut delivery);
                     match projection.project_typed_batch(&batch) {
                         Ok(events) => {
                             for event in events {
@@ -2571,7 +2871,7 @@ fn drain_operation_with_boundary(
                                 {
                                     projected_compacted_event = Some(event);
                                 } else {
-                                    let _ = event_tx.send(event);
+                                    delivery.send(event, &batch.cursor_after);
                                 }
                             }
                         }
@@ -2602,12 +2902,17 @@ fn drain_operation_with_boundary(
                 }
                 SurfaceSubscriptionItem::Sealed { .. } => sealed = true,
             }
-            if sealed {
+            if sealed || terminal_seen {
                 break;
             }
             next_item = subscription.try_recv();
         }
-        if let Ok(result) = wait_rx.try_recv() {
+        let receipt = if terminal_seen {
+            wait_rx.recv_timeout(Duration::from_millis(25)).ok()
+        } else {
+            wait_rx.try_recv().ok()
+        };
+        if let Some(result) = receipt {
             match result {
                 Ok(WaitOperationTerminalResult::Terminal { value }) => {
                     if &value.operation_id == operation_id {
@@ -2657,13 +2962,13 @@ fn drain_operation_with_boundary(
         );
         controller.remember_surface_terminal_delivery(operation_id.clone());
         if let Some(compacted) = projected_compacted_event.take() {
-            let _ = event_tx.send(compacted);
+            delivery.send(compacted, &terminal.cursor);
         }
         if let Some(terminal_event) = projected_terminal_event {
-            let _ = event_tx.send(terminal_event);
+            delivery.send(terminal_event, &terminal.cursor);
         } else {
             for event in operation_terminal_events(&terminal.terminal) {
-                let _ = event_tx.send(event);
+                delivery.send(event, &terminal.cursor);
             }
         }
         waiter_guard.join();
@@ -2685,6 +2990,280 @@ fn drain_operation_with_boundary(
     Ok(TuiHostedOperationOutcome::Turn {
         status: status.to_string(),
     })
+}
+
+fn send_operation_requests(
+    batch: &orca_runtime::surface::SurfaceCommitBatch,
+    operation: &SurfaceOperationId,
+    controller: &TuiSurfaceTaskControl,
+    delivery: &mut OperationDeliveryGuard<'_>,
+) {
+    use orca_runtime::surface::InteractionPatch;
+    for envelope in batch.events.as_slice() {
+        if let SurfaceEvent::Interaction(InteractionPatch::Requested { interaction }) =
+            &envelope.event
+            && &interaction.fence.operation_id == operation
+            && let Some(event) = controller.register_surface_interaction(interaction)
+        {
+            delivery.send(event, &batch.cursor_after);
+        } else if delivery.routed
+            && let SurfaceEvent::Interaction(patch) = &envelope.event
+            && let Some(settlement) = settlement_event(patch)
+        {
+            delivery.send(settlement, &batch.cursor_after);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn forwarded_transfer_for_test(
+    background: &orca_runtime::surface::SurfaceBackgroundOperation,
+    patch: orca_runtime::surface::InteractionPatch,
+    control: &TuiSurfaceTaskControl,
+) -> TuiEvent {
+    use orca_runtime::surface::*;
+    let before = background.transferred_at.clone();
+    let CursorSourceRevision::Recorded { durable_revision } = before.source_revision else {
+        panic!("expected recorded transfer")
+    };
+    let revision = DurableRevision::try_new(durable_revision.get() + 1).unwrap();
+    let class = CommitClass::Recorded {
+        thread_owner_epoch: background.fence.operation_fence.thread_owner_epoch,
+        durable_revision: revision,
+        commit_id: SurfaceCommitId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+    };
+    let envelope = SurfaceEventEnvelope {
+        ordinal: 0,
+        event_id: SurfaceEventId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+        commit_class: class.clone(),
+        scope: SurfaceScope::Background {
+            fence: background.fence.clone(),
+        },
+        event: SurfaceEvent::Interaction(patch),
+    };
+    let mut batch = SurfaceCommitBatch {
+        cursor_after: SurfaceCursor {
+            next_seq: SequenceNumber::new(before.next_seq.get() + 1),
+            source_revision: CursorSourceRevision::Recorded {
+                durable_revision: revision,
+            },
+            ..before.clone()
+        },
+        cursor_before: before,
+        commit_class: class,
+        event_count: 1,
+        batch_digest: Sha256Digest::new([0; 32]),
+        events: NonEmptyVec::try_new(vec![envelope]).unwrap(),
+    };
+    batch.batch_digest = canonical_batch_digest(&batch);
+    let (sender, events) = mpsc::unbounded();
+    let mut delivery = OperationDeliveryGuard::new(&sender, &background.operation_id, true);
+    send_operation_requests(&batch, &background.operation_id, control, &mut delivery);
+    assert_eq!(events.len(), 1);
+    events.try_recv().unwrap().into_test_payload()
+}
+
+fn settlement_event(patch: &orca_runtime::surface::InteractionPatch) -> Option<TuiEvent> {
+    use orca_runtime::surface::InteractionPatch;
+    match patch {
+        InteractionPatch::Resolved { interaction_id, .. }
+        | InteractionPatch::Cancelled { interaction_id, .. }
+        | InteractionPatch::Expired { interaction_id, .. }
+        | InteractionPatch::Transferred { interaction_id, .. } => Some(
+            TuiEvent::SurfaceRequestSettled(format!("{interaction_id:?}")),
+        ),
+        _ => None,
+    }
+}
+
+pub(crate) fn follow_queue_operation(
+    follow: orca_runtime::runtime_host::QueueSurfaceFollow,
+    owner: &orca_runtime::runtime_host::RuntimeThreadHandle,
+    controller: &TuiSurfaceTaskControl,
+    sender: &mpsc::Sender<TuiEvent>,
+) -> io::Result<()> {
+    follow_queue_operation_with_read(follow, owner, controller, sender, read_snapshot)
+}
+
+pub(crate) fn follow_queue_operation_with_read(
+    mut follow: orca_runtime::runtime_host::QueueSurfaceFollow,
+    owner: &orca_runtime::runtime_host::RuntimeThreadHandle,
+    controller: &TuiSurfaceTaskControl,
+    sender: &mpsc::Sender<TuiEvent>,
+    final_snapshot: impl FnOnce(&RuntimeSurfaceThreadHandle) -> io::Result<SurfaceSnapshot>,
+) -> io::Result<()> {
+    struct Binding<'control>(&'control TuiSurfaceTaskControl, SurfaceOperationId);
+    impl Drop for Binding<'_> {
+        fn drop(&mut self) {
+            self.0.unbind_followed_surface(&self.1);
+        }
+    }
+    controller.bind_followed_surface(follow.client.clone(), follow.operation.clone());
+    let _binding = Binding(controller, follow.operation.clone());
+    let mut projection = TuiSurfaceProjection::from_surface_snapshot(&follow.baseline.snapshot);
+    projection.focus_operation(follow.operation.clone());
+    let mut delivery = OperationDeliveryGuard::for_reader(sender, &follow.operation, controller);
+    while !controller.is_shutdown() {
+        let Some(item) = follow.subscription.recv_timeout(Duration::from_millis(25)) else {
+            if let Ok(failure) = follow.terminal_failure.try_recv() {
+                let message = terminal_wait_failure_message(&failure);
+                controller.note_follow_recovery(follow.operation.clone(), message);
+                delivery.send(
+                    TuiEvent::TerminalRecoveryNeeded(message.into()),
+                    projection.cursor(),
+                );
+                break;
+            }
+            continue;
+        };
+        let batch = match item {
+            SurfaceSubscriptionItem::Batch { batch } => batch,
+            SurfaceSubscriptionItem::ProviderRetry {
+                operation_id,
+                retry,
+            } => {
+                if let Some(event) = projection.project_provider_retry(&operation_id, retry) {
+                    let _ = sender.send(event);
+                }
+                continue;
+            }
+            SurfaceSubscriptionItem::Gap { required } => {
+                let message = format!("typed TUI subscription gap requires {:?}", required.reason);
+                delivery.error(message, &required.head);
+                if owner
+                    .interrupt_followed_operation(follow.operation.clone())
+                    .is_err()
+                {
+                    delivery.failed(&required.head);
+                    break;
+                }
+                let thread = owner.typed_surface();
+                let receipt = with_snapshot_attachment(&thread, |attachment| {
+                    let (_waiter, receipt) =
+                        TerminalWaiterGuard::start(&attachment.client, &follow.operation);
+                    while !controller.is_shutdown() {
+                        match receipt.recv_timeout(Duration::from_millis(25)) {
+                            Ok(result) => {
+                                return result.map(Some).map_err(|error| {
+                                    io::Error::other(format!("queued terminal read: {error:?}"))
+                                });
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                return Err(io::Error::other(
+                                    "queued terminal reader disconnected",
+                                ));
+                            }
+                        }
+                    }
+                    Ok(None)
+                });
+                let receipt = match receipt {
+                    Ok(Some(receipt)) => receipt,
+                    Ok(None) => break,
+                    Err(_) => {
+                        delivery.failed(&required.head);
+                        break;
+                    }
+                };
+                let terminal = match receipt {
+                    WaitOperationTerminalResult::Terminal { value } => value,
+                    failure @ (WaitOperationTerminalResult::TerminalCommitFailure { .. }
+                    | WaitOperationTerminalResult::TerminalProjectionFailure {
+                        ..
+                    }) => {
+                        let message = terminal_wait_failure_message(&failure);
+                        controller.note_follow_recovery(follow.operation.clone(), message);
+                        delivery.send(
+                            TuiEvent::TerminalRecoveryNeeded(message.into()),
+                            &required.head,
+                        );
+                        break;
+                    }
+                    _ => {
+                        delivery.failed(&required.head);
+                        break;
+                    }
+                };
+                match final_snapshot(&thread).and_then(|snapshot| {
+                    projection = TuiSurfaceProjection::from_surface_snapshot(&snapshot);
+                    projection.focus_operation(follow.operation.clone());
+                    projection
+                        .hydrate_after_delivery_watermark(
+                            &follow.operation,
+                            &controller.surface_delivery_watermark(&follow.operation),
+                        )
+                        .map_err(|error| io::Error::other(format!("{error:?}")))
+                }) {
+                    Ok(events) => {
+                        for event in events {
+                            delivery.send(event, &terminal.cursor);
+                        }
+                        controller.remember_surface_delivery_watermark(
+                            follow.operation.clone(),
+                            projection.delivery_watermark(&follow.operation),
+                        );
+                    }
+                    Err(error) => delivery.error(
+                        format!("queued terminal snapshot reconciliation failed: {error}"),
+                        &terminal.cursor,
+                    ),
+                }
+                for event in operation_terminal_events(&terminal.terminal) {
+                    delivery.send(event, &terminal.cursor);
+                }
+                controller.remember_surface_terminal_delivery(follow.operation);
+                break;
+            }
+            SurfaceSubscriptionItem::Sealed { .. } => break,
+        };
+        let events = projection.project_typed_batch(&batch).map_err(|error| {
+            io::Error::other(format!("queued operation projection failed: {error:?}"))
+        })?;
+        send_operation_requests(&batch, &follow.operation, controller, &mut delivery);
+        let start = batch
+            .events
+            .as_slice()
+            .iter()
+            .find_map(|envelope| match &envelope.event {
+                SurfaceEvent::Operation(OperationPatch::AgentLoopTurnStarted { turn })
+                    if turn.fence.operation_id == follow.operation =>
+                {
+                    Some(&turn.turn_id)
+                }
+                _ => None,
+            });
+        let terminal = batch.events.as_slice().iter().any(|envelope| matches!(&envelope.event, SurfaceEvent::Operation(OperationPatch::Terminal { record }) if record.operation_id == follow.operation));
+        for event in events {
+            let event = match (&event, start) {
+                (TuiEvent::TurnStarted { .. }, Some(id)) => TuiEvent::RuntimeTurnStarted {
+                    turn_id: id.as_str().to_owned(),
+                },
+                _ => event,
+            };
+            if !delivery.send(event, &batch.cursor_after) {
+                return Ok(());
+            }
+        }
+        controller.remember_surface_delivery_watermark(
+            follow.operation.clone(),
+            projection.delivery_watermark(&follow.operation),
+        );
+        if terminal {
+            controller.remember_surface_terminal_delivery(follow.operation);
+            break;
+        }
+        if projection.operation_is_runtime_backgrounded(&follow.operation) {
+            spawn_background_presentation(
+                &owner.surface(),
+                follow.operation,
+                controller,
+                sender.clone(),
+            )?;
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn spawn_background_presentation(
@@ -2933,7 +3512,7 @@ fn background_presentation_stopped(
     cancellation.is_cancelled() || controller.is_shutdown()
 }
 
-fn snapshot_operation_is_terminal(
+pub(crate) fn snapshot_operation_is_terminal(
     snapshot: &SurfaceSnapshot,
     operation_id: &SurfaceOperationId,
 ) -> bool {
@@ -2942,7 +3521,14 @@ fn snapshot_operation_is_terminal(
         .iter()
         .chain(snapshot.queued_operations.iter())
         .chain(snapshot.operation_history.iter())
-        .any(|operation| &operation.operation_id == operation_id && operation.terminal.is_some())
+        .any(|operation| {
+            &operation.operation_id == operation_id
+                && (operation.terminal.is_some()
+                    || matches!(
+                        operation.phase,
+                        orca_runtime::surface::OperationPhase::Terminal
+                    ))
+        })
 }
 
 fn terminal_wait_failure_message(result: &WaitOperationTerminalResult) -> &'static str {
@@ -2997,6 +3583,47 @@ mod tests {
 
     const TEST_SURFACE_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(10);
     const TEST_SURFACE_TERMINAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn fix5_reader_releases_only_an_unclosed_owned_delivery_at_its_last_cursor() {
+        let operation =
+            SurfaceOperationId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap();
+        let start = crate::surface_projection::test_surface_cursor(2);
+        let last = crate::surface_projection::test_surface_cursor(3);
+        for (owned, closed, releases) in [(true, false, 1), (true, true, 0), (false, false, 0)] {
+            let (sender, events) = mpsc::unbounded();
+            let mut delivery = OperationDeliveryGuard::new(&sender, &operation, true);
+            if owned {
+                assert!(delivery.send(
+                    TuiEvent::RuntimeTurnStarted {
+                        turn_id: "p".into()
+                    },
+                    &start
+                ));
+            }
+            assert!(delivery.send(TuiEvent::MessageDelta("text".into()), &last));
+            if closed {
+                assert!(delivery.send(
+                    TuiEvent::SessionCompleted {
+                        status: "success".into()
+                    },
+                    &last
+                ));
+            }
+            drop(delivery);
+            let mut seen = 0;
+            for event in events.try_iter() {
+                if let TuiEvent::SurfaceDelivery(item) = event
+                    && matches!(item.1, TuiEvent::OperationReleased)
+                {
+                    assert_eq!(item.0, last);
+                    assert_eq!(item.2.as_ref(), Some(&operation));
+                    seen += 1;
+                }
+            }
+            assert_eq!(seen, releases);
+        }
+    }
 
     fn assert_surface_active(controller: &TuiSurfaceTaskControl, context: &str) {
         assert!(
@@ -4185,6 +4812,80 @@ mod tests {
         }
     }
 
+    /// Runs the tries of one stop against scripted replies, one reply per
+    /// try; a try past the script is a failure of the test.
+    fn stop_with_replies(
+        replies: Vec<Result<SubagentStopTry, String>>,
+    ) -> (Result<TaskStopDisposition, TaskStopError>, usize) {
+        let mut replies = replies.into_iter();
+        let mut tries = 0;
+        let result = stop_subagent_until_not_stale(
+            || "\"alpha writes essay\"".to_string(),
+            || {
+                tries += 1;
+                replies.next().expect("no try past the scripted replies")
+            },
+        );
+        (result, tries)
+    }
+
+    #[test]
+    fn a_stop_refused_because_the_row_moved_is_sent_again_and_taken() {
+        // Seen in a terminal: `s` pressed as the agent's row was first
+        // listed carried the row's first revision, and the runtime, which
+        // had already bound the agent's thread, refused it as stale.
+        let (result, tries) =
+            stop_with_replies(vec![Ok(SubagentStopTry::Stale), Ok(SubagentStopTry::Taken)]);
+        assert_eq!(result, Ok(TaskStopDisposition::Stopping));
+        assert_eq!(tries, 2, "the stop is sent once more, and taken");
+    }
+
+    #[test]
+    fn a_stop_refused_as_stale_four_times_says_to_press_s_again() {
+        let (result, tries) = stop_with_replies(vec![Ok(SubagentStopTry::Stale); 4]);
+        assert_eq!(tries, 4, "no more than four tries for one press");
+        let error = result.expect_err("four stale refusals are not a stop");
+        assert_eq!(
+            error,
+            TaskStopError::RowKeptChanging(
+                "Could not stop \"alpha writes essay\". Press s again.".to_string()
+            )
+        );
+        assert!(
+            matches!(
+                error.into_event(),
+                TuiEvent::Notice(line)
+                    if line == "Could not stop \"alpha writes essay\". Press s again."
+            ),
+            "a plain line, not the runtime's error"
+        );
+    }
+
+    #[test]
+    fn a_stop_refused_as_stale_of_an_agent_that_has_since_ended_is_done() {
+        let (result, tries) = stop_with_replies(vec![
+            Ok(SubagentStopTry::Stale),
+            Ok(SubagentStopTry::AlreadyEnded),
+        ]);
+        assert_eq!(result, Ok(TaskStopDisposition::AlreadyEnded));
+        assert_eq!(tries, 2, "and nothing is sent once it has");
+    }
+
+    #[test]
+    fn a_stop_refused_for_another_reason_is_shown_as_it_is() {
+        let refusal = "typed TUI subagent stop did not commit: Invalid".to_string();
+        let (result, tries) = stop_with_replies(vec![Err(refusal.clone())]);
+        assert_eq!(tries, 1, "only a stale refusal is sent again");
+        let error = result.expect_err("the refusal stands");
+        assert_eq!(error, TaskStopError::Failed(refusal.clone()));
+        assert!(matches!(error.into_event(), TuiEvent::Error(message) if message == refusal));
+
+        let (result, tries) =
+            stop_with_replies(vec![Ok(SubagentStopTry::Stale), Err(refusal.clone())]);
+        assert_eq!(tries, 2);
+        assert_eq!(result, Err(TaskStopError::Failed(refusal)));
+    }
+
     #[test]
     fn launched_workflow_monitor_receives_provider_retry_and_clear() {
         use std::io::{Read, Write};
@@ -4363,8 +5064,10 @@ mod tests {
         };
 
         let controller = TuiSurfaceTaskControl::isolated_for_test();
-        let projection = stop_task(&thread.typed_surface(), &task_id, &controller, &event_tx)
-            .expect("typed workflow stop");
+        let (projection, disposition) =
+            stop_task(&thread.typed_surface(), &task_id, &controller, &event_tx)
+                .expect("typed workflow stop");
+        assert_eq!(disposition, TaskStopDisposition::Stopping);
         assert!(
             projection.workflow_tasks.iter().any(|task| {
                 task.id == task_id
@@ -4612,6 +5315,124 @@ mod tests {
         }
     }
 
+    /// A turn the user ended by denying its approval reads the same when its
+    /// conversation is rebuilt from the snapshot, back from a side
+    /// conversation or an agent's view, as it did live: the notice, not
+    /// "Approval could not be requested". The runtime still ends the turn as
+    /// failed for want of an approval.
+    #[test]
+    fn a_turn_ended_by_a_denied_approval_is_rebuilt_with_the_notice() {
+        let _guard = crate::test_support::lock_process_env();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("ORCA_HOME");
+        unsafe { std::env::set_var("ORCA_HOME", home.path()) };
+        let mut config = crate::test_support::test_run_config();
+        config.cwd = Some(home.path().to_path_buf());
+        config.history_mode = HistoryMode::Record;
+        let host = RuntimeHost::start().expect("runtime host");
+        let thread = host
+            .start_thread(config.clone(), "typed TUI denial")
+            .expect("runtime thread");
+        let controller = TuiSurfaceTaskControl::isolated_for_test();
+        let (event_tx, event_rx) = mpsc::unbounded();
+        let worker_controller = controller.clone();
+        let worker_thread = thread.clone();
+        let worker_event_tx = event_tx.clone();
+        let (worker_result_tx, worker_result_rx) = mpsc::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let result = run_through_dispatch(
+                &worker_thread,
+                HostedTurnRequest::new("bash pwd"),
+                config,
+                &worker_controller,
+                &worker_event_tx,
+            );
+            let _ = worker_result_tx.send(result);
+        });
+        let key = loop {
+            match event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("approval event")
+            {
+                TuiEvent::ApprovalNeeded { key, .. } => break key,
+                _ => {}
+            }
+        };
+        assert!(
+            controller
+                .respond_surface_interaction(
+                    &key,
+                    &crate::protocol::TuiInteractionResponse::Approval(false)
+                )
+                .expect("typed denial")
+        );
+        let outcome = worker_result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|error| {
+                let pending_events = event_rx.try_iter().collect::<Vec<_>>();
+                panic!("typed denial worker timed out: {error}; events={pending_events:?}")
+            })
+            .expect("typed denial");
+        worker.join().expect("typed denial worker");
+        assert!(matches!(
+            outcome,
+            TuiHostedOperationOutcome::Turn { status } if status == "failed"
+        ));
+
+        let snapshot = crate::surface_actions::TuiSurfaceActions::new(thread.typed_surface())
+            .read_snapshot()
+            .expect("snapshot after the denial");
+        let (_, conversation) = crate::hosted_session::hosted_projection_batch_from_snapshot(
+            &thread,
+            &snapshot,
+            crate::hosted_session::HistoryTarget::Conversation,
+        );
+        let messages = conversation.messages;
+        assert!(
+            matches!(
+                messages.last(),
+                Some(crate::transcript_state::ChatMessage::System { text, .. })
+                    if text == "Denied. Tell Orca what to do instead."
+            ),
+            "{messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|message| matches!(
+                message,
+                crate::transcript_state::ChatMessage::Diagnostic(_)
+            )),
+            "{messages:?}"
+        );
+        // Nobody asked, or a headless run answered no for nobody: the turn
+        // still ends with its diagnostic.
+        let shows_approval_unavailable = |snapshot: &orca_runtime::surface::SurfaceSnapshot| {
+            matches!(
+                crate::surface_projection::latest_terminal_message(snapshot),
+                Some(crate::transcript_state::ChatMessage::Diagnostic(diagnostic))
+                    if diagnostic.code() == "permission.approval_unavailable"
+            )
+        };
+        let mut nobody_asked = snapshot.clone();
+        nobody_asked.interactions.clear();
+        assert!(shows_approval_unavailable(&nobody_asked));
+        let mut headless = snapshot.clone();
+        for operation in headless
+            .foreground_operation
+            .iter_mut()
+            .chain(headless.operation_history.iter_mut())
+        {
+            operation.intent.origin = orca_runtime::surface::OperationOrigin::Headless;
+        }
+        assert!(shows_approval_unavailable(&headless));
+
+        thread.shutdown().expect("thread shutdown");
+        host.shutdown().expect("host shutdown");
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("ORCA_HOME", previous) },
+            None => unsafe { std::env::remove_var("ORCA_HOME") },
+        }
+    }
+
     #[test]
     fn typed_ordinary_turn_routes_permission_through_runtime_surface() {
         let _guard = crate::test_support::lock_process_env();
@@ -4741,7 +5562,16 @@ mod tests {
         let config = config.clone();
         let controller = controller.clone();
         let event_tx = event_tx.clone();
-        let prompt = prompt.to_string();
+        // The tests check what the command did once its turn has ended. A
+        // shell call waits for its command 10 s by default and then returns
+        // with the command still running, and the turn ends: a `git commit`
+        // slower than that on a loaded machine made no commit yet when the
+        // test counted (seen at about 11 s). So the call waits the longest a
+        // call can (30 s); `assert_git_turn_succeeded` waits longer still.
+        let prompt = match prompt.strip_prefix("bash ") {
+            Some(command) => format!("bash_wait 30000 :: {command}"),
+            None => prompt.to_string(),
+        };
         std::thread::spawn(move || {
             let result = run_through_dispatch(
                 &thread,
@@ -4773,8 +5603,9 @@ mod tests {
     fn assert_git_turn_succeeded(
         result_rx: &mpsc::Receiver<io::Result<TuiHostedOperationOutcome>>,
     ) {
+        // Longer than the 30 s its shell call may wait (see `spawn_git_turn`).
         let outcome = result_rx
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(Duration::from_secs(60))
             .expect("git turn finished without a second prompt")
             .expect("git turn");
         assert!(matches!(

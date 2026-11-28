@@ -69,7 +69,7 @@ fn registry_outcome_settles(task_status: surface::SurfaceTaskStatus, outcome: Ta
     }
 }
 
-/// The task and subagent patches that settle a detached child the way the
+/// The task and subagent patches that settle a child the way the
 /// task registry recorded its end. The registry's result is the payload the
 /// worker handed its parent; the surface shows the text inside it.
 /// `continuation` is the registry's as it stands after the child ended,
@@ -77,43 +77,62 @@ fn registry_outcome_settles(task_status: surface::SurfaceTaskStatus, outcome: Ta
 fn settled_subagent_batch(
     task: &surface::SurfaceTask,
     subagent: &surface::SurfaceSubagent,
-    record: &crate::tasks::TaskRecord,
+    record: Option<&crate::tasks::TaskRecord>,
     continuation: Option<surface::SurfaceSubagentContinuation>,
     settled_at: surface::UnixMillis,
 ) -> io::Result<Vec<(surface::SurfaceScope, surface::SurfaceEvent)>> {
-    let (task_status, status, activity) = match record.status {
-        TaskStatus::Completed => (
-            surface::SurfaceTaskStatus::Completed,
-            surface::SurfaceSubagentTerminalStatus::Completed,
-            "completed",
-        ),
-        TaskStatus::Blocked => (
-            surface::SurfaceTaskStatus::Blocked,
-            surface::SurfaceSubagentTerminalStatus::Blocked,
-            "blocked",
-        ),
-        TaskStatus::Failed => (
-            surface::SurfaceTaskStatus::Failed,
-            surface::SurfaceSubagentTerminalStatus::Failed,
-            "failed",
-        ),
-        TaskStatus::Cancelled => (
-            surface::SurfaceTaskStatus::Cancelled,
-            surface::SurfaceSubagentTerminalStatus::Cancelled,
-            "cancelled",
-        ),
-        TaskStatus::Stopped => (
-            surface::SurfaceTaskStatus::Stopped,
-            surface::SurfaceSubagentTerminalStatus::Cancelled,
-            "stopped",
-        ),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "only a settled task can settle its subagent",
-            ));
-        }
-    };
+    let kept = matches!(
+        subagent.owner,
+        surface::SurfaceSubagentOwner::Generation { .. }
+    );
+    let person_stopped = kept
+        && record.is_some_and(|record| {
+            record.status == TaskStatus::Stopped
+                && record.result.as_deref() == Some(crate::tasks::SUBAGENT_STOPPED_BY_PERSON)
+        });
+    let (task_status, status, activity) =
+        match record.map_or(TaskStatus::Failed, |record| record.status) {
+            TaskStatus::Completed => (
+                surface::SurfaceTaskStatus::Completed,
+                surface::SurfaceSubagentTerminalStatus::Completed,
+                "completed",
+            ),
+            TaskStatus::Blocked => (
+                surface::SurfaceTaskStatus::Blocked,
+                surface::SurfaceSubagentTerminalStatus::Blocked,
+                "blocked",
+            ),
+            TaskStatus::Failed => (
+                surface::SurfaceTaskStatus::Failed,
+                surface::SurfaceSubagentTerminalStatus::Failed,
+                "failed",
+            ),
+            TaskStatus::Cancelled => (
+                surface::SurfaceTaskStatus::Cancelled,
+                surface::SurfaceSubagentTerminalStatus::Cancelled,
+                "cancelled",
+            ),
+            TaskStatus::Stopped if kept && !person_stopped => (
+                surface::SurfaceTaskStatus::Cancelled,
+                surface::SurfaceSubagentTerminalStatus::Cancelled,
+                "cancelled",
+            ),
+            TaskStatus::Stopped => (
+                surface::SurfaceTaskStatus::Stopped,
+                surface::SurfaceSubagentTerminalStatus::Cancelled,
+                if person_stopped {
+                    "stopped by user"
+                } else {
+                    "stopped"
+                },
+            ),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "only a settled task can settle its subagent",
+                ));
+            }
+        };
     let revision_overflow = || io::Error::new(io::ErrorKind::InvalidData, "revision overflow");
     let next_task_revision = task
         .revision
@@ -127,15 +146,23 @@ fn settled_subagent_batch(
         .checked_add(1)
         .and_then(|revision| surface::SubagentRevision::try_new(revision).ok())
         .ok_or_else(revision_overflow)?;
-    let text = |value: &Option<String>| {
-        value.as_deref().map(|value| {
-            surface::DisplayText::new(crate::subagent_async_worker::async_subagent_result_text(
-                value,
-            ))
-        })
+    let text = |value: &str| {
+        surface::DisplayText::new(crate::subagent_async_worker::async_subagent_result_text(
+            value,
+        ))
     };
-    let output = text(&record.result);
-    let error = text(&record.error);
+    let output = record.and_then(|record| record.result.as_deref()).map(text);
+    let error = match record {
+        Some(record) => record.error.as_deref().map(text),
+        None => Some(surface::DisplayText::new(
+            "subagent task record is missing; execution remains indeterminate",
+        )),
+    };
+    let (output, error) = if person_stopped {
+        (None, error_after_a_persons_stop(error))
+    } else {
+        (output, error)
+    };
     let mut activity_history = subagent.subagent_activity_history.clone();
     orca_core::task_types::append_subagent_activity_history(
         &mut activity_history,
@@ -157,7 +184,14 @@ fn settled_subagent_batch(
             }),
         ),
         (
-            surface::SurfaceScope::Thread,
+            match &subagent.owner {
+                surface::SurfaceSubagentOwner::Generation { fence } => {
+                    surface::SurfaceScope::Generation {
+                        fence: fence.clone(),
+                    }
+                }
+                surface::SurfaceSubagentOwner::DetachedTask { .. } => surface::SurfaceScope::Thread,
+            },
             surface::SurfaceEvent::Subagent(surface::SubagentPatch::Settled {
                 subagent_id: subagent.subagent_id.clone(),
                 expected_revision: subagent.revision,
@@ -167,7 +201,7 @@ fn settled_subagent_batch(
                 output,
                 error,
                 usage: record
-                    .usage
+                    .and_then(|record| record.usage)
                     .map(surface_usage_totals)
                     .or_else(|| subagent.usage.clone()),
                 subagent_activity_history: activity_history,
@@ -342,8 +376,15 @@ fn subagent_activity_projection(
             None,
             None,
         ),
-        SubagentActivityPayload::Completed { .. } => {
-            (surface::DisplayText::new("completed"), None, None)
+        SubagentActivityPayload::Completed { status, .. } => {
+            use surface::SurfaceSubagentTerminalStatus as End;
+            let word = match status {
+                End::Completed => "completed",
+                End::Failed => "failed",
+                End::Cancelled => "cancelled",
+                End::Blocked => "blocked",
+            };
+            (surface::DisplayText::new(word), None, None)
         }
     }
 }
@@ -1187,12 +1228,73 @@ impl ThreadActor {
         fence: surface::SurfaceOperationFence,
         event: SubagentActivityEvent,
     ) -> io::Result<()> {
+        // A later turn of this thread is running; the end belongs to the
+        // earlier one that owned the child.
+        if active.surface_operation.as_ref() != Some(&fence)
+            && self.is_late_kept_subagent_end(&event)
+        {
+            return self.commit_late_kept_subagent_end(&fence, &active.task_registry, event);
+        }
+        // The running turn's own generation, should its surface already show
+        // it stopped, takes a child's end only from a host that keeps the
+        // child, as the idle and later-turn routes do. The actor does not
+        // hold a generation its surface shows stopped today; this keeps the
+        // gate from relying on that.
+        if !own_generation_takes(
+            self.surface_generation_phase(&fence),
+            &event,
+            self.keeps_children_in_process(),
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "subagent activity generation fence is stale or terminalizing",
+            ));
+        }
         self.commit_subagent_activity_inner(
             Some(active),
             Some(&fence),
             &active.task_registry,
             event,
         )
+    }
+
+    /// Whether `event` is the end of a child this host keeps in its process.
+    /// Such a child is owned by its parent's generation, and an interrupted
+    /// turn stops it without waiting for it, so its end can come after that
+    /// generation has stopped: while the thread is idle, or while a later
+    /// turn of it runs.
+    pub(super) fn is_late_kept_subagent_end(&self, event: &SubagentActivityEvent) -> bool {
+        matches!(&event.payload, SubagentActivityPayload::Completed { .. })
+            && matches!(&event.owner, SubagentActivityOwner::Generation { .. })
+            && self.keeps_children_in_process()
+    }
+
+    fn keeps_children_in_process(&self) -> bool {
+        self.agent_controller
+            .as_ref()
+            .is_some_and(|controller| controller.keeps_subagents_in_process())
+    }
+
+    /// The phase this thread's surface shows for the generation `fence`.
+    fn surface_generation_phase(
+        &self,
+        fence: &surface::SurfaceOperationFence,
+    ) -> Option<surface::GenerationPhase> {
+        surface::generation_phase(self.resident_surface.coordinator.state().snapshot(), fence)
+    }
+
+    /// Commits the end of a kept child, reported for `fence`, once that
+    /// generation is no longer the one running here. It is committed as any
+    /// end is, at the scope of the generation that owned the child, and the
+    /// surface permit decides: the end of a stopped generation's child is
+    /// admitted only while the child's row still runs under it.
+    pub(super) fn commit_late_kept_subagent_end(
+        &mut self,
+        fence: &surface::SurfaceOperationFence,
+        task_registry: &crate::tasks::TaskRegistry,
+        event: SubagentActivityEvent,
+    ) -> io::Result<()> {
+        self.commit_subagent_activity_inner(None, Some(fence), task_registry, event)
     }
 
     /// Commits a detached child event after the parent generation has ended.
@@ -1207,6 +1309,24 @@ impl ThreadActor {
     }
 
     fn commit_subagent_activity_inner(
+        &mut self,
+        active: Option<&ActiveOperation>,
+        fence: Option<&surface::SurfaceOperationFence>,
+        task_registry: &crate::tasks::TaskRegistry,
+        event: SubagentActivityEvent,
+    ) -> io::Result<()> {
+        let ending_task = matches!(&event.payload, SubagentActivityPayload::Completed { .. })
+            .then(|| event.task_id.clone());
+        let result = self.commit_subagent_activity_checked(active, fence, task_registry, event);
+        // A child ends once, whether its end is committed or refused, so a
+        // person's stop of it is no longer awaited either way.
+        if let Some(task_id) = ending_task {
+            self.subagents_stopped_by_person.remove(task_id.as_str());
+        }
+        result
+    }
+
+    fn commit_subagent_activity_checked(
         &mut self,
         active: Option<&ActiveOperation>,
         fence: Option<&surface::SurfaceOperationFence>,
@@ -1422,6 +1542,22 @@ impl ThreadActor {
             .iter()
             .find(|task| task.task_id == event.task_id);
         let (activity, turn, usage) = subagent_activity_projection(&event.payload);
+        // A kept child a person stopped ends as cancelled, from inside its
+        // own turn; that end is the stop, and is shown as one.
+        let stopped_by_person = matches!(
+            &event.payload,
+            SubagentActivityPayload::Completed {
+                status: surface::SurfaceSubagentTerminalStatus::Cancelled,
+                ..
+            }
+        ) && self
+            .subagents_stopped_by_person
+            .contains(event.task_id.as_str());
+        let activity = if stopped_by_person {
+            surface::DisplayText::new("stopped by user")
+        } else {
+            activity
+        };
         let terminal = match &event.payload {
             SubagentActivityPayload::Completed {
                 status,
@@ -1584,6 +1720,11 @@ impl ThreadActor {
                 );
                 let subagent_patch = match terminal {
                     Some((status, output, error, terminal_usage)) => {
+                        let error = if stopped_by_person {
+                            error_after_a_persons_stop(error)
+                        } else {
+                            error
+                        };
                         next_task.status = match status {
                             surface::SurfaceSubagentTerminalStatus::Completed => {
                                 surface::SurfaceTaskStatus::Completed
@@ -1593,6 +1734,11 @@ impl ThreadActor {
                             }
                             surface::SurfaceSubagentTerminalStatus::Blocked => {
                                 surface::SurfaceTaskStatus::Blocked
+                            }
+                            surface::SurfaceSubagentTerminalStatus::Cancelled
+                                if stopped_by_person =>
+                            {
+                                surface::SurfaceTaskStatus::Stopped
                             }
                             surface::SurfaceSubagentTerminalStatus::Cancelled => {
                                 surface::SurfaceTaskStatus::Cancelled
@@ -1892,20 +2038,100 @@ impl ThreadActor {
                 continue;
             }
             let settled_at = surface::UnixMillis::new(settled_at_ms.unwrap_or(now_ms));
-            let continuation = task_registry
-                .continuation_projection(task.task_id.as_str())
-                .ok()
-                .flatten()
+            let continuation = record
+                .continuation_projection()
                 .map(surface_subagent_continuation)
                 .or_else(|| subagent.continuation.clone());
             let Ok(batch) =
-                settled_subagent_batch(task, subagent, &record, continuation, settled_at)
+                settled_subagent_batch(task, subagent, Some(&record), continuation, settled_at)
             else {
                 continue;
             };
             let batch = self.surface_event_batch_with_commit_id(batch, None);
             // A failed commit leaves the child running; the next poll retries.
             let _ = self.commit_surface_actor_batch_with_retry(&batch);
+        }
+    }
+
+    pub(super) fn settle_stranded_kept_subagents(&mut self, registry: &crate::tasks::TaskRegistry) {
+        let Some(resident) = self.resident_surface.0.as_ref() else {
+            return;
+        };
+        if !self.keeps_children_in_process() || registry.persistence_unavailable() {
+            return;
+        }
+        let snapshot = resident.coordinator.state().snapshot();
+        let candidates: Vec<_> = snapshot
+            .subagents
+            .iter()
+            .filter_map(|row| {
+                let surface::SurfaceSubagentOwner::Generation { fence } = &row.owner else {
+                    return None;
+                };
+                if row.status != surface::SurfaceSubagentStatus::Running
+                    || (row.child_thread_id.is_none() && row.continuation.is_some())
+                    || surface::generation_phase(snapshot, fence)
+                        != Some(surface::GenerationPhase::Stopped)
+                {
+                    return None;
+                }
+                let task = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == row.task_id)?;
+                Some((
+                    task.clone(),
+                    row.clone(),
+                    fence.thread_owner_epoch < snapshot.thread.owner_epoch,
+                ))
+            })
+            .collect();
+        let now = chrono::Utc::now().timestamp_millis();
+        for (task, row, previous_owner) in candidates {
+            if !previous_owner && registry.local_subagent_end_pending(task.task_id.as_str()) {
+                continue;
+            }
+            let Ok(record) = registry.refresh_task_from_persistence(task.task_id.as_str()) else {
+                continue;
+            };
+            if record
+                .as_ref()
+                .is_some_and(|record| !record.is_settled_subagent() || record.worker_pid.is_some())
+            {
+                continue;
+            }
+            let outcome = record
+                .as_ref()
+                .map_or(TaskStatus::Failed, |record| record.status);
+            let ended = record
+                .as_ref()
+                .and_then(|record| record.completed_at_ms.or(record.last_activity_at_ms));
+            if !registry_outcome_settles(task.status, outcome)
+                || (!previous_owner
+                    && now.saturating_sub(ended.unwrap_or(row.source.occurred_at.get()))
+                        < SUBAGENT_SETTLE_GRACE.as_millis() as i64)
+            {
+                continue;
+            }
+            let continuation = record
+                .as_ref()
+                .and_then(|record| record.continuation_projection())
+                .map(surface_subagent_continuation)
+                .or_else(|| row.continuation.clone());
+            let Ok(events) = settled_subagent_batch(
+                &task,
+                &row,
+                record.as_ref(),
+                continuation,
+                surface::UnixMillis::new(ended.unwrap_or(now)),
+            ) else {
+                continue;
+            };
+            let batch = self.surface_event_batch_with_commit_id(events, None);
+            if self.commit_surface_actor_batch_with_retry(&batch).is_ok() {
+                self.subagents_stopped_by_person
+                    .remove(task.task_id.as_str());
+            }
         }
     }
 
@@ -5860,6 +6086,136 @@ pub(super) fn unrecorded_tool_output(
     (!rest.is_empty()).then(|| surface::DisplayText::new(rest.to_string()))
 }
 
+/// The error a kept child's row keeps when a person stopped it. Its record
+/// has no error for the stop, so neither has the row for the cancel the
+/// child's end reports; anything else it reports, a registry settlement
+/// that failed say, is still an error and stays.
+fn error_after_a_persons_stop(error: Option<surface::DisplayText>) -> Option<surface::DisplayText> {
+    error.filter(|error| error.as_str() != crate::agent_controller::AGENT_CANCELLED)
+}
+
+/// Whether the running turn's own generation takes `event` while its surface
+/// shows that generation in `phase`. Once the generation is shown stopped, a
+/// child's end is taken there only from a host that keeps its children in
+/// its process; anything else is left to the surface permit, as before.
+fn own_generation_takes(
+    phase: Option<surface::GenerationPhase>,
+    event: &SubagentActivityEvent,
+    keeps_children: bool,
+) -> bool {
+    phase != Some(surface::GenerationPhase::Stopped)
+        || !matches!(&event.payload, SubagentActivityPayload::Completed { .. })
+        || !matches!(&event.owner, SubagentActivityOwner::Generation { .. })
+        || keeps_children
+}
+
+#[cfg(test)]
+mod own_generation_tests {
+    use super::own_generation_takes;
+    use crate::agent_continuation::AgentAttemptId;
+    use crate::child_agent_types::{
+        SubagentActivityEvent, SubagentActivityOwner, SubagentActivityPayload,
+    };
+    use crate::runtime_surface as surface;
+
+    fn report(
+        owner: SubagentActivityOwner,
+        payload: SubagentActivityPayload,
+    ) -> SubagentActivityEvent {
+        SubagentActivityEvent::new(
+            surface::SurfaceTaskId::try_new("own-task").unwrap(),
+            surface::SurfaceSubagentId::try_new("own-agent").unwrap(),
+            AgentAttemptId::new(),
+            orca_core::thread_identity::TurnId::new(),
+            2,
+            owner,
+            payload,
+        )
+    }
+
+    fn generation() -> SubagentActivityOwner {
+        SubagentActivityOwner::Generation {
+            operation_id: surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn detached() -> SubagentActivityOwner {
+        SubagentActivityOwner::DetachedTask {
+            task_id: surface::SurfaceTaskId::try_new("own-task").unwrap(),
+            task_revision: surface::TaskRevision::try_new(1).unwrap(),
+            authority_digest: surface::Sha256Digest::digest("own-authority"),
+        }
+    }
+
+    fn end() -> SubagentActivityPayload {
+        SubagentActivityPayload::Completed {
+            status: surface::SurfaceSubagentTerminalStatus::Cancelled,
+            output: None,
+            error: None,
+            usage: None,
+        }
+    }
+
+    fn progress() -> SubagentActivityPayload {
+        SubagentActivityPayload::PhaseChanged {
+            phase: surface::SurfaceSubagentPhase::Thinking,
+            turn: None,
+        }
+    }
+
+    #[test]
+    fn a_stopped_own_generation_takes_an_end_only_from_a_keeping_host() {
+        let stopped = Some(surface::GenerationPhase::Stopped);
+        let an_end = report(generation(), end());
+        assert!(own_generation_takes(stopped, &an_end, true));
+        assert!(!own_generation_takes(stopped, &an_end, false));
+
+        // A live generation takes it from any host, as before.
+        for phase in [
+            surface::GenerationPhase::Started,
+            surface::GenerationPhase::Transferred,
+        ] {
+            assert!(own_generation_takes(Some(phase), &an_end, false));
+        }
+        // Anything but a generation-owned end is left to the permit.
+        let a_progress = report(generation(), progress());
+        let a_detached_end = report(detached(), end());
+        assert!(own_generation_takes(stopped, &a_progress, false));
+        assert!(own_generation_takes(stopped, &a_detached_end, false));
+    }
+}
+
+#[cfg(test)]
+mod persons_stop_tests {
+    use super::error_after_a_persons_stop;
+    use crate::runtime_surface as surface;
+
+    fn kept(error: Option<&str>) -> Option<String> {
+        error_after_a_persons_stop(error.map(|error| surface::DisplayText::new(error.to_string())))
+            .map(|error| error.as_str().to_string())
+    }
+
+    #[test]
+    fn a_persons_stop_drops_only_the_cancel_its_end_reports() {
+        assert_eq!(kept(Some("agent cancelled")), None);
+        assert_eq!(kept(None), None);
+        assert_eq!(
+            kept(Some(
+                "agent cancelled; task registry settlement failed: record is gone"
+            ))
+            .as_deref(),
+            Some("agent cancelled; task registry settlement failed: record is gone")
+        );
+        assert_eq!(
+            kept(Some("task registry settlement failed: record is gone")).as_deref(),
+            Some("task registry settlement failed: record is gone")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tool_output_tests {
     use super::unrecorded_tool_output;
@@ -6052,6 +6408,26 @@ mod subagent_activity_tests {
     }
     use crate::child_agent_types::SubagentActivityPayload;
     use crate::runtime_surface as surface;
+
+    #[test]
+    fn terminal_activity_names_the_actual_agent_outcome() {
+        use surface::SurfaceSubagentTerminalStatus as End;
+        for (status, word) in [
+            (End::Completed, "completed"),
+            (End::Failed, "failed"),
+            (End::Cancelled, "cancelled"),
+            (End::Blocked, "blocked"),
+        ] {
+            let (activity, _, _) =
+                subagent_activity_projection(&SubagentActivityPayload::Completed {
+                    status,
+                    output: None,
+                    error: None,
+                    usage: None,
+                });
+            assert_eq!(activity.as_str(), word);
+        }
+    }
 
     #[test]
     fn a_phase_reads_as_words() {
@@ -6283,7 +6659,7 @@ mod task_transcript_query_tests {
         let events = settled_subagent_batch(
             &task,
             &subagent,
-            &record,
+            Some(&record),
             Some(continuation.clone()),
             surface::UnixMillis::new(9),
         )
@@ -6333,13 +6709,102 @@ mod task_transcript_query_tests {
                     .is_some_and(|entry| entry.activity == "completed")
         ));
 
+        let kept = surface::SurfaceSubagent {
+            owner: surface::SurfaceSubagentOwner::Generation {
+                fence: surface::SurfaceOperationFence {
+                    thread_id: surface::SurfaceThreadId::try_from_bytes(
+                        *uuid::Uuid::new_v4().as_bytes(),
+                    )
+                    .unwrap(),
+                    thread_owner_epoch: surface::ThreadOwnerEpoch::new(1),
+                    operation_id: surface::SurfaceOperationId::try_from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    )
+                    .unwrap(),
+                    generation_id: surface::SurfaceGenerationId::new(0),
+                },
+            },
+            ..subagent.clone()
+        };
+        use surface::{SurfaceSubagentTerminalStatus as Agent, SurfaceTaskStatus as Task};
+        for (status, result, expected_task, expected_agent) in [
+            (None, None, Task::Failed, Agent::Failed),
+            (
+                Some(TaskStatus::Completed),
+                Some(crate::tasks::SUBAGENT_STOPPED_BY_PERSON),
+                Task::Completed,
+                Agent::Completed,
+            ),
+            (
+                Some(TaskStatus::Blocked),
+                None,
+                Task::Blocked,
+                Agent::Blocked,
+            ),
+            (
+                Some(TaskStatus::Cancelled),
+                None,
+                Task::Cancelled,
+                Agent::Cancelled,
+            ),
+            (
+                Some(TaskStatus::Stopped),
+                Some("parent cancelled"),
+                Task::Cancelled,
+                Agent::Cancelled,
+            ),
+            (
+                Some(TaskStatus::Stopped),
+                Some(crate::tasks::SUBAGENT_STOPPED_BY_PERSON),
+                Task::Stopped,
+                Agent::Cancelled,
+            ),
+        ] {
+            let ended = status.map(|status| {
+                let mut ended = record.clone();
+                ended.status = status;
+                ended.result = result.map(str::to_owned);
+                if expected_task == Task::Stopped {
+                    ended.error = Some(crate::agent_controller::AGENT_CANCELLED.into());
+                }
+                ended
+            });
+            let events = settled_subagent_batch(
+                &task,
+                &kept,
+                ended.as_ref(),
+                None,
+                surface::UnixMillis::new(9),
+            )
+            .unwrap();
+            if expected_task == Task::Stopped {
+                assert!(matches!(
+                    &events[0].1,
+                    surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                        result: None,
+                        error: None,
+                        ..
+                    })
+                ));
+                assert!(
+                    matches!(&events[1].1, surface::SurfaceEvent::Subagent(surface::SubagentPatch::Settled { output: None, error: None, subagent_activity_history, .. }) if subagent_activity_history.last().unwrap().activity == "stopped by user")
+                );
+            }
+            assert!(
+                matches!(&events[0], (surface::SurfaceScope::Thread, surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged { status, .. })) if *status == expected_task)
+            );
+            assert!(
+                matches!(&events[1], (surface::SurfaceScope::Generation { .. }, surface::SurfaceEvent::Subagent(surface::SubagentPatch::Settled { status, error, .. })) if *status == expected_agent && error.is_some() == ended.is_none())
+            );
+        }
+
         let running = registry.create_subagent("still running".to_string(), None);
         let running = registry.get(&running.id).expect("running record");
         assert!(
             settled_subagent_batch(
                 &task,
                 &subagent,
-                &running,
+                Some(&running),
                 None,
                 surface::UnixMillis::new(9)
             )

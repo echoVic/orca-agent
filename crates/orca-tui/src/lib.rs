@@ -49,6 +49,7 @@ mod hosted_session_lifecycle;
 mod hosted_settings;
 mod hosted_side;
 mod hosted_submission;
+mod hosted_view;
 mod hosted_workflow;
 mod idle_key_actions;
 mod idle_navigation_actions;
@@ -105,6 +106,7 @@ mod status_key_actions;
 mod stderr_capture;
 mod stdio_guard;
 mod streaming_markdown;
+mod subagent_lines;
 mod submitted_turn;
 mod surface_actions;
 #[cfg(test)]

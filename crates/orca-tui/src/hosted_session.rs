@@ -36,11 +36,25 @@ use crate::surface_actions::TuiSurfaceActions;
 use crate::surface_projection::{SessionProjectionPresentation, SurfaceProjectionState};
 use crate::transcript_state::ChatMessage;
 
-struct QueueApprovalHandler {
+struct QueueInteractionRoute {
     control: TuiSurfaceTaskControl,
+    thread_id: String,
+    sender: mpsc::Sender<TuiEvent>,
 }
 
-impl RuntimeApprovalHandler for QueueApprovalHandler {
+impl QueueInteractionRoute {
+    fn await_interaction(
+        &self,
+        request_id: String,
+        kind: TuiInteractionKind,
+        event: impl FnOnce(crate::protocol::TuiInteractionKey) -> TuiEvent,
+    ) -> io::Result<TuiInteractionResponse> {
+        self.control
+            .await_queue_interaction(&self.thread_id, &self.sender, request_id, kind, event)
+    }
+}
+
+impl RuntimeApprovalHandler for QueueInteractionRoute {
     fn resolve_interactive(
         &self,
         approval: &orca_core::approval_types::ApprovalRequest,
@@ -51,19 +65,18 @@ impl RuntimeApprovalHandler for QueueApprovalHandler {
             .as_deref()
             .unwrap_or_else(|| request.name.as_str())
             .to_string();
-        let response = self.control.await_queue_interaction(
-            approval.id.clone(),
-            TuiInteractionKind::Approval,
-            |key| TuiEvent::ApprovalNeeded {
-                key,
-                tool,
-                target: approval.target.clone().or_else(|| request.target.clone()),
-                preview: approval
-                    .preview
-                    .clone()
-                    .or_else(|| Some(approval.description.clone())),
-            },
-        )?;
+        let response =
+            self.await_interaction(approval.id.clone(), TuiInteractionKind::Approval, |key| {
+                TuiEvent::ApprovalNeeded {
+                    key,
+                    tool,
+                    target: approval.target.clone().or_else(|| request.target.clone()),
+                    preview: approval
+                        .preview
+                        .clone()
+                        .or_else(|| Some(approval.description.clone())),
+                }
+            })?;
         match response {
             TuiInteractionResponse::Approval(approved) => Ok(ApprovalResolution {
                 id: approval.id.clone(),
@@ -86,26 +99,21 @@ impl RuntimeApprovalHandler for QueueApprovalHandler {
     }
 }
 
-struct QueuePermissionHandler {
-    control: TuiSurfaceTaskControl,
-}
-
-impl RuntimePermissionRequestHandler for QueuePermissionHandler {
+impl RuntimePermissionRequestHandler for QueueInteractionRoute {
     fn request_permissions(
         &self,
         request: &RuntimePermissionRequest,
     ) -> io::Result<RuntimePermissionResponse> {
-        let response = self.control.await_queue_interaction(
-            request.id.clone(),
-            TuiInteractionKind::Permission,
-            |key| TuiEvent::PermissionApprovalNeeded {
-                key,
-                tool: request.id.clone(),
-                target: None,
-                preview: request.reason.clone(),
-                permission_kind: permission_kind(request),
-            },
-        )?;
+        let response =
+            self.await_interaction(request.id.clone(), TuiInteractionKind::Permission, |key| {
+                TuiEvent::PermissionApprovalNeeded {
+                    key,
+                    tool: request.id.clone(),
+                    target: None,
+                    preview: request.reason.clone(),
+                    permission_kind: permission_kind(request),
+                }
+            })?;
         let decision = match response {
             TuiInteractionResponse::Permission(decision) => decision,
             _ => {
@@ -137,43 +145,38 @@ impl RuntimePermissionRequestHandler for QueuePermissionHandler {
     }
 }
 
-struct QueueUserInputHandler {
-    control: TuiSurfaceTaskControl,
-}
-
-impl RuntimeUserInputHandler for QueueUserInputHandler {
+impl RuntimeUserInputHandler for QueueInteractionRoute {
     fn request_user_input(
         &self,
         request: &RuntimeUserInputRequest,
     ) -> io::Result<Option<orca_runtime::lifecycle::RuntimeUserInputResponse>> {
-        let response = self.control.await_queue_interaction(
-            request.id.clone(),
-            TuiInteractionKind::UserInput,
-            |key| TuiEvent::UserInputRequested {
-                key,
-                questionnaire: crate::protocol::TuiUserInputQuestionnaire {
-                    questions: request
-                        .questions
-                        .iter()
-                        .map(|question| crate::protocol::TuiUserInputQuestion {
-                            id: question.id.clone(),
-                            header: question.header.clone(),
-                            question: question.question.clone(),
-                            options: question
-                                .options
-                                .iter()
-                                .map(|option| crate::protocol::TuiUserInputOption {
-                                    label: option.label.clone(),
-                                    description: option.description.clone(),
-                                    preview: option.preview.clone(),
-                                })
-                                .collect(),
-                            multi_select: question.multi_select,
-                        })
-                        .collect(),
-                },
-            },
-        )?;
+        let response =
+            self.await_interaction(request.id.clone(), TuiInteractionKind::UserInput, |key| {
+                TuiEvent::UserInputRequested {
+                    key,
+                    questionnaire: crate::protocol::TuiUserInputQuestionnaire {
+                        questions: request
+                            .questions
+                            .iter()
+                            .map(|question| crate::protocol::TuiUserInputQuestion {
+                                id: question.id.clone(),
+                                header: question.header.clone(),
+                                question: question.question.clone(),
+                                options: question
+                                    .options
+                                    .iter()
+                                    .map(|option| crate::protocol::TuiUserInputOption {
+                                        label: option.label.clone(),
+                                        description: option.description.clone(),
+                                        preview: option.preview.clone(),
+                                    })
+                                    .collect(),
+                                multi_select: question.multi_select,
+                            })
+                            .collect(),
+                    },
+                }
+            })?;
         match response {
             TuiInteractionResponse::UserQuestionnaire(
                 crate::protocol::TuiUserInputResponse::Submitted { answers },
@@ -207,11 +210,7 @@ impl RuntimeUserInputHandler for QueueUserInputHandler {
     }
 }
 
-struct QueueMcpElicitationHandler {
-    control: TuiSurfaceTaskControl,
-}
-
-impl McpElicitationHandler for QueueMcpElicitationHandler {
+impl McpElicitationHandler for QueueInteractionRoute {
     fn handle_elicitation(
         &self,
         request: McpElicitationRequest,
@@ -221,8 +220,7 @@ impl McpElicitationHandler for QueueMcpElicitationHandler {
             McpElicitationMode::Url => TuiMcpElicitationMode::Url,
         };
         let response = self
-            .control
-            .await_queue_interaction(
+            .await_interaction(
                 request.id.clone(),
                 TuiInteractionKind::McpElicitation,
                 |key| TuiEvent::McpElicitationRequested {
@@ -291,6 +289,7 @@ fn runtime_event_to_tui(event: &EventEnvelope) -> Option<TuiEvent> {
                 turn_id: turn_id.to_string(),
             },
             None => TuiEvent::TurnStarted {
+                started_at_ms: None,
                 turn: event
                     .payload
                     .get("turn")
@@ -447,36 +446,18 @@ pub(crate) fn announce_runtime_ready(
     // that started with the TUI, should the thread have taken them, are its
     // own: no moment comes between when neither has them.
     control.hand_over_prestart_mcp(thread);
-    thread.set_prompt_queue_interaction_handlers(PromptQueueInteractionHandlers {
-        approval: Some(Arc::new(QueueApprovalHandler {
-            control: control.clone(),
-        })),
-        permission: Some(Arc::new(QueuePermissionHandler {
-            control: control.clone(),
-        })),
-        user_input: Some(Arc::new(QueueUserInputHandler {
-            control: control.clone(),
-        })),
-        mcp_elicitation: Some(Arc::new(QueueMcpElicitationHandler {
-            control: control.clone(),
-        })),
+    let route = Arc::new(QueueInteractionRoute {
+        control: control.clone(),
+        thread_id: thread.thread_id().to_owned(),
+        sender: event_tx.clone(),
     });
-    let runtime_events = event_tx.clone();
-    thread.set_prompt_queue_event_observer(Arc::new(move |event: &EventEnvelope| {
-        if let Some(projected) = runtime_event_to_tui(event) {
-            let _ = runtime_events.send(projected);
-            if event.event_type == EventType::ModelResponseCompleted
-                && let Some(reason) = event.payload.get("cut_short")
-                && let Ok(reason) = serde_json::from_value(reason.clone())
-            {
-                let _ = runtime_events.send(TuiEvent::AssistantReplyKept(reason));
-            }
-            if let Some(script) = runtime_event_script(event) {
-                let _ = runtime_events.send(script);
-            }
-        }
-        Ok(())
-    }));
+    thread.set_prompt_queue_interaction_handlers(PromptQueueInteractionHandlers {
+        approval: Some(route.clone()),
+        permission: Some(route.clone()),
+        user_input: Some(route.clone()),
+        mcp_elicitation: Some(route),
+    });
+    observe_prompt_queue(thread, event_tx, control);
     let _ = event_tx.send(TuiEvent::MentionRuntimeReady(thread.typed_surface()));
     if let Ok(snapshot) = thread.prompt_queue(orca_runtime::prompt_queue::PromptQueueAction::List) {
         let _ = event_tx.send(TuiEvent::PromptQueueUpdated(snapshot));
@@ -529,35 +510,165 @@ pub(crate) fn announce_runtime_ready(
     }
 }
 
+fn observe_prompt_queue(
+    thread: &RuntimeThreadHandle,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    control: &TuiSurfaceTaskControl,
+) {
+    let runtime_events = event_tx.clone();
+    let raw: Arc<dyn orca_core::event_sink::EventObserver> =
+        Arc::new(move |event: &EventEnvelope| {
+            if let Some(projected) = runtime_event_to_tui(event) {
+                let _ = runtime_events.send(projected);
+                if event.event_type == EventType::ModelResponseCompleted
+                    && let Some(reason) = event.payload.get("cut_short")
+                    && let Ok(reason) = serde_json::from_value(reason.clone())
+                {
+                    let _ = runtime_events.send(TuiEvent::AssistantReplyKept(reason));
+                }
+                if let Some(script) = runtime_event_script(event) {
+                    let _ = runtime_events.send(script);
+                }
+            }
+            Ok(())
+        });
+    let (send, follows) = std::sync::mpsc::channel();
+    let relay = event_tx.clone();
+    let control = control.clone();
+    let owner = thread.clone();
+    match std::thread::Builder::new()
+        .name("orca-tui-queue-presentation".into())
+        .spawn(move || {
+            let errors = relay.clone();
+            dispatch_queue_follows(
+                follows,
+                move |follow| {
+                    if let Err(error) = crate::surface_client::follow_queue_operation(
+                        follow, &owner, &control, &relay,
+                    ) {
+                        let _ = relay.send(TuiEvent::Error(error.to_string()));
+                    }
+                },
+                &errors,
+            );
+        }) {
+        Ok(_) => thread.set_prompt_queue_surface_observer(raw, send),
+        Err(error) => {
+            let _ = event_tx.send(TuiEvent::Error(format!(
+                "cannot follow queued operations: {error}"
+            )));
+        }
+    }
+}
+
+pub(crate) fn dispatch_queue_follows(
+    follows: std::sync::mpsc::Receiver<orca_runtime::runtime_host::QueueSurfaceFollow>,
+    run: impl Fn(orca_runtime::runtime_host::QueueSurfaceFollow) + Clone + Send + 'static,
+    errors: &mpsc::Sender<TuiEvent>,
+) {
+    for follow in follows {
+        let run = run.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("orca-tui-follow-operation".into())
+            .spawn(move || run(follow))
+        {
+            let _ = errors.send(TuiEvent::Error(error.to_string()));
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum HistoryTarget {
+    Conversation,
+    Side,
+}
+
 pub(crate) fn read_hosted_projection_batch(
     thread: &RuntimeThreadHandle,
-) -> Result<(SurfaceProjectionState, Vec<ChatMessage>), String> {
+    target: HistoryTarget,
+) -> Result<(SurfaceProjectionState, HostedConversation), String> {
     TuiSurfaceActions::new(thread.typed_surface())
         .read_snapshot()
-        .map(|snapshot| hosted_projection_batch_from_snapshot(thread, &snapshot))
+        .map(|snapshot| hosted_projection_batch_from_snapshot(thread, &snapshot, target))
         .map_err(|error| error.to_string())
 }
 
 pub(crate) fn hosted_projection_batch_from_snapshot(
     thread: &RuntimeThreadHandle,
     snapshot: &orca_runtime::surface::SurfaceSnapshot,
-) -> (SurfaceProjectionState, Vec<ChatMessage>) {
+    target: HistoryTarget,
+) -> (SurfaceProjectionState, HostedConversation) {
     let projection = SurfaceProjectionState::from_surface_snapshot(snapshot);
-    let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(snapshot);
+    let mut conversation = HostedConversation::from_snapshot(snapshot, target, &projection);
     if let Some(session_id) = thread.session_id()
         && let Ok(transcript) = load_saved_history_fallback(session_id)
     {
-        messages = attach_history_images(messages, &transcript.messages);
+        conversation.messages = attach_history_images(conversation.messages, &transcript.messages);
     }
-    if let Some(diagnostic) = crate::surface_projection::latest_terminal_diagnostic(snapshot) {
-        messages.push(ChatMessage::Diagnostic(diagnostic));
+    if let Some(message) = crate::surface_projection::latest_terminal_message(snapshot) {
+        conversation.messages.push(message);
     }
-    (projection, messages)
+    (projection, conversation)
+}
+
+pub(crate) struct HostedConversation {
+    pub(crate) agent_lines: crate::subagent_lines::AnnouncedAgentLines,
+    pub(crate) messages: Vec<ChatMessage>,
+    pub(crate) plan: Option<(Option<String>, Vec<PlanItem>)>,
+}
+
+impl HostedConversation {
+    pub(crate) fn from_snapshot(
+        snapshot: &orca_runtime::surface::SurfaceSnapshot,
+        target: HistoryTarget,
+        projection: &SurfaceProjectionState,
+    ) -> Self {
+        let (messages, agent_lines) = match target {
+            HistoryTarget::Conversation => (
+                crate::surface_projection::history_messages_from_surface_snapshot(snapshot),
+                crate::subagent_lines::AnnouncedAgentLines::from_tasks(&projection.workflow_tasks),
+            ),
+            HistoryTarget::Side => (
+                crate::surface_projection::history_messages_from_surface_items(
+                    &snapshot.items,
+                    &snapshot.tools,
+                ),
+                Default::default(),
+            ),
+        };
+        Self {
+            messages,
+            plan: snapshot_plan(snapshot),
+            agent_lines,
+        }
+    }
+
+    pub(crate) fn into_event(self, label: Option<&str>) -> TuiEvent {
+        let Self {
+            messages,
+            plan,
+            agent_lines,
+        } = self;
+        match label {
+            Some(label) => TuiEvent::HistoryLoaded {
+                agent_lines,
+                messages,
+                plan: None,
+                label: label.to_owned(),
+            },
+            None => TuiEvent::ConversationReprojected {
+                agent_lines,
+                messages,
+                plan,
+            },
+        }
+    }
 }
 
 pub(crate) fn project_hosted_thread_attached(
     projection: SurfaceProjectionState,
-    messages: Vec<ChatMessage>,
+    conversation: HostedConversation,
+    label: Option<&str>,
     attachment: SessionAttachmentId,
     root_event_tx: &mpsc::Sender<TuiEvent>,
 ) -> Result<(), String> {
@@ -567,28 +678,14 @@ pub(crate) fn project_hosted_thread_attached(
         TuiEvent::SessionProjectionReset(Box::new(projection)),
     )
     .map_err(|error| error.to_string())?;
-    send_attached_event(
-        root_event_tx,
-        attachment,
-        TuiEvent::HistoryLoaded {
-            messages,
-            plan: None,
-            label: "Inherited conversation context.".to_string(),
-        },
-    )
-    .map_err(|error| error.to_string())
+    send_attached_event(root_event_tx, attachment, conversation.into_event(label))
+        .map_err(|error| error.to_string())
 }
 
-pub(crate) fn emit_typed_history_snapshot(
-    thread: &RuntimeThreadHandle,
-    mode: &HistoryMode,
-    session_presentation: Option<SessionProjectionPresentation>,
-    event_tx: &mpsc::Sender<TuiEvent>,
-) -> Result<(), String> {
-    let actions = TuiSurfaceActions::new(thread.typed_surface());
-    let snapshot = actions.read_snapshot().map_err(|error| error.to_string())?;
-    let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(&snapshot);
-    let mut plan = if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
+fn snapshot_plan(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+) -> Option<(Option<String>, Vec<PlanItem>)> {
+    if snapshot.plan.items.is_empty() && snapshot.plan.explanation.is_none() {
         None
     } else {
         Some((
@@ -615,8 +712,29 @@ pub(crate) fn emit_typed_history_snapshot(
                 })
                 .collect(),
         ))
-    };
-    if messages.is_empty()
+    }
+}
+
+pub(crate) fn emit_typed_history_snapshot(
+    thread: &RuntimeThreadHandle,
+    mode: &HistoryMode,
+    session_presentation: Option<SessionProjectionPresentation>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), String> {
+    let actions = TuiSurfaceActions::new(thread.typed_surface());
+    let snapshot = actions.read_snapshot().map_err(|error| error.to_string())?;
+    emit_history_from_snapshot(&snapshot, mode, session_presentation, event_tx)
+}
+
+fn emit_history_from_snapshot(
+    snapshot: &orca_runtime::surface::SurfaceSnapshot,
+    mode: &HistoryMode,
+    session_presentation: Option<SessionProjectionPresentation>,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), String> {
+    let mut messages = crate::surface_projection::history_messages_from_surface_snapshot(snapshot);
+    let mut plan = snapshot_plan(snapshot);
+    if snapshot.items.is_empty()
         && let HistoryMode::Resume(selector) | HistoryMode::Fork(selector) = mode
     {
         let transcript = load_saved_history_fallback(selector)?;
@@ -625,6 +743,7 @@ pub(crate) fn emit_typed_history_snapshot(
             .messages
             .into_iter()
             .flat_map(|message| replay.convert(message))
+            .chain(messages)
             .collect();
         if plan.is_none() {
             plan = transcript.plan;
@@ -639,8 +758,12 @@ pub(crate) fn emit_typed_history_snapshot(
     } else {
         "Resumed saved conversation."
     };
+    let projection = SurfaceProjectionState::from_surface_snapshot(snapshot);
     event_tx
         .send(TuiEvent::HistoryLoaded {
+            agent_lines: crate::subagent_lines::AnnouncedAgentLines::from_tasks(
+                &projection.workflow_tasks,
+            ),
             messages,
             plan,
             label: label.to_string(),
@@ -649,9 +772,8 @@ pub(crate) fn emit_typed_history_snapshot(
     event_tx
         .send(TuiEvent::SurfaceProjectionSynced(Box::new(
             match session_presentation {
-                Some(presentation) => SurfaceProjectionState::from_surface_snapshot(&snapshot)
-                    .with_session_presentation(presentation),
-                None => SurfaceProjectionState::from_surface_snapshot(&snapshot),
+                Some(presentation) => projection.with_session_presentation(presentation),
+                None => projection,
             },
         )))
         .map_err(|error| error.to_string())?;
@@ -733,6 +855,7 @@ pub(crate) fn looks_like_uuid_session_id(value: &str) -> bool {
 
 pub(crate) fn emit_empty_history_snapshot(event_tx: &mpsc::Sender<TuiEvent>, label: &str) {
     let _ = event_tx.send(TuiEvent::HistoryLoaded {
+        agent_lines: Default::default(),
         messages: Vec::new(),
         plan: None,
         label: label.to_string(),
@@ -1182,8 +1305,39 @@ mod tests {
                 messages,
                 plan: None,
                 label,
+                ..
             }) if messages.is_empty() && label == "Unable to restore saved conversation."
         ));
+    }
+
+    #[test]
+    fn agent_notices_without_items_do_not_hide_the_saved_transcript() {
+        let home = crate::test_support::isolate_orca_home();
+        let mut writer =
+            history::SessionWriter::start(home.path(), "mock", None, "legacy").unwrap();
+        writer.enter_turn(orca_core::thread_identity::TurnId::new());
+        writer
+            .append_message(&Message::user("saved user".into()))
+            .unwrap();
+        writer.complete("completed").unwrap();
+        let mut snapshot = crate::hosted_child::tests::snapshot_with_child(1, 5);
+        snapshot.tasks[0].status = orca_runtime::surface::SurfaceTaskStatus::Completed;
+        assert!(snapshot.items.is_empty());
+        let (sender, events) = mpsc::unbounded();
+        emit_history_from_snapshot(
+            &snapshot,
+            &HistoryMode::Resume("latest".into()),
+            None,
+            &sender,
+        )
+        .unwrap();
+        let TuiEvent::HistoryLoaded { messages, .. } = events.recv().unwrap() else {
+            panic!("no history")
+        };
+        assert!(
+            matches!(messages.as_slice(), [ChatMessage::User(user), ChatMessage::System {text: launch,..}, ChatMessage::System {text: end,..}] if user == "saved user" && launch == "Delegating to 1 agent" && end == "Agent completed: child"),
+            "{messages:?}"
+        );
     }
 
     #[test]
@@ -1210,7 +1364,12 @@ mod tests {
 
         project_hosted_thread_attached(
             projection,
-            vec![ChatMessage::User("hello".to_string())],
+            HostedConversation {
+                agent_lines: Default::default(),
+                messages: vec![ChatMessage::User("hello".to_string())],
+                plan: None,
+            },
+            None,
             attachment,
             &event_tx,
         )
@@ -1228,7 +1387,7 @@ mod tests {
             second,
             TuiEvent::Attached(attached)
                 if attached.attachment == Some(attachment)
-                    && matches!(attached.event, TuiEvent::HistoryLoaded { .. })
+                    && matches!(attached.event, TuiEvent::ConversationReprojected { .. })
         ));
     }
 

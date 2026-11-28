@@ -99,18 +99,18 @@ impl ServerShellManager {
     pub(super) fn reap_completed_except(
         &mut self,
         protected_ids: &HashSet<String>,
-    ) -> io::Result<Vec<ShellSessionOutput>> {
+    ) -> io::Result<Vec<io::Result<ShellSessionOutput>>> {
         self.sessions
             .as_mut()
-            .map(|manager| manager.reap_completed_except(protected_ids))
+            .map(|manager| manager.reap_completed_results_except(protected_ids))
             .unwrap_or_else(|| Ok(Vec::new()))
     }
 
-    pub(super) fn reap_requested_stops(&mut self) -> io::Result<Vec<ShellSessionOutput>> {
+    pub(super) fn reap_requested_stops(&mut self) -> Vec<io::Result<ShellSessionOutput>> {
         self.sessions
             .as_mut()
-            .map(RuntimeShellSessionManager::reap_requested_stops)
-            .unwrap_or_else(|| Ok(Vec::new()))
+            .map(RuntimeShellSessionManager::reap_requested_stops_results)
+            .unwrap_or_default()
     }
 
     pub(super) fn read(

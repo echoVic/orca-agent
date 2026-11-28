@@ -2118,6 +2118,16 @@ struct RuntimeSurfaceSubagentActivityIngress {
     seen: Arc<std::sync::Mutex<VecDeque<(surface::SurfaceCommitId, surface::Sha256Digest)>>>,
 }
 
+#[cfg(test)]
+type HeldAgentEnd = (mpsc::SyncSender<()>, mpsc::Receiver<()>);
+
+#[cfg(test)]
+fn held_agent_ends_before_ingress() -> &'static std::sync::Mutex<HashMap<String, HeldAgentEnd>> {
+    static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, HeldAgentEnd>>> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(Default::default)
+}
+
 impl surface::RuntimeSubagentActivityIngress for RuntimeSurfaceSubagentActivityIngress {
     fn owner(&self) -> SubagentActivityOwner {
         SubagentActivityOwner::Generation {
@@ -2130,6 +2140,20 @@ impl surface::RuntimeSubagentActivityIngress for RuntimeSurfaceSubagentActivityI
     }
 
     fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
+        #[cfg(test)]
+        if matches!(
+            event.payload,
+            crate::child_agent_types::SubagentActivityPayload::Completed { .. }
+        ) {
+            let gate = held_agent_ends_before_ingress()
+                .lock()
+                .unwrap()
+                .remove(event.task_id.as_str());
+            if let Some((reached, release)) = gate {
+                let _ = reached.send(());
+                let _ = release.recv_timeout(Duration::from_secs(10));
+            }
+        }
         if !event.verify_digest() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -3329,12 +3353,26 @@ pub struct RuntimeThreadHandle {
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     surface: surface::RuntimeSurfaceHandle,
     prompt_queue_updates: tokio::sync::watch::Sender<crate::prompt_queue::PromptQueueSnapshot>,
-    prompt_queue_observer: Arc<Mutex<Option<Arc<dyn EventObserver>>>>,
+    prompt_queue_observer: Arc<Mutex<Option<QueueObservers>>>,
     prompt_queue_interaction_handlers: Arc<Mutex<PromptQueueInteractionHandlers>>,
     prompt_queue_dispatch_ready: Arc<AtomicBool>,
     /// Whether an interactive surface shows this thread now: set with the
     /// surface's event observer, cleared when the surface moves elsewhere.
     prompt_queue_surface_attached: Arc<AtomicBool>,
+}
+
+pub struct QueueSurfaceFollow {
+    pub operation: surface::SurfaceOperationId,
+    pub client: surface::RuntimeSurfaceClientHandle,
+    pub terminal_failure: mpsc::Receiver<surface::WaitOperationTerminalResult>,
+    pub baseline: surface::SnapshotAtCursor,
+    pub subscription: surface::SurfaceSubscriptionReceiver,
+}
+
+#[derive(Clone)]
+struct QueueObservers {
+    raw: Arc<dyn EventObserver>,
+    surface: Option<mpsc::Sender<QueueSurfaceFollow>>,
 }
 
 /// Interaction handlers used when the durable prompt queue starts a legacy
@@ -3591,6 +3629,23 @@ fn headless_interaction_capabilities() -> BTreeSet<surface::SurfaceInteractionKi
     ])
 }
 
+/// What a delegating controller hands the child's thread to start its turn
+/// on the child's surface: the delegated prompt and what the raw start took
+/// from `HostedTurnRequest`.
+pub(crate) struct DelegatedTurnStart {
+    pub(crate) prompt: String,
+    pub(crate) headless_root: bool,
+    pub(crate) observer: Arc<dyn EventObserver>,
+    pub(crate) approval: Option<Arc<dyn RuntimeApprovalHandler + Send + Sync>>,
+    pub(crate) permission: Option<Arc<dyn RuntimePermissionRequestHandler + Send + Sync>>,
+}
+
+/// Under test, a delegated prompt that is exactly this is refused by the
+/// child's surface, so the raw start a refusal falls back to can be seen.
+#[cfg(test)]
+pub(crate) const REFUSE_DELEGATED_SURFACE_TURN_FOR_TEST: &str =
+    "test_refuse_delegated_surface_turn";
+
 impl RuntimeThreadHandle {
     pub fn thread_id(&self) -> &str {
         &self.thread_id
@@ -3619,10 +3674,28 @@ impl RuntimeThreadHandle {
     /// Observes the turns this thread starts on its own; an interactive
     /// surface calls it when it shows the thread.
     pub fn set_prompt_queue_event_observer(&self, observer: Arc<dyn EventObserver>) {
+        self.set_queue_observers(QueueObservers {
+            raw: observer,
+            surface: None,
+        });
+    }
+
+    pub fn set_prompt_queue_surface_observer(
+        &self,
+        legacy: Arc<dyn EventObserver>,
+        follows: mpsc::Sender<QueueSurfaceFollow>,
+    ) {
+        self.set_queue_observers(QueueObservers {
+            raw: legacy,
+            surface: Some(follows),
+        });
+    }
+
+    fn set_queue_observers(&self, observers: QueueObservers) {
         *self
             .prompt_queue_observer
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observers);
         self.prompt_queue_surface_attached
             .store(true, Ordering::Release);
     }
@@ -3944,6 +4017,38 @@ impl RuntimeThreadHandle {
         self.start_turn_inner(request, Box::new(writer), None)
     }
 
+    /// Starts a delegated child turn through the child's surface, so the
+    /// turn is part of the conversation a view reads.
+    pub(crate) fn start_delegated_turn_on_surface<W>(
+        &self,
+        request: DelegatedTurnStart,
+        writer: W,
+    ) -> Result<OperationHandle, RuntimeHostError>
+    where
+        W: HostedOperationWriter,
+    {
+        let started = RuntimeStartedTurn {
+            turn_id: None,
+            observer: Some(request.observer),
+            surface_observers: None,
+            interaction_handlers: PromptQueueInteractionHandlers {
+                approval: request.approval,
+                permission: request.permission,
+                user_input: None,
+                mcp_elicitation: None,
+            },
+            headless_root: request.headless_root,
+        };
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.try_send(ThreadCommand::StartDelegatedTurnOnSurface {
+            prompt: request.prompt,
+            started,
+            writer: Box::new(writer),
+            reply: reply_tx,
+        })?;
+        receive_reply(reply_rx, "runtime thread")?
+    }
+
     pub fn start_turn_with_config_and_output<W>(
         &self,
         request: HostedTurnRequest,
@@ -4003,8 +4108,33 @@ impl RuntimeThreadHandle {
     /// surface operation. This command gives the queue owner the same bounded
     /// cancellation path without guessing the private active operation id.
     pub fn interrupt_active(&self) -> Result<(), RuntimeHostError> {
+        self.interrupt_active_with_completion().map(|_| ())
+    }
+
+    /// Interrupt the current generation and return its completion, or `None` if idle.
+    /// Waiting for that generation to settle is the caller's choice.
+    pub fn interrupt_active_with_completion(
+        &self,
+    ) -> Result<Option<OperationCompletion>, RuntimeHostError> {
+        self.interrupt_current(None)
+    }
+
+    pub fn interrupt_followed_operation(
+        &self,
+        operation: surface::SurfaceOperationId,
+    ) -> Result<Option<OperationCompletion>, RuntimeHostError> {
+        self.interrupt_current(Some(operation))
+    }
+
+    fn interrupt_current(
+        &self,
+        expected_follow: Option<surface::SurfaceOperationId>,
+    ) -> Result<Option<OperationCompletion>, RuntimeHostError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.try_send(ThreadCommand::InterruptActive { reply: reply_tx })?;
+        self.try_send(ThreadCommand::InterruptActive {
+            expected_follow,
+            reply: reply_tx,
+        })?;
         receive_reply(reply_rx, "runtime thread")?
     }
 
@@ -4557,6 +4687,98 @@ impl RuntimeHostHandle {
         )
     }
 
+    /// Subagents started under this host run on threads of this process
+    /// when they can, so an interactive client can follow their
+    /// conversations. They end with the process. A host that is not asked
+    /// keeps detaching them.
+    pub fn keep_subagents_in_process(&self) {
+        self.agent_registry.keep_subagents_in_process();
+    }
+
+    /// Whether this host was asked to keep its subagents in the process.
+    pub fn keeps_subagents_in_process(&self) -> bool {
+        self.agent_registry.keeps_subagents_in_process()
+    }
+
+    /// Asks every running subagent kept on a thread of this process to stop,
+    /// as an interrupted turn stops the children it started, and waits up to
+    /// `wait` for their ends to be reported. Returns how many were still
+    /// pending when it gave up. Only subagents on this
+    /// host's agent threads are asked, never a detached worker, a workflow or
+    /// a command; a host that was not asked to keep its subagents, or that
+    /// cannot say in time which threads it runs, asks none.
+    pub fn stop_kept_subagents(&self, wait: Duration) -> usize {
+        if !self.keeps_subagents_in_process() {
+            return 0;
+        }
+        let deadline = Instant::now() + wait;
+        let (reply, receive) = mpsc::sync_channel(1);
+        if self
+            .command_tx
+            .try_send(HostCommand::ListAgentThreads { reply })
+            .is_err()
+        {
+            return 0;
+        }
+        let Ok(agent_threads) =
+            receive.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        else {
+            return 0;
+        };
+        let mut asked = HashSet::new();
+        let mut stopping = Vec::new();
+        for agent in agent_threads {
+            let registry = agent.thread.task_registry();
+            let thread_id = agent.thread.thread_id();
+            // The task the thread was started for, and any later one bound
+            // to the same thread when the agent was continued.
+            let bound = registry
+                .list()
+                .into_iter()
+                .filter(|task| task.subagent_child_thread_id.as_deref() == Some(thread_id))
+                .map(|task| task.id);
+            for task_id in std::iter::once(agent.task_id.clone()).chain(bound) {
+                let Some(task) = registry.get(&task_id).filter(|task| {
+                    task.task_type == orca_core::task_types::TaskType::Subagent
+                        && task.worker_pid.is_none()
+                }) else {
+                    continue;
+                };
+                // The registry's stop for a child in this process marks the
+                // task and cancels its turn without waiting for it.
+                if asked.insert(task_id.clone()) && registry.local_subagent_end_pending(&task_id) {
+                    if task.status.is_active()
+                        && registry.request_stop(&task_id).is_err()
+                        && registry
+                            .get(&task_id)
+                            .is_some_and(|current| current.status.is_active())
+                    {
+                        continue;
+                    }
+                    stopping.push((registry.clone(), task_id));
+                }
+            }
+        }
+        loop {
+            let running = stopping
+                .iter()
+                .filter(|(registry, task_id)| registry.local_subagent_end_pending(task_id))
+                .count();
+            let now = Instant::now();
+            if running == 0 || now >= deadline {
+                return running;
+            }
+            thread::sleep(deadline.duration_since(now).min(Duration::from_millis(50)));
+        }
+    }
+
+    /// The registry this host's controllers share, so a test can build a
+    /// controller the way the host does.
+    #[cfg(test)]
+    pub(crate) fn agent_registry_for_test(&self) -> Arc<crate::agent_registry::AgentRegistry> {
+        Arc::clone(&self.agent_registry)
+    }
+
     pub fn agent_registry_snapshot(
         &self,
         root_thread_id: &str,
@@ -4762,8 +4984,25 @@ impl RuntimeHostHandle {
 }
 
 impl RuntimeHost {
+    #[cfg(feature = "test-utils")]
+    pub fn default_executor_for_test() -> Arc<dyn ThreadOperationExecutor> {
+        Arc::new(LegacyThreadOperationExecutor)
+    }
+
     pub fn start() -> Result<Self, RuntimeHostError> {
         Self::start_with_background_capacity(HOST_BACKGROUND_TASK_CAPACITY)
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn start_with_subscriber_limit_for_test(limit: u64) -> Result<Self, RuntimeHostError> {
+        Self::start_inner(
+            Arc::new(LegacyThreadOperationExecutor),
+            HOST_BACKGROUND_TASK_CAPACITY,
+            surface::SurfaceHubConfig {
+                subscriber_event_limit: limit,
+                ..Default::default()
+            },
+        )
     }
 
     pub fn start_with_background_capacity(
@@ -4945,6 +5184,10 @@ enum HostCommand {
     ResolveLiveThread {
         thread_id: String,
         reply: SyncSender<Result<RuntimeThreadHandle, RuntimeHostError>>,
+    },
+    /// The live threads started for a subagent's task.
+    ListAgentThreads {
+        reply: SyncSender<Vec<LiveAgentThread>>,
     },
     JsonlListSessions {
         cursor: Option<String>,
@@ -5540,6 +5783,14 @@ enum ThreadCommand {
         config: Option<Box<RunConfig>>,
         reply: SyncSender<Result<OperationHandle, RuntimeHostError>>,
     },
+    /// Start a delegated child turn as an operation of the child's surface.
+    /// `Err` means nothing started and the caller may start it raw.
+    StartDelegatedTurnOnSurface {
+        prompt: String,
+        started: RuntimeStartedTurn,
+        writer: Box<dyn HostedOperationWriter>,
+        reply: SyncSender<Result<OperationHandle, RuntimeHostError>>,
+    },
     LaunchWorkflow {
         request: Box<HostedWorkflowRequest>,
         reply: SyncSender<Result<HostedWorkflowLaunch, RuntimeHostError>>,
@@ -5549,7 +5800,8 @@ enum ThreadCommand {
         reply: SyncSender<Result<InterruptOperationResult, RuntimeHostError>>,
     },
     InterruptActive {
-        reply: SyncSender<Result<(), RuntimeHostError>>,
+        expected_follow: Option<surface::SurfaceOperationId>,
+        reply: SyncSender<Result<Option<OperationCompletion>, RuntimeHostError>>,
     },
     PauseGoalRun {
         operation_id: OperationId,
@@ -5638,6 +5890,36 @@ enum ThreadCommand {
     },
 }
 
+impl ThreadCommand {
+    fn surface_operation_fence(&self) -> Option<&surface::SurfaceOperationFence> {
+        match self {
+            Self::SurfacePrepareManualCompaction { fence, .. }
+            | Self::SurfaceCommitProviderResponse { fence, .. }
+            | Self::SurfaceCommitProviderFailure { fence, .. }
+            | Self::SurfaceCommitProviderAttemptFailure { fence, .. }
+            | Self::SurfaceCommitProviderStep { fence, .. }
+            | Self::SurfaceCommitToolResults { fence, .. }
+            | Self::SurfaceCommitToolOutput { fence, .. }
+            | Self::SurfaceCommitPlanUpdate { fence, .. }
+            | Self::SurfaceCommitWorkflowStarted { fence, .. }
+            | Self::SurfaceCommitWorkflowFinished { fence, .. }
+            | Self::SurfaceCommitWorkflowProgress { fence, .. }
+            | Self::SurfaceCommitSubagentActivity { fence, .. }
+            | Self::SurfaceDrainSubagentRelay { fence, .. }
+            | Self::SurfaceRequestToolApproval { fence, .. }
+            | Self::SurfaceRequestPermission { fence, .. }
+            | Self::SurfaceRequestUserInput { fence, .. }
+            | Self::SurfaceRequestMcpElicitation { fence, .. }
+            | Self::SurfaceRequestAcpReadTextFile { fence, .. }
+            | Self::SurfaceRequestAcpWriteTextFile { fence, .. }
+            | Self::SurfaceRequestAcpTerminalCreate { fence, .. }
+            | Self::SurfaceRequestAcpTerminalObservation { fence, .. }
+            | Self::SurfaceRequestAcpTerminalCleanup { fence, .. } => Some(fence),
+            _ => None,
+        }
+    }
+}
+
 enum ThreadShutdownAck {
     Complete,
     Retry,
@@ -5679,6 +5961,15 @@ struct ThreadActorEntry {
     handle: RuntimeThreadHandle,
     command_tx: tokio_mpsc::Sender<ThreadCommand>,
     join: JoinHandle<()>,
+    /// The subagent task the thread was started for, if it was.
+    agent_task_id: Option<String>,
+}
+
+/// A live thread of the host that runs a subagent, and the task it was
+/// started for, which its task registry holds.
+struct LiveAgentThread {
+    thread: RuntimeThreadHandle,
+    task_id: String,
 }
 
 struct ThreadActorExitNotifier {
@@ -5873,6 +6164,18 @@ async fn run_host_supervisor(
                     .ok_or(RuntimeHostError::ThreadUnavailable);
                 let _ = reply.send(result);
             }
+            HostCommand::ListAgentThreads { reply } => {
+                let agent_threads = actors
+                    .values()
+                    .filter_map(|actor| {
+                        actor.agent_task_id.as_ref().map(|task_id| LiveAgentThread {
+                            thread: actor.handle.clone(),
+                            task_id: task_id.clone(),
+                        })
+                    })
+                    .collect();
+                let _ = reply.send(agent_threads);
+            }
             HostCommand::StartThread { request, reply } => {
                 let completion_tx = command_tx.clone();
                 tokio::spawn(async move {
@@ -6062,6 +6365,7 @@ async fn run_host_supervisor(
                         agent_depth,
                     ),
                 );
+                let entry_agent_task_id = agent_type.as_ref().and(agent_task_id.clone());
                 if let Some(subagent_type) = agent_type {
                     thread
                         .thread_extensions()
@@ -6082,6 +6386,18 @@ async fn run_host_supervisor(
                     registry: handle.mcp_registry.clone(),
                     owned: Arc::clone(&handle.mcp_registry_owned),
                 };
+                let mut actor = ThreadActor::new(
+                    thread,
+                    actor_config,
+                    actor_handle,
+                    actor_executor,
+                    background_capacity,
+                    resident_surface,
+                    ephemeral_reservation_timeout,
+                    #[cfg(test)]
+                    ephemeral_close_commit_failures,
+                );
+                actor.settle_stranded_kept_subagents(&handle.task_registry);
                 let join = tokio::spawn(async move {
                     let _actor_exit = actor_exit;
                     // The actor hears of MCP changes until it ends.
@@ -6089,19 +6405,9 @@ async fn run_host_supervisor(
                     // Once it ends, the MCP servers the thread owns stop,
                     // before the host hears that it has ended.
                     let _mcp_servers = mcp_servers;
-                    ThreadActor::new(
-                        thread,
-                        actor_config,
-                        actor_handle,
-                        actor_executor,
-                        background_capacity,
-                        resident_surface,
-                        ephemeral_reservation_timeout,
-                        #[cfg(test)]
-                        ephemeral_close_commit_failures,
-                    )
-                    .run(actor_rx, capability_change_rx, mcp_change_rx)
-                    .await;
+                    actor
+                        .run(actor_rx, capability_change_rx, mcp_change_rx)
+                        .await;
                 });
                 actors.insert(
                     thread_id,
@@ -6109,6 +6415,7 @@ async fn run_host_supervisor(
                         handle: handle.clone(),
                         command_tx: thread_command_tx,
                         join,
+                        agent_task_id: entry_agent_task_id,
                     },
                 );
                 let _ = reply.send(Ok(handle));
@@ -12655,6 +12962,14 @@ struct ThreadActor {
     recap_inflight_keys: HashMap<String, crate::recap::RecapRequestId>,
     /// How commands that outlived their calls ended, for the typed surface.
     shell_task_ends: ShellTaskEnds,
+    /// The thread's agent controller. A running turn holds the thread, so it
+    /// is kept here for a person's stop to ask whether this host keeps its
+    /// children on threads of this process.
+    agent_controller: Option<Arc<crate::agent_controller::AgentController>>,
+    /// Tasks of kept children a person has stopped whose end has not reached
+    /// the surface yet. That end comes as the child's own cancelled
+    /// completion, and is shown as the stop it was.
+    subagents_stopped_by_person: HashSet<String>,
 }
 
 struct ResidentSurfaceSlot(Option<ResidentSurfaceState>);
@@ -12780,21 +13095,35 @@ struct PreparedSurfaceAdmission {
 /// What a turn the thread starts on its own (the next queued message, a wake
 /// for finished agents) carries that a turn a client admits does not. It is
 /// recorded on the surface like any other, so the conversation holds it when
-/// it is read back, but no surface client admitted it: whoever shows the
-/// thread watches it through `observer` and answers what it asks through
-/// `interaction_handlers`.
+/// it is read back. A TUI follow gets its events and interactions through
+/// the surface; other callers retain their own observer and handlers.
 #[derive(Clone)]
 struct RuntimeStartedTurn {
     /// The turn's id, when whoever queued the message already named it.
     turn_id: Option<TurnId>,
     observer: Option<Arc<dyn EventObserver>>,
+    surface_observers: Option<mpsc::Sender<QueueSurfaceFollow>>,
     interaction_handlers: PromptQueueInteractionHandlers,
+    /// A delegated child turn carries its root's headless flag, which the
+    /// raw start took from `HostedTurnRequest::with_headless_root`.
+    headless_root: bool,
 }
 
 impl RuntimeStartedTurn {
+    fn apply_on_surface(mut self, request: HostedTurnRequest) -> HostedTurnRequest {
+        if self.surface_observers.is_some() {
+            self.observer = None;
+            self.interaction_handlers = PromptQueueInteractionHandlers::default();
+        }
+        self.apply(request)
+    }
+
     fn apply(self, mut request: HostedTurnRequest) -> HostedTurnRequest {
         if let Some(turn_id) = self.turn_id {
             request = request.with_turn_id(turn_id);
+        }
+        if self.headless_root {
+            request = request.with_headless_root(true);
         }
         if let Some(observer) = self.observer {
             request = request.with_event_observer(observer);
@@ -15019,7 +15348,16 @@ struct ActiveOperation {
     surface_execution_failure: Option<surface::GenerationExecutionFailureClass>,
     surface_execution_failure_diagnostic: Option<surface::SafeDiagnosticText>,
     surface_background_control: Option<Arc<RuntimeSurfaceBackgroundControl>>,
-    pending_surface_background_transfer: Option<PendingSurfaceBackgroundTransfer>,
+    /// Shutdown closed the mailbox under a running generation, or the
+    /// durable-interrupt shutdown refused one of that generation's own fenced
+    /// commands while it ran. The generation's error is then taken as
+    /// cancellation, not failure. If acknowledging its reply failed, that
+    /// failure wins over any refusal in the durable-interrupt shutdown loop.
+    ///
+    /// `finish_generation_inner` keeps the flag only when the generation
+    /// itself returned an execution failure, so a failure the actor meets
+    /// after the generation returned keeps its error.
+    mailbox_closed_under_generation: bool,
 }
 
 enum QueuedJsonlResumePreparation {
@@ -15032,18 +15370,79 @@ enum QueuedJsonlResumePreparation {
     },
 }
 
-#[derive(Debug, Default)]
+/// What a person reads when the turn they asked to move to the background
+/// stays in the foreground because subagents it keeps in this process run.
+pub(crate) const TURN_KEPT_IN_FOREGROUND_BY_ITS_SUBAGENTS: &str =
+    "This turn cannot move to the background while its subagents are running.";
+
+/// A turn's own hand-off to the background, shared by the thread's actor,
+/// which takes the request, and the turn's generation, which suspends for
+/// it.
+///
+/// On a host that keeps its subagents in its process, the hand-off is
+/// refused, and the request dropped, while one of the turn's subagents runs
+/// there: once handed off, the turn's generation is over, so such an agent
+/// would be left running with nothing to show it or stop it. The actor
+/// refuses it when it is asked and when an agent of the turn reports; the
+/// generation's own check, where it would suspend, is the one that decides.
+#[derive(Default)]
 struct RuntimeSurfaceBackgroundControl {
+    /// Set while a hand-off waits for the generation, so the generation's
+    /// check on every provider event stays a load until one is asked for.
     requested: AtomicBool,
+    transfer: Mutex<SurfaceBackgroundTransfer>,
+    kept_subagents: Option<KeptSubagentsOfTurn>,
     #[cfg(test)]
     take_delay_ms: std::sync::atomic::AtomicU64,
 }
 
-impl RuntimeSurfaceBackgroundControl {
-    fn request(&self) {
-        self.requested.store(true, Ordering::Release);
-    }
+/// Where a turn's subagents kept in this process are recorded: the task
+/// registry, under the turn's main-session task.
+struct KeptSubagentsOfTurn {
+    registry: TaskRegistry,
+    root_task_id: String,
+}
 
+#[derive(Default)]
+enum SurfaceBackgroundTransfer {
+    #[default]
+    None,
+    /// Asked for; the generation has not reached a point where it can be
+    /// suspended.
+    Waiting(PendingSurfaceBackgroundTransfer),
+    /// The generation is suspending for it.
+    HandingOff(PendingSurfaceBackgroundTransfer),
+}
+
+impl std::fmt::Debug for RuntimeSurfaceBackgroundControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never waits for the transfer's lock, so a format of the control
+        // while that lock is held, on this thread too, cannot deadlock:
+        // `pending` is then left unknown.
+        let pending = match self.transfer.try_lock() {
+            Ok(state) => Some(!matches!(*state, SurfaceBackgroundTransfer::None)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(!matches!(
+                *poisoned.into_inner(),
+                SurfaceBackgroundTransfer::None
+            )),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        formatter
+            .debug_struct("RuntimeSurfaceBackgroundControl")
+            .field("requested", &self.requested)
+            .field("pending", &pending)
+            .field(
+                "kept_subagents_root",
+                &self
+                    .kept_subagents
+                    .as_ref()
+                    .map(|kept| kept.root_task_id.as_str()),
+            )
+            .finish()
+    }
+}
+
+impl RuntimeSurfaceBackgroundControl {
     fn for_canonical_input(_input: &str) -> Self {
         let control = Self::default();
         #[cfg(test)]
@@ -15056,13 +15455,102 @@ impl RuntimeSurfaceBackgroundControl {
         }
         control
     }
+
+    /// Refuses the hand-off while a subagent recorded under `root_task_id`
+    /// in `registry` runs in this process.
+    fn refused_while_kept_subagents_run(
+        mut self,
+        registry: TaskRegistry,
+        root_task_id: String,
+    ) -> Self {
+        self.kept_subagents = Some(KeptSubagentsOfTurn {
+            registry,
+            root_task_id,
+        });
+        self
+    }
+
+    fn transfer(&self) -> MutexGuard<'_, SurfaceBackgroundTransfer> {
+        self.transfer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn kept_subagents_run(&self) -> bool {
+        self.kept_subagents.as_ref().is_some_and(|kept| {
+            kept.registry
+                .has_unended_subagent_in_process_below(&kept.root_task_id)
+        })
+    }
+
+    /// Whether a hand-off was asked for and has not been answered.
+    fn has_pending_transfer(&self) -> bool {
+        !matches!(*self.transfer(), SurfaceBackgroundTransfer::None)
+    }
+
+    /// Asks the generation to suspend for `transfer`, or refuses it at once
+    /// while the turn's kept subagents run.
+    fn request(&self, transfer: PendingSurfaceBackgroundTransfer) {
+        let mut state = self.transfer();
+        if self.kept_subagents_run() {
+            drop(state);
+            transfer.refuse_while_kept_subagents_run();
+            return;
+        }
+        *state = SurfaceBackgroundTransfer::Waiting(transfer);
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// Refuses a hand-off that still waits for the generation if one of
+    /// the turn's kept subagents runs by now.
+    fn refuse_waiting_transfer_if_kept_subagents_run(&self) {
+        let mut state = self.transfer();
+        if !matches!(*state, SurfaceBackgroundTransfer::Waiting(_)) || !self.kept_subagents_run() {
+            return;
+        }
+        match std::mem::take(&mut *state) {
+            SurfaceBackgroundTransfer::Waiting(transfer) => {
+                self.requested.store(false, Ordering::Release);
+                drop(state);
+                transfer.refuse_while_kept_subagents_run();
+            }
+            // Not waiting after all: what was taken is put back as it was.
+            other => *state = other,
+        }
+    }
+
+    /// The hand-off the generation suspended for, or one still waiting
+    /// when it ended without suspending.
+    fn take_transfer(&self) -> Option<PendingSurfaceBackgroundTransfer> {
+        match std::mem::take(&mut *self.transfer()) {
+            SurfaceBackgroundTransfer::None => None,
+            SurfaceBackgroundTransfer::Waiting(transfer)
+            | SurfaceBackgroundTransfer::HandingOff(transfer) => Some(transfer),
+        }
+    }
 }
 
 impl RuntimeProviderSuspensionControl for RuntimeSurfaceBackgroundControl {
+    /// Called by the turn's generation, between provider events. A kept
+    /// subagent of this turn is recorded only on this same generation's
+    /// thread, while it runs a tool, and a generation that suspends here
+    /// runs no tool again. So a check that finds none running here holds
+    /// until the hand-off is done.
     fn take_suspension_request(&self) -> bool {
         if !self.requested.swap(false, Ordering::AcqRel) {
             return false;
         }
+        let mut state = self.transfer();
+        let SurfaceBackgroundTransfer::Waiting(transfer) = std::mem::take(&mut *state) else {
+            return false;
+        };
+        if self.kept_subagents_run() {
+            drop(state);
+            transfer.refuse_while_kept_subagents_run();
+            return false;
+        }
+        *state = SurfaceBackgroundTransfer::HandingOff(transfer);
+        drop(state);
         #[cfg(test)]
         {
             let delay_ms = self.take_delay_ms.swap(0, Ordering::AcqRel);
@@ -15076,6 +15564,7 @@ impl RuntimeProviderSuspensionControl for RuntimeSurfaceBackgroundControl {
 
 struct PendingSurfaceBackgroundTransfer {
     request_id: surface::SurfaceRequestId,
+    fence: surface::SurfaceOperationFence,
     client: surface::RuntimeSurfaceClientHandle,
     reply: SyncSender<
         Result<
@@ -15083,6 +15572,25 @@ struct PendingSurfaceBackgroundTransfer {
             surface::SurfaceClientCommandError,
         >,
     >,
+}
+
+impl PendingSurfaceBackgroundTransfer {
+    /// Answers that the turn stays in the foreground while its kept
+    /// subagents run, as an invalid request in its current state.
+    fn refuse_while_kept_subagents_run(self) {
+        let _ = self.reply.send(Ok(surface::MutationReply::Uncommitted {
+            mutation: surface::UncommittedMutation::Invalid {
+                request_id: self.request_id,
+                target: Some(surface::MutationTarget::Generation { fence: self.fence }),
+                error: surface::InvalidMutationError::new(surface::SurfaceMutationError {
+                    code: surface::SurfaceMutationErrorCode::IllegalState,
+                    message: surface::DisplayText::new(TURN_KEPT_IN_FOREGROUND_BY_ITS_SUBAGENTS),
+                    winning_request_id: None,
+                    current_revision: None,
+                }),
+            },
+        }));
+    }
 }
 
 struct ActiveGeneration {
@@ -17258,6 +17766,9 @@ impl ThreadActor {
         if resident_surface.is_some() {
             thread.thread_extensions().insert(shell_task_end_sink);
         }
+        let agent_controller = thread
+            .thread_extensions()
+            .get::<crate::agent_controller::AgentController>();
         let (state, usage_ledger) = ThreadActorState::new(thread);
         let mut background_controller = ResidentBackgroundController::new(background_capacity);
         retain_recovered_background_approvals(
@@ -17290,6 +17801,8 @@ impl ThreadActor {
             recap_workers: HashMap::new(),
             recap_inflight_keys: HashMap::new(),
             shell_task_ends: ShellTaskEnds::new(shell_task_end_inbox),
+            agent_controller,
+            subagents_stopped_by_person: HashSet::new(),
         }
     }
 
@@ -17509,7 +18022,7 @@ impl ThreadActor {
                     .thread
                     .session()
                     .task_registry()
-                    .undelivered_root_subagent_result_ids()
+                    .root_subagent_results_that_wake_parent()
             })
             .unwrap_or_default();
         // A wake whose turn left these same results undelivered (the session
@@ -17518,24 +18031,21 @@ impl ThreadActor {
         if owed.is_empty() || owed == self.last_child_results_wake_owed {
             return;
         }
-        let Some(observer) = self
-            .handle
-            .prompt_queue_observer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        else {
+        let started = self.runtime_started_turn(None);
+        if started.observer.is_none() {
             return;
-        };
+        }
         self.last_child_results_wake = Some(Instant::now());
         self.last_child_results_wake_owed = owed;
-        let mut started = self.runtime_started_turn(None);
-        started.observer = Some(observer);
-        if self
-            .start_runtime_turn_on_surface(CHILD_RESULTS_WAKE_PROMPT, &[], started.clone())
-            .is_ok()
-        {
-            return;
+        let follows_surface =
+            started.surface_observers.is_some() && self.resident_surface.0.is_some();
+        match self.start_runtime_turn_on_surface(CHILD_RESULTS_WAKE_PROMPT, &[], started.clone()) {
+            Ok(_) => return,
+            Err(error) if follows_surface => {
+                eprintln!("orca: finished background agents could not wake the thread: {error:?}");
+                return;
+            }
+            Err(_) => {}
         }
         // The surface could not take the turn: it runs unrecorded there, as
         // on a thread that has none.
@@ -17558,20 +18068,23 @@ impl ThreadActor {
     /// What a turn this thread starts on its own is watched and answered
     /// through: whatever the surface that shows the thread last handed over.
     fn runtime_started_turn(&self, turn_id: Option<TurnId>) -> RuntimeStartedTurn {
+        let observers = self
+            .handle
+            .prompt_queue_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         RuntimeStartedTurn {
             turn_id,
-            observer: self
-                .handle
-                .prompt_queue_observer
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
+            observer: observers.as_ref().map(|observers| observers.raw.clone()),
+            surface_observers: observers.and_then(|observers| observers.surface),
             interaction_handlers: self
                 .handle
                 .prompt_queue_interaction_handlers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
+            headless_root: false,
         }
     }
 
@@ -17641,6 +18154,13 @@ impl ThreadActor {
             started.clone(),
         ) {
             Ok(operation_id) => Ok(Ok(operation_id)),
+            Err(error)
+                if started.surface_observers.is_some() && self.resident_surface.0.is_some() =>
+            {
+                Ok(Err(RuntimeHostError::ThreadStartFailed {
+                    message: format!("queued surface admission failed: {error:?}"),
+                }))
+            }
             // The surface could not take the turn: it runs unrecorded there,
             // as on a thread that has none.
             Err(_) => {
@@ -18180,6 +18700,7 @@ impl ThreadActor {
             return;
         };
         let task_registry = state.thread.session().task_registry().clone();
+        self.settle_stranded_kept_subagents(&task_registry);
         if !task_registry.supports_detached_subagent_relay() {
             return;
         }
@@ -18783,6 +19304,7 @@ impl ThreadActor {
                                 active.generation.cancel.cancel();
                                 // The interrupted generation still needs its actor to
                                 // acknowledge the reply before it can finish.
+                                let mut reply_ack_failed = false;
                                 let generation_result = loop {
                                     let command = tokio::select! {
                                         biased;
@@ -18796,6 +19318,10 @@ impl ThreadActor {
                                             let result = self.commit_surface_provider_response(
                                                 &mut active, fence, &response,
                                             );
+                                            if result.is_err() {
+                                                reply_ack_failed = true;
+                                                active.mailbox_closed_under_generation = false;
+                                            }
                                             let _ = reply.send(result);
                                         }
                                         Some(ThreadCommand::ShutdownThread { reply, .. }) => {
@@ -18803,7 +19329,16 @@ impl ThreadActor {
                                                 let _ = reply.send(ThreadShutdownAck::Retry);
                                             }
                                         }
-                                        Some(command) => Self::reject_thread_command_unavailable(command),
+                                        Some(command) => {
+                                            if !reply_ack_failed
+                                                && command.surface_operation_fence().is_some_and(|fence| {
+                                                    active.surface_operation.as_ref() == Some(fence)
+                                                })
+                                            {
+                                                active.mailbox_closed_under_generation = true;
+                                            }
+                                            Self::reject_thread_command_unavailable(command);
+                                        }
                                         None => break (&mut active.generation.join).await,
                                     }
                                 };
@@ -18844,6 +19379,9 @@ impl ThreadActor {
                                 self.active = Some(active);
                                 continue;
                             }
+                            // Taken before the terminalization cancels the
+                            // generation; see `mailbox_closed_under_generation`.
+                            let ended_before_close = active.generation.join.is_finished();
                             if let Err(error) = self
                                 .commit_surface_terminalization(&mut active, terminalization)
                             {
@@ -18882,6 +19420,7 @@ impl ThreadActor {
                                 self.active = Some(active);
                                 continue;
                             }
+                            active.mailbox_closed_under_generation = !ended_before_close;
                             command_rx.close();
                             active.generation.cancel.cancel();
                             Self::drain_closed_thread_commands(&mut command_rx);
@@ -18983,6 +19522,13 @@ impl ThreadActor {
         self.recap_cancellations.clear();
         self.recap_inflight_keys.clear();
         self.seal_resident_surface(subscription_seal_reason);
+        self.handle
+            .prompt_queue_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.handle
+            .set_prompt_queue_interaction_handlers(PromptQueueInteractionHandlers::default());
         if let Some(state) = self.state.as_ref() {
             state
                 .thread
@@ -19233,13 +19779,16 @@ impl ThreadActor {
                 ThreadCommand::StartTurn { reply, .. } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
+                ThreadCommand::StartDelegatedTurnOnSurface { reply, .. } => {
+                    let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
+                }
                 ThreadCommand::LaunchWorkflow { reply, .. } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
                 ThreadCommand::InterruptOperation { reply, .. } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
-                ThreadCommand::InterruptActive { reply } => {
+                ThreadCommand::InterruptActive { reply, .. } => {
                     let _ = reply.send(Err(RuntimeHostError::ThreadUnavailable));
                 }
                 ThreadCommand::PauseGoalRun { reply, .. } => {
@@ -19441,7 +19990,10 @@ impl ThreadActor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let _ = observe_event(observer.as_deref(), event);
+        let _ = observe_event(
+            observer.as_ref().map(|observers| observers.raw.as_ref()),
+            event,
+        );
     }
 
     fn handle_idle_command(&mut self, command: ThreadCommand) {
@@ -19753,21 +20305,30 @@ impl ThreadActor {
                     "runtime generation is not active",
                 )));
             }
-            ThreadCommand::SurfaceCommitSubagentActivity { event, reply, .. } => {
+            ThreadCommand::SurfaceCommitSubagentActivity {
+                fence,
+                event,
+                reply,
+            } => {
+                let registry = self
+                    .state
+                    .as_ref()
+                    .map(|state| state.thread.session().task_registry().clone())
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotConnected, "runtime state is unavailable")
+                    });
                 let result = if matches!(&event.owner, SubagentActivityOwner::DetachedTask { .. }) {
-                    self.state
-                        .as_ref()
-                        .map(|state| state.thread.session().task_registry().clone())
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::NotConnected,
-                                "runtime state is unavailable",
-                            )
-                        })
-                        .and_then(|registry| {
-                            self.commit_detached_subagent_activity(&registry, event)
-                        })
+                    registry.and_then(|registry| {
+                        self.commit_detached_subagent_activity(&registry, event)
+                    })
+                } else if self.is_late_kept_subagent_end(&event) {
+                    registry.and_then(|registry| {
+                        self.commit_late_kept_subagent_end(&fence, &registry, event)
+                    })
                 } else {
+                    // Only the end of a kept child outlives its turn; its
+                    // progress, and any report of a child the host does not
+                    // keep, is refused once the turn is over.
                     Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "runtime generation is not active",
@@ -20057,7 +20618,7 @@ impl ThreadActor {
                 let result = if self
                     .admits_surface_client(&client, surface::SurfaceCapability::ManageTask)
                 {
-                    self.control_surface_task(&client, request_id, action)
+                    self.control_surface_task(&client, request_id, action, None)
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
@@ -20306,7 +20867,7 @@ impl ThreadActor {
                     surface_execution_failure: None,
                     surface_execution_failure_diagnostic: None,
                     surface_background_control: None,
-                    pending_surface_background_transfer: None,
+                    mailbox_closed_under_generation: false,
                 });
                 let _ = reply.send(Ok(OperationHandle {
                     operation_id,
@@ -20314,6 +20875,15 @@ impl ThreadActor {
                     thread: self.handle.clone(),
                     completion,
                 }));
+            }
+            ThreadCommand::StartDelegatedTurnOnSurface {
+                prompt,
+                started,
+                writer,
+                reply,
+            } => {
+                let result = self.start_delegated_turn_on_surface(&prompt, started, writer);
+                let _ = reply.send(result);
             }
             ThreadCommand::LaunchWorkflow { request, reply } => {
                 let result = self.launch_hosted_workflow(*request);
@@ -20327,8 +20897,8 @@ impl ThreadActor {
                     requested_operation_id: operation_id,
                 }));
             }
-            ThreadCommand::InterruptActive { reply } => {
-                let _ = reply.send(Ok(()));
+            ThreadCommand::InterruptActive { reply, .. } => {
+                let _ = reply.send(Ok(None));
             }
             ThreadCommand::PauseGoalRun {
                 operation_id,
@@ -20569,6 +21139,18 @@ impl ThreadActor {
     }
 
     fn handle_running_command(&mut self, command: ThreadCommand, active: &mut ActiveOperation) {
+        if matches!(
+            &command,
+            ThreadCommand::SurfaceRequestToolApproval { fence, .. }
+                | ThreadCommand::SurfaceRequestPermission { fence, .. }
+                | ThreadCommand::SurfaceRequestUserInput { fence, .. }
+                | ThreadCommand::SurfaceRequestMcpElicitation { fence, .. }
+                if active.surface_operation.as_ref() == Some(fence)
+        ) && self.interrupt_if_follow_gapped(active)
+        {
+            Self::reject_thread_command_unavailable(command);
+            return;
+        }
         let permitted_during_manual_precommit = matches!(
             &command,
             ThreadCommand::SurfaceWaitOperationTerminal { .. }
@@ -20719,33 +21301,33 @@ impl ThreadActor {
                         }
                     }
                 }
-                let accepted = can_control
-                    && active.pending_surface_background_transfer.is_none()
-                    && !active.request.surface_goal_owned
-                    && self.background_controller.has_capacity(1)
-                    && active.surface_operation.as_ref().is_some_and(|fence| {
-                        matches!(
+                let Some(control) = active.surface_background_control.clone() else {
+                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
+                    return;
+                };
+                let fence = active.surface_operation.clone().filter(|fence| {
+                    can_control
+                        && !control.has_pending_transfer()
+                        && !active.request.surface_goal_owned
+                        && self.background_controller.has_capacity(1)
+                        && matches!(
                             &target,
                             surface::BackgroundTarget::ActiveGeneration {
                                 fence: requested,
                             } if requested == fence
-                        ) && self.bind_surface_operation_controller(&client, &fence.operation_id)
-                    });
-                let Some(control) = active.surface_background_control.as_ref() else {
+                        )
+                        && self.bind_surface_operation_controller(&client, &fence.operation_id)
+                });
+                let Some(fence) = fence else {
                     let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
                     return;
                 };
-                if !accepted {
-                    let _ = reply.send(Err(surface::SurfaceClientCommandError::RuntimeUnavailable));
-                    return;
-                }
-                active.pending_surface_background_transfer =
-                    Some(PendingSurfaceBackgroundTransfer {
-                        request_id,
-                        client,
-                        reply,
-                    });
-                control.request();
+                control.request(PendingSurfaceBackgroundTransfer {
+                    request_id,
+                    fence,
+                    client,
+                    reply,
+                });
             }
             ThreadCommand::SurfacePauseGoalOperation {
                 client,
@@ -20932,7 +21514,7 @@ impl ThreadActor {
                 let result = if self
                     .admits_surface_client(&client, surface::SurfaceCapability::ManageTask)
                 {
-                    self.control_surface_task(&client, request_id, action)
+                    self.control_surface_task(&client, request_id, action, Some(&*active))
                 } else {
                     Err(surface::SurfaceClientCommandError::Unauthorized)
                 };
@@ -20998,6 +21580,12 @@ impl ThreadActor {
             } => {
                 let result = self.commit_surface_subagent_activity(active, fence, event);
                 let _ = reply.send(result);
+                // An agent of the turn that reports runs in this process: a
+                // hand-off asked for before it started is not left waiting
+                // for the generation to refuse it.
+                if let Some(control) = active.surface_background_control.as_ref() {
+                    control.refuse_waiting_transfer_if_kept_subagents_run();
+                }
             }
             ThreadCommand::SurfaceDrainSubagentRelay {
                 fence,
@@ -21617,6 +22205,11 @@ impl ThreadActor {
                     operation_id: active.operation_id,
                 }));
             }
+            ThreadCommand::StartDelegatedTurnOnSurface { reply, .. } => {
+                let _ = reply.send(Err(RuntimeHostError::OperationActive {
+                    operation_id: active.operation_id,
+                }));
+            }
             ThreadCommand::LaunchWorkflow { reply, .. } => {
                 let _ = reply.send(Err(RuntimeHostError::OperationActive {
                     operation_id: active.operation_id,
@@ -21662,11 +22255,12 @@ impl ThreadActor {
                 };
                 let _ = reply.send(Ok(result));
             }
-            ThreadCommand::InterruptActive { reply } => {
-                self.pause_prompt_queue_for_interrupt();
-                active.generation.user_interrupted = true;
-                Self::cancel_active_task_tree(active);
-                let _ = reply.send(Ok(()));
+            ThreadCommand::InterruptActive {
+                expected_follow,
+                reply,
+            } => {
+                let _ =
+                    reply.send(self.interrupt_current_generation(active, expected_follow.as_ref()));
             }
             ThreadCommand::PauseGoalRun {
                 operation_id,
@@ -22028,6 +22622,71 @@ impl ThreadActor {
         }
     }
 
+    fn interrupt_if_follow_gapped(&mut self, active: &mut ActiveOperation) -> bool {
+        let Some(follow) = self.operation_recovery.followed.as_ref().filter(|follow| {
+            active
+                .surface_operation
+                .as_ref()
+                .is_some_and(|fence| fence.operation_id == follow.operation)
+                && follow.gapped.load(std::sync::atomic::Ordering::Acquire)
+        }) else {
+            return false;
+        };
+        let operation = follow.operation.clone();
+        if let Err(error) = self.interrupt_current_generation(active, Some(&operation)) {
+            eprintln!("orca: cannot interrupt gapped follow: {error}");
+        }
+        true
+    }
+
+    fn interrupt_current_generation(
+        &mut self,
+        active: &mut ActiveOperation,
+        expected_follow: Option<&surface::SurfaceOperationId>,
+    ) -> Result<Option<OperationCompletion>, RuntimeHostError> {
+        let followed = active.surface_operation.as_ref().filter(|fence| {
+            self.operation_recovery
+                .followed
+                .as_ref()
+                .is_some_and(|follow| follow.operation == fence.operation_id)
+        });
+        if expected_follow
+            .is_some_and(|expected| followed.is_none_or(|fence| &fence.operation_id != expected))
+        {
+            return Ok(None);
+        }
+        self.pause_prompt_queue_for_interrupt();
+        if let Some(fence) = followed.cloned().filter(|fence| {
+            expected_follow.is_some()
+                || self
+                    .resident_surface
+                    .coordinator
+                    .state()
+                    .snapshot()
+                    .interactions
+                    .iter()
+                    .any(|request| {
+                        request.fence == *fence
+                            && request.lifecycle == surface::SurfaceInteractionLifecycle::Requested
+                    })
+        }) {
+            if active.surface_terminalization.is_none() {
+                self.commit_surface_terminalization_batch(
+                    active,
+                    &fence,
+                    surface::TerminalizationCause::UserCancel,
+                )
+                .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                    message: format!("failed to commit typed user interrupt: {error:?}"),
+                })?;
+            }
+        } else {
+            Self::cancel_active_task_tree(active);
+        }
+        active.generation.user_interrupted = true;
+        Ok(Some(active.completion.clone()))
+    }
+
     fn cancel_active_task_tree(active: &ActiveOperation) {
         active.generation.cancel.cancel();
         let root_task_id = active.root_task_id.clone();
@@ -22045,13 +22704,14 @@ impl ThreadActor {
 
     fn finish_surface_background_transfer(
         &mut self,
-        mut active: ActiveOperation,
+        active: ActiveOperation,
         result: Result<OperationTaskResult, tokio::task::JoinError>,
         allow_resume: bool,
     ) -> Result<(), RuntimeHostError> {
         let pending = active
-            .pending_surface_background_transfer
-            .take()
+            .surface_background_control
+            .as_ref()
+            .and_then(|control| control.take_transfer())
             .expect("background transfer is pending");
         let provider_suspended = matches!(
             &result,
@@ -22448,7 +23108,23 @@ impl ThreadActor {
         allow_resume: bool,
         settle_lost_goal_turn: bool,
     ) -> Result<(), RuntimeHostError> {
-        if active.pending_surface_background_transfer.is_some() {
+        // Only the generation's own error can come from the mailbox a
+        // shutdown closed under it. A failure met below, after the
+        // generation returned (a durable write, the writer's finish,
+        // background work), is not the shutdown's doing and keeps its error.
+        if !result.as_ref().is_ok_and(|result| {
+            matches!(
+                result.outcome,
+                GenerationTaskOutcome::ExecutionFailed { .. }
+            )
+        }) {
+            active.mailbox_closed_under_generation = false;
+        }
+        if active
+            .surface_background_control
+            .as_ref()
+            .is_some_and(|control| control.has_pending_transfer())
+        {
             return self.finish_surface_background_transfer(active, result, allow_resume);
         }
         let mut surface_usage = UsageTotals::default();
@@ -29190,6 +29866,285 @@ mod tests {
     }
 
     #[test]
+    fn fix4_foreign_request_at_a_gapped_follow_does_not_cancel_the_active_turn() {
+        let cwd = tempfile::tempdir().unwrap();
+        let marker = ReleaseMarker(cwd.path().join("release-follow"));
+        let host = RuntimeHost::start().unwrap();
+        let config = surface_test_config(cwd.path().to_owned(), HistoryMode::Record);
+        let thread = host.start_thread(config, "foreign request").unwrap();
+        let (sender, follows) = mpsc::channel();
+        thread.set_prompt_queue_surface_observer(
+            Arc::new(|_: &orca_core::event_schema::EventEnvelope| Ok(())),
+            sender,
+        );
+        thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text(format!(
+                    "mock_stream_release_marker {}",
+                    marker.0.display()
+                )),
+            })
+            .unwrap();
+        let mut follow = follows.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        let fence = loop {
+            let Some(surface::SurfaceSubscriptionItem::Batch { batch }) =
+                follow.subscription.recv_timeout(SURFACE_TEST_TIMEOUT)
+            else {
+                panic!("no followed start")
+            };
+            if let Some(fence) = batch
+                .events
+                .as_slice()
+                .iter()
+                .find_map(|envelope| match &envelope.event {
+                    surface::SurfaceEvent::Operation(
+                        surface::OperationPatch::AgentLoopTurnStarted { turn },
+                    ) => Some(turn.fence.clone()),
+                    _ => None,
+                })
+            {
+                break fence;
+            }
+        };
+        follow
+            .subscription
+            .gap_signal()
+            .store(true, std::sync::atomic::Ordering::Release);
+        let foreign = surface::SurfaceOperationFence {
+            operation_id: surface::SurfaceOperationId::try_from_bytes(
+                *uuid::Uuid::now_v7().as_bytes(),
+            )
+            .unwrap(),
+            ..fence
+        };
+        let (reply, answer) = mpsc::sync_channel(1);
+        thread
+            .command_tx
+            .try_send(ThreadCommand::SurfaceRequestUserInput {
+                fence: foreign,
+                request: crate::lifecycle::RuntimeUserInputRequest::single(
+                    "foreign",
+                    "?",
+                    Vec::new(),
+                ),
+                reply,
+            })
+            .unwrap();
+        assert!(answer.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap().is_err());
+        marker.release();
+        let receipt = follow
+            .client
+            .wait_operation_terminal(surface_request_id(), follow.operation.clone())
+            .unwrap();
+        host.shutdown().unwrap();
+        assert!(
+            matches!(receipt, surface::WaitOperationTerminalResult::Terminal { value } if matches!(value.terminal, surface::OperationTerminal::Succeeded {..})),
+            "foreign request cancelled main"
+        );
+    }
+
+    #[test]
+    fn queued_surface_request_is_committed_and_granted_to_the_follower() {
+        followed_queued_approval(false);
+    }
+
+    #[test]
+    fn host_interrupt_commits_followed_request_cancellation_before_terminal() {
+        followed_queued_approval(true);
+    }
+
+    fn followed_queued_approval(interrupt: bool) {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("witness.txt"), "before").unwrap();
+        let mut config = surface_test_config(cwd.path().to_owned(), HistoryMode::Record);
+        config.approval_mode = orca_core::approval_types::ApprovalMode::Suggest;
+        let host = RuntimeHost::start().unwrap();
+        let thread = host.start_thread(config, "queued approval").unwrap();
+        let (sender, follows) = mpsc::channel();
+        thread.set_prompt_queue_surface_observer(
+            Arc::new(|_: &orca_core::event_schema::EventEnvelope| Ok(())),
+            sender,
+        );
+        thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text(
+                    "edit witness.txt :: before => after",
+                ),
+            })
+            .unwrap();
+        let mut follow = follows.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let mut requested = None;
+        while let Some(surface::SurfaceSubscriptionItem::Batch { batch }) = follow
+            .subscription
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            if let Some(interaction) =
+                batch
+                    .events
+                    .as_slice()
+                    .iter()
+                    .find_map(|envelope| match &envelope.event {
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Requested { interaction },
+                        ) if interaction.fence.operation_id == follow.operation => {
+                            Some(interaction.clone())
+                        }
+                        _ => None,
+                    })
+            {
+                requested = Some(interaction);
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        let request = requested.expect("missing committed request for queued edit");
+        assert!(
+            matches!(&request.route, surface::SurfaceInteractionRoute::Exclusive { attachment_id, .. } if attachment_id == follow.client.attachment_id())
+        );
+        if interrupt {
+            assert!(thread.interrupt_active_with_completion().unwrap().is_some());
+            let mut cancelled_at = None;
+            'terminal: loop {
+                let Some(surface::SurfaceSubscriptionItem::Batch { batch }) =
+                    follow.subscription.recv_timeout(SURFACE_TEST_TIMEOUT)
+                else {
+                    panic!("missing committed terminal")
+                };
+                for envelope in batch.events.as_slice() {
+                    match &envelope.event {
+                        surface::SurfaceEvent::Interaction(
+                            surface::InteractionPatch::Cancelled {
+                                interaction_id,
+                                reason:
+                                    surface::InteractionCancelReason::OperationCancelled {
+                                        reason: surface::CancelReason::User,
+                                    },
+                                ..
+                            },
+                        ) if interaction_id == &request.interaction_id => {
+                            cancelled_at = Some(batch.cursor_after.next_seq)
+                        }
+                        surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                            record,
+                        }) if record.operation_id == follow.operation => {
+                            assert!(matches!(
+                                record.terminal,
+                                surface::OperationTerminal::Cancelled {
+                                    reason: surface::CancelReason::User
+                                }
+                            ));
+                            assert!(
+                                cancelled_at.is_some_and(|seq| seq < batch.cursor_after.next_seq),
+                                "request cancellation must be committed before the operation terminal"
+                            );
+                            break 'terminal;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            committed_surface_value(
+                follow
+                    .client
+                    .respond_interaction_by_id(
+                        surface_request_id(),
+                        request.interaction_id,
+                        surface::SurfaceClientInteractionAnswer::ToolApproval {
+                            decision: surface::SurfaceAllowDeny::Deny,
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            follow
+                .client
+                .wait_operation_terminal(surface_request_id(), follow.operation.clone())
+                .unwrap(),
+            surface::WaitOperationTerminalResult::Terminal { .. }
+        ));
+        drop(follow);
+        host.shutdown().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cwd.path().join("witness.txt")).unwrap(),
+            "before"
+        );
+    }
+
+    #[test]
+    fn queued_surface_follower_receives_the_repaired_final_commit() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().unwrap();
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_owned(), HistoryMode::Record),
+                "queued repair",
+            )
+            .unwrap();
+        let path = SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap()
+            .path;
+        let (send, follows) = mpsc::channel();
+        let (raw, observed) = mpsc::channel();
+        thread.set_prompt_queue_surface_observer(
+            Arc::new(move |_: &orca_core::event_schema::EventEnvelope| {
+                let _ = raw.send(());
+                Ok(())
+            }),
+            send,
+        );
+        surface::JsonlSurfaceCommitLedger::inject_generation_append_failure_once(path.clone());
+        surface::JsonlSurfaceCommitLedger::inject_terminal_append_failure_once(path);
+        thread
+            .prompt_queue(crate::prompt_queue::PromptQueueAction::Add {
+                input: crate::prompt_queue::PromptQueueInput::text("queued repair"),
+            })
+            .unwrap();
+        let mut follow = follows.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap();
+        let mut cursor = follow.baseline.cursor;
+        loop {
+            let Some(surface::SurfaceSubscriptionItem::Batch { batch }) =
+                follow.subscription.recv_timeout(SURFACE_TEST_TIMEOUT)
+            else {
+                panic!("no repaired terminal on queue subscription")
+            };
+            assert_eq!(batch.cursor_before, cursor);
+            cursor = batch.cursor_after.clone();
+            if let Some(record) =
+                batch
+                    .events
+                    .as_slice()
+                    .iter()
+                    .find_map(|event| match &event.event {
+                        surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                            record,
+                        }) if record.operation_id == follow.operation => Some(record),
+                        _ => None,
+                    })
+            {
+                assert!(matches!(
+                    record.terminal,
+                    surface::OperationTerminal::Failed {
+                        class: surface::FailureClass::Persistence,
+                        ..
+                    }
+                ));
+                break;
+            }
+        }
+        host.shutdown().unwrap();
+        assert!(
+            observed.try_iter().next().is_none(),
+            "the repaired typed operation must not also run through the legacy observer"
+        );
+    }
+
+    #[test]
     fn failed_typed_admission_is_terminal_and_allows_next_turn_without_restart() {
         let cwd = tempfile::tempdir().unwrap();
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
@@ -31159,18 +32114,14 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let host = RuntimeHost::start().expect("start durable provider outcome recovery host");
         let config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Resume(thread_id));
-        #[cfg(unix)]
-        let config = if mode == "approval-mcp" {
-            RunConfig {
-                mcp_servers: vec![slow_mcp_server("slow", cwd.path(), Some(2))],
-                ..config
-            }
-        } else {
-            config
-        };
         let thread = if mode == "approval-mcp" {
             #[cfg(unix)]
             {
+                let (server, hold) = held_mcp_server("slow", cwd.path());
+                let config = RunConfig {
+                    mcp_servers: vec![server],
+                    ..config
+                };
                 let other = host
                     .start_thread(
                         surface_test_config(cwd.path().to_path_buf(), HistoryMode::Disabled),
@@ -31190,15 +32141,19 @@ mod tests {
                     assert!(Instant::now() < deadline, "slow MCP never started");
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                let started = Instant::now();
                 host.handle()
                     .resolve_live_thread(other.thread_id())
                     .unwrap();
+                fs::remove_file(hold).expect("release initialize after the supervisor replies");
+                let recovered = recovering.join().unwrap();
                 assert!(
-                    started.elapsed() < Duration::from_millis(300),
-                    "MCP recovery blocked the host supervisor"
+                    recovered
+                        .mcp_registry()
+                        .resolve_tool("mcp__slow__wait")
+                        .is_some(),
+                    "the supervisor must reply before the held initialize times out"
                 );
-                recovering.join().unwrap()
+                recovered
             }
             #[cfg(not(unix))]
             unreachable!("MCP recovery fixture requires Unix");
@@ -32656,6 +33611,51 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_agents_session_is_read_without_taking_its_thread() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let host = RuntimeHost::start().unwrap();
+        host.handle().keep_subagents_in_process();
+        let parent = host.start_thread(config, "parent").unwrap();
+        let surface = parent.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        run_surface_turn_to_success(&surface, &attachment, "subagent sync mock_usage");
+        let marker = cwd.path().join("release-main");
+        let (operation, _) = admit_surface_turn(
+            &surface,
+            &attachment,
+            &format!("mock_stream_release_marker {}", marker.display()),
+        );
+        let snapshot = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let child = &snapshot.subagents[0];
+        let id =
+            uuid::Uuid::from_bytes(*child.child_thread_id.as_ref().unwrap().as_bytes()).to_string();
+        assert_eq!(
+            snapshot.foreground_operation.as_ref().unwrap().operation_id,
+            operation
+        );
+        let transcript = surface::RuntimeSurfaceHostHandle::load_saved_session(&id).unwrap();
+        assert_eq!(transcript.meta.session_id, id);
+        assert_eq!(
+            transcript.meta.parent_id.as_deref(),
+            Some(parent.thread_id())
+        );
+        assert!(transcript.messages.iter().any(|message| matches!(message, orca_core::conversation::Message::Assistant {content:Some(text),..} if text.contains("usage accounting"))));
+        std::fs::write(marker, "done").unwrap();
+        assert!(
+            matches!(attachment.client.wait_operation_terminal(surface_request_id(), operation).unwrap(), surface::WaitOperationTerminalResult::Terminal {value} if matches!(value.terminal, surface::OperationTerminal::Succeeded {..}))
+        );
+        run_surface_turn_to_success(&surface, &attachment, "mock_usage");
+        host.shutdown().unwrap();
+    }
+
+    #[test]
     fn a_finished_sync_agents_transcript_is_read_from_its_child_session() {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
@@ -33939,6 +34939,22 @@ mod tests {
         });
     }
 
+    fn remove_owner_stamp_for_legacy_fixture(home: &std::path::Path, session_id: &str, id: &str) {
+        let path = home
+            .join("task-sessions")
+            .join(session_id)
+            .join("tasks.json");
+        let mut records: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let stamp = records[id]
+            .as_object_mut()
+            .unwrap()
+            .remove("registry_owner")
+            .unwrap();
+        assert_eq!(stamp["session"], session_id);
+        std::fs::write(path, serde_json::to_vec(&records).unwrap()).unwrap();
+    }
+
     #[test]
     fn recorded_restart_adopts_and_stops_registry_only_running_main_session_once() {
         let _env = crate::history::lock_test_env();
@@ -33979,7 +34995,10 @@ mod tests {
             let before = registry
                 .get(&legacy.id)
                 .expect("active task before adoption");
+            let stamped = registry.create_main_session("crashed stamped main task".into());
+            registry.mark_running(&stamped.id).unwrap();
             drop(registry);
+            remove_owner_stamp_for_legacy_fixture(home, &session_id, &legacy.id);
 
             let resumed_host = RuntimeHost::start_with_executor(Arc::new(PanicExecutor))
                 .expect("start first active-adoption host");
@@ -33992,6 +35011,14 @@ mod tests {
                     "first active adoption",
                 )
                 .expect("resume registry-only active task");
+            let ended = resumed.task_registry().get(&stamped.id).unwrap();
+            assert_eq!(ended.status, TaskStatus::Failed);
+            assert_eq!(
+                ended.error.as_deref(),
+                Some(
+                    "main session interrupted before completion; async task execution is process-local"
+                )
+            );
             let first_snapshot = fresh_surface_attachment_with_capabilities(
                 &resumed.surface(),
                 BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
@@ -34371,6 +35398,7 @@ mod tests {
                 .get(&legacy.id)
                 .expect("active task before failure");
             drop(registry);
+            remove_owner_stamp_for_legacy_fixture(home, &session_id, &legacy.id);
             surface::JsonlSurfaceCommitLedger::inject_active_task_adoption_append_failures(
                 transcript_path.clone(),
                 SURFACE_SEMANTIC_COMMIT_RETRY_ATTEMPTS,
@@ -34918,6 +35946,3166 @@ mod tests {
             surface::MutationReply::Uncommitted { .. }
         ));
         host.shutdown().expect("shutdown typed task stop host");
+    }
+
+    /// The subagent patches and the task patches that set `status`, of the
+    /// batches a parent's subscription has seen so far.
+    fn subagent_terminals_seen(
+        subscription: &mut surface::SurfaceSubscriptionReceiver,
+        task_id: &surface::SurfaceTaskId,
+        subagent_id: &surface::SurfaceSubagentId,
+        status: surface::SurfaceTaskStatus,
+        seen: &mut (usize, usize),
+    ) {
+        while let Some(item) = subscription.try_recv() {
+            let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                continue;
+            };
+            for envelope in batch.events.as_slice() {
+                match &envelope.event {
+                    surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {
+                        task_id: changed,
+                        status: changed_to,
+                        ..
+                    }) if changed == task_id && *changed_to == status => seen.0 += 1,
+                    surface::SurfaceEvent::Subagent(
+                        surface::SubagentPatch::Completed {
+                            subagent_id: ended, ..
+                        }
+                        | surface::SubagentPatch::Stopped {
+                            subagent_id: ended, ..
+                        }
+                        | surface::SubagentPatch::Settled {
+                            subagent_id: ended, ..
+                        },
+                    ) if ended == subagent_id => seen.1 += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// A person's stop of the agent whose task is `task_id` (the command its
+    /// `s` key sends), fenced on the task's revision as the parent's surface
+    /// shows it, and how long the answer kept took. The agent's own reports
+    /// move that revision on, so one landing between the read and the stop
+    /// makes the answer stale; the stop is then asked once more, on the
+    /// revision the surface shows by then.
+    fn stop_agent_as_a_person(
+        attachment: &surface::FreshSurfaceAttachment,
+        read_snapshot: impl Fn() -> Arc<surface::SurfaceSnapshot>,
+        task_id: &surface::SurfaceTaskId,
+    ) -> (surface::MutationReply<surface::TaskControlOutput>, Duration) {
+        let ask = || {
+            let task = read_snapshot()
+                .tasks
+                .iter()
+                .find(|task| task.task_id == *task_id)
+                .cloned()
+                .expect("the agent's task");
+            let asked = Instant::now();
+            let reply = attachment
+                .client
+                .task_control(
+                    surface_request_id(),
+                    surface::TaskControlAction::Stop {
+                        fence: surface::SurfaceTaskFence {
+                            task_id: task.task_id.clone(),
+                            task_revision: task.revision,
+                            background_owner: task.background_fence.clone(),
+                        },
+                    },
+                )
+                .expect("ask to stop the agent");
+            (reply, asked.elapsed())
+        };
+        let first = ask();
+        if matches!(
+            &first.0,
+            surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Stale { .. }
+            }
+        ) {
+            return ask();
+        }
+        first
+    }
+
+    /// Waits until the parent's surface shows one running agent described as
+    /// each of `descriptions`, each on its own thread and past its start.
+    fn kept_agents_under_way(
+        read_snapshot: impl Fn() -> Arc<surface::SurfaceSnapshot>,
+        descriptions: &[&str],
+    ) -> Vec<surface::SurfaceSubagent> {
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let snapshot = read_snapshot();
+            let agents: Vec<_> = descriptions
+                .iter()
+                .filter_map(|description| {
+                    snapshot
+                        .subagents
+                        .iter()
+                        .find(|subagent| {
+                            subagent.description.as_str() == *description
+                                && subagent.status == surface::SurfaceSubagentStatus::Running
+                                && subagent.child_thread_id.is_some()
+                                && subagent.revision.get() >= 3
+                        })
+                        .cloned()
+                })
+                .collect();
+            if agents.len() == descriptions.len() {
+                return agents;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the kept agents {descriptions:?} never got under way: {:?}",
+                snapshot.subagents
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Stops the agents a keeping host runs on its threads when the test
+    /// that started them ends, a panic included, so that the host can end
+    /// instead of waiting on agents that stream for many seconds.
+    struct StopsKeptAgents(RuntimeHostHandle);
+
+    impl Drop for StopsKeptAgents {
+        fn drop(&mut self) {
+            let _ = self.0.stop_kept_subagents(Duration::from_secs(5));
+        }
+    }
+
+    /// A parent's turn on a host that keeps its children in its process,
+    /// admitted with `prompt` on a fresh thread, and what stops its agents
+    /// once the test is done with them.
+    fn start_keeping_parent_turn(
+        host: &RuntimeHost,
+        cwd: &std::path::Path,
+        prompt: &str,
+    ) -> (
+        RuntimeThreadHandle,
+        surface::FreshSurfaceAttachment,
+        surface::SurfaceOperationId,
+        StopsKeptAgents,
+    ) {
+        host.handle().keep_subagents_in_process();
+        let mut config = surface_test_config(cwd.to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let thread = host
+            .start_thread(config, "a keeping parent")
+            .expect("start parent thread");
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &thread.surface(),
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageTask,
+            ]),
+        );
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(&attachment.baseline.snapshot, prompt),
+                )
+                .expect("reserve the parent's turn"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit the parent's turn"),
+        );
+        assert!(
+            matches!(admitted, surface::AdmissionOutput::Admitted { .. }),
+            "the parent's turn was queued"
+        );
+        (
+            thread,
+            attachment,
+            reserved.operation_id,
+            StopsKeptAgents(host.handle()),
+        )
+    }
+
+    /// How the parent's surface shows the agent whose task is `task_id`, once
+    /// its record and its row there have both ended.
+    fn kept_agent_end(
+        registry: &crate::tasks::TaskRegistry,
+        read_snapshot: impl Fn() -> Arc<surface::SurfaceSnapshot>,
+        task_id: &surface::SurfaceTaskId,
+        within: Duration,
+    ) -> (
+        crate::tasks::TaskRecord,
+        surface::SurfaceTask,
+        surface::SurfaceSubagent,
+    ) {
+        let deadline = Instant::now() + within;
+        loop {
+            let record = registry.get(task_id.as_str()).expect("the agent's record");
+            let snapshot = read_snapshot();
+            let task = snapshot
+                .tasks
+                .iter()
+                .find(|task| task.task_id == *task_id)
+                .cloned()
+                .expect("the agent's task on the parent's surface");
+            let subagent = snapshot
+                .subagents
+                .iter()
+                .find(|subagent| subagent.task_id == *task_id)
+                .cloned()
+                .expect("the agent on the parent's surface");
+            if !record.status.is_active() && task.completed_at.is_some() {
+                return (record, task, subagent);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the agent did not end: record {:?} {:?}, parent's surface {:?} {:?}",
+                record.status,
+                record.error,
+                task.status,
+                subagent.status
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A person's stop of a sync agent the TUI keeps on a thread of its
+    /// process: the turn waiting on it is told it was stopped and goes on,
+    /// and so does the agent that turn started before it.
+    #[test]
+    fn stopping_a_kept_sync_subagent_leaves_its_parent_turn_running() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start kept sync subagent stop host");
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
+            &host,
+            cwd.path(),
+            "subagent async_then_sync mock_stream_delay_ms 30000",
+        );
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let agents = kept_agents_under_way(read_snapshot, &["async child", "sync child"]);
+        let (sibling, sync_agent) = (&agents[0], &agents[1]);
+
+        let (reply, _) = stop_agent_as_a_person(&attachment, read_snapshot, &sync_agent.task_id);
+        match &reply {
+            surface::MutationReply::Committed { value, .. } => {
+                assert_eq!(value.task.status, surface::SurfaceTaskStatus::Running);
+            }
+            surface::MutationReply::Uncommitted { mutation } => {
+                panic!("the stop was refused: {mutation:?}")
+            }
+            surface::MutationReply::Deferred { .. } => panic!("the stop was deferred"),
+        }
+        let (record, task, shown) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &sync_agent.task_id,
+            Duration::from_secs(5),
+        );
+        assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        assert_eq!(task.status, surface::SurfaceTaskStatus::Stopped);
+        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
+
+        // The turn is told its agent was stopped and goes on to its next
+        // model call; a turn that ended with it would not have made one.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot = loop {
+            let snapshot = read_snapshot();
+            let went_on = snapshot.items.iter().any(|item| {
+                matches!(
+                    item,
+                    surface::SurfaceItem::AssistantMessage { text, .. }
+                        if text.as_str() == "Mock completed after tool execution."
+                )
+            });
+            let ended = snapshot
+                .foreground_operation
+                .as_ref()
+                .is_none_or(|operation| operation.terminal.is_some());
+            if went_on || ended {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the parent's turn neither went on nor ended"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            snapshot
+                .foreground_operation
+                .as_ref()
+                .is_some_and(|operation| operation.operation_id == operation_id
+                    && operation.terminal.is_none()),
+            "the parent's turn has ended: {:?}",
+            snapshot
+                .foreground_operation
+                .as_ref()
+                .map(|operation| &operation.terminal)
+        );
+        assert_eq!(
+            registry
+                .get(sibling.task_id.as_str())
+                .expect("the async agent's record")
+                .status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            snapshot
+                .subagents
+                .iter()
+                .find(|subagent| subagent.subagent_id == sibling.subagent_id)
+                .map(|subagent| subagent.status),
+            Some(surface::SurfaceSubagentStatus::Running)
+        );
+
+        let _ = attachment
+            .client
+            .cancel_operation(surface_request_id(), operation_id.clone());
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id);
+        // What the turn read of the call.
+        let told: Vec<_> = thread
+            .read_surface_history()
+            .expect("the parent's conversation")
+            .into_iter()
+            .filter_map(|message| match message {
+                surface::SurfaceHistoryMessage::Tool { content, .. } => {
+                    Some(content.as_str().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            told.iter().any(|content| content.contains(
+                "the person using Orca stopped this subagent from the Agents panel; it was not stopped by you and it did not fail. Do not start it again unless they ask."
+            )),
+            "{told:?}"
+        );
+        host.shutdown()
+            .expect("shutdown kept sync subagent stop host");
+    }
+
+    /// The `task_stop` tool's stop of a sync agent the TUI keeps is not a
+    /// person's: the agent reads cancelled, and the turn waiting on it ends
+    /// cancelled with it, as before a person could stop one agent.
+    #[test]
+    fn a_tools_stop_of_a_kept_sync_subagent_ends_the_turn_waiting_on_it() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start kept sync subagent tool stop host");
+        let (thread, _attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
+            &host,
+            cwd.path(),
+            "subagent sync mock_stream_delay_ms 30000",
+        );
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let agent = kept_agents_under_way(read_snapshot, &["mock_stream_delay_ms 30000"]).remove(0);
+
+        // What the `task_stop` tool asks of the registry.
+        registry
+            .request_stop(agent.task_id.as_str())
+            .expect("the tool's stop");
+
+        let (record, _, _) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &agent.task_id,
+            Duration::from_secs(5),
+        );
+        assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        assert_eq!(
+            record.result.as_deref(),
+            Some(crate::agent_controller::AGENT_CANCELLED)
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (snapshot, terminal) = loop {
+            let snapshot = read_snapshot();
+            let terminal = snapshot
+                .foreground_operation
+                .iter()
+                .chain(&snapshot.operation_history)
+                .find(|operation| operation.operation_id == operation_id)
+                .and_then(|operation| operation.terminal.clone());
+            if let Some(terminal) = terminal {
+                break (snapshot, terminal);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the parent's turn did not end with its agent"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            matches!(
+                terminal.terminal,
+                surface::OperationTerminal::Cancelled { .. }
+            ),
+            "the parent's turn ended cancelled: {:?}",
+            terminal.terminal
+        );
+        assert!(
+            !snapshot.items.iter().any(|item| matches!(
+                item,
+                surface::SurfaceItem::AssistantMessage { text, .. }
+                    if text.as_str() == "Mock completed after tool execution."
+            )),
+            "the turn made no model call after its agent was stopped"
+        );
+        let told: Vec<_> = thread
+            .read_surface_history()
+            .expect("the parent's conversation")
+            .into_iter()
+            .filter_map(|message| match message {
+                surface::SurfaceHistoryMessage::Tool { content, .. } => {
+                    Some(content.as_str().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !told
+                .iter()
+                .any(|content| content.contains("stopped this subagent from the Agents panel")),
+            "{told:?}"
+        );
+        host.shutdown()
+            .expect("shutdown kept sync subagent tool stop host");
+    }
+
+    /// A kept agent that is already being stopped, by the `task_stop` tool or
+    /// by its parent's interrupt, is not a person's stop: a person's `s` in
+    /// that window is answered, and the agent still ends cancelled.
+    #[test]
+    fn a_kept_subagent_already_stopping_is_not_relabelled_by_a_persons_stop() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start already stopping subagent host");
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
+            &host,
+            cwd.path(),
+            "subagent async mock_stream_slow_cancel_ms 3000",
+        );
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let agent =
+            kept_agents_under_way(read_snapshot, &["mock_stream_slow_cancel_ms 3000"]).remove(0);
+
+        // What the `task_stop` tool asks of the registry.
+        registry
+            .request_stop(agent.task_id.as_str())
+            .expect("the tool's stop");
+        let record = registry.get(agent.task_id.as_str()).expect("the record");
+        assert!(record.stop_requested && record.status.is_active());
+
+        let (reply, _) = stop_agent_as_a_person(&attachment, read_snapshot, &agent.task_id);
+        match &reply {
+            surface::MutationReply::Committed { value, .. } => {
+                assert_eq!(value.task.status, surface::SurfaceTaskStatus::Running);
+            }
+            surface::MutationReply::Uncommitted { mutation } => {
+                panic!("the stop was refused: {mutation:?}")
+            }
+            surface::MutationReply::Deferred { .. } => panic!("the stop was deferred"),
+        }
+        let (record, task, shown) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &agent.task_id,
+            Duration::from_secs(10),
+        );
+        assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        assert_eq!(
+            record.result.as_deref(),
+            Some(crate::agent_controller::AGENT_CANCELLED)
+        );
+        assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
+        assert_ne!(
+            shown
+                .subagent_activity_history
+                .last()
+                .map(|entry| entry.activity.as_str()),
+            Some("stopped by user")
+        );
+
+        let _ = attachment
+            .client
+            .cancel_operation(surface_request_id(), operation_id.clone());
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id);
+        host.shutdown()
+            .expect("shutdown already stopping subagent host");
+    }
+
+    /// A kept agent whose record has ended while its row still runs (its end
+    /// is on its way to the parent) is answered as already ended, and is not
+    /// remembered as a person's stop: its row ends as the agent did. Its
+    /// sibling keeps the parent's turn waiting, so the turn is still running.
+    #[test]
+    fn a_kept_subagent_whose_record_has_ended_is_answered_already_terminal() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start ended record subagent host");
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
+            &host,
+            cwd.path(),
+            "subagent batch async mock_stream_slow_cancel_ms 3000",
+        );
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let agent =
+            kept_agents_under_way(read_snapshot, &["mock_stream_slow_cancel_ms 3000"]).remove(0);
+
+        registry
+            .stop(agent.task_id.as_str(), "Task stopped".to_string())
+            .expect("end the agent's record");
+        // The agent reports its stream's start and then waits; its task's
+        // revision holds still from then on. That report is its fourth,
+        // after its start, its thread and its turn, and changes nothing but
+        // the revisions, so it is waited for by the agent's revision: a quiet
+        // spell is no sign of it, as a loaded machine can send it later.
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let before = loop {
+            let snapshot = read_snapshot();
+            let streaming = snapshot
+                .subagents
+                .iter()
+                .any(|subagent| subagent.task_id == agent.task_id && subagent.revision.get() >= 4);
+            if streaming {
+                break snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == agent.task_id)
+                    .map(|task| (task.revision, task.status))
+                    .expect("the agent's task");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the agent never reported its stream's start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(before.1, surface::SurfaceTaskStatus::Running);
+
+        let (reply, _) = stop_agent_as_a_person(&attachment, read_snapshot, &agent.task_id);
+        let surface::MutationReply::Uncommitted {
+            mutation: surface::UncommittedMutation::Invalid { error, .. },
+        } = reply
+        else {
+            panic!("the stop was not refused");
+        };
+        assert_eq!(
+            error.error().message.as_str(),
+            "subagent task is already terminal"
+        );
+        assert_eq!(
+            read_snapshot()
+                .tasks
+                .iter()
+                .find(|task| task.task_id == agent.task_id)
+                .map(|task| (task.revision, task.status)),
+            Some(before),
+            "the answer wrote nothing"
+        );
+        // Its end, once its turn is cancelled, is its own.
+        registry
+            .get(agent.task_id.as_str())
+            .expect("the agent's record")
+            .control
+            .cancel
+            .cancel();
+        let (_, task, shown) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &agent.task_id,
+            Duration::from_secs(10),
+        );
+        assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+        assert_ne!(
+            shown
+                .subagent_activity_history
+                .last()
+                .map(|entry| entry.activity.as_str()),
+            Some("stopped by user")
+        );
+
+        let _ = attachment
+            .client
+            .cancel_operation(surface_request_id(), operation_id.clone());
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id);
+        host.shutdown()
+            .expect("shutdown ended record subagent host");
+    }
+
+    /// Makes `cwd` a repository with one commit, which a worktree needs.
+    fn a_repository_with_a_commit(cwd: &std::path::Path) {
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "orca@example.test"]);
+        git(&["config", "user.name", "Orca Test"]);
+        std::fs::write(cwd.join("file.txt"), "placeholder").unwrap();
+        git(&["add", "file.txt"]);
+        git(&["commit", "-q", "-m", "seed"]);
+    }
+
+    /// A sync agent that runs in the parent's process without a thread of
+    /// its own (here, one isolated in a worktree) is shown running as the
+    /// turn's, but only its parent's cancel reaches it: a person's stop of
+    /// it is refused, as before the TUI kept its agents, and leaves its
+    /// record running, not stopping.
+    #[test]
+    fn a_persons_stop_of_an_agent_without_a_thread_of_its_own_is_refused() {
+        let cwd = tempfile::tempdir().unwrap();
+        a_repository_with_a_commit(cwd.path());
+        let host = RuntimeHost::start().expect("start threadless subagent stop host");
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
+            &host,
+            cwd.path(),
+            "subagent worktree sync mock_stream_delay_ms 30000",
+        );
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let agent = loop {
+            let found = read_snapshot()
+                .subagents
+                .iter()
+                .find(|subagent| {
+                    subagent.description.as_str() == "mock_stream_delay_ms 30000"
+                        && subagent.status == surface::SurfaceSubagentStatus::Running
+                })
+                .cloned();
+            if let Some(agent) = found {
+                break agent;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the agent never showed running: {:?}",
+                read_snapshot().subagents
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            matches!(
+                agent.owner,
+                surface::SurfaceSubagentOwner::Generation { .. }
+            ),
+            "{:?}",
+            agent.owner
+        );
+        let record = registry
+            .get(agent.task_id.as_str())
+            .expect("the agent's record");
+        assert_eq!(record.task_type, orca_core::task_types::TaskType::Subagent);
+        assert_eq!(record.worker_pid, None);
+        assert!(!record.control.runs_on_its_own_thread());
+
+        let (reply, _) = stop_agent_as_a_person(&attachment, read_snapshot, &agent.task_id);
+        let error = match reply {
+            surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Invalid { error, .. },
+            } => error,
+            surface::MutationReply::Uncommitted { mutation } => {
+                panic!("the stop was not refused as invalid: {mutation:?}")
+            }
+            surface::MutationReply::Committed { .. } => panic!("the stop was taken"),
+            surface::MutationReply::Deferred { .. } => panic!("the stop was deferred"),
+        };
+        assert_eq!(
+            error.error().message.as_str(),
+            "this subagent cannot be stopped independently"
+        );
+        let record = registry
+            .get(agent.task_id.as_str())
+            .expect("the agent's record");
+        assert_eq!(record.status, TaskStatus::Running);
+        assert!(!record.stop_requested);
+        assert!(!record.control.cancel.is_cancelled());
+        assert!(!record.control.stopped_by_person());
+
+        let _ = attachment
+            .client
+            .cancel_operation(surface_request_id(), operation_id.clone());
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id);
+        host.shutdown()
+            .expect("shutdown threadless subagent stop host");
+    }
+
+    /// An agent the TUI keeps that waits for capacity has not started: no
+    /// thread, and no row on its parent's surface, so a person has nothing
+    /// to press `s` on; a stop by its id finds no task there.
+    #[test]
+    fn a_queued_kept_subagent_has_no_row_to_stop() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start queued kept subagent host");
+        host.handle().keep_subagents_in_process();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        config.subagents.limits.max_running = 1;
+        let thread = host
+            .start_thread(config, "a queued kept subagent")
+            .expect("start parent thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageTask,
+            ]),
+        );
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "subagent batch async mock_stream_delay_ms 30000",
+                    ),
+                )
+                .expect("reserve the parent's turn"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit the parent's turn"),
+        );
+        assert!(
+            matches!(admitted, surface::AdmissionOutput::Admitted { .. }),
+            "the parent's turn was queued"
+        );
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+
+        // One agent runs; the other waits for its place.
+        let running = kept_agents_under_way(read_snapshot, &["mock_stream_delay_ms 30000"]);
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let queued = loop {
+            let records = registry.records_snapshot().expect("the records");
+            if let Some(queued) = records.into_iter().find(|record| {
+                record.task_type == orca_core::task_types::TaskType::Subagent
+                    && record.status == TaskStatus::Queued
+            }) {
+                break queued;
+            }
+            assert!(Instant::now() < deadline, "no agent waited for its place");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_ne!(queued.id, running[0].task_id.as_str());
+        // Its record says it gets a thread of its own before it has one.
+        assert!(queued.control.gets_a_thread_of_its_own());
+        assert!(!queued.control.runs_on_its_own_thread());
+        let snapshot = read_snapshot();
+        assert!(
+            snapshot
+                .tasks
+                .iter()
+                .all(|task| task.task_id.as_str() != queued.id),
+            "a waiting agent has a task row"
+        );
+        assert!(
+            snapshot
+                .subagents
+                .iter()
+                .all(|subagent| subagent.task_id.as_str() != queued.id),
+            "a waiting agent has an agent row"
+        );
+        assert_eq!(snapshot.subagents.len(), 1, "{:?}", snapshot.subagents);
+
+        let reply = attachment
+            .client
+            .task_control(
+                surface_request_id(),
+                surface::TaskControlAction::Stop {
+                    fence: surface::SurfaceTaskFence {
+                        task_id: surface::SurfaceTaskId::try_new(queued.id.clone())
+                            .expect("the waiting agent's id"),
+                        task_revision: surface::TaskRevision::try_new(1).expect("a revision"),
+                        background_owner: None,
+                    },
+                },
+            )
+            .expect("ask to stop the waiting agent");
+        let surface::MutationReply::Uncommitted {
+            mutation: surface::UncommittedMutation::Invalid { error, .. },
+        } = reply
+        else {
+            panic!("the stop was not refused");
+        };
+        assert_eq!(error.error().message.as_str(), "task does not exist");
+        assert_eq!(
+            registry.get(&queued.id).expect("the waiting agent").status,
+            TaskStatus::Queued
+        );
+
+        let _ = attachment
+            .client
+            .cancel_operation(surface_request_id(), reserved.operation_id.clone());
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), reserved.operation_id);
+        host.shutdown().expect("shutdown queued kept subagent host");
+    }
+
+    #[test]
+    fn a_running_kept_subagents_record_names_its_thread() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start host");
+        let release = ReleaseMarker(cwd.path().join("release"));
+        let child_prompt = format!("mock_stream_release_marker {}", release.0.display());
+        let (thread, attachment, operation_id, _stops_agents) =
+            start_keeping_parent_turn(&host, cwd.path(), &format!("subagent async {child_prompt}"));
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let agent = kept_agents_under_way(read_snapshot, &[&child_prompt]).remove(0);
+        let thread_id = agent.child_thread_id.expect("running agent's thread");
+        let thread_id = uuid::Uuid::from_bytes(*thread_id.as_bytes()).to_string();
+        let registry = thread.task_registry();
+        let running = registry
+            .get(agent.task_id.as_str())
+            .expect("running record");
+
+        release.release();
+        attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id)
+            .expect("wait for parent turn");
+        let ended = registry.get(agent.task_id.as_str()).expect("ended record");
+        host.shutdown().expect("shutdown host");
+
+        assert_eq!(running.status, TaskStatus::Running);
+        assert_eq!(
+            running.subagent_child_thread_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(ended.status, TaskStatus::Completed);
+        assert_eq!(
+            ended.subagent_child_thread_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+    }
+
+    fn interrupted_agent_with_held_end(lose_end: bool, terminal_record: bool) {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().unwrap();
+        let marker_path = cwd.path().join("release");
+        let prompt = format!(
+            "mock_stream_usage_after_cancel_marker {}",
+            marker_path.display()
+        );
+        let (thread, attachment, operation, _stops) =
+            start_keeping_parent_turn(&host, cwd.path(), &format!("subagent async {prompt}"));
+        let marker = ReleaseMarker(marker_path);
+        let surface = thread.surface();
+        let read = || fresh_surface_attachment(&surface).baseline.snapshot;
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .unwrap();
+        let agent = kept_agents_under_way(read, &[&prompt]).remove(0);
+        interrupt_parent_turn(&attachment, &operation);
+        let registry = thread.task_registry();
+        let snapshot = read();
+        assert!(snapshot.foreground_operation.is_none());
+        let running = &snapshot.subagents[0];
+        assert_eq!(running.status, surface::SurfaceSubagentStatus::Running);
+        assert!(
+            registry
+                .get(agent.task_id.as_str())
+                .unwrap()
+                .status
+                .is_active()
+        );
+        if lose_end {
+            let control = registry.get(agent.task_id.as_str()).unwrap().control;
+            control.mark_end_reported();
+            registry
+                .fail(agent.task_id.as_str(), "lost terminal receipt".into())
+                .unwrap();
+            let (record, task, shown) =
+                kept_agent_end(&registry, read, &agent.task_id, Duration::from_secs(5));
+            assert_eq!(record.status, TaskStatus::Failed);
+            assert_eq!(task.status, surface::SurfaceTaskStatus::Failed);
+            assert_eq!(shown.status, surface::SurfaceSubagentStatus::Failed);
+            assert_eq!(
+                shown.error.as_ref().unwrap().as_str(),
+                "lost terminal receipt"
+            );
+            let settled = read();
+            assert!(
+                settled
+                    .subagents
+                    .iter()
+                    .all(|row| row.status != surface::SurfaceSubagentStatus::Running)
+            );
+            std::thread::sleep(SUBAGENT_RELAY_POLL_INTERVAL * 4);
+            assert_eq!(read().cursor, settled.cursor);
+            let mut seen = (0, 0);
+            subagent_terminals_seen(
+                &mut subscription,
+                &agent.task_id,
+                &agent.subagent_id,
+                task.status,
+                &mut seen,
+            );
+            assert_eq!(seen, (1, 1));
+            control.reset_simulated_end_report();
+            marker.release();
+            let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+            while !control.end_reported() {
+                assert!(
+                    Instant::now() < deadline,
+                    "child never finished reporting its own end"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(read().cursor, settled.cursor);
+            subagent_terminals_seen(
+                &mut subscription,
+                &agent.task_id,
+                &agent.subagent_id,
+                task.status,
+                &mut seen,
+            );
+            assert_eq!(seen, (1, 1));
+            host.shutdown().unwrap();
+        } else {
+            if terminal_record {
+                registry
+                    .stop(agent.task_id.as_str(), "parent interrupted".into())
+                    .unwrap();
+                let ended = registry.get(agent.task_id.as_str()).unwrap();
+                assert!(ended.control.runs_on_its_own_thread() && !ended.control.end_reported());
+            }
+            std::thread::sleep(SUBAGENT_SETTLE_GRACE + SUBAGENT_RELAY_POLL_INTERVAL * 4);
+            let before_release = read().subagents[0].clone();
+            marker.release();
+            let (_, task, shown) =
+                kept_agent_end(&registry, read, &agent.task_id, Duration::from_secs(5));
+            assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+            assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
+            assert!(shown.source.source_sequence > running.source.source_sequence);
+            let mut seen = (0, 0);
+            subagent_terminals_seen(
+                &mut subscription,
+                &agent.task_id,
+                &agent.subagent_id,
+                task.status,
+                &mut seen,
+            );
+            host.shutdown().unwrap();
+            assert_eq!(before_release, *running);
+            assert_eq!(seen, (1, 1));
+        }
+    }
+
+    #[test]
+    fn an_agent_whose_end_was_lost_is_settled_from_its_record_when_idle() {
+        interrupted_agent_with_held_end(true, true);
+    }
+
+    #[test]
+    fn a_live_kept_agent_of_an_ended_generation_is_left_alone() {
+        interrupted_agent_with_held_end(false, false);
+    }
+
+    #[test]
+    fn fix4_quitting_waits_for_the_stopped_agents_commit_before_sealing_main() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().unwrap();
+        let marker = ReleaseMarker(cwd.path().join("finish-cancelled-agent"));
+        let prompt = format!(
+            "mock_stream_usage_after_cancel_marker {}",
+            marker.0.display()
+        );
+        let (thread, attachment, parent, _cleanup) =
+            start_keeping_parent_turn(&host, cwd.path(), &format!("subagent async {prompt}"));
+        let surface = thread.surface();
+        let read = || fresh_surface_attachment(&surface).baseline.snapshot;
+        let agent = kept_agents_under_way(read, &[&prompt]).remove(0);
+        let path = crate::history::SessionStore::new()
+            .load_session(thread.thread_id())
+            .unwrap()
+            .path;
+        let baseline = attachment.baseline.cursor.clone();
+        let (reached, held) = mpsc::sync_channel(1);
+        let (release, gate) = mpsc::channel();
+        held_agent_ends_before_ingress()
+            .lock()
+            .unwrap()
+            .insert(agent.task_id.as_str().to_owned(), (reached, gate));
+        interrupt_parent_turn(&attachment, &parent);
+        marker.release();
+        held.recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("end held before ledger ingress");
+        assert!(
+            !thread
+                .task_registry()
+                .get(agent.task_id.as_str())
+                .unwrap()
+                .status
+                .is_active()
+        );
+        assert_eq!(
+            read().subagents[0].status,
+            surface::SurfaceSubagentStatus::Running
+        );
+        let handle = host.handle();
+        let outstanding = handle.stop_kept_subagents(Duration::from_millis(250));
+        if outstanding == 0 {
+            thread.shutdown().unwrap();
+        }
+        release.send(()).unwrap();
+        if outstanding != 0 {
+            assert_eq!(handle.stop_kept_subagents(Duration::from_secs(5)), 0);
+            thread.shutdown().unwrap();
+        }
+        host.shutdown().unwrap();
+        let ledger = surface::JsonlSurfaceCommitLedger::new(path, baseline);
+        assert!(ledger.recover_batches().unwrap().committed.iter().any(|batch| batch.events.as_slice().iter().any(|envelope| matches!(&envelope.event, surface::SurfaceEvent::Task(surface::TaskPatch::StatusChanged {task_id,status: surface::SurfaceTaskStatus::Cancelled,..}) if task_id == &agent.task_id))), "saved conversation still shows Running");
+        assert_eq!(outstanding, 1);
+    }
+
+    #[test]
+    fn a_kept_subagent_with_an_ended_record_publishes_its_own_delayed_end() {
+        interrupted_agent_with_held_end(false, true);
+    }
+
+    #[test]
+    fn a_resumed_thread_settles_the_agents_it_lost() {
+        const PHASE: &str = "ORCA_TEST_CRASHED_KEPT_AGENT_PHASE";
+        if let Ok(phase) = std::env::var(PHASE) {
+            let home = PathBuf::from(std::env::var_os("ORCA_HOME").unwrap());
+            let fixture = home.join("kept-agent.json");
+            let host = RuntimeHost::start().unwrap();
+            if phase == "crash" {
+                let prompt = format!(
+                    "mock_stream_release_marker {}",
+                    home.join("unreleased").display()
+                );
+                let (thread, _, _, _stops) =
+                    start_keeping_parent_turn(&host, &home, &format!("subagent async {prompt}"));
+                let agent = kept_agents_under_way(
+                    || {
+                        fresh_surface_attachment(&thread.surface())
+                            .baseline
+                            .snapshot
+                    },
+                    &[&prompt],
+                )
+                .remove(0);
+                std::fs::write(
+                    fixture,
+                    serde_json::to_vec(&(thread.thread_id(), agent.task_id.as_str())).unwrap(),
+                )
+                .unwrap();
+                std::process::exit(0);
+            }
+            let (parent, task_id): (String, String) =
+                serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+            let records: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(home.join("task-sessions").join(&parent).join("tasks.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            let raw = &records[&task_id];
+            if phase != "second" {
+                assert_eq!(raw["status"], "running");
+                assert!(raw["error"].is_null());
+            }
+            assert_eq!(raw["registry_owner"]["session"], parent);
+            assert!(raw["registry_owner"]["id"].is_string());
+            assert_eq!(raw["subagent_execution_started"], true);
+            if phase != "nonkeeping" {
+                host.handle().keep_subagents_in_process();
+            }
+            let thread = host
+                .start_thread(
+                    surface_test_config(home.clone(), HistoryMode::Resume(parent)),
+                    "resume after crash",
+                )
+                .unwrap();
+            let record = thread.task_registry().get(&task_id).unwrap();
+            assert_eq!(record.status, TaskStatus::Failed);
+            let error = record.error.unwrap();
+            assert!(error.contains("execution remains indeterminate"));
+            let snapshot = fresh_surface_attachment(&thread.surface())
+                .baseline
+                .snapshot;
+            let row = snapshot
+                .subagents
+                .iter()
+                .find(|row| row.task_id.as_str() == task_id)
+                .unwrap();
+            if phase == "nonkeeping" {
+                std::thread::sleep(SUBAGENT_RELAY_POLL_INTERVAL * 4);
+                let fresh = fresh_surface_attachment(&thread.surface())
+                    .baseline
+                    .snapshot;
+                assert_eq!(row.status, surface::SurfaceSubagentStatus::Running);
+                assert_eq!(fresh.subagents, snapshot.subagents);
+                host.shutdown().unwrap();
+                return;
+            }
+            assert_eq!(row.status, surface::SurfaceSubagentStatus::Failed);
+            assert_eq!(row.error.as_ref().unwrap().as_str(), error);
+            assert!(
+                snapshot
+                    .subagents
+                    .iter()
+                    .all(|row| row.status != surface::SurfaceSubagentStatus::Running)
+            );
+            let queue = thread
+                .prompt_queue(crate::prompt_queue::PromptQueueAction::List)
+                .unwrap();
+            assert!(!queue.paused && queue.items.is_empty());
+            let (events, observed) = mpsc::channel();
+            thread.set_prompt_queue_event_observer(Arc::new(
+                move |event: &orca_core::event_schema::EventEnvelope| {
+                    let _ = events.send(event.event_type);
+                    Ok(())
+                },
+            ));
+            assert!(
+                matches!(
+                    observed.recv_timeout(SUBAGENT_RELAY_POLL_INTERVAL * 8),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "resume started a turn"
+            );
+            let fresh = fresh_surface_attachment(&thread.surface())
+                .baseline
+                .snapshot;
+            assert!(fresh.foreground_operation.is_none());
+            assert_eq!(fresh.operation_history, snapshot.operation_history);
+            assert_eq!(
+                thread
+                    .task_registry()
+                    .get(&task_id)
+                    .unwrap()
+                    .result_delivery,
+                crate::tasks::ResultDelivery::Pending
+            );
+            if phase == "second" {
+                let path = home.join("person-turn.jsonl");
+                let result = thread
+                    .start_turn(
+                        HostedTurnRequest::new("mock_echo_task_notifications"),
+                        std::fs::File::create(&path).unwrap(),
+                    )
+                    .unwrap()
+                    .wait();
+                assert_eq!(
+                    result.outcome(),
+                    &OperationOutcome::Completed(RunStatus::Success)
+                );
+                let response = std::fs::read_to_string(path).unwrap();
+                let reply: String = response
+                    .lines()
+                    .map(|line| {
+                        serde_json::from_str::<orca_core::event_schema::EventEnvelope>(line)
+                            .unwrap()
+                    })
+                    .filter(|event| {
+                        event.event_type
+                            == orca_core::event_schema::EventType::AssistantMessageDelta
+                    })
+                    .map(|event| event.payload["text"].as_str().unwrap().to_owned())
+                    .collect();
+                assert!(
+                    reply.starts_with("<task-notification>")
+                        && reply.contains(&task_id)
+                        && reply.contains(&error),
+                    "first model call did not receive the failure: {reply:?}"
+                );
+                assert_eq!(
+                    thread
+                        .task_registry()
+                        .get(&task_id)
+                        .unwrap()
+                        .result_delivery,
+                    crate::tasks::ResultDelivery::Delivered
+                );
+            }
+            host.shutdown().unwrap();
+            return;
+        }
+        for phases in [&["crash", "resume", "second"][..], &["crash", "nonkeeping"]] {
+            let home = tempfile::tempdir().unwrap();
+            for phase in phases {
+                let status = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "runtime_host::tests::a_resumed_thread_settles_the_agents_it_lost",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(PHASE, phase)
+                    .env("ORCA_HOME", home.path())
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "{phase} child: {status}");
+            }
+        }
+    }
+
+    /// A person's stop of one agent the TUI keeps on a thread of its process
+    /// (its `s` key ends in this command) while the turn that started it runs.
+    /// The answer comes at once; the agent ends stopped on its record, in its
+    /// own conversation and, once, on the parent's surface; the other agent
+    /// and the parent's turn go on.
+    #[test]
+    fn a_person_can_stop_one_kept_subagent() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start kept subagent stop host");
+        let host_handle = host.handle();
+        host_handle.keep_subagents_in_process();
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let thread = host
+            .start_thread(config, "stop one kept subagent")
+            .expect("start parent thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageTask,
+            ]),
+        );
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim the parent's subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "subagent batch async mock_stream_delay_ms 30000",
+                    ),
+                )
+                .expect("reserve the parent's turn"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit the parent's turn"),
+        );
+        assert!(
+            matches!(admitted, surface::AdmissionOutput::Admitted { .. }),
+            "the parent's turn was queued"
+        );
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+
+        // Both agents are under way: each runs on its own thread and has
+        // reported past its start, so the stop ends a turn that ran.
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let (first, second) = loop {
+            let snapshot = read_snapshot();
+            let mut running: Vec<_> = snapshot
+                .subagents
+                .iter()
+                .filter(|subagent| {
+                    subagent.status == surface::SurfaceSubagentStatus::Running
+                        && subagent.child_thread_id.is_some()
+                        && subagent.revision.get() >= 3
+                })
+                .cloned()
+                .collect();
+            if running.len() == 2 {
+                running.sort_by(|left, right| left.task_id.as_str().cmp(right.task_id.as_str()));
+                let second = running.pop().expect("two agents");
+                break (running.pop().expect("two agents"), second);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "two kept agents never got under way: {:?}",
+                snapshot.subagents
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(matches!(
+            first.owner,
+            surface::SurfaceSubagentOwner::Generation { .. }
+        ));
+        let mut seen = (0, 0);
+        subagent_terminals_seen(
+            &mut subscription,
+            &first.task_id,
+            &first.subagent_id,
+            surface::SurfaceTaskStatus::Stopped,
+            &mut seen,
+        );
+
+        let (reply, answered_in) =
+            stop_agent_as_a_person(&attachment, read_snapshot, &first.task_id);
+        match &reply {
+            // While the turn runs, the answer writes no stop: one task
+            // refresh, the task still running. The agent's own end does.
+            surface::MutationReply::Committed { mutation, value } => {
+                assert_eq!(value.task.status, surface::SurfaceTaskStatus::Running);
+                assert!(
+                    matches!(
+                        mutation.acknowledgements.as_slice(),
+                        [surface::MutationCommitAck::ThreadLocalCursor {
+                            family: surface::SurfaceFactFamily::Task,
+                            ..
+                        }]
+                    ),
+                    "{:?}",
+                    mutation.acknowledgements
+                );
+            }
+            surface::MutationReply::Uncommitted { mutation } => {
+                panic!("the stop was refused: {mutation:?}")
+            }
+            surface::MutationReply::Deferred { .. } => panic!("the stop was deferred"),
+        }
+        assert!(
+            answered_in < Duration::from_millis(500),
+            "the stop was answered after {answered_in:?}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (record, snapshot) = loop {
+            let record = registry
+                .get(first.task_id.as_str())
+                .expect("the first agent's record");
+            let snapshot = read_snapshot();
+            let shown = snapshot
+                .tasks
+                .iter()
+                .find(|candidate| candidate.task_id == first.task_id)
+                .map(|candidate| candidate.status);
+            if !record.status.is_active() && shown == Some(surface::SurfaceTaskStatus::Stopped) {
+                break (record, snapshot);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the first agent did not end stopped: record {:?} {:?}, parent's surface {shown:?}",
+                record.status,
+                record.error
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        assert_eq!(record.error, None);
+        assert!(record.usage.is_some(), "the agent's usage is kept");
+        // What `task_wait`, `task_read_output` and the completion notice
+        // give the parent for it.
+        assert_eq!(
+            record.result.as_deref(),
+            Some(
+                "the person using Orca stopped this subagent from the Agents panel; it was not stopped by you and it did not fail. Do not start it again unless they ask."
+            )
+        );
+
+        // Its own conversation records its turn as cancelled.
+        let first_thread = first
+            .child_thread_id
+            .as_ref()
+            .map(|id| uuid::Uuid::from_bytes(*id.as_bytes()).to_string())
+            .expect("the first agent's thread");
+        let child = host_handle
+            .resolve_live_thread(&first_thread)
+            .expect("the first agent's thread is live");
+        let child_snapshot = fresh_surface_attachment_with_capabilities(
+            &child.surface(),
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        )
+        .baseline
+        .snapshot;
+        let child_operations: Vec<_> = child_snapshot
+            .foreground_operation
+            .iter()
+            .chain(&child_snapshot.queued_operations)
+            .chain(&child_snapshot.operation_history)
+            .collect();
+        assert_eq!(child_operations.len(), 1, "{child_operations:?}");
+        assert!(
+            matches!(
+                child_operations[0]
+                    .terminal
+                    .as_ref()
+                    .map(|record| &record.terminal),
+                Some(surface::OperationTerminal::Cancelled { .. })
+            ),
+            "the agent's turn ended cancelled: {:?}",
+            child_operations[0].terminal
+        );
+
+        // The parent's surface shows it stopped, from one patch of each.
+        let shown_task = snapshot
+            .tasks
+            .iter()
+            .find(|candidate| candidate.task_id == first.task_id)
+            .expect("the first agent's task on the parent's surface");
+        assert_eq!(shown_task.error, None, "a stop is not an error");
+        assert_eq!(shown_task.result, None);
+        assert!(shown_task.completed_at.is_some());
+        let shown = snapshot
+            .subagents
+            .iter()
+            .find(|subagent| subagent.subagent_id == first.subagent_id)
+            .expect("the first agent on the parent's surface");
+        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
+        assert_eq!(shown.error, None, "a stop is not an error");
+        assert_eq!(shown.output, None);
+        assert_eq!(
+            shown
+                .subagent_activity_history
+                .last()
+                .map(|entry| entry.activity.as_str()),
+            Some("stopped by user")
+        );
+        subagent_terminals_seen(
+            &mut subscription,
+            &first.task_id,
+            &first.subagent_id,
+            surface::SurfaceTaskStatus::Stopped,
+            &mut seen,
+        );
+        assert_eq!(
+            seen,
+            (1, 1),
+            "(task Stopped patches, subagent terminal patches)"
+        );
+
+        // The other agent and the parent's turn go on.
+        assert_eq!(
+            registry
+                .get(second.task_id.as_str())
+                .expect("the second agent's record")
+                .status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            snapshot
+                .subagents
+                .iter()
+                .find(|subagent| subagent.subagent_id == second.subagent_id)
+                .map(|subagent| subagent.status),
+            Some(surface::SurfaceSubagentStatus::Running)
+        );
+        assert_eq!(
+            snapshot
+                .tasks
+                .iter()
+                .find(|task| task.task_id == second.task_id)
+                .map(|task| task.status),
+            Some(surface::SurfaceTaskStatus::Running)
+        );
+        assert!(
+            snapshot
+                .foreground_operation
+                .as_ref()
+                .is_some_and(|operation| operation.operation_id == reserved.operation_id
+                    && operation.terminal.is_none()),
+            "the parent's turn has not ended"
+        );
+
+        let _ = attachment
+            .client
+            .cancel_operation(surface_request_id(), reserved.operation_id.clone());
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), reserved.operation_id);
+        host.shutdown().expect("shutdown kept subagent stop host");
+    }
+
+    /// What Esc on the parent's turn sends: the turn is cancelled, and the
+    /// answer waited for until the turn has ended.
+    fn interrupt_parent_turn(
+        attachment: &surface::FreshSurfaceAttachment,
+        operation_id: &surface::SurfaceOperationId,
+    ) {
+        let _ = attachment
+            .client
+            .cancel_operation(surface_request_id(), operation_id.clone())
+            .expect("cancel the parent's turn");
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id.clone())
+            .expect("wait for the parent's turn to end");
+        assert!(
+            matches!(
+                terminal,
+                surface::WaitOperationTerminalResult::Terminal { .. }
+            ),
+            "the parent's turn did not end"
+        );
+    }
+
+    /// The marker a `mock_stream_release_marker` turn waits on. It is also
+    /// written when dropped, so an assertion that fails first does not leave
+    /// that turn waiting through the host's teardown.
+    struct ReleaseMarker(std::path::PathBuf);
+
+    impl ReleaseMarker {
+        fn release(&self) {
+            std::fs::write(&self.0, b"").expect("release the turn");
+        }
+    }
+
+    impl Drop for ReleaseMarker {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"");
+        }
+    }
+
+    /// Esc on a parent's turn stops the agent it keeps on a thread of this
+    /// process and does not wait for it, so the agent's end comes after the
+    /// turn is over. The parent's surface takes that end, once, so the row
+    /// ends instead of running on: cancelled, as the agent's own end says,
+    /// while its record ends stopped with no error. Nothing of the ended
+    /// turn is left running.
+    #[test]
+    fn an_agent_stopped_with_its_parent_turn_is_shown_as_stopped() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start interrupted parent host");
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
+            &host,
+            cwd.path(),
+            "subagent async mock_stream_slow_cancel_ms 1000",
+        );
+        let surface = thread.surface();
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim the parent's subscription");
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let agent =
+            kept_agents_under_way(read_snapshot, &["mock_stream_slow_cancel_ms 1000"]).remove(0);
+        let surface::SurfaceSubagentOwner::Generation { fence } = agent.owner.clone() else {
+            panic!("the agent is not its parent turn's: {:?}", agent.owner);
+        };
+        let mut seen = (0, 0);
+        subagent_terminals_seen(
+            &mut subscription,
+            &agent.task_id,
+            &agent.subagent_id,
+            surface::SurfaceTaskStatus::Cancelled,
+            &mut seen,
+        );
+
+        interrupt_parent_turn(&attachment, &operation_id);
+        // The turn is over and its generation stopped; the agent, which takes
+        // a second to end once cancelled, is still ending, and its row runs.
+        let snapshot = read_snapshot();
+        assert!(snapshot.foreground_operation.is_none());
+        assert_eq!(
+            surface::generation_phase(&snapshot, &fence),
+            Some(surface::GenerationPhase::Stopped)
+        );
+        let record = registry.get(agent.task_id.as_str()).expect("the record");
+        assert!(
+            record.status.is_active() && record.stop_requested,
+            "{:?}",
+            record.status
+        );
+        assert_eq!(
+            snapshot
+                .subagents
+                .iter()
+                .find(|subagent| subagent.subagent_id == agent.subagent_id)
+                .map(|subagent| subagent.status),
+            Some(surface::SurfaceSubagentStatus::Running)
+        );
+
+        let (record, task, shown) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &agent.task_id,
+            Duration::from_secs(5),
+        );
+        assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        assert_eq!(record.error, None);
+        // Its parent's interrupt is not a person's stop of it.
+        assert_eq!(
+            record.result.as_deref(),
+            Some(crate::agent_controller::AGENT_CANCELLED)
+        );
+        assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+        assert!(task.completed_at.is_some());
+        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
+        // Both rows carry the cancel the agent's end reports, as when it
+        // lands while the turn still runs; the record has no error for it.
+        assert_eq!(
+            task.error.as_ref().map(surface::DisplayText::as_str),
+            Some(crate::agent_controller::AGENT_CANCELLED)
+        );
+        assert_eq!(
+            shown.error.as_ref().map(surface::DisplayText::as_str),
+            Some(crate::agent_controller::AGENT_CANCELLED)
+        );
+        // The agent's own end, as when it lands while the turn still runs.
+        assert_eq!(
+            shown
+                .subagent_activity_history
+                .last()
+                .map(|entry| entry.activity.as_str()),
+            Some("cancelled") // Task 9 item 2: the activity names how the agent ended.
+        );
+        assert!(shown.usage.is_some(), "the agent's final usage is kept");
+        assert_eq!(shown.usage, record.usage.map(surface_usage_totals));
+
+        // Written once: nothing more comes after a while.
+        std::thread::sleep(Duration::from_millis(300));
+        subagent_terminals_seen(
+            &mut subscription,
+            &agent.task_id,
+            &agent.subagent_id,
+            surface::SurfaceTaskStatus::Cancelled,
+            &mut seen,
+        );
+        assert_eq!(
+            seen,
+            (1, 1),
+            "(task Cancelled patches, subagent terminal patches)"
+        );
+        let snapshot = read_snapshot();
+        let ended_turn = surface::SurfaceSubagentOwner::Generation {
+            fence: fence.clone(),
+        };
+        assert!(
+            snapshot
+                .subagents
+                .iter()
+                .filter(|subagent| subagent.owner == ended_turn)
+                .all(|subagent| subagent.status != surface::SurfaceSubagentStatus::Running),
+            "{:?}",
+            snapshot.subagents
+        );
+        assert!(
+            snapshot
+                .tasks
+                .iter()
+                .filter(|task| task.parent_operation.as_ref() == Some(&fence.operation_id))
+                .all(|task| task.completed_at.is_some()),
+            "a task of the ended turn is still running: {:?}",
+            snapshot
+                .tasks
+                .iter()
+                .map(|task| (task.task_id.as_str(), task.status))
+                .collect::<Vec<_>>()
+        );
+        host.shutdown().expect("shutdown interrupted parent host");
+    }
+
+    /// The person types again right after Esc, and the agent's end, slow to
+    /// come, lands while that next turn runs. It is still the ended turn's
+    /// end and is taken there, once; the running turn is not touched by it
+    /// and ends as it would have.
+    #[test]
+    fn a_late_end_is_accepted_while_a_later_turn_runs() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start later turn host");
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
+            &host,
+            cwd.path(),
+            "subagent async mock_stream_slow_cancel_ms 3000",
+        );
+        let surface = thread.surface();
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim the parent's subscription");
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let agent =
+            kept_agents_under_way(read_snapshot, &["mock_stream_slow_cancel_ms 3000"]).remove(0);
+        let surface::SurfaceSubagentOwner::Generation { fence } = agent.owner.clone() else {
+            panic!("the agent is not its parent turn's: {:?}", agent.owner);
+        };
+        let mut seen = (0, 0);
+        subagent_terminals_seen(
+            &mut subscription,
+            &agent.task_id,
+            &agent.subagent_id,
+            surface::SurfaceTaskStatus::Cancelled,
+            &mut seen,
+        );
+
+        interrupt_parent_turn(&attachment, &operation_id);
+        // The agent takes three seconds to end once cancelled.
+        let record = registry.get(agent.task_id.as_str()).expect("the record");
+        assert!(
+            record.status.is_active() && record.stop_requested,
+            "{:?}",
+            record.status
+        );
+
+        // The next turn runs until it is released.
+        let release = ReleaseMarker(cwd.path().join("release the next turn"));
+        let snapshot = read_snapshot();
+        let next = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &snapshot,
+                        &format!("mock_stream_release_marker {}", release.0.display()),
+                    ),
+                )
+                .expect("reserve the next turn"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    next.operation_id.clone(),
+                    next.lease.lease_id,
+                )
+                .expect("admit the next turn"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation: next_fence,
+            ..
+        } = admitted
+        else {
+            panic!("the next turn was queued");
+        };
+        // It started before the agent's end came.
+        let snapshot = read_snapshot();
+        assert_eq!(
+            snapshot
+                .subagents
+                .iter()
+                .find(|subagent| subagent.subagent_id == agent.subagent_id)
+                .map(|subagent| subagent.status),
+            Some(surface::SurfaceSubagentStatus::Running),
+            "the agent ended before the next turn started"
+        );
+
+        let (record, task, shown) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &agent.task_id,
+            Duration::from_secs(10),
+        );
+        let snapshot = read_snapshot();
+        assert!(
+            snapshot
+                .foreground_operation
+                .as_ref()
+                .is_some_and(|operation| operation.operation_id == next.operation_id
+                    && operation.terminal.is_none()),
+            "the next turn is not running: {:?}",
+            snapshot.foreground_operation
+        );
+        assert_eq!(
+            surface::generation_phase(&snapshot, &next_fence),
+            Some(surface::GenerationPhase::Started)
+        );
+        assert!(
+            snapshot.subagents.iter().all(|subagent| subagent.owner
+                != surface::SurfaceSubagentOwner::Generation {
+                    fence: next_fence.clone(),
+                }),
+            "{:?}",
+            snapshot.subagents
+        );
+        assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        assert_eq!(record.error, None);
+        assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
+        assert_eq!(
+            shown.owner,
+            surface::SurfaceSubagentOwner::Generation {
+                fence: fence.clone(),
+            }
+        );
+        assert_eq!(
+            shown
+                .subagent_activity_history
+                .last()
+                .map(|entry| entry.activity.as_str()),
+            Some("cancelled") // Task 9 item 2: the activity names how the agent ended.
+        );
+        assert_eq!(shown.usage, record.usage.map(surface_usage_totals));
+        std::thread::sleep(Duration::from_millis(300));
+        subagent_terminals_seen(
+            &mut subscription,
+            &agent.task_id,
+            &agent.subagent_id,
+            surface::SurfaceTaskStatus::Cancelled,
+            &mut seen,
+        );
+        assert_eq!(
+            seen,
+            (1, 1),
+            "(task Cancelled patches, subagent terminal patches)"
+        );
+
+        release.release();
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), next.operation_id.clone())
+            .expect("wait for the next turn");
+        assert!(
+            matches!(
+                &terminal,
+                surface::WaitOperationTerminalResult::Terminal { value }
+                    if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. })
+            ),
+            "the next turn did not succeed"
+        );
+        host.shutdown().expect("shutdown later turn host");
+    }
+
+    /// A person's stop of a kept agent, with Esc on its parent's turn in the
+    /// instant after, is still the person's: the agent's end comes after the
+    /// turn is over and shows it stopped by user, once.
+    #[test]
+    fn a_persons_stop_right_before_an_interrupt_still_ends_stopped() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start stop then interrupt host");
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
+            &host,
+            cwd.path(),
+            "subagent async mock_stream_slow_cancel_ms 1500",
+        );
+        let surface = thread.surface();
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim the parent's subscription");
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let agent =
+            kept_agents_under_way(read_snapshot, &["mock_stream_slow_cancel_ms 1500"]).remove(0);
+        let mut seen = (0, 0);
+        subagent_terminals_seen(
+            &mut subscription,
+            &agent.task_id,
+            &agent.subagent_id,
+            surface::SurfaceTaskStatus::Stopped,
+            &mut seen,
+        );
+
+        let (reply, _) = stop_agent_as_a_person(&attachment, read_snapshot, &agent.task_id);
+        assert!(
+            matches!(
+                &reply,
+                surface::MutationReply::Committed { value, .. }
+                    if value.task.status == surface::SurfaceTaskStatus::Running
+            ),
+            "the stop was not answered"
+        );
+        interrupt_parent_turn(&attachment, &operation_id);
+        // The turn is over before the agent's end comes.
+        assert_eq!(
+            read_snapshot()
+                .subagents
+                .iter()
+                .find(|subagent| subagent.subagent_id == agent.subagent_id)
+                .map(|subagent| subagent.status),
+            Some(surface::SurfaceSubagentStatus::Running)
+        );
+
+        let (record, task, shown) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &agent.task_id,
+            Duration::from_secs(5),
+        );
+        assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        assert_eq!(record.error, None);
+        assert_eq!(task.status, surface::SurfaceTaskStatus::Stopped);
+        assert_eq!(task.error, None, "a stop is not an error");
+        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
+        assert_eq!(shown.error, None, "a stop is not an error");
+        assert_eq!(
+            shown
+                .subagent_activity_history
+                .last()
+                .map(|entry| entry.activity.as_str()),
+            Some("stopped by user")
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        subagent_terminals_seen(
+            &mut subscription,
+            &agent.task_id,
+            &agent.subagent_id,
+            surface::SurfaceTaskStatus::Stopped,
+            &mut seen,
+        );
+        assert_eq!(
+            seen,
+            (1, 1),
+            "(task Stopped patches, subagent terminal patches)"
+        );
+        host.shutdown().expect("shutdown stop then interrupt host");
+    }
+
+    /// Esc while a kept agent is in a tool. The tool is cancelled with the
+    /// agent, and the agent says so after the turn is over, which the
+    /// parent's surface refuses as it refuses any report of an ended turn.
+    /// The agent's end, which comes right after, is still taken: the row
+    /// ends cancelled, once, and the record stopped with no error.
+    #[test]
+    fn an_agent_in_a_tool_when_its_parent_turn_is_interrupted_is_shown_as_stopped() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start interrupted tool host");
+        let (thread, attachment, operation_id, _stops_agents) =
+            start_keeping_parent_turn(&host, cwd.path(), "subagent async bash sleep 30");
+        let surface = thread.surface();
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim the parent's subscription");
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let agent = kept_agents_under_way(read_snapshot, &["bash sleep 30"]).remove(0);
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let snapshot = read_snapshot();
+            let shown = snapshot
+                .subagents
+                .iter()
+                .find(|subagent| subagent.subagent_id == agent.subagent_id)
+                .expect("the agent on the parent's surface");
+            if shown
+                .activity
+                .as_ref()
+                .is_some_and(|activity| activity.as_str().contains("bash:"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the agent never ran its tool: {:?}",
+                shown.activity
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Well inside the tool, which runs for thirty seconds.
+        std::thread::sleep(Duration::from_millis(300));
+        let mut seen = (0, 0);
+        subagent_terminals_seen(
+            &mut subscription,
+            &agent.task_id,
+            &agent.subagent_id,
+            surface::SurfaceTaskStatus::Cancelled,
+            &mut seen,
+        );
+
+        interrupt_parent_turn(&attachment, &operation_id);
+        let (record, task, shown) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &agent.task_id,
+            Duration::from_secs(5),
+        );
+        assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        assert_eq!(record.error, None);
+        assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
+        assert_eq!(
+            shown
+                .subagent_activity_history
+                .last()
+                .map(|entry| entry.activity.as_str()),
+            Some("cancelled") // Task 9 item 2: the activity names how the agent ended.
+        );
+        // The end took the place of the cancelled tool's report, which the
+        // parent refused: that report never landed, so what came before the
+        // end is still the tool the agent was in. Nothing makes the report
+        // come after the turn is over; it does because the agent's tool takes
+        // longer to stop than the turn (when this was written, the report
+        // came 120-240 ms after the turn was over). The order is forced in
+        // `an_agent_that_reports_after_its_parent_turn_was_interrupted_is_shown_ending`.
+        let history = &shown.subagent_activity_history;
+        assert_eq!(
+            history
+                .len()
+                .checked_sub(2)
+                .map(|before_end| history[before_end].activity.as_str()),
+            Some("bash: sleep 30"),
+            "{history:?}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        subagent_terminals_seen(
+            &mut subscription,
+            &agent.task_id,
+            &agent.subagent_id,
+            surface::SurfaceTaskStatus::Cancelled,
+            &mut seen,
+        );
+        assert_eq!(
+            seen,
+            (1, 1),
+            "(task Cancelled patches, subagent terminal patches)"
+        );
+        host.shutdown().expect("shutdown interrupted tool host");
+    }
+
+    /// Esc on the parent's turn while it keeps an async agent running, and
+    /// the agent reports after the turn is over: the parent's surface
+    /// refuses that report, as it refuses anything an ended turn's agent
+    /// reports but its end. The agent's end, when it comes, is still taken:
+    /// its row ends, once, as the agent ended, its record is not failed for
+    /// want of a surface to show its end on, and the refused report never
+    /// lands.
+    ///
+    /// The end is `cancelled` here because Esc stops the agents the turn
+    /// keeps. The order is forced, not observed: the agent's stream, once
+    /// cancelled, waits for the marker before it ends with the usage the
+    /// agent then reports, and the marker is written only once
+    /// `interrupt_parent_turn` has seen the turn end.
+    #[test]
+    fn an_agent_that_reports_after_its_parent_turn_was_interrupted_is_shown_ending() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start interrupted parent host");
+        let marker = ReleaseMarker(cwd.path().join("agent-reports-after-its-turn"));
+        let description = format!(
+            "mock_stream_usage_after_cancel_marker {}",
+            marker.0.display()
+        );
+        let (thread, attachment, operation_id, _stops_agents) =
+            start_keeping_parent_turn(&host, cwd.path(), &format!("subagent async {description}"));
+        let surface = thread.surface();
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim the parent's subscription");
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let agent = kept_agents_under_way(read_snapshot, &[description.as_str()]).remove(0);
+        let surface::SurfaceSubagentOwner::Generation { fence } = agent.owner.clone() else {
+            panic!("the agent is not its parent turn's: {:?}", agent.owner);
+        };
+        let mut seen = (0, 0);
+        subagent_terminals_seen(
+            &mut subscription,
+            &agent.task_id,
+            &agent.subagent_id,
+            surface::SurfaceTaskStatus::Cancelled,
+            &mut seen,
+        );
+
+        interrupt_parent_turn(&attachment, &operation_id);
+        // The turn's generation is over while the agent still runs.
+        let snapshot = read_snapshot();
+        assert!(snapshot.foreground_operation.is_none());
+        assert_eq!(
+            surface::generation_phase(&snapshot, &fence),
+            Some(surface::GenerationPhase::Stopped)
+        );
+        let before_end = snapshot
+            .subagents
+            .iter()
+            .find(|subagent| subagent.subagent_id == agent.subagent_id)
+            .cloned()
+            .expect("the agent on the parent's surface");
+        assert_eq!(
+            before_end.status,
+            surface::SurfaceSubagentStatus::Running,
+            "the agent ended before the turn's generation did"
+        );
+        let record = registry.get(agent.task_id.as_str()).expect("the record");
+        assert!(
+            record.status.is_active() && record.stop_requested,
+            "{:?}",
+            record.status
+        );
+
+        // The agent reports its usage, then ends.
+        marker.release();
+        let (record, task, shown) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &agent.task_id,
+            Duration::from_secs(10),
+        );
+        assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        assert_eq!(record.error, None);
+        assert_eq!(task.status, surface::SurfaceTaskStatus::Cancelled);
+        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Cancelled);
+        assert_eq!(
+            shown.owner,
+            surface::SurfaceSubagentOwner::Generation {
+                fence: fence.clone(),
+            }
+        );
+        assert_eq!(shown.usage, record.usage.map(surface_usage_totals));
+        // Only the end landed after the turn was over: the refused report
+        // did not, before it or after it.
+        assert_eq!(
+            shown.revision.get(),
+            before_end.revision.get() + 1,
+            "{:?}",
+            shown.subagent_activity_history
+        );
+        assert_eq!(
+            shown
+                .subagent_activity_history
+                .last()
+                .map(|entry| entry.activity.as_str()),
+            Some("cancelled") // Task 9 item 2: the activity names how the agent ended.
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        subagent_terminals_seen(
+            &mut subscription,
+            &agent.task_id,
+            &agent.subagent_id,
+            surface::SurfaceTaskStatus::Cancelled,
+            &mut seen,
+        );
+        assert_eq!(
+            seen,
+            (1, 1),
+            "(task Cancelled patches, subagent terminal patches)"
+        );
+        host.shutdown().expect("shutdown interrupted parent host");
+    }
+
+    /// What a person reads when the background key is refused because the
+    /// turn's subagents run.
+    const SUBAGENTS_KEEP_THE_TURN: &str =
+        "This turn cannot move to the background while its subagents are running.";
+
+    type TransferBackgroundAnswer = Result<
+        surface::MutationReply<surface::TransferBackgroundOutput>,
+        surface::SurfaceClientCommandError,
+    >;
+
+    /// What the background key sends for the turn whose generation is
+    /// `fence`, asked from a thread of its own, since the answer can wait
+    /// for the turn.
+    fn ask_to_move_the_turn_to_the_background(
+        attachment: &surface::FreshSurfaceAttachment,
+        fence: &surface::SurfaceOperationFence,
+    ) -> mpsc::Receiver<TransferBackgroundAnswer> {
+        let client = attachment.client.clone();
+        let fence = fence.clone();
+        let (answer_tx, answer_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = answer_tx.send(client.transfer_background(
+                surface_request_id(),
+                surface::BackgroundTarget::ActiveGeneration { fence },
+            ));
+        });
+        answer_rx
+    }
+
+    /// Whether `answer` refuses to move the generation `fence` to the
+    /// background because the turn's subagents run.
+    fn refused_while_its_subagents_run(
+        answer: &TransferBackgroundAnswer,
+        fence: &surface::SurfaceOperationFence,
+    ) -> bool {
+        matches!(
+            answer,
+            Ok(surface::MutationReply::Uncommitted {
+                mutation: surface::UncommittedMutation::Invalid {
+                    target: Some(surface::MutationTarget::Generation { fence: refused }),
+                    error,
+                    ..
+                },
+            }) if refused == fence
+                && error.error().code == surface::SurfaceMutationErrorCode::IllegalState
+                && error.error().message.as_str() == SUBAGENTS_KEEP_THE_TURN
+                && error.error().winning_request_id.is_none()
+        )
+    }
+
+    /// `answer`, told briefly for a failed assertion.
+    fn background_answer_shown(answer: &TransferBackgroundAnswer) -> String {
+        match answer {
+            Ok(surface::MutationReply::Committed {
+                value: surface::TransferBackgroundOutput::HandedOff { .. },
+                ..
+            }) => "handed off".to_string(),
+            Ok(surface::MutationReply::Committed { .. }) => "queued on start".to_string(),
+            Ok(surface::MutationReply::Uncommitted { mutation }) => format!("{mutation:?}"),
+            Ok(surface::MutationReply::Deferred { .. }) => "deferred".to_string(),
+            Err(error) => format!("{error:?}"),
+        }
+    }
+
+    /// Waits for the turn `operation_id` to end, and checks that it ended
+    /// where it ran: it succeeded in the foreground, and neither its
+    /// surface nor its main-session record was ever moved to the
+    /// background.
+    fn turn_ended_in_the_foreground(
+        attachment: &surface::FreshSurfaceAttachment,
+        operation_id: &surface::SurfaceOperationId,
+        registry: &crate::tasks::TaskRegistry,
+        read_snapshot: impl Fn() -> Arc<surface::SurfaceSnapshot>,
+    ) {
+        let terminal = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id.clone())
+            .expect("wait for the turn to end");
+        let surface::WaitOperationTerminalResult::Terminal { value } = terminal else {
+            panic!("the turn did not end");
+        };
+        assert!(
+            matches!(value.terminal, surface::OperationTerminal::Succeeded { .. }),
+            "{:?}",
+            value.terminal
+        );
+        let snapshot = read_snapshot();
+        assert!(
+            snapshot
+                .background_operations
+                .iter()
+                .all(|operation| operation.operation_id != *operation_id),
+            "the turn was moved to the background"
+        );
+        let main_session_tasks: Vec<_> = registry
+            .list()
+            .into_iter()
+            .filter(|task| task.task_type == orca_core::task_types::TaskType::MainSession)
+            .collect();
+        assert!(!main_session_tasks.is_empty(), "the turn's record");
+        assert!(
+            main_session_tasks.iter().all(|task| !task.is_backgrounded),
+            "the turn's record was moved to the background: {main_session_tasks:?}"
+        );
+    }
+
+    /// A parent's turn admitted with `prompt` on a fresh thread of `host`,
+    /// in `approval_mode`, with an attachment that can also answer its tool
+    /// approvals, and the fence of the generation a hand-off names.
+    fn start_parent_turn_to_move(
+        host: &RuntimeHost,
+        cwd: &std::path::Path,
+        prompt: &str,
+        approval_mode: ApprovalMode,
+    ) -> (
+        RuntimeThreadHandle,
+        surface::FreshSurfaceAttachment,
+        surface::SurfaceOperationId,
+        surface::SurfaceOperationFence,
+    ) {
+        let mut config = surface_test_config(cwd.to_path_buf(), HistoryMode::Record);
+        config.approval_mode = approval_mode;
+        let thread = host
+            .start_thread(config, "a parent to move")
+            .expect("start parent thread");
+        let attachment = match thread.surface().attach_fresh(surface::FreshAttachRequest {
+            request_id: surface_request_id(),
+            role: surface::SurfaceAttachmentRole::Tui,
+            requested_capabilities: BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageTask,
+                surface::SurfaceCapability::RespondGrantedInteraction,
+            ]),
+            interaction_capabilities: BTreeSet::from([
+                surface::SurfaceInteractionKind::ToolApproval,
+            ]),
+        }) {
+            surface::AttachResult::FreshAttached { attachment } => attachment,
+            _ => panic!("attach the parent's client"),
+        };
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(&attachment.baseline.snapshot, prompt),
+                )
+                .expect("reserve the parent's turn"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit the parent's turn"),
+        );
+        let surface::AdmissionOutput::Admitted {
+            first_generation, ..
+        } = admitted
+        else {
+            panic!("the parent's turn was queued");
+        };
+        (thread, attachment, reserved.operation_id, first_generation)
+    }
+
+    #[test]
+    fn main_waits_for_its_kept_agent_after_its_natural_reply() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().unwrap();
+        let marker = cwd.path().join("release-child");
+        let description = format!("mock_stream_release_marker {}", marker.display());
+        let (thread, attachment, operation, _stop) =
+            start_keeping_parent_turn(&host, cwd.path(), &format!("subagent async {description}"));
+        let release = ReleaseMarker(marker);
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &thread.surface(),
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let agent = kept_agents_under_way(read_snapshot, &[&description]).remove(0);
+        let reply = "Mock completed after tool execution.";
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        loop {
+            let snapshot = read_snapshot();
+            if snapshot.items.iter().any(|item| matches!(item, surface::SurfaceItem::AssistantMessage { text, .. } if text.as_str() == reply))
+                || snapshot.assistant_streams.iter().any(|stream| stream.text.as_str() == reply) { break; }
+            assert!(
+                Instant::now() < deadline,
+                "main never produced its post-tool reply"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let client = attachment.client.clone();
+        let (send, terminal) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _ = send.send(client.wait_operation_terminal(surface_request_id(), operation));
+        });
+        assert!(
+            matches!(
+                terminal.recv_timeout(Duration::from_millis(250)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "main ended with its child still held"
+        );
+        let registry = thread.task_registry();
+        let running = registry.get(agent.task_id.as_str()).unwrap();
+        assert_eq!(running.status, TaskStatus::Running);
+        let parent = running.parent_task_id.unwrap();
+        assert_eq!(registry.get(&parent).unwrap().status, TaskStatus::Running);
+        release.release();
+        assert!(
+            matches!(terminal.recv_timeout(SURFACE_TEST_TIMEOUT).unwrap().unwrap(), surface::WaitOperationTerminalResult::Terminal { value } if matches!(value.terminal, surface::OperationTerminal::Succeeded { .. }))
+        );
+        waiter.join().unwrap();
+        let child = registry.get(agent.task_id.as_str()).unwrap();
+        assert_eq!(child.status, TaskStatus::Completed);
+        assert!(
+            child.completed_at_ms.unwrap()
+                <= registry.get(&parent).unwrap().completed_at_ms.unwrap()
+        );
+    }
+
+    /// The background key while the turn keeps an async agent running: the
+    /// person is told at once that the turn stays, the turn and its agent
+    /// go on, and once the agent has ended the turn ends where it ran, not
+    /// moved by that old key press.
+    #[test]
+    fn a_turn_with_a_running_async_subagent_is_not_moved_to_the_background() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start host");
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
+            &host,
+            cwd.path(),
+            "subagent async mock_stream_delay_ms 3000",
+        );
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let agent = kept_agents_under_way(read_snapshot, &["mock_stream_delay_ms 3000"]).remove(0);
+        let surface::SurfaceSubagentOwner::Generation { fence } = agent.owner.clone() else {
+            panic!("the agent is not its parent turn's: {:?}", agent.owner);
+        };
+
+        let answer = ask_to_move_the_turn_to_the_background(&attachment, &fence)
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the background key was left waiting for the turn's agent");
+        assert!(
+            refused_while_its_subagents_run(&answer, &fence),
+            "{}",
+            background_answer_shown(&answer)
+        );
+        // The turn and its agent go on.
+        assert_eq!(
+            registry
+                .get(agent.task_id.as_str())
+                .expect("the agent's record")
+                .status,
+            TaskStatus::Running
+        );
+        let snapshot = read_snapshot();
+        assert_eq!(
+            surface::generation_phase(&snapshot, &fence),
+            Some(surface::GenerationPhase::Started)
+        );
+        assert_eq!(
+            snapshot
+                .subagents
+                .iter()
+                .find(|subagent| subagent.subagent_id == agent.subagent_id)
+                .map(|subagent| subagent.status),
+            Some(surface::SurfaceSubagentStatus::Running)
+        );
+
+        let (record, _, shown) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &agent.task_id,
+            Duration::from_secs(10),
+        );
+        assert_eq!(record.status, TaskStatus::Completed, "{:?}", record.error);
+        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Completed);
+        turn_ended_in_the_foreground(&attachment, &operation_id, &registry, read_snapshot);
+        host.shutdown().expect("shutdown host");
+    }
+
+    /// The background key while the turn waits on a sync agent, with an
+    /// async one running too: refused at once. A person then stops the sync
+    /// agent, so the turn streams again while its async agent runs, which
+    /// is where a hand-off used to happen: the turn is not moved then
+    /// either, and ends where it ran. Both agents run until released, so
+    /// the async one is still running when the sync one has ended.
+    #[test]
+    fn a_turn_waiting_on_a_sync_subagent_is_not_moved_to_the_background() {
+        let cwd = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        let release = ReleaseMarker(markers.path().join("release the agents"));
+        let host = RuntimeHost::start().expect("start host");
+        let (thread, attachment, operation_id, _stops_agents) = start_keeping_parent_turn(
+            &host,
+            cwd.path(),
+            &format!(
+                "subagent async_then_sync mock_stream_release_marker {}",
+                release.0.display()
+            ),
+        );
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let agents = kept_agents_under_way(read_snapshot, &["async child", "sync child"]);
+        let (agent, sync_agent) = (agents[0].clone(), agents[1].clone());
+        let surface::SurfaceSubagentOwner::Generation { fence } = agent.owner.clone() else {
+            panic!("the agent is not its parent turn's: {:?}", agent.owner);
+        };
+        // Both were accepted to run on threads of their own.
+        for kept in [&agent, &sync_agent] {
+            assert!(
+                registry
+                    .get(kept.task_id.as_str())
+                    .expect("the agent's record")
+                    .control
+                    .gets_a_thread_of_its_own()
+            );
+        }
+
+        let answer = ask_to_move_the_turn_to_the_background(&attachment, &fence)
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the background key was left waiting for the turn's sync agent");
+        assert!(
+            refused_while_its_subagents_run(&answer, &fence),
+            "{}",
+            background_answer_shown(&answer)
+        );
+
+        let (reply, _) = stop_agent_as_a_person(&attachment, read_snapshot, &sync_agent.task_id);
+        assert!(
+            matches!(reply, surface::MutationReply::Committed { .. }),
+            "the sync agent's stop was not answered"
+        );
+        let (record, _, _) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &sync_agent.task_id,
+            Duration::from_secs(5),
+        );
+        assert_eq!(record.status, TaskStatus::Stopped, "{:?}", record.error);
+        // The turn goes on in the foreground while its async agent runs.
+        let snapshot = read_snapshot();
+        assert_eq!(
+            surface::generation_phase(&snapshot, &fence),
+            Some(surface::GenerationPhase::Started)
+        );
+        assert_eq!(
+            registry
+                .get(agent.task_id.as_str())
+                .expect("the async agent's record")
+                .status,
+            TaskStatus::Running
+        );
+
+        release.release();
+        let (record, _, shown) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &agent.task_id,
+            Duration::from_secs(10),
+        );
+        assert_eq!(record.status, TaskStatus::Completed, "{:?}", record.error);
+        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Completed);
+        turn_ended_in_the_foreground(&attachment, &operation_id, &registry, read_snapshot);
+        host.shutdown().expect("shutdown host");
+    }
+
+    /// The background key while the turn waits for the approval of the call
+    /// that starts its agent: no agent runs yet, so the request waits for
+    /// the turn. Once the agent starts, the request is refused and dropped,
+    /// and the turn is not moved while the agent runs or after it.
+    #[test]
+    fn a_background_request_made_before_a_subagent_starts_does_not_move_the_turn() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start host");
+        host.handle().keep_subagents_in_process();
+        let _stops_agents = StopsKeptAgents(host.handle());
+        let (thread, attachment, operation_id, fence) = start_parent_turn_to_move(
+            &host,
+            cwd.path(),
+            "subagent async mock_stream_delay_ms 3000",
+            ApprovalMode::Suggest,
+        );
+        let surface = thread.surface();
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim the parent's subscription");
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let approval = collect_requested_surface_interaction(&mut subscription);
+        assert!(
+            matches!(
+                approval.request,
+                surface::SurfaceInteractionRequest::ToolApproval { .. }
+            ),
+            "the turn did not ask to approve the agent's start"
+        );
+
+        let answer = ask_to_move_the_turn_to_the_background(&attachment, &fence);
+        assert!(
+            answer.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the request was answered before any agent started"
+        );
+        committed_surface_value(
+            attachment
+                .client
+                .respond_interaction_by_id(
+                    surface_request_id(),
+                    approval.interaction_id,
+                    surface::SurfaceClientInteractionAnswer::ToolApproval {
+                        decision: surface::SurfaceAllowDeny::Allow,
+                    },
+                )
+                .expect("approve the agent's start"),
+        );
+        let answer = answer
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("the request was never answered");
+        assert!(
+            refused_while_its_subagents_run(&answer, &fence),
+            "{}",
+            background_answer_shown(&answer)
+        );
+        let agent = kept_agents_under_way(read_snapshot, &["mock_stream_delay_ms 3000"]).remove(0);
+        assert_eq!(
+            surface::generation_phase(&read_snapshot(), &fence),
+            Some(surface::GenerationPhase::Started)
+        );
+
+        let (record, _, shown) = kept_agent_end(
+            &registry,
+            read_snapshot,
+            &agent.task_id,
+            Duration::from_secs(10),
+        );
+        assert_eq!(record.status, TaskStatus::Completed, "{:?}", record.error);
+        assert_eq!(shown.status, surface::SurfaceSubagentStatus::Completed);
+        turn_ended_in_the_foreground(&attachment, &operation_id, &registry, read_snapshot);
+        host.shutdown().expect("shutdown host");
+    }
+
+    /// The generation's own check, where it would suspend, decides whatever
+    /// the turn's actor answered when it was asked: a hand-off that waits
+    /// is refused there, and dropped, once a kept subagent of the turn
+    /// runs, and is taken there when none does.
+    #[test]
+    fn the_generations_check_refuses_a_waiting_hand_off_while_a_kept_subagent_runs() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "a client to answer",
+            )
+            .expect("start thread");
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &thread.surface(),
+            BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+        );
+        let fence = recovery_matrix_fence();
+        let ask = || {
+            let (reply, answer) = std::sync::mpsc::sync_channel(1);
+            let transfer = PendingSurfaceBackgroundTransfer {
+                request_id: surface_request_id(),
+                fence: fence.clone(),
+                client: attachment.client.clone(),
+                reply,
+            };
+            (transfer, answer)
+        };
+        let registry = crate::tasks::TaskRegistry::new("the generation's check".into());
+        let turn = registry.create_main_session("the turn".into());
+        let control = RuntimeSurfaceBackgroundControl::default()
+            .refused_while_kept_subagents_run(registry.clone(), turn.id.clone());
+
+        // Asked while none runs: the request waits for the generation.
+        let (transfer, answer) = ask();
+        control.request(transfer);
+        assert!(matches!(
+            *control.transfer(),
+            SurfaceBackgroundTransfer::Waiting(_)
+        ));
+        assert!(answer.try_recv().is_err());
+        // A kept subagent of the turn starts on a thread of its own before
+        // the generation reaches its check.
+        let kept = registry.create_subagent_with_parent("kept".into(), None, Some(turn.id.clone()));
+        registry.mark_running(&kept.id).expect("the agent runs");
+        let kept_control = registry.get(&kept.id).expect("the agent's record").control;
+        kept_control.mark_runs_on_its_own_thread();
+        assert!(!control.take_suspension_request());
+        assert!(matches!(
+            *control.transfer(),
+            SurfaceBackgroundTransfer::None
+        ));
+        let refused = answer
+            .try_recv()
+            .expect("the waiting hand-off was not answered");
+        assert!(
+            refused_while_its_subagents_run(&refused, &fence),
+            "{}",
+            background_answer_shown(&refused)
+        );
+
+        // Once that agent has ended and said so, the next request is taken.
+        registry
+            .complete(&kept.id, "done".into())
+            .expect("the agent ends");
+        kept_control.mark_end_reported();
+        let (transfer, answer) = ask();
+        control.request(transfer);
+        assert!(matches!(
+            *control.transfer(),
+            SurfaceBackgroundTransfer::Waiting(_)
+        ));
+        assert!(control.take_suspension_request());
+        assert!(matches!(
+            *control.transfer(),
+            SurfaceBackgroundTransfer::HandingOff(_)
+        ));
+        assert!(answer.try_recv().is_err());
+        drop(control);
+        host.shutdown().expect("shutdown host");
+    }
+
+    /// The background key while the turn waits on a sync agent that runs in
+    /// this process without a thread of its own (here, one isolated in a
+    /// worktree): the host does not keep such an agent, so the key is not
+    /// refused. The request waits for the turn, as on a host that keeps
+    /// none, and the turn is moved to the background once the agent ends.
+    #[test]
+    fn a_turn_waiting_on_a_sync_subagent_without_a_thread_of_its_own_is_moved_after_it() {
+        let cwd = tempfile::tempdir().unwrap();
+        a_repository_with_a_commit(cwd.path());
+        let markers = tempfile::tempdir().unwrap();
+        let release = ReleaseMarker(markers.path().join("release the agent"));
+        let host = RuntimeHost::start().expect("start host");
+        host.handle().keep_subagents_in_process();
+        let _stops_agents = StopsKeptAgents(host.handle());
+        let child_prompt = format!("mock_stream_release_marker {}", release.0.display());
+        let (thread, attachment, operation_id, fence) = start_parent_turn_to_move(
+            &host,
+            cwd.path(),
+            &format!("subagent worktree sync {child_prompt}"),
+            ApprovalMode::FullAuto,
+        );
+        let surface = thread.surface();
+        let read_snapshot = || {
+            fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot
+        };
+        let registry = thread.task_registry();
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let agent = loop {
+            let found = read_snapshot()
+                .subagents
+                .iter()
+                .find(|subagent| {
+                    subagent.description.as_str() == child_prompt
+                        && subagent.status == surface::SurfaceSubagentStatus::Running
+                })
+                .cloned();
+            if let Some(agent) = found {
+                break agent;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the agent never showed running: {:?}",
+                read_snapshot().subagents
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let record = registry
+            .get(agent.task_id.as_str())
+            .expect("the agent's record");
+        assert_eq!(record.worker_pid, None);
+        assert!(record.subagent_launch_intent.is_some());
+        assert!(!record.control.gets_a_thread_of_its_own());
+        assert!(!record.control.runs_on_its_own_thread());
+        assert!(agent.continuation.is_some());
+
+        let answer = ask_to_move_the_turn_to_the_background(&attachment, &fence);
+        if let Ok(answer) = answer.recv_timeout(Duration::from_millis(300)) {
+            panic!(
+                "the request was answered while the agent ran: {}",
+                background_answer_shown(&answer)
+            );
+        }
+        assert_eq!(
+            registry
+                .get(agent.task_id.as_str())
+                .expect("the agent's record")
+                .status,
+            TaskStatus::Running
+        );
+
+        release.release();
+        let answer = answer
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("the request was never answered");
+        assert!(
+            matches!(
+                answer,
+                Ok(surface::MutationReply::Committed {
+                    value: surface::TransferBackgroundOutput::HandedOff { .. },
+                    ..
+                })
+            ),
+            "{}",
+            background_answer_shown(&answer)
+        );
+        let record = registry
+            .get(agent.task_id.as_str())
+            .expect("the agent's record");
+        assert_eq!(record.status, TaskStatus::Completed, "{:?}", record.error);
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id);
+        host.shutdown().expect("shutdown host");
+    }
+
+    /// On a host that keeps its subagents, a turn whose only running child
+    /// runs in a worker process is moved to the background as before: that
+    /// child goes on in its own process whatever its parent's turn does.
+    /// No worker is started here: the child's record is made by hand in the
+    /// shape a launch in a worker process leaves, with no launch intent, not
+    /// accepted for a thread of its own, and with a worker pid.
+    #[test]
+    fn a_turn_whose_running_child_is_in_a_worker_process_is_moved_to_the_background() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start host");
+        host.handle().keep_subagents_in_process();
+        let (thread, attachment, operation_id, fence) = start_parent_turn_to_move(
+            &host,
+            cwd.path(),
+            "mock_stream_delay_ms 3000",
+            ApprovalMode::FullAuto,
+        );
+        let registry = thread.task_registry();
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let turn_task = loop {
+            if let Some(task) = registry.list().into_iter().find(|task| {
+                task.task_type == orca_core::task_types::TaskType::MainSession
+                    && task.status == TaskStatus::Running
+            }) {
+                break task;
+            }
+            assert!(Instant::now() < deadline, "the turn's record never ran");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let detached = registry.create_subagent_with_parent(
+            "a child in a worker process".into(),
+            None,
+            Some(turn_task.id.clone()),
+        );
+        registry
+            .mark_running(&detached.id)
+            .expect("the detached child runs");
+        registry
+            .mark_worker_spawned(&detached.id, 4242)
+            .expect("the detached child has a worker");
+        let record = registry.get(&detached.id).expect("the detached child");
+        assert!(record.subagent_launch_intent.is_none());
+        assert!(!record.control.gets_a_thread_of_its_own());
+
+        let answer = ask_to_move_the_turn_to_the_background(&attachment, &fence)
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("the request was never answered");
+        assert!(
+            matches!(
+                answer,
+                Ok(surface::MutationReply::Committed {
+                    value: surface::TransferBackgroundOutput::HandedOff { .. },
+                    ..
+                })
+            ),
+            "{}",
+            background_answer_shown(&answer)
+        );
+        assert!(
+            registry
+                .get(&turn_task.id)
+                .expect("the turn's record")
+                .is_backgrounded
+        );
+        registry
+            .stop(&detached.id, "the test is over".into())
+            .expect("stop the detached child");
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id);
+        host.shutdown().expect("shutdown host");
+    }
+
+    /// On a host that does not keep its subagents, nothing changes: a
+    /// request made while the turn waits on a child it runs is not refused,
+    /// and the turn is moved to the background once the child is done.
+    #[test]
+    fn a_host_that_does_not_keep_its_subagents_moves_the_turn_as_before() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start host");
+        let (thread, attachment, operation_id, fence) = start_parent_turn_to_move(
+            &host,
+            cwd.path(),
+            "subagent sync mock_stream_delay_ms 1500",
+            ApprovalMode::FullAuto,
+        );
+        let surface = thread.surface();
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let agent = loop {
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            if let Some(agent) = snapshot
+                .subagents
+                .iter()
+                .find(|subagent| subagent.status == surface::SurfaceSubagentStatus::Running)
+                .cloned()
+            {
+                break agent;
+            }
+            assert!(Instant::now() < deadline, "the child never ran");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let answer = ask_to_move_the_turn_to_the_background(&attachment, &fence)
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("the request was never answered");
+        assert!(
+            matches!(
+                answer,
+                Ok(surface::MutationReply::Committed {
+                    value: surface::TransferBackgroundOutput::HandedOff { .. },
+                    ..
+                })
+            ),
+            "{}",
+            background_answer_shown(&answer)
+        );
+        let record = thread
+            .task_registry()
+            .get(agent.task_id.as_str())
+            .expect("the child's record");
+        assert!(
+            !record.status.is_active(),
+            "the turn was moved while its child ran: {:?}",
+            record.status
+        );
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), operation_id);
+        host.shutdown().expect("shutdown host");
+    }
+
+    /// A host that does not keep its children in its process has no way to
+    /// stop one that is part of a running turn on its own, as before: a
+    /// person's stop of it is refused in the words a person now reads, and
+    /// the child goes on.
+    #[test]
+    fn a_subagent_that_cannot_be_stopped_alone_is_refused_with_the_new_sentence() {
+        let cwd = tempfile::tempdir().unwrap();
+        let host = RuntimeHost::start().expect("start refused subagent stop host");
+        let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
+        config.approval_mode = ApprovalMode::FullAuto;
+        let thread = host
+            .start_thread(config, "refuse a subagent stop")
+            .expect("start parent thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment_with_capabilities(
+            &surface,
+            BTreeSet::from([
+                surface::SurfaceCapability::ReadSnapshot,
+                surface::SurfaceCapability::SubmitOperation,
+                surface::SurfaceCapability::ControlBoundOperation,
+                surface::SurfaceCapability::ManageTask,
+            ]),
+        );
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(
+                        &attachment.baseline.snapshot,
+                        "subagent sync mock_stream_delay_ms 30000",
+                    ),
+                )
+                .expect("reserve the parent's turn"),
+        );
+        let admitted = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    reserved.operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit the parent's turn"),
+        );
+        assert!(
+            matches!(admitted, surface::AdmissionOutput::Admitted { .. }),
+            "the parent's turn was queued"
+        );
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
+        let task = loop {
+            let snapshot = fresh_surface_attachment_with_capabilities(
+                &surface,
+                BTreeSet::from([surface::SurfaceCapability::ReadSnapshot]),
+            )
+            .baseline
+            .snapshot;
+            let running = snapshot.subagents.iter().find(|subagent| {
+                subagent.status == surface::SurfaceSubagentStatus::Running
+                    && matches!(
+                        subagent.owner,
+                        surface::SurfaceSubagentOwner::Generation { .. }
+                    )
+            });
+            if let Some(task) = running.and_then(|subagent| {
+                snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == subagent.task_id)
+                    .cloned()
+            }) {
+                break task;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the agent never got under way: {:?}",
+                snapshot.subagents
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let reply = attachment
+            .client
+            .task_control(
+                surface_request_id(),
+                surface::TaskControlAction::Stop {
+                    fence: surface::SurfaceTaskFence {
+                        task_id: task.task_id.clone(),
+                        task_revision: task.revision,
+                        background_owner: task.background_fence.clone(),
+                    },
+                },
+            )
+            .expect("ask to stop the agent");
+        let surface::MutationReply::Uncommitted {
+            mutation: surface::UncommittedMutation::Invalid { error, .. },
+        } = reply
+        else {
+            panic!("the stop was not refused");
+        };
+        assert_eq!(
+            error.error().message.as_str(),
+            "this subagent cannot be stopped independently"
+        );
+        let record = thread
+            .task_registry()
+            .get(task.task_id.as_str())
+            .expect("the agent's record");
+        assert_eq!(record.status, TaskStatus::Running);
+        assert!(!record.stop_requested);
+
+        let _ = attachment
+            .client
+            .cancel_operation(surface_request_id(), reserved.operation_id.clone());
+        let _ = attachment
+            .client
+            .wait_operation_terminal(surface_request_id(), reserved.operation_id);
+        host.shutdown()
+            .expect("shutdown refused subagent stop host");
     }
 
     #[test]
@@ -39685,6 +43873,96 @@ mod tests {
             .expect("shutdown returned before the generation completed");
         assert!(thread.command_tx.is_closed());
         assert!(shutdown.is_ok(), "host shutdown returned {shutdown:?}");
+    }
+
+    /// A shutdown that closes the mailbox under a running generation excuses
+    /// only the generation's own error, which the closed mailbox can cause.
+    /// A failure the actor meets after the generation has returned, here the
+    /// writer's finish of a turn that returned cancelled, is not the
+    /// shutdown's doing: the turn ends failed, with that error.
+    #[test]
+    fn host_shutdown_keeps_a_failure_met_after_the_generation_returned() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (cancel_observed_tx, _cancel_observed_rx) = mpsc::sync_channel(1);
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let host = RuntimeHost::start_with_executor(Arc::new(CancelAwareShutdownExecutor {
+            entered: entered_tx,
+            cancel_observed: cancel_observed_tx,
+            completed: completed_tx,
+        }))
+        .expect("start runtime host");
+        let thread = host
+            .start_thread(
+                surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record),
+                "fail the writer's finish during a host shutdown",
+            )
+            .expect("start recorded runtime thread");
+        let surface = thread.surface();
+        let attachment = fresh_surface_attachment(&surface);
+        let mut subscription = surface
+            .claim_subscription(&attachment.subscription)
+            .expect("claim subscription");
+        let reserved = committed_surface_value(
+            attachment
+                .client
+                .reserve_operation(
+                    surface_request_id(),
+                    surface_user_turn_intent(&attachment.baseline.snapshot, "wait for shutdown"),
+                )
+                .expect("reserve typed operation"),
+        );
+        let operation_id = reserved.operation_id.clone();
+        let _ = committed_surface_value(
+            attachment
+                .client
+                .admit_reserved(
+                    surface_request_id(),
+                    operation_id.clone(),
+                    reserved.lease.lease_id,
+                )
+                .expect("admit typed operation"),
+        );
+        entered_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("executor did not start");
+        inject_passthrough_finish_failure_once(thread.thread_id());
+
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(host.shutdown());
+        });
+        let _shutdown = shutdown_rx
+            .recv_timeout(SURFACE_TEST_TIMEOUT)
+            .expect("host shutdown hung");
+
+        let mut terminals = Vec::new();
+        while let Some(item) = subscription.try_recv() {
+            let surface::SurfaceSubscriptionItem::Batch { batch } = item else {
+                continue;
+            };
+            for envelope in batch.events.as_slice() {
+                if let surface::SurfaceEvent::Operation(surface::OperationPatch::Terminal {
+                    record,
+                }) = &envelope.event
+                    && record.operation_id == operation_id
+                {
+                    terminals.push(record.terminal.clone());
+                }
+            }
+        }
+        let [terminal] = terminals.as_slice() else {
+            panic!("expected one terminal for the turn, got {terminals:?}");
+        };
+        let surface::OperationTerminal::Failed { message, .. } = terminal else {
+            panic!("the writer's failure was reported as {terminal:?}");
+        };
+        assert!(
+            message
+                .as_str()
+                .contains("injected passthrough generation finish failure"),
+            "the failure lost its error: {message:?}"
+        );
     }
 
     #[test]
@@ -45067,18 +49345,7 @@ done
         surface: &surface::RuntimeSurfaceHandle,
         ready: impl Fn(&surface::SurfaceMcpCatalogSnapshot) -> bool,
     ) -> surface::SurfaceMcpCatalogSnapshot {
-        wait_for_mcp_catalog_within(surface, SURFACE_TEST_TIMEOUT, ready)
-    }
-
-    /// The MCP catalog of a fresh attachment, once `ready` accepts it, which
-    /// must happen within `timeout`.
-    #[cfg(unix)]
-    fn wait_for_mcp_catalog_within(
-        surface: &surface::RuntimeSurfaceHandle,
-        timeout: Duration,
-        ready: impl Fn(&surface::SurfaceMcpCatalogSnapshot) -> bool,
-    ) -> surface::SurfaceMcpCatalogSnapshot {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + SURFACE_TEST_TIMEOUT;
         loop {
             let catalog = fresh_surface_attachment_with_capabilities(
                 surface,
@@ -45818,6 +50085,7 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       : > "$0.initializing"
       if [ "$delay" != never ]; then
+        while [ -f "$0.held" ]; do sleep 0.05; done
         sleep "$delay"
         printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"slow","version":"1"}}}}}}\n' "$id"
       fi
@@ -45849,6 +50117,17 @@ done
     }
 
     #[cfg(unix)]
+    fn held_mcp_server(
+        name: &str,
+        dir: &std::path::Path,
+    ) -> (orca_core::mcp_types::McpServerConfig, PathBuf) {
+        let server = slow_mcp_server(name, dir, Some(0));
+        let hold = catalog_mcp_server_dir(name, dir).join("server.sh.held");
+        fs::write(&hold, []).expect("hold initialize until the test releases it");
+        (server, hold)
+    }
+
+    #[cfg(unix)]
     #[test]
     fn thread_start_does_not_wait_for_servers() {
         let _env = crate::history::lock_test_env();
@@ -45856,20 +50135,14 @@ done
         let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
-        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), Some(2))];
+        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), None)];
         let host = RuntimeHost::start().expect("start runtime host");
 
-        let started = Instant::now();
         let thread = host
             .handle()
             .start_thread(config, "mcp start")
             .expect("start the thread");
 
-        let took = started.elapsed();
-        assert!(
-            took < Duration::from_secs(1),
-            "the thread start took {took:?}"
-        );
         assert!(
             thread.mcp_registry().is_starting(),
             "the server is still connecting"
@@ -45885,7 +50158,8 @@ done
         let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
-        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), Some(2))];
+        let (server, hold) = held_mcp_server("slow", cwd.path());
+        config.mcp_servers = vec![server];
         let host = RuntimeHost::start().expect("start runtime host");
         let thread = host
             .handle()
@@ -45893,7 +50167,6 @@ done
             .expect("start the thread");
         let surface = thread.surface();
 
-        // Nothing is asked of the thread: the catalog follows the server.
         wait_for_mcp_catalog(&surface, |catalog| {
             catalog.servers
                 == [catalog_server(
@@ -45901,7 +50174,10 @@ done
                     surface::SurfaceMcpServerStatus::Starting,
                 )]
         });
-        let catalog = wait_for_mcp_catalog_within(&surface, Duration::from_secs(3), |catalog| {
+        // Only the server is released. No turn or reconnect can publish Ready
+        // for the idle thread; its registry wake must update the snapshot.
+        fs::remove_file(hold).expect("release initialize after observing Starting");
+        let catalog = wait_for_mcp_catalog(&surface, |catalog| {
             catalog.servers
                 == [catalog_server(
                     "slow",
@@ -46025,7 +50301,11 @@ done
         let _home = crate::history::redirect_test_orca_home(home.path());
         let cwd = tempfile::tempdir().unwrap();
         let mut config = surface_test_config(cwd.path().to_path_buf(), HistoryMode::Record);
-        config.mcp_servers = vec![slow_mcp_server("slow", cwd.path(), Some(5))];
+        // The server never answers, so it is connecting until its startup
+        // timeout ends it: a turn that waited for it would end no sooner.
+        let server = slow_mcp_server("slow", cwd.path(), None);
+        let startup_timeout = Duration::from_millis(server.startup_timeout_ms.unwrap());
+        config.mcp_servers = vec![server];
         let host = RuntimeHost::start().expect("start runtime host");
         let thread = host
             .handle()
@@ -46057,10 +50337,10 @@ done
             "the turn ended as {:?}",
             value.terminal
         );
-        assert!(
-            took < Duration::from_secs(1),
-            "the turn took {took:?} to stop"
-        );
+        // Stopping takes a few durable commits after the 25 ms wait poll sees
+        // the cancel, which a loaded machine can stretch past a second; waiting
+        // for the server would take its whole startup timeout.
+        assert!(took < startup_timeout / 3, "the turn took {took:?} to stop");
         assert!(
             thread.mcp_registry().is_starting(),
             "the server is still connecting"

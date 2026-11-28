@@ -22,7 +22,8 @@ use crate::surface_projection::{
 use crate::transcript_state::ChatMessage;
 use crate::types::{
     AppState, AppStatus, ApprovalDialog, PanelMode, PlanApprovalDialog, RecapState, RewindPhase,
-    RewindState, SessionPickerPhase, SideConversationUiState, TaskTranscriptViewState,
+    RewindState, SessionPickerPhase, SideConversationUiState, SideParentStatus,
+    TaskTranscriptViewState,
 };
 use crate::user_input_dialog::UserInputDialog;
 
@@ -74,6 +75,81 @@ fn put_output(text: &mut String, offset: Option<usize>, chunk: &str) {
 }
 
 impl AppState {
+    pub(crate) fn accept_surface_delivery(&mut self, event: TuiEvent) -> Option<TuiEvent> {
+        let TuiEvent::SurfaceDelivery(delivery) = event else {
+            return Some(event);
+        };
+        let (cursor, event, owner) = *delivery;
+        if let Some(owner) = owner {
+            let accepted = event.accepts_lifecycle(
+                self.lifecycle_cursor.as_ref(),
+                &owner,
+                &cursor,
+                matches!(
+                    self.status,
+                    AppStatus::WaitingApproval | AppStatus::WaitingUserInput
+                ),
+            );
+            if let TuiEvent::Diagnostic(diagnostic) = event {
+                if accepted {
+                    return Some(TuiEvent::Diagnostic(diagnostic));
+                }
+                let current_turn_seen = self.turn_diagnostic_seen;
+                self.push_message(ChatMessage::Diagnostic(diagnostic));
+                self.turn_diagnostic_seen = current_turn_seen;
+                return None;
+            }
+            if let TuiEvent::Compacted {
+                before_messages,
+                after_messages,
+                ref reason,
+                ref strategy,
+                collapsed_messages,
+                ref status_text,
+            } = event
+            {
+                if accepted {
+                    return Some(event);
+                }
+                self.push_message(ChatMessage::System {
+                    text: format_compaction_notice(
+                        reason,
+                        strategy,
+                        before_messages,
+                        after_messages,
+                        collapsed_messages,
+                        status_text,
+                    ),
+                    expanded: false,
+                });
+                return None;
+            }
+            if !accepted
+                || matches!(event, TuiEvent::TerminalRecoveryNeeded(_))
+                    && self.status == AppStatus::Idle
+                    && self.lifecycle_cursor.as_ref().is_some_and(|previous| {
+                        !previous.live && previous.owner == owner && previous.cursor == cursor
+                    })
+            {
+                return None;
+            }
+            self.lifecycle_cursor =
+                Some(event.lifecycle_delivery(owner, cursor, self.lifecycle_cursor.as_ref()));
+            if matches!(event, TuiEvent::OperationReleased) {
+                return None;
+            }
+        }
+        Some(event)
+    }
+
+    fn clear_terminal_interactions(&mut self) {
+        self.approval_dialog = None;
+        self.interaction.pending_input = None;
+        self.interaction.pending_mcp_elicitation_mode = None;
+        self.interaction.pending_submission = None;
+        self.user_input_dialog = None;
+    }
+
     /// Adds output a tool wrote to its row: to a script's calls, or to any
     /// other tool's output.
     fn take_tool_output(&mut self, id: String, offset: Option<usize>, chunk: &str) {
@@ -168,10 +244,22 @@ impl AppState {
                     Err(error) => self.push_message(ChatMessage::Error(error)),
                 }
             }
+            event @ TuiEvent::SurfaceDelivery(_) => {
+                if let Some(event) = self.accept_surface_delivery(event) {
+                    self.update(event);
+                }
+            }
+            TuiEvent::TerminalRecoveryNeeded(message) => {
+                self.clear_terminal_interactions();
+                self.update(TuiEvent::Error(message));
+                self.set_status(AppStatus::Idle);
+            }
             TuiEvent::Attached(_) => {
                 eprintln!("orca: ignored an attached TUI event that bypassed attachment fencing");
             }
-            TuiEvent::SessionAttachmentActivated => {}
+            TuiEvent::SessionAttachmentActivated
+            | TuiEvent::SurfaceRequestSettled(_)
+            | TuiEvent::OperationReleased => {}
             TuiEvent::SideConversationChanged {
                 active,
                 available,
@@ -197,8 +285,14 @@ impl AppState {
                 if let Some(side) = self.side_conversation.as_mut() {
                     side.parent_status = status;
                 }
+                if self.conversation_target.task_id().is_some() {
+                    self.main_behind_child = Some(status);
+                }
             }
             TuiEvent::ChildFocusChanged { task_id } => {
+                if task_id.is_none() {
+                    self.main_behind_child = None;
+                }
                 self.pending_tool_image_call_id = None;
                 self.invalidate_recap();
                 // Only snapshot the current workflow task list when transitioning
@@ -209,18 +303,25 @@ impl AppState {
                     self.background_workflow_tasks = self.workflow_panel.task_list();
                 }
                 self.focused_workflow_tasks.clear();
+                self.agent_dock_selected_task_id.clone_from(&task_id);
                 self.set_conversation_target(match task_id {
                     Some(task_id) => ConversationTarget::subagent(task_id),
                     None => ConversationTarget::Main,
                 });
+                if self.selected_agent_dock_task().is_none() {
+                    self.agent_dock_selected_task_id = None;
+                }
                 self.task_transcript = None;
                 self.panel_mode = PanelMode::Conversation;
                 self.scroll_to_bottom();
             }
             TuiEvent::SurfaceProjectionSynced(projection) => {
-                self.apply_surface_projection_state(*projection);
+                if self.apply_surface_projection_state(*projection) {
+                    self.announce_visible_agent_lines();
+                }
             }
             TuiEvent::NewSessionStarted => {
+                self.main_behind_child = None;
                 self.pending_tool_image_call_id = None;
                 self.invalidate_recap();
                 self.task_transcript = None;
@@ -232,18 +333,22 @@ impl AppState {
                 self.announced_subagent_terminals.clear();
             }
             TuiEvent::SessionProjectionReset(projection) => {
-                if !SurfaceSessionProjectionState::accepts_reset(&projection)
-                    || !SurfaceOperationProjectionState::accepts_reset(&projection)
-                {
-                    return;
-                }
-                self.reset_session_projection();
-                self.invalidate_recap();
-                self.task_transcript = None;
-                self.apply_surface_projection_state(*projection);
+                let seed = projection.foreground_operation_id.clone().map(|owner| {
+                    crate::protocol::LifecycleDelivery {
+                        owner,
+                        cursor: projection.cursor.clone(),
+                        delivered: None,
+                        live: true,
+                    }
+                });
+                self.reset_main_projection(*projection, seed);
+            }
+            TuiEvent::ReturnedMainProjection(projection, seed) => {
+                self.reset_main_projection(*projection, seed);
             }
             TuiEvent::ChildProjectionReset {
                 task_id,
+                main_status,
                 projection,
             } => {
                 if !SurfaceSessionProjectionState::accepts_reset(&projection)
@@ -251,14 +356,20 @@ impl AppState {
                 {
                     return;
                 }
-                let background_tasks = self.background_workflow_tasks.clone();
-                self.reset_session_projection();
-                self.invalidate_recap();
-                self.background_workflow_tasks = background_tasks;
-                self.set_conversation_target(ConversationTarget::subagent(task_id));
-                self.task_transcript = None;
-                self.panel_mode = PanelMode::Conversation;
+                self.reset_child_view(task_id, main_status, false);
                 self.apply_surface_projection_state(*projection);
+            }
+            TuiEvent::FinishedChildProjection {
+                task_id,
+                main_status,
+                projection,
+            } => {
+                self.reset_child_view(task_id, Some(main_status), true);
+                if let Some(projection) = projection {
+                    self.apply_surface_projection_state(*projection);
+                } else {
+                    self.update_workflow_panel(self.background_workflow_tasks.clone());
+                }
             }
             TuiEvent::SavedSessionsUpdated {
                 sessions,
@@ -291,10 +402,13 @@ impl AppState {
                 self.surface_metrics.apply_acp_metrics(metrics);
             }
             TuiEvent::HistoryLoaded {
+                agent_lines,
                 messages,
                 plan,
                 label,
             } => {
+                self.announced_subagent_batches = agent_lines.batches;
+                self.announced_subagent_terminals = agent_lines.terminals;
                 self.replace_messages(messages);
                 self.settle_restored_command_rows();
                 if let Some(plan) = plan {
@@ -307,10 +421,25 @@ impl AppState {
                 self.transcript.finalized_count = self.transcript.messages.len();
                 self.set_status(AppStatus::Idle);
             }
-            TuiEvent::TurnStarted { .. } => {
+            TuiEvent::ConversationReprojected {
+                agent_lines,
+                messages,
+                plan,
+            } => {
+                self.announced_subagent_batches = agent_lines.batches;
+                self.announced_subagent_terminals = agent_lines.terminals;
+                self.replace_messages(messages);
+                self.settle_restored_command_rows();
+                self.restore_plan(plan);
+                self.transcript.finalized_count = self.transcript.messages.len();
+            }
+            TuiEvent::TurnStarted { started_at_ms, .. } => {
                 self.invalidate_recap();
                 self.suppress_background_main_session_output = false;
-                self.enter_running();
+                self.enter_running_at(started_at_ms);
+            }
+            TuiEvent::RuntimeTurnRestored(turn_id) => {
+                self.runtime_turn_id = Some(turn_id.to_string());
             }
             TuiEvent::RuntimeTurnStarted { turn_id } => {
                 self.invalidate_recap();
@@ -440,6 +569,10 @@ impl AppState {
                 if self.suppress_background_main_session_output {
                     return;
                 }
+                self.handle_message_delta(&text);
+            }
+            TuiEvent::OpenMessageRestored(text) => {
+                self.transcript.assistant_stream.restore_open_reply();
                 self.handle_message_delta(&text);
             }
             TuiEvent::ProposedPlanDelta(text) => {
@@ -877,6 +1010,12 @@ impl AppState {
                 )));
                 self.set_status(AppStatus::Idle);
             }
+            TuiEvent::CommandRefused(text) => {
+                self.push_message(ChatMessage::System {
+                    text,
+                    expanded: false,
+                });
+            }
             TuiEvent::OperationRejected(message) => {
                 self.cancel_latest_queued_edit();
                 self.user_input_dialog = None;
@@ -888,18 +1027,33 @@ impl AppState {
                 )));
                 self.set_status(AppStatus::Idle);
             }
+            TuiEvent::RefusedElsewhere {
+                prompt, message, ..
+            } => {
+                // A queue edit that was refused is not in flight any more;
+                // the conversation in view goes on as it was.
+                if prompt.is_none() {
+                    self.cancel_latest_queued_edit();
+                }
+                self.push_message(ChatMessage::Diagnostic(TuiDiagnostic::from_message(
+                    DiagnosticContext::Input,
+                    message,
+                )));
+            }
             TuiEvent::Diagnostic(diagnostic) => {
                 self.finish_assistant_stream();
                 self.clear_receiving_tool_progress();
                 // The runtime ends a turn whose approval was denied the same
                 // way as one nobody could approve; after the user's own "no"
-                // that is their answer, not an error.
+                // that is their answer, not an error. The notice explains the
+                // end, so the turn's failed status after it adds nothing.
                 if self.denied_approval_stops_turn
                     && diagnostic.code() == "permission.approval_unavailable"
                 {
                     self.denied_approval_stops_turn = false;
+                    self.turn_diagnostic_seen = true;
                     self.push_message(ChatMessage::System {
-                        text: "Denied. Tell Orca what to do instead.".to_string(),
+                        text: crate::approval_actions::DENIED_APPROVAL_NOTICE.to_string(),
                         expanded: false,
                     });
                     return;
@@ -940,6 +1094,24 @@ impl AppState {
                     expanded: false,
                 });
             }
+            TuiEvent::TurnKeptInForeground(msg) => {
+                self.finish_assistant_stream();
+                self.push_message(ChatMessage::System {
+                    text: msg,
+                    expanded: false,
+                });
+                // The background key showed the turn idle before the runtime
+                // answered; it is still running here. Only the status comes
+                // back: what else the key started stays started. A refusal
+                // that comes later, when an agent reports or main streams
+                // again after a request made while main ran a tool, lands on
+                // the view on screen then, which may no longer be the one
+                // the key was pressed in. Stage 2's work on returning to
+                // main is to revisit this.
+                if self.status == AppStatus::Idle {
+                    self.enter_running();
+                }
+            }
             TuiEvent::McpActionFinished { server } => {
                 self.mcp_actions_in_flight.remove(&server);
             }
@@ -955,6 +1127,12 @@ impl AppState {
             TuiEvent::McpCatalogPrestart(catalog) => {
                 if self.mcp_servers_before_start() {
                     self.mcp_catalog = catalog;
+                }
+            }
+            TuiEvent::MainMcpCatalogWhileVisiting(catalog) => {
+                if self.conversation_target().task_id().is_some() {
+                    self.mcp_catalog = catalog;
+                    self.surface_mcp_catalog_applied = true;
                 }
             }
             TuiEvent::McpLoginUrl { server, url } => {
@@ -1140,11 +1318,7 @@ impl AppState {
                         TuiDiagnostic::from_completion_status(&status)
                     };
                 self.suppress_background_main_session_output = false;
-                self.approval_dialog = None;
-                self.interaction.pending_input = None;
-                self.interaction.pending_mcp_elicitation_mode = None;
-                self.interaction.pending_submission = None;
-                self.user_input_dialog = None;
+                self.clear_terminal_interactions();
                 self.clear_receiving_tool_progress();
                 self.flush_proposed_plan_parser();
                 self.finish_assistant_stream();
@@ -1418,40 +1592,70 @@ impl AppState {
             .map(|offset| first + 1 + offset)
     }
 
-    /// Materialize only the root-level delegation announcement. Child state is
-    /// owned by the dock and focused child surface; putting task snapshots in
-    /// `ChatMessage` makes the root transcript a second, stale authority.
     pub(crate) fn sync_subagent_transcript_messages(&mut self) {
         let tasks = self
-            .workflow_tasks()
+            .visible_conversation_tasks()
             .iter()
             .filter(|task| task.task_type == orca_core::task_types::TaskType::Subagent)
             .cloned()
             .collect::<Vec<_>>();
         for task in &tasks {
-            let batch_key = task
-                .subagent_batch_id
-                .clone()
-                .unwrap_or_else(|| task.id.clone());
-            if (task.status.is_active() || task.status.requires_attention())
-                && self.announced_subagent_batches.insert(batch_key)
-            {
+            let batch_key = crate::subagent_lines::batch_key(task).to_owned();
+            if self.announced_subagent_batches.insert(batch_key) {
                 self.finish_assistant_stream();
-                let batch_size = task.subagent_batch_size.unwrap_or(1).max(1);
-                let noun = if batch_size == 1 {
-                    "agent"
-                } else {
-                    "agents in parallel"
-                };
                 self.push_message(ChatMessage::System {
-                    text: format!("Delegating to {batch_size} {noun}"),
+                    text: crate::subagent_lines::delegating_line(
+                        task.subagent_batch_size.unwrap_or(1) as usize,
+                    ),
                     expanded: false,
                 });
             }
         }
     }
 
-    pub(crate) fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) {
+    fn reset_child_view(
+        &mut self,
+        task_id: String,
+        main_status: Option<SideParentStatus>,
+        finished: bool,
+    ) {
+        let selected = if self.conversation_target().task_id() == Some(&task_id) {
+            self.agent_dock_selected_task_id.take()
+        } else {
+            Some(task_id.clone())
+        };
+        let background_tasks = std::mem::take(&mut self.background_workflow_tasks);
+        self.reset_session_projection();
+        if let Some(status) = main_status {
+            self.main_behind_child = Some(status);
+        }
+        self.invalidate_recap();
+        self.background_workflow_tasks = background_tasks;
+        self.set_conversation_target(ConversationTarget::subagent(task_id));
+        self.agent_dock_selected_task_id = selected;
+        self.finished_child = finished;
+        self.task_transcript = None;
+        self.panel_mode = PanelMode::Conversation;
+    }
+
+    fn reset_main_projection(
+        &mut self,
+        projection: SurfaceProjectionState,
+        lifecycle: Option<crate::protocol::LifecycleDelivery>,
+    ) {
+        if !SurfaceSessionProjectionState::accepts_reset(&projection)
+            || !SurfaceOperationProjectionState::accepts_reset(&projection)
+        {
+            return;
+        }
+        self.reset_session_projection();
+        self.invalidate_recap();
+        self.task_transcript = None;
+        self.lifecycle_cursor = lifecycle;
+        self.apply_surface_projection_state(projection);
+    }
+
+    fn apply_surface_projection_state(&mut self, projection: SurfaceProjectionState) -> bool {
         let mut projection = projection;
         let mut surface_session = self.surface_session.clone();
         let session_apply = surface_session.apply_projection(&projection);
@@ -1466,7 +1670,7 @@ impl AppState {
                 .surface_metrics
                 .rejects_usage_revision(projection.usage_revision)
         {
-            return;
+            return false;
         }
         if self.conversation_target().task_id().is_some() {
             self.focused_workflow_tasks
@@ -1477,15 +1681,15 @@ impl AppState {
             );
         } else {
             self.focused_workflow_tasks.clear();
+            self.mcp_catalog.clone_from(&projection.mcp_catalog);
+            self.surface_mcp_catalog_applied = true;
         }
         self.surface_session = surface_session;
         self.surface_operation = surface_operation;
         self.surface_workflow_tasks = surface_workflow_tasks;
         self.surface_metrics.apply_projection(&projection);
-        self.mcp_catalog.clone_from(&projection.mcp_catalog);
-        self.surface_mcp_catalog_applied = true;
         let goal_effect = self.surface_goal.apply_projection(&projection);
-        self.apply_workflow_tasks_update(projection.workflow_tasks.clone());
+        self.update_workflow_panel(projection.workflow_tasks.clone());
         match operation_apply {
             SurfaceOperationProjectionApply::Rejected => unreachable!("projection was rejected"),
             SurfaceOperationProjectionApply::Accepted(operation_effect) => match operation_effect {
@@ -1547,6 +1751,7 @@ impl AppState {
             SurfaceSessionProjectionApply::Accepted(None)
             | SurfaceSessionProjectionApply::Rejected => {}
         }
+        true
     }
 
     pub(crate) fn promote_trailing_reasoning(&mut self) {
@@ -1567,6 +1772,7 @@ impl AppState {
         // transcript and is replaced, and put them back after the completed
         // text; left in place they would keep the streamed reasoning above
         // them and gain a second copy below.
+        let restored = self.transcript.assistant_stream.is_restored_reply();
         let receiving = self.take_trailing_receiving_tool_calls();
         // The response's own streamed text is what trails the transcript:
         // the text before the last tool row, notice, or message belongs to
@@ -1582,6 +1788,9 @@ impl AppState {
         // Streaming markdown may still hold an unfinished partial line from the
         // content being replaced; drop it so the completed response renders alone.
         self.reset_assistant_stream();
+        if restored {
+            self.transcript.assistant_stream.restore_open_reply();
+        }
         if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
             self.push_message(ChatMessage::Reasoning {
                 text: reasoning.to_string(),
@@ -1696,20 +1905,8 @@ impl AppState {
     ) {
         for action in actions {
             match action {
-                StreamingMarkdownAction::UpdateTail(text) => {
-                    if let Some(index) = self.transcript.assistant_stream_tail {
-                        self.mutate_message(index, |message| {
-                            let ChatMessage::Assistant(existing) = message else {
-                                unreachable!();
-                            };
-                            *existing = text;
-                        });
-                    } else {
-                        let index = self.transcript.messages.len();
-                        self.push_message(ChatMessage::Assistant(text));
-                        self.transcript.assistant_stream_tail = Some(index);
-                    }
-                }
+                StreamingMarkdownAction::UpdateTail(text) => self.write_assistant_tail(text, false),
+                StreamingMarkdownAction::ExtendTail(text) => self.write_assistant_tail(text, true),
                 StreamingMarkdownAction::FreezeTail {
                     text,
                     trailing_blank,
@@ -1755,6 +1952,25 @@ impl AppState {
                     self.transcript.assistant_stream_tail = None;
                 }
             }
+        }
+    }
+
+    fn write_assistant_tail(&mut self, text: String, append: bool) {
+        if let Some(index) = self.transcript.assistant_stream_tail {
+            self.mutate_message(index, |message| {
+                let ChatMessage::Assistant(existing) = message else {
+                    unreachable!()
+                };
+                if append {
+                    existing.push_str(&text);
+                } else {
+                    *existing = text;
+                }
+            });
+        } else {
+            let index = self.transcript.messages.len();
+            self.push_message(ChatMessage::Assistant(text));
+            self.transcript.assistant_stream_tail = Some(index);
         }
     }
 

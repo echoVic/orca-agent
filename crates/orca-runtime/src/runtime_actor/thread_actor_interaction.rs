@@ -6217,6 +6217,18 @@ impl ThreadActor {
             return;
         }
         while let Some(attachment_id) = self.next_invalid_surface_interaction_attachment() {
+            if let Some(active) = active.as_deref_mut()
+                && let Some(fence) = active.surface_operation.as_ref()
+                && self
+                    .resident_surface
+                    .interactions
+                    .operation_origin_attachments
+                    .get(&fence.operation_id)
+                    == Some(&attachment_id)
+                && self.interrupt_if_follow_gapped(active)
+            {
+                return;
+            }
             let transition = match self.prepare_surface_attachment_transition(&attachment_id) {
                 Ok(Some(transition)) => transition,
                 Ok(None) | Err(()) => return,

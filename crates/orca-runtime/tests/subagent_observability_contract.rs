@@ -210,13 +210,14 @@ fn task_transcript_action_is_dispatched_instead_of_dropped() {
 fn hosted_child_navigation_requires_a_surface_lifecycle_binding() {
     let focus = balanced_block(HOSTED_CHILD, "fn focus_child");
     let projection = balanced_block(HOSTED_CHILD, "fn project_hosted_child_attached");
-    let resolver = balanced_block(HOSTED_CHILD, "fn resolve_child_binding");
-    let surface_binding = balanced_block(HOSTED_CHILD, "fn child_binding");
+    let decision = balanced_block(HOSTED_CHILD, "fn resolve_child_open(");
 
     assert!(focus.contains("project_hosted_child_attached"));
     assert!(projection.contains("TuiEvent::ChildProjectionReset"));
-    assert!(resolver.contains("child_binding"));
-    assert!(surface_binding.contains("SurfaceSubagentStatus::Running"));
+    assert!(focus.contains("resolve_child_open(&current_snapshot"));
+    assert!(decision.contains("child_binding(snapshot, task_id, expected_revision)"));
+    assert!(decision.contains("finished_revision(snapshot, task_id)"));
+    assert!(decision.contains("SurfaceSubagentStatus::Running"));
     assert!(!HOSTED_CHILD.contains("registry_child_binding"));
     assert!(!HOSTED_CHILD.contains("agent_registry_snapshot"));
 }
@@ -299,22 +300,23 @@ fn hosted_tui_subagent_views_have_no_registry_input() {
 fn subagent_runtime_events_are_not_a_parallel_tui_projection() {
     let mapper = balanced_block(HOSTED_SESSION, "fn runtime_event_to_tui");
     let reducer = balanced_block(TUI_STATE_REDUCER, "pub fn update");
-    let projection = balanced_block(
-        TUI_STATE_REDUCER,
-        "pub(crate) fn apply_surface_projection_state",
+    let projection = balanced_block(TUI_STATE_REDUCER, "fn apply_surface_projection_state(");
+    let synced = balanced_block(reducer, "TuiEvent::SurfaceProjectionSynced(projection) =>");
+    let accepted = balanced_block(
+        synced,
+        "if self.apply_surface_projection_state(*projection)",
     );
 
     assert!(mapper.contains(
         "EventType::SubagentStarted | EventType::SubagentProgress | EventType::SubagentCompleted"
     ));
-    assert!(reducer.contains("TuiEvent::SurfaceProjectionSynced(projection)"));
-    assert!(reducer.contains("self.apply_surface_projection_state(*projection)"));
-    assert!(projection.contains("self.apply_workflow_tasks_update"));
+    assert!(accepted.contains("self.announce_visible_agent_lines()"));
+    assert!(projection.contains("self.update_workflow_panel(projection.workflow_tasks"));
 }
 
 #[test]
 fn surface_task_projection_preserves_the_registry_parent_identity() {
-    let function = balanced_block(GENERATION_ACTOR, "fn commit_subagent_activity_inner");
+    let function = balanced_block(GENERATION_ACTOR, "fn commit_subagent_activity_checked");
     assert!(
         function.contains("resolve_subagent_parent_task_id")
             && function.contains("parent_task_id,"),
@@ -324,7 +326,7 @@ fn surface_task_projection_preserves_the_registry_parent_identity() {
 
 #[test]
 fn durable_commit_retry_checks_the_event_digest_before_acknowledging_id() {
-    let function = balanced_block(GENERATION_ACTOR, "fn commit_subagent_activity_inner");
+    let function = balanced_block(GENERATION_ACTOR, "fn commit_subagent_activity_checked");
     let lookup_start = function
         .find("lookup_commit(&event.surface_commit_id)")
         .expect("subagent activity commit should consult the durable retry index");
