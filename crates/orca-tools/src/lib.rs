@@ -631,6 +631,83 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/S", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_reads_refuse_a_swapped_root_junction() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("workspace");
+        let neighbor = fixture.path().join("neighbor");
+        fs::create_dir(&cwd).unwrap();
+        fs::create_dir(&neighbor).unwrap();
+        fs::write(cwd.join("notes.txt"), "inside").unwrap();
+        fs::write(neighbor.join("notes.txt"), "outside").unwrap();
+        let request = ToolRequest {
+            id: "read".into(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("notes.txt".into()),
+            raw_arguments: None,
+        };
+        let result = read_file::execute(&request, &cwd, 4096);
+        assert!(result.output.unwrap().contains("inside"));
+        fs::rename(&cwd, fixture.path().join("old")).unwrap();
+        junction(&cwd, &neighbor);
+        let result = read_file::execute(&request, &cwd, 4096);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("workspace root changed while Orca was running")
+        );
+        fs::remove_dir(cwd).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_workspace_reads_refuse_a_spill_junction_swap() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("workspace");
+        let session = fixture.path().join("session");
+        let spill = session.join("spill");
+        let neighbor = fixture.path().join("neighbor");
+        for dir in [&cwd, &spill, &neighbor.join("spill")] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let file = spill.join("call.txt");
+        fs::write(&file, "saved result").unwrap();
+        fs::write(neighbor.join("spill/call.txt"), "outside").unwrap();
+        let request = ToolRequest {
+            id: "read".into(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some(file.to_str().unwrap().into()),
+            raw_arguments: None,
+        };
+        let read = || read_file::execute_in_session(&request, &cwd, 4096, Some(&spill), || false);
+        assert!(read().output.unwrap().contains("saved result"));
+        fs::rename(&session, fixture.path().join("old")).unwrap();
+        junction(&session, &neighbor);
+        let result = read();
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(result.output.is_none());
+        fs::remove_dir(session).unwrap();
+    }
+
+    #[cfg(windows)]
     #[test]
     fn windows_unc_paths_use_the_workspace_spelling() {
         let plain = Path::new(r"\\server\share\repo");

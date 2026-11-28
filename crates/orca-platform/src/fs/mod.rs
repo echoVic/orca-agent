@@ -13,7 +13,8 @@ pub use confined::{
     confined_files_size, open_confined_regular, remove_confined_files, write_confined_private,
 };
 pub use directory::{
-    FileAccess, FileIdentity, FileLinks, VerifiedDirectory, file_links, file_mode, stale_path,
+    DirectoryEntry, DirectoryEntryKind, FileAccess, FileIdentity, FileLinks, VerifiedDirectory,
+    file_links, file_mode, stale_path,
 };
 pub use lock::ExclusiveFileLock;
 pub use long_path::extended_length_path;
