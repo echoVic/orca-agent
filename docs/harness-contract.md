@@ -454,7 +454,7 @@ Built-in tools:
 | `read_file` | read | Reads UTF-8 file content, truncated at 8KB |
 | `glob` | read | Finds files and directories by glob pattern or `mode: "fuzzy"` path query, sorted as workspace-relative paths; returns `(no matches)` when the path is missing or no entries match |
 | `list_files` | read | Compatibility alias for directory listing; returns sorted names and `(empty)` for missing directories |
-| `grep` | read | Regex search with line numbers; uses `rg` when available and a native in-process fallback otherwise, `(no matches)` for empty results |
+| `grep` | read | Regex search with line numbers; uses `rg` with enforced read limits and searches in process otherwise, `(no matches)` for empty results |
 | `git_status` | read | Runs `git status --short` |
 | `web_search` | network | Searches the web for current information |
 | `bash` | shell | Executes via `sh -c` under the active approval policy and sandbox |
@@ -468,6 +468,14 @@ Built-in tools:
 | `create_goal` | read | Creates a persistent goal while goal mode is running and no unfinished goal exists |
 | `update_goal` | read | Submits an evidence-bearing complete/blocked intent for turn-end verification while Goal mode is running |
 | `ask_user_question` | read | Asks 1-4 structured questions through the interactive runtime; each question has a header and 2-4 described options, with optional preview and multi-select support |
+
+`read_file`, `read_document`, `grep`, `glob`, and `list_files` resolve paths inside the workspace. An empty path selects the workspace root. A missing intermediate directory or a file used as a directory is an error. Links to locations inside the workspace work. The tools refuse paths that resolve outside and skip listing entries that point outside. If a directory is replaced with a link while a file is opening, the tool refuses the read.
+
+`grep` skips symlinked ignore files. It uses the workspace's `.gitignore` and `.ignore` rules and also honors two Git ignore sources outside the workspace. These are the user's global excludes file (`core.excludesFile`, defaulting to `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`) and the repository's `info/exclude`, including the common Git directory of a linked worktree.
+
+`grep` runs ripgrep when macOS Seatbelt or Linux bubblewrap or Landlock can enforce restricted reads. On Windows, on hosts without that enforcement, or when ripgrep is missing, Orca searches in process.
+
+The model's `Workflow` tool accepts a saved workflow `name` without path separators. `.` and `..` are invalid names. A model-supplied `scriptPath` must resolve inside the workspace, a trusted ancestor's `.orca/workflows`, or your user workflows directory. You can still pass a path directly to `orca workflow run`.
 
 Tools are registered through a canonical registry. Each tool spec declares its capability set, renderer hint, exposure, aliases, and concurrent-safety flag. Runtime approval derives from the resolved tool spec instead of a separate hard-coded name list. Tool arguments are validated before execution with common JSON Schema object keywords, enums, arrays, and `oneOf` / `anyOf` composition.
 

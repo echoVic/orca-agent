@@ -245,6 +245,14 @@ DeepSeek bills these calls separately from tokens: 0.75 US dollars per 1,000 suc
 deepseek_web = false   # Brave or Exa for search, local requests only for fetch, no OCR
 ```
 
+## Reading files in the workspace
+
+`read_file`, `read_document`, `grep`, `glob`, and `list_files` resolve paths inside the workspace. An empty path selects the workspace root. A missing intermediate directory or a file used as a directory is an error. Links to locations inside the workspace work. The tools refuse paths that resolve outside and skip listing entries that point outside. If a directory is replaced with a link while a file is opening, the tool refuses the read.
+
+`grep` skips symlinked ignore files. It uses the workspace's `.gitignore` and `.ignore` rules and also honors two Git ignore sources outside the workspace. These are the user's global excludes file (`core.excludesFile`, defaulting to `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`) and the repository's `info/exclude`, including the common Git directory of a linked worktree.
+
+`grep` runs ripgrep when macOS Seatbelt or Linux bubblewrap or Landlock can enforce restricted reads. On Windows, on hosts without that enforcement, or when ripgrep is missing, Orca searches in process.
+
 ## Reading documents and images
 
 Under the same conditions, the `read_document` tool reads PDF, Word (`.doc`, `.docx`), PowerPoint (`.ppt`, `.pptx`) and image files (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp`, `.tif`, `.tiff`). It uploads the file to DeepSeek's OCR API and returns the recognized text with a `--- Page N ---` line before each page, numbered as DeepSeek numbers it; the first line says so when some pages came back without text. DeepSeek says the file is not stored in its Files API and is not passed to a chat model. `offset` and `limit` count the lines of that text, as `read_file` counts a file's lines. `read_file` still reads text, and points the model at `read_document` when a document is not text.

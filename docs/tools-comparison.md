@@ -29,12 +29,20 @@ special dispatch 执行，不再通过普通工具 worker 或 thread-local callb
 
 ## 当前 Orca 工具清单
 
+`read_file`、`read_document`、`grep`、`glob` 和 `list_files` 都在工作区内解析路径。空路径指向工作区根目录。路径中间的目录不存在，或把文件当成目录使用，工具会报错。指向工作区内的符号链接可以正常使用，指向工作区外的路径会被拒绝，列表也会跳过指向工作区外的条目。如果打开文件时目录被换成符号链接，工具会拒绝这次读取。
+
+`grep` 会跳过符号链接形式的忽略文件。它读取工作区内的 `.gitignore` 和 `.ignore`，也接受两处工作区外的 Git 忽略规则。一处是用户的全局排除文件，由 `core.excludesFile` 指定，默认是 `$XDG_CONFIG_HOME/git/ignore` 或 `~/.config/git/ignore`。另一处是仓库的 `info/exclude`，也包括关联工作树在公共 Git 目录中的这份文件。
+
+macOS 的 Seatbelt 或 Linux 的 bubblewrap、Landlock 能限制读取范围时，`grep` 会运行 ripgrep。在 Windows 上，或读取范围无法限制、ripgrep 未安装时，Orca 在进程内完成搜索。
+
+模型调用 `Workflow` 时，`name` 必须是单个已保存的工作流名称，不能包含路径分隔符，也不能是 `.` 或 `..`。模型传入的 `scriptPath` 必须解析到工作区内、受信任的上级目录的 `.orca/workflows` 内，或用户工作流目录内。你在命令行中仍可用 `orca workflow run` 直接指定脚本路径。
+
 | 工具 | 类型 | 当前状态 | 说明 |
 |------|------|----------|------|
 | `read_file` | read | 已实现 | 读取 UTF-8 文件内容，输出按 8KB 截断 |
 | `glob` | read | 已实现 | 首选文件发现工具，支持 glob pattern 和 `mode: "fuzzy"` 路径查询，返回 workspace-relative 路径 |
 | `list_files` | read | 兼容 alias | 保留给旧 prompt 和历史会话，模型 prompt 不再优先推荐 |
-| `grep` | read | 已实现 | 优先使用 ripgrep，缺失时回退到进程内正则搜索，空结果返回 `(no matches)` |
+| `grep` | read | 已实现 | 读取范围可限制时使用 ripgrep，否则在进程内搜索，空结果返回 `(no matches)` |
 | `git_status` | read | 已实现 | `git status --short` |
 | `web_search` | network | 已实现 | 网络搜索，按 network 能力走审批策略 |
 | `bash` | shell | 已实现 | 通过 `sh -c` 执行命令，shell 能力需要对应审批 |

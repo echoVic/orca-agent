@@ -211,6 +211,14 @@ DeepSeek 对这些调用单独计费，不算在 token 费用里：每 1000 次�
 deepseek_web = false   # 搜索改用 Brave 或 Exa，抓取只在本机直接请求，也不再用 OCR
 ```
 
+## 读取工作区文件
+
+`read_file`、`read_document`、`grep`、`glob` 和 `list_files` 都在工作区内解析路径。空路径指向工作区根目录。路径中间的目录不存在，或把文件当成目录使用，工具会报错。指向工作区内的符号链接可以正常使用，指向工作区外的路径会被拒绝，列表也会跳过指向工作区外的条目。如果打开文件时目录被换成符号链接，工具会拒绝这次读取。
+
+`grep` 会跳过符号链接形式的忽略文件。它读取工作区内的 `.gitignore` 和 `.ignore`，也接受两处工作区外的 Git 忽略规则。一处是用户的全局排除文件，由 `core.excludesFile` 指定，默认是 `$XDG_CONFIG_HOME/git/ignore` 或 `~/.config/git/ignore`。另一处是仓库的 `info/exclude`，也包括关联工作树在公共 Git 目录中的这份文件。
+
+macOS 的 Seatbelt 或 Linux 的 bubblewrap、Landlock 能限制读取范围时，`grep` 会运行 ripgrep。在 Windows 上，或读取范围无法限制、ripgrep 未安装时，Orca 在进程内完成搜索。
+
 ## 读取文档和图片
 
 满足同样的条件时，`read_document` 工具能读 PDF、Word（`.doc`、`.docx`）、PowerPoint（`.ppt`、`.pptx`）和图片文件（`.png`、`.jpg`、`.jpeg`、`.webp`、`.gif`、`.bmp`、`.tif`、`.tiff`）。它把文件上传到 DeepSeek 的 OCR 接口，返回识别出的文字，每页前面有一行 `--- Page N ---`，页码沿用 DeepSeek 的编号；有页面没有返回文字时，第一行会写明。DeepSeek 称文件不会存进它的 Files API，也不会交给对话模型。`offset` 和 `limit` 按这份文字的行数计算，和 `read_file` 数文件行数的方式一样。`read_file` 照旧读文本；遇到不是文本的文档，它会提示模型改用 `read_document`。
