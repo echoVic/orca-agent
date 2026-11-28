@@ -254,6 +254,14 @@ impl WorkflowStateStore {
         }
     }
 
+    pub(crate) fn ensure_session(&self) -> io::Result<Arc<orca_platform::fs::VerifiedDirectory>> {
+        if let Some((tasks, cwd)) = &self.session {
+            return tasks.ensure_workflow_session(cwd);
+        }
+        fs::create_dir_all(&self.session_path)?;
+        self.open_session()
+    }
+
     pub(crate) fn open_artifact(&self, run_id: &str, name: &str) -> io::Result<File> {
         if !super::script::single_workflow_component(run_id)
             || run_id.contains([':', '\0'])

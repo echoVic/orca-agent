@@ -1262,7 +1262,7 @@ impl WorkflowRunner {
         let run_id = format!("workflow-run-{}", uuid::Uuid::new_v4());
         let persisted_script_path = self.state.run_dir(&run_id).join("script.js");
         let resolved_input = self.resolve_launch_input(&request.input)?;
-        fs::create_dir_all(&self.session_dir)?;
+        let _session = self.state.ensure_session()?;
         let resolved = resolve_workflow_script_for_launch(
             &resolved_input,
             &cwd,

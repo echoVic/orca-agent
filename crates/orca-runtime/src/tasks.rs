@@ -1860,12 +1860,35 @@ impl TaskRegistry {
     }
 
     pub(crate) fn open_workflow_session(&self, cwd: &Path) -> io::Result<Arc<VerifiedDirectory>> {
+        self.workflow_session_handle(cwd, false)
+    }
+
+    pub(crate) fn ensure_workflow_session(&self, cwd: &Path) -> io::Result<Arc<VerifiedDirectory>> {
+        self.workflow_session_handle(cwd, true)
+    }
+
+    fn workflow_session_handle(
+        &self,
+        cwd: &Path,
+        create: bool,
+    ) -> io::Result<Arc<VerifiedDirectory>> {
         match self.artifact_storage.as_ref() {
             TaskArtifactStorage::Recorded => {
-                let directory = orca_tools::open_workspace_root(cwd)?
-                    .child(".orca".as_ref())?
-                    .child("workflow-sessions".as_ref())?
-                    .child(self.session_id().as_ref())?;
+                let mut directory = orca_tools::open_workspace_root(cwd)?;
+                for name in [".orca", "workflow-sessions", self.session_id()] {
+                    let name = name.as_ref();
+                    directory = match directory.child(name) {
+                        Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
+                            match directory.create_directory(name) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                                Err(error) => return Err(error),
+                            }
+                            directory.child(name)?
+                        }
+                        result => result?,
+                    };
+                }
                 Ok(Arc::new(directory))
             }
             TaskArtifactStorage::ProcessLocal { scratch } => {

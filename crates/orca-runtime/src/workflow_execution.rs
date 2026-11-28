@@ -1561,6 +1561,31 @@ export const meta = {
 
     #[cfg(unix)]
     #[test]
+    fn recorded_workflow_launch_refuses_a_replaced_session_directory() {
+        let _home = crate::history::lock_test_env();
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let cwd = base.join("workspace");
+        let outside = base.join("other");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let mut config = config();
+        config.cwd = Some(cwd.clone());
+        let tasks = TaskRegistry::new_for_cwd("workflow-session".into(), &cwd);
+        let session = tasks.workflow_session_dir(&cwd).unwrap();
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        link_draft_fixture(&outside, &session);
+        let runner = crate::workflow::WorkflowRunner::for_session(config, tasks, &cwd).unwrap();
+        let request = crate::workflow::WorkflowLaunchRequest::from(WorkflowInput {
+            script: Some(startup_failure_script().into()),
+            ..Default::default()
+        });
+        assert!(runner.prepare_model_background(request).is_err());
+        assert!(std::fs::read_dir(outside).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_user_workflow_root_swapped_for_a_link_is_refused() {
         let fixture = tempfile::tempdir().unwrap();
         let cwd = fixture.path().canonicalize().unwrap();
