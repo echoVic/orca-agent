@@ -3618,6 +3618,29 @@ impl ChildAgentCoordinator {
         Ok(ContinuationProjection::from(&committed))
     }
 
+    pub(crate) fn validate_live_lease(
+        &self,
+        lease: &ContinuationLease,
+    ) -> Result<(), AgentContinuationError> {
+        let record = self
+            .store
+            .load_record(&lease.continuation_id)?
+            .ok_or(AgentContinuationError::NotFound)?;
+        lease.fence(lease.revision).validate(&record)?;
+        validate_live_lease(&record, lease, continuation_now_ms())?;
+        if record.current_attempt.state != AttemptState::Running
+            || !matches!(
+                record.status,
+                ContinuationStatus::Running | ContinuationStatus::Checkpointed
+            )
+        {
+            return Err(AgentContinuationError::NotResumable {
+                status: record.status,
+            });
+        }
+        Ok(())
+    }
+
     /// Commits one digest-valid monotonically sequenced checkpoint under the full live lease fence; it keeps the attempt Running, advances the record revision, and installs the task projection after durable store success.
     pub(crate) fn commit_checkpoint(
         &self,

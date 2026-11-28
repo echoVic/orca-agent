@@ -2168,7 +2168,7 @@ fn execute_acquired_sync_subagent(
     is_resume: bool,
     prepared: PreparedContinuation,
     coordinator: ChildAgentCoordinator,
-    mut lease: ContinuationLease,
+    lease: ContinuationLease,
     child_config: RunConfig,
     child_cwd: PathBuf,
     worktree_execution: SyncWorktreeExecution,
@@ -2190,12 +2190,8 @@ fn execute_acquired_sync_subagent(
     output_format: orca_core::config::OutputFormat,
     durable_reservation: Option<crate::child_budget_ledger::ChildBudgetReservation>,
 ) -> RuntimeSubagentCallOutput {
-    let mut prepared = prepared;
-    match coordinator.renew(&lease, lease.revision) {
-        Ok(projection) => {
-            prepared.revision = projection.revision;
-            lease.revision = projection.revision;
-        }
+    match coordinator.validate_live_lease(&lease) {
+        Ok(()) => {}
         Err(error) => {
             let worktree = worktree_execution.finish();
             return sync_setup_failure_with_worktree(
