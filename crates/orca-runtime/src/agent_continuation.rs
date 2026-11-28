@@ -4995,13 +4995,9 @@ mod tests {
             .unwrap();
         fs::remove_file(fork_prefix_path(root.path(), "parent", digest)).unwrap();
 
-        assert_corrupt_fork_history(
-            coordinator
-                .create_with_fork(input, Some(digest))
-                .unwrap_err(),
-            &id,
-            "referenced fork prefix is missing",
-        );
+        let error = coordinator
+            .create_with_fork(input, Some(digest))
+            .unwrap_err();
         assert!(coordinator.store.load_record(&id).unwrap().is_none());
         assert!(!continuation_record_path(root.path(), "parent", &id).exists());
         assert!(
@@ -5011,6 +5007,7 @@ mod tests {
                 .is_none()
         );
         assert!(!fork_child_path(root.path(), "parent", &id).exists());
+        assert_corrupt_fork_history(error, &id, "referenced fork prefix is missing");
     }
 
     #[test]
@@ -5025,13 +5022,9 @@ mod tests {
             .store_fork_prefix(test_fork_prefix())
             .unwrap();
         fs::remove_file(fork_prefix_path(root.path(), "parent", digest)).unwrap();
-        assert_corrupt_fork_history(
-            coordinator
-                .create_with_fork(input, Some(digest))
-                .unwrap_err(),
-            &id,
-            "referenced fork prefix is missing",
-        );
+        let error = coordinator
+            .create_with_fork(input, Some(digest))
+            .unwrap_err();
 
         let fresh = test_continuation_input(&registry);
         let task_id = fresh.task_id.clone();
@@ -5045,6 +5038,7 @@ mod tests {
         assert_eq!(prepared.latest_task_id, task_id);
         assert!(prepared.fork_prefix.is_none());
         assert!(!fork_child_path(root.path(), "parent", &id).exists());
+        assert_corrupt_fork_history(error, &id, "referenced fork prefix is missing");
     }
 
     #[test]
