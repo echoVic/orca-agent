@@ -61,7 +61,8 @@ use crate::worktree::{WorktreeGuard, WorktreeOutcome};
 use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost, WorkflowHostIpcPaths};
 use super::ipc::WorkflowIpcContext;
 use super::script::{
-    ResolvedWorkflowScript, resolve_workflow_script_to_path, validate_workflow_args,
+    ResolvedWorkflowScript, ScriptPathAccess, resolve_workflow_script_for_launch,
+    single_workflow_component, validate_workflow_args,
 };
 use super::state::{
     WorkflowAgentRecord, WorkflowAgentStatusCounts, WorkflowStateStore, WorkflowWorkerRecord,
@@ -885,13 +886,13 @@ impl WorkflowRunner {
     }
 
     pub fn launch(&self, request: WorkflowLaunchRequest) -> io::Result<WorkflowLaunchResult> {
-        let prepared = self.prepare_launch(request)?;
+        let prepared = self.prepare_launch(request, ScriptPathAccess::User)?;
         self.activate_prepared_run(&prepared)?;
         self.execute_prepared(prepared)
     }
 
     pub fn resume(&self, request: WorkflowLaunchRequest) -> io::Result<WorkflowLaunchResult> {
-        let prepared = self.prepare_launch(request)?;
+        let prepared = self.prepare_launch(request, ScriptPathAccess::User)?;
         self.activate_prepared_run(&prepared)?;
         self.execute_prepared(prepared)
     }
@@ -908,7 +909,22 @@ impl WorkflowRunner {
         &self,
         request: WorkflowLaunchRequest,
     ) -> io::Result<PreparedWorkflowBackgroundLaunch> {
-        let prepared = self.prepare_launch(request)?;
+        self.prepare_background_with_access(request, ScriptPathAccess::User)
+    }
+
+    pub(crate) fn prepare_model_background(
+        &self,
+        request: WorkflowLaunchRequest,
+    ) -> io::Result<PreparedWorkflowBackgroundLaunch> {
+        self.prepare_background_with_access(request, ScriptPathAccess::Model)
+    }
+
+    fn prepare_background_with_access(
+        &self,
+        request: WorkflowLaunchRequest,
+        access: ScriptPathAccess<'_>,
+    ) -> io::Result<PreparedWorkflowBackgroundLaunch> {
+        let prepared = self.prepare_launch(request, access)?;
         let task_id = prepared.task_id.clone();
         let run_id = prepared.run_id.clone();
         let workflow_name = prepared.resolved.meta.name.clone();
@@ -1174,13 +1190,46 @@ impl WorkflowRunner {
         Ok(())
     }
 
-    fn prepare_launch(&self, request: WorkflowLaunchRequest) -> io::Result<PreparedWorkflowRun> {
+    fn prepare_launch(
+        &self,
+        request: WorkflowLaunchRequest,
+        access: ScriptPathAccess<'_>,
+    ) -> io::Result<PreparedWorkflowRun> {
         let mut request = request;
         let cwd = match self.config.cwd.clone() {
             Some(cwd) => cwd,
             None => std::env::current_dir()?,
         };
         fs::create_dir_all(&self.session_dir)?;
+
+        let access = if matches!(access, ScriptPathAccess::Model) {
+            if let Some(run_id) = request.input.resume_from_run_id.as_deref()
+                && !single_workflow_component(run_id)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "resumeFromRunId must be a workflow run ID",
+                ));
+            }
+            if let Some(draft) = request
+                .input
+                .draft_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+            {
+                if !single_workflow_component(draft) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "draftId must be a workflow draft ID",
+                    ));
+                }
+                ScriptPathAccess::Draft(&self.session_dir)
+            } else {
+                access
+            }
+        } else {
+            access
+        };
 
         if request.input.token_budget.is_none()
             && let Some(resume_from_run_id) = request.input.resume_from_run_id.as_deref()
@@ -1201,8 +1250,12 @@ impl WorkflowRunner {
         let run_id = format!("workflow-run-{}", uuid::Uuid::new_v4());
         let persisted_script_path = self.state.run_dir(&run_id).join("script.js");
         let resolved_input = self.resolve_launch_input(&request.input)?;
-        let resolved =
-            resolve_workflow_script_to_path(&resolved_input, &cwd, &persisted_script_path)?;
+        let resolved = resolve_workflow_script_for_launch(
+            &resolved_input,
+            &cwd,
+            &persisted_script_path,
+            access,
+        )?;
         let normalized_args =
             validate_workflow_args(resolved_input.args.clone(), &resolved.args_schema)?;
         request.input.args = Some(normalized_args);

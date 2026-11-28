@@ -516,6 +516,13 @@
       "windows-test-portability"
     ],
     [
+      "runtime-workflow-script-test-unix-fixture",
+      "crates/orca-runtime/src/workflow/script.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "tools-test-unix-fixture",
       "crates/orca-tools/src/lib.rs",
       "unix_std_api",

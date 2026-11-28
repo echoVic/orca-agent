@@ -306,7 +306,7 @@ pub(crate) fn execute_workflow_tool(
     let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir)
         .with_child_executor(child_executor)
         .with_parent_budget(parent_budget);
-    let prepared = runner.prepare_background(WorkflowLaunchRequest::from(input))?;
+    let prepared = runner.prepare_model_background(WorkflowLaunchRequest::from(input))?;
     let task_id = prepared.task_id.clone();
     let run_id = prepared.run_id.clone();
     let workflow_name = prepared.workflow_name.clone();
@@ -1340,6 +1340,46 @@ export const meta = {
         )
         .expect("the loader finds the saved user workflow");
         assert_eq!(resolved.original_path, Some(saved));
+    }
+
+    #[test]
+    fn a_model_script_path_outside_the_workspace_is_refused() {
+        let _guard = crate::history::lock_test_env();
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(fixture.path().join("file.js"), "export const meta = { name: 'file', description: 'Fixture', phases: ['main'] }; export default await phase('main', async () => 'done');").unwrap();
+        let mut config = config();
+        config.cwd = Some(cwd.clone());
+        let registry = TaskRegistry::new("file-workflow".into());
+        let mut events = EventFactory::new("file-workflow".into());
+        let mut sink = EventSink::new(Cursor::new(Vec::new()), OutputFormat::Jsonl);
+        let request = tool_request(
+            "file",
+            ToolName::Workflow,
+            serde_json::json!({"scriptPath": "../file.js"}),
+        );
+        let error = execute_workflow_tool(
+            &config,
+            &cwd,
+            &mut events,
+            &mut sink,
+            &request,
+            false,
+            &registry,
+            &mut Vec::new(),
+            unused_child_executor,
+            true,
+            None,
+            None,
+        )
+        .expect_err("a model script path must be confined");
+        assert!(
+            error
+                .to_string()
+                .starts_with("scriptPath must be inside the workspace or a workflows directory:"),
+            "{error}"
+        );
     }
 
     #[test]
