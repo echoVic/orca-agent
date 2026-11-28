@@ -33,6 +33,7 @@ pub mod update_goal;
 pub mod update_plan;
 pub mod web_fetch;
 pub mod web_search;
+mod workspace_ignore;
 mod workspace_read;
 pub mod write_file;
 

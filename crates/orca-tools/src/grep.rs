@@ -1,11 +1,11 @@
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
 
-use ignore::WalkBuilder;
+use ignore::gitignore::gitconfig_excludes_path;
 use orca_core::capability::{
     CapabilityProcessClass, CapabilityReceipt, CapabilityRequest, CapabilitySet, EnforcementState,
     SandboxEnforcementDecision,
@@ -13,8 +13,11 @@ use orca_core::capability::{
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 use regex::Regex;
 use serde::Deserialize;
+use walkdir::WalkDir;
 
 use crate::spill::ReadTarget;
+use crate::workspace_ignore::WorkspaceIgnores;
+use crate::workspace_read::canonical_read_path;
 
 const DEFAULT_GREP_HEAD_LIMIT: usize = 250;
 const MAX_GREP_HEAD_LIMIT: usize = 1_000;
@@ -115,39 +118,69 @@ fn execute_with_read_enforcement(
             return ToolResult::failed(request, format!("cannot resolve cwd: {error}"), None);
         }
     };
-    let rg_path = if spill.is_some() {
-        Path::new("-")
-    } else if Path::new(requested_path).is_absolute() {
-        search_path.as_path()
+    let (rg_path, input, directory) = match spill.as_ref() {
+        Some(file) => match file.try_clone() {
+            Ok(input) => (PathBuf::from("-"), Some(input), None),
+            Err(error) => {
+                return ToolResult::failed(
+                    request,
+                    format!("could not read saved tool result: {error}"),
+                    None,
+                );
+            }
+        },
+        None => {
+            let canonical = match canonical_read_path(&root, &search_path) {
+                Ok(path) => path,
+                Err(error) => return ToolResult::failed(request, error.to_string(), None),
+            };
+            if canonical.is_dir() {
+                let label = if Path::new(requested_path).is_absolute() {
+                    search_path.as_path()
+                } else {
+                    search_path
+                        .strip_prefix(cwd)
+                        .expect("resolved workspace path")
+                };
+                let relative = canonical.strip_prefix(&root).expect("checked search path");
+                let path = if relative.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    Path::new(".").join(relative)
+                };
+                let directory = RgDirectorySearch {
+                    ignores: WorkspaceIgnores::new(
+                        root.clone(),
+                        gitconfig_excludes_path().as_deref(),
+                    ),
+                    root: root.clone(),
+                    base: canonical,
+                    label: label.to_owned(),
+                    opened: None,
+                };
+                (path, None, Some(directory))
+            } else {
+                match crate::open_workspace_file(&root, &canonical) {
+                    Ok(file) => (PathBuf::from("-"), Some(file), None),
+                    Err(error) => return ToolResult::failed(request, error.to_string(), None),
+                }
+            }
+        }
+    };
+    let rg_args = if directory.is_some() {
+        rg_directory_args(pattern, &rg_path)
     } else {
-        let relative = search_path
-            .strip_prefix(cwd)
-            .expect("resolved path is inside the workspace");
-        if relative.as_os_str().is_empty() {
-            Path::new(".")
-        } else if relative.as_os_str() == "-" {
-            // Ripgrep reads stdin for a bare "-", so spell the file path explicitly.
-            Path::new("./-")
-        } else {
-            relative
-        }
+        rg_args(pattern, &rg_path)
     };
-
-    let input = match spill.as_ref().map(File::try_clone).transpose() {
-        Ok(input) => input,
-        Err(error) => {
-            return ToolResult::failed(
-                request,
-                format!("could not read saved tool result: {error}"),
-                None,
-            );
-        }
-    };
+    let read_roots = directory
+        .as_ref()
+        .map(|search| search.ignores.read_roots())
+        .unwrap_or_else(|| vec![root.clone()]);
     let offset = args.offset.unwrap_or(0);
     let limit = normalized_head_limit(args.head_limit);
     let collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
     let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
-    let output = spawn_rg(&root, &rg_args(pattern, rg_path), input, decision)
+    let output = spawn_rg(&root, &rg_args, input, read_roots, decision)
         .map(|(child, process_job, _receipt)| (child, process_job))
         .and_then(|(child, process_job)| {
             crate::process::wait_for_child_stdout_lines_with_timeout_or_cancel(
@@ -158,9 +191,16 @@ fn execute_with_read_enforcement(
                 crate::process::DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM,
                 collector,
                 &should_cancel,
-                |collector, line| {
-                    collector.push(line);
-                    Ok(())
+                {
+                    let mut directory = directory;
+                    move |collector, line| {
+                        if let Some(search) = directory.as_mut() {
+                            search.collect(collector, line);
+                        } else {
+                            collector.push(line);
+                        }
+                        Ok(())
+                    }
                 },
             )
         });
@@ -236,6 +276,7 @@ fn spawn_rg(
     root: &Path,
     args: &[OsString],
     input: Option<File>,
+    read_roots: Vec<PathBuf>,
     decision: SandboxEnforcementDecision,
 ) -> io::Result<(Child, orca_platform::process::ProcessJob, CapabilityReceipt)> {
     let executable = rg_executable(root).ok_or(io::ErrorKind::NotFound)?;
@@ -245,7 +286,7 @@ fn spawn_rg(
         CapabilitySet::read_only(),
         root,
     );
-    request.read_roots.push(root.to_owned());
+    request.read_roots = read_roots;
     crate::process::spawn_read_only_helper(&executable, args, input, request, decision)
 }
 
@@ -307,6 +348,110 @@ fn rg_args(pattern: &str, search_path: &Path) -> Vec<OsString> {
     ]
 }
 
+fn rg_directory_args(pattern: &str, search_path: &Path) -> Vec<OsString> {
+    let mut args = [
+        "--no-ignore",
+        "--hidden",
+        "--glob=!.git",
+        "--null",
+        "--with-filename",
+        "--byte-offset",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    args.extend(rg_args(pattern, search_path));
+    args
+}
+
+struct RgDirectorySearch {
+    ignores: WorkspaceIgnores,
+    root: PathBuf,
+    base: PathBuf,
+    label: PathBuf,
+    opened: Option<(PathBuf, Option<VerifiedGrepFile>)>,
+}
+
+struct VerifiedGrepFile {
+    file: File,
+    bom_bytes: u64,
+}
+
+impl VerifiedGrepFile {
+    fn open(root: &Path, path: &Path) -> io::Result<Self> {
+        let file = crate::open_workspace_file(root, path)?;
+        let mut reader = BufReader::new(file);
+        let bom_bytes = if reader.fill_buf()?.starts_with(b"\xef\xbb\xbf") {
+            3
+        } else {
+            0
+        };
+        Ok(Self {
+            file: reader.into_inner(),
+            bom_bytes,
+        })
+    }
+
+    fn same_text(&mut self, offset: u64, text: &[u8]) -> io::Result<bool> {
+        self.file
+            .seek(SeekFrom::Start(offset.saturating_add(self.bom_bytes)))?;
+        let mut verified = vec![0; text.len()];
+        self.file.read_exact(&mut verified)?;
+        Ok(verified == text)
+    }
+}
+
+impl RgDirectorySearch {
+    fn collect(
+        &mut self,
+        collector: &mut GrepPageCollector,
+        line: crate::process::BoundedLine<'_>,
+    ) {
+        if let Some((path, number, text)) = self.verified_match(line.bytes) {
+            let mut output = format!("{}:{number}:", path.display()).into_bytes();
+            output.extend_from_slice(text);
+            collector.push(crate::process::BoundedLine {
+                bytes: &output,
+                observed_bytes: output.len().saturating_add(line.omitted_bytes),
+                omitted_bytes: line.omitted_bytes,
+            });
+        }
+    }
+
+    fn verified_match<'a>(&mut self, line: &'a [u8]) -> Option<(PathBuf, u64, &'a [u8])> {
+        let (label, rest) = split_at_byte(line, 0)?;
+        let (number, rest) = split_at_byte(rest, b':')?;
+        let (offset, text) = split_at_byte(rest, b':')?;
+        let number = std::str::from_utf8(number).ok()?.parse().ok()?;
+        let offset = std::str::from_utf8(offset).ok()?.parse().ok()?;
+        let label = Path::new(std::str::from_utf8(label).ok()?);
+        let path = self.root.join(label.strip_prefix(".").unwrap_or(label));
+        let relative = path.strip_prefix(&self.base).ok()?;
+        if self
+            .opened
+            .as_ref()
+            .is_none_or(|(current, _)| *current != path)
+        {
+            let file = (!self.ignores.ignored_below(&self.base, &path))
+                .then(|| VerifiedGrepFile::open(&self.root, &path).ok())
+                .flatten();
+            self.opened = Some((path.clone(), file));
+        }
+        let (_, Some(file)) = self.opened.as_mut()? else {
+            return None;
+        };
+        // The helper has some platform and ignore-file read grants in addition to the
+        // workspace. Return text only when it is present in a verified workspace file.
+        file.same_text(offset, text)
+            .ok()?
+            .then(|| (self.label.join(relative), number, text))
+    }
+}
+
+fn split_at_byte(bytes: &[u8], separator: u8) -> Option<(&[u8], &[u8])> {
+    let index = bytes.iter().position(|byte| *byte == separator)?;
+    Some((&bytes[..index], &bytes[index + 1..]))
+}
+
 pub(crate) fn execute_in_process(
     request: &ToolRequest,
     cwd: &Path,
@@ -314,6 +459,26 @@ pub(crate) fn execute_in_process(
     search_path: &Path,
     max_bytes: usize,
     should_cancel: &dyn Fn() -> bool,
+) -> ToolResult {
+    execute_in_process_with_global_excludes(
+        request,
+        cwd,
+        pattern,
+        search_path,
+        max_bytes,
+        should_cancel,
+        None,
+    )
+}
+
+fn execute_in_process_with_global_excludes(
+    request: &ToolRequest,
+    cwd: &Path,
+    pattern: &str,
+    search_path: &Path,
+    max_bytes: usize,
+    should_cancel: &dyn Fn() -> bool,
+    global_excludes: Option<&Path>,
 ) -> ToolResult {
     let regex = match Regex::new(pattern) {
         Ok(regex) => regex,
@@ -329,35 +494,37 @@ pub(crate) fn execute_in_process(
             return ToolResult::failed(request, format!("cannot resolve cwd: {error}"), None);
         }
     };
-    let mut walker = WalkBuilder::new(search_path);
-    walker
-        .hidden(true)
-        .follow_links(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true);
-
-    for entry in walker.build() {
+    let base = match canonical_read_path(&root, search_path) {
+        Ok(base) => base,
+        Err(error) => return ToolResult::failed(request, error.to_string(), None),
+    };
+    let mut ignores = WorkspaceIgnores::new(root.clone(), global_excludes);
+    let mut walker = WalkDir::new(&base).follow_links(false).into_iter();
+    while let Some(entry) = walker.next() {
         if should_cancel() {
             return ToolResult::cancelled(request, GREP_CANCELLED, None);
         }
         let Ok(entry) = entry else {
             continue;
         };
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
+        let path = entry.path();
+        if path != base && ignores.entry_ignored(path, entry.file_type().is_dir()) {
+            if entry.file_type().is_dir() {
+                walker.skip_current_dir();
+            }
             continue;
         }
-
-        let path = entry.path();
-        let Ok(canonical) = crate::workspace_read::canonical_read_path(&root, path) else {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(file) = crate::open_workspace_file(&root, path) else {
             continue;
         };
-        let Ok(file) = crate::open_workspace_file(&root, &canonical) else {
-            continue;
-        };
+        let label = search_path.join(
+            path.strip_prefix(&base)
+                .expect("walker path is below its root"),
+        );
+        let path = if path == base { search_path } else { &label };
         if !search_file(
             file,
             path.strip_prefix(cwd).unwrap_or(path),
@@ -381,6 +548,12 @@ fn search_file(
     should_cancel: &dyn Fn() -> bool,
 ) -> bool {
     let mut reader = BufReader::new(file);
+    if reader
+        .fill_buf()
+        .is_ok_and(|bytes| bytes.starts_with(b"\xef\xbb\xbf"))
+    {
+        reader.consume(3);
+    }
     let path = path.to_string_lossy().replace('\\', "/");
     let mut line_number = 1;
     while let Some(line) = read_bounded_line(&mut reader, max_line_bytes) {
@@ -583,7 +756,8 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::write(fixture.path().join("neighbor.txt"), "neighbor text\n").unwrap();
         let args = rg_args("neighbor text", Path::new("../neighbor.txt"));
-        let (child, job, receipt) = match spawn_rg(&root, &args, None, decision) {
+        let (child, job, receipt) = match spawn_rg(&root, &args, None, vec![root.clone()], decision)
+        {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 eprintln!("rg unavailable on this host");
                 return;
@@ -597,7 +771,7 @@ mod tests {
             4096,
             4096,
             Vec::new(),
-            &|| false,
+            || false,
             |lines, line| {
                 lines.push(line.bytes.to_vec());
                 Ok(())
@@ -627,6 +801,22 @@ mod tests {
     }
 
     #[test]
+    fn directory_search_keeps_matches_in_utf8_files_with_a_bom() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("bom.txt"),
+            b"\xef\xbb\xbfneedle one\nneedle two\n",
+        )
+        .unwrap();
+        let request = grep_request(r#"{"pattern":"needle"}"#);
+        let result = execute(&request, workspace.path(), 4096);
+        assert_eq!(
+            result.output.as_deref(),
+            Some("bom.txt:1:needle one\nbom.txt:2:needle two")
+        );
+    }
+
+    #[test]
     fn a_denied_file_is_skipped_not_a_failed_search() {
         let denied = b"rg: notes.txt: Permission denied (os error 13)\n";
         assert!(rg_read_completed(Some(2), denied, 0));
@@ -637,6 +827,159 @@ mod tests {
             b"rg: notes.txt: Permission denied (os error 13)\nregex parse error:\n",
             0
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_ignore_file_pointing_outside_is_not_read() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("workspace");
+        fs::create_dir_all(cwd.join(".git")).unwrap();
+        fs::write(cwd.join("notes.txt"), "needle\n").unwrap();
+        let outside = fixture.path().join("rules");
+        fs::write(&outside, "notes.txt\n").unwrap();
+        crate::tests::symlink(&outside, cwd.join(".gitignore")).unwrap();
+        let request = grep_request(r#"{"pattern":"needle"}"#);
+        for result in [
+            execute_in_process_with_global_excludes(
+                &request,
+                &cwd,
+                "needle",
+                &cwd,
+                4096,
+                &|| false,
+                None,
+            ),
+            execute(&request, &cwd, 4096),
+        ] {
+            assert_eq!(
+                result.output.as_deref(),
+                Some("notes.txt:1:needle"),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_global_excludes_file_still_filters() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("workspace");
+        fs::create_dir_all(cwd.join(".git")).unwrap();
+        fs::write(cwd.join("excluded.txt"), "needle\n").unwrap();
+        fs::write(cwd.join("visible.txt"), "needle\n").unwrap();
+        let excludes = fixture.path().join("global-excludes");
+        fs::write(&excludes, "excluded.txt\n").unwrap();
+        let request = grep_request(r#"{"pattern":"needle"}"#);
+        let result = execute_in_process_with_global_excludes(
+            &request,
+            &cwd,
+            "needle",
+            &cwd,
+            4096,
+            &|| false,
+            Some(&excludes),
+        );
+        assert_eq!(
+            result.output.as_deref(),
+            Some("visible.txt:1:needle"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_linked_worktrees_info_exclude_still_filters() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("linked");
+        let common = fixture.path().join("repo/.git");
+        let worktree = common.join("worktrees/linked");
+        fs::create_dir(&cwd).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir(common.join("info")).unwrap();
+        fs::write(cwd.join(".git"), "gitdir: ../repo/.git/worktrees/linked\n").unwrap();
+        fs::write(worktree.join("commondir"), "../..\n").unwrap();
+        fs::write(common.join("info/exclude"), "excluded.txt\n").unwrap();
+        fs::write(cwd.join("excluded.txt"), "needle\n").unwrap();
+        fs::write(cwd.join("visible.txt"), "needle\n").unwrap();
+        let request = grep_request(r#"{"pattern":"needle"}"#);
+        for result in [
+            execute_in_process_with_global_excludes(
+                &request,
+                &cwd,
+                "needle",
+                &cwd,
+                4096,
+                &|| false,
+                None,
+            ),
+            execute(&request, &cwd, 4096),
+        ] {
+            assert_eq!(
+                result.output.as_deref(),
+                Some("visible.txt:1:needle"),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_excludes_apply_when_the_workspace_is_a_subdirectory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("src");
+        let info = fixture.path().join(".git/info");
+        fs::create_dir_all(&info).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        fs::write(info.join("exclude"), "/src/excluded.txt\n").unwrap();
+        fs::write(cwd.join("excluded.txt"), "needle\n").unwrap();
+        fs::write(cwd.join("visible.txt"), "needle\n").unwrap();
+        let request = grep_request(r#"{"pattern":"needle"}"#);
+        for result in [
+            execute_in_process_with_global_excludes(
+                &request,
+                &cwd,
+                "needle",
+                &cwd,
+                4096,
+                &|| false,
+                None,
+            ),
+            execute(&request, &cwd, 4096),
+        ] {
+            assert_eq!(
+                result.output.as_deref(),
+                Some("visible.txt:1:needle"),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_tree_gitignore_still_filters() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path();
+        fs::create_dir_all(cwd.join(".git")).unwrap();
+        fs::create_dir_all(cwd.join("src")).unwrap();
+        fs::write(cwd.join("src/.gitignore"), "ignored.txt\n").unwrap();
+        fs::write(cwd.join("src/ignored.txt"), "needle\n").unwrap();
+        fs::write(cwd.join("src/visible.txt"), "needle\n").unwrap();
+        let request = grep_request(r#"{"pattern":"needle"}"#);
+        for result in [
+            execute_in_process_with_global_excludes(
+                &request,
+                cwd,
+                "needle",
+                cwd,
+                4096,
+                &|| false,
+                None,
+            ),
+            execute(&request, cwd, 4096),
+        ] {
+            assert_eq!(
+                result.output.as_deref(),
+                Some("src/visible.txt:1:needle"),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]
