@@ -30,6 +30,8 @@ const MAX_GREP_HEAD_LIMIT: usize = 1_000;
 const MIN_GREP_LINE_BYTES: usize = 8 * 1024;
 const MAX_GREP_DISPLAY_BYTES: usize = 1024 * 1024;
 const MAX_GREP_LINE_BYTES: usize = 16 * 1024 * 1024;
+// Space for the longest continuation notice, including its numeric fields.
+const MAX_GREP_CONTINUATION_BYTES: usize = 160;
 const GREP_TIMEOUT: Duration = Duration::from_secs(120);
 const GREP_CANCELLED: &str = "grep was cancelled";
 
@@ -813,16 +815,28 @@ impl GrepPageCollector {
         if index < self.offset || index - self.offset >= self.limit {
             return;
         }
+        let prefix = match path {
+            Some(path) => format!("{path}:{number}:"),
+            None => format!("{number}:"),
+        };
         let mut keep = line.len().min(max_line_bytes);
+        if length > keep {
+            let notice_bytes =
+                crate::process::preserve_ingress_omission_notice(String::new(), length).len();
+            let preview_budget = self
+                .retained_budget
+                .saturating_sub(prefix.len() + notice_bytes + MAX_GREP_CONTINUATION_BYTES);
+            if preview_budget > 0 {
+                keep = keep.min(preview_budget);
+            }
+        }
         while keep < line.len() && keep > 0 && line[keep] & 0xc0 == 0x80 {
             keep -= 1;
         }
         let omitted = length.saturating_sub(keep);
         let line = String::from_utf8_lossy(&line[..keep]);
-        let text = match path {
-            Some(path) => format!("{path}:{number}:{line}"),
-            None => format!("{number}:{line}"),
-        };
+        let mut text = prefix;
+        text.push_str(&line);
         let text = crate::process::preserve_ingress_omission_notice(text, omitted);
         self.retain(StoredLine {
             text,
