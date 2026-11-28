@@ -133,6 +133,7 @@ impl<'a> WorkspaceIgnores<'a> {
         &self,
         path: &Path,
         is_dir: bool,
+        hidden: bool,
         current: &IgnoreDirectory<'_>,
     ) -> bool {
         let local =
@@ -160,7 +161,7 @@ impl<'a> WorkspaceIgnores<'a> {
         if in_git {
             first_match(&mut global_match, self.global.as_ref(), path, is_dir);
         }
-        global_match.unwrap_or(false)
+        global_match.unwrap_or(hidden)
     }
 }
 

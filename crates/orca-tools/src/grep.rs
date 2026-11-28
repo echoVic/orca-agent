@@ -11,11 +11,12 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use memchr::{memchr, memchr_iter};
+use memchr::memchr;
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 use orca_platform::fs::{DirectoryEntryKind, VerifiedDirectory};
 use rayon::prelude::*;
-use regex::Regex;
+use regex::bytes::Regex;
+use regex_syntax::hir::{Hir, HirKind};
 use serde::Deserialize;
 
 use crate::ResolvedWorkspacePath;
@@ -94,15 +95,25 @@ fn execute_search(
     let Some(pattern) = pattern else {
         return ToolResult::failed(request, "grep pattern is required", None);
     };
-    let regex = match Regex::new(pattern) {
+    let regex = match compile_pattern(pattern) {
         Ok(regex) => regex,
-        Err(error) => return ToolResult::failed(request, error.to_string(), None),
+        Err(error) => return ToolResult::failed(request, error, None),
     };
     let requested = args.path.as_deref().unwrap_or(".");
     let target = match crate::spill::resolve_read_path(cwd, Some(requested), spill_dir) {
         Ok(target) => target,
         Err(error) => return ToolResult::failed(request, error, None),
     };
+    if let ReadTarget::Workspace(workspace) = &target
+        && [&workspace.path, &workspace.canonical]
+            .into_iter()
+            .any(|path| {
+                path.strip_prefix(&workspace.root)
+                    .is_ok_and(|relative| relative.iter().any(|part| is_git_directory(part)))
+            })
+    {
+        return render_search(request, GrepPageCollector::new(0, 0, 0), max_bytes);
+    }
     let mut page = GrepPageCollector::new(
         args.offset.unwrap_or(0),
         normalized_head_limit(args.head_limit),
@@ -111,44 +122,55 @@ fn execute_search(
     let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_DISPLAY_BYTES);
     let result = match target {
         ReadTarget::Spill(_, file) => {
-            search_file(file, None, &regex, max_line_bytes, &mut page, &stop)
+            search_file(file, None, &regex, max_line_bytes, &mut page, &stop, true)
         }
         ReadTarget::Workspace(workspace) => {
-            let label = workspace.path.strip_prefix(cwd).unwrap_or(&workspace.path);
             let label = if Path::new(requested).is_absolute() {
-                &workspace.path
+                workspace.path.as_path()
             } else {
-                label
+                workspace.path.strip_prefix(cwd).unwrap_or(&workspace.path)
             };
-            match crate::workspace_read::open_read_file(&workspace) {
-                Ok((file, _)) => {
-                    let _ =
-                        search_file(file, Some(label), &regex, max_line_bytes, &mut page, &stop);
-                    crate::workspace_read::open_root(&workspace.root).map(drop)
-                }
-                Err(_) => match open_directory(&workspace.root, &workspace.canonical) {
-                    Ok(directory) if !stop() => {
-                        let reads = IgnoreReads::new(&stop);
-                        let global = global_excludes(&reads);
-                        let ignores = WorkspaceIgnores::new(
-                            &workspace.root,
-                            &workspace.canonical,
-                            global.as_deref(),
-                            &reads,
-                        );
-                        DirectorySearch {
-                            workspace: &workspace,
-                            label,
-                            regex: &regex,
-                            max_line_bytes,
-                            ignores: &ignores,
-                        }
-                        .search(&directory, &mut page, &reads)
-                        .and_then(|()| crate::workspace_read::open_root(&workspace.root).map(drop))
+            let mut search = || match open_directory(&workspace.root, &workspace.canonical) {
+                Ok(directory) if !stop() => {
+                    let reads = IgnoreReads::new(&stop);
+                    let global = global_excludes(&reads);
+                    let ignores = WorkspaceIgnores::new(
+                        &workspace.root,
+                        &workspace.canonical,
+                        global.as_deref(),
+                        &reads,
+                    );
+                    DirectorySearch {
+                        workspace: &workspace,
+                        label,
+                        regex: &regex,
+                        max_line_bytes,
+                        ignores: &ignores,
                     }
-                    _ => crate::workspace_read::open_root(&workspace.root).map(drop),
+                    .search(&directory, &mut page, &reads)
+                }
+                Ok(_) => Ok(()),
+                Err(directory_error) => match crate::workspace_read::open_read_file(&workspace) {
+                    Ok((file, _)) => search_file(
+                        file,
+                        Some(label),
+                        &regex,
+                        max_line_bytes,
+                        &mut page,
+                        &stop,
+                        true,
+                    ),
+                    Err(error)
+                        if error.kind() == io::ErrorKind::NotFound
+                            && directory_error.kind() == io::ErrorKind::NotFound =>
+                    {
+                        Ok(())
+                    }
+                    Err(_) if is_resource_failure(&directory_error) => Err(directory_error),
+                    Err(error) => Err(error),
                 },
-            }
+            };
+            search().and_then(|()| crate::workspace_read::open_root(&workspace.root).map(drop))
         }
     };
     if is_cancelled() {
@@ -161,6 +183,46 @@ fn execute_search(
         return ToolResult::failed(request, error.to_string(), None);
     }
     render_search(request, page, max_bytes)
+}
+
+fn compile_pattern(pattern: &str) -> Result<Regex, String> {
+    if !pattern.contains(['\\', '\n', '\0']) {
+        return Regex::new(pattern).map_err(|error| error.to_string());
+    }
+    let hir = regex_syntax::ParserBuilder::new()
+        .utf8(false)
+        .build()
+        .parse(pattern)
+        .map_err(|error| error.to_string())?;
+    if contains_literal(&hir, b'\n') {
+        return Err(format!(
+            "the pattern can match a line break, which grep does not support: {pattern}"
+        ));
+    }
+    if contains_literal(&hir, 0) {
+        return Err("pattern contains a NUL byte but it is impossible to match".to_string());
+    }
+    Regex::new(pattern).map_err(|error| error.to_string())
+}
+
+// Classes such as whitespace also match ordinary line content. As in ripgrep,
+// the line-break error is reserved for literal terminators in the compiled pattern.
+fn contains_literal(hir: &Hir, byte: u8) -> bool {
+    match hir.kind() {
+        HirKind::Literal(literal) => literal.0.contains(&byte),
+        kind => kind
+            .subs()
+            .iter()
+            .any(|child| contains_literal(child, byte)),
+    }
+}
+
+fn is_git_directory(name: &std::ffi::OsStr) -> bool {
+    if cfg!(windows) {
+        name.as_encoded_bytes().eq_ignore_ascii_case(b".git")
+    } else {
+        name == ".git"
+    }
 }
 
 struct DirectorySearch<'a> {
@@ -293,13 +355,13 @@ impl DirectorySearch<'_> {
             if should_stop() {
                 return Err(io::ErrorKind::Interrupted.into());
             }
-            if entry.hidden || entry.kind == DirectoryEntryKind::Other {
+            if is_git_directory(&entry.name) || entry.kind == DirectoryEntryKind::Other {
                 return Ok(());
             }
             let is_dir = entry.kind == DirectoryEntryKind::Directory;
             if self
                 .ignores
-                .entry_ignored(&path.join(&entry.name), is_dir, &ignores)
+                .entry_ignored(&path.join(&entry.name), is_dir, entry.hidden, &ignores)
             {
                 return Ok(());
             }
@@ -359,6 +421,7 @@ impl DirectorySearch<'_> {
                             self.max_line_bytes,
                             page,
                             should_stop,
+                            false,
                         )
                     },
                 );
@@ -405,6 +468,7 @@ fn search_file(
     max_line_bytes: usize,
     page: &mut GrepPageCollector,
     should_stop: &dyn Fn() -> bool,
+    explicit: bool,
 ) -> io::Result<()> {
     let saved = (
         page.total_lines,
@@ -427,19 +491,23 @@ fn search_file(
     } else {
         None
     };
-    let path = path.map(|path| path.to_string_lossy().replace('\\', "/"));
+    let path = path.map(Path::to_string_lossy);
+    #[cfg(windows)]
+    let path = path.map(|path| path.replace('\\', "/"));
     let mut visit = |number, line: &[u8], length| {
         if length > MAX_GREP_LINE_BYTES {
             page.skipped_lines += 1;
-        } else if regex.is_match(&String::from_utf8_lossy(line)) {
+        } else if regex.is_match(line) {
             page.push(path.as_deref(), number, line, length, max_line_bytes);
         }
     };
     let read = match encoding {
-        Some(big_endian) => scan_utf16(reader, big_endian, should_stop, &mut visit),
-        None => scan_bytes(reader, should_stop, &mut visit),
+        Some(big_endian) => scan_utf16(reader, big_endian, should_stop, explicit, &mut visit),
+        None => scan_bytes(reader, should_stop, explicit, &mut visit),
     };
-    if !matches!(read, Ok(true)) {
+    let binary_match =
+        explicit && matches!(read, Ok(ScanEnd::Binary)) && page.total_lines > saved.0;
+    if !matches!(read, Ok(ScanEnd::Text)) {
         (
             page.total_lines,
             _,
@@ -449,28 +517,59 @@ fn search_file(
         ) = saved;
         page.lines.truncate(saved.1);
     }
+    if binary_match {
+        let text = path.map_or_else(
+            || "binary file matches".to_string(),
+            |path| format!("{path}: binary file matches"),
+        );
+        page.total_lines += 1;
+        if saved.0 >= page.offset && saved.0 - page.offset < page.limit {
+            page.retain(StoredLine {
+                text,
+                truncated: false,
+            });
+        }
+    }
     read.map(drop)
+}
+
+enum ScanEnd {
+    Text,
+    Binary,
+    Stopped,
 }
 
 fn scan_bytes(
     mut reader: impl BufRead,
     should_stop: &dyn Fn() -> bool,
+    explicit: bool,
     visit: &mut impl FnMut(usize, &[u8], usize),
-) -> io::Result<bool> {
+) -> io::Result<ScanEnd> {
     let mut line = SearchLine::default();
+    let mut binary = false;
     while !should_stop() {
         let data = reader.fill_buf()?;
         if data.is_empty() {
             if line.length != 0 {
                 line.finish(b"", false, visit);
             }
-            return Ok(true);
+            return Ok(if binary {
+                ScanEnd::Binary
+            } else {
+                ScanEnd::Text
+            });
         }
-        if memchr(0, data).is_some() {
-            return Ok(false);
+        binary |= memchr(0, data).is_some();
+        if binary && !explicit {
+            return Ok(ScanEnd::Binary);
         }
         let mut start = 0;
-        for end in memchr_iter(b'\n', data) {
+        let breaks = if binary {
+            memchr::memchr2_iter(b'\n', 0, data)
+        } else {
+            memchr::memchr2_iter(b'\n', b'\n', data)
+        };
+        for end in breaks {
             line.finish(&data[start..end], true, visit);
             start = end + 1;
         }
@@ -478,16 +577,18 @@ fn scan_bytes(
         let consumed = data.len();
         reader.consume(consumed);
     }
-    Ok(false)
+    Ok(ScanEnd::Stopped)
 }
 
 fn scan_utf16(
     mut reader: impl BufRead,
     big_endian: bool,
     should_stop: &dyn Fn() -> bool,
+    explicit: bool,
     visit: &mut impl FnMut(usize, &[u8], usize),
-) -> io::Result<bool> {
+) -> io::Result<ScanEnd> {
     let mut line = SearchLine::default();
+    let mut binary = false;
     let mut error = None;
     let units = std::iter::from_fn(|| {
         let mut unit = [0; 2];
@@ -514,10 +615,14 @@ fn scan_utf16(
     });
     for (index, scalar) in char::decode_utf16(units).enumerate() {
         if index % 1024 == 0 && should_stop() {
-            return Ok(false);
+            return Ok(ScanEnd::Stopped);
         }
         match scalar.unwrap_or(char::REPLACEMENT_CHARACTER) {
-            '\0' => return Ok(false),
+            '\0' if !explicit => return Ok(ScanEnd::Binary),
+            '\0' => {
+                binary = true;
+                line.finish(b"", true, visit);
+            }
             '\n' => line.finish(b"", true, visit),
             ch => line.extend(ch.encode_utf8(&mut [0; 4]).as_bytes()),
         }
@@ -528,7 +633,11 @@ fn scan_utf16(
     if line.length != 0 {
         line.finish(b"", false, visit);
     }
-    Ok(true)
+    Ok(if binary {
+        ScanEnd::Binary
+    } else {
+        ScanEnd::Text
+    })
 }
 
 #[derive(Default)]
@@ -582,11 +691,10 @@ fn render_search(
 ) -> ToolResult {
     let no_matches = collector.total_lines == 0;
     let skipped_lines = collector.skipped_lines;
-    let (output, page_truncated) = collector.render();
     let (mut output, truncated) = if no_matches {
         ("(no matches)".to_string(), false)
     } else {
-        truncate_output(output, max_bytes)
+        collector.render(max_bytes)
     };
     if skipped_lines > 0 {
         output.push_str(&format!(
@@ -596,10 +704,10 @@ fn render_search(
     ToolResult::completed_kind(
         request,
         output,
-        page_truncated || truncated || skipped_lines > 0,
+        truncated || skipped_lines > 0,
         if no_matches {
             ToolResultKind::NoMatches
-        } else if page_truncated || truncated || skipped_lines > 0 {
+        } else if truncated || skipped_lines > 0 {
             ToolResultKind::Truncated
         } else {
             ToolResultKind::Success
@@ -711,26 +819,11 @@ impl GrepPageCollector {
             self.retain(line);
         }
     }
-    fn render(self) -> (String, bool) {
+    fn render(self, max_bytes: usize) -> (String, bool) {
         let next_offset = (self.total_lines.saturating_sub(self.offset) > self.limit)
             .then_some(self.offset.saturating_add(self.limit));
-
-        let mut output = String::new();
-        let mut truncated = self.selection_truncated;
-        for line in self.lines {
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            let remaining = self.retained_budget - output.len();
-            let (text, shortened) = truncate_output(line.text, remaining);
-            output.push_str(&text);
-            truncated |= line.truncated || shortened;
-            if shortened {
-                break;
-            }
-        }
-        if let Some(next_offset) = next_offset {
-            let notice = if self.offset == 0 {
+        let notice = next_offset.map(|next_offset| {
+            if self.offset == 0 {
                 format!(
                     "[Showing first {} results; use offset={next_offset} to continue]",
                     self.limit
@@ -742,13 +835,36 @@ impl GrepPageCollector {
                     self.offset + 1,
                     self.total_lines
                 )
-            };
-            if output.is_empty() {
-                output = notice;
-            } else {
-                output.push('\n');
-                output.push_str(&notice);
             }
+        });
+        let available = max_bytes.saturating_sub(notice.as_ref().map_or(0, |text| text.len() + 1));
+        let mut output = String::new();
+        let mut truncated = self.selection_truncated;
+        for line in self.lines {
+            let separator = usize::from(!output.is_empty());
+            let remaining = available.saturating_sub(output.len() + separator);
+            if remaining == 0 {
+                truncated = true;
+                break;
+            }
+            let (text, shortened) = truncate_output(line.text, remaining);
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&text);
+            truncated |= line.truncated || shortened;
+            if shortened {
+                break;
+            }
+        }
+        if let Some(notice) = notice {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            let (notice, shortened) =
+                truncate_output(notice, max_bytes.saturating_sub(output.len()));
+            truncated |= shortened;
+            output.push_str(&notice);
         }
         (output, truncated)
     }
@@ -931,6 +1047,158 @@ mod tests {
             .status,
             ToolStatus::Failed
         );
+    }
+
+    #[test]
+    fn grep_uses_byte_regex_with_unicode_defaults() {
+        let workspace = crate::workspace_tempdir().unwrap();
+        fs::write(workspace.path().join("notes.txt"), b"needle\xff\n").unwrap();
+        for (pattern, expected) in [
+            (r"(?-u:\xFF)", "notes.txt:1:needle�"),
+            ("�", "(no matches)"),
+        ] {
+            let request = grep_request(&serde_json::json!({"pattern": pattern}).to_string());
+            let result = execute(&request, workspace.path(), 4096);
+            assert_eq!(result.output.as_deref(), Some(expected), "{result:?}");
+        }
+    }
+
+    #[test]
+    fn grep_refuses_explicit_line_breaks_in_patterns() {
+        let workspace = crate::workspace_tempdir().unwrap();
+        for pattern in [r"needle\n", r"\x0a", "needle\n", r"[\n]"] {
+            let request = grep_request(&serde_json::json!({"pattern": pattern}).to_string());
+            let result = execute(&request, workspace.path(), 4096);
+            assert_eq!(
+                result.error.as_deref(),
+                Some(
+                    format!(
+                        "the pattern can match a line break, which grep does not support: {pattern}"
+                    )
+                    .as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn grep_admits_whitelisted_hidden_files_and_always_skips_dot_git() {
+        let workspace = crate::workspace_tempdir().unwrap();
+        let cwd = workspace.path();
+        fs::create_dir(cwd.join(".git")).unwrap();
+        fs::write(cwd.join(".git/notes.txt"), "needle\n").unwrap();
+        fs::write(cwd.join(".env"), "needle\r\n").unwrap();
+        fs::write(cwd.join(".hidden"), "needle\n").unwrap();
+        fs::write(cwd.join(".ignore"), "!.env\n!.git/\n").unwrap();
+        for (target, expected) in [
+            (".", ".env:1:needle"),
+            (".env", ".env:1:needle"),
+            (".git/notes.txt", "(no matches)"),
+        ] {
+            let request = grep_request(
+                &serde_json::json!({"pattern": "^needle$", "path": target}).to_string(),
+            );
+            assert_eq!(
+                execute(&request, cwd, 4096).output.as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn grep_reports_explicit_binary_matches() {
+        let workspace = crate::workspace_tempdir().unwrap();
+        let cwd = workspace.path();
+        fs::write(cwd.join("notes.bin"), b"needle\n\0\n").unwrap();
+        let search = |path, pattern| {
+            execute(
+                &grep_request(&serde_json::json!({"pattern": pattern, "path": path}).to_string()),
+                cwd,
+                4096,
+            )
+        };
+        assert_eq!(
+            search("notes.bin", "needle").output.as_deref(),
+            Some("notes.bin: binary file matches")
+        );
+        assert_eq!(
+            search("notes.bin", "other").output.as_deref(),
+            Some("(no matches)")
+        );
+        assert_eq!(
+            search(".", "needle").output.as_deref(),
+            Some("(no matches)")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_reports_an_unreadable_explicit_file_and_skips_it_recursively() {
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = crate::workspace_tempdir().unwrap();
+        let path = workspace.path().join("notes.txt");
+        fs::write(&path, "needle").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+        if fs::File::open(&path).is_ok() {
+            return;
+        }
+        let explicit = execute(
+            &grep_request(r#"{"pattern":"needle","path":"notes.txt"}"#),
+            workspace.path(),
+            4096,
+        );
+        assert_eq!(explicit.status, ToolStatus::Failed);
+        assert!(explicit.error.as_deref().unwrap().contains("notes.txt"));
+        let recursive = execute(
+            &grep_request(r#"{"pattern":"needle"}"#),
+            workspace.path(),
+            4096,
+        );
+        assert_eq!(recursive.output.as_deref(), Some("(no matches)"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_preserves_literal_backslashes_in_unix_paths() {
+        let workspace = crate::workspace_tempdir().unwrap();
+        fs::write(workspace.path().join(r"one\two.txt"), "needle").unwrap();
+        let result = execute(
+            &grep_request(r#"{"pattern":"needle"}"#),
+            workspace.path(),
+            4096,
+        );
+        assert_eq!(result.output.as_deref(), Some(r"one\two.txt:1:needle"));
+    }
+
+    #[test]
+    fn grep_resolves_a_relative_global_excludes_file_from_the_workspace() {
+        const CHILD: &str = "ORCA_TEST_GREP_GLOBAL_CONFIG";
+        let workspace = crate::workspace_tempdir().unwrap();
+        let cwd = workspace.path();
+        if std::env::var_os(CHILD).is_none() {
+            let config = cwd.join("gitconfig");
+            fs::write(&config, "[core]\n  excludesFile = excludes\n").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "grep::tests::grep_resolves_a_relative_global_excludes_file_from_the_workspace",
+                ])
+                .env("GIT_CONFIG_GLOBAL", config)
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        fs::create_dir(cwd.join(".git")).unwrap();
+        fs::write(cwd.join("excludes"), "notes.txt\n").unwrap();
+        fs::write(cwd.join("notes.txt"), "needle").unwrap();
+        let result = execute(&grep_request(r#"{"pattern":"needle"}"#), cwd, 4096);
+        assert_eq!(result.output.as_deref(), Some("(no matches)"));
     }
 
     #[test]
@@ -1167,7 +1435,14 @@ mod tests {
         let output = result.output.unwrap();
         let mut lines = output.lines().collect::<Vec<_>>();
         lines.sort_unstable();
-        assert_eq!(lines, ["restored.txt:1:needle", "visible.txt:1:needle"]);
+        assert_eq!(
+            lines,
+            [
+                ".hidden.txt:1:needle",
+                "restored.txt:1:needle",
+                "visible.txt:1:needle"
+            ]
+        );
     }
 
     #[test]

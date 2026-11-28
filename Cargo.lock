@@ -2672,6 +2672,7 @@ dependencies = [
  "orca-platform",
  "rayon",
  "regex",
+ "regex-syntax",
  "reqwest",
  "seccompiler",
  "serde",
