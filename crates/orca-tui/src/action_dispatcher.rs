@@ -47,7 +47,44 @@ pub(crate) struct TuiActionDispatcher {
 
 struct DispatcherPending {
     commands: VecDeque<UserAction>,
-    event: Option<TuiEvent>,
+    event: Option<DispatcherOutcome>,
+}
+
+struct DispatcherOutcome {
+    event: TuiEvent,
+    acknowledgement: Option<TuiEvent>,
+}
+
+impl From<TuiEvent> for DispatcherOutcome {
+    fn from(event: TuiEvent) -> Self {
+        Self {
+            event,
+            acknowledgement: None,
+        }
+    }
+}
+
+impl DispatcherPending {
+    fn flush_event(&mut self, event_tx: &Sender<TuiEvent>) -> Result<(), TrySendError<()>> {
+        while let Some(DispatcherOutcome {
+            event,
+            acknowledgement,
+        }) = self.event.take()
+        {
+            match event_tx.try_send(event) {
+                Ok(()) => self.event = acknowledgement.map(DispatcherOutcome::from),
+                Err(TrySendError::Full(event)) => {
+                    self.event = Some(DispatcherOutcome {
+                        event,
+                        acknowledgement,
+                    });
+                    return Err(TrySendError::Full(()));
+                }
+                Err(TrySendError::Disconnected(_)) => return Err(TrySendError::Disconnected(())),
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TuiActionDispatcher {
@@ -140,19 +177,16 @@ fn run_dispatcher(
         event: None,
     };
     'dispatch: loop {
-        if let Some(event) = pending.event.take() {
-            match event_tx.try_send(event) {
-                Ok(()) => {}
-                Err(TrySendError::Full(event)) => {
-                    pending.event = Some(event);
-                    crossbeam_channel::select! {
-                        recv(shutdown_rx) -> _ => break,
-                        default(Duration::from_millis(2)) => {}
-                    }
-                    continue;
+        match pending.flush_event(&event_tx) {
+            Ok(()) => {}
+            Err(TrySendError::Full(())) => {
+                crossbeam_channel::select! {
+                    recv(shutdown_rx) -> _ => break,
+                    default(Duration::from_millis(2)) => {}
                 }
-                Err(TrySendError::Disconnected(_)) => break,
+                continue;
             }
+            Err(TrySendError::Disconnected(())) => break,
         }
 
         while let Some(action) = pending.commands.pop_front() {
@@ -243,7 +277,7 @@ fn route_action(
             crate::hosted_view::OutOfStep::AgentRuns => AGENT_STILL_RUNNING,
         }
         .to_string();
-        match action {
+        let outcome = match action {
             // Sent while the conversation in view runs: nothing there
             // stopped, so only the text goes back.
             UserAction::QueuePrompt {
@@ -255,26 +289,24 @@ fn route_action(
                 prompt,
                 bindings,
                 images,
-            } => {
-                let _ = event_tx.try_send(TuiEvent::RefusedElsewhere {
-                    prompt: Some(prompt),
-                    bindings,
-                    images,
-                    message,
-                });
+            } => TuiEvent::RefusedElsewhere {
+                prompt: Some(prompt),
+                bindings,
+                images,
+                message,
             }
-            UserAction::PromptQueueControl(_) => {
-                let _ = event_tx.try_send(TuiEvent::RefusedElsewhere {
-                    prompt: None,
-                    bindings: orca_runtime::mentions::MentionBindings::default(),
-                    images: Vec::new(),
-                    message,
-                });
+            .into(),
+            UserAction::PromptQueueControl(_) => TuiEvent::RefusedElsewhere {
+                prompt: None,
+                bindings: orca_runtime::mentions::MentionBindings::default(),
+                images: Vec::new(),
+                message,
             }
+            .into(),
             // A plain submit: the renderer showed it and waits for its turn.
-            action => reject_action(event_tx, action, message),
-        }
-        return true;
+            action => reject_action(action, message),
+        };
+        return deliver_dispatcher_outcome(event_tx, pending, outcome);
     }
     if matches!(
         action,
@@ -288,7 +320,7 @@ fn route_action(
     {
         return deliver_dispatcher_outcome(
             event_tx,
-            &mut pending.event,
+            pending,
             TuiEvent::CommandRefused(reason.to_string()),
         );
     }
@@ -304,7 +336,9 @@ fn route_action(
                 ) {
                     EnqueueResult::Queued => {}
                     EnqueueResult::Disconnected => return false,
-                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                    EnqueueResult::Overflow(action) => {
+                        return reject_overflowed_action(event_tx, pending, action);
+                    }
                 }
             }
         }
@@ -329,7 +363,7 @@ fn route_action(
             Err(error) => {
                 if !deliver_dispatcher_outcome(
                     event_tx,
-                    &mut pending.event,
+                    pending,
                     TuiEvent::OperationRejected(error.to_string()),
                 ) {
                     return false;
@@ -370,7 +404,9 @@ fn route_action(
                 ) {
                     EnqueueResult::Queued => {}
                     EnqueueResult::Disconnected => return false,
-                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                    EnqueueResult::Overflow(action) => {
+                        return reject_overflowed_action(event_tx, pending, action);
+                    }
                 },
                 Err(error) => {
                     let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
@@ -395,7 +431,7 @@ fn route_action(
             Ok(crate::operation_controller::SubmitNowOutcome::Steered) => {
                 if !deliver_dispatcher_outcome(
                     event_tx,
-                    &mut pending.event,
+                    pending,
                     TuiEvent::PromptSteered { prompt },
                 ) {
                     return false;
@@ -417,7 +453,9 @@ fn route_action(
                 ) {
                     EnqueueResult::Queued => {}
                     EnqueueResult::Disconnected => return false,
-                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                    EnqueueResult::Overflow(action) => {
+                        return reject_overflowed_action(event_tx, pending, action);
+                    }
                 }
             }
             Err(error) => {
@@ -457,7 +495,9 @@ fn route_action(
                         ));
                         return false;
                     }
-                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                    EnqueueResult::Overflow(action) => {
+                        return reject_overflowed_action(event_tx, pending, action);
+                    }
                 },
                 Err(error) => {
                     let _ = event_tx.try_send(TuiEvent::OperationRejected(error.to_string()));
@@ -475,7 +515,9 @@ fn route_action(
                 ) {
                     EnqueueResult::Queued => {}
                     EnqueueResult::Disconnected => return false,
-                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                    EnqueueResult::Overflow(action) => {
+                        return reject_overflowed_action(event_tx, pending, action);
+                    }
                 }
             }
             Err(error) => {
@@ -495,7 +537,7 @@ fn route_action(
                         .try_send(TuiEvent::SurfaceProjectionSynced(Box::new(projection)));
                     if !deliver_dispatcher_outcome(
                         event_tx,
-                        &mut pending.event,
+                        pending,
                         TuiEvent::Notice(disposition.notice(&label)),
                     ) {
                         return false;
@@ -509,11 +551,12 @@ fn route_action(
                 ) {
                     EnqueueResult::Queued => {}
                     EnqueueResult::Disconnected => return false,
-                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                    EnqueueResult::Overflow(action) => {
+                        return reject_overflowed_action(event_tx, pending, action);
+                    }
                 },
                 Err(error) => {
-                    if !deliver_dispatcher_outcome(event_tx, &mut pending.event, error.into_event())
-                    {
+                    if !deliver_dispatcher_outcome(event_tx, pending, error.into_event()) {
                         return false;
                     }
                 }
@@ -524,7 +567,7 @@ fn route_action(
                 Some(result) => {
                     if !deliver_dispatcher_outcome(
                         event_tx,
-                        &mut pending.event,
+                        pending,
                         TuiEvent::TaskTranscriptResult { request, result },
                     ) {
                         return false;
@@ -538,7 +581,9 @@ fn route_action(
                 ) {
                     EnqueueResult::Queued => {}
                     EnqueueResult::Disconnected => return false,
-                    EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                    EnqueueResult::Overflow(action) => {
+                        return reject_overflowed_action(event_tx, pending, action);
+                    }
                 },
             }
         }
@@ -567,7 +612,9 @@ fn route_action(
             ) {
                 EnqueueResult::Queued => {}
                 EnqueueResult::Disconnected => return false,
-                EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                EnqueueResult::Overflow(action) => {
+                    return reject_overflowed_action(event_tx, pending, action);
+                }
             },
         },
         UserAction::ReturnToParentThread => match controller.view() {
@@ -580,7 +627,9 @@ fn route_action(
             ) {
                 EnqueueResult::Queued => {}
                 EnqueueResult::Disconnected => return false,
-                EnqueueResult::Overflow(action) => reject_overflowed_action(event_tx, action),
+                EnqueueResult::Overflow(action) => {
+                    return reject_overflowed_action(event_tx, pending, action);
+                }
             },
         },
         action @ (UserAction::McpReconnect { .. }
@@ -600,7 +649,7 @@ fn route_action(
                 // ahead of the notice, which may be dropped.
                 if !deliver_dispatcher_outcome(
                     event_tx,
-                    &mut pending.event,
+                    pending,
                     TuiEvent::McpActionFinished {
                         server: not_started.server,
                     },
@@ -627,7 +676,7 @@ fn route_action(
                 event_tx.clone(),
             ) {
                 // No worker will report on the prompt, so this must arrive.
-                if !deliver_dispatcher_outcome(event_tx, &mut pending.event, *not_started) {
+                if !deliver_dispatcher_outcome(event_tx, pending, *not_started) {
                     return false;
                 }
             }
@@ -658,7 +707,7 @@ fn route_action(
                     if armed_here {
                         controller.cancel_surface_activation();
                     }
-                    reject_overflowed_action(event_tx, action);
+                    return reject_overflowed_action(event_tx, pending, action);
                 }
             }
         }
@@ -668,18 +717,15 @@ fn route_action(
 
 fn deliver_dispatcher_outcome(
     event_tx: &Sender<TuiEvent>,
-    pending_event: &mut Option<TuiEvent>,
-    event: TuiEvent,
+    pending: &mut DispatcherPending,
+    outcome: impl Into<DispatcherOutcome>,
 ) -> bool {
-    debug_assert!(pending_event.is_none());
-    match event_tx.try_send(event) {
-        Ok(()) => true,
-        Err(TrySendError::Full(event)) => {
-            *pending_event = Some(event);
-            true
-        }
-        Err(TrySendError::Disconnected(_)) => false,
-    }
+    debug_assert!(pending.event.is_none());
+    pending.event = Some(outcome.into());
+    !matches!(
+        pending.flush_event(event_tx),
+        Err(TrySendError::Disconnected(()))
+    )
 }
 
 fn interaction_response_ack(
@@ -725,31 +771,36 @@ fn enqueue_action(
     EnqueueResult::Queued
 }
 
-fn reject_overflowed_action(event_tx: &Sender<TuiEvent>, action: UserAction) {
-    reject_action(
+fn reject_overflowed_action(
+    event_tx: &Sender<TuiEvent>,
+    pending: &mut DispatcherPending,
+    action: UserAction,
+) -> bool {
+    deliver_dispatcher_outcome(
         event_tx,
-        action,
-        "TUI command queue is full; command rejected".to_string(),
-    );
+        pending,
+        reject_action(
+            action,
+            "TUI command queue is full; command rejected".to_string(),
+        ),
+    )
 }
 
-fn reject_action(event_tx: &Sender<TuiEvent>, action: UserAction, message: String) {
+fn reject_action(action: UserAction, message: String) -> DispatcherOutcome {
     // A plain submit, with the token it carried: the controller never gets it.
     let plain_submit = match &action {
         UserAction::Submit(_) => Some(None),
         UserAction::SubmitWithMentions { token, .. } => Some(*token),
         _ => None,
     };
-    match action {
-        UserAction::Submit(prompt) => {
-            let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
-                queued_id: None,
-                prompt,
-                bindings: orca_runtime::mentions::MentionBindings::default(),
-                images: Vec::new(),
-                message,
-            });
-        }
+    let event = match action {
+        UserAction::Submit(prompt) => TuiEvent::SubmissionRejected {
+            queued_id: None,
+            prompt,
+            bindings: orca_runtime::mentions::MentionBindings::default(),
+            images: Vec::new(),
+            message,
+        },
         UserAction::SubmitWithMentions {
             prompt,
             bindings,
@@ -765,36 +816,29 @@ fn reject_action(event_tx: &Sender<TuiEvent>, action: UserAction, message: Strin
             prompt,
             bindings,
             images,
-        } => {
-            let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
-                queued_id: None,
-                prompt,
-                bindings,
-                images,
-                message,
-            });
-        }
-        UserAction::PromptQueueControl(_) | UserAction::PasteImages { .. } => {
-            let _ = event_tx.try_send(TuiEvent::OperationRejected(message));
-        }
+        } => TuiEvent::SubmissionRejected {
+            queued_id: None,
+            prompt,
+            bindings,
+            images,
+            message,
+        },
         UserAction::SubmitQueued {
             id,
             prompt,
             bindings,
             images,
-        } => {
-            let _ = event_tx.try_send(TuiEvent::SubmissionRejected {
-                queued_id: Some(id),
-                prompt,
-                bindings,
-                images,
-                message,
-            });
-        }
-        UserAction::ImplementApprovedPlan { .. } => {
-            let _ = event_tx.try_send(TuiEvent::OperationRejected(message));
-        }
-        UserAction::NewSession
+        } => TuiEvent::SubmissionRejected {
+            queued_id: Some(id),
+            prompt,
+            bindings,
+            images,
+            message,
+        },
+        UserAction::PromptQueueControl(_)
+        | UserAction::PasteImages { .. }
+        | UserAction::ImplementApprovedPlan { .. }
+        | UserAction::NewSession
         | UserAction::ForkCurrentSession { .. }
         | UserAction::RenameCurrentSession { .. }
         | UserAction::ResumeSavedSession { .. }
@@ -810,25 +854,16 @@ fn reject_action(event_tx: &Sender<TuiEvent>, action: UserAction, message: Strin
         | UserAction::GoalEdit(_)
         | UserAction::GoalClear
         | UserAction::GoalPause
-        | UserAction::GoalResume => {
-            let _ = event_tx.try_send(TuiEvent::OperationRejected(message));
-        }
-        _ => {
-            let _ = event_tx.try_send(TuiEvent::Error(message));
-        }
-    }
+        | UserAction::GoalResume => TuiEvent::OperationRejected(message),
+        _ => TuiEvent::Error(message),
+    };
     // A message the controller never gets is one it did not start a turn for;
     // said after the rejection, as the controller says it. The renderer holds
     // what the user sends for the turn of a message with a token, and goes on
-    // only when it hears one way or the other, so this one is not left to a
-    // full queue: it waits a moment for room.
-    if let Some(token) = plain_submit {
-        let event = TuiEvent::TurnNotStarted { token };
-        if token.is_some() {
-            let _ = event_tx.send_timeout(event, Duration::from_millis(500));
-        } else {
-            let _ = event_tx.try_send(event);
-        }
+    // only when it hears one way or the other.
+    DispatcherOutcome {
+        event,
+        acknowledgement: plain_submit.map(|token| TuiEvent::TurnNotStarted { token }),
     }
 }
 
@@ -880,11 +915,19 @@ mod tests {
     #[test]
     fn a_refused_message_comes_back_with_its_text() {
         let (event_tx, event_rx) = mpsc::unbounded::<TuiEvent>();
-        super::reject_action(
-            &event_tx,
-            UserAction::Submit("one".to_string()),
-            super::AGENT_ON_SCREEN.to_string(),
-        );
+        let mut pending = super::DispatcherPending {
+            commands: Default::default(),
+            event: None,
+        };
+        let mut reject = |action| {
+            let outcome = super::reject_action(action, super::AGENT_ON_SCREEN.to_string());
+            assert!(super::deliver_dispatcher_outcome(
+                &event_tx,
+                &mut pending,
+                outcome
+            ));
+        };
+        reject(UserAction::Submit("one".to_string()));
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(1)),
             Ok(TuiEvent::SubmissionRejected { prompt, message, .. })
@@ -894,15 +937,11 @@ mod tests {
             event_rx.recv_timeout(Duration::from_secs(1)),
             Ok(TuiEvent::TurnNotStarted { token: None })
         ));
-        super::reject_action(
-            &event_tx,
-            UserAction::QueuePrompt {
-                prompt: "two".to_string(),
-                bindings: Default::default(),
-                images: Vec::new(),
-            },
-            super::AGENT_ON_SCREEN.to_string(),
-        );
+        reject(UserAction::QueuePrompt {
+            prompt: "two".to_string(),
+            bindings: Default::default(),
+            images: Vec::new(),
+        });
         assert!(matches!(
             event_rx.recv_timeout(Duration::from_secs(1)),
             Ok(TuiEvent::SubmissionRejected { prompt, message, .. })
@@ -945,42 +984,170 @@ mod tests {
         on_child.shutdown();
     }
 
+    fn drain_child_refusal(action: UserAction) -> Vec<TuiEvent> {
+        let on_child = crate::hosted_child::live_child_for_test::ViewOnChild::start();
+        let (event_tx, event_rx) = mpsc::bounded(1);
+        let (command_tx, command_rx) = mpsc::bounded(1);
+        let (ack_tx, _ack_rx) = mpsc::bounded(1);
+        let mut pending = super::DispatcherPending {
+            commands: Default::default(),
+            event: None,
+        };
+        event_tx
+            .send(TuiEvent::Notice("occupy mailbox".into()))
+            .unwrap();
+        let routed = super::route_action(
+            action,
+            &command_tx,
+            &event_tx,
+            &ack_tx,
+            &on_child.control,
+            &mut pending,
+            1,
+        );
+        let initial = event_rx.try_recv();
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            assert!(!matches!(
+                pending.flush_event(&event_tx),
+                Err(mpsc::TrySendError::Disconnected(()))
+            ));
+            events.extend(event_rx.try_iter());
+        }
+        on_child.shutdown();
+
+        assert!(routed);
+        assert!(matches!(initial, Ok(TuiEvent::Notice(text)) if text == "occupy mailbox"));
+        assert!(command_rx.is_empty() && pending.commands.is_empty());
+        assert!(pending.event.is_none());
+        events
+    }
+
+    #[test]
+    fn full_event_mailbox_retains_complete_child_drafts_in_order() {
+        use crate::clipboard_image::ClipboardImagePayload;
+        use crate::composer_images::ComposerImageState;
+        use orca_runtime::mentions::{MentionBinding, MentionBindings, MentionTarget};
+
+        let text = "read @notes";
+        let bindings = MentionBindings::from_bindings(
+            text,
+            vec![MentionBinding {
+                start: "read ".len(),
+                end: text.len(),
+                visible: "@notes".into(),
+                target: MentionTarget::Resource {
+                    server: "docs".into(),
+                    uri: "notes://draft".into(),
+                },
+            }],
+        );
+        assert!(!bindings.is_empty());
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[0, 0xff, 0, 0xff], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let mut composer = ComposerImageState::default();
+        let paste = composer.begin_paste().unwrap();
+        let (insertion, _, _) = composer
+            .complete_paste(
+                paste,
+                text,
+                text.len(),
+                vec![ClipboardImagePayload {
+                    media_type: "image/png".into(),
+                    data: png,
+                    width: 1,
+                    height: 1,
+                    source_name: Some("draft.png".into()),
+                }],
+            )
+            .unwrap();
+        let images = composer.attachments_for_text(&format!("{text}{insertion}"));
+        assert_eq!(images.len(), 1);
+        let token = crate::protocol::SubmitToken::new(5);
+        let queued = drain_child_refusal(UserAction::QueuePrompt {
+            prompt: text.into(),
+            bindings: bindings.clone(),
+            images: images.clone(),
+        });
+        let steered = drain_child_refusal(UserAction::SubmitNow {
+            prompt: text.into(),
+            bindings: bindings.clone(),
+            images: images.clone(),
+        });
+        let plain = drain_child_refusal(UserAction::SubmitWithMentions {
+            prompt: text.into(),
+            bindings: bindings.clone(),
+            images: images.clone(),
+            token: Some(token),
+        });
+        let follow_ups_restored = [&queued, &steered].into_iter().all(|events| {
+            matches!(events.as_slice(), [TuiEvent::RefusedElsewhere { prompt: Some(prompt), bindings: got_bindings, images: got_images, message }]
+                if prompt == text && got_bindings == &bindings && got_images == &images && message == super::AGENT_ON_SCREEN)
+        });
+        let plain_restored = matches!(plain.as_slice(), [TuiEvent::SubmissionRejected { queued_id: None, prompt, bindings: got_bindings, images: got_images, message }, TuiEvent::TurnNotStarted { token: Some(got_token) }]
+            if prompt == text && got_bindings == &bindings && got_images == &images && message == super::AGENT_ON_SCREEN && *got_token == token);
+        assert!(
+            follow_ups_restored && plain_restored,
+            "expected each draft once and the token after the plain rejection; QueuePrompt={queued:?}, SubmitNow={steered:?}, SubmitWithMentions={plain:?}"
+        );
+    }
+
     #[test]
     fn a_return_with_a_view_bound_does_not_wait_behind_the_controller() {
+        let on_child = crate::hosted_child::live_child_for_test::ViewOnChild::start();
+        assert!(on_child.view.has_focus());
         let (raw_tx, raw_rx) = mpsc::unbounded();
         let (event_tx, _event_rx) = mpsc::unbounded::<TuiEvent>();
-        let control = TuiSurfaceTaskControl::isolated_for_test();
-        let host = orca_runtime::runtime_host::RuntimeHost::start_with_background_capacity(1)
-            .expect("runtime host");
-        let attachment = crate::protocol::SessionAttachmentId::new(1);
-        control.bind_view(crate::hosted_view::HostedView::new(
-            host.handle(),
-            event_tx.clone(),
-            std::sync::Arc::new(std::sync::Mutex::new(
-                crate::attachment_routing::AttachmentRouting::new(attachment),
-            )),
-            event_tx.clone(),
-            attachment,
-        ));
-        let (mut dispatcher, command_rx) =
-            TuiActionDispatcher::spawn(raw_rx, event_tx, control, 1, 1).expect("spawn dispatcher");
-
-        raw_tx
-            .send(UserAction::Submit("a turn the controller runs".to_string()))
-            .expect("submit");
+        let (command_tx, command_rx) = mpsc::bounded(1);
+        let (_shutdown_tx, shutdown_rx) = mpsc::bounded(1);
+        let (_finished_tx, finished_rx) = mpsc::unbounded();
+        let (ack_tx, _ack_rx) = mpsc::unbounded();
+        let prompt = "a turn pending in the controller mailbox";
+        command_tx.send(UserAction::Submit(prompt.into())).unwrap();
+        let control = on_child.control.clone();
+        let dispatcher = std::thread::spawn(move || {
+            super::run_dispatcher(
+                raw_rx,
+                event_tx,
+                command_tx,
+                ack_tx,
+                (shutdown_rx, finished_rx),
+                control,
+                1,
+            );
+        });
         raw_tx
             .send(UserAction::ReturnToParentThread)
             .expect("return action");
 
-        assert!(matches!(
-            command_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(UserAction::Submit(prompt)) if prompt == "a turn the controller runs"
-        ));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut returned = false;
+        while let Ok(event) = on_child.events.recv_deadline(deadline) {
+            if matches!(
+                event.into_test_payload(),
+                TuiEvent::ReturnedMainProjection(..)
+            ) {
+                returned = true;
+                break;
+            }
+        }
+        drop(raw_tx);
+        dispatcher.join().expect("shutdown dispatcher");
+        let still_focused = on_child.view.has_focus();
+        let commands: Vec<_> = command_rx.try_iter().collect();
+        on_child.shutdown();
+
         assert!(
-            command_rx.recv_timeout(Duration::from_millis(200)).is_err(),
-            "the return never entered the mailbox"
+            returned,
+            "Return did not project main while submit was pending"
         );
-        dispatcher.shutdown().expect("shutdown dispatcher");
+        assert!(!still_focused, "Return did not clear child focus");
+        assert!(
+            matches!(commands.as_slice(), [UserAction::Submit(queued)] if queued == prompt),
+            "expected only the original submit, got {commands:?}"
+        );
     }
 
     #[test]

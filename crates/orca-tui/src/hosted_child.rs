@@ -1558,8 +1558,7 @@ pub(crate) mod live_child_for_test {
     pub(crate) struct ViewOnChild {
         pub(crate) view: HostedView,
         pub(crate) control: TuiSurfaceTaskControl,
-        // Kept so the view's senders stay connected.
-        _events: crossbeam_channel::Receiver<TuiEvent>,
+        pub(crate) events: crossbeam_channel::Receiver<TuiEvent>,
         host: orca_runtime::runtime_host::RuntimeHost,
         parent: orca_runtime::runtime_host::RuntimeThreadHandle,
         child: orca_runtime::runtime_host::RuntimeThreadHandle,
@@ -1637,7 +1636,7 @@ pub(crate) mod live_child_for_test {
             Self {
                 view,
                 control,
-                _events: events,
+                events,
                 host,
                 parent,
                 child,
@@ -1753,7 +1752,7 @@ pub(crate) mod live_child_for_test {
         fixture
             .view
             .handle(super::HostedChildAction::Return, &fixture.control);
-        for event in fixture._events.try_iter() {
+        for event in fixture.events.try_iter() {
             if let Some(event) =
                 crate::attachment_routing::accept_attached_tui_event(&mut returned, event).unwrap()
             {
@@ -3961,7 +3960,7 @@ pub(crate) mod live_child_for_test {
             .unwrap();
         let projection = loop {
             match fixture
-                ._events
+                .events
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap()
             {
