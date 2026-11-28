@@ -28,7 +28,7 @@ impl<'a> IgnoreReads<'a> {
         match result {
             Ok(value) => Some(value),
             Err(error) => {
-                if crate::grep::is_resource_failure(&error) {
+                if crate::workspace_read::is_resource_failure(&error) {
                     self.failure.replace(Some(error));
                 }
                 None

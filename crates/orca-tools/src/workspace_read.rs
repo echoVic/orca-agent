@@ -50,7 +50,7 @@ pub fn open_workspace_file(root: &Path, path: &Path) -> io::Result<File> {
         .zip(path.file_name())
         .filter(|(parent, _)| parent.starts_with(root))
         .ok_or_else(not_regular)?;
-    let changed = |error: io::Error| changed_path(path, error.kind());
+    let changed = |error: io::Error| changed_path(path, error);
     let directory = open_below(open_root(root)?, root, parent).map_err(changed)?;
     let file_type = path.symlink_metadata().map_err(changed)?.file_type();
     if file_type.is_symlink() {
@@ -73,11 +73,11 @@ pub fn open_relative_file(root: &VerifiedDirectory, path: &Path) -> io::Result<F
                 .as_ref()
                 .unwrap_or(root)
                 .child_for_read(part)
-                .map_err(|error| changed_path(path, error.kind()))?,
+                .map_err(|error| changed_path(path, error))?,
         );
     }
     open_file_in(directory.as_ref().unwrap_or(root), name)
-        .map_err(|error| changed_path(path, error.kind()))
+        .map_err(|error| changed_path(path, error))
 }
 
 pub(crate) fn open_file_in(directory: &VerifiedDirectory, name: &OsStr) -> io::Result<File> {
@@ -95,11 +95,24 @@ fn not_regular() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "not a regular file")
 }
 
-fn changed_path(path: &Path, kind: io::ErrorKind) -> io::Error {
+fn changed_path(path: &Path, error: io::Error) -> io::Error {
+    if is_resource_failure(&error) {
+        return error;
+    }
     io::Error::new(
-        kind,
+        error.kind(),
         format!("path changed while it was opened: {}", path.display()),
     )
+}
+
+pub(crate) fn is_resource_failure(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    return matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS)
+    );
+    #[cfg(windows)]
+    return matches!(error.raw_os_error(), Some(4 | 8 | 14 | 1450));
 }
 
 pub(crate) fn open_directory(root: &Path, path: &Path) -> io::Result<VerifiedDirectory> {

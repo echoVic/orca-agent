@@ -24,7 +24,7 @@ use crate::spill::ReadTarget;
 use crate::workspace_ignore::{
     IgnoreDirectory, IgnoreReads, WorkspaceIgnores, global_excludes_path,
 };
-use crate::workspace_read::{open_directory, open_file_in};
+use crate::workspace_read::{is_resource_failure, open_directory, open_file_in};
 
 const DEFAULT_GREP_HEAD_LIMIT: usize = 250;
 const MAX_GREP_HEAD_LIMIT: usize = 1_000;
@@ -150,8 +150,11 @@ fn execute_search(
                     .search(&directory, &mut page, &reads)
                 }
                 Ok(_) => Ok(()),
-                Err(directory_error) => match crate::workspace_read::open_read_file(&workspace) {
-                    Ok((file, _)) => search_file(
+                Err(directory_error) if is_resource_failure(&directory_error) => {
+                    Err(directory_error)
+                }
+                Err(directory_error) => match open_explicit_file(&workspace) {
+                    Ok(file) => search_file(
                         file,
                         Some(label),
                         &regex,
@@ -166,8 +169,10 @@ fn execute_search(
                     {
                         Ok(())
                     }
-                    Err(_) if is_resource_failure(&directory_error) => Err(directory_error),
-                    Err(error) => Err(error),
+                    Err(error) => Err(io::Error::new(
+                        error.kind(),
+                        format!("cannot read {}: {error}", label.display()),
+                    )),
                 },
             };
             search().and_then(|()| crate::workspace_read::open_root(&workspace.root).map(drop))
@@ -183,6 +188,16 @@ fn execute_search(
         return ToolResult::failed(request, error.to_string(), None);
     }
     render_search(request, page, max_bytes)
+}
+
+fn open_explicit_file(workspace: &ResolvedWorkspacePath) -> io::Result<File> {
+    let path = &workspace.canonical;
+    let (parent, name) = path
+        .parent()
+        .zip(path.file_name())
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    let directory = open_directory(&workspace.root, parent)?;
+    open_file_in(&directory, name)
 }
 
 fn compile_pattern(pattern: &str) -> Result<Regex, String> {
@@ -449,16 +464,6 @@ fn open_search_directory(
         }
     }
     Ok(directory)
-}
-
-pub(crate) fn is_resource_failure(error: &io::Error) -> bool {
-    #[cfg(unix)]
-    return matches!(
-        error.raw_os_error(),
-        Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS)
-    );
-    #[cfg(windows)]
-    return matches!(error.raw_os_error(), Some(4 | 8 | 14 | 1450));
 }
 
 fn search_file(
@@ -1148,7 +1153,12 @@ mod tests {
             4096,
         );
         assert_eq!(explicit.status, ToolStatus::Failed);
-        assert!(explicit.error.as_deref().unwrap().contains("notes.txt"));
+        let error = explicit.error.as_deref().unwrap();
+        assert!(error.contains("notes.txt"), "{error}");
+        assert!(
+            error.contains(&fs::File::open(&path).unwrap_err().to_string()),
+            "{error}"
+        );
         let recursive = execute(
             &grep_request(r#"{"pattern":"needle"}"#),
             workspace.path(),
