@@ -651,7 +651,7 @@ fn register_builtin_tools(registry: &mut ToolRegistry, apply_patch: bool) {
     registry.register(BuiltinTool::new(
         safe_local_read_builtin_spec(
             "grep",
-            "Search for a regex pattern in files using ripgrep when available, with a native in-process fallback. Returns matching lines with line numbers.",
+            "Search for a regex pattern in files. Returns matching lines with line numbers.",
             json!({
                 "type": "object",
                 "properties": {

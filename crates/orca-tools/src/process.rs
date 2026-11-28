@@ -1,5 +1,3 @@
-use std::ffi::OsString;
-use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -16,8 +14,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 
 use orca_core::capability::{
-    CapabilityProcessClass, CapabilityReceipt, CapabilityRequest, CapabilitySet,
-    EffectiveCapability, EnforcementState, ExecutionProfile, SandboxEnforcementDecision,
+    CapabilityProcessClass, CapabilityReceipt, CapabilitySet, EffectiveCapability,
+    EnforcementState, SandboxEnforcementDecision,
 };
 use orca_core::execution_broker::{ExecutionBroker, LaunchError};
 use orca_core::retained_output::{
@@ -214,52 +212,6 @@ pub fn spawn_with_enforcement_decision_profile(
     )
 }
 
-/// Launch an Orca helper only when the platform can apply its read roots.
-pub(crate) fn spawn_read_only_helper(
-    program: &Path,
-    args: &[OsString],
-    input: Option<File>,
-    request: CapabilityRequest,
-    decision: SandboxEnforcementDecision,
-) -> io::Result<(Child, ProcessJob, CapabilityReceipt)> {
-    let broker = ExecutionBroker::with_enforcement_decision(decision.clone())
-        .with_profile(ExecutionProfile::ReadOnly);
-    let effective = resolve_process_capability(request)?;
-    broker
-        .authorize_platform(&effective)
-        .map_err(launch_error)?;
-    let mut command =
-        crate::sandbox::read_only_helper_command(program, args, &effective, &decision)?;
-    prepare_non_interactive_command(&mut command);
-    orca_platform::process::remove_credential_env(&mut command);
-    command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("LC_ALL", "C");
-    if let Some(input) = input {
-        command.stdin(Stdio::from(input));
-    }
-    broker
-        .launch(command, effective)
-        .map(|launched| (launched.child, launched.process_job, launched.receipt))
-        .map_err(launch_error)
-}
-
-fn resolve_process_capability(request: CapabilityRequest) -> io::Result<EffectiveCapability> {
-    let capabilities = request.capabilities.clone();
-    EffectiveCapability::resolve(
-        request,
-        capabilities,
-        orca_core::approval_types::ApprovalMode::FullAuto,
-    )
-    .map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("invalid process capability: {error:?}"),
-        )
-    })
-}
-
 fn spawn_with_broker(
     command: Command,
     request_id: String,
@@ -277,47 +229,52 @@ fn spawn_with_broker(
             capabilities.clone(),
             cwd.to_path_buf(),
         );
-        let effective = resolve_process_capability(request)?;
+        let effective = EffectiveCapability::resolve(
+            request,
+            capabilities,
+            orca_core::approval_types::ApprovalMode::FullAuto,
+        )
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("invalid process capability: {error:?}"),
+            )
+        })?;
         broker.launch(command, effective)
     };
     launched
         .map(|launched| (launched.child, launched.process_job, launched.receipt))
-        .map_err(launch_error)
+        .map_err(|error| match error {
+            LaunchError::Cwd(error) => error,
+            LaunchError::Spawn(error) => error,
+            LaunchError::EnforcementUnavailable { backend, evidence } => io::Error::new(
+                io::ErrorKind::Unsupported,
+                crate::sandbox::enforcement_unavailable_message(&backend, &evidence),
+            ),
+            LaunchError::EnforcementAdvisory => io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "process sandbox would be advisory for this process class",
+            ),
+            LaunchError::UntrustedProcessClass => io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "trusted process class requires the explicit user-trusted launcher",
+            ),
+            LaunchError::NetworkTargetsUnsupported => io::Error::new(
+                io::ErrorKind::Unsupported,
+                "target-scoped network capabilities are not supported by the selected backend",
+            ),
+            LaunchError::RemoteBackendUnavailable => io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote sandbox execution requested but no remote backend is available",
+            ),
+            LaunchError::CapabilityCeilingExceeded => io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "process capability exceeds the broker hard ceiling",
+            ),
+        })
 }
 
-fn launch_error(error: LaunchError) -> io::Error {
-    match error {
-        LaunchError::Cwd(error) => error,
-        LaunchError::Spawn(error) => error,
-        LaunchError::EnforcementUnavailable { backend, evidence } => io::Error::new(
-            io::ErrorKind::Unsupported,
-            crate::sandbox::enforcement_unavailable_message(&backend, &evidence),
-        ),
-        LaunchError::EnforcementAdvisory => io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "process sandbox would be advisory for this process class",
-        ),
-        LaunchError::UntrustedProcessClass => io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "trusted process class requires the explicit user-trusted launcher",
-        ),
-        LaunchError::NetworkTargetsUnsupported => io::Error::new(
-            io::ErrorKind::Unsupported,
-            "target-scoped network capabilities are not supported by the selected backend",
-        ),
-        LaunchError::RemoteBackendUnavailable => io::Error::new(
-            io::ErrorKind::Unsupported,
-            "remote sandbox execution requested but no remote backend is available",
-        ),
-        LaunchError::CapabilityCeilingExceeded => io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "process capability exceeds the broker hard ceiling",
-        ),
-    }
-}
-
-/// Starts one of Orca's own helper processes (git, the clipboard
-/// tools). They never need Orca's credentials, and a repository's git hooks
+/// Starts one of Orca's own helper processes (git and the clipboard tools). They never need Orca's credentials, and a repository's git hooks
 /// run inside git, so the credentials are removed first (#178).
 pub fn spawn_user_trusted(
     mut command: Command,
@@ -982,7 +939,7 @@ mod tests {
 
     #[test]
     fn orca_helper_processes_do_not_inherit_orca_credentials() {
-        // #178: git, ripgrep and the clipboard helpers run as Orca's own
+        // #178: git and the clipboard helpers run as Orca's own
         // helpers, and a repository's git hooks run inside git.
         let cwd = tempfile::tempdir().unwrap();
         let shell = ShellResolver::for_current_host()

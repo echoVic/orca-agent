@@ -17,6 +17,8 @@ globset = { workspace = true }
 walkdir = { workspace = true }
 ignore = { workspace = true }
 regex = { workspace = true }
+memchr = "2"
+rayon = "1"
 url = { workspace = true }
 chrono = { workspace = true }
 libc = { workspace = true }

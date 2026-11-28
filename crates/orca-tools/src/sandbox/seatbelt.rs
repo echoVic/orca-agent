@@ -226,33 +226,6 @@ pub fn read_only_bash_command(context: ReadOnlySandboxCommandContext<'_>) -> Com
     cmd
 }
 
-pub(crate) fn read_only_helper_command(
-    program: &Path,
-    args: &[OsString],
-    effective: &orca_core::capability::EffectiveCapability,
-) -> Command {
-    let mut profile = SeatbeltProfileBuilder::new();
-    profile.push_rule("(allow file-read* (literal \"/\"))");
-    profile.push_rule(SYSTEM_SYMLINK_LOOKUP_RULE);
-    let root = profile.path_parameter("WORKSPACE", &effective.cwd);
-    profile.push_rule(format!("(allow file-read* (subpath {root}))"));
-    append_path_ancestor_metadata_rules(&mut profile, &effective.cwd);
-    for file in effective
-        .read_roots
-        .iter()
-        .map(PathBuf::as_path)
-        .filter(|path| *path != effective.cwd)
-        .chain(std::iter::once(program))
-    {
-        let path = profile.path_parameter("READABLE_FILE", file);
-        profile.push_rule(format!("(allow file-read* (literal {path}))"));
-        append_path_ancestor_metadata_rules(&mut profile, file);
-    }
-    let mut command = seatbelt_command(profile.finish());
-    command.arg("--").arg(program).args(args);
-    command
-}
-
 fn seatbelt_command(profile: SeatbeltProfile) -> Command {
     let mut command = Command::new(SEATBELT_EXECUTABLE);
     command.arg("-p").arg(profile.policy);

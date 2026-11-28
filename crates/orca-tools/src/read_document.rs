@@ -503,14 +503,8 @@ mod tests {
         assert!(result.output.unwrap().contains("linked document"));
 
         request.name = ToolName::Grep;
-        let result = crate::grep::execute_in_process(
-            &request,
-            cwd.path(),
-            "linked text",
-            &cwd.path().join("linked.txt"),
-            4096,
-            &|| false,
-        );
+        request.raw_arguments = Some(r#"{"path":"linked.txt","pattern":"linked text"}"#.into());
+        let result = crate::grep::execute(&request, cwd.path(), 4096);
         assert_eq!(result.output.as_deref(), Some("linked.txt:1:linked text"));
     }
 

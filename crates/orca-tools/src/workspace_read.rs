@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -122,9 +123,11 @@ pub fn open_workspace_file(root: &Path, path: &Path) -> io::Result<File> {
     if !file_type.is_file() {
         return Err(not_regular());
     }
-    let file = directory
-        .open_file(name, FileAccess::Read)
-        .map_err(changed)?;
+    open_file_in(&directory, name).map_err(changed)
+}
+
+pub(crate) fn open_file_in(directory: &VerifiedDirectory, name: &OsStr) -> io::Result<File> {
+    let file = directory.open_file(name, FileAccess::Read)?;
     if !file.metadata()?.is_file() {
         return Err(not_regular());
     }

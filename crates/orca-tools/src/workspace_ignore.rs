@@ -1,132 +1,106 @@
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use orca_platform::fs::VerifiedDirectory;
 
-use crate::{open_workspace_file, workspace_read::open_directory};
+use crate::{
+    open_workspace_file,
+    workspace_read::{open_directory, open_file_in},
+};
 
-pub(crate) struct WorkspaceIgnores {
-    root: PathBuf,
-    global: Option<(PathBuf, Gitignore)>,
-    directories: HashMap<PathBuf, DirectoryRules>,
+pub(crate) struct WorkspaceIgnores<'a> {
+    root: &'a Path,
+    global: Option<Gitignore>,
     ancestors: Vec<DirectoryRules>,
 }
 
-struct DirectoryRules {
+pub(crate) struct DirectoryRules {
     rules: [Option<Gitignore>; 3],
     git: bool,
-    exclude: Option<(PathBuf, Gitignore)>,
+    exclude: Option<Gitignore>,
 }
 
-impl WorkspaceIgnores {
-    pub(crate) fn new(root: PathBuf, global: Option<&Path>) -> Self {
+pub(crate) struct IgnoreDirectory<'a> {
+    pub rules: DirectoryRules,
+    pub parent: Option<&'a IgnoreDirectory<'a>>,
+}
+
+impl<'a> WorkspaceIgnores<'a> {
+    pub(crate) fn new(root: &'a Path, base: &Path, global: Option<&Path>) -> Self {
         let global = global.and_then(|file| {
             let path = file.canonicalize().ok()?;
-            let rules = read_rules(&root, path.parent()?, &path)?;
-            Some((path, rules))
+            read_rules(
+                root,
+                &path,
+                open_workspace_file(path.parent()?, &path).ok()?,
+            )
         });
-        let directory = DirectoryRules::load(&root, &root);
         let mut ancestors = Vec::new();
-        if !directory.git
-            && let Some((repo, repository)) = root.ancestors().skip(1).find_map(|ancestor| {
-                let rules = DirectoryRules::git_rules(ancestor, ancestor, [None, None, None]);
-                rules.git.then_some((ancestor, rules))
-            })
+        for parent in base
+            .ancestors()
+            .skip(1)
+            .take_while(|path| path.starts_with(root))
         {
-            for ancestor in root.ancestors().skip(1) {
-                let rules = [None, Some(".ignore"), Some(".gitignore")]
-                    .map(|name| read_rules(ancestor, ancestor, &ancestor.join(name?)));
-                if ancestor == repo {
-                    ancestors.push(DirectoryRules {
-                        rules,
-                        ..repository
-                    });
-                    break;
-                }
-                ancestors.push(DirectoryRules {
-                    rules,
-                    git: false,
-                    exclude: None,
-                });
+            if let Ok(directory) = open_directory(root, parent) {
+                ancestors.push(DirectoryRules::load(root, parent, &directory));
             }
         }
-        let directories = HashMap::from([(root.clone(), directory)]);
+        if !repo_marker(root)
+            && let Some(repo) = root
+                .ancestors()
+                .skip(1)
+                .find(|ancestor| repo_marker(ancestor))
+        {
+            for ancestor in root.ancestors().skip(1) {
+                if let Ok(directory) = open_directory(ancestor, ancestor) {
+                    let rules = [None, Some(".ignore"), Some(".gitignore")]
+                        .map(|name| read_rule_in(&directory, ancestor, name?));
+                    ancestors.push(if ancestor == repo {
+                        DirectoryRules::git_rules(repo, repo, rules)
+                    } else {
+                        DirectoryRules {
+                            rules,
+                            git: false,
+                            exclude: None,
+                        }
+                    });
+                }
+                if ancestor == repo {
+                    break;
+                }
+            }
+        }
         Self {
             root,
             global,
-            directories,
             ancestors,
         }
     }
 
-    pub(crate) fn read_roots(&self) -> Vec<PathBuf> {
-        let mut roots = vec![self.root.clone()];
-        roots.extend(self.global.iter().map(|(path, _)| path.clone()));
-        roots.extend(
-            self.directories[&self.root]
-                .exclude
-                .iter()
-                .map(|(path, _)| path.clone()),
-        );
-        roots.extend(
-            self.ancestors
-                .iter()
-                .filter_map(|rules| rules.exclude.as_ref())
-                .map(|(path, _)| path.clone()),
-        );
-        roots
+    pub(crate) fn directory(&self, path: &Path, handle: &VerifiedDirectory) -> DirectoryRules {
+        DirectoryRules::load(self.root, path, handle)
     }
 
-    /// Check the entry and the directories a recursive search walks through.
-    pub(crate) fn ignored_below(&mut self, base: &Path, path: &Path) -> bool {
-        self.entry_ignored(path, false)
-            || path
-                .ancestors()
-                .skip(1)
-                .take_while(|parent| *parent != base)
-                .any(|parent| self.entry_ignored(parent, true))
-    }
-
-    pub(crate) fn entry_ignored(&mut self, path: &Path, is_dir: bool) -> bool {
-        if !path.starts_with(&self.root) {
-            return true;
-        }
-        let parents = || {
-            path.ancestors()
-                .skip(1)
-                .take_while(|parent| parent.starts_with(&self.root))
-        };
-        for parent in parents() {
-            self.directories
-                .entry(parent.to_owned())
-                .or_insert_with(|| DirectoryRules::load(&self.root, parent));
-        }
-        if path
-            .file_name()
-            .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."))
-        {
-            return true;
-        }
+    pub(crate) fn entry_ignored(
+        &self,
+        path: &Path,
+        is_dir: bool,
+        current: &IgnoreDirectory<'_>,
+    ) -> bool {
+        let local =
+            std::iter::successors(Some(current), |entry| entry.parent).map(|entry| &entry.rules);
         let mut matches = [None; 4];
         let mut in_git = false;
-        for rules in parents()
-            .map(|parent| &self.directories[parent])
-            .chain(&self.ancestors)
-        {
+        for rules in local.chain(&self.ancestors) {
             for (index, matcher) in rules.rules.iter().enumerate() {
                 if index < 2 || !in_git {
                     first_match(&mut matches[index], matcher.as_ref(), path, is_dir);
                 }
             }
             if !in_git {
-                first_match(
-                    &mut matches[3],
-                    rules.exclude.as_ref().map(|(_, rules)| rules),
-                    path,
-                    is_dir,
-                );
+                first_match(&mut matches[3], rules.exclude.as_ref(), path, is_dir);
             }
             in_git |= rules.git;
         }
@@ -138,31 +112,37 @@ impl WorkspaceIgnores {
         }
         let mut global_match = None;
         if in_git {
-            first_match(
-                &mut global_match,
-                self.global.as_ref().map(|(_, rules)| rules),
-                path,
-                is_dir,
-            );
+            first_match(&mut global_match, self.global.as_ref(), path, is_dir);
         }
         global_match.unwrap_or(false)
     }
 }
 
+fn repo_marker(directory: &Path) -> bool {
+    directory
+        .join(".git")
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.is_dir() || meta.is_file())
+}
+
 impl DirectoryRules {
-    fn load(root: &Path, directory: &Path) -> Self {
+    fn load(root: &Path, directory: &Path, handle: &VerifiedDirectory) -> Self {
         let rules = [".rgignore", ".ignore", ".gitignore"]
-            .map(|name| read_rules(directory, root, &directory.join(name)));
+            .map(|name| read_rule_in(handle, directory, name));
         Self::git_rules(root, directory, rules)
     }
 
     fn git_rules(root: &Path, directory: &Path, rules: [Option<Gitignore>; 3]) -> Self {
         let dot_git = directory.join(".git");
         let (git, common) = match dot_git.symlink_metadata() {
-            Ok(metadata) if metadata.is_dir() && open_directory(root, &dot_git).is_ok() => {
-                (true, Some(dot_git))
+            Ok(metadata) if metadata.is_dir() => {
+                let git = open_directory(root, &dot_git).ok();
+                (git.is_some(), git.map(|handle| (dot_git, handle)))
             }
-            Ok(metadata) if metadata.is_file() => match first_line(root, &dot_git) {
+            Ok(metadata) if metadata.is_file() => match open_workspace_file(root, &dot_git)
+                .ok()
+                .and_then(first_line)
+            {
                 Some(line) if line.starts_with("gitdir: ") => (
                     true,
                     associated_git_dir(root, directory, &dot_git, &line[8..]),
@@ -171,10 +151,10 @@ impl DirectoryRules {
             },
             _ => (false, None),
         };
-        let exclude = common.and_then(|common| {
-            let path = common.join("info/exclude");
-            let rules = read_rules(directory, &common, &path)?;
-            Some((path, rules))
+        let exclude = common.and_then(|(common, handle)| {
+            let file =
+                open_file_in(&handle.child("info".as_ref()).ok()?, "exclude".as_ref()).ok()?;
+            read_rules(directory, &common.join("info/exclude"), file)
         });
         Self {
             rules,
@@ -189,27 +169,30 @@ fn associated_git_dir(
     directory: &Path,
     dot_git: &Path,
     pointer: &str,
-) -> Option<PathBuf> {
+) -> Option<(PathBuf, VerifiedDirectory)> {
     let git_dir = directory.join(pointer).canonicalize().ok()?;
     let worktrees = git_dir
         .parent()
         .filter(|path| path.file_name().is_some_and(|name| name == "worktrees"));
-    if let Some(common) = worktrees.and_then(Path::parent) {
-        let backlink = first_line(&git_dir, &git_dir.join("gitdir"));
-        if backlink
+    if let Some(common) = worktrees.and_then(Path::parent)
+        && let Ok(handle) = open_directory(common, common)
+        && let Ok(record) = handle
+            .child("worktrees".as_ref())
+            .and_then(|dir| dir.child(git_dir.file_name().expect("worktree record name")))
+        && let Ok(backlink) = open_file_in(&record, "gitdir".as_ref())
+        && first_line(backlink)
             .is_some_and(|path| git_dir.join(path).canonicalize().ok().as_deref() == Some(dot_git))
-        {
-            return Some(common.to_owned());
-        }
+    {
+        return Some((common.to_owned(), handle));
     }
-    if git_dir.starts_with(root) || core_worktree(&git_dir).as_deref() == Some(directory) {
-        return Some(git_dir);
+    let handle = open_directory(&git_dir, &git_dir).ok()?;
+    if git_dir.starts_with(root) || core_worktree(&git_dir, &handle).as_deref() == Some(directory) {
+        return Some((git_dir, handle));
     }
     None
 }
 
-fn first_line(root: &Path, path: &Path) -> Option<String> {
-    let file = open_workspace_file(root, path).ok()?;
+fn first_line(file: File) -> Option<String> {
     let mut line = String::new();
     let mut input = BufReader::new(file).take(8192);
     input.read_line(&mut line).ok()?;
@@ -219,8 +202,8 @@ fn first_line(root: &Path, path: &Path) -> Option<String> {
     Some(line.trim_end_matches(['\r', '\n']).to_owned())
 }
 
-fn core_worktree(git_dir: &Path) -> Option<PathBuf> {
-    let config = open_workspace_file(git_dir, &git_dir.join("config")).ok()?;
+fn core_worktree(git_dir: &Path, handle: &VerifiedDirectory) -> Option<PathBuf> {
+    let config = open_file_in(handle, "config".as_ref()).ok()?;
     let mut in_core = false;
     let mut worktree = None;
     // Only this repository's own setting can associate its excludes with a worktree.
@@ -289,8 +272,12 @@ fn first_match(result: &mut Option<bool>, matcher: Option<&Gitignore>, path: &Pa
     }
 }
 
-fn read_rules(base: &Path, root: &Path, path: &Path) -> Option<Gitignore> {
-    let file: File = open_workspace_file(root, path).ok()?;
+fn read_rule_in(directory: &VerifiedDirectory, base: &Path, name: &str) -> Option<Gitignore> {
+    let file = open_file_in(directory, name.as_ref()).ok()?;
+    read_rules(base, &base.join(name), file)
+}
+
+fn read_rules(base: &Path, path: &Path, file: File) -> Option<Gitignore> {
     let mut builder = GitignoreBuilder::new(base);
     for (index, line) in BufReader::new(file)
         .lines()

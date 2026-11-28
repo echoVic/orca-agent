@@ -154,30 +154,6 @@ pub fn read_only_bash_command(context: ReadOnlySandboxCommandContext<'_>) -> Com
     command
 }
 
-pub(crate) fn read_only_helper_command(
-    program: &Path,
-    args: &[std::ffi::OsString],
-    effective: &orca_core::capability::EffectiveCapability,
-    _decision: &SandboxEnforcementDecision,
-) -> std::io::Result<Command> {
-    #[cfg(target_os = "macos")]
-    {
-        Ok(seatbelt::read_only_helper_command(program, args, effective))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        linux::read_only_helper_command(program, args, effective, _decision)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (program, args, effective);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "restricted helper reads are unavailable",
-        ))
-    }
-}
-
 /// Why a host whose sandbox backend enforces still refuses commands under a
 /// policy, in the launch's own words, and what would let them run.
 #[derive(Clone, Debug, Eq, PartialEq)]

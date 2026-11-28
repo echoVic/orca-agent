@@ -1,28 +1,31 @@
-use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Child;
-use std::time::Duration;
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+use std::time::{Duration, Instant};
 
 use ignore::gitignore::gitconfig_excludes_path;
-use orca_core::capability::{
-    CapabilityProcessClass, CapabilityReceipt, CapabilityRequest, CapabilitySet, EnforcementState,
-    SandboxEnforcementDecision,
-};
+use memchr::{memchr, memchr_iter};
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
+use orca_platform::fs::{DirectoryEntryKind, VerifiedDirectory};
+use rayon::prelude::*;
 use regex::Regex;
 use serde::Deserialize;
-use walkdir::WalkDir;
 
 use crate::ResolvedWorkspacePath;
 use crate::spill::ReadTarget;
-use crate::workspace_ignore::WorkspaceIgnores;
+use crate::workspace_ignore::{IgnoreDirectory, WorkspaceIgnores};
+use crate::workspace_read::{open_directory, open_file_in};
 
 const DEFAULT_GREP_HEAD_LIMIT: usize = 250;
 const MAX_GREP_HEAD_LIMIT: usize = 1_000;
 const MIN_GREP_LINE_BYTES: usize = 8 * 1024;
 const MAX_GREP_LINE_BYTES: usize = 1024 * 1024;
+const GREP_TIMEOUT: Duration = Duration::from_secs(120);
 const GREP_CANCELLED: &str = "grep was cancelled";
 
 #[derive(Default, Deserialize)]
@@ -54,23 +57,23 @@ pub(crate) fn execute_in_session(
     spill_dir: Option<&Path>,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
-    execute_with_read_enforcement(
+    execute_search(
         request,
         cwd,
         max_bytes,
         spill_dir,
-        should_cancel,
-        crate::sandbox::enforcement_decision(),
+        &should_cancel,
+        gitconfig_excludes_path,
     )
 }
 
-fn execute_with_read_enforcement(
+fn execute_search(
     request: &ToolRequest,
     cwd: &Path,
     max_bytes: usize,
     spill_dir: Option<&Path>,
-    should_cancel: impl Fn() -> bool,
-    decision: SandboxEnforcementDecision,
+    should_cancel: &dyn Fn() -> bool,
+    global_excludes: impl FnOnce() -> Option<PathBuf>,
 ) -> ToolResult {
     let args = parse_args(request);
     let pattern = args.pattern.as_deref().or(request
@@ -80,529 +83,445 @@ fn execute_with_read_enforcement(
     let Some(pattern) = pattern else {
         return ToolResult::failed(request, "grep pattern is required", None);
     };
-
-    let requested_path = args.path.as_deref().unwrap_or(".");
-    let (search_path, workspace, spill) =
-        match crate::spill::resolve_read_path(cwd, Some(requested_path), spill_dir) {
-            Ok(ReadTarget::Workspace(workspace)) => (workspace.path.clone(), Some(workspace), None),
-            Ok(ReadTarget::Spill(path, file)) => (path, None, Some(file)),
-            Err(message) => return ToolResult::failed(request, message, None),
-        };
-
-    if workspace
-        .as_ref()
-        .is_some_and(|path| !path.canonical.exists())
-    {
-        return ToolResult::completed_kind(
-            request,
-            "(no matches)".to_string(),
-            false,
-            ToolResultKind::NoMatches,
-        );
-    }
-
-    let fallback = |spill: Option<File>| match workspace.as_ref() {
-        Some(workspace) => execute_workspace_search(
-            request,
-            cwd,
-            pattern,
-            workspace,
-            max_bytes,
-            &should_cancel,
-            gitconfig_excludes_path().as_deref(),
-        ),
-        None => execute_spill_search(
-            request,
-            pattern,
-            &search_path,
-            spill.expect("spill read"),
-            max_bytes,
-            &should_cancel,
-        ),
-    };
-    if decision.state != EnforcementState::Enforced {
-        return fallback(spill);
-    }
-    let root = match workspace
-        .as_ref()
-        .map(|path| Ok(path.root.clone()))
-        .unwrap_or_else(|| cwd.canonicalize())
-    {
-        Ok(root) => root,
-        Err(error) => {
-            return ToolResult::failed(request, format!("cannot resolve cwd: {error}"), None);
-        }
-    };
-    let (rg_path, input, directory) = match spill.as_ref() {
-        Some(file) => match file.try_clone() {
-            Ok(input) => (PathBuf::from("-"), Some(input), None),
-            Err(error) => {
-                return ToolResult::failed(
-                    request,
-                    format!("could not read saved tool result: {error}"),
-                    None,
-                );
-            }
-        },
-        None => {
-            let canonical = &workspace.as_ref().expect("workspace read").canonical;
-            if canonical.is_dir() {
-                let label = if Path::new(requested_path).is_absolute() {
-                    search_path.as_path()
-                } else {
-                    search_path
-                        .strip_prefix(cwd)
-                        .expect("resolved workspace path")
-                };
-                let relative = canonical.strip_prefix(&root).expect("checked search path");
-                let path = if relative.as_os_str().is_empty() {
-                    PathBuf::from(".")
-                } else {
-                    Path::new(".").join(relative)
-                };
-                let directory = RgDirectorySearch {
-                    ignores: WorkspaceIgnores::new(
-                        root.clone(),
-                        gitconfig_excludes_path().as_deref(),
-                    ),
-                    root: root.clone(),
-                    base: canonical.clone(),
-                    label: label.to_owned(),
-                    opened: None,
-                };
-                (path, None, Some(directory))
-            } else {
-                match crate::open_workspace_file(&root, canonical) {
-                    Ok(file) => (PathBuf::from("-"), Some(file), None),
-                    Err(error) => return ToolResult::failed(request, error.to_string(), None),
-                }
-            }
-        }
-    };
-    let rg_args = if directory.is_some() {
-        rg_directory_args(pattern, &rg_path)
-    } else {
-        rg_args(pattern, &rg_path)
-    };
-    let read_roots = directory
-        .as_ref()
-        .map(|search| search.ignores.read_roots())
-        .unwrap_or_else(|| vec![root.clone()]);
-    let offset = args.offset.unwrap_or(0);
-    let limit = normalized_head_limit(args.head_limit);
-    let collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
-    let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
-    let output = spawn_rg(&root, &rg_args, input, read_roots, decision)
-        .map(|(child, process_job, _receipt)| (child, process_job))
-        .and_then(|(child, process_job)| {
-            crate::process::wait_for_child_stdout_lines_with_timeout_or_cancel(
-                child,
-                process_job,
-                Duration::from_secs(120),
-                max_line_bytes,
-                crate::process::DEFAULT_PROCESS_OUTPUT_RETAINED_BYTES_PER_STREAM,
-                collector,
-                &should_cancel,
-                {
-                    let mut directory = directory;
-                    move |collector, line| {
-                        if let Some(search) = directory.as_mut() {
-                            search.collect(collector, line);
-                        } else {
-                            collector.push(line);
-                        }
-                        Ok(())
-                    }
-                },
-            )
-        });
-
-    match output {
-        Ok(output) if output.cancelled => ToolResult::cancelled(request, GREP_CANCELLED, None),
-        Ok(output)
-            if rg_read_completed(
-                output.status.code(),
-                &output.stderr,
-                output.stderr_omitted_bytes,
-            ) && !output.timed_out =>
-        {
-            if output.value.total_lines == 0 {
-                return render_search(request, output.value, max_bytes);
-            }
-            let ingress_truncated = output.stdout_omitted_bytes != 0;
-            let (stdout, page_truncated) = output.value.render();
-            let (stdout, truncated) = truncate_output(stdout, max_bytes);
-            let stdout = crate::process::preserve_ingress_omission_notice(
-                stdout,
-                output.stdout_omitted_bytes,
-            );
-            ToolResult::completed(
-                request,
-                stdout,
-                ingress_truncated || page_truncated || truncated,
-            )
-        }
-        Ok(output) if output.timed_out => {
-            let stderr = output.stderr_text().trim().to_string();
-            ToolResult::failed(
-                request,
-                if stderr.is_empty() {
-                    "rg timed out after 120s".to_string()
-                } else {
-                    format!("rg timed out after 120s: {stderr}")
-                },
-                output.status.code(),
-            )
-        }
-        Ok(output) if output.status.code() == Some(1) => ToolResult::completed_kind(
-            request,
-            "(no matches)".to_string(),
-            false,
-            ToolResultKind::NoMatches,
-        ),
-        Ok(output) => {
-            let stderr = output.stderr_text().trim().to_string();
-            ToolResult::failed(request, stderr, output.status.code())
-        }
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::Unsupported
-            ) =>
-        {
-            fallback(spill)
-        }
-        Err(error) => ToolResult::failed(request, format!("failed to run rg: {error}"), None),
-    }
-}
-
-fn rg_executable(root: &Path) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .filter(|directory| directory.is_absolute())
-        .filter_map(|directory| directory.join("rg").canonicalize().ok())
-        .find(|executable| executable.is_file() && !executable.starts_with(root))
-}
-
-fn spawn_rg(
-    root: &Path,
-    args: &[OsString],
-    input: Option<File>,
-    read_roots: Vec<PathBuf>,
-    decision: SandboxEnforcementDecision,
-) -> io::Result<(Child, orca_platform::process::ProcessJob, CapabilityReceipt)> {
-    let executable = rg_executable(root).ok_or(io::ErrorKind::NotFound)?;
-    let mut request = CapabilityRequest::new(
-        "tool:grep",
-        CapabilityProcessClass::SandboxedTool,
-        CapabilitySet::read_only(),
-        root,
-    );
-    request.read_roots = read_roots;
-    crate::process::spawn_read_only_helper(&executable, args, input, request, decision)
-}
-
-fn rg_read_completed(code: Option<i32>, stderr: &[u8], omitted: usize) -> bool {
-    code == Some(0)
-        || (code == Some(2)
-            && omitted == 0
-            && !stderr.is_empty()
-            && String::from_utf8_lossy(stderr).lines().all(|line| {
-                line.starts_with("rg: ")
-                    && (line.ends_with(": Permission denied (os error 13)")
-                        || line.ends_with(": Operation not permitted (os error 1)"))
-            }))
-}
-
-fn execute_spill_search(
-    request: &ToolRequest,
-    pattern: &str,
-    search_path: &Path,
-    file: File,
-    max_bytes: usize,
-    should_cancel: &dyn Fn() -> bool,
-) -> ToolResult {
     let regex = match Regex::new(pattern) {
         Ok(regex) => regex,
         Err(error) => return ToolResult::failed(request, error.to_string(), None),
     };
-    let args = parse_args(request);
-    let mut collector = GrepPageCollector::new(
+    let requested = args.path.as_deref().unwrap_or(".");
+    let target = match crate::spill::resolve_read_path(cwd, Some(requested), spill_dir) {
+        Ok(target) => target,
+        Err(error) => return ToolResult::failed(request, error, None),
+    };
+    let mut page = GrepPageCollector::new(
         args.offset.unwrap_or(0),
         normalized_head_limit(args.head_limit),
         max_bytes.max(1),
     );
-    if !search_file(
-        file,
-        search_path,
-        &regex,
-        MAX_GREP_LINE_BYTES,
-        &mut collector,
-        should_cancel,
-    ) {
+    let started = Instant::now();
+    let stop = || should_cancel() || started.elapsed() >= GREP_TIMEOUT;
+    let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
+    let result = match target {
+        ReadTarget::Spill(_, file) => {
+            search_file(file, None, &regex, max_line_bytes, &mut page, &stop)
+        }
+        ReadTarget::Workspace(workspace) => {
+            let label = workspace.path.strip_prefix(cwd).unwrap_or(&workspace.path);
+            let label = if Path::new(requested).is_absolute() {
+                &workspace.path
+            } else {
+                label
+            };
+            match crate::workspace_read::open_read_file(&workspace) {
+                Ok((file, _)) => {
+                    let _ =
+                        search_file(file, Some(label), &regex, max_line_bytes, &mut page, &stop);
+                    crate::workspace_read::open_root(&workspace.root).map(drop)
+                }
+                Err(_) => match open_directory(&workspace.root, &workspace.canonical) {
+                    Ok(directory) if !stop() => {
+                        let global = global_excludes();
+                        let ignores = WorkspaceIgnores::new(
+                            &workspace.root,
+                            &workspace.canonical,
+                            global.as_deref(),
+                        );
+                        DirectorySearch {
+                            workspace: &workspace,
+                            label,
+                            regex: &regex,
+                            max_line_bytes,
+                            ignores: &ignores,
+                        }
+                        .search(&directory, &mut page, &stop);
+                        crate::workspace_read::open_root(&workspace.root).map(drop)
+                    }
+                    _ => crate::workspace_read::open_root(&workspace.root).map(drop),
+                },
+            }
+        }
+    };
+    if should_cancel() {
         return ToolResult::cancelled(request, GREP_CANCELLED, None);
     }
-    render_search(request, collector, max_bytes)
-}
-
-fn rg_args(pattern: &str, search_path: &Path) -> Vec<OsString> {
-    vec![
-        "--no-config".into(),
-        "--line-number".into(),
-        "--no-heading".into(),
-        format!("--regexp={pattern}").into(),
-        "--".into(),
-        search_path.as_os_str().to_owned(),
-    ]
-}
-
-fn rg_directory_args(pattern: &str, search_path: &Path) -> Vec<OsString> {
-    let mut args = [
-        "--no-ignore",
-        "--hidden",
-        "--glob=!.git",
-        "--null",
-        "--with-filename",
-        "--byte-offset",
-    ]
-    .map(OsString::from)
-    .to_vec();
-    args.extend(rg_args(pattern, search_path));
-    args
-}
-
-struct RgDirectorySearch {
-    ignores: WorkspaceIgnores,
-    root: PathBuf,
-    base: PathBuf,
-    label: PathBuf,
-    opened: Option<(PathBuf, Option<VerifiedGrepFile>)>,
-}
-
-struct VerifiedGrepFile {
-    file: File,
-    bom_bytes: u64,
-}
-
-impl VerifiedGrepFile {
-    fn open(root: &Path, path: &Path) -> io::Result<Self> {
-        let file = crate::open_workspace_file(root, path)?;
-        let mut reader = BufReader::new(file);
-        let bom_bytes = if reader.fill_buf()?.starts_with(b"\xef\xbb\xbf") {
-            3
-        } else {
-            0
-        };
-        Ok(Self {
-            file: reader.into_inner(),
-            bom_bytes,
-        })
+    if started.elapsed() >= GREP_TIMEOUT {
+        return ToolResult::failed(request, "grep timed out after 120s", None);
     }
-
-    fn same_text(&mut self, offset: u64, text: &[u8]) -> io::Result<bool> {
-        self.file
-            .seek(SeekFrom::Start(offset.saturating_add(self.bom_bytes)))?;
-        let mut verified = vec![0; text.len()];
-        self.file.read_exact(&mut verified)?;
-        Ok(verified == text)
+    if let Err(error) = result {
+        return ToolResult::failed(request, error.to_string(), None);
     }
+    render_search(request, page, max_bytes)
 }
 
-impl RgDirectorySearch {
-    fn collect(
-        &mut self,
-        collector: &mut GrepPageCollector,
-        line: crate::process::BoundedLine<'_>,
+struct DirectorySearch<'a> {
+    workspace: &'a ResolvedWorkspacePath,
+    label: &'a Path,
+    regex: &'a Regex,
+    max_line_bytes: usize,
+    ignores: &'a WorkspaceIgnores<'a>,
+}
+
+impl DirectorySearch<'_> {
+    fn search(
+        &self,
+        directory: &VerifiedDirectory,
+        page: &mut GrepPageCollector,
+        should_stop: &dyn Fn() -> bool,
     ) {
-        if let Some((path, number, text)) = self.verified_match(line.bytes) {
-            let mut output = format!("{}:{number}:", path.display()).into_bytes();
-            output.extend_from_slice(text);
-            collector.push(crate::process::BoundedLine {
-                bytes: &output,
-                observed_bytes: output.len().saturating_add(line.omitted_bytes),
-                omitted_bytes: line.omitted_bytes,
+        // Only the calling thread invokes the caller's cancellation callback.
+        let stop = AtomicBool::new(false);
+        let stop_ref = &stop;
+        std::thread::scope(|scope| {
+            let (done, receive) = mpsc::sync_channel(1);
+            scope.spawn(move || {
+                static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+                let pool = POOL.get_or_init(|| {
+                    let threads = std::thread::available_parallelism()
+                        .map_or(2, usize::from)
+                        .min(8);
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .expect("start grep workers")
+                });
+                let should_stop = || stop_ref.load(Ordering::Relaxed);
+                pool.install(|| self.search_directory(directory, page, &should_stop));
+                let _ = done.send(());
             });
-        }
-    }
-
-    fn verified_match<'a>(&mut self, line: &'a [u8]) -> Option<(PathBuf, u64, &'a [u8])> {
-        let (label, rest) = split_at_byte(line, 0)?;
-        let (number, rest) = split_at_byte(rest, b':')?;
-        let (offset, text) = split_at_byte(rest, b':')?;
-        let number = std::str::from_utf8(number).ok()?.parse().ok()?;
-        let offset = std::str::from_utf8(offset).ok()?.parse().ok()?;
-        let label = Path::new(std::str::from_utf8(label).ok()?);
-        let path = self.root.join(label.strip_prefix(".").unwrap_or(label));
-        let relative = path.strip_prefix(&self.base).ok()?;
-        if self
-            .opened
-            .as_ref()
-            .is_none_or(|(current, _)| *current != path)
-        {
-            let file = (!self.ignores.ignored_below(&self.base, &path))
-                .then(|| VerifiedGrepFile::open(&self.root, &path).ok())
-                .flatten();
-            self.opened = Some((path.clone(), file));
-        }
-        let (_, Some(file)) = self.opened.as_mut()? else {
-            return None;
-        };
-        // The helper has some platform and ignore-file read grants in addition to the
-        // workspace. Return text only when it is present in a verified workspace file.
-        file.same_text(offset, text)
-            .ok()?
-            .then(|| (self.label.join(relative), number, text))
-    }
-}
-
-fn split_at_byte(bytes: &[u8], separator: u8) -> Option<(&[u8], &[u8])> {
-    let index = bytes.iter().position(|byte| *byte == separator)?;
-    Some((&bytes[..index], &bytes[index + 1..]))
-}
-
-#[cfg(test)]
-pub(crate) fn execute_in_process(
-    request: &ToolRequest,
-    cwd: &Path,
-    pattern: &str,
-    search_path: &Path,
-    max_bytes: usize,
-    should_cancel: &dyn Fn() -> bool,
-) -> ToolResult {
-    execute_in_process_with_global_excludes(
-        request,
-        cwd,
-        pattern,
-        search_path,
-        max_bytes,
-        should_cancel,
-        None,
-    )
-}
-
-#[cfg(test)]
-fn execute_in_process_with_global_excludes(
-    request: &ToolRequest,
-    cwd: &Path,
-    pattern: &str,
-    search_path: &Path,
-    max_bytes: usize,
-    should_cancel: &dyn Fn() -> bool,
-    global_excludes: Option<&Path>,
-) -> ToolResult {
-    let workspace = match crate::resolve_workspace_read_path(cwd, search_path.to_str()) {
-        Ok(path) => path,
-        Err(error) => return ToolResult::failed(request, error, None),
-    };
-    execute_workspace_search(
-        request,
-        cwd,
-        pattern,
-        &workspace,
-        max_bytes,
-        should_cancel,
-        global_excludes,
-    )
-}
-
-fn execute_workspace_search(
-    request: &ToolRequest,
-    cwd: &Path,
-    pattern: &str,
-    workspace: &ResolvedWorkspacePath,
-    max_bytes: usize,
-    should_cancel: &dyn Fn() -> bool,
-    global_excludes: Option<&Path>,
-) -> ToolResult {
-    let regex = match Regex::new(pattern) {
-        Ok(regex) => regex,
-        Err(error) => return ToolResult::failed(request, error.to_string(), None),
-    };
-
-    let offset = parse_args(request).offset.unwrap_or(0);
-    let limit = normalized_head_limit(parse_args(request).head_limit);
-    let mut collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
-    let ResolvedWorkspacePath {
-        root,
-        canonical: base,
-        path: search_path,
-    } = workspace;
-    let mut ignores = WorkspaceIgnores::new(root.clone(), global_excludes);
-    let mut walker = WalkDir::new(base).follow_links(false).into_iter();
-    while let Some(entry) = walker.next() {
-        if should_cancel() {
-            return ToolResult::cancelled(request, GREP_CANCELLED, None);
-        }
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let path = entry.path();
-        if path != base && ignores.entry_ignored(path, entry.file_type().is_dir()) {
-            if entry.file_type().is_dir() {
-                walker.skip_current_dir();
+            loop {
+                if should_stop() {
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                match receive.recv_timeout(Duration::from_millis(5)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
             }
-            continue;
+        });
+    }
+
+    fn search_directory(
+        &self,
+        directory: &VerifiedDirectory,
+        page: &mut GrepPageCollector,
+        should_stop: &(impl Fn() -> bool + Sync),
+    ) {
+        let files = Mutex::new(Vec::new());
+        self.walk(directory, Path::new(""), None, &files, should_stop);
+        let mut files = files.into_inner().unwrap();
+        files.par_sort_unstable_by(|left, right| left.as_os_str().cmp(right.as_os_str()));
+        if page.offset != 0 {
+            self.search_files(directory, &files, self.regex, page, should_stop);
+            return;
         }
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let Ok(file) = crate::open_workspace_file(root, path) else {
-            continue;
-        };
-        let label = search_path.join(
-            path.strip_prefix(base)
-                .expect("walker path is below its root"),
-        );
-        let path = if path == base { search_path } else { &label };
-        if !search_file(
-            file,
-            path.strip_prefix(cwd).unwrap_or(path),
-            &regex,
-            max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES),
-            &mut collector,
-            should_cancel,
-        ) {
-            return ToolResult::cancelled(request, GREP_CANCELLED, None);
+
+        // Keep a bounded set of pages in flight and combine them in path order.
+        for batch in files.chunks(128) {
+            if should_stop() || page.has_next_page() {
+                break;
+            }
+            let chunks = batch
+                .par_chunks(16)
+                .map(|chunk| {
+                    let mut first = GrepPageCollector::new(0, page.limit, page.retained_budget);
+                    self.search_files(
+                        directory,
+                        chunk,
+                        &self.regex.clone(),
+                        &mut first,
+                        should_stop,
+                    );
+                    first
+                })
+                .collect::<Vec<_>>();
+            for chunk in chunks {
+                page.append_first_page(chunk);
+            }
         }
     }
-    render_search(request, collector, max_bytes)
+
+    fn walk(
+        &self,
+        directory: &VerifiedDirectory,
+        relative: &Path,
+        parents: Option<&IgnoreDirectory<'_>>,
+        files: &Mutex<Vec<PathBuf>>,
+        should_stop: &(impl Fn() -> bool + Sync),
+    ) {
+        if should_stop() {
+            return;
+        }
+        let Ok(entries) = directory.read_entries() else {
+            return;
+        };
+        let path = self.workspace.canonical.join(relative);
+        let ignores = IgnoreDirectory {
+            rules: self.ignores.directory(&path, directory),
+            parent: parents,
+        };
+        let mut folders = Vec::new();
+        let mut found = Vec::new();
+        for entry in entries {
+            if should_stop() {
+                return;
+            }
+            if entry.hidden || entry.kind == DirectoryEntryKind::Other {
+                continue;
+            }
+            let is_dir = entry.kind == DirectoryEntryKind::Directory;
+            if self
+                .ignores
+                .entry_ignored(&path.join(&entry.name), is_dir, &ignores)
+            {
+                continue;
+            }
+            if is_dir {
+                folders.push(entry.name);
+            } else {
+                found.push(relative.join(entry.name));
+            }
+        }
+        files.lock().unwrap().extend(found);
+        folders.into_par_iter().for_each(|name| {
+            if !should_stop()
+                && let Ok(child) = directory.child(&name)
+            {
+                self.walk(
+                    &child,
+                    &relative.join(name),
+                    Some(&ignores),
+                    files,
+                    should_stop,
+                );
+            }
+        });
+    }
+
+    fn search_files(
+        &self,
+        base: &VerifiedDirectory,
+        files: &[PathBuf],
+        regex: &Regex,
+        page: &mut GrepPageCollector,
+        should_stop: &dyn Fn() -> bool,
+    ) {
+        let mut parent = None;
+        let mut opened = None;
+        for path in files {
+            if should_stop() || (page.offset == 0 && page.has_next_page()) {
+                break;
+            }
+            let current = path.parent().expect("relative file path");
+            if parent != Some(current) {
+                parent = Some(current);
+                opened = if current.as_os_str().is_empty() {
+                    None
+                } else {
+                    current
+                        .iter()
+                        .try_fold(None, |directory: Option<VerifiedDirectory>, name| {
+                            directory
+                                .as_ref()
+                                .unwrap_or(base)
+                                .child(name)
+                                .ok()
+                                .map(Some)
+                        })
+                        .flatten()
+                };
+            }
+            let directory = if current.as_os_str().is_empty() {
+                Some(base)
+            } else {
+                opened.as_ref()
+            };
+            if let Some(directory) = directory
+                && let Ok(file) = open_file_in(directory, path.file_name().expect("file name"))
+            {
+                let label = self.label.join(path);
+                let _ = search_file(
+                    file,
+                    Some(&label),
+                    regex,
+                    self.max_line_bytes,
+                    page,
+                    should_stop,
+                );
+            }
+        }
+    }
 }
 
 fn search_file(
     file: File,
-    path: &Path,
+    path: Option<&Path>,
     regex: &Regex,
     max_line_bytes: usize,
-    collector: &mut GrepPageCollector,
-    should_cancel: &dyn Fn() -> bool,
-) -> bool {
-    let mut reader = BufReader::new(file);
-    if reader
-        .fill_buf()
-        .is_ok_and(|bytes| bytes.starts_with(b"\xef\xbb\xbf"))
-    {
+    page: &mut GrepPageCollector,
+    should_stop: &dyn Fn() -> bool,
+) -> io::Result<()> {
+    let saved = (
+        page.total_lines,
+        page.lines.len(),
+        page.retained_bytes,
+        page.selection_truncated,
+    );
+    let mut reader = BufReader::with_capacity(32 * 1024, file);
+    let prefix = reader.fill_buf()?;
+    let encoding = if prefix.starts_with(b"\xef\xbb\xbf") {
         reader.consume(3);
-    }
-    let path = path.to_string_lossy().replace('\\', "/");
-    let mut line_number = 1;
-    while let Some(line) = read_bounded_line(&mut reader, max_line_bytes) {
-        if should_cancel() {
-            return false;
+        None
+    } else if prefix.starts_with(b"\xff\xfe") {
+        reader.consume(2);
+        Some(false)
+    } else if prefix.starts_with(b"\xfe\xff") {
+        reader.consume(2);
+        Some(true)
+    } else {
+        None
+    };
+    let path = path.map(|path| path.to_string_lossy().replace('\\', "/"));
+    let mut visit = |number, line: &[u8], length| {
+        if regex.is_match(&String::from_utf8_lossy(line)) {
+            page.push(path.as_deref(), number, line, length, max_line_bytes);
         }
-        if regex.is_match(&String::from_utf8_lossy(&line.bytes)) {
-            let prefix = format!("{path}:{line_number}:");
-            let mut output_line = Vec::with_capacity(prefix.len() + line.bytes.len());
-            output_line.extend_from_slice(prefix.as_bytes());
-            output_line.extend_from_slice(&line.bytes);
-            collector.push(crate::process::BoundedLine {
-                bytes: &output_line,
-                observed_bytes: output_line.len().saturating_add(line.omitted_bytes),
-                omitted_bytes: line.omitted_bytes,
-            });
-        }
-        line_number += 1;
+    };
+    let read = match encoding {
+        Some(big_endian) => scan_utf16(reader, big_endian, should_stop, &mut visit),
+        None => scan_bytes(reader, should_stop, &mut visit),
+    };
+    if !matches!(read, Ok(true)) {
+        (
+            page.total_lines,
+            _,
+            page.retained_bytes,
+            page.selection_truncated,
+        ) = saved;
+        page.lines.truncate(saved.1);
     }
-    true
+    read.map(drop)
+}
+
+fn scan_bytes(
+    mut reader: impl BufRead,
+    should_stop: &dyn Fn() -> bool,
+    visit: &mut impl FnMut(usize, &[u8], usize),
+) -> io::Result<bool> {
+    let mut line = SearchLine::default();
+    while !should_stop() {
+        let data = reader.fill_buf()?;
+        if data.is_empty() {
+            if line.length != 0 {
+                line.finish(b"", false, visit);
+            }
+            return Ok(true);
+        }
+        if memchr(0, data).is_some() {
+            return Ok(false);
+        }
+        let mut start = 0;
+        for end in memchr_iter(b'\n', data) {
+            line.finish(&data[start..end], true, visit);
+            start = end + 1;
+        }
+        line.extend(&data[start..]);
+        let consumed = data.len();
+        reader.consume(consumed);
+    }
+    Ok(false)
+}
+
+fn scan_utf16(
+    mut reader: impl BufRead,
+    big_endian: bool,
+    should_stop: &dyn Fn() -> bool,
+    visit: &mut impl FnMut(usize, &[u8], usize),
+) -> io::Result<bool> {
+    let mut line = SearchLine::default();
+    let mut error = None;
+    let units = std::iter::from_fn(|| {
+        let mut unit = [0; 2];
+        match reader.read(&mut unit[..1]) {
+            Ok(0) => return None,
+            Ok(_) => match reader.read_exact(&mut unit[1..]) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Some(0xfffd),
+                Err(err) => {
+                    error = Some(err);
+                    return None;
+                }
+            },
+            Err(err) => {
+                error = Some(err);
+                return None;
+            }
+        }
+        Some(if big_endian {
+            u16::from_be_bytes(unit)
+        } else {
+            u16::from_le_bytes(unit)
+        })
+    });
+    for (index, scalar) in char::decode_utf16(units).enumerate() {
+        if index % 1024 == 0 && should_stop() {
+            return Ok(false);
+        }
+        match scalar.unwrap_or(char::REPLACEMENT_CHARACTER) {
+            '\0' => return Ok(false),
+            '\n' => line.finish(b"", true, visit),
+            ch => line.extend(ch.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+    }
+    if let Some(error) = error {
+        return Err(error);
+    }
+    if line.length != 0 {
+        line.finish(b"", false, visit);
+    }
+    Ok(true)
+}
+
+#[derive(Default)]
+struct SearchLine {
+    number: usize,
+    length: usize,
+    bytes: Vec<u8>,
+    last: Option<u8>,
+}
+
+impl SearchLine {
+    fn extend(&mut self, bytes: &[u8]) {
+        let keep = bytes
+            .len()
+            .min(MAX_GREP_LINE_BYTES.saturating_sub(self.bytes.len()));
+        self.bytes.extend_from_slice(&bytes[..keep]);
+        self.length = self.length.saturating_add(bytes.len());
+        self.last = bytes.last().copied().or(self.last);
+    }
+
+    fn finish(&mut self, tail: &[u8], newline: bool, visit: &mut impl FnMut(usize, &[u8], usize)) {
+        self.number += 1;
+        if self.length == 0 {
+            let text = if newline {
+                tail.strip_suffix(b"\r").unwrap_or(tail)
+            } else {
+                tail
+            };
+            visit(self.number, text, text.len());
+        } else {
+            self.extend(tail);
+            if newline && self.last == Some(b'\r') {
+                if self.length == self.bytes.len() {
+                    self.bytes.pop();
+                }
+                self.length -= 1;
+            }
+            visit(self.number, &self.bytes, self.length);
+            self.bytes.clear();
+            self.length = 0;
+            self.last = None;
+        }
+    }
 }
 
 fn render_search(
@@ -622,47 +541,6 @@ fn render_search(
     }
     let (output, truncated) = truncate_output(output, max_bytes);
     ToolResult::completed(request, output, page_truncated || truncated)
-}
-
-struct BoundedInputLine {
-    bytes: Vec<u8>,
-    omitted_bytes: usize,
-}
-
-fn read_bounded_line(reader: &mut impl BufRead, max_bytes: usize) -> Option<BoundedInputLine> {
-    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
-    let mut omitted_bytes: usize = 0;
-    let mut saw_bytes = false;
-
-    loop {
-        let buffer = reader.fill_buf().ok()?;
-        if buffer.is_empty() {
-            break;
-        }
-        saw_bytes = true;
-        let newline = buffer.iter().position(|byte| *byte == b'\n');
-        let content_len = newline.unwrap_or(buffer.len());
-        let remaining = max_bytes.saturating_sub(bytes.len());
-        let retained_len = content_len.min(remaining);
-        bytes.extend_from_slice(&buffer[..retained_len]);
-        omitted_bytes = omitted_bytes.saturating_add(content_len - retained_len);
-        let consumed = newline.map_or(content_len, |index| index + 1);
-        reader.consume(consumed);
-        if newline.is_some() {
-            break;
-        }
-    }
-
-    if !saw_bytes {
-        return None;
-    }
-    if bytes.last() == Some(&b'\r') {
-        bytes.pop();
-    }
-    Some(BoundedInputLine {
-        bytes,
-        omitted_bytes,
-    })
 }
 
 fn parse_args(request: &ToolRequest) -> GrepArgs {
@@ -686,8 +564,13 @@ struct GrepPageCollector {
     total_lines: usize,
     retained_bytes: usize,
     retained_budget: usize,
-    lines: Vec<String>,
+    lines: Vec<StoredLine>,
     selection_truncated: bool,
+}
+
+struct StoredLine {
+    text: String,
+    truncated: bool,
 }
 
 impl GrepPageCollector {
@@ -698,45 +581,80 @@ impl GrepPageCollector {
             total_lines: 0,
             retained_bytes: 0,
             retained_budget,
-            lines: Vec::with_capacity(limit.min(DEFAULT_GREP_HEAD_LIMIT)),
+            lines: Vec::new(),
             selection_truncated: false,
         }
     }
 
-    fn push(&mut self, line: crate::process::BoundedLine<'_>) {
+    fn has_next_page(&self) -> bool {
+        self.total_lines.saturating_sub(self.offset) > self.limit
+    }
+
+    fn push(
+        &mut self,
+        path: Option<&str>,
+        number: usize,
+        line: &[u8],
+        length: usize,
+        max_line_bytes: usize,
+    ) {
         let index = self.total_lines;
         self.total_lines = self.total_lines.saturating_add(1);
-        if index < self.offset || self.lines.len() >= self.limit {
+        if index < self.offset || index - self.offset >= self.limit {
             return;
         }
+        let keep = line.len().min(max_line_bytes);
+        let omitted = length.saturating_sub(keep);
+        let line = String::from_utf8_lossy(&line[..keep]);
+        let text = match path {
+            Some(path) => format!("{path}:{number}:{line}"),
+            None => format!("{number}:{line}"),
+        };
+        let text = crate::process::preserve_ingress_omission_notice(text, omitted);
+        self.retain(StoredLine {
+            text,
+            truncated: omitted > 0,
+        });
+    }
 
-        let separator_bytes = usize::from(!self.lines.is_empty());
+    fn retain(&mut self, line: StoredLine) {
+        let separator = usize::from(!self.lines.is_empty());
         let remaining = self
             .retained_budget
-            .saturating_sub(self.retained_bytes.saturating_add(separator_bytes));
+            .saturating_sub(self.retained_bytes.saturating_add(separator));
         if remaining == 0 {
             self.selection_truncated = true;
             return;
         }
-
-        let mut text = String::from_utf8_lossy(line.bytes).to_string();
-        if line.omitted_bytes > 0 {
-            text = crate::process::preserve_ingress_omission_notice(text, line.omitted_bytes);
-        }
-        let (text, truncated) = truncate_output(text, remaining);
-        self.selection_truncated |= truncated || line.omitted_bytes > 0;
-        self.retained_bytes = self
-            .retained_bytes
-            .saturating_add(separator_bytes)
-            .saturating_add(text.len());
-        self.lines.push(text);
+        let (text, truncated) = truncate_output(line.text, remaining);
+        let truncated = truncated || line.truncated;
+        self.selection_truncated |= truncated;
+        self.retained_bytes += separator + text.len();
+        self.lines.push(StoredLine { text, truncated });
     }
 
+    fn append_first_page(&mut self, page: Self) {
+        debug_assert_eq!(self.offset, 0);
+        let selected = self
+            .limit
+            .saturating_sub(self.total_lines)
+            .min(page.total_lines);
+        self.selection_truncated |= selected > page.lines.len();
+        self.total_lines = self.total_lines.saturating_add(page.total_lines);
+        for line in page.lines.into_iter().take(selected) {
+            self.retain(line);
+        }
+    }
     fn render(self) -> (String, bool) {
         let next_offset = (self.total_lines.saturating_sub(self.offset) > self.limit)
             .then_some(self.offset.saturating_add(self.limit));
 
-        let mut output = self.lines.join("\n");
+        let mut output = self
+            .lines
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n");
         if let Some(next_offset) = next_offset {
             let notice = if self.offset == 0 {
                 format!(
@@ -772,63 +690,6 @@ mod tests {
 
     use super::*;
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn sandboxed_rg_returns_nothing_outside_its_read_roots() {
-        let decision = crate::sandbox::enforcement_decision();
-        if decision.state != EnforcementState::Enforced {
-            eprintln!("restricted reads unavailable on this host");
-            return;
-        }
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path().canonicalize().unwrap().join("workspace");
-        fs::create_dir(&root).unwrap();
-        fs::write(fixture.path().join("neighbor.txt"), "neighbor text\n").unwrap();
-        let args = rg_args("neighbor text", Path::new("../neighbor.txt"));
-        let (child, job, receipt) = match spawn_rg(&root, &args, None, vec![root.clone()], decision)
-        {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                eprintln!("rg unavailable on this host");
-                return;
-            }
-            result => result.unwrap(),
-        };
-        let output = crate::process::wait_for_child_stdout_lines_with_timeout_or_cancel(
-            child,
-            job,
-            Duration::from_secs(5),
-            4096,
-            4096,
-            Vec::new(),
-            || false,
-            |lines, line| {
-                lines.push(line.bytes.to_vec());
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(output.value.is_empty(), "{output:?}");
-        assert_eq!(receipt.enforcement, EnforcementState::Enforced);
-    }
-
-    #[test]
-    fn grep_uses_the_in_process_search_without_enforced_reads() {
-        let workspace = tempfile::tempdir().unwrap();
-        fs::write(workspace.path().join("notes.txt"), "needle\n").unwrap();
-        let request = grep_request(r#"{"pattern":"needle","path":"notes.txt"}"#);
-        let decision =
-            SandboxEnforcementDecision::new(EnforcementState::Unavailable, "test", vec![]);
-        let result = execute_with_read_enforcement(
-            &request,
-            workspace.path(),
-            4096,
-            None,
-            || false,
-            decision,
-        );
-        assert_eq!(result.output.as_deref(), Some("notes.txt:1:needle"));
-    }
-
     #[test]
     fn directory_search_keeps_matches_in_utf8_files_with_a_bom() {
         let workspace = tempfile::tempdir().unwrap();
@@ -845,17 +706,107 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn a_denied_file_is_skipped_not_a_failed_search() {
-        let denied = b"rg: notes.txt: Permission denied (os error 13)\n";
-        assert!(rg_read_completed(Some(2), denied, 0));
-        assert!(!rg_read_completed(Some(2), denied, 1));
-        assert!(!rg_read_completed(Some(2), b"regex parse error:\n", 0));
-        assert!(!rg_read_completed(
-            Some(2),
-            b"rg: notes.txt: Permission denied (os error 13)\nregex parse error:\n",
-            0
-        ));
+    fn recursive_grep_keeps_native_filenames_in_the_page() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        for name in ["z.txt", "a\nfile.txt"] {
+            fs::write(workspace.path().join(name), "needle\n").unwrap();
+        }
+        let native = workspace
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"b\xff.txt"));
+        let (middle, name) = match fs::write(native, "needle\n") {
+            Ok(()) => ("b�.txt", None),
+            Err(_) if cfg!(target_os = "macos") => ("b-é.txt", Some("b-é.txt")),
+            Err(error) => panic!("cannot create byte filename: {error}"),
+        };
+        if let Some(name) = name {
+            fs::write(workspace.path().join(name), "needle\n").unwrap();
+        }
+        let result = execute(
+            &grep_request(r#"{"pattern":"needle","offset":1,"head_limit":1}"#),
+            workspace.path(),
+            4096,
+        );
+        assert_eq!(
+            result.output.as_deref(),
+            Some(
+                format!("{middle}:1:needle\n[Showing results 2-2 of 3; use offset=2 to continue]")
+                    .as_str()
+            )
+        );
+        let result = execute(
+            &grep_request(r#"{"pattern":"needle","head_limit":3}"#),
+            workspace.path(),
+            4096,
+        );
+        assert_eq!(
+            result.output.as_deref(),
+            Some(format!("a\nfile.txt:1:needle\n{middle}:1:needle\nz.txt:1:needle").as_str())
+        );
+    }
+
+    #[test]
+    fn recursive_grep_decodes_unicode_and_returns_a_sorted_page() {
+        let workspace = tempfile::tempdir().unwrap();
+        for (name, big_endian) in [("z-be.txt", true), ("a-le.txt", false)] {
+            let mut bytes = if big_endian {
+                vec![0xfe, 0xff]
+            } else {
+                vec![0xff, 0xfe]
+            };
+            for unit in "first line\r\nneedle 🌱\n".encode_utf16() {
+                bytes.extend(if big_endian {
+                    unit.to_be_bytes()
+                } else {
+                    unit.to_le_bytes()
+                });
+            }
+            fs::write(workspace.path().join(name), bytes).unwrap();
+        }
+        fs::write(workspace.path().join("m.txt"), b"\xef\xbb\xbfneedle\n").unwrap();
+        fs::write(
+            workspace.path().join("b-binary.txt"),
+            b"needle\nsecond line\0\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join(".hidden.txt"), "needle\n").unwrap();
+        let request = grep_request(r#"{"pattern":"^needle","offset":1,"head_limit":1}"#);
+        for _ in 0..3 {
+            let result = execute(&request, workspace.path(), 4096);
+            assert_eq!(
+                result.output.as_deref(),
+                Some("m.txt:1:needle\n[Showing results 2-2 of 3; use offset=2 to continue]")
+            );
+        }
+        let request = grep_request(r#"{"pattern":"^needle","head_limit":3}"#);
+        let result = execute(&request, workspace.path(), 4096);
+        assert_eq!(
+            result.output.as_deref(),
+            Some("a-le.txt:2:needle 🌱\nm.txt:1:needle\nz-be.txt:2:needle 🌱")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_skipped_and_search_continues() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let unreadable = workspace.path().join("denied.txt");
+        fs::write(&unreadable, "needle\n").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::write(workspace.path().join("visible.txt"), "needle\n").unwrap();
+        let can_read_denied = File::open(&unreadable).is_ok();
+        let request = grep_request(r#"{"pattern":"needle"}"#);
+        let result = execute(&request, workspace.path(), 4096);
+        assert_eq!(result.status, ToolStatus::Completed);
+        let output = result.output.unwrap();
+        assert_eq!(output.contains("denied.txt"), can_read_denied);
+        assert!(output.contains("visible.txt:1:needle"));
     }
 
     #[cfg(unix)]
@@ -869,24 +820,12 @@ mod tests {
         fs::write(&outside, "notes.txt\n").unwrap();
         crate::tests::symlink(&outside, cwd.join(".gitignore")).unwrap();
         let request = grep_request(r#"{"pattern":"needle"}"#);
-        for result in [
-            execute_in_process_with_global_excludes(
-                &request,
-                &cwd,
-                "needle",
-                &cwd,
-                4096,
-                &|| false,
-                None,
-            ),
-            execute(&request, &cwd, 4096),
-        ] {
-            assert_eq!(
-                result.output.as_deref(),
-                Some("notes.txt:1:needle"),
-                "{result:?}"
-            );
-        }
+        let result = execute(&request, &cwd, 4096);
+        assert_eq!(
+            result.output.as_deref(),
+            Some("notes.txt:1:needle"),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -899,15 +838,9 @@ mod tests {
         let excludes = fixture.path().join("global-excludes");
         fs::write(&excludes, "excluded.txt\n").unwrap();
         let request = grep_request(r#"{"pattern":"needle"}"#);
-        let result = execute_in_process_with_global_excludes(
-            &request,
-            &cwd,
-            "needle",
-            &cwd,
-            4096,
-            &|| false,
-            Some(&excludes),
-        );
+        let result = execute_search(&request, &cwd, 4096, None, &|| false, || {
+            Some(excludes.clone())
+        });
         assert_eq!(
             result.output.as_deref(),
             Some("visible.txt:1:needle"),
@@ -931,24 +864,12 @@ mod tests {
         fs::write(cwd.join("excluded.txt"), "needle\n").unwrap();
         fs::write(cwd.join("visible.txt"), "needle\n").unwrap();
         let request = grep_request(r#"{"pattern":"needle"}"#);
-        for result in [
-            execute_in_process_with_global_excludes(
-                &request,
-                &cwd,
-                "needle",
-                &cwd,
-                4096,
-                &|| false,
-                None,
-            ),
-            execute(&request, &cwd, 4096),
-        ] {
-            assert_eq!(
-                result.output.as_deref(),
-                Some("visible.txt:1:needle"),
-                "{result:?}"
-            );
-        }
+        let result = execute(&request, &cwd, 4096);
+        assert_eq!(
+            result.output.as_deref(),
+            Some("visible.txt:1:needle"),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -962,24 +883,12 @@ mod tests {
         fs::write(cwd.join("excluded.txt"), "needle\n").unwrap();
         fs::write(cwd.join("visible.txt"), "needle\n").unwrap();
         let request = grep_request(r#"{"pattern":"needle"}"#);
-        for result in [
-            execute_in_process_with_global_excludes(
-                &request,
-                &cwd,
-                "needle",
-                &cwd,
-                4096,
-                &|| false,
-                None,
-            ),
-            execute(&request, &cwd, 4096),
-        ] {
-            assert_eq!(
-                result.output.as_deref(),
-                Some("visible.txt:1:needle"),
-                "{result:?}"
-            );
-        }
+        let result = execute(&request, &cwd, 4096);
+        assert_eq!(
+            result.output.as_deref(),
+            Some("visible.txt:1:needle"),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -1011,15 +920,7 @@ mod tests {
             fs::write(cwd.join(name), "needle\n").unwrap();
         }
         let request = grep_request(r#"{"pattern":"needle"}"#);
-        let result = execute_in_process_with_global_excludes(
-            &request,
-            &cwd,
-            "needle",
-            &cwd,
-            4096,
-            &|| false,
-            None,
-        );
+        let result = execute_search(&request, &cwd, 4096, None, &|| false, || None);
         let output = result.output.unwrap();
         let mut lines = output.lines().collect::<Vec<_>>();
         lines.sort_unstable();
@@ -1042,17 +943,9 @@ mod tests {
         }
         let request = grep_request(r#"{"pattern":"needle"}"#);
         let search = || {
-            execute_in_process_with_global_excludes(
-                &request,
-                &cwd,
-                "needle",
-                &cwd,
-                4096,
-                &|| false,
-                None,
-            )
-            .output
-            .unwrap()
+            execute_search(&request, &cwd, 4096, None, &|| false, || None)
+                .output
+                .unwrap()
         };
         fs::write(
             cwd.join(".git"),
@@ -1088,39 +981,11 @@ mod tests {
         fs::write(cwd.join("src/ignored.txt"), "needle\n").unwrap();
         fs::write(cwd.join("src/visible.txt"), "needle\n").unwrap();
         let request = grep_request(r#"{"pattern":"needle"}"#);
-        for result in [
-            execute_in_process_with_global_excludes(
-                &request,
-                cwd,
-                "needle",
-                cwd,
-                4096,
-                &|| false,
-                None,
-            ),
-            execute(&request, cwd, 4096),
-        ] {
-            assert_eq!(
-                result.output.as_deref(),
-                Some("src/visible.txt:1:needle"),
-                "{result:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn rg_args_pass_the_pattern_and_path_as_values() {
+        let result = execute(&request, cwd, 4096);
         assert_eq!(
-            rg_args("-> Result", Path::new("src")),
-            [
-                "--no-config",
-                "--line-number",
-                "--no-heading",
-                "--regexp=-> Result",
-                "--",
-                "src",
-            ]
-            .map(std::ffi::OsString::from),
+            result.output.as_deref(),
+            Some("src/visible.txt:1:needle"),
+            "{result:?}"
         );
     }
 
@@ -1147,18 +1012,24 @@ mod tests {
     }
 
     #[test]
-    fn a_pattern_naming_an_rg_option_is_searched_literally() {
-        let cwd = temp_dir("grep-option-name");
-        fs::create_dir_all(&cwd).expect("create temp workspace");
-        fs::write(cwd.join("notes.txt"), "pass --files to list them\n").expect("write fixture");
-        fs::write(cwd.join("other.txt"), "nothing here\n").expect("write fixture");
-
-        let result = execute(&grep_request(r#"{"pattern":"--files"}"#), &cwd, 4096);
-
-        assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
-        let output = result.output.as_deref().expect("grep output");
-        assert_eq!(output.lines().count(), 1);
-        assert!(output.contains("pass --files to list them"), "{output}");
+    fn option_shaped_patterns_are_searched_literally() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cwd = workspace.path();
+        fs::write(
+            cwd.join("notes.txt"),
+            "pass --files to list them\n-e option\n",
+        )
+        .unwrap();
+        fs::write(cwd.join("other.txt"), "nothing here\n").unwrap();
+        for (pattern, output) in [
+            ("--files", "notes.txt:1:pass --files to list them"),
+            ("-e", "notes.txt:2:-e option"),
+        ] {
+            let arguments = serde_json::json!({ "pattern": pattern });
+            let result = execute(&grep_request(&arguments.to_string()), cwd, 4096);
+            assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
+            assert_eq!(result.output.as_deref(), Some(output));
+        }
     }
 
     #[test]
@@ -1303,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fallback_searches_the_resolved_path_literally() {
+    fn search_matches_the_resolved_path() {
         let cwd = temp_dir("grep-fallback-dash-pattern");
         fs::create_dir_all(&cwd).expect("create temp workspace");
         fs::write(
@@ -1312,10 +1183,7 @@ mod tests {
         )
         .expect("write fixture");
         let request = grep_request(r#"{"pattern":"-> Result","path":"."}"#);
-        let search_path =
-            crate::resolve_workspace_path(&cwd, Some(".")).expect("resolve workspace");
-
-        let result = execute_in_process(&request, &cwd, "-> Result", &search_path, 4096, &|| false);
+        let result = execute(&request, &cwd, 4096);
 
         assert_eq!(result.status, ToolStatus::Completed, "{result:?}");
         assert_eq!(
@@ -1513,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn in_process_fallback_reports_no_matches_with_the_builtin_contract() {
+    fn search_reports_no_matches_with_the_builtin_contract() {
         let cwd = temp_dir("grep-fallback-no-matches");
         fs::create_dir_all(&cwd).expect("create temp workspace");
         fs::write(cwd.join("notes.txt"), "haystack\n").expect("write fixture");
@@ -1525,14 +1393,7 @@ mod tests {
             raw_arguments: Some(r#"{"pattern":"needle","path":"notes.txt"}"#.to_string()),
         };
 
-        let result = execute_in_process(
-            &request,
-            &cwd,
-            "needle",
-            &cwd.join("notes.txt"),
-            4096,
-            &|| false,
-        );
+        let result = execute(&request, &cwd, 4096);
 
         assert_eq!(result.status, ToolStatus::Completed);
         assert_eq!(result.kind, ToolResultKind::NoMatches);
@@ -1552,16 +1413,9 @@ mod tests {
             raw_arguments: Some(r#"{"pattern":"needle"}"#.to_string()),
         };
 
-        // With `rg`, and without it.
-        let results = [
-            execute_or_cancel(&request, &cwd, 4096, || true),
-            execute_in_process(&request, &cwd, "needle", &cwd, 4096, &|| true),
-        ];
-
-        for result in results {
-            assert_eq!(result.status, ToolStatus::Cancelled);
-            assert_eq!(result.error.as_deref(), Some("grep was cancelled"));
-        }
+        let result = execute_or_cancel(&request, &cwd, 4096, || true);
+        assert_eq!(result.status, ToolStatus::Cancelled);
+        assert_eq!(result.error.as_deref(), Some("grep was cancelled"));
         let _ = fs::remove_dir_all(&cwd);
     }
 

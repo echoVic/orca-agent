@@ -244,50 +244,6 @@ pub(crate) fn sandbox_command(request: LinuxSandboxRequest) -> Command {
     }
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn read_only_helper_command(
-    program: &Path,
-    args: &[std::ffi::OsString],
-    effective: &orca_core::capability::EffectiveCapability,
-    decision: &SandboxEnforcementDecision,
-) -> io::Result<Command> {
-    let mut readable_roots = effective.read_roots.clone();
-    readable_roots.push(program.to_owned());
-    let request = LinuxSandboxRequest {
-        command: String::new(),
-        policy: LinuxSandboxPolicy {
-            cwd: effective.cwd.clone(),
-            read_scope: LinuxReadScope::Restricted,
-            readable_roots,
-            allowed_unix_socket_roots: vec![],
-            writable_roots: vec![],
-            metadata_protection_roots: vec![],
-            metadata_writable_roots: vec![],
-            read_only_roots: vec![],
-            denied_roots: vec![],
-            network_access: false,
-        },
-        strict: true,
-    };
-    match decision.backend.as_str() {
-        BWRAP_BACKEND => {
-            let bwrap = bwrap_path(&effective.cwd).ok_or(io::ErrorKind::Unsupported)?;
-            let mut command = Command::new(bwrap);
-            command
-                .args(super::bwrap::build_bwrap_arguments(&request.policy))
-                .arg(program)
-                .args(args);
-            Ok(command)
-        }
-        LANDLOCK_SECCOMP_BACKEND => {
-            let mut command = Command::new(program);
-            command.args(args);
-            attach_landlock(command, &request)
-        }
-        _ => Err(io::ErrorKind::Unsupported.into()),
-    }
-}
-
 /// Why a command under `request` would be refused although `decision` found
 /// a backend that enforces: a deny path is missing, or the policy needs more
 /// than Landlock and seccomp can express while bubblewrap cannot run. The
@@ -547,14 +503,6 @@ fn landlock_command(_request: &LinuxSandboxRequest) -> io::Result<Command> {
 
 #[cfg(target_os = "linux")]
 fn landlock_command(request: &LinuxSandboxRequest) -> io::Result<Command> {
-    attach_landlock(
-        plain_command(&request.command, &request.policy.cwd),
-        request,
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn attach_landlock(mut cmd: Command, request: &LinuxSandboxRequest) -> io::Result<Command> {
     use std::os::unix::process::CommandExt;
 
     if policy_requires_bwrap(request) {
@@ -566,6 +514,7 @@ fn attach_landlock(mut cmd: Command, request: &LinuxSandboxRequest) -> io::Resul
     linux_landlock::probe_landlock_supported()?;
     let prepared = linux_landlock::PreparedSandbox::new(request)?;
     let mut prepared = Some(prepared);
+    let mut cmd = plain_command(&request.command, &request.policy.cwd);
 
     // SAFETY: path opening, ruleset construction, and BPF compilation happened
     // in the parent. The child only applies the prepared kernel objects before
@@ -643,7 +592,7 @@ mod linux_landlock {
                     let existing: Vec<&PathBuf> =
                         readable_roots.iter().filter(|root| root.exists()).collect();
                     for root in existing {
-                        ruleset = add_path_rule(ruleset, root, access_ro, !root.is_dir())?;
+                        ruleset = add_path_rule(ruleset, root, access_ro, false)?;
                     }
                 }
             }

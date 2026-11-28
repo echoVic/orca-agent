@@ -137,12 +137,6 @@ fn is_explicit_metadata_writable_root(
 /// The returned argv ends with `sh -c <command>`; callers prepend the resolved
 /// `bwrap` binary path.
 pub fn build_bwrap_argv(policy: &LinuxSandboxPolicy, command: &str) -> Vec<String> {
-    let mut argv = build_bwrap_arguments(policy);
-    argv.extend(["sh".to_string(), "-c".to_string(), command.to_string()]);
-    argv
-}
-
-pub(crate) fn build_bwrap_arguments(policy: &LinuxSandboxPolicy) -> Vec<String> {
     // Process isolation. `--die-with-parent` guarantees the sandbox tears down
     // if the agent process exits; the unshares drop the child into private
     // user/pid/ipc/uts namespaces. Network is unshared separately below.
@@ -234,6 +228,9 @@ pub(crate) fn build_bwrap_arguments(policy: &LinuxSandboxPolicy) -> Vec<String> 
     argv.push(path_arg(&policy.cwd));
 
     argv.push("--".to_string());
+    argv.push("sh".to_string());
+    argv.push("-c".to_string());
+    argv.push(command.to_string());
 
     argv
 }
