@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -98,7 +99,13 @@ fn execute_search(
         max_bytes.max(1),
     );
     let started = Instant::now();
-    let stop = || should_cancel() || started.elapsed() >= GREP_TIMEOUT;
+    let cancelled = Cell::new(false);
+    let is_cancelled = || {
+        let observed = cancelled.get() || should_cancel();
+        cancelled.set(observed);
+        observed
+    };
+    let stop = || is_cancelled() || started.elapsed() >= GREP_TIMEOUT;
     let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
     let result = match target {
         ReadTarget::Spill(_, file) => {
@@ -140,7 +147,7 @@ fn execute_search(
             }
         }
     };
-    if should_cancel() {
+    if is_cancelled() {
         return ToolResult::cancelled(request, GREP_CANCELLED, None);
     }
     if started.elapsed() >= GREP_TIMEOUT {
@@ -1417,6 +1424,20 @@ mod tests {
         assert_eq!(result.status, ToolStatus::Cancelled);
         assert_eq!(result.error.as_deref(), Some("grep was cancelled"));
         let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn grep_keeps_a_cancellation_observed_once() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("notes.txt"), "needle\n").unwrap();
+        let cancelled = Cell::new(true);
+        let result = execute_or_cancel(
+            &grep_request(r#"{"pattern":"needle"}"#),
+            workspace.path(),
+            4096,
+            || cancelled.replace(false),
+        );
+        assert_eq!(result.status, ToolStatus::Cancelled);
     }
 
     fn grep_request(arguments: &str) -> ToolRequest {
