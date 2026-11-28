@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::File;
@@ -63,9 +62,15 @@ pub(crate) fn execute_in_session(
     spill_dir: Option<&Path>,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
-    execute_search(request, cwd, max_bytes, spill_dir, &should_cancel, |stop| {
-        global_excludes_path(cwd, stop)
-    })
+    execute_search(
+        request,
+        cwd,
+        max_bytes,
+        spill_dir,
+        &should_cancel,
+        GREP_TIMEOUT,
+        global_excludes_path,
+    )
 }
 
 fn execute_search(
@@ -74,19 +79,68 @@ fn execute_search(
     max_bytes: usize,
     spill_dir: Option<&Path>,
     should_cancel: &dyn Fn() -> bool,
-    global_excludes: impl FnOnce(&IgnoreReads<'_>) -> Option<PathBuf>,
+    timeout: Duration,
+    global_excludes: impl FnOnce(&Path, &IgnoreReads<'_>) -> Option<PathBuf> + Send + 'static,
 ) -> ToolResult {
     let started = Instant::now();
-    let cancelled = Cell::new(false);
-    let is_cancelled = || {
-        let observed = cancelled.get() || should_cancel();
-        cancelled.set(observed);
-        observed
-    };
-    let stop = || is_cancelled() || started.elapsed() >= GREP_TIMEOUT;
-    if stop() {
+    if should_cancel() {
         return ToolResult::cancelled(request, GREP_CANCELLED, None);
     }
+    let worker_request = request.clone();
+    let cwd = cwd.to_path_buf();
+    let spill_dir = spill_dir.map(Path::to_path_buf);
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let (send, receive) = mpsc::sync_channel(1);
+    // A stalled read can keep this worker alive until the read returns.
+    if let Err(error) = std::thread::Builder::new().spawn(move || {
+        let stop = || worker_stop.load(Ordering::Relaxed);
+        let result = search(
+            &worker_request,
+            &cwd,
+            max_bytes,
+            spill_dir.as_deref(),
+            &stop,
+            global_excludes,
+        );
+        let _ = send.send(result);
+    }) {
+        return ToolResult::failed(request, format!("cannot start grep worker: {error}"), None);
+    }
+    // Only the caller invokes its cancellation callback. Check it and the
+    // deadline even if the worker has just sent a result.
+    let mut outcome = None;
+    loop {
+        if should_cancel() {
+            stop.store(true, Ordering::Relaxed);
+            return ToolResult::cancelled(request, GREP_CANCELLED, None);
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            stop.store(true, Ordering::Relaxed);
+            return ToolResult::failed(request, "grep timed out after 120s", None);
+        }
+        if let Some(outcome) = outcome {
+            return outcome;
+        }
+        match receive.recv_timeout(remaining.min(Duration::from_millis(5))) {
+            Ok(result) => outcome = Some(result),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                outcome = Some(ToolResult::failed(request, "grep worker stopped", None));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn search(
+    request: &ToolRequest,
+    cwd: &Path,
+    max_bytes: usize,
+    spill_dir: Option<&Path>,
+    stop: &(impl Fn() -> bool + Sync),
+    global_excludes: impl FnOnce(&Path, &IgnoreReads<'_>) -> Option<PathBuf>,
+) -> ToolResult {
     let args = parse_args(request);
     let pattern = args.pattern.as_deref().or(request
         .target
@@ -122,7 +176,7 @@ fn execute_search(
     let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_DISPLAY_BYTES);
     let result = match target {
         ReadTarget::Spill(_, file) => {
-            search_file(file, None, &regex, max_line_bytes, &mut page, &stop, true)
+            search_file(file, None, &regex, max_line_bytes, &mut page, stop, true)
         }
         ReadTarget::Workspace(workspace) => {
             let label = if Path::new(requested).is_absolute() {
@@ -132,8 +186,8 @@ fn execute_search(
             };
             let search = || match open_directory(&workspace.root, &workspace.canonical) {
                 Ok(directory) if !stop() => {
-                    let reads = IgnoreReads::new(&stop);
-                    let global = global_excludes(&reads);
+                    let reads = IgnoreReads::new(stop);
+                    let global = global_excludes(cwd, &reads);
                     let ignores = WorkspaceIgnores::new(
                         &workspace.root,
                         &workspace.canonical,
@@ -147,7 +201,7 @@ fn execute_search(
                         max_line_bytes,
                         ignores: &ignores,
                     }
-                    .search(&directory, &mut page, &reads)
+                    .search(&directory, &mut page, &reads, stop)
                 }
                 Ok(_) => Ok(()),
                 Err(directory_error) if is_resource_failure(&directory_error) => {
@@ -160,7 +214,7 @@ fn execute_search(
                         &regex,
                         max_line_bytes,
                         &mut page,
-                        &stop,
+                        stop,
                         true,
                     ),
                     Err(error)
@@ -178,12 +232,6 @@ fn execute_search(
             search().and_then(|()| crate::workspace_read::open_root(&workspace.root).map(drop))
         }
     };
-    if is_cancelled() {
-        return ToolResult::cancelled(request, GREP_CANCELLED, None);
-    }
-    if started.elapsed() >= GREP_TIMEOUT {
-        return ToolResult::failed(request, "grep timed out after 120s", None);
-    }
     if let Err(error) = result {
         return ToolResult::failed(request, error.to_string(), None);
     }
@@ -265,9 +313,9 @@ impl DirectorySearch<'_> {
         directory: &VerifiedDirectory,
         page: &mut GrepPageCollector,
         reads: &IgnoreReads<'_>,
+        should_stop: &(impl Fn() -> bool + Sync),
     ) -> io::Result<()> {
         reads.check()?;
-        let should_stop = reads.stop;
         // Keep only paths during discovery. Ordering happens as each entry is
         // inserted, so cancellation can interrupt it even in a flat directory.
         let mut files = BTreeSet::new();
@@ -277,44 +325,20 @@ impl DirectorySearch<'_> {
         }
         result?;
         let files = files.into_iter().map(PathBuf::from);
-        // Only the calling thread invokes the caller's cancellation callback.
-        let stop = AtomicBool::new(false);
-        let stop_ref = &stop;
-        std::thread::scope(|scope| {
-            let (done, receive) = mpsc::sync_channel(1);
-            scope.spawn(move || {
-                static POOL: Mutex<Option<Arc<rayon::ThreadPool>>> = Mutex::new(None);
-                let pool = (page.offset == 0).then(|| {
-                    grep_pool(&POOL, || {
-                        let threads = std::thread::available_parallelism()
-                            .map_or(2, usize::from)
-                            .min(8);
-                        rayon::ThreadPoolBuilder::new().num_threads(threads).build()
-                    })
-                });
-                let should_stop = || stop_ref.load(Ordering::Relaxed);
-                let result = match pool.flatten() {
-                    Some(pool) => pool.install(|| {
-                        self.search_directory(directory, files, page, &should_stop, true)
-                    }),
-                    None => self.search_directory(directory, files, page, &should_stop, false),
-                };
-                let _ = done.send(result);
+        if page.offset == 0 {
+            static POOL: Mutex<Option<Arc<rayon::ThreadPool>>> = Mutex::new(None);
+            let pool = grep_pool(&POOL, || {
+                let threads = std::thread::available_parallelism()
+                    .map_or(2, usize::from)
+                    .min(8);
+                rayon::ThreadPoolBuilder::new().num_threads(threads).build()
             });
-            loop {
-                if should_stop() {
-                    stop.store(true, Ordering::Relaxed);
-                    return Ok(());
-                }
-                match receive.recv_timeout(Duration::from_millis(5)) {
-                    Ok(result) => return result,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(io::Error::other("grep worker stopped"));
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                }
+            if let Some(pool) = pool {
+                return pool
+                    .install(|| self.search_directory(directory, files, page, should_stop, true));
             }
-        })
+        }
+        self.search_directory(directory, files, page, should_stop, false)
     }
 
     fn search_directory(
@@ -890,6 +914,7 @@ impl GrepPageCollector {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -912,6 +937,40 @@ mod tests {
             rayon::ThreadPoolBuilder::new().num_threads(1).build()
         });
         assert!(running.is_some(), "the next search must retry pool startup");
+    }
+
+    #[test]
+    fn grep_returns_at_the_deadline_while_the_search_is_still_blocked() {
+        let workspace = crate::workspace_tempdir().unwrap();
+        let cwd = workspace.path();
+        let (entered, waiting) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let (finished, result) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let request = grep_request(r#"{"pattern":"needle"}"#);
+                let output = execute_search(
+                    &request,
+                    cwd,
+                    4096,
+                    None,
+                    &|| false,
+                    Duration::from_millis(250),
+                    move |_, _| {
+                        entered.send(()).unwrap();
+                        let _ = blocked.recv();
+                        None
+                    },
+                );
+                finished.send(output).unwrap();
+            });
+            let started = waiting.recv_timeout(Duration::from_secs(2));
+            let outcome = result.recv_timeout(Duration::from_secs(2));
+            let _ = release.send(());
+            started.expect("the search reached the blocking read");
+            let output = outcome.expect("grep must return while its read is still blocked");
+            assert_eq!(output.error.as_deref(), Some("grep timed out after 120s"));
+        });
     }
 
     #[test]
@@ -983,17 +1042,21 @@ mod tests {
     #[test]
     fn grep_checks_cancellation_during_discovery() {
         let workspace = crate::workspace_tempdir().unwrap();
-        for index in 0..256 {
-            fs::write(workspace.path().join(format!("{index}.txt")), "miss").unwrap();
-        }
-        let polls = Cell::new(0);
-        let result = execute_or_cancel(
+        let (entered, waiting) = mpsc::channel();
+        let result = execute_search(
             &grep_request(r#"{"pattern":"needle"}"#),
             workspace.path(),
             4096,
-            || {
-                polls.set(polls.get() + 1);
-                polls.get() >= 32
+            None,
+            &|| waiting.try_recv().is_ok(),
+            Duration::from_secs(2),
+            move |_, reads| {
+                entered.send(()).unwrap();
+                let started = Instant::now();
+                while !(reads.stop)() && started.elapsed() < Duration::from_secs(2) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                None
             },
         );
         assert_eq!(result.status, ToolStatus::Cancelled);
@@ -1388,9 +1451,15 @@ mod tests {
         let excludes = fixture.path().join("global-excludes");
         fs::write(&excludes, "excluded.txt\n").unwrap();
         let request = grep_request(r#"{"pattern":"needle"}"#);
-        let result = execute_search(&request, &cwd, 4096, None, &|| false, |_| {
-            Some(excludes.clone())
-        });
+        let result = execute_search(
+            &request,
+            &cwd,
+            4096,
+            None,
+            &|| false,
+            GREP_TIMEOUT,
+            move |_, _| Some(excludes),
+        );
         assert_eq!(
             result.output.as_deref(),
             Some("visible.txt:1:needle"),
@@ -1470,7 +1539,15 @@ mod tests {
             fs::write(cwd.join(name), "needle\n").unwrap();
         }
         let request = grep_request(r#"{"pattern":"needle"}"#);
-        let result = execute_search(&request, &cwd, 4096, None, &|| false, |_| None);
+        let result = execute_search(
+            &request,
+            &cwd,
+            4096,
+            None,
+            &|| false,
+            GREP_TIMEOUT,
+            |_, _| None,
+        );
         let output = result.output.unwrap();
         let mut lines = output.lines().collect::<Vec<_>>();
         lines.sort_unstable();
@@ -1500,9 +1577,17 @@ mod tests {
         }
         let request = grep_request(r#"{"pattern":"needle"}"#);
         let search = || {
-            execute_search(&request, &cwd, 4096, None, &|| false, |_| None)
-                .output
-                .unwrap()
+            execute_search(
+                &request,
+                &cwd,
+                4096,
+                None,
+                &|| false,
+                GREP_TIMEOUT,
+                |_, _| None,
+            )
+            .output
+            .unwrap()
         };
         fs::write(
             cwd.join(".git"),
