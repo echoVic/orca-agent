@@ -9,7 +9,7 @@ use orca_core::config::{DelegationSnapshot, RunConfig};
 use orca_core::cost_types::UsageTotals;
 use orca_core::event_schema::{EventEnvelope, EventFactory, EventType, RunStatus};
 use orca_core::event_sink::{EventObserver, EventSink};
-use orca_core::subagent_types::SubagentType;
+use orca_core::subagent_types::{RoleContextPolicy, SubagentType};
 use orca_core::thread_identity::TurnId;
 use orca_core::tool_types::{ToolRequest, ToolResult};
 use orca_mcp::McpRegistry;
@@ -1591,6 +1591,7 @@ fn run_subagent_worker(
                 .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
         });
     if invocation.agent_controller.is_some()
+        && invocation.request.context == RoleContextPolicy::Fresh
         && invocation.request.isolation == SubagentIsolation::None
         && !matches!(invocation.request.subagent_type, SubagentType::Custom(_))
         && !resumes_custom
@@ -1622,11 +1623,11 @@ fn run_subagent_worker(
     let SubagentRequest {
         budget_reservation,
         description,
-        prompt,
+        mut prompt,
         subagent_type: requested_subagent_type,
         model: requested_model,
-        context: _,
-        fork_prefix_ref,
+        mut context,
+        mut fork_prefix_ref,
         captured_fork_prefix,
         mode: _,
         isolation: requested_isolation,
@@ -1851,9 +1852,28 @@ fn run_subagent_worker(
                 prompt_id,
                 compatibility,
             };
-            coordinator
-                .create_with_fork(input.clone(), fork_prefix_ref)
-                .or_else(|_| coordinator.create_with_fork(input, fork_prefix_ref))
+            let mut create = |input| {
+                coordinator.create_with_fork_policy(input, fork_prefix_ref, |loaded| {
+                    if context == RoleContextPolicy::Fresh {
+                        return loaded;
+                    }
+                    let reason = match loaded {
+                        Ok(Some(prefix)) => {
+                            match crate::subagent::validate_fork_prefix(&child_config, &prefix) {
+                                Ok(()) => return Ok(Some(prefix)),
+                                Err(reason) => reason,
+                            }
+                        }
+                        Ok(None) => "no parent history was saved for this child".to_string(),
+                        Err(error) => error.to_string(),
+                    };
+                    prompt = crate::subagent::fresh_fork_prompt(&prompt, &reason);
+                    context = RoleContextPolicy::Fresh;
+                    fork_prefix_ref = None;
+                    Ok(None)
+                })
+            };
+            create(input.clone()).or_else(|_| create(input))
         }
     };
     let mut prepared = match prepared {
@@ -1873,7 +1893,9 @@ fn run_subagent_worker(
             );
         }
     };
-    if let Some(prefix) = captured_fork_prefix {
+    if prepared.fork_prefix.is_some()
+        && let Some(prefix) = captured_fork_prefix
+    {
         prepared.fork_prefix = Some(prefix);
     }
     let lease = match coordinator

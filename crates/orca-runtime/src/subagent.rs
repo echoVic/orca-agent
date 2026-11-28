@@ -149,10 +149,7 @@ pub(crate) fn prepare_fork_request(
         Ok(prefix) => prefix,
         Err(note) => {
             request.context = RoleContextPolicy::Fresh;
-            request.prompt = format!(
-                "Fork context unavailable: {note}. Starting fresh.\n\n{}",
-                request.prompt
-            );
+            request.prompt = fresh_fork_prompt(&request.prompt, note);
             return Ok(Some(note));
         }
     };
@@ -166,6 +163,10 @@ pub(crate) fn prepare_fork_request(
     );
     request.captured_fork_prefix = Some(std::sync::Arc::new(prefix));
     Ok(None)
+}
+
+pub(crate) fn fresh_fork_prompt(prompt: &str, note: &str) -> String {
+    format!("Fork context unavailable: {note}. Starting fresh.\n\n{prompt}")
 }
 
 pub(crate) fn validate_fork_prefix(

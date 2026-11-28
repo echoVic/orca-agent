@@ -2958,6 +2958,18 @@ impl ChildAgentCoordinator {
         input: CreateContinuationInput,
         fork_prefix_ref: Option<Sha256Digest>,
     ) -> Result<PreparedContinuation, AgentContinuationError> {
+        self.create_with_fork_policy(input, fork_prefix_ref, |prefix| prefix)
+    }
+
+    pub(crate) fn create_with_fork_policy(
+        &self,
+        input: CreateContinuationInput,
+        fork_prefix_ref: Option<Sha256Digest>,
+        prepare_prefix: impl FnOnce(
+            Result<Option<Arc<ProviderForkPrefix>>, AgentContinuationError>,
+        )
+            -> Result<Option<Arc<ProviderForkPrefix>>, AgentContinuationError>,
+    ) -> Result<PreparedContinuation, AgentContinuationError> {
         validate_task_binding(&input.parent_task_id, &input.task_id)?;
         validate_compatibility_shape(&input.compatibility)?;
         let continuation_id = input
@@ -2990,9 +3002,11 @@ impl ChildAgentCoordinator {
             return Err(AgentContinuationError::AlreadyExists { continuation_id });
         }
 
-        let fork_prefix = self
-            .store
-            .load_child_fork_prefix(&continuation_id, fork_prefix_ref)?;
+        let fork_prefix = prepare_prefix(
+            self.store
+                .load_child_fork_prefix(&continuation_id, fork_prefix_ref),
+        )?;
+        let fork_prefix_ref = fork_prefix_ref.filter(|_| fork_prefix.is_some());
         let now_ms = continuation_now_ms();
         let record = AgentContinuationRecord {
             schema_version: AGENT_CONTINUATION_SCHEMA_VERSION,
