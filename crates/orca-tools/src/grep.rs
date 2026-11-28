@@ -1,15 +1,16 @@
 use std::cell::Cell;
+use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Mutex, OnceLock,
+    OnceLock,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant};
 
-use ignore::gitignore::gitconfig_excludes_path;
 use memchr::{memchr, memchr_iter};
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 use orca_platform::fs::{DirectoryEntryKind, VerifiedDirectory};
@@ -19,7 +20,9 @@ use serde::Deserialize;
 
 use crate::ResolvedWorkspacePath;
 use crate::spill::ReadTarget;
-use crate::workspace_ignore::{IgnoreDirectory, WorkspaceIgnores};
+use crate::workspace_ignore::{
+    IgnoreDirectory, IgnoreReads, WorkspaceIgnores, global_excludes_path,
+};
 use crate::workspace_read::{open_directory, open_file_in};
 
 const DEFAULT_GREP_HEAD_LIMIT: usize = 250;
@@ -59,14 +62,9 @@ pub(crate) fn execute_in_session(
     spill_dir: Option<&Path>,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
-    execute_search(
-        request,
-        cwd,
-        max_bytes,
-        spill_dir,
-        &should_cancel,
-        gitconfig_excludes_path,
-    )
+    execute_search(request, cwd, max_bytes, spill_dir, &should_cancel, |stop| {
+        global_excludes_path(cwd, stop)
+    })
 }
 
 fn execute_search(
@@ -75,8 +73,19 @@ fn execute_search(
     max_bytes: usize,
     spill_dir: Option<&Path>,
     should_cancel: &dyn Fn() -> bool,
-    global_excludes: impl FnOnce() -> Option<PathBuf>,
+    global_excludes: impl FnOnce(&IgnoreReads<'_>) -> Option<PathBuf>,
 ) -> ToolResult {
+    let started = Instant::now();
+    let cancelled = Cell::new(false);
+    let is_cancelled = || {
+        let observed = cancelled.get() || should_cancel();
+        cancelled.set(observed);
+        observed
+    };
+    let stop = || is_cancelled() || started.elapsed() >= GREP_TIMEOUT;
+    if stop() {
+        return ToolResult::cancelled(request, GREP_CANCELLED, None);
+    }
     let args = parse_args(request);
     let pattern = args.pattern.as_deref().or(request
         .target
@@ -99,14 +108,6 @@ fn execute_search(
         normalized_head_limit(args.head_limit),
         max_bytes.max(1),
     );
-    let started = Instant::now();
-    let cancelled = Cell::new(false);
-    let is_cancelled = || {
-        let observed = cancelled.get() || should_cancel();
-        cancelled.set(observed);
-        observed
-    };
-    let stop = || is_cancelled() || started.elapsed() >= GREP_TIMEOUT;
     let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_DISPLAY_BYTES);
     let result = match target {
         ReadTarget::Spill(_, file) => {
@@ -127,11 +128,13 @@ fn execute_search(
                 }
                 Err(_) => match open_directory(&workspace.root, &workspace.canonical) {
                     Ok(directory) if !stop() => {
-                        let global = global_excludes();
+                        let reads = IgnoreReads::new(&stop);
+                        let global = global_excludes(&reads);
                         let ignores = WorkspaceIgnores::new(
                             &workspace.root,
                             &workspace.canonical,
                             global.as_deref(),
+                            &reads,
                         );
                         DirectorySearch {
                             workspace: &workspace,
@@ -140,8 +143,8 @@ fn execute_search(
                             max_line_bytes,
                             ignores: &ignores,
                         }
-                        .search(&directory, &mut page, &stop);
-                        crate::workspace_read::open_root(&workspace.root).map(drop)
+                        .search(&directory, &mut page, &reads)
+                        .and_then(|()| crate::workspace_read::open_root(&workspace.root).map(drop))
                     }
                     _ => crate::workspace_read::open_root(&workspace.root).map(drop),
                 },
@@ -173,60 +176,73 @@ impl DirectorySearch<'_> {
         &self,
         directory: &VerifiedDirectory,
         page: &mut GrepPageCollector,
-        should_stop: &dyn Fn() -> bool,
-    ) {
+        reads: &IgnoreReads<'_>,
+    ) -> io::Result<()> {
+        reads.check()?;
+        let should_stop = reads.stop;
+        // Keep only paths during discovery. Ordering happens as each entry is
+        // inserted, so cancellation can interrupt it even in a flat directory.
+        let mut files = BTreeSet::new();
+        let result = self.walk(directory, Path::new(""), None, &mut files, reads);
+        if should_stop() {
+            return Ok(());
+        }
+        result?;
+        let files = files.into_iter().map(PathBuf::from);
         // Only the calling thread invokes the caller's cancellation callback.
         let stop = AtomicBool::new(false);
         let stop_ref = &stop;
         std::thread::scope(|scope| {
             let (done, receive) = mpsc::sync_channel(1);
             scope.spawn(move || {
-                static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+                static POOL: OnceLock<Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>> =
+                    OnceLock::new();
                 let pool = POOL.get_or_init(|| {
                     let threads = std::thread::available_parallelism()
                         .map_or(2, usize::from)
                         .min(8);
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(threads)
-                        .build()
-                        .expect("start grep workers")
+                    rayon::ThreadPoolBuilder::new().num_threads(threads).build()
                 });
                 let should_stop = || stop_ref.load(Ordering::Relaxed);
-                pool.install(|| self.search_directory(directory, page, &should_stop));
-                let _ = done.send(());
+                let result = match pool {
+                    Ok(pool) => {
+                        pool.install(|| self.search_directory(directory, files, page, &should_stop))
+                    }
+                    Err(error) => Err(io::Error::other(error.to_string())),
+                };
+                let _ = done.send(result);
             });
             loop {
                 if should_stop() {
                     stop.store(true, Ordering::Relaxed);
-                    break;
+                    return Ok(());
                 }
                 match receive.recv_timeout(Duration::from_millis(5)) {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Ok(result) => return result,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(io::Error::other("grep worker stopped"));
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
             }
-        });
+        })
     }
 
     fn search_directory(
         &self,
         directory: &VerifiedDirectory,
+        mut files: impl Iterator<Item = PathBuf>,
         page: &mut GrepPageCollector,
         should_stop: &(impl Fn() -> bool + Sync),
-    ) {
-        let files = Mutex::new(Vec::new());
-        self.walk(directory, Path::new(""), None, &files, should_stop);
-        let mut files = files.into_inner().unwrap();
-        files.par_sort_unstable_by(|left, right| left.as_os_str().cmp(right.as_os_str()));
-        if page.offset != 0 {
-            self.search_files(directory, &files, self.regex, page, should_stop);
-            return;
-        }
-
-        // Keep a bounded set of pages in flight and combine them in path order.
-        for batch in files.chunks(128) {
-            if should_stop() || page.has_next_page() {
+    ) -> io::Result<()> {
+        while !should_stop() && (page.offset != 0 || !page.has_next_page()) {
+            let batch = files.by_ref().take(128).collect::<Vec<_>>();
+            if batch.is_empty() {
                 break;
+            }
+            if page.offset != 0 {
+                self.search_files(directory, &batch, self.regex, page, should_stop)?;
+                continue;
             }
             let chunks = batch
                 .par_chunks(16)
@@ -238,71 +254,74 @@ impl DirectorySearch<'_> {
                         &self.regex.clone(),
                         &mut first,
                         should_stop,
-                    );
-                    first
+                    )?;
+                    Ok(first)
                 })
-                .collect::<Vec<_>>();
+                .collect::<Vec<io::Result<_>>>();
             for chunk in chunks {
-                page.append_first_page(chunk);
+                page.append_first_page(chunk?);
             }
         }
+        Ok(())
     }
 
     fn walk(
         &self,
-        directory: &VerifiedDirectory,
+        base: &VerifiedDirectory,
         relative: &Path,
         parents: Option<&IgnoreDirectory<'_>>,
-        files: &Mutex<Vec<PathBuf>>,
-        should_stop: &(impl Fn() -> bool + Sync),
-    ) {
+        files: &mut BTreeSet<OsString>,
+        reads: &IgnoreReads<'_>,
+    ) -> io::Result<()> {
+        let should_stop = reads.stop;
         if should_stop() {
-            return;
+            return Ok(());
         }
-        let Ok(entries) = directory.read_entries() else {
-            return;
-        };
+        let opened = open_search_directory(base, relative)?;
+        if !relative.as_os_str().is_empty() && opened.is_none() {
+            return Ok(());
+        }
+        let directory = opened.as_ref().unwrap_or(base);
         let path = self.workspace.canonical.join(relative);
         let ignores = IgnoreDirectory {
-            rules: self.ignores.directory(&path, directory),
+            rules: self.ignores.directory(&path, directory, reads),
             parent: parents,
         };
+        reads.check()?;
         let mut folders = Vec::new();
-        let mut found = Vec::new();
-        for entry in entries {
+        let entries = directory.visit_entries(|entry| {
             if should_stop() {
-                return;
+                return Err(io::ErrorKind::Interrupted.into());
             }
             if entry.hidden || entry.kind == DirectoryEntryKind::Other {
-                continue;
+                return Ok(());
             }
             let is_dir = entry.kind == DirectoryEntryKind::Directory;
             if self
                 .ignores
                 .entry_ignored(&path.join(&entry.name), is_dir, &ignores)
             {
-                continue;
+                return Ok(());
             }
+            let child = relative.join(entry.name);
             if is_dir {
-                folders.push(entry.name);
+                folders.push(child);
             } else {
-                found.push(relative.join(entry.name));
+                files.insert(child.into_os_string());
             }
-        }
-        files.lock().unwrap().extend(found);
-        folders.into_par_iter().for_each(|name| {
-            if !should_stop()
-                && let Ok(child) = directory.child(&name)
-            {
-                self.walk(
-                    &child,
-                    &relative.join(name),
-                    Some(&ignores),
-                    files,
-                    should_stop,
-                );
-            }
+            Ok(())
         });
+        if let Err(error) = entries {
+            if should_stop() {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        drop(opened);
+        for child in folders {
+            self.walk(base, &child, Some(&ignores), files, reads)?;
+        }
+        Ok(())
     }
 
     fn search_files(
@@ -312,7 +331,7 @@ impl DirectorySearch<'_> {
         regex: &Regex,
         page: &mut GrepPageCollector,
         should_stop: &dyn Fn() -> bool,
-    ) {
+    ) -> io::Result<()> {
         let mut parent = None;
         let mut opened = None;
         for path in files {
@@ -322,42 +341,61 @@ impl DirectorySearch<'_> {
             let current = path.parent().expect("relative file path");
             if parent != Some(current) {
                 parent = Some(current);
-                opened = if current.as_os_str().is_empty() {
-                    None
-                } else {
-                    current
-                        .iter()
-                        .try_fold(None, |directory: Option<VerifiedDirectory>, name| {
-                            directory
-                                .as_ref()
-                                .unwrap_or(base)
-                                .child(name)
-                                .ok()
-                                .map(Some)
-                        })
-                        .flatten()
-                };
+                opened = open_search_directory(base, current)?;
             }
             let directory = if current.as_os_str().is_empty() {
                 Some(base)
             } else {
                 opened.as_ref()
             };
-            if let Some(directory) = directory
-                && let Ok(file) = open_file_in(directory, path.file_name().expect("file name"))
-            {
-                let label = self.label.join(path);
-                let _ = search_file(
-                    file,
-                    Some(&label),
-                    regex,
-                    self.max_line_bytes,
-                    page,
-                    should_stop,
+            if let Some(directory) = directory {
+                let found = open_file_in(directory, path.file_name().expect("file name")).and_then(
+                    |file| {
+                        let label = self.label.join(path);
+                        search_file(
+                            file,
+                            Some(&label),
+                            regex,
+                            self.max_line_bytes,
+                            page,
+                            should_stop,
+                        )
+                    },
                 );
+                if let Err(error) = found
+                    && is_resource_failure(&error)
+                {
+                    return Err(error);
+                }
             }
         }
+        Ok(())
     }
+}
+
+fn open_search_directory(
+    base: &VerifiedDirectory,
+    relative: &Path,
+) -> io::Result<Option<VerifiedDirectory>> {
+    let mut directory = None;
+    for component in relative {
+        match directory.as_ref().unwrap_or(base).child_for_read(component) {
+            Ok(child) => directory = Some(child),
+            Err(error) if is_resource_failure(&error) => return Err(error),
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(directory)
+}
+
+pub(crate) fn is_resource_failure(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    return matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS)
+    );
+    #[cfg(windows)]
+    return matches!(error.raw_os_error(), Some(4 | 8 | 14 | 1450));
 }
 
 fn search_file(
@@ -793,6 +831,109 @@ mod tests {
     }
 
     #[test]
+    fn grep_checks_cancellation_during_discovery() {
+        let workspace = crate::workspace_tempdir().unwrap();
+        for index in 0..256 {
+            fs::write(workspace.path().join(format!("{index}.txt")), "miss").unwrap();
+        }
+        let polls = Cell::new(0);
+        let result = execute_or_cancel(
+            &grep_request(r#"{"pattern":"needle"}"#),
+            workspace.path(),
+            4096,
+            || {
+                polls.set(polls.get() + 1);
+                polls.get() >= 32
+            },
+        );
+        assert_eq!(result.status, ToolStatus::Cancelled);
+    }
+
+    #[test]
+    fn grep_skips_an_oversized_ignore_file() {
+        let workspace = crate::workspace_tempdir().unwrap();
+        let mut rules = String::from("notes.txt\n#");
+        rules.push_str(&"x".repeat(1024 * 1024));
+        fs::write(workspace.path().join(".ignore"), rules).unwrap();
+        fs::write(workspace.path().join("notes.txt"), "needle").unwrap();
+        let result = execute(
+            &grep_request(r#"{"pattern":"needle"}"#),
+            workspace.path(),
+            4096,
+        );
+        assert_eq!(result.output.as_deref(), Some("notes.txt:1:needle"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_searches_deep_trees_with_a_low_descriptor_limit() {
+        use std::os::unix::process::CommandExt;
+        const CHILD: &str = "ORCA_TEST_GREP_LOW_DESCRIPTOR_LIMIT";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "grep::tests::grep_searches_deep_trees_with_a_low_descriptor_limit",
+                ])
+                .env(CHILD, "1");
+            unsafe {
+                child.pre_exec(|| {
+                    let mut limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    limit.rlim_cur = 48.min(limit.rlim_max);
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let workspace = crate::workspace_tempdir().unwrap();
+        let leaf = workspace.path().join("level/".repeat(64));
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(leaf.join("notes.txt"), "needle").unwrap();
+        let result = execute(
+            &grep_request(r#"{"pattern":"needle"}"#),
+            workspace.path(),
+            4096,
+        );
+        assert!(
+            result
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("notes.txt:1:needle"),
+            "{result:?}"
+        );
+        let mut descriptors = Vec::new();
+        while let Ok(file) = File::open(leaf.join("notes.txt")) {
+            descriptors.push(file);
+        }
+        assert_eq!(
+            execute(
+                &grep_request(r#"{"pattern":"needle"}"#),
+                workspace.path(),
+                4096
+            )
+            .status,
+            ToolStatus::Failed
+        );
+    }
+
+    #[test]
     fn directory_search_keeps_matches_in_utf8_files_with_a_bom() {
         let workspace = crate::workspace_tempdir().unwrap();
         fs::write(
@@ -940,7 +1081,7 @@ mod tests {
         let excludes = fixture.path().join("global-excludes");
         fs::write(&excludes, "excluded.txt\n").unwrap();
         let request = grep_request(r#"{"pattern":"needle"}"#);
-        let result = execute_search(&request, &cwd, 4096, None, &|| false, || {
+        let result = execute_search(&request, &cwd, 4096, None, &|| false, |_| {
             Some(excludes.clone())
         });
         assert_eq!(
@@ -1022,7 +1163,7 @@ mod tests {
             fs::write(cwd.join(name), "needle\n").unwrap();
         }
         let request = grep_request(r#"{"pattern":"needle"}"#);
-        let result = execute_search(&request, &cwd, 4096, None, &|| false, || None);
+        let result = execute_search(&request, &cwd, 4096, None, &|| false, |_| None);
         let output = result.output.unwrap();
         let mut lines = output.lines().collect::<Vec<_>>();
         lines.sort_unstable();
@@ -1045,7 +1186,7 @@ mod tests {
         }
         let request = grep_request(r#"{"pattern":"needle"}"#);
         let search = || {
-            execute_search(&request, &cwd, 4096, None, &|| false, || None)
+            execute_search(&request, &cwd, 4096, None, &|| false, |_| None)
                 .output
                 .unwrap()
         };

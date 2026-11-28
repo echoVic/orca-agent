@@ -82,7 +82,40 @@ impl VerifiedDirectory {
     }
 
     pub fn read_entries(&self) -> io::Result<Vec<DirectoryEntry>> {
-        self.0.read_entries()
+        let mut entries = Vec::new();
+        self.visit_entries(|entry| {
+            entries.push(entry);
+            Ok(())
+        })?;
+        Ok(entries)
+    }
+
+    pub fn visit_entries(
+        &self,
+        visit: impl FnMut(DirectoryEntry) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.0.visit_entries(visit)
+    }
+
+    /// Walk a read path without keeping its ancestor handles open.
+    pub fn open_for_read(path: &Path) -> io::Result<Self> {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected an absolute directory",
+            ));
+        }
+        platform::open_directory_for_read(path).map(Self)
+    }
+
+    pub fn child_for_read(&self, name: &OsStr) -> io::Result<Self> {
+        validate_name(name)?;
+        self.0.child_for_read(name).map(Self)
+    }
+
+    pub fn entry_is_regular_file(&self, name: &OsStr) -> io::Result<bool> {
+        validate_name(name)?;
+        self.0.entry_is_regular_file(name)
     }
 
     pub fn entry_is_directory(&self, name: &OsStr) -> io::Result<bool> {
@@ -297,6 +330,8 @@ mod platform {
         Ok(directory)
     }
 
+    pub(super) use open_directory as open_directory_for_read;
+
     pub(super) fn file_links(file: &File) -> io::Result<FileLinks> {
         let metadata = file.metadata()?;
         Ok(FileLinks {
@@ -326,9 +361,11 @@ mod platform {
             Ok(unsafe { File::from_raw_fd(fd) })
         }
 
-        pub(super) fn read_entries(&self) -> io::Result<Vec<DirectoryEntry>> {
+        pub(super) fn visit_entries(
+            &self,
+            mut visit: impl FnMut(DirectoryEntry) -> io::Result<()>,
+        ) -> io::Result<()> {
             use rustix::fs::{AtFlags, FileType, statat};
-            let mut entries = Vec::new();
             for entry in rustix::fs::Dir::read_from(&self.0)? {
                 let entry = entry?;
                 let name = entry.file_name().to_bytes();
@@ -338,12 +375,11 @@ mod platform {
                 let file_type = match entry.file_type() {
                     FileType::Unknown => {
                         statat(&self.0, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW)
-                            .map(|stat| FileType::from_raw_mode(stat.st_mode))
-                            .unwrap_or(FileType::Unknown)
+                            .map(|stat| FileType::from_raw_mode(stat.st_mode))?
                     }
                     known => known,
                 };
-                entries.push(DirectoryEntry {
+                visit(DirectoryEntry {
                     name: OsStr::from_bytes(name).to_owned(),
                     kind: match file_type {
                         FileType::Directory => DirectoryEntryKind::Directory,
@@ -351,9 +387,19 @@ mod platform {
                         _ => DirectoryEntryKind::Other,
                     },
                     hidden: name.starts_with(b"."),
-                });
+                })?;
             }
-            Ok(entries)
+            Ok(())
+        }
+
+        pub(super) fn entry_is_regular_file(&self, name: &OsStr) -> io::Result<bool> {
+            use rustix::fs::{AtFlags, FileType, statat};
+            let entry = statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            Ok(FileType::from_raw_mode(entry.st_mode) == FileType::RegularFile)
+        }
+
+        pub(super) fn child_for_read(&self, name: &OsStr) -> io::Result<Self> {
+            self.child(name)
         }
 
         pub(super) fn entry_is_directory(&self, name: &OsStr) -> io::Result<bool> {
@@ -507,6 +553,17 @@ mod platform {
     }
 
     pub(super) fn open_directory(path: &Path) -> io::Result<Directory> {
+        open_directory_components(path, Directory::child)
+    }
+
+    pub(super) fn open_directory_for_read(path: &Path) -> io::Result<Directory> {
+        open_directory_components(path, Directory::child_for_read)
+    }
+
+    fn open_directory_components(
+        path: &Path,
+        child: impl Fn(&Directory, &OsStr) -> io::Result<Directory>,
+    ) -> io::Result<Directory> {
         let mut parts = path.components();
         let (Some(Component::Prefix(prefix)), Some(Component::RootDir)) =
             (parts.next(), parts.next())
@@ -530,7 +587,7 @@ mod platform {
                     "directory path is not normalized",
                 ));
             };
-            directory = directory.child(name)?;
+            directory = child(&directory, name)?;
         }
         Ok(directory)
     }
@@ -550,7 +607,10 @@ mod platform {
         })
     }
 
-    fn read_entry_batch(mut bytes: &[u8], entries: &mut Vec<DirectoryEntry>) -> io::Result<()> {
+    fn read_entry_batch(
+        mut bytes: &[u8],
+        visit: &mut impl FnMut(DirectoryEntry) -> io::Result<()>,
+    ) -> io::Result<()> {
         let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid directory entry");
         let field = |bytes: &[u8], start| -> Option<u32> {
             Some(u32::from_ne_bytes(
@@ -584,12 +644,12 @@ mod platform {
                 } else {
                     DirectoryEntryKind::File
                 };
-                entries.push(DirectoryEntry {
+                visit(DirectoryEntry {
                     hidden: attrs & FILE_ATTRIBUTE_HIDDEN != 0
                         || name.as_encoded_bytes().starts_with(b"."),
                     name,
                     kind,
-                });
+                })?;
             }
             if next == 0 {
                 return Ok(());
@@ -612,10 +672,12 @@ mod platform {
             &self.0.file
         }
 
-        pub(super) fn read_entries(&self) -> io::Result<Vec<DirectoryEntry>> {
+        pub(super) fn visit_entries(
+            &self,
+            mut visit: impl FnMut(DirectoryEntry) -> io::Result<()>,
+        ) -> io::Result<()> {
             // The enumeration cursor belongs to this handle.
             let _guard = self.0.enumeration.lock().unwrap();
-            let mut entries = Vec::new();
             let mut class = FileIdBothDirectoryRestartInfo;
             let mut buffer = [0u64; 2048];
             loop {
@@ -630,7 +692,7 @@ mod platform {
                 if result == 0 {
                     let error = io::Error::last_os_error();
                     if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                        return Ok(entries);
+                        return Ok(());
                     }
                     return Err(error);
                 }
@@ -641,8 +703,30 @@ mod platform {
                         size_of::<[u64; 2048]>(),
                     )
                 };
-                read_entry_batch(bytes, &mut entries)?;
+                read_entry_batch(bytes, &mut visit)?;
             }
+        }
+
+        pub(super) fn entry_is_regular_file(&self, name: &OsStr) -> io::Result<bool> {
+            let file = self.open_child(
+                name,
+                FILE_READ_ATTRIBUTES,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE,
+                SHARE_READ_WRITE,
+            )?;
+            Ok(file.metadata()?.is_file())
+        }
+
+        pub(super) fn child_for_read(&self, name: &OsStr) -> io::Result<Self> {
+            let file = self.open_child(
+                name,
+                DIRECTORY_ACCESS,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE,
+                SHARE_READ_WRITE,
+            )?;
+            Ok(Self::new(file, self.0.path.join(name), None))
         }
 
         pub(super) fn entry_is_directory(&self, name: &OsStr) -> io::Result<bool> {

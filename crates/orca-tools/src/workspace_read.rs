@@ -7,7 +7,7 @@ use orca_platform::fs::{FileAccess, VerifiedDirectory};
 
 /// Open the canonical path selected when the runtime accepted this workspace.
 pub fn open_root(root: &Path) -> io::Result<VerifiedDirectory> {
-    VerifiedDirectory::open(root).map_err(|error| {
+    VerifiedDirectory::open_for_read(root).map_err(|error| {
         if matches!(error.kind(), io::ErrorKind::NotADirectory)
             || cfg!(unix) && error.raw_os_error() == Some(libc::ELOOP)
             || cfg!(windows) && matches!(error.raw_os_error(), Some(681 | 4395))
@@ -72,7 +72,7 @@ pub fn open_relative_file(root: &VerifiedDirectory, path: &Path) -> io::Result<F
             directory
                 .as_ref()
                 .unwrap_or(root)
-                .child(part)
+                .child_for_read(part)
                 .map_err(|error| changed_path(path, error.kind()))?,
         );
     }
@@ -81,6 +81,9 @@ pub fn open_relative_file(root: &VerifiedDirectory, path: &Path) -> io::Result<F
 }
 
 pub(crate) fn open_file_in(directory: &VerifiedDirectory, name: &OsStr) -> io::Result<File> {
+    if !directory.entry_is_regular_file(name)? {
+        return Err(not_regular());
+    }
     let file = directory.open_file(name, FileAccess::Read)?;
     if !file.metadata()?.is_file() {
         return Err(not_regular());
@@ -112,7 +115,7 @@ fn open_below(
         .strip_prefix(root)
         .map_err(|_| io::ErrorKind::PermissionDenied)?;
     for part in relative {
-        directory = directory.child(part)?;
+        directory = directory.child_for_read(part)?;
     }
     Ok(directory)
 }
