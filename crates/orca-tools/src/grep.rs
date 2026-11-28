@@ -926,6 +926,7 @@ mod tests {
         fs::create_dir(common.join("info")).unwrap();
         fs::write(cwd.join(".git"), "gitdir: ../repo/.git/worktrees/linked\n").unwrap();
         fs::write(worktree.join("commondir"), "../..\n").unwrap();
+        fs::write(worktree.join("gitdir"), "../../../../linked/.git\n").unwrap();
         fs::write(common.join("info/exclude"), "excluded.txt\n").unwrap();
         fs::write(cwd.join("excluded.txt"), "needle\n").unwrap();
         fs::write(cwd.join("visible.txt"), "needle\n").unwrap();
@@ -979,6 +980,102 @@ mod tests {
                 "{result:?}"
             );
         }
+    }
+
+    #[test]
+    fn ancestor_ignore_rules_stop_at_the_repository_root() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repo");
+        let parent = repo.join("src");
+        let cwd = parent.join("workspace");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(fixture.path().join(".ignore"), "visible.txt\n").unwrap();
+        fs::write(
+            repo.join(".gitignore"),
+            "\u{feff}/src/workspace/excluded.txt\nrestored.txt\n",
+        )
+        .unwrap();
+        fs::write(
+            parent.join(".ignore"),
+            "more.txt\n!restored.txt\n!.hidden.txt\n",
+        )
+        .unwrap();
+        for name in [
+            "excluded.txt",
+            "more.txt",
+            "restored.txt",
+            "visible.txt",
+            ".hidden.txt",
+        ] {
+            fs::write(cwd.join(name), "needle\n").unwrap();
+        }
+        let request = grep_request(r#"{"pattern":"needle"}"#);
+        let result = execute_in_process_with_global_excludes(
+            &request,
+            &cwd,
+            "needle",
+            &cwd,
+            4096,
+            &|| false,
+            None,
+        );
+        let output = result.output.unwrap();
+        let mut lines = output.lines().collect::<Vec<_>>();
+        lines.sort_unstable();
+        assert_eq!(lines, ["restored.txt:1:needle", "visible.txt:1:needle"]);
+    }
+
+    #[test]
+    fn outside_repository_excludes_require_an_association() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let cwd = root.join("workspace");
+        let common = root.join("repository.git");
+        let worktree = common.join("worktrees/record");
+        fs::create_dir(&cwd).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir(common.join("info")).unwrap();
+        fs::write(common.join("info/exclude"), "excluded.txt\n").unwrap();
+        for name in ["excluded.txt", "visible.txt"] {
+            fs::write(cwd.join(name), "needle\n").unwrap();
+        }
+        let request = grep_request(r#"{"pattern":"needle"}"#);
+        let search = || {
+            execute_in_process_with_global_excludes(
+                &request,
+                &cwd,
+                "needle",
+                &cwd,
+                4096,
+                &|| false,
+                None,
+            )
+            .output
+            .unwrap()
+        };
+        fs::write(
+            cwd.join(".git"),
+            "gitdir: ../repository.git/worktrees/record\n",
+        )
+        .unwrap();
+        fs::write(worktree.join("gitdir"), "../../../elsewhere/.git\n").unwrap();
+        assert!(search().contains("excluded.txt"));
+        fs::write(worktree.join("gitdir"), "../../../workspace/.git\n").unwrap();
+        assert_eq!(search(), "visible.txt:1:needle");
+        fs::write(cwd.join(".git"), "gitdir: ../repository.git\n").unwrap();
+        fs::write(
+            common.join("config"),
+            "[other]\nworktree = ../workspace\n[core]\nworktree = ../elsewhere\n",
+        )
+        .unwrap();
+        assert!(search().contains("excluded.txt"));
+        fs::write(
+            common.join("config"),
+            "[core]\nworktree = \"../workspace\" # location\n",
+        )
+        .unwrap();
+        assert_eq!(search(), "visible.txt:1:needle");
     }
 
     #[test]

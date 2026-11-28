@@ -356,6 +356,11 @@ fn resolve_workspace_path_inner(
     if cwd.is_absolute() {
         normalized = windows_path_in_workspace(cwd, &normalized, target)?;
     }
+    #[cfg(target_os = "macos")]
+    if !allow_missing_parents && !normalized.starts_with(cwd) {
+        normalized = macos_path_in_workspace(cwd, &normalized)
+            .ok_or_else(|| format!("path escapes workspace: {target}"))?;
+    }
     if !normalized.starts_with(cwd) {
         return Err(format!("path escapes workspace: {target}"));
     }
@@ -459,6 +464,33 @@ fn resolve_parent_components(path: &Path) -> std::io::Result<PathBuf> {
     Ok(resolved)
 }
 
+#[cfg(target_os = "macos")]
+fn macos_path_in_workspace(cwd: &Path, path: &Path) -> Option<PathBuf> {
+    use orca_platform::fs::VerifiedDirectory;
+    use unicode_casefold::UnicodeCaseFold;
+    use unicode_normalization::UnicodeNormalization;
+
+    let depth = path
+        .components()
+        .count()
+        .checked_sub(cwd.components().count())?;
+    let prefix = path.ancestors().nth(depth)?;
+    let normalize =
+        |path: &Path| -> Option<String> { Some(path.to_str()?.nfc().case_fold().nfc().collect()) };
+    if normalize(cwd)? != normalize(prefix)? {
+        return None;
+    }
+    let expected = VerifiedDirectory::open(&pin_read_root(cwd).ok()?)
+        .ok()?
+        .identity()
+        .ok()?;
+    let actual = VerifiedDirectory::open(&prefix.canonicalize().ok()?)
+        .ok()?
+        .identity()
+        .ok()?;
+    (expected == actual).then(|| cwd.join(path.strip_prefix(prefix).expect("checked prefix")))
+}
+
 #[cfg(any(test, windows))]
 fn reject_drive_relative(path: &str) -> Result<(), String> {
     let spelling = path.replace('/', "\\");
@@ -552,6 +584,27 @@ mod tests {
             windows_path_identity("C:foo").unwrap_err(),
             "drive-relative paths are not supported: C:foo",
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_read_resolver_accepts_equivalent_root_spellings_by_identity() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let root = base.join("Répo");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("notes.txt"), "inside").unwrap();
+        let mut tested = false;
+        for spelling in ["répo", "Re\u{301}po"] {
+            let alternate = base.join(spelling).join("notes.txt");
+            if alternate.is_file() {
+                tested = true;
+                let resolved = resolve_workspace_read_path(&root, alternate.to_str()).unwrap();
+                assert_eq!(resolved.path, root.join("notes.txt"));
+            }
+        }
+        assert!(tested, "expected a normalization-equivalent path on macOS");
+        assert!(resolve_workspace_read_path(&root, base.join("other/notes.txt").to_str()).is_err());
     }
 
     #[cfg(windows)]
