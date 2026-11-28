@@ -33,7 +33,10 @@ pub mod update_goal;
 pub mod update_plan;
 pub mod web_fetch;
 pub mod web_search;
+mod workspace_read;
 pub mod write_file;
+
+pub use workspace_read::open_workspace_file;
 
 pub use registry::{Tool, ToolContext, ToolRegistry, validate_tool_request};
 
@@ -348,6 +351,61 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_link_after_resolution_is_refused() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap().join("workspace");
+        let folder = root.join("folder");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("file.txt"), "workspace text").unwrap();
+        let replacement = fixture.path().join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        fs::write(replacement.join("file.txt"), "neighbor text").unwrap();
+
+        let path = resolve_workspace_path(&root, Some("folder/file.txt")).unwrap();
+        fs::rename(&folder, root.join("previous")).unwrap();
+        symlink(&replacement, &folder).unwrap();
+
+        assert_eq!(
+            open_workspace_file(&root, &path).unwrap_err().to_string(),
+            format!("path changed while it was opened: {}", path.display())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_outward_link_in_a_parent_is_refused() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap().join("workspace");
+        let neighbor = fixture.path().join("neighbor");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&neighbor).unwrap();
+        fs::write(neighbor.join("file.txt"), "neighbor text").unwrap();
+        let link = root.join("folder");
+        symlink(&neighbor, &link).unwrap();
+
+        let request = ToolRequest {
+            id: "read".into(),
+            name: ToolName::ReadFile,
+            action: ActionKind::Read,
+            target: Some("folder/file.txt".into()),
+            raw_arguments: None,
+        };
+        let result = read_file::execute(&request, &root, 4096);
+        assert_eq!(result.status, ToolStatus::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("escapes workspace")
+        );
+    }
 
     #[test]
     fn micro_compact_preserves_head_and_tail() {

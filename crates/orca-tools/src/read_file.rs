@@ -7,9 +7,7 @@ use serde::Deserialize;
 
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind};
 
-use crate::file_admission::{
-    BoundedTextOutput, FileAdmissionError, open_regular_file, stream_utf8_reader,
-};
+use crate::file_admission::{BoundedTextOutput, FileAdmissionError, stream_utf8_reader};
 use crate::read_document::document_kind;
 use crate::spill::ReadTarget;
 
@@ -63,7 +61,9 @@ pub(crate) fn execute_in_session(
                     .metadata()
                     .map(|metadata| (file, metadata.len()))
                     .map_err(FileAdmissionError::from),
-                None => open_regular_file(&path),
+                None => crate::workspace_read::open_read_file(cwd, &path)
+                    .map(|(file, size, _)| (file, size))
+                    .map_err(FileAdmissionError::from),
             };
             opened.and_then(|(file, size)| read_lines(file, size, &args, max_bytes, &should_cancel))
         }

@@ -17,7 +17,6 @@ use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, ToolService
 use crate::deepseek_web::{
     self, DeepSeekWebAccess, DeepSeekWebError, OcrResult, OcrUpload, OcrUploadError,
 };
-use crate::file_admission::open_regular_file;
 use crate::ocr_disk_cache;
 use crate::read_file::render_lines;
 use crate::resolve_workspace_path;
@@ -98,7 +97,7 @@ pub fn execute_or_cancel(
             None,
         )
     };
-    let (mut file, size) = match open_regular_file(&path) {
+    let (mut file, size, canonical) = match crate::workspace_read::open_read_file(cwd, &path) {
         Ok(opened) => opened,
         Err(error) => return failed(&error),
     };
@@ -120,7 +119,7 @@ pub fn execute_or_cancel(
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     let key = OcrKey {
-        path: path.canonicalize().unwrap_or_else(|_| path.clone()),
+        path: canonical,
         size,
         modified: file
             .metadata()
@@ -469,6 +468,49 @@ mod tests {
             200,
             json!({"object": "ocr.result", "pages": pages}).to_string(),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_workspace_links_still_read() {
+        let cwd = workspace_with("report.pdf", b"%PDF-1.4 linked fixture");
+        fs::write(cwd.path().join("notes.txt"), "linked text\n").unwrap();
+        use std::os::unix::fs::symlink;
+
+        symlink("report.pdf", cwd.path().join("linked.pdf")).unwrap();
+        symlink("notes.txt", cwd.path().join("linked.txt")).unwrap();
+
+        let mut request = read_request("linked", r#"{"path":"linked.txt"}"#);
+        request.name = ToolName::ReadFile;
+        request.action = ActionKind::Read;
+        let result = crate::read_file::execute(&request, cwd.path(), 4096);
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        assert!(result.output.unwrap().contains("linked text"));
+
+        let fixture = crate::test_http::serve(vec![ocr_reply(json!([
+            {"index": 0, "text": "linked document", "finish_reason": "stop"},
+        ]))]);
+        let access = DeepSeekWebAccess::for_test(&fixture.origin, "sk-test");
+        let result = execute_or_cancel(
+            &read_request("linked", r#"{"path":"linked.pdf"}"#),
+            cwd.path(),
+            4096,
+            Some(&access),
+            || false,
+        );
+        assert_eq!(result.status, ToolStatus::Completed, "{:?}", result.error);
+        assert!(result.output.unwrap().contains("linked document"));
+
+        request.name = ToolName::Grep;
+        let result = crate::grep::execute_in_process(
+            &request,
+            cwd.path(),
+            "linked text",
+            &cwd.path().join("linked.txt"),
+            4096,
+            &|| false,
+        );
+        assert_eq!(result.output.as_deref(), Some("linked.txt:1:linked text"));
     }
 
     #[test]

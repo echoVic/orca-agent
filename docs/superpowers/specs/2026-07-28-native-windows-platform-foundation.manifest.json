@@ -519,7 +519,7 @@
       "tools-test-unix-fixture",
       "crates/orca-tools/src/lib.rs",
       "unix_std_api",
-      1,
+      2,
       "windows-test-portability"
     ],
     [
@@ -527,6 +527,13 @@
       "crates/orca-tools/src/registry.rs",
       "unix_std_api",
       3,
+      "windows-test-portability"
+    ],
+    [
+      "tools-read-document-test-unix-fixture",
+      "crates/orca-tools/src/read_document.rs",
+      "unix_std_api",
+      1,
       "windows-test-portability"
     ],
     [

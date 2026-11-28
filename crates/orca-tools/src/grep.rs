@@ -217,7 +217,7 @@ fn rg_args(pattern: &str, search_path: &Path) -> Vec<OsString> {
     ]
 }
 
-fn execute_in_process(
+pub(crate) fn execute_in_process(
     request: &ToolRequest,
     cwd: &Path,
     pattern: &str,
@@ -233,6 +233,12 @@ fn execute_in_process(
     let offset = parse_args(request).offset.unwrap_or(0);
     let limit = normalized_head_limit(parse_args(request).head_limit);
     let mut collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
+    let root = match cwd.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            return ToolResult::failed(request, format!("cannot resolve cwd: {error}"), None);
+        }
+    };
     let mut walker = WalkBuilder::new(search_path);
     walker
         .hidden(true)
@@ -256,7 +262,10 @@ fn execute_in_process(
         }
 
         let path = entry.path();
-        let Ok(file) = File::open(path) else {
+        let Ok(canonical) = crate::workspace_read::canonical_read_path(&root, path) else {
+            continue;
+        };
+        let Ok(file) = crate::open_workspace_file(&root, &canonical) else {
             continue;
         };
         if !search_file(
