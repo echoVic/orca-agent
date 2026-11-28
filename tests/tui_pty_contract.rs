@@ -725,12 +725,17 @@ fn tui_esc_closes_agents_before_returning_from_the_running_child() {
         user_lines_showing(frame, "mock_stream_release_marker") == 1
             && user_lines_showing(frame, "subagent async_then_sync") == 0
     };
-    wait_for_screen(
+    let child = wait_for_screen(
         &process,
         &mut output,
-        |frame| child_text(frame) && frame.contains("Main is running · Esc return"),
+        |frame| {
+            child_text(frame)
+                && frame.contains("Main is running · Esc return")
+                && frame.contains("Running ")
+        },
         "did not visit the sync child's own conversation",
     );
+    assert!(!child.contains("Esc interrupt"), "{child}");
     process.write(b"/agents\r").unwrap();
     let sibling_selected = |frame: &str| {
         frame.lines().any(|line| {

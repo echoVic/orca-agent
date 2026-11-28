@@ -5678,14 +5678,17 @@ fn foreground_activity_line(state: &AppState, theme: &Theme) -> Option<Line<'sta
                 format_elapsed_compact(persisted_goal_elapsed.saturating_add(live_elapsed));
             let detail =
                 current_tool_label(state).unwrap_or_else(|| stream_phase_label(state).to_string());
-            Some(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!(" {spinner} Running {elapsed}"),
                     Style::default().fg(theme.warning),
                 ),
                 Span::styled(format!(" · {detail}"), theme.muted_style()),
-                Span::styled(" · Esc interrupt".to_string(), theme.dim_style()),
-            ]))
+            ];
+            if state.conversation_target().task_id().is_none() {
+                spans.push(Span::styled(" · Esc interrupt", theme.dim_style()));
+            }
+            Some(Line::from(spans))
         }
         AppStatus::Compacting => Some(Line::from(Span::styled(
             format!(" {spinner} Compacting context…"),
@@ -13729,6 +13732,58 @@ mod tests {
             text,
             " ⠋ Running 12s · bash cargo test -p orca-tui · Esc interrupt"
         );
+    }
+
+    #[test]
+    fn running_child_activity_line_after_live_turn_start_does_not_offer_interrupt() {
+        let mut state = test_state();
+        state.update(crate::protocol::TuiEvent::ChildFocusChanged {
+            task_id: Some("child".into()),
+        });
+        state.update(crate::protocol::TuiEvent::SideParentStatusChanged(
+            crate::types::SideParentStatus::Running,
+        ));
+        state.update(crate::protocol::TuiEvent::TurnStarted {
+            turn: 1,
+            task: None,
+            started_at_ms: None,
+        });
+        assert_running_child_escape_hints(&state);
+    }
+
+    #[test]
+    fn running_child_activity_line_after_projection_rebuild_does_not_offer_interrupt() {
+        use crate::protocol::TuiEvent;
+        use crate::surface_projection::{SurfaceProjectionState, TuiSurfaceProjection};
+
+        crate::hosted_child::tests::with_streaming_main(|_, snapshot| {
+            let mut state = test_state();
+            let projection = SurfaceProjectionState::from_surface_snapshot(&snapshot);
+            assert!(projection.foreground_operation_id.is_some());
+            state.update(TuiEvent::ChildProjectionReset {
+                task_id: "child".into(),
+                main_status: Some(crate::types::SideParentStatus::Running),
+                projection: Box::new(projection),
+            });
+            for event in TuiSurfaceProjection::for_conversation(&snapshot, None)
+                .hydrate_open_streams()
+            {
+                state.update(event);
+            }
+            assert_running_child_escape_hints(&state);
+        });
+    }
+
+    fn assert_running_child_escape_hints(state: &AppState) {
+        let theme = Theme::named(ThemeName::Dark);
+        assert_eq!(state.conversation_target().task_id(), Some("child"));
+        assert_eq!(state.status, AppStatus::Running);
+        assert_eq!(
+            main_behind_child_line(state, &theme).unwrap().to_string(),
+            " ● Main is running · Esc return"
+        );
+        let row = activity_line(state, &theme).expect("running child activity row");
+        assert!(row.contains("Running ") && !row.contains("Esc"), "{row}");
     }
 
     #[test]
