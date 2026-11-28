@@ -137,7 +137,11 @@ fn resolve_workflow_script_with_dirs_to_path(
     } else {
         None
     };
-    let user = if workspace.is_some() || input.name.is_some() {
+    let uses_user_directory = input
+        .script_path
+        .as_deref()
+        .is_some_and(|script_path| resolve_path(cwd, script_path).starts_with(user_workflow_dir));
+    let user = if workspace.is_some() || input.name.is_some() || uses_user_directory {
         match orca_tools::pin_read_root(user_workflow_dir) {
             Ok(root) => Some(root),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -1315,7 +1319,23 @@ mod tests {
                 super::ScriptPathAccess::Model,
             )
         };
-        assert_eq!(prepare().unwrap().script, FILE_WORKFLOW);
+        let direct = super::WorkflowInput {
+            script_path: Some(user.join("file.js").display().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::resolve_workflow_script_with_dirs_to_path(
+                &direct,
+                &cwd,
+                &user,
+                None,
+                &cwd.join("persisted.js"),
+                super::ScriptPathAccess::User,
+            )
+            .unwrap()
+            .script,
+            FILE_WORKFLOW,
+        );
         std::fs::rename(&user, base.join("previous")).unwrap();
         symlink(&neighbor, &user).unwrap();
         assert_eq!(
