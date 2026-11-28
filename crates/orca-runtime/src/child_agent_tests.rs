@@ -2562,6 +2562,20 @@ fn a_fork_recovered_from_the_queue_still_inherits() {
 }
 
 #[test]
+fn a_recovered_fork_with_a_missing_prefix_file_says_why_it_started_fresh() {
+    let (_, child) = recorded_hosted_fork(true, true, None);
+    let child = std::str::from_utf8(&child).unwrap();
+    assert!(child.contains("Fork context unavailable:"), "{child}");
+    assert!(
+        child.contains("referenced fork prefix is missing"),
+        "{child}"
+    );
+    assert!(child.contains("Starting fresh."), "{child}");
+    assert!(child.contains("Report the relevant evidence."), "{child}");
+    assert!(!child.contains("Earlier parent evidence."));
+}
+
+#[test]
 fn a_hosted_fork_without_a_usable_prefix_says_why_it_started_fresh() {
     let (_, child) = recorded_hosted_fork(false, true, None);
     let child = std::str::from_utf8(&child).unwrap();
@@ -2905,6 +2919,7 @@ fn recorded_hosted_fork(
         let registry = TaskRegistry::new_persistent(session.into(), tasks).unwrap();
         let queued = registry.queued_subagent_launches(None).unwrap();
         assert_eq!(queued.len(), 1);
+        assert!(queued[0].1.request.fork_prefix_ref.is_some());
         assert!(queued[0].1.request.captured_fork_prefix.is_none());
         assert_eq!(
             recover_queued_subagent_launches(

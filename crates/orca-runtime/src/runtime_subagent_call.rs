@@ -1690,7 +1690,7 @@ fn threaded_sync_surface_activity(
 /// a checkpoint (the hosted path refuses `resume_from`), and has no finite
 /// budget (a budgeted child is run without the controller).
 ///
-/// This rule must stay at least as strict as `runs_through_the_controller`,
+/// This rule must stay at least as strict as `request_for_controller`,
 /// the test by which a worker runs a child on a thread: every child it lets
 /// through must be one that test also runs on a thread, or a child placed
 /// here for a thread of its own would run without one.
@@ -1711,11 +1711,9 @@ fn has_accepted_fork(request: &SubagentRequest) -> bool {
     request.captured_fork_prefix.is_some() || request.fork_prefix_ref.is_some()
 }
 
-/// Whether a worker runs `invocation` through the agent controller, on a
-/// hosted thread, rather than within the call that started it: there is a
-/// controller to host it, and the child has no isolation, is not a custom
-/// agent, does not continue a custom agent, and does not inherit a fork prefix.
-fn runs_through_the_controller(invocation: &RuntimeSubagentInvocation) -> bool {
+/// The request to run on a hosted thread, including the fresh-start note
+/// when a fork cannot inherit its saved history.
+fn request_for_controller(invocation: &RuntimeSubagentInvocation) -> Option<SubagentRequest> {
     let resumes_custom = invocation
         .request
         .resume_from
@@ -1726,38 +1724,46 @@ fn runs_through_the_controller(invocation: &RuntimeSubagentInvocation) -> bool {
                 .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
         });
     let mut request = invocation.request.clone();
-    if !has_usable_fork_prefix(invocation) {
-        request.captured_fork_prefix = None;
-        request.fork_prefix_ref = None;
-    }
-    request_runs_through_the_controller(
+    let fallback = if request.context == RoleContextPolicy::Fork {
+        match validate_saved_fork_prefix(invocation) {
+            Ok(()) => return None,
+            Err(reason) => Some(reason),
+        }
+    } else {
+        None
+    };
+    request.captured_fork_prefix = None;
+    request.fork_prefix_ref = None;
+    if !request_runs_through_the_controller(
         &request,
         invocation.agent_controller.is_some(),
         resumes_custom,
-    )
+    ) {
+        return None;
+    }
+    if let Some(reason) = fallback {
+        request.prompt = crate::subagent::fresh_fork_prompt(&request.prompt, &reason);
+        request.context = RoleContextPolicy::Fresh;
+    }
+    Some(request)
 }
 
-fn has_usable_fork_prefix(invocation: &RuntimeSubagentInvocation) -> bool {
-    if invocation.request.context != RoleContextPolicy::Fork {
-        return false;
-    }
-    let prefix = invocation.request.captured_fork_prefix.clone().or_else(|| {
-        invocation
-            .request
-            .fork_prefix_ref
-            .as_ref()
-            .and_then(|reference| {
-                invocation
-                    .task_registry
-                    .continuation_store()
-                    .ok()?
-                    .load_fork_prefix(*reference)
-                    .ok()
-            })
-    });
-    prefix.is_some_and(|prefix| {
-        crate::subagent::validate_fork_prefix(&invocation.config, &prefix).is_ok()
-    })
+fn validate_saved_fork_prefix(invocation: &RuntimeSubagentInvocation) -> Result<(), String> {
+    let prefix = match &invocation.request.captured_fork_prefix {
+        Some(prefix) => Arc::clone(prefix),
+        None => {
+            let reference = invocation
+                .request
+                .fork_prefix_ref
+                .ok_or_else(|| "no parent history was saved for this child".to_string())?;
+            invocation
+                .task_registry
+                .continuation_store()?
+                .load_fork_prefix(reference)
+                .map_err(|error| error.to_string())?
+        }
+    };
+    crate::subagent::validate_fork_prefix(&invocation.config, &prefix)
 }
 
 fn request_runs_through_the_controller(
@@ -1784,16 +1790,17 @@ fn request_runs_through_the_controller(
 fn gets_a_thread_of_its_own(invocation: &RuntimeSubagentInvocation) -> bool {
     invocation.request.resume_from.is_none()
         && invocation.activity_ingress.is_some()
-        && runs_through_the_controller(invocation)
+        && request_for_controller(invocation).is_some()
 }
 
 fn run_subagent_worker(
-    invocation: RuntimeSubagentInvocation,
+    mut invocation: RuntimeSubagentInvocation,
     lifecycle: RuntimeSessionLifecycle,
     started_task: RuntimeTaskLifecycle,
     cancel: CancelToken,
 ) -> RuntimeSubagentCallOutput {
-    if runs_through_the_controller(&invocation) {
+    if let Some(request) = request_for_controller(&invocation) {
+        invocation.request = request;
         return run_threaded_agent_worker(invocation, lifecycle, started_task, cancel);
     }
     let RuntimeSubagentInvocation {
