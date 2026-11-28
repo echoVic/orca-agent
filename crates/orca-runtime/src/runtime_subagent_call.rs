@@ -774,6 +774,9 @@ impl RuntimeSubagentBatch {
         let panic_task = started_task.clone();
         let hosted = invocation.agent_controller.is_some();
         let threaded = gets_a_thread_of_its_own(&invocation);
+        if invocation.request.resume_from.is_some() {
+            invocation.agent_controller = None;
+        }
         let threaded_cancel = threaded.then(CancelToken::new);
         let (worker_cancel, parent_watcher_stop) = if hosted {
             // The threaded route attaches the task token after marking it running.
@@ -1726,11 +1729,24 @@ fn runs_through_the_controller(invocation: &RuntimeSubagentInvocation) -> bool {
                 .and_then(|coordinator| coordinator.prepared(selector))
                 .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
         });
-    invocation.agent_controller.is_some()
-        && invocation.request.isolation == SubagentIsolation::None
-        && !matches!(invocation.request.subagent_type, SubagentType::Custom(_))
+    request_runs_through_the_controller(
+        &invocation.request,
+        invocation.agent_controller.is_some(),
+        resumes_custom,
+    )
+}
+
+fn request_runs_through_the_controller(
+    request: &SubagentRequest,
+    has_controller: bool,
+    resumes_custom: bool,
+) -> bool {
+    has_controller
+        && request.isolation == SubagentIsolation::None
+        && !matches!(request.subagent_type, SubagentType::Custom(_))
+        && request.resume_from.is_none()
         && !resumes_custom
-        && !has_accepted_fork(&invocation.request)
+        && !has_accepted_fork(request)
 }
 
 /// Whether the worker that runs `invocation` gives the child's turn a
@@ -3482,6 +3498,20 @@ mod tests {
             );
         }
         assert!(!child_qualifies_for_thread(&plain_request(), false, true));
+    }
+
+    #[test]
+    fn an_immediate_resume_and_a_queued_resume_take_the_same_route() {
+        let request = SubagentRequest {
+            resume_from: Some("checkpoint".to_string()),
+            ..plain_request()
+        };
+
+        let immediate_route = request_runs_through_the_controller(&request, true, false);
+        let queued_route = request_runs_through_the_controller(&request, false, false);
+
+        assert_eq!(immediate_route, queued_route);
+        assert!(!immediate_route);
     }
 
     #[test]
