@@ -435,8 +435,15 @@
       "workflow-host-unix-process-api",
       "crates/orca-runtime/src/workflow/host.rs",
       "unix_std_api",
-      6,
+      7,
       "process-ownership-plan"
+    ],
+    [
+      "workflow-resume-test-linked-files",
+      "crates/orca-runtime/src/workflow/runner.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
     ],
     [
       "workflow-host-test-fifo-flags",

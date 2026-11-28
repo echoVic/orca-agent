@@ -1232,7 +1232,7 @@ fn missing_meta_field(field: &str) -> io::Error {
     )
 }
 
-fn sha256_hex(input: &[u8]) -> String {
+pub(super) fn sha256_hex(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input);
     orca_core::hex::lower(&hasher.finalize())

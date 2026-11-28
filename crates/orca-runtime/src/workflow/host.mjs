@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 
 const scriptPath = process.argv[2];
@@ -1151,14 +1150,15 @@ function isIdentifierPart(char) {
   return isIdentifierStart(char) || (char >= "0" && char <= "9");
 }
 
-try {
-  const script = await readFile(scriptPath);
-  if (scriptDigest && createHash("sha256").update(script).digest("hex") !== scriptDigest) {
-    throw new Error("workflow script changed after preparation");
+export function run(script) {
+  try {
+    if (scriptDigest && createHash("sha256").update(script).digest("hex") !== scriptDigest) {
+      throw new Error("workflow script changed after preparation");
+    }
+    startWorkflow(script.toString("utf8"));
+  } catch (error) {
+    HOST_OPERATIONS.failed({ error: error?.stack ?? String(error) });
   }
-  startWorkflow(script.toString("utf8"));
-} catch (error) {
-  workflowTerminal = true;
-  emit({ type: "workflow_failed", error: error?.stack ?? String(error) });
-  process.exitCode = 1;
 }
+
+//# sourceURL=orca-workflow-host.mjs

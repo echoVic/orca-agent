@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -62,7 +62,7 @@ use super::host::{AgentCall, HostCommand, HostEvent, WorkflowHost, WorkflowHostI
 use super::ipc::WorkflowIpcContext;
 use super::script::{
     ResolvedWorkflowScript, ScriptPathAccess, resolve_workflow_script_for_launch,
-    single_workflow_component, validate_workflow_args,
+    validate_workflow_args,
 };
 use super::state::{
     WorkflowAgentRecord, WorkflowAgentStatusCounts, WorkflowStateStore, WorkflowWorkerRecord,
@@ -814,6 +814,24 @@ impl WorkflowRunner {
         }
     }
 
+    pub(crate) fn for_session(
+        config: RunConfig,
+        tasks: TaskRegistry,
+        cwd: &Path,
+    ) -> io::Result<Self> {
+        let workspace = config
+            .tools
+            .workspace_read_root
+            .clone()
+            .map_or_else(|| cwd.canonicalize(), Ok)?;
+        let session_dir = tasks.workflow_session_dir(&workspace)?;
+        let mut config = config;
+        config.tools.workspace_read_root = Some(workspace.clone());
+        let mut runner = Self::new(config, tasks.clone(), session_dir);
+        runner.state = runner.state.with_session(tasks, workspace);
+        Ok(runner)
+    }
+
     pub(crate) fn with_parent_budget(
         mut self,
         reservation: Option<crate::child_budget_ledger::ChildBudgetReservation>,
@@ -1205,15 +1223,6 @@ impl WorkflowRunner {
                 .map_or_else(std::env::current_dir, Ok)?
                 .canonicalize()?,
         };
-        if matches!(access, ScriptPathAccess::Model)
-            && let Some(run_id) = request.input.resume_from_run_id.as_deref()
-            && !single_workflow_component(run_id)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "resumeFromRunId must be a workflow run ID",
-            ));
-        }
         let draft_session;
         let access = if let Some(draft) = request.input.draft_id.as_deref() {
             super::draft::validate_draft_id(draft)?;
@@ -1226,14 +1235,22 @@ impl WorkflowRunner {
             access
         };
 
-        if request.input.token_budget.is_none()
-            && let Some(resume_from_run_id) = request.input.resume_from_run_id.as_deref()
-        {
-            request.input.token_budget = self
-                .state
-                .load_launch_input(resume_from_run_id)
-                .ok()
-                .and_then(|input| input.token_budget);
+        if let Some(source) = request.input.resume_from_run_id.as_deref() {
+            let launch = match self.state.load_launch_input(source) {
+                Ok(input) => Some(input),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            if request.input.token_budget.is_none() {
+                request.input.token_budget = launch.and_then(|input| input.token_budget);
+            }
+            for name in ["task-lists.json", "agent-cache.json"] {
+                match self.state.open_artifact(source, name) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
         }
         if request.input.token_budget == Some(0) {
             return Err(io::Error::new(
@@ -1359,7 +1376,17 @@ impl WorkflowRunner {
         let resume_from = request.input.resume_from_run_id.clone();
         let restart_phase = request.input.restart_phase.clone();
         if let Some(source) = &resume_from {
-            WorkflowIpcContext::reconcile_dead_claims(&self.state.task_lists_path(source))?;
+            match self.state.open_artifact(source, "task-lists.json") {
+                Ok(file) => {
+                    drop(file);
+                    WorkflowIpcContext::reconcile_verified_claims(
+                        &self.state.task_lists_path(source),
+                        || self.state.open_artifact(source, "task-lists.json"),
+                    )?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
         let cached_agents = Arc::new(AtomicU32::new(0));
         let mut failed_error = None;
@@ -1400,7 +1427,11 @@ impl WorkflowRunner {
         let mut phase_agent_baselines = std::collections::HashMap::new();
         let mut agent_events_seen = 0u32;
         match WorkflowHost::run_with_agent_event_control_and_ipc_paths(
-            (&resolved.persisted_path, &resolved.script_digest),
+            (
+                &resolved.persisted_path,
+                &resolved.script,
+                &resolved.script_digest,
+            ),
             args,
             (&ipc_paths, &workflow_ipc),
             workflow_limits.max_concurrent_agents,
@@ -4492,6 +4523,39 @@ mod tests {
                 wall_time_ms: 0,
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_resume_refuses_linked_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let mut config = test_run_config();
+        config.cwd = Some(cwd.clone());
+        let tasks = TaskRegistry::new("workflow-resume-files".into());
+        let runner = WorkflowRunner::for_session(config, tasks, &cwd).unwrap();
+        let request = WorkflowLaunchRequest::from(WorkflowInput {
+            script: Some("export const meta = { name: 'fixture', description: 'Fixture', phases: [] }; export default 'done';".into()),
+            ..Default::default()
+        });
+        let source = runner.prepare_background(request.clone()).unwrap();
+        for (name, value) in [
+            ("launch-input.json", "{\"tokenBudget\":321}"),
+            ("task-lists.json", "{}"),
+            ("agent-cache.json", "{}"),
+        ] {
+            let path = runner.state.run_dir(&source.run_id).join(name);
+            let outside = cwd.join(name);
+            fs::write(&outside, value).unwrap();
+            if path.exists() {
+                fs::remove_file(&path).unwrap();
+            }
+            std::os::unix::fs::symlink(outside, &path).unwrap();
+            let result = runner
+                .prepare_model_background(request.clone().with_resume_from(source.run_id.clone()));
+            assert!(result.is_err(), "resumed with linked {name}");
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

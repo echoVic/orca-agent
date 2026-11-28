@@ -302,8 +302,7 @@ pub(crate) fn execute_workflow_tool(
     }
 
     let input = parse_workflow_input(tool_request)?;
-    let session_dir = task_registry.workflow_session_dir(cwd)?;
-    let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir)
+    let runner = WorkflowRunner::for_session(config.clone(), task_registry.clone(), cwd)?
         .with_child_executor(child_executor)
         .with_parent_budget(parent_budget);
     let prepared = runner.prepare_model_background(WorkflowLaunchRequest::from(input))?;
@@ -453,9 +452,10 @@ pub(crate) fn execute_workflow_draft_action_tool(
 
     let output = match input.action.as_str() {
         "run" => {
-            let runner = WorkflowRunner::new(config.clone(), task_registry.clone(), session_dir)
-                .with_child_executor(child_executor)
-                .with_parent_budget(parent_budget);
+            let runner =
+                WorkflowRunner::for_session(config.clone(), task_registry.clone(), &workspace)?
+                    .with_child_executor(child_executor)
+                    .with_parent_budget(parent_budget);
             let prepared =
                 runner.prepare_model_background(WorkflowLaunchRequest::from(WorkflowInput {
                     draft_id: Some(input.draft_id.clone()),
@@ -1342,7 +1342,7 @@ export const meta = {
         ] {
             let stored = temp.path().join(path.file_name().unwrap());
             std::fs::rename(&path, &stored).unwrap();
-            std::os::unix::fs::symlink(&stored, &path).unwrap();
+            link_draft_fixture(&stored, &path);
             let error = run(&draft.draft_id).unwrap_err();
             assert!(
                 error
@@ -1365,6 +1365,11 @@ export const meta = {
     #[test]
     fn process_local_workflow_draft_action_reads_from_its_owned_session() {
         check_draft_action_with_replaced_session(true);
+    }
+
+    #[cfg(unix)]
+    fn link_draft_fixture(source: &std::path::Path, path: &std::path::Path) {
+        std::os::unix::fs::symlink(source, path).unwrap();
     }
 
     #[cfg(unix)]
@@ -1396,7 +1401,7 @@ export const meta = {
         WorkflowDraftStore::new(neighbor.join("workflow-drafts"))
             .write(&outside)
             .unwrap();
-        std::os::unix::fs::symlink(&neighbor, &session).unwrap();
+        link_draft_fixture(&neighbor, &session);
         let request = tool_request(
             "save",
             ToolName::WorkflowDraftAction,
@@ -1430,7 +1435,7 @@ export const meta = {
     }
 
     #[test]
-    fn workflow_draft_action_refuses_a_script_changed_before_host_start() {
+    fn workflow_draft_action_runs_the_prepared_script_after_the_file_changes() {
         let _guard = crate::history::lock_test_env();
         if !WorkflowHost::node_available() {
             return;
@@ -1484,10 +1489,7 @@ export const meta = {
             Some(&ingress),
         );
         let emitted = String::from_utf8(sink.writer_mut().get_ref().clone()).unwrap();
-        assert!(
-            emitted.contains("workflow script changed after preparation"),
-            "{emitted}"
-        );
+        assert!(emitted.contains("startup boom"), "{emitted}");
         assert!(!emitted.contains("replacement ran"), "{emitted}");
     }
 

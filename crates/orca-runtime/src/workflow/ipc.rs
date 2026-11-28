@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -113,8 +113,20 @@ impl WorkflowIpcContext {
         }
     }
 
-    pub(crate) fn cached_agent_can_be_reused(path: &Path, call_path: &str) -> bool {
-        match read_task_list_state(path) {
+    pub(crate) fn reconcile_verified_claims(
+        path: &Path,
+        open: impl FnOnce() -> io::Result<fs::File>,
+    ) -> io::Result<()> {
+        let read = || read_verified_task_list_state(open()?);
+        match WorkflowTaskLists::durable_with(path.to_owned(), read) {
+            Ok(store) => store.release_claims(None).map_err(io::Error::other),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn cached_agent_can_be_reused(file: io::Result<fs::File>, call_path: &str) -> bool {
+        match file.and_then(read_verified_task_list_state) {
             Ok(state) => state
                 .mutating_calls
                 .is_some_and(|calls| !calls.contains(call_path)),
@@ -407,6 +419,14 @@ impl Default for WorkflowTaskLists {
 
 impl WorkflowTaskLists {
     fn durable(path: PathBuf) -> io::Result<Self> {
+        let read_path = path.clone();
+        Self::durable_with(path, || read_task_list_state(&read_path))
+    }
+
+    fn durable_with(
+        path: PathBuf,
+        read: impl FnOnce() -> io::Result<WorkflowTaskListState>,
+    ) -> io::Result<Self> {
         let mut lock_path = path.as_os_str().to_owned();
         lock_path.push(".lock");
         let owner = ExclusiveFileLock::try_acquire(Path::new(&lock_path)).map_err(|error| {
@@ -418,7 +438,7 @@ impl WorkflowTaskLists {
             io::Error::new(kind, error)
         })?;
         let mut store = Self::default();
-        match read_task_list_state(&path) {
+        match read() {
             Ok(state) => store.state = Mutex::new(state),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -584,6 +604,11 @@ impl WorkflowTaskLists {
             )
         })
     }
+}
+
+fn read_verified_task_list_state(file: fs::File) -> io::Result<WorkflowTaskListState> {
+    serde_json::from_reader(BufReader::new(file))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn read_task_list_state(path: &Path) -> io::Result<WorkflowTaskListState> {

@@ -7723,12 +7723,12 @@ fn reconcile_durable_workflow_outcomes_on_start(
             message: "workflow recovery requires a working directory".to_string(),
         })?;
     let task_registry = thread.session().task_registry().clone();
-    let session_dir = task_registry.workflow_session_dir(&cwd).map_err(|error| {
-        RuntimeHostError::ThreadStartFailed {
-            message: format!("failed to resolve workflow runtime storage: {error}"),
-        }
-    })?;
-    let runner = WorkflowRunner::new(config.clone(), task_registry, session_dir);
+    let runner =
+        WorkflowRunner::for_session(config.clone(), task_registry, &cwd).map_err(|error| {
+            RuntimeHostError::ThreadStartFailed {
+                message: format!("failed to resolve workflow runtime storage: {error}"),
+            }
+        })?;
     loop {
         let snapshot = coordinator.state().snapshot().clone();
         let mut durable_outcome = None;
