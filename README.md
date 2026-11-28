@@ -122,7 +122,7 @@ Full Access on resume. Headless `exec` and shared daemons default to `auto-edit`
 - **Steer a running turn.** `Esc` interrupts. `Enter` queues a follow-up for
   the next turn, `Ctrl+Enter` sends it into the running turn (in terminals
   with the kitty keyboard protocol), and `Ctrl+B` moves the turn to the
-  background.
+  background unless it has subagents running inside the TUI.
 - **Approve tool calls.** A call that needs approval turns the input into an
   approval panel: allow once, allow this exact call, allow the tool for the
   session, or deny. `Esc` denies; once a computer call has run in the turn, it
@@ -138,11 +138,11 @@ Full Access on resume. Headless `exec` and shared daemons default to `auto-edit`
   they do not change the default mode in your config.
 - **Background work.** `/tasks` shows the tasks dock under the conversation,
   where background turns, subagents, commands, monitors, and workflow children
-  appear. `/agents` opens the Agent Workspace with each task's live
-  conversation or transcript and the controls it can safely take: stop,
-  resume, retry, or a follow-up. When background agents finish while you are
-  idle, Orca continues with their results. `/workflows` keeps the workflow run
-  tree.
+  appear. In `/agents`, press `Enter` to read an in-process subagent's live or
+  finished conversation, or `s` to stop it while it runs. Other tasks offer
+  a transcript and controls such as resume or retry when available. Orca
+  can continue with background subagent results while you are idle.
+  `/workflows` keeps the workflow run tree.
 - **MCP servers.** The servers in your config connect in the background as
   soon as the TUI opens. `/mcp` shows how each stands, with its tools and
   prompts, and reconnects, logs in, or logs out; each MCP prompt runs as a
@@ -227,9 +227,8 @@ recall, storage, privacy, and deletion.
   accepted overflow queues without creating a worker, and parents waiting for
   children yield their lease before re-entering the fair queue.
 - Keeps up to four active child summaries visible in the conversation and up to
-  eight durable activity entries per child. `/agents` opens live conversations
-  and transcripts and exposes only controls the selected child can safely
-  perform: stop, resume, retry, or a revision-fenced follow-up.
+  eight durable activity entries per child. `/agents` opens live and read-only
+  subagent conversations and offers follow-up controls where supported.
 - Learns a bounded set of durable project facts after successfully committed
   turns and retrieves only prompt-relevant facts on later turns.
 - Runs with no implicit turn ceiling; optional `[budget]` limits

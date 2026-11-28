@@ -78,6 +78,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.27":
+        "Open a running subagent from the terminal dock or /agents and press Esc to return to the main conversation. Finished conversations are read-only and can be reopened after a resume. Press s in /agents to stop one in-process subagent without stopping the others. These agents cannot ask for approval and end when the terminal UI quits. Servers sharing one Orca home no longer mark each other's running commands as interrupted. command/exec reports finish errors to its original caller, and command/exec/list settles exits it observes.",
       "v0.5.26":
         "Deep compaction replays the cached DeepSeek prefix to write a structured checkpoint. Resumed sessions keep their recorded prompt and append notices for changed instructions. A subagent started with context: \"fork\" can use the parent's completed conversation. Orca saves large tool results for read_file and grep, discovers nested AGENTS.md files, and gives the model a skills catalog. Set tool_loading = \"on-demand\" on an MCP server to load tools as needed, or enable apply_patch under [tools] for multi-file patches. A steer reaches a parent waiting for children, concurrent workflow task-list updates are preserved, repeated calls get a reminder, and eligible network reads run in parallel.",
       "v0.5.25":
@@ -726,6 +728,8 @@ const copy = {
       ],
     },
     summaries: {
+      "v0.5.27":
+        "从终端任务栏或 /agents 打开正在运行的子代理对话，按 Esc 返回主对话。已结束的对话是只读的，恢复会话后也能打开。在 /agents 中按 s 可以单独停止在界面进程内运行的子代理，不影响其他子代理。这些子代理不会发出审批请求，退出终端界面时也会停止。共用同一个 Orca 数据目录的服务端不再把彼此正在运行的命令标为中断。command/exec 会把收尾错误发回原请求，command/exec/list 发现命令已退出时会完成收尾。",
       "v0.5.26":
         "深度压缩会回放 DeepSeek 已缓存的对话前缀，生成结构化检查点。恢复会话时沿用原来的提示词，指令有变化才追加说明。子代理可用 context: \"fork\" 继承父代理已完成的对话。大段工具输出存成文件，可以继续用 read_file 分段读取或用 grep 搜索。Orca 会发现子目录的 AGENTS.md，并把 skill 目录发给模型。MCP 服务器可设 tool_loading = \"on-demand\" 按需加载工具，也可在 [tools] 中开启 apply_patch 一次修改多个文件。父代理等待子任务时也能收到你的消息。工作流任务清单会保留每次并发更新。连续重复的工具调用会收到提醒，审批策略已允许的一批网络读取可以并行执行。",
       "v0.5.25":

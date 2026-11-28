@@ -4,9 +4,16 @@ export const localeStorageKey = "orca-site-locale";
 export const canonicalOrigin = "https://orcaagent.dev";
 export const socialImageUrl = `${canonicalOrigin}/orca-social.png`;
 
-export const releaseVersion = "v0.5.26";
+export const releaseVersion = "v0.5.27";
 
 export const releases = [
+  {
+    version: "v0.5.27",
+    date: "2026-11-28",
+    title: "Open live and finished subagent conversations",
+    body: "Open a running subagent from the terminal dock or /agents, then press Esc to return without interrupting the main turn. Finished conversations are read-only and can be reopened after a resume. The main conversation keeps its launch and result lines, and s in /agents stops just the selected in-process subagent. These agents stop when the terminal UI quits. App-server commands now report finish errors to the original request and settle exits observed by command/exec/list.",
+    url: "https://github.com/echoVic/orca-agent/releases/tag/v0.5.27",
+  },
   {
     version: "v0.5.26",
     date: "2026-11-28",
