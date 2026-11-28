@@ -2990,6 +2990,9 @@ impl ChildAgentCoordinator {
             return Err(AgentContinuationError::AlreadyExists { continuation_id });
         }
 
+        let fork_prefix = self
+            .store
+            .load_child_fork_prefix(&continuation_id, fork_prefix_ref)?;
         let now_ms = continuation_now_ms();
         let record = AgentContinuationRecord {
             schema_version: AGENT_CONTINUATION_SCHEMA_VERSION,
@@ -3027,7 +3030,10 @@ impl ChildAgentCoordinator {
         };
         let record = self.store.create_record(record)?;
         self.install_projection(&record)?;
-        self.prepare_record(&record)
+        Ok(PreparedContinuation {
+            fork_prefix,
+            ..PreparedContinuation::from(&record)
+        })
     }
 
     fn prepare_record(
@@ -4919,6 +4925,72 @@ mod tests {
         let restored = coordinator.prepared(id.as_str()).unwrap();
         assert!(restored.fork_prefix.is_none());
         assert!(!association.exists());
+    }
+
+    #[test]
+    fn a_missing_prefix_blob_publishes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let input = test_continuation_input(&registry);
+        let id = input.continuation_id.clone().unwrap();
+        let task_id = input.task_id.clone();
+        let digest = coordinator
+            .store
+            .store_fork_prefix(test_fork_prefix())
+            .unwrap();
+        fs::remove_file(fork_prefix_path(root.path(), "parent", digest)).unwrap();
+
+        assert_corrupt_fork_history(
+            coordinator
+                .create_with_fork(input, Some(digest))
+                .unwrap_err(),
+            &id,
+            "referenced fork prefix is missing",
+        );
+        assert!(coordinator.store.load_record(&id).unwrap().is_none());
+        assert!(!continuation_record_path(root.path(), "parent", &id).exists());
+        assert!(
+            registry
+                .continuation_projection(&task_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!fork_child_path(root.path(), "parent", &id).exists());
+    }
+
+    #[test]
+    fn a_fresh_retry_with_the_same_id_succeeds_after_a_failed_fork_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let input = test_continuation_input(&registry);
+        let id = input.continuation_id.clone().unwrap();
+        let digest = coordinator
+            .store
+            .store_fork_prefix(test_fork_prefix())
+            .unwrap();
+        fs::remove_file(fork_prefix_path(root.path(), "parent", digest)).unwrap();
+        assert_corrupt_fork_history(
+            coordinator
+                .create_with_fork(input, Some(digest))
+                .unwrap_err(),
+            &id,
+            "referenced fork prefix is missing",
+        );
+
+        let fresh = test_continuation_input(&registry);
+        let task_id = fresh.task_id.clone();
+        let prepared = coordinator
+            .create(CreateContinuationInput {
+                continuation_id: Some(id.clone()),
+                ..fresh
+            })
+            .unwrap();
+        assert_eq!(prepared.continuation_id, id);
+        assert_eq!(prepared.latest_task_id, task_id);
+        assert!(prepared.fork_prefix.is_none());
+        assert!(!fork_child_path(root.path(), "parent", &id).exists());
     }
 
     #[test]
