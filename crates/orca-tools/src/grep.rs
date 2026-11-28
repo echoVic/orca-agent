@@ -34,6 +34,10 @@ const MAX_GREP_LINE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GREP_CONTINUATION_BYTES: usize = 160;
 const GREP_TIMEOUT: Duration = Duration::from_secs(120);
 const GREP_CANCELLED: &str = "grep was cancelled";
+static GREP_POOL: GrepPool = GrepPool {
+    threads: Mutex::new(None),
+    busy: AtomicBool::new(false),
+};
 
 #[derive(Default, Deserialize)]
 struct GrepArgs {
@@ -203,7 +207,7 @@ fn search(
                         max_line_bytes,
                         ignores: &ignores,
                     }
-                    .search(&directory, &mut page, &reads, stop)
+                    .search(&directory, &mut page, &reads, stop, &GREP_POOL)
                 }
                 Ok(_) => Ok(()),
                 Err(directory_error) if is_resource_failure(&directory_error) => {
@@ -298,6 +302,28 @@ struct DirectorySearch<'a> {
     ignores: &'a WorkspaceIgnores<'a>,
 }
 
+struct GrepPool {
+    threads: Mutex<Option<Arc<rayon::ThreadPool>>>,
+    busy: AtomicBool,
+}
+
+impl GrepPool {
+    fn try_admit(&self) -> Option<PoolAdmission<'_>> {
+        self.busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        Some(PoolAdmission(&self.busy))
+    }
+}
+
+struct PoolAdmission<'a>(&'a AtomicBool);
+
+impl Drop for PoolAdmission<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 fn grep_pool(
     pool: &Mutex<Option<Arc<rayon::ThreadPool>>>,
     start: impl FnOnce() -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>,
@@ -316,6 +342,7 @@ impl DirectorySearch<'_> {
         page: &mut GrepPageCollector,
         reads: &IgnoreReads<'_>,
         should_stop: &(impl Fn() -> bool + Sync),
+        pool: &GrepPool,
     ) -> io::Result<()> {
         reads.check()?;
         // Keep only paths during discovery. Ordering happens as each entry is
@@ -327,17 +354,21 @@ impl DirectorySearch<'_> {
         }
         result?;
         let files = files.into_iter().map(PathBuf::from);
-        if page.offset == 0 {
-            static POOL: Mutex<Option<Arc<rayon::ThreadPool>>> = Mutex::new(None);
-            let pool = grep_pool(&POOL, || {
+        if page.offset == 0
+            && let Some(admission) = pool.try_admit()
+        {
+            let pool = grep_pool(&pool.threads, || {
                 let threads = std::thread::available_parallelism()
                     .map_or(2, usize::from)
                     .min(8);
                 rayon::ThreadPoolBuilder::new().num_threads(threads).build()
             });
             if let Some(pool) = pool {
-                return pool
-                    .install(|| self.search_directory(directory, files, page, should_stop, true));
+                return pool.install(move || {
+                    // Keep admission while reads are outstanding, even after the caller times out.
+                    let _admission = admission;
+                    self.search_directory(directory, files, page, should_stop, true)
+                });
             }
         }
         self.search_directory(directory, files, page, should_stop, false)
@@ -938,6 +969,71 @@ mod tests {
             rayon::ThreadPoolBuilder::new().num_threads(1).build()
         });
         assert!(running.is_some(), "the next search must retry pool startup");
+    }
+
+    #[test]
+    fn a_search_after_a_stalled_one_still_completes() {
+        let fixture = crate::workspace_tempdir().unwrap();
+        let cwd = fixture.path();
+        fs::write(cwd.join("notes.txt"), "needle\n").unwrap();
+        let pool = GrepPool {
+            threads: Mutex::new(Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ))),
+            busy: AtomicBool::new(false),
+        };
+        let search = |stop: &(dyn Fn() -> bool + Sync)| {
+            let workspace = crate::resolve_workspace_read_path(cwd, None).unwrap();
+            let directory = open_directory(&workspace.root, &workspace.canonical).unwrap();
+            let reads = IgnoreReads::new(stop);
+            let ignores = WorkspaceIgnores::new(&workspace.root, cwd, None, &reads);
+            let mut page = GrepPageCollector::new(0, 10, 4096);
+            DirectorySearch {
+                workspace: &workspace,
+                label: Path::new(""),
+                regex: &Regex::new("needle").unwrap(),
+                max_line_bytes: 4096,
+                ignores: &ignores,
+            }
+            .search(&directory, &mut page, &reads, &stop, &pool)
+            .unwrap();
+            page.total_lines
+        };
+
+        let (started, waiting) = mpsc::channel();
+        let (release, blocked) = mpsc::channel::<()>();
+        let blocked = Mutex::new(Some(blocked));
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                search(&|| {
+                    if rayon::current_thread_index().is_some()
+                        && let Some(blocked) = blocked.lock().unwrap().take()
+                    {
+                        started.send(()).unwrap();
+                        // Hold the worker until the second search returns.
+                        let _ = blocked.recv();
+                    }
+                    stop.load(Ordering::Relaxed)
+                })
+            });
+            let first_started = waiting.recv_timeout(Duration::from_secs(2));
+            // The caller sets this flag at the deadline, even if a read is still pending.
+            stop.store(true, Ordering::Relaxed);
+            let (finished, result) = mpsc::channel();
+            scope.spawn(move || {
+                let _ = finished.send(search(&|| false));
+            });
+            let second = result.recv_timeout(Duration::from_secs(2));
+            drop(release);
+
+            first_started.expect("the first search entered the pool");
+            assert_eq!(second.expect("the second search finished"), 1);
+            assert_eq!(first.join().unwrap(), 0);
+        });
     }
 
     #[test]
