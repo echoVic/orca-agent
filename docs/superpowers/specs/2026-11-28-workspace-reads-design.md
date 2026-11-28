@@ -1,54 +1,15 @@
 # Workspace Reads Stay in the Workspace
 
-## Intent
+## Decisions taken with the user on 2026-11-28
 
-Orca's read tools promise to stay inside the workspace. Today they check a path and then open it by name later, so a directory that is replaced by a link between the check and the open can send the read elsewhere. This change closes that window and four smaller gaps found in the same review.
+1. **D1.** `grep` searches in process on every platform. Walk directories in parallel, check verified ignore rules before descending, and open files relative to verified directories. Sort native paths before applying `offset` and `head_limit`. Keep bounded output and cancellation. Decode BOM-marked UTF-16LE, UTF-16BE and UTF-8 and preserve decoded line numbering. Recursive discovery skips links, hidden entries, binary files and unreadable files. Explicit targets can resolve to files or directories inside the workspace.
+2. **D2.** Read `.gitignore` and `.ignore` from the workspace through its Git root, including intervening ancestors. Open each without following links. Deeper rules win within each file type. `.ignore` takes precedence over `.gitignore`, and negation cannot reopen an excluded parent. Strip a UTF-8 BOM from the first line. The global excludes file and associated repository `info/exclude` are the other outside sources. Reading `core.excludesFile` can consult system, global and XDG Git configuration.
 
-## Goals
+## Read behaviour
 
-1. **Content reads.** `read_file`, `read_document`, `grep` and Workflow scripts never return content from outside the workspace. This holds even when a path component is swapped for a link during the call. Links inside the workspace that point inside it keep working.
-2. **Listings.** `glob` and `list_files` never return an entry whose real location is outside the workspace.
-3. **`rg`.**
-   - Where Orca can enforce restricted reads, `rg` runs inside a read-only sandbox whose read roots are the workspace plus the two authorized ignore sources: macOS with Seatbelt enforced, and Linux with bwrap or Landlock.
-   - Everywhere else, `grep` uses Orca's in-process search, which opens every file through the verified path: Windows, and Linux without a usable sandbox.
-4. **Ignore files.**
-   - In-tree `.gitignore` and `.ignore` files still apply, but a symlinked ignore file is skipped.
-   - Two Git sources outside the workspace remain allowed: the user's global excludes file (`core.excludesFile`, default `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`) and the repository's `info/exclude`, including a linked worktree's common directory.
-   - No other file outside the workspace is read.
-   - This keeps today's results for ordinary repositories.
-5. **Windows path spelling.**
-   - A request for `C:\work\repo\src` is accepted when the workspace is spelled `\\?\C:\work\repo`, and the other way round. The same holds for UNC paths and their verbatim spelling, and for mixed separators.
-   - Drive-relative forms such as `C:foo` are refused with a clear message.
-6. **Existence semantics.**
-   - A requested path keeps its meaning. `Cargo.toml/../crates` does not silently become `crates`, and a missing intermediate directory is an error, as before the grep change.
-   - An empty `path` means the workspace root, explicitly.
-7. **Workflow paths.**
-   - `name` must be a single saved-workflow name, with no separators and no `.` or `..`.
-   - When the model calls the Workflow tool, `scriptPath` must resolve inside the workspace or inside a workflows directory Orca already uses: a trusted ancestor's `.orca/workflows`, or the user workflow directory.
-   - A path the user types in a command keeps working as today.
-
-## Non-goals
-
-- No change to which files the shell tools can read; that is the sandbox policy's job.
-- No change to spill files, which live in Orca's session directory and are read through the existing spill path.
-- No performance work beyond keeping `rg` where it can be confined.
-
-## Decisions taken with the user (2026-11-28)
-
-- **Ignore files:** keep the global excludes file and the repository's `info/exclude` as the only outside sources. Skip every other outside ignore file.
-- **Hosts without a read sandbox:** use the in-process search. It may be slower than `rg` on very large repositories.
-
-## Approaches considered
-
-- **Open-then-verify by name.** Open by name, then check the handle's real path. This works for files, but it still lists the wrong directory if a directory is swapped. Rejected as the only mechanism.
-- **Verified traversal plus a sandboxed `rg`** (chosen).
-  - Resolve the canonical path and check containment.
-  - Then open it component by component from the canonical workspace root with `orca_platform::fs::VerifiedDirectory`, which follows no links. If a component has become a link, the open fails.
-  - `rg` cannot be confined from the outside, so the sandbox enforces its reads. Where there is no sandbox, Orca does not use it.
-- **Drop `rg` everywhere.** Simplest, but it loses `rg`'s speed on the platforms that can confine it. Rejected.
-
-## Left to the builder
-
-- Where the verified-open helper lives: orca-tools or orca-platform.
-- How the in-process search builds ignore matchers. The `ignore` crate's `Gitignore` builder fed with verified reads, or an equivalent.
-- How `rg`'s read errors for denied files are reported. A denied read is a skipped file, not a failed search.
+- Pin the canonical workspace root and its directory identity on first use. Refuse later calls when that root changes. Resolve the request inside the pinned root, then verify components when opening files. Links that resolve inside the workspace work for explicit targets. Hard links are ordinary files. Treat a drive-relative Windows path as invalid. Accept normal and verbatim Windows paths and equivalent macOS root spellings after checking their native identity on disk.
+- An empty path means the workspace root. Validate intermediate components before applying `..`. A missing intermediate directory or a file used as one is an error.
+- For `glob` and `list_files`, each returned entry was inside the workspace when it was checked. Enumerate from verified directory handles and recheck the selected page before returning it.
+- Verify a linked worktree through the backlink in the common directory's `worktrees/<name>/gitdir`. For a separate Git directory, read its `info/exclude` when the Git directory is inside the workspace or its own `core.worktree` points back to the worktree. Use the same verified directory handle for the association and the excludes read.
+- Model Workflow paths resolve inside the workspace, a trusted ancestor's `.orca/workflows`, or the pinned user workflow directory. A saved `name` is a single component. A draft ID must be a single safe component, and verified draft reads are relative to the session root. The Workflow host hashes the bytes it loads and refuses a mismatch with the prepared script. User commands can still pass direct script paths.
+- Edit and Apply Patch continue to resolve their write targets through the existing write resolver. Spill reads continue to use the session's spill directory with verified opens.

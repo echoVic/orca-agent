@@ -33,7 +33,7 @@ the script directly. Workflow scripts are JavaScript modules with a declared
 metadata export, not YAML files. Keep the script, its verifier logic, and its
 input schema under version control.
 
-The model's `Workflow` tool accepts a saved workflow `name` without path separators. `.` and `..` are invalid names. A model-supplied `scriptPath` must resolve inside the workspace, a trusted ancestor's `.orca/workflows`, or your user workflows directory. You can still pass a path directly to `orca workflow run`.
+The model's `Workflow` tool accepts a saved workflow `name` without path separators. `.` and `..` are invalid names. A model-supplied `scriptPath` must resolve inside the workspace, a trusted ancestor's `.orca/workflows`, or your user workflows directory. You can still pass a path directly to `orca workflow run`. Orca refuses draft IDs with path components and reads draft metadata and scripts from the session directory. The Workflow host refuses a script if its bytes changed after preparation. Replacing the user workflows directory after first use causes later Workflow reads to be refused.
 
 ## Shared execution capacity
 
