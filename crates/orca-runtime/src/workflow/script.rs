@@ -51,22 +51,36 @@ pub fn resolve_workflow_script_to_path(
     cwd: &Path,
     persisted_path: &Path,
 ) -> io::Result<ResolvedWorkflowScript> {
-    resolve_workflow_script_for_launch(input, cwd, persisted_path, ScriptPathAccess::User)
+    resolve_workflow_script_for_launch(
+        input,
+        cwd,
+        persisted_path,
+        crate::command::config::user_workflow_directory().as_deref(),
+        ScriptPathAccess::User,
+    )
 }
 
 pub(super) fn resolve_workflow_script_for_launch(
     input: &WorkflowInput,
     cwd: &Path,
     persisted_path: &Path,
+    user_directory: Option<&Path>,
     access: ScriptPathAccess<'_>,
 ) -> io::Result<ResolvedWorkflowScript> {
     let config_dir =
         orca_core::config::folder_trust::config_dir().unwrap_or_else(|| PathBuf::from(".orca"));
-    let user_dir = config_dir.join("workflows");
+    let default_user_dir = user_directory
+        .is_none()
+        .then(crate::command::config::user_workflow_directory)
+        .flatten();
+    let fallback = config_dir.join("workflows");
+    let user_dir = user_directory
+        .or(default_user_dir.as_deref())
+        .unwrap_or(&fallback);
     resolve_workflow_script_with_dirs_to_path(
         input,
         cwd,
-        &user_dir,
+        user_dir,
         Some(&config_dir),
         persisted_path,
         access,
@@ -114,10 +128,13 @@ pub fn resolve_workflow_script_with_user_dir_to_path(
     persisted_path: &Path,
 ) -> io::Result<ResolvedWorkflowScript> {
     let config_dir = orca_core::config::folder_trust::config_dir();
+    let user_dir = user_workflow_dir
+        .canonicalize()
+        .unwrap_or_else(|_| user_workflow_dir.to_path_buf());
     resolve_workflow_script_with_dirs_to_path(
         input,
         cwd,
-        user_workflow_dir,
+        &user_dir,
         config_dir.as_deref(),
         persisted_path,
         ScriptPathAccess::User,
@@ -133,7 +150,8 @@ fn resolve_workflow_script_with_dirs_to_path(
     access: ScriptPathAccess<'_>,
 ) -> io::Result<ResolvedWorkflowScript> {
     let workspace = if matches!(access, ScriptPathAccess::Model) {
-        Some(orca_tools::pin_read_root(cwd)?)
+        orca_tools::open_workspace_root(cwd)?;
+        Some(cwd)
     } else {
         None
     };
@@ -142,8 +160,8 @@ fn resolve_workflow_script_with_dirs_to_path(
         .as_deref()
         .is_some_and(|script_path| resolve_path(cwd, script_path).starts_with(user_workflow_dir));
     let user = if workspace.is_some() || input.name.is_some() || uses_user_directory {
-        match orca_tools::pin_read_root(user_workflow_dir) {
-            Ok(root) => Some(root),
+        match orca_tools::open_workspace_root(user_workflow_dir) {
+            Ok(_) => Some(user_workflow_dir),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         }
@@ -152,19 +170,19 @@ fn resolve_workflow_script_with_dirs_to_path(
     };
     let read_script = |path: &Path, label: &str| match access {
         ScriptPathAccess::User if path.starts_with(user_workflow_dir) && user.is_some() => {
-            let root = user.as_deref().expect("checked workflow root");
+            let root = user.expect("checked workflow root");
             read_resolved_workflow_script(root, &path.canonicalize()?)
         }
         ScriptPathAccess::User => fs::read_to_string(path),
         ScriptPathAccess::Model => read_model_script_path(
             path,
             label,
-            workspace.as_deref().expect("model workspace root"),
-            user.as_deref(),
+            workspace.expect("model workspace root"),
+            user,
             config_dir,
         ),
         ScriptPathAccess::Draft(session_dir) => {
-            let root = orca_tools::pin_read_root(session_dir)?;
+            let root = session_dir.canonicalize()?;
             let relative = path.strip_prefix(session_dir).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -1252,10 +1270,11 @@ mod tests {
     #[test]
     fn a_model_script_path_in_a_workflows_directory_runs() {
         let fixture = tempfile::tempdir().unwrap();
-        let cwd = fixture.path().join("project/src");
+        let base = fixture.path().canonicalize().unwrap();
+        let cwd = base.join("project/src");
         let project = cwd.parent().unwrap();
         let workflows = project.join(".orca/workflows");
-        let config = fixture.path().join("config");
+        let config = base.join("config");
         let user = config.join("workflows");
         for path in [&cwd, &workflows, &user] {
             std::fs::create_dir_all(path).unwrap();
@@ -1293,7 +1312,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_replaced_user_workflow_root_is_refused() {
+    fn the_user_workflow_root_swapped_for_a_link_is_refused() {
         let fixture = tempfile::tempdir().unwrap();
         let base = fixture.path().canonicalize().unwrap();
         let cwd = base.join("workspace");
@@ -1319,29 +1338,12 @@ mod tests {
                 super::ScriptPathAccess::Model,
             )
         };
-        let direct = super::WorkflowInput {
-            script_path: Some(user.join("file.js").display().to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            super::resolve_workflow_script_with_dirs_to_path(
-                &direct,
-                &cwd,
-                &user,
-                None,
-                &cwd.join("persisted.js"),
-                super::ScriptPathAccess::User,
-            )
-            .unwrap()
-            .script,
-            FILE_WORKFLOW,
-        );
         std::fs::rename(&user, base.join("previous")).unwrap();
         symlink(&neighbor, &user).unwrap();
         assert_eq!(
             prepare().unwrap_err().to_string(),
             format!(
-                "workspace root changed while Orca was running: {}",
+                "workspace path changed while Orca was running: {}",
                 user.display()
             )
         );

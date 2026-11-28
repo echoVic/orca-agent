@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn directory_search_keeps_matches_in_utf8_files_with_a_bom() {
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace_tempdir().unwrap();
         fs::write(
             workspace.path().join("bom.txt"),
             b"\xef\xbb\xbfneedle one\nneedle two\n",
@@ -718,7 +718,7 @@ mod tests {
     fn recursive_grep_keeps_native_filenames_in_the_page() {
         use std::os::unix::ffi::OsStrExt;
 
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace_tempdir().unwrap();
         for name in ["z.txt", "a\nfile.txt"] {
             fs::write(workspace.path().join(name), "needle\n").unwrap();
         }
@@ -758,7 +758,7 @@ mod tests {
 
     #[test]
     fn recursive_grep_decodes_unicode_and_returns_a_sorted_page() {
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace_tempdir().unwrap();
         for (name, big_endian) in [("z-be.txt", true), ("a-le.txt", false)] {
             let mut bytes = if big_endian {
                 vec![0xfe, 0xff]
@@ -802,7 +802,7 @@ mod tests {
     fn an_unreadable_file_is_skipped_and_search_continues() {
         use std::os::unix::fs::PermissionsExt;
 
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace_tempdir().unwrap();
         let unreadable = workspace.path().join("denied.txt");
         fs::write(&unreadable, "needle\n").unwrap();
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
@@ -819,7 +819,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_ignore_file_pointing_outside_is_not_read() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = crate::workspace_tempdir().unwrap();
         let cwd = fixture.path().join("workspace");
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::write(cwd.join("notes.txt"), "needle\n").unwrap();
@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     fn the_global_excludes_file_still_filters() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = crate::workspace_tempdir().unwrap();
         let cwd = fixture.path().join("workspace");
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::write(cwd.join("excluded.txt"), "needle\n").unwrap();
@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn a_linked_worktrees_info_exclude_still_filters() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = crate::workspace_tempdir().unwrap();
         let cwd = fixture.path().join("linked");
         let common = fixture.path().join("repo/.git");
         let worktree = common.join("worktrees/linked");
@@ -881,7 +881,7 @@ mod tests {
 
     #[test]
     fn repository_excludes_apply_when_the_workspace_is_a_subdirectory() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = crate::workspace_tempdir().unwrap();
         let cwd = fixture.path().join("src");
         let info = fixture.path().join(".git/info");
         fs::create_dir_all(&info).unwrap();
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn ancestor_ignore_rules_stop_at_the_repository_root() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = crate::workspace_tempdir().unwrap();
         let repo = fixture.path().join("repo");
         let parent = repo.join("src");
         let cwd = parent.join("workspace");
@@ -936,7 +936,7 @@ mod tests {
 
     #[test]
     fn outside_repository_excludes_require_an_association() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = crate::workspace_tempdir().unwrap();
         let root = fixture.path();
         let cwd = root.join("workspace");
         let common = root.join("repository.git");
@@ -980,7 +980,7 @@ mod tests {
 
     #[test]
     fn in_tree_gitignore_still_filters() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = crate::workspace_tempdir().unwrap();
         let cwd = fixture.path();
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(cwd.join("src")).unwrap();
@@ -1020,7 +1020,7 @@ mod tests {
 
     #[test]
     fn option_shaped_patterns_are_searched_literally() {
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace_tempdir().unwrap();
         let cwd = workspace.path();
         fs::write(
             cwd.join("notes.txt"),
@@ -1158,7 +1158,7 @@ mod tests {
 
     #[test]
     fn a_dot_slash_prefix_keeps_relative_output() {
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace_tempdir().unwrap();
         fs::create_dir(workspace.path().join("src")).unwrap();
         fs::write(workspace.path().join("src/notes.txt"), "needle\n").unwrap();
         let request = grep_request(r#"{"pattern":"needle","path":"./src"}"#);
@@ -1428,7 +1428,7 @@ mod tests {
 
     #[test]
     fn grep_keeps_a_cancellation_observed_once() {
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace_tempdir().unwrap();
         fs::write(workspace.path().join("notes.txt"), "needle\n").unwrap();
         let cancelled = Cell::new(true);
         let result = execute_or_cancel(
@@ -1451,7 +1451,7 @@ mod tests {
     }
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+        std::env::temp_dir().canonicalize().unwrap().join(format!(
             "orca-{prefix}-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

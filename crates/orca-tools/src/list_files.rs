@@ -79,8 +79,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn list_files_skips_entries_whose_real_location_is_outside() {
-        let workspace = tempfile::tempdir().unwrap();
-        let neighbor = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace_tempdir().unwrap();
+        let neighbor = crate::workspace_tempdir().unwrap();
         let root = workspace.path().canonicalize().unwrap();
         let linked = root.join("linked");
         fs::create_dir(neighbor.path().join("notes")).unwrap();
@@ -92,8 +92,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn list_files_rechecks_selected_entries_before_emission() {
-        let workspace = tempfile::tempdir().unwrap();
-        let neighbor = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace_tempdir().unwrap();
+        let neighbor = crate::workspace_tempdir().unwrap();
         let root = workspace.path().canonicalize().unwrap();
         let changing = root.join("changing.txt");
         fs::write(&changing, "original").unwrap();
@@ -138,7 +138,7 @@ mod tests {
     }
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+        std::env::temp_dir().canonicalize().unwrap().join(format!(
             "orca-{prefix}-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

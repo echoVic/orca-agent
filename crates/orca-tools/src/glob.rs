@@ -368,9 +368,9 @@ fn relative_to_workspace(cwd: &Path, path: &Path) -> String {
 mod tests {
     use std::fs;
 
+    use crate::workspace_tempdir as tempdir;
     use orca_core::approval_types::ActionKind;
     use orca_core::tool_types::{ToolName, ToolResultKind, ToolStatus};
-    use tempfile::tempdir;
 
     use super::*;
 

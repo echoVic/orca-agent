@@ -2661,6 +2661,19 @@ impl RuntimeThreadStartRequest {
     }
 
     fn prepare(mut self) -> Result<PreparedRuntimeThreadStart, RuntimeHostError> {
+        let cwd = self
+            .config
+            .cwd
+            .clone()
+            .map_or_else(std::env::current_dir, Ok);
+        cwd.and_then(|cwd| crate::command::config::accept_workspace(&mut self.config, &cwd))
+            .map_err(|error| RuntimeHostError::ThreadStartFailed {
+                message: format!("cannot resolve workspace: {error}"),
+            })?;
+        if self.config.workflows.user_directory.is_none() {
+            self.config.workflows.user_directory =
+                crate::command::config::user_workflow_directory();
+        }
         if self.inherited_conversation.is_some() {
             if !matches!(self.config.history_mode, HistoryMode::Disabled) {
                 return Err(RuntimeHostError::ThreadStartFailed {
@@ -12047,6 +12060,8 @@ fn apply_runtime_settings_patch(
             settings.active_permission_profile = None;
         }
         surface::RuntimeSettingsPatch::SetCwd { cwd } => {
+            crate::command::config::accept_workspace(config, cwd.as_path())
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
             config.cwd = Some(cwd.as_path().to_path_buf());
             settings.cwd = cwd.clone();
         }
@@ -12175,13 +12190,14 @@ pub fn hydrate_run_config_from_surface_settings(
         }
     };
     apply_runtime_settings_patch(config, &mut restored, &approval_patch)?;
-    apply_runtime_settings_patch(
-        config,
-        &mut restored,
-        &surface::RuntimeSettingsPatch::SetCwd {
-            cwd: settings.cwd.clone(),
-        },
-    )?;
+    if config.cwd.as_deref() != Some(settings.cwd.as_path()) {
+        let existing_cwd = config.cwd.clone().or_else(|| std::env::current_dir().ok());
+        if existing_cwd.as_deref() != Some(settings.cwd.as_path()) {
+            crate::command::config::accept_workspace(config, settings.cwd.as_path())
+                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
+        }
+        config.cwd = Some(settings.cwd.as_path().to_path_buf());
+    }
     apply_runtime_settings_patch(
         config,
         &mut restored,

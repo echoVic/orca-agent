@@ -114,6 +114,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolContext<'a> {
     pub cwd: &'a Path,
     spill_dir: Option<&'a Path>,
+    workspace_read_root: Option<&'a Path>,
     pub output_truncation: ToolOutputTruncation,
     /// How long an external tool may run; `None` sets no limit.
     pub shell_timeout: Option<Duration>,
@@ -133,6 +134,7 @@ impl<'a> ToolContext<'a> {
         Self {
             cwd,
             spill_dir: None,
+            workspace_read_root: None,
             output_truncation: ToolOutputTruncation::bytes(MAX_TOOL_OUTPUT_BYTES),
             shell_timeout: Some(Duration::from_secs(120)),
             additional_working_directories: Vec::new(),
@@ -142,6 +144,11 @@ impl<'a> ToolContext<'a> {
             execution_profile: orca_core::capability::ExecutionProfile::Workspace,
             deepseek_web: None,
         }
+    }
+
+    pub fn with_workspace_read_root(mut self, root: Option<&'a Path>) -> Self {
+        self.workspace_read_root = root;
+        self
     }
 
     pub fn with_spill_directory(mut self, directory: Option<&'a Path>) -> Self {
@@ -2155,29 +2162,32 @@ impl Tool for BuiltinTool {
         match self.executor {
             BuiltinExecutor::ReadFile => read_file::execute_in_session(
                 request,
-                ctx.cwd,
+                ctx.workspace_read_root.unwrap_or(ctx.cwd),
                 ctx.max_output_bytes(),
                 ctx.spill_dir,
                 || ctx.is_cancelled(),
             ),
             BuiltinExecutor::ReadDocument => read_document::execute_or_cancel(
                 request,
-                ctx.cwd,
+                ctx.workspace_read_root.unwrap_or(ctx.cwd),
                 ctx.max_output_bytes(),
                 ctx.deepseek_web.as_ref(),
                 || ctx.is_cancelled(),
             ),
-            BuiltinExecutor::Glob if request.name.as_str() == "list_files" => {
-                list_files::execute(request, ctx.cwd, ctx.max_output_bytes())
-            }
-            BuiltinExecutor::Glob => {
-                glob::execute_or_cancel(request, ctx.cwd, ctx.max_output_bytes(), || {
-                    ctx.is_cancelled()
-                })
-            }
+            BuiltinExecutor::Glob if request.name.as_str() == "list_files" => list_files::execute(
+                request,
+                ctx.workspace_read_root.unwrap_or(ctx.cwd),
+                ctx.max_output_bytes(),
+            ),
+            BuiltinExecutor::Glob => glob::execute_or_cancel(
+                request,
+                ctx.workspace_read_root.unwrap_or(ctx.cwd),
+                ctx.max_output_bytes(),
+                || ctx.is_cancelled(),
+            ),
             BuiltinExecutor::Grep => grep::execute_in_session(
                 request,
-                ctx.cwd,
+                ctx.workspace_read_root.unwrap_or(ctx.cwd),
                 ctx.max_output_bytes(),
                 ctx.spill_dir,
                 || ctx.is_cancelled(),
@@ -2808,8 +2818,8 @@ mod tests {
 
     #[test]
     fn a_large_mcp_result_is_saved_and_pointed_to() {
-        let cwd = tempfile::tempdir().unwrap();
-        let session = tempfile::tempdir().unwrap();
+        let cwd = crate::workspace_tempdir().unwrap();
+        let session = crate::workspace_tempdir().unwrap();
         let spill = session.path().join("spill");
         let text = format!("FIRST\n{}\nLAST", " hello".repeat(34_000));
         let original = mcp_spill_result(ToolContext::new(cwd.path()), &text)
@@ -2844,8 +2854,8 @@ mod tests {
 
     #[test]
     fn a_storage_failure_keeps_the_original_result() {
-        let cwd = tempfile::tempdir().unwrap();
-        let session = tempfile::tempdir().unwrap();
+        let cwd = crate::workspace_tempdir().unwrap();
+        let session = crate::workspace_tempdir().unwrap();
         let blocked = session.path().join("blocked");
         std::fs::write(&blocked, "occupied").unwrap();
         let text = " word".repeat(13_000);
@@ -2872,8 +2882,8 @@ mod tests {
 
     #[test]
     fn read_file_reads_a_spill_file_with_offset_and_limit() {
-        let cwd = tempfile::tempdir().unwrap();
-        let spill = tempfile::tempdir().unwrap();
+        let cwd = crate::workspace_tempdir().unwrap();
+        let spill = crate::workspace_tempdir().unwrap();
         let file = spill.path().join("call.txt");
         std::fs::write(&file, "first\nsecond\nthird\n").unwrap();
         let result = spill_read(
@@ -2891,8 +2901,8 @@ mod tests {
 
     #[test]
     fn grep_searches_a_spill_file() {
-        let cwd = tempfile::tempdir().unwrap();
-        let spill = tempfile::tempdir().unwrap();
+        let cwd = crate::workspace_tempdir().unwrap();
+        let spill = crate::workspace_tempdir().unwrap();
         let file = spill.path().join("call.txt");
         std::fs::write(&file, "alpha\nneedle\nomega\n").unwrap();
         let result = spill_read(
@@ -2907,8 +2917,8 @@ mod tests {
 
     #[test]
     fn grep_matches_beyond_the_start_of_a_long_spill_line() {
-        let cwd = tempfile::tempdir().unwrap();
-        let spill = tempfile::tempdir().unwrap();
+        let cwd = crate::workspace_tempdir().unwrap();
+        let spill = crate::workspace_tempdir().unwrap();
         let file = spill.path().join("call.txt");
         std::fs::write(
             &file,
@@ -2931,8 +2941,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlink_in_the_spill_dir_is_refused() {
-        let cwd = tempfile::tempdir().unwrap();
-        let spill = tempfile::tempdir().unwrap();
+        let cwd = crate::workspace_tempdir().unwrap();
+        let spill = crate::workspace_tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
         let link = spill.path().join("link.txt");
         let regular = spill.path().join("regular.txt");
@@ -2967,8 +2977,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spill_reads_and_writes_refuse_a_linked_ancestor() {
-        let cwd = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
+        let cwd = crate::workspace_tempdir().unwrap();
+        let root = crate::workspace_tempdir().unwrap();
         let outside = root.path().join("outside");
         let outside_spill = outside.join("session/spill");
         std::fs::create_dir_all(&outside_spill).unwrap();
@@ -2993,8 +3003,8 @@ mod tests {
 
     #[test]
     fn spill_saves_the_history_redacted_result() {
-        let cwd = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
+        let cwd = crate::workspace_tempdir().unwrap();
+        let root = crate::workspace_tempdir().unwrap();
         let spill = root.path().join("spill");
         let words = " hello".repeat(10_000);
         let value = "fixture-value";
@@ -3013,8 +3023,8 @@ mod tests {
 
     #[test]
     fn read_file_pages_a_single_long_spill_line_by_byte() {
-        let cwd = tempfile::tempdir().unwrap();
-        let spill = tempfile::tempdir().unwrap();
+        let cwd = crate::workspace_tempdir().unwrap();
+        let spill = crate::workspace_tempdir().unwrap();
         let file = spill.path().join("call.txt");
         std::fs::write(
             &file,
@@ -3040,7 +3050,7 @@ mod tests {
 
     #[test]
     fn the_threshold_is_exclusive() {
-        let session = tempfile::tempdir().unwrap();
+        let session = crate::workspace_tempdir().unwrap();
         let spill = session.path().join("spill");
         let request = spill_request("threshold", ToolName::WebFetch, json!({}));
         let completed = |words| {
@@ -3292,7 +3302,7 @@ mod tests {
 
     #[test]
     fn registry_hands_deepseek_access_to_read_document() {
-        let cwd = tempfile::tempdir().expect("workspace");
+        let cwd = crate::workspace_tempdir().expect("workspace");
         std::fs::write(cwd.path().join("scan.png"), b"\x89PNG fixture").expect("image fixture");
         let fixture = crate::test_http::serve(vec![(
             200,
@@ -3701,7 +3711,7 @@ mod tests {
 
     #[test]
     fn run_script_outside_the_runtime_says_so() {
-        let cwd = tempfile::tempdir().unwrap();
+        let cwd = crate::workspace_tempdir().unwrap();
 
         let result =
             crate::execute_with_mcp_external_roots_policy_or_cancel_and_elicitation_with_profile(

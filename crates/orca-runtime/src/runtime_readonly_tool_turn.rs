@@ -323,7 +323,10 @@ pub(crate) fn execute_readonly_batch<W: io::Write>(
                         },
                     ),
                     request: request.clone(),
-                    cwd: cwd.to_path_buf(),
+                    cwd: network
+                        .as_ref()
+                        .and_then(|network| network.config.tools.workspace_read_root.clone())
+                        .unwrap_or_else(|| cwd.to_path_buf()),
                     mcp_registry: mcp_registry.clone(),
                     output_truncation,
                 })

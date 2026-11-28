@@ -1,92 +1,28 @@
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
-use orca_platform::fs::{FileAccess, FileIdentity, VerifiedDirectory};
+use orca_platform::fs::{FileAccess, VerifiedDirectory};
 
-#[derive(Clone)]
-struct RootIdentity {
-    canonical: PathBuf,
-    identity: FileIdentity,
-}
-
-static READ_ROOTS: OnceLock<Mutex<HashMap<PathBuf, RootIdentity>>> = OnceLock::new();
-
-fn read_roots() -> &'static Mutex<HashMap<PathBuf, RootIdentity>> {
-    READ_ROOTS.get_or_init(Mutex::default)
-}
-
-fn changed_root(path: &Path) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        format!(
-            "workspace root changed while Orca was running: {}",
-            path.display()
-        ),
-    )
-}
-
-/// Remember the directory selected on first use, including its original spelling.
-pub fn pin_read_root(path: &Path) -> io::Result<PathBuf> {
-    let key = std::path::absolute(path)?;
-    let mut roots = read_roots().lock().unwrap();
-    let pin = roots.get(&key);
-    let canonical = key.canonicalize().map_err(|error| {
-        if pin.is_some() {
-            changed_root(path)
+/// Open the canonical path selected when the runtime accepted this workspace.
+pub fn open_root(root: &Path) -> io::Result<VerifiedDirectory> {
+    VerifiedDirectory::open(root).map_err(|error| {
+        if matches!(error.kind(), io::ErrorKind::NotADirectory)
+            || cfg!(unix) && error.raw_os_error() == Some(libc::ELOOP)
+            || cfg!(windows) && matches!(error.raw_os_error(), Some(681 | 4395))
+        {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "workspace path changed while Orca was running: {}",
+                    root.display()
+                ),
+            )
         } else {
             error
         }
-    })?;
-    if let Some(pin) = pin
-        && canonical != pin.canonical
-    {
-        return Err(changed_root(path));
-    }
-    let known = pin.or_else(|| roots.get(&canonical));
-    let identity = VerifiedDirectory::open(&canonical)
-        .and_then(|directory| directory.identity())
-        .map_err(|error| {
-            if known.is_some() {
-                changed_root(path)
-            } else {
-                error
-            }
-        })?;
-    if known.is_some_and(|root| root.identity != identity) {
-        return Err(changed_root(path));
-    }
-    let root = RootIdentity {
-        canonical: canonical.clone(),
-        identity,
-    };
-    roots.insert(canonical.clone(), root.clone());
-    roots.insert(key, root);
-    Ok(canonical)
-}
-
-pub(crate) fn open_root(root: &Path) -> io::Result<VerifiedDirectory> {
-    let expected = read_roots()
-        .lock()
-        .unwrap()
-        .get(root)
-        .map(|pin| pin.identity);
-    let directory = VerifiedDirectory::open(root).map_err(|error| {
-        if expected.is_some() {
-            changed_root(root)
-        } else {
-            error
-        }
-    })?;
-    if let Some(expected) = expected
-        && directory.identity().ok() != Some(expected)
-    {
-        return Err(changed_root(root));
-    }
-    Ok(directory)
+    })
 }
 
 pub(crate) fn canonical_read_path(root: &Path, path: &Path) -> io::Result<PathBuf> {

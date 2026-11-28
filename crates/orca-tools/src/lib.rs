@@ -37,7 +37,7 @@ mod workspace_ignore;
 mod workspace_read;
 pub mod write_file;
 
-pub use workspace_read::{open_workspace_file, pin_read_root};
+pub use workspace_read::{open_root as open_workspace_root, open_workspace_file};
 
 pub use registry::{Tool, ToolContext, ToolRegistry, validate_tool_request};
 
@@ -337,6 +337,13 @@ fn resolve_workspace_path_inner(
     let candidate = PathBuf::from(target.replace('/', "\\"));
     #[cfg(not(windows))]
     let candidate = PathBuf::from(target);
+    let root = if allow_missing_parents {
+        cwd.canonicalize()
+            .map_err(|error| format!("cannot resolve cwd: {error}"))?
+    } else {
+        open_workspace_root(cwd).map_err(|error| error.to_string())?;
+        cwd.to_path_buf()
+    };
     let joined = join_requested_path(cwd, candidate);
 
     // Check the lexical target before resolving any components on disk.
@@ -365,17 +372,13 @@ fn resolve_workspace_path_inner(
         return Err(format!("path escapes workspace: {target}"));
     }
 
-    let root = if allow_missing_parents {
-        cwd.canonicalize()
-            .map_err(|error| format!("cannot resolve cwd: {error}"))?
-    } else {
-        pin_read_root(cwd).map_err(|error| error.to_string())?
-    };
     let resolve_error = |error| format!("cannot resolve path {target}: {error}");
     let joined = if allow_missing_parents {
         normalized.clone()
     } else if has_parent_component {
         resolve_parent_components(&joined).map_err(resolve_error)?
+    } else if Path::new(target).is_absolute() {
+        normalized.clone()
     } else {
         joined
     };
@@ -477,14 +480,12 @@ fn macos_path_in_workspace(cwd: &Path, path: &Path) -> Option<PathBuf> {
     let prefix = path.ancestors().nth(depth)?;
     let normalize =
         |path: &Path| -> Option<String> { Some(path.to_str()?.nfc().case_fold().nfc().collect()) };
-    if normalize(cwd)? != normalize(prefix)? {
+    let resolved_prefix = prefix.canonicalize().ok()?;
+    if normalize(cwd)? != normalize(&resolved_prefix)? {
         return None;
     }
-    let expected = VerifiedDirectory::open(&pin_read_root(cwd).ok()?)
-        .ok()?
-        .identity()
-        .ok()?;
-    let actual = VerifiedDirectory::open(&prefix.canonicalize().ok()?)
+    let expected = open_workspace_root(cwd).ok()?.identity().ok()?;
+    let actual = VerifiedDirectory::open(&resolved_prefix)
         .ok()?
         .identity()
         .ok()?;
@@ -524,6 +525,11 @@ fn windows_path_in_workspace(cwd: &Path, path: &Path, target: &str) -> Result<Pa
 }
 
 #[cfg(test)]
+pub(crate) fn workspace_tempdir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use orca_core::approval_types::ActionKind;
@@ -538,7 +544,7 @@ mod tests {
 
     #[test]
     fn a_file_used_as_a_directory_is_an_error() {
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace_tempdir().unwrap();
         fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         fs::create_dir(workspace.path().join("crates")).unwrap();
         assert!(resolve_workspace_path(workspace.path(), Some("Cargo.toml/../crates")).is_err());
@@ -546,7 +552,7 @@ mod tests {
 
     #[test]
     fn a_missing_intermediate_directory_is_an_error() {
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace_tempdir().unwrap();
         fs::create_dir(workspace.path().join("crates")).unwrap();
         assert!(resolve_workspace_path(workspace.path(), Some("missing/../crates")).is_err());
         assert!(resolve_workspace_path(workspace.path(), Some("missing/file.txt")).is_err());
@@ -555,7 +561,7 @@ mod tests {
 
     #[test]
     fn an_empty_path_means_the_workspace_root() {
-        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace_tempdir().unwrap();
         assert_eq!(
             resolve_workspace_path(workspace.path(), Some("")).unwrap(),
             workspace.path()
@@ -589,7 +595,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_read_resolver_accepts_equivalent_root_spellings_by_identity() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = workspace_tempdir().unwrap();
         let base = fixture.path().canonicalize().unwrap();
         let root = base.join("Répo");
         fs::create_dir(&root).unwrap();
@@ -610,7 +616,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_resolver_accepts_normal_and_verbatim_paths_with_mixed_separators() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = workspace_tempdir().unwrap();
         let verbatim = fixture.path().canonicalize().unwrap();
         let plain = Path::new(verbatim.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
         fs::create_dir(plain.join("src")).unwrap();
@@ -648,7 +654,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_workspace_reads_refuse_a_swapped_root_junction() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = workspace_tempdir().unwrap();
         let cwd = fixture.path().join("workspace");
         let neighbor = fixture.path().join("neighbor");
         fs::create_dir(&cwd).unwrap();
@@ -662,16 +668,15 @@ mod tests {
             target: Some("notes.txt".into()),
             raw_arguments: None,
         };
-        let result = read_file::execute(&request, &cwd, 4096);
-        assert!(result.output.unwrap().contains("inside"));
+        let accepted = cwd.canonicalize().unwrap();
         fs::rename(&cwd, fixture.path().join("old")).unwrap();
         junction(&cwd, &neighbor);
-        let result = read_file::execute(&request, &cwd, 4096);
+        let result = read_file::execute(&request, &accepted, 4096);
         assert!(
             result
                 .error
                 .unwrap()
-                .contains("workspace root changed while Orca was running")
+                .contains("workspace path changed while Orca was running")
         );
         fs::remove_dir(cwd).unwrap();
     }
@@ -679,7 +684,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_workspace_reads_refuse_a_spill_junction_swap() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = workspace_tempdir().unwrap();
         let cwd = fixture.path().join("workspace");
         let session = fixture.path().join("session");
         let spill = session.join("spill");
@@ -727,7 +732,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_directory_swapped_for_a_link_after_resolution_is_refused() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = workspace_tempdir().unwrap();
         let root = fixture.path().canonicalize().unwrap().join("workspace");
         let folder = root.join("folder");
         fs::create_dir_all(&folder).unwrap();
@@ -747,15 +752,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn a_replaced_workspace_is_refused_by_read_file() {
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path().canonicalize().unwrap().join("workspace");
-        let neighbor = fixture.path().join("neighbor");
-        fs::create_dir(&root).unwrap();
-        fs::create_dir(&neighbor).unwrap();
-        fs::write(root.join("notes.txt"), "workspace text").unwrap();
-        fs::write(neighbor.join("notes.txt"), "neighbor text").unwrap();
+    fn read_workspace_notes(root: &Path) -> orca_core::tool_types::ToolResult {
         let request = ToolRequest {
             id: "read".into(),
             name: ToolName::ReadFile,
@@ -763,35 +760,76 @@ mod tests {
             target: Some("notes.txt".into()),
             raw_arguments: None,
         };
+        read_file::execute(&request, root, 4096)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_swapped_for_a_link_before_the_first_read_is_refused() {
+        let fixture = workspace_tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let root = base.join("workspace");
+        let neighbor = base.join("neighbor");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&neighbor).unwrap();
+        fs::write(neighbor.join("notes.txt"), "neighbor text").unwrap();
+        let accepted = root.canonicalize().unwrap();
+        fs::rename(&root, base.join("previous")).unwrap();
+        symlink(&neighbor, &root).unwrap();
+        assert_eq!(
+            read_workspace_notes(&accepted).error.as_deref().unwrap(),
+            format!(
+                "workspace path changed while Orca was running: {}",
+                accepted.display()
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    fn read_after_reclone(new_session: bool) {
+        let fixture = workspace_tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("notes.txt"), "original").unwrap();
+        let accepted = root.canonicalize().unwrap();
         assert!(
-            read_file::execute(&request, &root, 4096)
+            read_workspace_notes(&accepted)
                 .output
                 .unwrap()
-                .contains("workspace text")
+                .contains("original")
         );
-        fs::rename(&root, fixture.path().join("previous")).unwrap();
-        symlink(&neighbor, &root).unwrap();
-        let expected = format!(
-            "workspace root changed while Orca was running: {}",
-            root.display()
-        );
-        assert_eq!(
-            read_file::execute(&request, &root, 4096).error.as_deref(),
-            Some(expected.as_str())
-        );
-        fs::remove_file(&root).unwrap();
+        fs::rename(&root, root.with_file_name("previous")).unwrap();
         fs::create_dir(&root).unwrap();
-        fs::write(root.join("notes.txt"), "new directory").unwrap();
-        assert_eq!(
-            read_file::execute(&request, &root, 4096).error.as_deref(),
-            Some(expected.as_str())
+        fs::write(root.join("notes.txt"), "recloned").unwrap();
+        let accepted = if new_session {
+            root.canonicalize().unwrap()
+        } else {
+            accepted
+        };
+        assert!(
+            read_workspace_notes(&accepted)
+                .output
+                .unwrap()
+                .contains("recloned")
         );
     }
 
     #[cfg(unix)]
     #[test]
+    fn a_recloned_workspace_at_the_same_path_keeps_working() {
+        read_after_reclone(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_session_after_a_reclone_reads_normally() {
+        read_after_reclone(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_workspace_root_swapped_after_resolution_is_refused() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = workspace_tempdir().unwrap();
         let root = fixture.path().canonicalize().unwrap().join("workspace");
         let neighbor = fixture.path().join("neighbor");
         fs::create_dir(&root).unwrap();
@@ -807,7 +845,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_outward_link_in_a_parent_is_refused() {
-        let fixture = tempfile::tempdir().unwrap();
+        let fixture = workspace_tempdir().unwrap();
         let root = fixture.path().canonicalize().unwrap().join("workspace");
         let neighbor = fixture.path().join("neighbor");
         fs::create_dir(&root).unwrap();
@@ -1034,7 +1072,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mcp_tool_execution_observes_cancel_callback() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         let server = temp_dir.path().join("slow_mcp_server.sh");
         fs::write(
             &server,
@@ -1361,7 +1399,7 @@ done
     fn external_tool_runs_to_completion_without_an_administrator_cap() {
         // `shell_timeout_secs = 0` is the default and sets no cap; it must
         // not become a one-second limit on every external tool.
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = workspace_tempdir().unwrap();
         let external_tools = vec![ExternalToolConfig {
             name: "slow_lookup".to_string(),
             description: "takes a moment".to_string(),
@@ -1395,7 +1433,7 @@ done
 
     #[test]
     fn external_tool_stops_at_the_administrator_cap() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = workspace_tempdir().unwrap();
         let external_tools = vec![ExternalToolConfig {
             name: "slow_lookup".to_string(),
             description: "takes too long".to_string(),
@@ -1458,7 +1496,7 @@ done
 
     #[test]
     fn registry_executes_glob_with_pattern_and_path() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         fs::create_dir_all(temp_dir.path().join("src/bin")).expect("fixture dir");
         fs::write(temp_dir.path().join("src/lib.rs"), "lib").expect("fixture");
         fs::write(temp_dir.path().join("src/bin/main.rs"), "main").expect("fixture");
@@ -1483,7 +1521,7 @@ done
 
     #[test]
     fn registry_executes_glob_with_workspace_prefixed_pattern_from_dot_path() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         fs::create_dir_all(temp_dir.path().join("src/bin")).expect("fixture dir");
         fs::write(temp_dir.path().join("src/lib.rs"), "lib").expect("fixture");
         fs::write(temp_dir.path().join("src/bin/main.rs"), "main").expect("fixture");
@@ -1508,7 +1546,7 @@ done
 
     #[test]
     fn registry_executes_glob_with_no_matches() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         fs::create_dir_all(temp_dir.path()).expect("fixture dir");
         let reg = registry::default_tool_registry();
         let request = ToolRequest {
@@ -1531,7 +1569,7 @@ done
 
     #[test]
     fn registry_executes_glob_with_fuzzy_query() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         fs::create_dir_all(temp_dir.path().join("src/runtime/config")).expect("fixture dir");
         fs::write(temp_dir.path().join("src/runtime/config/mod.rs"), "mod").expect("fixture");
         let reg = registry::default_tool_registry();
@@ -1579,7 +1617,7 @@ done
 
     #[test]
     fn registry_executes_glob_with_truncated_kind() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         fs::create_dir_all(temp_dir.path().join("src")).expect("fixture dir");
         fs::write(temp_dir.path().join("src/alpha.rs"), "alpha").expect("fixture");
         fs::write(temp_dir.path().join("src/bravo.rs"), "bravo").expect("fixture");
@@ -1603,7 +1641,7 @@ done
 
     #[test]
     fn registry_executes_builtin_tool_by_registered_name() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let temp_dir = workspace_tempdir().expect("temp dir");
         fs::write(temp_dir.path().join("note.txt"), "hello registry\n").expect("fixture");
         let reg = registry::default_tool_registry();
         let request = ToolRequest {

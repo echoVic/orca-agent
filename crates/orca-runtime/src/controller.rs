@@ -2250,6 +2250,18 @@ fn run_thread_turn_inner_with_events_outcome<W: io::Write>(
     thread_extensions: Option<Arc<ExtensionData>>,
     turn_extension_id: Option<String>,
 ) -> io::Result<ThreadTurnOutcome> {
+    let mut turn_config = config.clone();
+    turn_config
+        .tools
+        .workspace_read_root
+        .get_or_insert_with(|| session.workspace_read_root.clone());
+    if turn_config.workflows.user_directory.is_none() {
+        turn_config
+            .workflows
+            .user_directory
+            .clone_from(&session.user_workflow_directory);
+    }
+    let config = &turn_config;
     let thread_extensions =
         Some(thread_extensions.unwrap_or_else(|| session.runtime_extensions(lifecycle.run_id())));
     let turn_extension_id =

@@ -1196,9 +1196,14 @@ impl WorkflowRunner {
         access: ScriptPathAccess<'_>,
     ) -> io::Result<PreparedWorkflowRun> {
         let mut request = request;
-        let cwd = match self.config.cwd.clone() {
-            Some(cwd) => cwd,
-            None => std::env::current_dir()?,
+        let cwd = match &self.config.tools.workspace_read_root {
+            Some(cwd) => cwd.clone(),
+            None => self
+                .config
+                .cwd
+                .clone()
+                .map_or_else(std::env::current_dir, Ok)?
+                .canonicalize()?,
         };
         if matches!(access, ScriptPathAccess::Model)
             && let Some(run_id) = request.input.resume_from_run_id.as_deref()
@@ -1212,7 +1217,7 @@ impl WorkflowRunner {
         let access = if let Some(draft) = request.input.draft_id.as_deref() {
             super::draft::validate_draft_id(draft)?;
             if matches!(access, ScriptPathAccess::Model) {
-                orca_tools::pin_read_root(&cwd)?;
+                orca_tools::open_workspace_root(&cwd)?;
             }
             ScriptPathAccess::Draft(&self.session_dir)
         } else {
@@ -1243,6 +1248,7 @@ impl WorkflowRunner {
             &resolved_input,
             &cwd,
             &persisted_script_path,
+            self.config.workflows.user_directory.as_deref(),
             access,
         )?;
         let normalized_args =

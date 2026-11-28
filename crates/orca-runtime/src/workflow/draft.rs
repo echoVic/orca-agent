@@ -84,7 +84,7 @@ impl WorkflowDraftStore {
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let root = orca_tools::pin_read_root(session)?;
+        let root = session.canonicalize()?;
         let relative = self.draft_path(draft_id);
         let path = root.join(relative.strip_prefix(session).unwrap_or(&relative));
         let file = orca_tools::open_workspace_file(&root, &path)?;

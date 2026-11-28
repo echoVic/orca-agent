@@ -315,6 +315,9 @@ pub struct ToolConfig {
     /// Advertisement only: an exec run without an interactive input transport.
     #[serde(skip)]
     pub headless_exec: bool,
+    /// Canonical workspace path selected by the runtime.
+    #[serde(skip)]
+    pub workspace_read_root: Option<PathBuf>,
 }
 
 /// `run_script`: JavaScript the model writes that calls read-only tools
@@ -370,6 +373,7 @@ impl Default for ToolConfig {
             script: ScriptToolConfig::default(),
             shell_enforcement_decision: None,
             headless_exec: false,
+            workspace_read_root: None,
         }
     }
 }
@@ -461,6 +465,9 @@ pub struct WorkflowConfig {
     pub teams: HashMap<String, WorkflowTeamConfig>,
     #[serde(default)]
     pub capabilities: crate::capability::CapabilitySet,
+    /// User workflow directory resolved when loading configuration.
+    #[serde(skip)]
+    pub user_directory: Option<PathBuf>,
 }
 
 impl Default for WorkflowConfig {
@@ -474,6 +481,7 @@ impl Default for WorkflowConfig {
             keyword_trigger_enabled: true,
             teams: HashMap::new(),
             capabilities: crate::capability::CapabilitySet::read_only(),
+            user_directory: None,
         }
     }
 }

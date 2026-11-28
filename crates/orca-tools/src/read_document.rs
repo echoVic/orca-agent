@@ -459,7 +459,7 @@ mod tests {
 
     /// A workspace holding one file, `name`, with `bytes`.
     fn workspace_with(name: &str, bytes: &[u8]) -> tempfile::TempDir {
-        let cwd = tempfile::tempdir().expect("temp workspace");
+        let cwd = crate::workspace_tempdir().expect("temp workspace");
         fs::write(cwd.path().join(name), bytes).expect("write document fixture");
         cwd
     }
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn read_document_reports_the_pages_deepseek_bills() {
-        let cwd = tempfile::tempdir().expect("temp workspace");
+        let cwd = crate::workspace_tempdir().expect("temp workspace");
         fs::write(cwd.path().join("counted.pdf"), b"%PDF counted").expect("a document");
         fs::write(cwd.path().join("listed.pdf"), b"%PDF listed").expect("a document");
         let fixture = crate::test_http::serve(vec![
@@ -1033,7 +1033,7 @@ mod tests {
         // does not rely on what it still holds.)
         let cwd = workspace_with("partial.pdf", b"%PDF partial");
         fs::write(cwd.path().join("blank.png"), b"\x89PNG blank").expect("write the image");
-        let cache = tempfile::tempdir().expect("a cache dir");
+        let cache = crate::workspace_tempdir().expect("a cache dir");
         crate::ocr_disk_cache::set_test_cache_root(Some(cache.path().to_path_buf()));
         let fixture = crate::test_http::serve(vec![
             (
@@ -1075,7 +1075,7 @@ mod tests {
     fn a_corrupt_disk_entry_is_recognized_again() {
         let bytes = b"%PDF corrupt entry";
         let cwd = workspace_with("report.pdf", bytes);
-        let cache = tempfile::tempdir().expect("a cache dir");
+        let cache = crate::workspace_tempdir().expect("a cache dir");
         crate::ocr_disk_cache::set_test_cache_root(Some(cache.path().to_path_buf()));
         let entry = crate::ocr_disk_cache::entry_path(
             cache.path(),
@@ -1232,7 +1232,7 @@ mod tests {
 
     #[test]
     fn read_document_reports_a_missing_file_as_missing() {
-        let cwd = tempfile::tempdir().expect("temp workspace");
+        let cwd = crate::workspace_tempdir().expect("temp workspace");
 
         let result = execute_or_cancel(
             &read_request("missing", r#"{"path":"missing.pdf"}"#),
@@ -1275,7 +1275,7 @@ mod tests {
 
     #[test]
     fn read_document_refuses_files_over_100_mib() {
-        let cwd = tempfile::tempdir().expect("temp workspace");
+        let cwd = crate::workspace_tempdir().expect("temp workspace");
         // Sparse: only the length is set, so nothing is written.
         fs::File::create(cwd.path().join("big.pdf"))
             .and_then(|file| file.set_len(100 * 1024 * 1024 + 1))

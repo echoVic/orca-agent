@@ -442,7 +442,9 @@ pub(crate) fn execute_workflow_draft_action_tool(
     let session_dir = task_registry.workflow_session_dir(cwd)?;
     let draft_store = WorkflowDraftStore::new(session_dir.join("workflow-drafts"));
     if input.action == "run" {
-        orca_tools::pin_read_root(cwd)?;
+        if let Some(root) = &config.tools.workspace_read_root {
+            orca_tools::open_workspace_root(root)?;
+        }
     }
     let draft = draft_store.load(&input.draft_id)?;
 

@@ -532,7 +532,7 @@ mod tests {
     }
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+        std::env::temp_dir().canonicalize().unwrap().join(format!(
             "orca-{prefix}-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
