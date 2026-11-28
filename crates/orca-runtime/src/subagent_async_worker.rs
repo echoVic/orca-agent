@@ -2491,6 +2491,182 @@ mod tests {
     }
 
     #[test]
+    fn a_heartbeat_recovers_after_a_projection_write_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let PreparedDetachedSubagent {
+            session,
+            registry,
+            task_id,
+            coordinator,
+            prepared,
+            ..
+        } = prepare_detached_subagent(cwd.path(), "Renew after storage recovers");
+        let lease = coordinator.acquire(&prepared).unwrap();
+        let store = registry.continuation_store().unwrap();
+
+        // Make only the task projection unavailable during renewal.
+        let tasks = home
+            .path()
+            .join("task-sessions")
+            .join(session)
+            .join("tasks.json");
+        let parked = tasks.with_file_name("tasks.parked");
+        std::fs::rename(&tasks, &parked).unwrap();
+        std::fs::create_dir(&tasks).unwrap();
+        let failure = coordinator.renew(&lease, lease.revision).unwrap_err();
+        std::fs::remove_dir(&tasks).unwrap();
+        std::fs::rename(&parked, &tasks).unwrap();
+        assert!(matches!(
+            failure,
+            crate::agent_continuation::AgentContinuationError::Persistence { .. }
+        ));
+        let committed = store.load_record(&lease.continuation_id).unwrap().unwrap();
+        assert_eq!(committed.revision.get(), lease.revision.get() + 1);
+        assert_eq!(
+            registry
+                .continuation_projection(&task_id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            lease.revision
+        );
+
+        // The failed renewal leaves the heartbeat holding the old revision.
+        let revision = Arc::new(Mutex::new(lease.revision));
+        let cancel = CancelToken::new();
+        let heartbeat = SubagentLeaseHeartbeat::start(
+            None,
+            coordinator,
+            lease.clone(),
+            Arc::clone(&revision),
+            Some(cancel.clone()),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while *revision.lock().unwrap() == lease.revision
+            && !cancel.is_cancelled()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(heartbeat);
+
+        assert!(!cancel.is_cancelled(), "a projection failure ended the run");
+        let renewed = store.load_record(&lease.continuation_id).unwrap().unwrap();
+        assert!(renewed.revision > committed.revision);
+        assert_eq!(renewed.revision, *revision.lock().unwrap());
+        assert_eq!(renewed.current_attempt.attempt_id, lease.attempt_id);
+        assert_eq!(
+            renewed.current_attempt.owner_id.as_deref(),
+            Some(lease.owner_id.as_str())
+        );
+        assert_eq!(renewed.current_attempt.lease_epoch, lease.lease_epoch);
+        assert!(
+            renewed.current_attempt.lease_expires_at_ms
+                > committed.current_attempt.lease_expires_at_ms
+        );
+        assert_eq!(
+            registry
+                .continuation_projection(&task_id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            renewed.revision
+        );
+    }
+
+    #[test]
+    fn a_stale_worker_cannot_renew_a_replacement_lease() {
+        use crate::agent_continuation::AgentContinuationError;
+        use crate::child_agent_types::ChildAgentCheckpointObservation;
+        use orca_core::conversation::Conversation;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::history::redirect_test_orca_home(home.path());
+        let PreparedDetachedSubagent {
+            registry,
+            coordinator,
+            prepared,
+            ..
+        } = prepare_detached_subagent(cwd.path(), "Original worker");
+        let old_lease = coordinator.acquire(&prepared).unwrap();
+        let (observer, revision) =
+            build_checkpoint_observer(coordinator.clone(), old_lease.clone(), &prepared);
+        let mut conversation = Conversation::new();
+        conversation.add_user("Inspect the workspace.".into());
+        conversation.add_assistant(Some("Inspection complete.".into()), None, vec![]);
+        observer
+            .checkpoint(ChildAgentCheckpointObservation {
+                conversation: &conversation,
+                turn: 1,
+                usage: Default::default(),
+                last_tool_boundary: None,
+            })
+            .unwrap();
+        coordinator
+            .commit_terminal(
+                &old_lease,
+                *revision.lock().unwrap(),
+                AgentTerminal::Completed { result: None },
+            )
+            .unwrap();
+
+        let replacement =
+            ChildAgentCoordinator::with_owner_id(registry.clone(), "replacement-worker".into())
+                .unwrap();
+        let task = registry.create_subagent("Continue inspection".into(), None);
+        let resumed = replacement
+            .prepare_resume(ResumeContinuationInput {
+                selector: old_lease.continuation_id.to_string(),
+                parent_task_id: None,
+                task_id: task.id,
+                prompt_id: AgentPromptId::new(),
+                compatibility: prepared.compatibility,
+            })
+            .unwrap();
+        let new_lease = replacement.acquire(&resumed).unwrap();
+        assert_ne!(old_lease.attempt_id, new_lease.attempt_id);
+        assert_ne!(old_lease.owner_id, new_lease.owner_id);
+        assert!(new_lease.lease_epoch > old_lease.lease_epoch);
+        assert!(matches!(
+            coordinator.renew(&old_lease, *revision.lock().unwrap()),
+            Err(AgentContinuationError::RevisionConflict { .. })
+        ));
+
+        let cancel = CancelToken::new();
+        let heartbeat = SubagentLeaseHeartbeat::start(
+            None,
+            coordinator,
+            old_lease,
+            revision,
+            Some(cancel.clone()),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cancel.is_cancelled() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(heartbeat);
+
+        let current = registry
+            .continuation_store()
+            .unwrap()
+            .load_record(&new_lease.continuation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.revision, new_lease.revision,
+            "the stale worker renewed the replacement lease"
+        );
+        assert_eq!(
+            current.current_attempt.lease_expires_at_ms,
+            Some(new_lease.expires_at_ms)
+        );
+        assert!(cancel.is_cancelled(), "the stale worker kept running");
+    }
+
+    #[test]
     fn a_storage_hiccup_while_renewing_the_continuation_lease_keeps_the_run_going() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
