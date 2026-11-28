@@ -113,7 +113,8 @@ A running turn shows an activity line above the input:
   kitty, or WezTerm.
 - `Alt+↑` edits the latest queued message.
 - `Ctrl+B` with an empty input moves the turn to the background, where it keeps
-  running while you start something else.
+  running while you start something else. A turn with subagents running inside
+  the TUI stays in the foreground.
 
 ## Approvals
 
@@ -183,11 +184,19 @@ whose command was still running when Orca exited says `state unknown`.
 `/agents` opens the Agent Workspace, which lists every task with its status.
 Select one and press `Enter`:
 
-- a running agent opens its live conversation, or its live activity while
-  another turn is running;
-- a finished agent opens its transcript;
-- a resumable agent also offers `r` to resume, `R` to retry, and
-  `/task-follow-up` to send it a follow-up.
+- a subagent running inside the TUI opens its live conversation, even while
+  the main turn runs;
+- a finished in-process subagent opens a read-only conversation, including
+  after `--resume`. If it cannot be loaded, you see the last checkpoint if
+  available;
+- tasks without a conversation of their own open their transcript. Resumable
+  tasks may also offer `r` to resume, `R` to retry, and `/task-follow-up`.
+
+With an empty composer, you can also select a subagent in the dock with
+`Shift+↑` or `Shift+↓`, then press `Enter`. `Esc` closes an open panel first;
+from the agent conversation it returns to main without interrupting it. Press
+`s` on an in-process subagent in `/agents` to stop just that agent. These
+subagents cannot ask for approval, and they stop when the TUI quits.
 
 ## Plan mode
 
