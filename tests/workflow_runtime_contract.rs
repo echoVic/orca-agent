@@ -378,6 +378,10 @@ fn workflow_resume_uses_completed_agent_cache() {
 #[cfg(unix)]
 #[test]
 fn workflow_resume_stops_when_an_agent_cache_cannot_be_verified() {
+    if !orca_runtime::workflow::host::WorkflowHost::node_available() {
+        return;
+    }
+
     let temp = tempdir().unwrap();
     let script = temp.path().join("workflow.js");
     fs::write(
