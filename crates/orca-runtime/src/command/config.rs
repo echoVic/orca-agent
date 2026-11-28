@@ -94,7 +94,7 @@ pub(crate) fn user_workflow_directory() -> Option<PathBuf> {
 }
 
 // The directory may be created later when the user saves their first workflow.
-fn canonicalize_config_path(path: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn canonicalize_config_path(path: &Path) -> std::io::Result<PathBuf> {
     match path.canonicalize() {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let Some((parent, name)) = path.parent().zip(path.file_name()) else {
@@ -108,6 +108,30 @@ fn canonicalize_config_path(path: &Path) -> std::io::Result<PathBuf> {
 
 pub(crate) fn accept_workspace(config: &mut RunConfig, cwd: &Path) -> std::io::Result<()> {
     config.tools.workspace_read_root = Some(cwd.canonicalize()?);
+    Ok(())
+}
+
+pub(crate) fn inherit_workspace(
+    config: &mut RunConfig,
+    accepted: &RunConfig,
+    cwd: &Path,
+) -> std::io::Result<()> {
+    let accepted_cwd = accepted
+        .cwd
+        .clone()
+        .map_or_else(std::env::current_dir, Ok)?;
+    if cwd == accepted_cwd
+        && let Some(root) = &accepted.tools.workspace_read_root
+    {
+        config.tools.workspace_read_root = Some(root.clone());
+    } else {
+        accept_workspace(config, cwd)?;
+    }
+    config.cwd = Some(cwd.to_path_buf());
+    config
+        .workflows
+        .user_directory
+        .clone_from(&accepted.workflows.user_directory);
     Ok(())
 }
 

@@ -20187,9 +20187,21 @@ impl ThreadActor {
                 let initial_generation = GenerationFence::initial(operation_id);
                 let completion = OperationCompletion::new();
                 let mut request = *request;
-                let mut config = config
-                    .map(|config| *config)
-                    .unwrap_or_else(|| self.config.clone());
+                let mut config = if let Some(mut config) = config {
+                    let cwd = config.cwd.clone().map_or_else(std::env::current_dir, Ok);
+                    if let Err(error) = cwd.and_then(|cwd| {
+                        crate::command::config::inherit_workspace(&mut config, &self.config, &cwd)
+                    }) {
+                        self.state = Some(state);
+                        let _ = reply.send(Err(RuntimeHostError::ThreadStartFailed {
+                            message: format!("cannot resolve workspace: {error}"),
+                        }));
+                        return;
+                    }
+                    *config
+                } else {
+                    self.config.clone()
+                };
                 if request.operation_kind() == &HostedOperationKind::GoalRun {
                     request.task_description = None;
                     request.task_id = None;
