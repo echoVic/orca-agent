@@ -2665,11 +2665,15 @@ impl RuntimeThreadStartRequest {
             .config
             .cwd
             .clone()
-            .map_or_else(std::env::current_dir, Ok);
-        cwd.and_then(|cwd| crate::command::config::accept_workspace(&mut self.config, &cwd))
+            .map_or_else(std::env::current_dir, Ok)
+            .and_then(|cwd| {
+                crate::command::config::accept_workspace(&mut self.config, &cwd)?;
+                Ok(cwd)
+            })
             .map_err(|error| RuntimeHostError::ThreadStartFailed {
                 message: format!("cannot resolve workspace: {error}"),
             })?;
+        self.config.cwd = Some(cwd);
         if self.config.workflows.user_directory.is_none() {
             self.config.workflows.user_directory =
                 crate::command::config::user_workflow_directory();
@@ -12190,13 +12194,16 @@ pub fn hydrate_run_config_from_surface_settings(
         }
     };
     apply_runtime_settings_patch(config, &mut restored, &approval_patch)?;
-    if config.cwd.as_deref() != Some(settings.cwd.as_path()) {
-        let existing_cwd = config.cwd.clone().or_else(|| std::env::current_dir().ok());
-        if existing_cwd.as_deref() != Some(settings.cwd.as_path()) {
-            crate::command::config::accept_workspace(config, settings.cwd.as_path())
-                .map_err(|_| surface::SurfaceClientCommandError::RuntimeUnavailable)?;
-        }
-        config.cwd = Some(settings.cwd.as_path().to_path_buf());
+    if config.cwd.as_deref() != Some(settings.cwd.as_path())
+        || config.tools.workspace_read_root.is_none()
+    {
+        apply_runtime_settings_patch(
+            config,
+            &mut restored,
+            &surface::RuntimeSettingsPatch::SetCwd {
+                cwd: settings.cwd.clone(),
+            },
+        )?;
     }
     apply_runtime_settings_patch(
         config,
@@ -35645,6 +35652,77 @@ mod tests {
             thread.shutdown().unwrap();
             host.shutdown().unwrap();
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hydrated_process_workspace_refuses_a_later_link_swap() {
+        const CHILD: &str = "ORCA_TEST_HYDRATED_PROCESS_WORKSPACE";
+        if std::env::var_os(CHILD).is_none() {
+            // Changing the working directory here would affect the other tests.
+            let fixture = tempfile::tempdir().unwrap();
+            let cwd = fixture.path().join("workspace");
+            std::fs::create_dir(&cwd).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .current_dir(cwd)
+                .env(CHILD, "1")
+                .args([
+                    "--exact",
+                    concat!(
+                        module_path!(),
+                        "::hydrated_process_workspace_refuses_a_later_link_swap"
+                    )
+                    .split_once("::")
+                    .unwrap()
+                    .1,
+                ])
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}"
+            );
+            return;
+        }
+
+        let cwd = std::env::current_dir().unwrap();
+        let saved = surface_test_config(cwd.clone(), HistoryMode::Disabled);
+        let snapshot = initial_surface_snapshot(
+            surface::SurfaceThreadId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+            surface::SurfaceIncarnation::try_from_bytes(*uuid::Uuid::now_v7().as_bytes()).unwrap(),
+            surface::ThreadOwnerEpoch::new(1),
+            surface::ThreadPersistence::EphemeralAttached,
+            &saved,
+            "restored workspace",
+            None,
+        )
+        .unwrap();
+        let mut config = RunConfig::default();
+        hydrate_run_config_from_surface_settings(&mut config, &snapshot.settings.effective)
+            .unwrap();
+
+        let moved = cwd.with_file_name("moved");
+        std::fs::rename(&cwd, &moved).unwrap();
+        std::fs::write(moved.join("notes.txt"), "original").unwrap();
+        std::os::unix::fs::symlink(&moved, &cwd).unwrap();
+        let request = orca_core::tool_types::ToolRequest {
+            id: "read-notes".into(),
+            name: orca_core::tool_types::ToolName::ReadFile,
+            action: orca_core::approval_types::ActionKind::Read,
+            target: Some("notes.txt".into()),
+            raw_arguments: Some(r#"{"path":"notes.txt"}"#.into()),
+        };
+        let context = orca_tools::ToolContext::new(config.cwd.as_deref().unwrap())
+            .with_workspace_read_root(config.tools.workspace_read_root.as_deref());
+        let result = orca_tools::registry::default_tool_registry().execute(&request, &context);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("workspace path changed")),
+            "{result:?}"
+        );
     }
 
     #[test]
