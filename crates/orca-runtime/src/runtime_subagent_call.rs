@@ -2207,10 +2207,10 @@ fn execute_acquired_sync_subagent(
             );
         }
     }
-    let cancel = task_registry
+    let child_cancel = task_registry
         .get(&registry_task_id)
         .map(|task| task.control.cancel)
-        .unwrap_or(cancel);
+        .unwrap_or_else(CancelToken::new);
     let continuation_start = if is_resume {
         let Some(checkpoint) = prepared.checkpoint.clone() else {
             let output = continuation_started_failure(
@@ -2403,12 +2403,30 @@ fn execute_acquired_sync_subagent(
             emitter: Arc::clone(&activity),
         }),
     );
+    let (cancel_watch_stop, cancel_watch_receiver) = mpsc::channel();
+    let parent_cancel = cancel;
+    let child_cancel_watch = child_cancel.clone();
+    let cancel_watcher = thread::spawn(move || {
+        loop {
+            match cancel_watch_receiver.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if parent_cancel.is_cancelled() {
+                child_cancel_watch.cancel();
+                return;
+            }
+            if child_cancel_watch.is_cancelled() {
+                return;
+            }
+        }
+    });
     let heartbeat = SubagentLeaseHeartbeat::start(
         None,
         coordinator.clone(),
         lease.clone(),
         Arc::clone(&shared_revision),
-        Some(cancel.clone()),
+        Some(child_cancel.clone()),
     );
     let child = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
@@ -2419,7 +2437,7 @@ fn execute_acquired_sync_subagent(
             memory: &memory,
             mcp_registry: &mcp_registry,
             hooks: &hooks,
-            cancel: &cancel,
+            cancel: &child_cancel,
             lifecycle: Some(&mut lifecycle),
             task_registry: Some(&task_registry),
             root_task_id: root_task_id.as_deref(),
@@ -2431,6 +2449,8 @@ fn execute_acquired_sync_subagent(
         });
         run_child_agent(&child_config, &child_request, &mut runtime)
     }));
+    let _ = cancel_watch_stop.send(());
+    let _ = cancel_watcher.join();
     let claim_cleanup_error = child_request
         .workflow_ipc
         .as_ref()
