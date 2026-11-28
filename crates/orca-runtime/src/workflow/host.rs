@@ -25,26 +25,7 @@ use orca_platform::process::ProcessJob;
 use super::ipc::WorkflowIpcContext;
 
 const WORKFLOW_HOST_MODULE: &[u8] = include_bytes!("host.mjs");
-const WORKFLOW_HOST_BOOTSTRAP: &str = r#"
-import { createHash } from 'node:crypto';
-import { readSync } from 'node:fs';
-function receive(length) {
-  const bytes = Buffer.alloc(length);
-  for (let offset = 0; offset < bytes.length;) {
-    const read = readSync(0, bytes, offset, bytes.length - offset, null);
-    if (!read) throw new Error('workflow host input ended early');
-    offset += read;
-  }
-  return bytes;
-}
-const module = receive(Number(process.argv[8]));
-if (createHash('sha256').update(module).digest('hex') !== process.argv[9]) {
-  throw new Error('workflow host module changed before launch');
-}
-const script = receive(Number(process.argv[10]));
-const host = await import('data:text/javascript;base64,' + module.toString('base64'));
-host.run(script);
-"#;
+const WORKFLOW_HOST_BOOTSTRAP: &str = include_str!("host_bootstrap.mjs");
 
 const MAX_WORKFLOW_HOST_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKFLOW_HOST_EVENTS: usize = 8_192;
