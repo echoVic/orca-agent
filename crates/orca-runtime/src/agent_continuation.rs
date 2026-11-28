@@ -1637,6 +1637,7 @@ pub(crate) struct PreparedContinuation {
     /// Compatibility and workspace identity the child loop must retain.
     pub(crate) compatibility: ContinuationCompatibility,
     pub(crate) fork_prefix: Option<Arc<ProviderForkPrefix>>,
+    fork_prefix_ref: Option<Sha256Digest>,
     /// Source checkpoint for resume, or the latest checkpoint after settlement.
     pub(crate) checkpoint: Option<AgentCheckpoint>,
     /// Current durable revision to use when acquiring or committing.
@@ -1667,6 +1668,7 @@ impl From<&AgentContinuationRecord> for PreparedContinuation {
                 compatibility_hash: record.compatibility_hash,
             },
             fork_prefix: None,
+            fork_prefix_ref: None,
             checkpoint: record.checkpoint.clone(),
             revision: record.revision,
             source_task_id: record.source_task_id.clone(),
@@ -2996,6 +2998,7 @@ impl ChildAgentCoordinator {
                 self.install_projection(&record)?;
                 return Ok(PreparedContinuation {
                     fork_prefix,
+                    fork_prefix_ref: existing_fork_prefix_ref,
                     ..PreparedContinuation::from(&record)
                 });
             }
@@ -3046,6 +3049,7 @@ impl ChildAgentCoordinator {
         self.install_projection(&record)?;
         Ok(PreparedContinuation {
             fork_prefix,
+            fork_prefix_ref,
             ..PreparedContinuation::from(&record)
         })
     }
@@ -3060,6 +3064,7 @@ impl ChildAgentCoordinator {
             .load_child_fork_prefix(&record.continuation_id, reference)?;
         Ok(PreparedContinuation {
             fork_prefix,
+            fork_prefix_ref: reference,
             ..PreparedContinuation::from(record)
         })
     }
@@ -3181,6 +3186,7 @@ impl ChildAgentCoordinator {
         let expected_revision = record.revision;
         let previous = self.prepare_record(&record)?;
         let fork_prefix = previous.fork_prefix.clone();
+        let fork_prefix_ref = previous.fork_prefix_ref;
         let prompt_id = input.prompt_id;
         let task_id = input.task_id;
         let parent_task_id = input.parent_task_id;
@@ -3217,6 +3223,7 @@ impl ChildAgentCoordinator {
                     };
                     record.latest_task_id = task_id;
                     record.parent_task_id = parent_task_id;
+                    record.fork_prefix_ref = record.fork_prefix_ref.or(fork_prefix_ref);
                     record.active_tool_boundary = None;
                     record.terminal = None;
                     record.updated_at_ms = now_ms;
@@ -3225,6 +3232,7 @@ impl ChildAgentCoordinator {
         self.install_projection(&committed)?;
         Ok(PreparedContinuation {
             fork_prefix,
+            fork_prefix_ref,
             ..PreparedContinuation::from(&committed)
         })
     }
@@ -3488,6 +3496,7 @@ impl ChildAgentCoordinator {
                 record.current_attempt.owner_id = Some(owner_id);
                 record.current_attempt.lease_expires_at_ms = Some(expires_at_ms);
                 record.current_attempt.started_at_ms = Some(now_ms);
+                record.fork_prefix_ref = record.fork_prefix_ref.or(prepared.fork_prefix_ref);
                 record.updated_at_ms = now_ms;
                 Ok(())
             },
@@ -5358,6 +5367,71 @@ mod tests {
             Some(test_fork_prefix().messages.as_slice())
         );
     }
+
+    #[test]
+    fn resuming_a_legacy_fork_record_restores_its_inline_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::new_persistent("parent".into(), root.path().into()).unwrap();
+        let child = create_test_fork(&registry);
+        let coordinator = ChildAgentCoordinator::new(registry.clone()).unwrap();
+        let lease = coordinator.acquire(&child).unwrap();
+        let saved = coordinator
+            .commit_checkpoint(
+                &lease,
+                lease.revision,
+                checkpoint(lease.attempt_id.clone(), 0, 0),
+            )
+            .unwrap();
+        coordinator
+            .commit_terminal(
+                &lease,
+                saved.revision,
+                AgentTerminal::Completed { result: None },
+            )
+            .unwrap();
+
+        let id = &child.continuation_id;
+        let path = continuation_record_path(root.path(), "parent", id);
+        let association = fork_child_path(root.path(), "parent", id);
+        let associated_digest = fs::read(&association).unwrap();
+        let rewrite_as_older_release = || {
+            let older: legacy_v0_5_25::AgentContinuationRecord =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            fs::write(&path, serde_json::to_vec(&older).unwrap()).unwrap();
+        };
+        rewrite_as_older_release();
+        let task = test_continuation_input(&registry);
+        let resumed = coordinator
+            .prepare_resume(ResumeContinuationInput {
+                selector: id.to_string(),
+                parent_task_id: task.parent_task_id,
+                task_id: task.task_id,
+                prompt_id: task.prompt_id,
+                compatibility: child.compatibility,
+            })
+            .unwrap();
+        assert_eq!(resumed.fork_prefix, child.fork_prefix);
+        fs::remove_file(&association).unwrap();
+        let prepared = coordinator.prepared(id.as_str()).unwrap();
+        assert!(
+            prepared.fork_prefix.is_some(),
+            "resume lost the inline fork reference"
+        );
+        assert_eq!(prepared.fork_prefix, child.fork_prefix);
+
+        fs::write(&association, associated_digest).unwrap();
+        rewrite_as_older_release();
+        let prepared = coordinator.prepared(id.as_str()).unwrap();
+        coordinator.acquire(&prepared).unwrap();
+        fs::remove_file(&association).unwrap();
+        let prepared = coordinator.prepared(id.as_str()).unwrap();
+        assert!(
+            prepared.fork_prefix.is_some(),
+            "acquire lost the inline fork reference"
+        );
+        assert_eq!(prepared.fork_prefix, child.fork_prefix);
+    }
+
     #[test]
     fn custom_agent_snapshot_does_not_change_legacy_builtin_hash_or_record_shape() {
         let delegation = DelegationSnapshot::default();
@@ -5432,6 +5506,7 @@ mod tests {
                 compatibility_hash: legacy_hash,
             },
             fork_prefix: None,
+            fork_prefix_ref: None,
             checkpoint: None,
             revision: ContinuationRevision::ZERO,
             source_task_id: "task-source".to_string(),
