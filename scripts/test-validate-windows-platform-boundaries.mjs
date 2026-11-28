@@ -400,9 +400,11 @@ const grepSource = readFileSync(
   path.join(repoRoot, "crates/orca-tools/src/grep.rs"),
   "utf8",
 );
-assert.ok(
-  grepSource.includes("spawn_read_only_helper("),
-  "grep must enter the execution broker through the restricted helper launcher",
+assert.match(grepSource, /open_file_in\(/, "grep must use verified file handles");
+assert.doesNotMatch(
+  grepSource,
+  /(?:Command::new|crate::process::spawn_)/,
+  "grep must search in process",
 );
 const verificationSource = readFileSync(
   path.join(repoRoot, "crates/orca-core/src/verification.rs"),
