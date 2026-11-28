@@ -2667,7 +2667,13 @@ impl RuntimeThreadStartRequest {
             .clone()
             .map_or_else(std::env::current_dir, Ok)
             .and_then(|cwd| {
-                crate::command::config::accept_workspace(&mut self.config, &cwd)?;
+                // Hosted agents receive the parent's config for this cwd.
+                if self.agent_type.is_none()
+                    || self.config.cwd.is_none()
+                    || self.config.tools.workspace_read_root.is_none()
+                {
+                    crate::command::config::accept_workspace(&mut self.config, &cwd)?;
+                }
                 Ok(cwd)
             })
             .map_err(|error| RuntimeHostError::ThreadStartFailed {
@@ -25150,6 +25156,44 @@ mod tests {
         );
         assert!(!child.config.computer_use.interactive);
         assert_eq!(child.config.startup_approval_mode, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_started_after_a_link_swap_keeps_the_parents_root() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let replacement = fixture.path().join("replacement");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let config = RunConfig {
+            cwd: Some(workspace.clone()),
+            history_mode: HistoryMode::Disabled,
+            ..Default::default()
+        };
+        let parent = RuntimeThreadStartRequest::new(config, "parent")
+            .prepare()
+            .unwrap();
+        let accepted_root = workspace.canonicalize().unwrap();
+
+        fs::rename(&workspace, fixture.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&replacement, &workspace).unwrap();
+        let child = RuntimeThreadStartRequest::new(parent.request.config, "child")
+            .with_agent_parent(
+                "parent",
+                "parent",
+                1,
+                orca_core::subagent_types::SubagentType::General,
+                "task".to_owned(),
+                TaskRegistry::new("parent".to_owned()),
+            )
+            .prepare()
+            .unwrap();
+
+        assert_eq!(
+            child.request.config.tools.workspace_read_root,
+            Some(accepted_root)
+        );
     }
 
     #[test]
