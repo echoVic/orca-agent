@@ -1,11 +1,15 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::time::Duration;
 
 use ignore::WalkBuilder;
+use orca_core::capability::{
+    CapabilityProcessClass, CapabilityReceipt, CapabilityRequest, CapabilitySet, EnforcementState,
+    SandboxEnforcementDecision,
+};
 use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_output};
 use regex::Regex;
 use serde::Deserialize;
@@ -47,6 +51,24 @@ pub(crate) fn execute_in_session(
     spill_dir: Option<&Path>,
     should_cancel: impl Fn() -> bool,
 ) -> ToolResult {
+    execute_with_read_enforcement(
+        request,
+        cwd,
+        max_bytes,
+        spill_dir,
+        should_cancel,
+        crate::sandbox::enforcement_decision(),
+    )
+}
+
+fn execute_with_read_enforcement(
+    request: &ToolRequest,
+    cwd: &Path,
+    max_bytes: usize,
+    spill_dir: Option<&Path>,
+    should_cancel: impl Fn() -> bool,
+    decision: SandboxEnforcementDecision,
+) -> ToolResult {
     let args = parse_args(request);
     let pattern = args.pattern.as_deref().or(request
         .target
@@ -73,6 +95,26 @@ pub(crate) fn execute_in_session(
         );
     }
 
+    let fallback = |spill| {
+        execute_fallback(
+            request,
+            cwd,
+            pattern,
+            &search_path,
+            spill,
+            max_bytes,
+            &should_cancel,
+        )
+    };
+    if decision.state != EnforcementState::Enforced {
+        return fallback(spill);
+    }
+    let root = match cwd.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            return ToolResult::failed(request, format!("cannot resolve cwd: {error}"), None);
+        }
+    };
     let rg_path = if spill.is_some() {
         Path::new("-")
     } else if Path::new(requested_path).is_absolute() {
@@ -91,33 +133,21 @@ pub(crate) fn execute_in_session(
         }
     };
 
-    let mut command = Command::new("rg");
-    command
-        .args(rg_args(pattern, rg_path))
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    crate::process::prepare_non_interactive_command(&mut command);
-    if let Some(file) = spill.as_ref() {
-        let input = match file.try_clone() {
-            Ok(input) => input,
-            Err(error) => {
-                return ToolResult::failed(
-                    request,
-                    format!("could not read saved tool result: {error}"),
-                    None,
-                );
-            }
-        };
-        // Pass the already verified file as stdin, so the helper never
-        // resolves its pathname again.
-        command.stdin(Stdio::from(input));
-    }
+    let input = match spill.as_ref().map(File::try_clone).transpose() {
+        Ok(input) => input,
+        Err(error) => {
+            return ToolResult::failed(
+                request,
+                format!("could not read saved tool result: {error}"),
+                None,
+            );
+        }
+    };
     let offset = args.offset.unwrap_or(0);
     let limit = normalized_head_limit(args.head_limit);
     let collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
     let max_line_bytes = max_bytes.clamp(MIN_GREP_LINE_BYTES, MAX_GREP_LINE_BYTES);
-    let output = crate::process::spawn_user_trusted(command, "tool:grep", cwd)
+    let output = spawn_rg(&root, &rg_args(pattern, rg_path), input, decision)
         .map(|(child, process_job, _receipt)| (child, process_job))
         .and_then(|(child, process_job)| {
             crate::process::wait_for_child_stdout_lines_with_timeout_or_cancel(
@@ -137,8 +167,17 @@ pub(crate) fn execute_in_session(
 
     match output {
         Ok(output) if output.cancelled => ToolResult::cancelled(request, GREP_CANCELLED, None),
-        Ok(output) if output.status.success() && !output.timed_out => {
-            let ingress_truncated = output.output_was_omitted();
+        Ok(output)
+            if rg_read_completed(
+                output.status.code(),
+                &output.stderr,
+                output.stderr_omitted_bytes,
+            ) && !output.timed_out =>
+        {
+            if output.value.total_lines == 0 {
+                return render_search(request, output.value, max_bytes);
+            }
+            let ingress_truncated = output.stdout_omitted_bytes != 0;
             let (stdout, page_truncated) = output.value.render();
             let (stdout, truncated) = truncate_output(stdout, max_bytes);
             let stdout = crate::process::preserve_ingress_omission_notice(
@@ -173,37 +212,88 @@ pub(crate) fn execute_in_session(
             let stderr = output.stderr_text().trim().to_string();
             ToolResult::failed(request, stderr, output.status.code())
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if let Some(file) = spill {
-                let regex = match Regex::new(pattern) {
-                    Ok(regex) => regex,
-                    Err(error) => return ToolResult::failed(request, error.to_string(), None),
-                };
-                let mut collector = GrepPageCollector::new(offset, limit, max_bytes.max(1));
-                if !search_file(
-                    file,
-                    &search_path,
-                    &regex,
-                    MAX_GREP_LINE_BYTES,
-                    &mut collector,
-                    &should_cancel,
-                ) {
-                    return ToolResult::cancelled(request, GREP_CANCELLED, None);
-                }
-                render_search(request, collector, max_bytes)
-            } else {
-                execute_in_process(
-                    request,
-                    cwd,
-                    pattern,
-                    &search_path,
-                    max_bytes,
-                    &should_cancel,
-                )
-            }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::Unsupported
+            ) =>
+        {
+            fallback(spill)
         }
         Err(error) => ToolResult::failed(request, format!("failed to run rg: {error}"), None),
     }
+}
+
+fn rg_executable(root: &Path) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|directory| directory.is_absolute())
+        .filter_map(|directory| directory.join("rg").canonicalize().ok())
+        .find(|executable| executable.is_file() && !executable.starts_with(root))
+}
+
+fn spawn_rg(
+    root: &Path,
+    args: &[OsString],
+    input: Option<File>,
+    decision: SandboxEnforcementDecision,
+) -> io::Result<(Child, orca_platform::process::ProcessJob, CapabilityReceipt)> {
+    let executable = rg_executable(root).ok_or(io::ErrorKind::NotFound)?;
+    let mut request = CapabilityRequest::new(
+        "tool:grep",
+        CapabilityProcessClass::SandboxedTool,
+        CapabilitySet::read_only(),
+        root,
+    );
+    request.read_roots.push(root.to_owned());
+    crate::process::spawn_read_only_helper(&executable, args, input, request, decision)
+}
+
+fn rg_read_completed(code: Option<i32>, stderr: &[u8], omitted: usize) -> bool {
+    code == Some(0)
+        || (code == Some(2)
+            && omitted == 0
+            && !stderr.is_empty()
+            && String::from_utf8_lossy(stderr).lines().all(|line| {
+                line.starts_with("rg: ")
+                    && (line.ends_with(": Permission denied (os error 13)")
+                        || line.ends_with(": Operation not permitted (os error 1)"))
+            }))
+}
+
+fn execute_fallback(
+    request: &ToolRequest,
+    cwd: &Path,
+    pattern: &str,
+    search_path: &Path,
+    spill: Option<File>,
+    max_bytes: usize,
+    should_cancel: &dyn Fn() -> bool,
+) -> ToolResult {
+    let Some(file) = spill else {
+        return execute_in_process(request, cwd, pattern, search_path, max_bytes, should_cancel);
+    };
+    let regex = match Regex::new(pattern) {
+        Ok(regex) => regex,
+        Err(error) => return ToolResult::failed(request, error.to_string(), None),
+    };
+    let args = parse_args(request);
+    let mut collector = GrepPageCollector::new(
+        args.offset.unwrap_or(0),
+        normalized_head_limit(args.head_limit),
+        max_bytes.max(1),
+    );
+    if !search_file(
+        file,
+        search_path,
+        &regex,
+        MAX_GREP_LINE_BYTES,
+        &mut collector,
+        should_cancel,
+    ) {
+        return ToolResult::cancelled(request, GREP_CANCELLED, None);
+    }
+    render_search(request, collector, max_bytes)
 }
 
 fn rg_args(pattern: &str, search_path: &Path) -> Vec<OsString> {
@@ -479,6 +569,75 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolResultKind, ToolStatus};
 
     use super::*;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn sandboxed_rg_returns_nothing_outside_its_read_roots() {
+        let decision = crate::sandbox::enforcement_decision();
+        if decision.state != EnforcementState::Enforced {
+            eprintln!("restricted reads unavailable on this host");
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(fixture.path().join("neighbor.txt"), "neighbor text\n").unwrap();
+        let args = rg_args("neighbor text", Path::new("../neighbor.txt"));
+        let (child, job, receipt) = match spawn_rg(&root, &args, None, decision) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                eprintln!("rg unavailable on this host");
+                return;
+            }
+            result => result.unwrap(),
+        };
+        let output = crate::process::wait_for_child_stdout_lines_with_timeout_or_cancel(
+            child,
+            job,
+            Duration::from_secs(5),
+            4096,
+            4096,
+            Vec::new(),
+            &|| false,
+            |lines, line| {
+                lines.push(line.bytes.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(output.value.is_empty(), "{output:?}");
+        assert_eq!(receipt.enforcement, EnforcementState::Enforced);
+    }
+
+    #[test]
+    fn grep_uses_the_in_process_search_without_enforced_reads() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("notes.txt"), "needle\n").unwrap();
+        let request = grep_request(r#"{"pattern":"needle","path":"notes.txt"}"#);
+        let decision =
+            SandboxEnforcementDecision::new(EnforcementState::Unavailable, "test", vec![]);
+        let result = execute_with_read_enforcement(
+            &request,
+            workspace.path(),
+            4096,
+            None,
+            || false,
+            decision,
+        );
+        assert_eq!(result.output.as_deref(), Some("notes.txt:1:needle"));
+    }
+
+    #[test]
+    fn a_denied_file_is_skipped_not_a_failed_search() {
+        let denied = b"rg: notes.txt: Permission denied (os error 13)\n";
+        assert!(rg_read_completed(Some(2), denied, 0));
+        assert!(!rg_read_completed(Some(2), denied, 1));
+        assert!(!rg_read_completed(Some(2), b"regex parse error:\n", 0));
+        assert!(!rg_read_completed(
+            Some(2),
+            b"rg: notes.txt: Permission denied (os error 13)\nregex parse error:\n",
+            0
+        ));
+    }
 
     #[test]
     fn rg_args_pass_the_pattern_and_path_as_values() {

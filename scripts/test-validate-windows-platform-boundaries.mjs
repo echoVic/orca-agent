@@ -388,7 +388,6 @@ const atomicJobSpawnContracts = [
   ],
   ["crates/orca-tools/src/external.rs", "spawn_with_capability_profile("],
   ["crates/orca-tools/src/git.rs", "spawn_user_trusted("],
-  ["crates/orca-tools/src/grep.rs", "spawn_user_trusted("],
 ];
 for (const [relativePath, marker] of atomicJobSpawnContracts) {
   const source = readFileSync(path.join(repoRoot, relativePath), "utf8");
@@ -397,6 +396,14 @@ for (const [relativePath, marker] of atomicJobSpawnContracts) {
     `${relativePath} must enter the execution broker before creating its Windows child`,
   );
 }
+const grepSource = readFileSync(
+  path.join(repoRoot, "crates/orca-tools/src/grep.rs"),
+  "utf8",
+);
+assert.ok(
+  grepSource.includes("spawn_read_only_helper("),
+  "grep must enter the execution broker through the restricted helper launcher",
+);
 const verificationSource = readFileSync(
   path.join(repoRoot, "crates/orca-core/src/verification.rs"),
   "utf8",
