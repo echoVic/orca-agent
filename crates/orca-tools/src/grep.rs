@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    OnceLock,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -248,6 +248,17 @@ struct DirectorySearch<'a> {
     ignores: &'a WorkspaceIgnores<'a>,
 }
 
+fn grep_pool(
+    pool: &Mutex<Option<Arc<rayon::ThreadPool>>>,
+    start: impl FnOnce() -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>,
+) -> Option<Arc<rayon::ThreadPool>> {
+    let mut pool = pool.lock().ok()?;
+    if pool.is_none() {
+        *pool = start().ok().map(Arc::new);
+    }
+    pool.clone()
+}
+
 impl DirectorySearch<'_> {
     fn search(
         &self,
@@ -272,20 +283,21 @@ impl DirectorySearch<'_> {
         std::thread::scope(|scope| {
             let (done, receive) = mpsc::sync_channel(1);
             scope.spawn(move || {
-                static POOL: OnceLock<Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>> =
-                    OnceLock::new();
-                let pool = POOL.get_or_init(|| {
-                    let threads = std::thread::available_parallelism()
-                        .map_or(2, usize::from)
-                        .min(8);
-                    rayon::ThreadPoolBuilder::new().num_threads(threads).build()
+                static POOL: Mutex<Option<Arc<rayon::ThreadPool>>> = Mutex::new(None);
+                let pool = (page.offset == 0).then(|| {
+                    grep_pool(&POOL, || {
+                        let threads = std::thread::available_parallelism()
+                            .map_or(2, usize::from)
+                            .min(8);
+                        rayon::ThreadPoolBuilder::new().num_threads(threads).build()
+                    })
                 });
                 let should_stop = || stop_ref.load(Ordering::Relaxed);
-                let result = match pool {
-                    Ok(pool) => {
-                        pool.install(|| self.search_directory(directory, files, page, &should_stop))
-                    }
-                    Err(error) => Err(io::Error::other(error.to_string())),
+                let result = match pool.flatten() {
+                    Some(pool) => pool.install(|| {
+                        self.search_directory(directory, files, page, &should_stop, true)
+                    }),
+                    None => self.search_directory(directory, files, page, &should_stop, false),
                 };
                 let _ = done.send(result);
             });
@@ -311,13 +323,14 @@ impl DirectorySearch<'_> {
         mut files: impl Iterator<Item = PathBuf>,
         page: &mut GrepPageCollector,
         should_stop: &(impl Fn() -> bool + Sync),
+        parallel: bool,
     ) -> io::Result<()> {
         while !should_stop() && (page.offset != 0 || !page.has_next_page()) {
             let batch = files.by_ref().take(128).collect::<Vec<_>>();
             if batch.is_empty() {
                 break;
             }
-            if page.offset != 0 {
+            if !parallel {
                 self.search_files(directory, &batch, self.regex, page, should_stop)?;
                 continue;
             }
@@ -884,6 +897,22 @@ mod tests {
     use orca_core::tool_types::{ToolName, ToolResultKind, ToolStatus};
 
     use super::*;
+
+    #[test]
+    fn grep_retries_starting_the_pool_after_a_failure() {
+        let pool = Mutex::new(None);
+        let failed = grep_pool(&pool, || {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .spawn_handler(|_| Err(io::Error::other("could not start a thread")))
+                .build()
+        });
+        assert!(failed.is_none());
+        let running = grep_pool(&pool, || {
+            rayon::ThreadPoolBuilder::new().num_threads(1).build()
+        });
+        assert!(running.is_some(), "the next search must retry pool startup");
+    }
 
     #[test]
     fn grep_matches_the_whole_line_without_matching_a_cut() {
