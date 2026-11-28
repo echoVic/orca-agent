@@ -64,6 +64,11 @@ impl VerifiedDirectory {
         self.0.read_names()
     }
 
+    pub fn entry_is_directory(&self, name: &OsStr) -> io::Result<bool> {
+        validate_name(name)?;
+        self.0.entry_is_directory(name)
+    }
+
     pub fn identity(&self) -> io::Result<FileIdentity> {
         Ok(file_links(self.0.file())?.identity)
     }
@@ -249,6 +254,15 @@ mod platform {
                 }
             }
             Ok(names)
+        }
+
+        pub(super) fn entry_is_directory(&self, name: &OsStr) -> io::Result<bool> {
+            use rustix::fs::{AtFlags, FileType, statat};
+            let entry = statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            match FileType::from_raw_mode(entry.st_mode) {
+                FileType::Symlink => Err(io::ErrorKind::PermissionDenied.into()),
+                kind => Ok(kind == FileType::Directory),
+            }
         }
 
         pub(super) fn child(&self, name: &OsStr) -> io::Result<Self> {
@@ -451,6 +465,12 @@ mod platform {
             std::fs::read_dir(&self.0.path)?
                 .map(|entry| entry.map(|entry| entry.file_name()))
                 .collect()
+        }
+
+        pub(super) fn entry_is_directory(&self, name: &OsStr) -> io::Result<bool> {
+            let file =
+                self.open_child(name, FILE_READ_ATTRIBUTES, FILE_OPEN, 0, SHARE_READ_WRITE)?;
+            Ok(file.metadata()?.is_dir())
         }
 
         pub(super) fn child(&self, name: &OsStr) -> io::Result<Self> {

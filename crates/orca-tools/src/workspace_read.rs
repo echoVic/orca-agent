@@ -163,15 +163,27 @@ fn open_below(
 /// Check the real location of a listing entry and report whether it is a directory.
 pub(crate) fn listing_entry(root: &Path, path: &Path) -> Option<bool> {
     let canonical = canonical_read_path(root, path).ok()?;
-    let parent = if canonical == root {
-        root
+    let is_directory = if canonical == root {
+        open_root(root).ok()?;
+        true
     } else {
-        canonical.parent()?
+        let parent = open_directory(root, canonical.parent()?).ok()?;
+        parent.entry_is_directory(canonical.file_name()?).ok()?
     };
-    let _parent = open_directory(root, parent).ok()?;
-    let kind = canonical.symlink_metadata().ok()?.file_type();
-    if kind.is_symlink() || canonical_read_path(root, path).ok()? != canonical {
-        return None;
+    (canonical_read_path(root, path).ok()? == canonical).then_some(is_directory)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) mod listing_test {
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub(crate) static BEFORE_EMISSION: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     }
-    Some(kind.is_dir())
+
+    pub(crate) fn before_emission() {
+        if let Some(change) = BEFORE_EMISSION.with(|hook| hook.take()) {
+            change();
+        }
+    }
 }

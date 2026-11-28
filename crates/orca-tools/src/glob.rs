@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::{
     ResolvedWorkspacePath, resolve_workspace_read_path,
-    workspace_read::{listing_entry, open_directory},
+    workspace_read::{listing_entry, open_directory, open_root},
 };
 
 #[derive(Deserialize)]
@@ -94,12 +94,10 @@ pub fn execute_or_cancel(
         );
     }
 
-    let output = paginate_output(
-        matches,
-        args.offset.unwrap_or(0),
-        args.head_limit,
-        DEFAULT_GLOB_HEAD_LIMIT,
-    );
+    let output = match paginate_output(&resolved, matches, &args) {
+        Ok(output) => output,
+        Err(error) => return ToolResult::failed(request, error.to_string(), None),
+    };
     let (output, truncated) = truncate_output(output, max_bytes);
     ToolResult::completed_kind(
         request,
@@ -160,14 +158,15 @@ fn execute_fuzzy(
     let mut matches = Vec::new();
     let mut visited = 0;
     walk_listing(resolved, true, should_cancel, |relative, is_directory| {
-        let candidate = relative_to_workspace(cwd, &resolved.path.join(relative));
+        let path = resolved.path.join(relative);
+        let candidate = relative_to_workspace(cwd, &path);
         let candidate = if is_directory {
             format!("{candidate}/")
         } else {
             candidate
         };
         if let Some(score) = fuzzy_score(&candidate, query) {
-            matches.push((score, candidate));
+            matches.push((score, candidate, path));
         }
         visited += 1;
         visited < MAX_FUZZY_VISITS
@@ -182,7 +181,7 @@ fn execute_fuzzy(
     let matches = matches
         .into_iter()
         .take(MAX_FUZZY_MATCHES)
-        .map(|(_, path)| path)
+        .map(|(_, label, path)| (label, path))
         .collect::<Vec<_>>();
     if matches.is_empty() {
         return Some(ToolResult::completed_kind(
@@ -192,12 +191,10 @@ fn execute_fuzzy(
             ToolResultKind::NoMatches,
         ));
     }
-    let output = paginate_output(
-        matches,
-        args.offset.unwrap_or(0),
-        args.head_limit,
-        DEFAULT_GLOB_HEAD_LIMIT,
-    );
+    let output = match paginate_output(resolved, matches, args) {
+        Ok(output) => output,
+        Err(error) => return Some(ToolResult::failed(request, error.to_string(), None)),
+    };
     let (output, truncated) = truncate_output(output, max_bytes);
     Some(ToolResult::completed_kind(
         request,
@@ -212,26 +209,29 @@ fn execute_fuzzy(
 }
 
 fn paginate_output(
-    lines: Vec<String>,
-    offset: usize,
-    head_limit: Option<usize>,
-    default_limit: usize,
-) -> String {
-    if head_limit == Some(0) {
-        return lines.get(offset..).unwrap_or_default().to_vec().join("\n");
-    }
-
+    resolved: &ResolvedWorkspacePath,
+    lines: Vec<(String, PathBuf)>,
+    args: &GlobArgs,
+) -> std::io::Result<String> {
     let total = lines.len();
-    let limit = head_limit.unwrap_or(default_limit);
-    let page = lines
-        .iter()
+    let offset = args.offset.unwrap_or(0);
+    let limit = match args.head_limit {
+        Some(0) => usize::MAX,
+        Some(limit) => limit,
+        None => DEFAULT_GLOB_HEAD_LIMIT,
+    };
+    let next_offset = (total.saturating_sub(offset) > limit).then(|| offset + limit);
+
+    #[cfg(all(test, unix))]
+    crate::workspace_read::listing_test::before_emission();
+    open_root(&resolved.root)?;
+    let mut output = lines
+        .into_iter()
         .skip(offset)
         .take(limit)
-        .cloned()
-        .collect::<Vec<_>>();
-    let next_offset = (total.saturating_sub(offset) > limit).then_some(offset + limit);
-
-    let mut output = page.join("\n");
+        .filter_map(|(label, path)| listing_entry(&resolved.root, &path).map(|_| label))
+        .collect::<Vec<_>>()
+        .join("\n");
     if let Some(next_offset) = next_offset {
         let notice = if offset == 0 {
             format!("[Showing first {limit} results; use offset={next_offset} to continue]")
@@ -250,7 +250,7 @@ fn paginate_output(
             output.push_str(&notice);
         }
     }
-    output
+    Ok(output)
 }
 
 fn build_matcher(pattern: &str) -> Result<globset::GlobSet, String> {
@@ -268,21 +268,22 @@ fn match_tree(
     resolved: &ResolvedWorkspacePath,
     matcher: &globset::GlobSet,
     should_cancel: &dyn Fn() -> bool,
-) -> Option<Vec<String>> {
+) -> Option<Vec<(String, PathBuf)>> {
     let mut matches = Vec::new();
     walk_listing(resolved, false, should_cancel, |relative, _| {
         if matcher.is_match(relative) {
-            matches.push(relative_to_workspace(cwd, &resolved.path.join(relative)));
+            let path = resolved.path.join(relative);
+            matches.push((relative_to_workspace(cwd, &path), path));
         }
         true
     })?;
     Some(matches)
 }
 
-fn match_file(cwd: &Path, path: &Path, matcher: &globset::GlobSet) -> Vec<String> {
+fn match_file(cwd: &Path, path: &Path, matcher: &globset::GlobSet) -> Vec<(String, PathBuf)> {
     let name = path.file_name().map(PathBuf::from).unwrap_or_default();
     if matcher.is_match(name) {
-        vec![relative_to_workspace(cwd, path)]
+        vec![(relative_to_workspace(cwd, path), path.to_owned())]
     } else {
         Vec::new()
     }
@@ -384,6 +385,36 @@ mod tests {
         crate::tests::symlink(neighbor.path(), &linked).unwrap();
 
         assert_eq!(listing_entry(&root, &linked.join("notes.txt")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_rechecks_selected_entries_before_emission() {
+        let workspace = tempdir().unwrap();
+        let neighbor = tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("notes.txt"), "original").unwrap();
+        fs::write(root.join("keep.txt"), "inside").unwrap();
+        fs::write(neighbor.path().join("notes.txt"), "outside").unwrap();
+        let outside = neighbor.path().to_owned();
+        let old = root.join("old");
+        crate::workspace_read::listing_test::BEFORE_EMISSION.with(|hook| {
+            hook.replace(Some(Box::new(move || {
+                fs::rename(&sub, old).unwrap();
+                crate::tests::symlink(outside, sub).unwrap();
+            })));
+        });
+        let request = ToolRequest {
+            id: "glob-page".into(),
+            name: ToolName::Glob,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: Some(r#"{"pattern":"**/*.txt","head_limit":2}"#.into()),
+        };
+        let result = execute(&request, &root, 4096);
+        assert_eq!(result.output.as_deref(), Some("keep.txt"));
     }
 
     #[test]

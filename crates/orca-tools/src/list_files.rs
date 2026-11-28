@@ -5,7 +5,7 @@ use orca_core::tool_types::{ToolRequest, ToolResult, ToolResultKind, truncate_ou
 
 use crate::{
     resolve_workspace_read_path,
-    workspace_read::{listing_entry, open_directory},
+    workspace_read::{listing_entry, open_directory, open_root},
 };
 
 pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResult {
@@ -34,14 +34,24 @@ pub fn execute(request: &ToolRequest, cwd: &Path, max_bytes: usize) -> ToolResul
         }
     };
 
-    let mut names = Vec::new();
-    for name in entries {
-        if listing_entry(&resolved.root, &resolved.path.join(&name)).is_some() {
-            names.push(name.to_string_lossy().into_owned());
-        }
-    }
+    let mut names = entries
+        .into_iter()
+        .filter_map(|name| {
+            let path = resolved.path.join(&name);
+            listing_entry(&resolved.root, &path)?;
+            Some((name.to_string_lossy().into_owned(), path))
+        })
+        .collect::<Vec<_>>();
     names.sort();
-
+    #[cfg(all(test, unix))]
+    crate::workspace_read::listing_test::before_emission();
+    if let Err(error) = open_root(&resolved.root) {
+        return ToolResult::failed(request, error.to_string(), None);
+    }
+    let names = names
+        .into_iter()
+        .filter_map(|(label, path)| listing_entry(&resolved.root, &path).map(|_| label))
+        .collect::<Vec<_>>();
     let (output, truncated) = truncate_output(names.join("\n"), max_bytes);
     let kind = if output.is_empty() && !truncated {
         ToolResultKind::Empty
@@ -77,6 +87,34 @@ mod tests {
         crate::tests::symlink(neighbor.path(), &linked).unwrap();
 
         assert_eq!(listing_entry(&root, &linked.join("notes")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_files_rechecks_selected_entries_before_emission() {
+        let workspace = tempfile::tempdir().unwrap();
+        let neighbor = tempfile::tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        let changing = root.join("changing.txt");
+        fs::write(&changing, "original").unwrap();
+        fs::write(root.join("keep.txt"), "inside").unwrap();
+        let outside = neighbor.path().join("outside.txt");
+        fs::write(&outside, "outside").unwrap();
+        crate::workspace_read::listing_test::BEFORE_EMISSION.with(|hook| {
+            hook.replace(Some(Box::new(move || {
+                fs::remove_file(&changing).unwrap();
+                crate::tests::symlink(outside, changing).unwrap();
+            })));
+        });
+        let request = ToolRequest {
+            id: "list".into(),
+            name: ToolName::ListFiles,
+            action: ActionKind::Read,
+            target: None,
+            raw_arguments: None,
+        };
+        let result = execute(&request, &root, 4096);
+        assert_eq!(result.output.as_deref(), Some("keep.txt"));
     }
 
     #[test]
