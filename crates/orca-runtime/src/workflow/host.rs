@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use orca_core::capability::CapabilitySet;
 use orca_core::execution_broker::{ExecutionBroker, LaunchError};
+use orca_core::redaction::redact_sensitive_text;
 use orca_core::retained_output::{RetainedOutput, RetainedOutputSnapshot};
 use orca_platform::fs::{AtomicWritePolicy, atomic_write};
 use orca_platform::process::ProcessJob;
@@ -31,6 +32,7 @@ const MAX_WORKFLOW_HOST_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKFLOW_HOST_EVENTS: usize = 8_192;
 const MAX_WORKFLOW_HOST_EVENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WORKFLOW_HOST_STDERR_BYTES: usize = 64 * 1024;
+const MAX_WORKFLOW_HOST_STARTUP_STDERR_BYTES: usize = 2 * 1024;
 const WORKFLOW_HOST_FRAME_CHANNEL_CAPACITY: usize = 8;
 const DEFAULT_WORKFLOW_HOST_AGENT_WORKERS: usize = 16;
 const WORKFLOW_HOST_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -416,6 +418,7 @@ impl WorkflowHost {
         let agent_error = Arc::new(Mutex::new(None));
         let fatal_worker_error = Arc::new(Mutex::new(None));
         let abort_workers = Arc::new(AtomicBool::new(false));
+        let mut stdout_closed_early = false;
         let on_agent_call = &on_agent_call;
         let execution_result = thread::scope(|scope| -> io::Result<()> {
             // Start the input writer alongside the output readers. A host
@@ -477,6 +480,7 @@ impl WorkflowHost {
                     let frame = match frame_rx.recv_timeout(WORKFLOW_HOST_CONTROL_POLL_INTERVAL) {
                         Ok(WorkflowHostFrame::Data(frame)) => frame,
                         Ok(WorkflowHostFrame::Eof) => {
+                            stdout_closed_early = true;
                             return Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
                                 "workflow host stdout closed before a terminal event",
@@ -617,6 +621,26 @@ impl WorkflowHost {
         let stderr_result = join_host_thread(stderr_handle, "stderr reader");
 
         if let Err(error) = execution_result {
+            if stdout_closed_early && let Ok(stderr) = stderr_result {
+                let start = if stderr.is_truncated() {
+                    stderr.retained_head_bytes()
+                } else {
+                    0
+                };
+                let stderr =
+                    redact_sensitive_text(String::from_utf8_lossy(&stderr.bytes[start..]).trim());
+                if !stderr.is_empty() {
+                    let start = stderr.ceil_char_boundary(
+                        stderr
+                            .len()
+                            .saturating_sub(MAX_WORKFLOW_HOST_STARTUP_STDERR_BYTES),
+                    );
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("{error}: {}", &stderr[start..]),
+                    ));
+                }
+            }
             return Err(error);
         }
         stdout_result?;
@@ -1384,6 +1408,147 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
                 .contains("workflow host module changed before launch")
         );
+    }
+
+    #[test]
+    fn workflow_bootstrap_retries_stdin_and_delivers_agent_results() {
+        if !WorkflowHost::node_available() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let command = node_with_preload(
+            fixture.path(),
+            r#"
+const fs = require('node:fs');
+const { readSync } = fs;
+let attempts = 0;
+fs.readSync = (fd, buffer, offset, length, position) => {
+  if (fd === 0) {
+    attempts++;
+    if (attempts <= 2) throw Object.assign(new Error('pipe has no data yet'), { code: 'EAGAIN' });
+    if (attempts === 3) length = Math.min(length, 7);
+  }
+  return readSync(fd, buffer, offset, length, position);
+};
+require('node:module').syncBuiltinESMExports();
+"#,
+        );
+        let script = fixture.path().join("workflow.js");
+        fs::write(
+            &script,
+            "export const meta = { name: 'pipe', description: 'Pipe test', phases: [] };\r\n\
+             export default await agent('check');\r\n",
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let events = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
+            command,
+            &script,
+            Value::Null,
+            None,
+            WorkflowHostRunPolicy::collecting(),
+            |call| {
+                Ok(HostCommand::AgentResult {
+                    call_id: call.call_id,
+                    result: serde_json::json!({"reply": "received ✓"}),
+                })
+            },
+            |_| Ok(()),
+            || Ok(Instant::now() >= deadline),
+            || {},
+        )
+        .expect("read startup payload and agent reply");
+
+        assert!(
+            matches!(events.last(), Some(HostEvent::WorkflowCompleted { result })
+                if *result == serde_json::json!({"reply": "received ✓"}))
+        );
+    }
+
+    #[test]
+    fn workflow_bootstrap_reports_eof_as_short_input() {
+        if !WorkflowHost::node_available() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let mut command = node_with_preload(
+            fixture.path(),
+            r#"
+const fs = require('node:fs');
+const { readSync } = fs;
+fs.readSync = (fd, ...args) => {
+  if (fd === 0) throw Object.assign(new Error('pipe closed'), { code: 'EOF' });
+  return readSync(fd, ...args);
+};
+require('node:module').syncBuiltinESMExports();
+"#,
+        );
+        workflow_host_bootstrap(&mut command);
+        let output = command
+            .args(["workflow.js", "null", "", "", "1024", "", "1"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(!output.status.success());
+        assert!(
+            stderr.contains("Error: workflow host input ended early"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn workflow_host_early_exit_includes_redacted_stderr_tail() {
+        if !WorkflowHost::node_available() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let command = node_with_preload(
+            fixture.path(),
+            r#"
+const { writeFileSync } = require('node:fs');
+writeFileSync(2, 'start of log\n' + '界'.repeat(23_000) + '\n');
+writeFileSync(2, 'api_key=' + 'opaque-demo-value'.repeat(180) + '\n');
+writeFileSync(2, 'workflow startup failed: token=opaque-test-token\n');
+process.exit(7);
+"#,
+        );
+        let script = fixture.path().join("workflow.js");
+        fs::write(&script, "").unwrap();
+
+        let error = WorkflowHost::run_collecting_events_with_agent_and_event_callback_inner(
+            command,
+            &script,
+            Value::Null,
+            None,
+            WorkflowHostRunPolicy::collecting(),
+            |_| unreachable!("fixture exits before sending events"),
+            |_| Ok(()),
+            || Ok(false),
+            || {},
+        )
+        .expect_err("host exits before a terminal event");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        let message = error.to_string();
+        let stderr = message
+            .strip_prefix("workflow host stdout closed before a terminal event: ")
+            .expect(&message);
+        assert!(stderr.len() <= 2 * 1024);
+        assert!(
+            stderr.ends_with("workflow startup failed: token=<redacted>"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("start of log"));
+        assert!(!stderr.contains("opaque-demo-value"));
+    }
+
+    fn node_with_preload(directory: &Path, source: &str) -> Command {
+        let preload = directory.join("preload.cjs");
+        fs::write(&preload, source).unwrap();
+        let mut command = Command::new(WorkflowHost::node_executable());
+        command.arg("--require").arg(node_entry_path(preload));
+        command
     }
 
     #[test]
