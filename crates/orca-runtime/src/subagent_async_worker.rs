@@ -278,7 +278,15 @@ impl SubagentLeaseHeartbeat {
                 let Ok(mut revision) = continuation_revision.lock() else {
                     return;
                 };
-                match coordinator.renew(&continuation_lease, *revision) {
+                let renewal = coordinator.renew(&continuation_lease, *revision);
+                let renewal = match renewal {
+                    Err(crate::agent_continuation::AgentContinuationError::RevisionConflict {
+                        actual,
+                        ..
+                    }) => coordinator.renew(&continuation_lease, actual),
+                    result => result,
+                };
+                match renewal {
                     Ok(projection) => {
                         *revision = projection.revision;
                         continuation_renewed_at = Instant::now();

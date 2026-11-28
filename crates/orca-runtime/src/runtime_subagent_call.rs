@@ -838,12 +838,8 @@ impl RuntimeSubagentBatch {
             .spawn(move || {
                 // Disconnect the parent watcher when the worker exits.
                 let _parent_watcher_stop = parent_watcher_stop;
-                let output = run_subagent_worker(
-                    invocation,
-                    lifecycle,
-                    started_task,
-                    worker_cancel,
-                );
+                let output =
+                    run_subagent_worker(invocation, lifecycle, started_task, worker_cancel);
                 if let Some(cancel) = threaded_cancel {
                     cancel.cancel();
                 }
@@ -2172,7 +2168,7 @@ fn execute_acquired_sync_subagent(
     is_resume: bool,
     prepared: PreparedContinuation,
     coordinator: ChildAgentCoordinator,
-    lease: ContinuationLease,
+    mut lease: ContinuationLease,
     child_config: RunConfig,
     child_cwd: PathBuf,
     worktree_execution: SyncWorktreeExecution,
@@ -2194,6 +2190,31 @@ fn execute_acquired_sync_subagent(
     output_format: orca_core::config::OutputFormat,
     durable_reservation: Option<crate::child_budget_ledger::ChildBudgetReservation>,
 ) -> RuntimeSubagentCallOutput {
+    let mut prepared = prepared;
+    match coordinator.renew(&lease, lease.revision) {
+        Ok(projection) => {
+            prepared.revision = projection.revision;
+            lease.revision = projection.revision;
+        }
+        Err(error) => {
+            let worktree = worktree_execution.finish();
+            return sync_setup_failure_with_worktree(
+                tool_request,
+                description,
+                lifecycle,
+                started_task,
+                &child_config,
+                &task_registry,
+                &registry_task_id,
+                continuation_error("failed to validate child continuation lease", &error),
+                worktree,
+            );
+        }
+    }
+    let cancel = task_registry
+        .get(&registry_task_id)
+        .map(|task| task.control.cancel)
+        .unwrap_or(cancel);
     let continuation_start = if is_resume {
         let Some(checkpoint) = prepared.checkpoint.clone() else {
             let output = continuation_started_failure(
@@ -2391,7 +2412,7 @@ fn execute_acquired_sync_subagent(
         coordinator.clone(),
         lease.clone(),
         Arc::clone(&shared_revision),
-        None,
+        Some(cancel.clone()),
     );
     let child = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut runtime = ChildAgentRuntime::new(ChildAgentRuntimeContext {
