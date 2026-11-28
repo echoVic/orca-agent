@@ -5890,6 +5890,36 @@ enum ThreadCommand {
     },
 }
 
+impl ThreadCommand {
+    fn surface_operation_fence(&self) -> Option<&surface::SurfaceOperationFence> {
+        match self {
+            Self::SurfacePrepareManualCompaction { fence, .. }
+            | Self::SurfaceCommitProviderResponse { fence, .. }
+            | Self::SurfaceCommitProviderFailure { fence, .. }
+            | Self::SurfaceCommitProviderAttemptFailure { fence, .. }
+            | Self::SurfaceCommitProviderStep { fence, .. }
+            | Self::SurfaceCommitToolResults { fence, .. }
+            | Self::SurfaceCommitToolOutput { fence, .. }
+            | Self::SurfaceCommitPlanUpdate { fence, .. }
+            | Self::SurfaceCommitWorkflowStarted { fence, .. }
+            | Self::SurfaceCommitWorkflowFinished { fence, .. }
+            | Self::SurfaceCommitWorkflowProgress { fence, .. }
+            | Self::SurfaceCommitSubagentActivity { fence, .. }
+            | Self::SurfaceDrainSubagentRelay { fence, .. }
+            | Self::SurfaceRequestToolApproval { fence, .. }
+            | Self::SurfaceRequestPermission { fence, .. }
+            | Self::SurfaceRequestUserInput { fence, .. }
+            | Self::SurfaceRequestMcpElicitation { fence, .. }
+            | Self::SurfaceRequestAcpReadTextFile { fence, .. }
+            | Self::SurfaceRequestAcpWriteTextFile { fence, .. }
+            | Self::SurfaceRequestAcpTerminalCreate { fence, .. }
+            | Self::SurfaceRequestAcpTerminalObservation { fence, .. }
+            | Self::SurfaceRequestAcpTerminalCleanup { fence, .. } => Some(fence),
+            _ => None,
+        }
+    }
+}
+
 enum ThreadShutdownAck {
     Complete,
     Retry,
@@ -15318,20 +15348,15 @@ struct ActiveOperation {
     surface_execution_failure: Option<surface::GenerationExecutionFailureClass>,
     surface_execution_failure_diagnostic: Option<surface::SafeDiagnosticText>,
     surface_background_control: Option<Arc<RuntimeSurfaceBackgroundControl>>,
-    /// A shutdown closed this actor's mailbox while the generation was still
-    /// running, after cancelling it. What the generation sends on its way out
-    /// (a buffered provider delta, a cancelled tool's result, an interaction)
-    /// then fails with "runtime semantic ingress actor is unavailable", or is
-    /// answered "runtime thread is shutting down" from the drained queue, and
-    /// the generation returns that error. Such an error is taken as the
-    /// shutdown's doing: the surface terminal is the operation's
-    /// cancellation, not a failure.
+    /// Shutdown closed the mailbox under a running generation, or the
+    /// durable-interrupt shutdown refused one of that generation's own fenced
+    /// commands while it ran. The generation's error is then taken as
+    /// cancellation, not failure. If acknowledging its reply failed, that
+    /// failure wins over any refusal in the durable-interrupt shutdown loop.
     ///
     /// `finish_generation_inner` keeps the flag only when the generation
     /// itself returned an execution failure, so a failure the actor meets
-    /// after the generation returned keeps its error. A generation error with
-    /// another cause inside that window is taken as the shutdown's too: the
-    /// flag cannot tell the two apart.
+    /// after the generation returned keeps its error.
     mailbox_closed_under_generation: bool,
 }
 
@@ -19279,6 +19304,7 @@ impl ThreadActor {
                                 active.generation.cancel.cancel();
                                 // The interrupted generation still needs its actor to
                                 // acknowledge the reply before it can finish.
+                                let mut reply_ack_failed = false;
                                 let generation_result = loop {
                                     let command = tokio::select! {
                                         biased;
@@ -19292,6 +19318,10 @@ impl ThreadActor {
                                             let result = self.commit_surface_provider_response(
                                                 &mut active, fence, &response,
                                             );
+                                            if result.is_err() {
+                                                reply_ack_failed = true;
+                                                active.mailbox_closed_under_generation = false;
+                                            }
                                             let _ = reply.send(result);
                                         }
                                         Some(ThreadCommand::ShutdownThread { reply, .. }) => {
@@ -19299,7 +19329,16 @@ impl ThreadActor {
                                                 let _ = reply.send(ThreadShutdownAck::Retry);
                                             }
                                         }
-                                        Some(command) => Self::reject_thread_command_unavailable(command),
+                                        Some(command) => {
+                                            if !reply_ack_failed
+                                                && command.surface_operation_fence().is_some_and(|fence| {
+                                                    active.surface_operation.as_ref() == Some(fence)
+                                                })
+                                            {
+                                                active.mailbox_closed_under_generation = true;
+                                            }
+                                            Self::reject_thread_command_unavailable(command);
+                                        }
                                         None => break (&mut active.generation.join).await,
                                     }
                                 };
