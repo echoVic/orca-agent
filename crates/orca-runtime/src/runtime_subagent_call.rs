@@ -1161,6 +1161,27 @@ impl Drop for EndReportedWhenDone {
     }
 }
 
+fn relay_threaded_agent_cancellation(
+    registry: &TaskRegistry,
+    task_id: &str,
+    parent_cancel: &CancelToken,
+    task_cancel: &CancelToken,
+) {
+    loop {
+        if parent_cancel.is_cancelled() {
+            task_cancel.cancel();
+            break;
+        }
+        let terminal = registry
+            .get(task_id)
+            .is_none_or(|task| !task.status.is_active() && !task.status.requires_attention());
+        if terminal {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn run_threaded_agent_worker(
     invocation: RuntimeSubagentInvocation,
     _lifecycle: RuntimeSessionLifecycle,
@@ -1269,22 +1290,12 @@ fn run_threaded_agent_worker(
         let watcher = std::thread::Builder::new()
             .name(format!("orca-agent-cancel-{}", task_id_for_cancel))
             .spawn(move || {
-                loop {
-                    if parent_cancel.is_cancelled() {
-                        watcher_task_cancel.cancel();
-                        break;
-                    }
-                    let terminal =
-                        registry_for_cancel
-                            .get(&task_id_for_cancel)
-                            .is_none_or(|task| {
-                                !task.status.is_active() && !task.status.requires_attention()
-                            });
-                    if terminal {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
+                relay_threaded_agent_cancellation(
+                    &registry_for_cancel,
+                    &task_id_for_cancel,
+                    &parent_cancel,
+                    &watcher_task_cancel,
+                );
             });
         if let Err(error) = watcher {
             let message = format!("failed to watch child cancellation: {error}");
@@ -3337,6 +3348,49 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_continuation_survives_sync_worker_cleanup_after_completion() {
+        use crate::agent_controller::{AgentThreadPolicy, AgentTurnAdmission};
+        use orca_core::task_types::TaskStatus;
+
+        let registry = TaskRegistry::new("sync-worker-cleanup".into());
+        let limits = orca_core::subagent_config::SubagentLimits::default();
+        let original = registry
+            .execution_scope(&limits)
+            .submit_subagent("first".into(), None, None, 1)
+            .unwrap();
+        let task_id = original.task_id;
+        let task_cancel = registry.get(&task_id).unwrap().control.cancel;
+        let worker_cancel = CancelToken::new();
+        registry
+            .complete_with_usage(&task_id, "done".into(), None)
+            .unwrap();
+        assert!(!task_cancel.is_cancelled());
+        worker_cancel.cancel();
+        relay_threaded_agent_cancellation(&registry, &task_id, &worker_cancel, &task_cancel);
+        let completed = registry.get(&task_id).unwrap();
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert!(!completed.stop_requested);
+        assert!(completed.control.cancel.is_cancelled());
+
+        let policy = AgentThreadPolicy {
+            subagent_type: SubagentType::General,
+            depth: 1,
+            task_id: Some(task_id.clone()),
+            continued_task: Default::default(),
+        };
+        let admitted = AgentTurnAdmission::acquire(
+            &policy,
+            &registry,
+            limits,
+            "continue",
+            None,
+            &CancelToken::new(),
+        )
+        .expect("the finished worker's cleanup must not veto the next attempt");
+        assert_ne!(admitted.task_id, task_id);
+    }
+
     fn plain_request() -> SubagentRequest {
         SubagentRequest {
             budget_reservation: None,

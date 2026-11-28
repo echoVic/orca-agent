@@ -70,10 +70,10 @@ impl AgentTurnAdmission {
                 "agent task is absent from its owning execution scope",
             ));
         }
-        if current
-            .as_ref()
-            .is_some_and(|record| record.stop_requested || record.control.cancel.is_cancelled())
-        {
+        if current.as_ref().is_some_and(|record| {
+            record.status.is_active()
+                && (record.stop_requested || record.control.cancel.is_cancelled())
+        }) {
             return Err(io::Error::other(
                 "agent continuation stopped before execution",
             ));
@@ -1023,6 +1023,48 @@ fn settle_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_continuation_rejects_a_still_active_task_with_a_stop_requested() {
+        let registry = crate::tasks::TaskRegistry::new("ui-stopped-attempt".into());
+        let limits = orca_core::subagent_config::SubagentLimits::default();
+        let scope = registry.execution_scope(&limits);
+        let original = scope
+            .submit_subagent("first".into(), None, None, 1)
+            .unwrap();
+        let task_id = original.task_id;
+        assert_eq!(
+            registry.get(&task_id).unwrap().status,
+            orca_core::task_types::TaskStatus::Running
+        );
+        registry.request_stop(&task_id).unwrap();
+        let stopped = registry.get(&task_id).unwrap();
+        assert!(stopped.status.is_active());
+        assert!(stopped.stop_requested);
+
+        let policy = AgentThreadPolicy {
+            subagent_type: SubagentType::General,
+            depth: 1,
+            task_id: Some(task_id),
+            continued_task: Default::default(),
+        };
+        let error = AgentTurnAdmission::acquire(
+            &policy,
+            &registry,
+            limits,
+            "continue",
+            None,
+            &CancelToken::new(),
+        )
+        .err()
+        .expect("an unsettled task with a stop requested must not continue");
+        assert_eq!(
+            error.to_string(),
+            "agent continuation stopped before execution"
+        );
+        assert!(policy.continued_task.lock().unwrap().is_none());
+    }
+
     #[test]
     fn ui_continuation_queues_in_shared_scope_and_creates_a_new_attempt() {
         let registry = crate::tasks::TaskRegistry::new("ui-shared-scope".into());
