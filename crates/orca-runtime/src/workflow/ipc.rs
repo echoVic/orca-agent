@@ -114,12 +114,16 @@ impl WorkflowIpcContext {
         }
     }
 
-    pub(crate) fn cached_agent_can_be_reused(file: io::Result<fs::File>, call_path: &str) -> bool {
+    pub(crate) fn cached_agent_can_be_reused(
+        file: io::Result<fs::File>,
+        call_path: &str,
+    ) -> io::Result<bool> {
         match file.and_then(read_verified_task_list_state) {
-            Ok(state) => state
+            Ok(state) => Ok(state
                 .mutating_calls
-                .is_some_and(|calls| !calls.contains(call_path)),
-            Err(error) => error.kind() == io::ErrorKind::NotFound,
+                .is_some_and(|calls| !calls.contains(call_path))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error),
         }
     }
 

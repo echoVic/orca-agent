@@ -1664,7 +1664,7 @@ impl WorkflowRunner {
         {
             if let Some(cached_value) =
                 self.state
-                    .find_cached_agent_value(resume_run_id, &call.call_path, &hash)
+                    .find_cached_agent_value(resume_run_id, &call.call_path, &hash)?
             {
                 cached_agents.fetch_add(1, Ordering::Relaxed);
                 let normalized_cached_value = normalize_cached_agent_result(&call, cached_value);
@@ -1745,10 +1745,12 @@ impl WorkflowRunner {
 
         let mut continuation_selector = resume_from
             .filter(|_| !call_path_matches_phase(&call.call_path, restart_phase))
-            .and_then(|resume_run_id| {
+            .map(|resume_run_id| {
                 self.state
                     .find_agent_record(resume_run_id, &call.call_path, &hash)
             })
+            .transpose()?
+            .flatten()
             .and_then(|record| record.continuation);
         if continuation_selector
             .as_ref()

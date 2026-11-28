@@ -1034,7 +1034,9 @@ fn state_store_reads_legacy_agent_cache_shape() {
         })
     );
 
-    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
+    let found = store
+        .find_cached_agent_value(&state.run_id, "phases.scan", "1234")
+        .unwrap();
     assert_eq!(
         found,
         Some(json!({
@@ -1084,7 +1086,9 @@ fn state_store_reads_legacy_string_agent_cache_without_json_quoting() {
     )
     .unwrap();
 
-    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
+    let found = store
+        .find_cached_agent_value(&state.run_id, "phases.scan", "1234")
+        .unwrap();
     assert_eq!(found, Some(json!("legacy result")));
 }
 
@@ -1135,7 +1139,9 @@ fn state_store_preserves_legacy_json_looking_string_cache_values() {
         )
         .unwrap();
 
-        let found = store.find_cached_agent_value(&state.run_id, "phases.scan", input_hash);
+        let found = store
+            .find_cached_agent_value(&state.run_id, "phases.scan", input_hash)
+            .unwrap();
         assert_eq!(found, Some(json!(output)), "case {output}");
     }
 }
@@ -1180,7 +1186,9 @@ fn state_store_reads_legacy_null_agent_cache_as_null_value() {
     )
     .unwrap();
 
-    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
+    let found = store
+        .find_cached_agent_value(&state.run_id, "phases.scan", "1234")
+        .unwrap();
     assert_eq!(found, Some(serde_json::Value::Null));
 }
 
@@ -1226,7 +1234,9 @@ fn state_store_returns_legacy_object_cache_as_object_value() {
     )
     .unwrap();
 
-    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
+    let found = store
+        .find_cached_agent_value(&state.run_id, "phases.scan", "1234")
+        .unwrap();
     assert_eq!(found, Some(json!({ "kind": "legacy-object" })));
 }
 
@@ -1276,7 +1286,9 @@ fn state_store_reads_current_null_output_as_null_value() {
     )
     .unwrap();
 
-    let found = store.find_cached_agent_value(&state.run_id, "phases.scan", "1234");
+    let found = store
+        .find_cached_agent_value(&state.run_id, "phases.scan", "1234")
+        .unwrap();
     assert_eq!(found, Some(serde_json::Value::Null));
 
     let cached = store
@@ -1413,7 +1425,9 @@ fn state_store_preserves_current_json_looking_string_outputs() {
             )
             .unwrap();
 
-        let found = store.find_cached_agent_value(&state.run_id, "phases.scan", input_hash);
+        let found = store
+            .find_cached_agent_value(&state.run_id, "phases.scan", input_hash)
+            .unwrap();
         assert_eq!(found, Some(json!(output)), "find case {output}");
 
         let cached = store
@@ -1506,7 +1520,9 @@ fn state_store_preserves_missing_output_field_when_appending_completed_record() 
         .unwrap();
 
     assert_eq!(
-        store.find_cached_agent_value(&state.run_id, "phases.scan", "missing-output"),
+        store
+            .find_cached_agent_value(&state.run_id, "phases.scan", "missing-output")
+            .unwrap(),
         None
     );
     assert_eq!(
@@ -1598,7 +1614,9 @@ fn state_store_cached_agent_result_ignores_incomplete_or_outputless_current_reco
         None
     );
     assert_eq!(
-        store.find_cached_agent_value(&state.run_id, "phases.scan", "missing-output"),
+        store
+            .find_cached_agent_value(&state.run_id, "phases.scan", "missing-output")
+            .unwrap(),
         None
     );
 }

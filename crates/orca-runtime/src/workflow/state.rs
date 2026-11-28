@@ -293,7 +293,11 @@ impl WorkflowStateStore {
         &self,
         run_id: &str,
     ) -> io::Result<HashMap<String, CachedWorkflowAgentRecord>> {
-        parse_agent_cache(&self.read_artifact(run_id, "agent-cache.json")?)
+        match self.read_artifact(run_id, "agent-cache.json") {
+            Ok(content) => parse_agent_cache(&content),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn run_dir(&self, run_id: &str) -> PathBuf {
@@ -575,9 +579,10 @@ impl WorkflowStateStore {
         run_id: &str,
         call_path: &str,
         input_hash: &str,
-    ) -> Option<String> {
-        self.find_cached_agent_value(run_id, call_path, input_hash)
-            .map(|value| value_to_output_string(value))
+    ) -> io::Result<Option<String>> {
+        Ok(self
+            .find_cached_agent_value(run_id, call_path, input_hash)?
+            .map(value_to_output_string))
     }
 
     pub fn find_cached_agent_value(
@@ -585,19 +590,19 @@ impl WorkflowStateStore {
         run_id: &str,
         call_path: &str,
         input_hash: &str,
-    ) -> Option<Value> {
+    ) -> io::Result<Option<Value>> {
         if !super::ipc::WorkflowIpcContext::cached_agent_can_be_reused(
             self.open_artifact(run_id, "task-lists.json"),
             call_path,
-        ) {
-            return None;
+        )? {
+            return Ok(None);
         }
-        let cache = self.read_run_agent_cache(run_id).ok()?;
-        cache
+        let cache = self.read_run_agent_cache(run_id)?;
+        Ok(cache
             .get(&cache_key(call_path, input_hash))
             .filter(|entry| is_reusable_cached_status(entry.record.status))
             .filter(|entry| entry.output_present)
-            .map(|entry| entry.record.output.clone().unwrap_or(Value::Null))
+            .map(|entry| entry.record.output.clone().unwrap_or(Value::Null)))
     }
 
     pub fn find_agent_record(
@@ -605,11 +610,11 @@ impl WorkflowStateStore {
         run_id: &str,
         call_path: &str,
         input_hash: &str,
-    ) -> Option<WorkflowAgentRecord> {
-        self.read_run_agent_cache(run_id)
-            .ok()?
+    ) -> io::Result<Option<WorkflowAgentRecord>> {
+        Ok(self
+            .read_run_agent_cache(run_id)?
             .get(&cache_key(call_path, input_hash))
-            .map(|entry| entry.record.clone())
+            .map(|entry| entry.record.clone()))
     }
 
     pub fn cached_agent_result(
@@ -618,12 +623,7 @@ impl WorkflowStateStore {
         call_path: &str,
         input_hash: &str,
     ) -> io::Result<Option<WorkflowAgentCacheRecord>> {
-        let path = self.run_dir(run_id).join("agent-cache.json");
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let cache = read_agent_cache(&path)?;
+        let cache = self.read_run_agent_cache(run_id)?;
         Ok(cache
             .get(&cache_key(call_path, input_hash))
             .filter(|entry| is_reusable_cached_status(entry.record.status))
@@ -683,11 +683,7 @@ impl WorkflowStateStore {
     }
 
     pub(crate) fn agent_records(&self, run_id: &str) -> io::Result<Vec<WorkflowAgentRecord>> {
-        let cache = match self.read_run_agent_cache(run_id) {
-            Ok(cache) => cache,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error),
-        };
+        let cache = self.read_run_agent_cache(run_id)?;
         let mut records = cache
             .values()
             .map(|entry| entry.record.clone())
