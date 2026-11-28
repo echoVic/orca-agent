@@ -1725,11 +1725,39 @@ fn runs_through_the_controller(invocation: &RuntimeSubagentInvocation) -> bool {
                 .and_then(|coordinator| coordinator.prepared(selector))
                 .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
         });
+    let mut request = invocation.request.clone();
+    if !has_usable_fork_prefix(invocation) {
+        request.captured_fork_prefix = None;
+        request.fork_prefix_ref = None;
+    }
     request_runs_through_the_controller(
-        &invocation.request,
+        &request,
         invocation.agent_controller.is_some(),
         resumes_custom,
     )
+}
+
+fn has_usable_fork_prefix(invocation: &RuntimeSubagentInvocation) -> bool {
+    if invocation.request.context != RoleContextPolicy::Fork {
+        return false;
+    }
+    let prefix = invocation.request.captured_fork_prefix.clone().or_else(|| {
+        invocation
+            .request
+            .fork_prefix_ref
+            .as_ref()
+            .and_then(|reference| {
+                invocation
+                    .task_registry
+                    .continuation_store()
+                    .ok()?
+                    .load_fork_prefix(*reference)
+                    .ok()
+            })
+    });
+    prefix.is_some_and(|prefix| {
+        crate::subagent::validate_fork_prefix(&invocation.config, &prefix).is_ok()
+    })
 }
 
 fn request_runs_through_the_controller(
