@@ -1,7 +1,7 @@
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use orca_core::cancel::CancelToken;
@@ -361,7 +361,8 @@ fn enqueue_accepted_subagent(
                 .unwrap_or_default();
             let mut lifecycle = RuntimeSessionLifecycle::new(format!("subagent-{worker_id}"));
             let started = lifecycle.start_task(RuntimeTaskKind::Subagent).clone();
-            let output = run_subagent_worker(invocation, lifecycle, started, cancel);
+            let threaded = uses_threaded_subagent_worker(&invocation);
+            let output = run_subagent_worker(invocation, lifecycle, started, cancel, threaded);
             if let Some(error) = output.event_error {
                 let _ = worker_registry.fail(&worker_id, error);
             }
@@ -759,10 +760,22 @@ impl RuntimeSubagentBatch {
         let panic_request = tool_request.clone();
         let panic_description = description.clone();
         let panic_task = started_task.clone();
-        let worker_cancel = if invocation.agent_controller.is_some() {
-            let worker_cancel = CancelToken::new();
+        let hosted = invocation.agent_controller.is_some();
+        let threaded = uses_threaded_subagent_worker(&invocation);
+        let threaded_cancel = threaded.then(CancelToken::new);
+        let (worker_cancel, parent_watcher_stop) = if hosted {
+            // The threaded route attaches the task token after marking it running.
+            // A continuation worker uses the admitted child's token directly.
+            let worker_cancel = threaded_cancel.clone().unwrap_or_else(|| {
+                self.registry
+                    .get(&task_id)
+                    .expect("admitted subagent task exists")
+                    .control
+                    .cancel
+            });
             let parent_cancel = self.cancel.clone();
             let worker_cancel_bridge = worker_cancel.clone();
+            let (stop, worker_done) = mpsc::channel::<()>();
             let watcher = thread::Builder::new()
                 .name(format!("orca-subagent-parent-cancel-{}", tool_request.id))
                 .spawn(move || {
@@ -771,7 +784,12 @@ impl RuntimeSubagentBatch {
                             worker_cancel_bridge.cancel();
                             break;
                         }
-                        thread::sleep(std::time::Duration::from_millis(10));
+                        if !matches!(
+                            worker_done.recv_timeout(std::time::Duration::from_millis(10)),
+                            Err(mpsc::RecvTimeoutError::Timeout)
+                        ) {
+                            break;
+                        }
                     }
                 });
             if let Err(error) = watcher {
@@ -792,16 +810,10 @@ impl RuntimeSubagentBatch {
                     event_error: None,
                 };
             }
-            worker_cancel
+            (worker_cancel, Some(stop))
         } else {
-            self.cancel.clone()
+            (self.cancel.clone(), None)
         };
-        let worker_cancel_for_thread = worker_cancel.clone();
-        let watcher_cancel = worker_cancel.clone();
-        let worker_cleanup = invocation
-            .agent_controller
-            .as_ref()
-            .map(|_| worker_cancel.clone());
         // The worker adopts the record this batch submitted instead of
         // creating its own, so capacity accounting and the model's view of the
         // task describe the same task.
@@ -809,20 +821,25 @@ impl RuntimeSubagentBatch {
         let join = match thread::Builder::new()
             .name(format!("orca-subagent-{}", tool_request.id))
             .spawn(move || {
+                // Disconnect the parent watcher when the worker exits.
+                let _parent_watcher_stop = parent_watcher_stop;
                 let output = run_subagent_worker(
                     invocation,
                     lifecycle,
                     started_task,
-                    worker_cancel_for_thread.clone(),
+                    worker_cancel,
+                    threaded,
                 );
-                if let Some(worker_cleanup) = worker_cleanup {
-                    worker_cleanup.cancel();
+                if let Some(cancel) = threaded_cancel {
+                    cancel.cancel();
                 }
                 output
             }) {
             Ok(join) => join,
             Err(error) => {
-                watcher_cancel.cancel();
+                if !hosted {
+                    self.cancel.cancel();
+                }
                 let message = format!("failed to start subagent worker: {error}");
                 let _ = self.registry.fail(&task_id, message.clone());
                 return SpawnOutcome {
@@ -1576,27 +1593,30 @@ fn threaded_sync_surface_activity(
     })
 }
 
+fn uses_threaded_subagent_worker(invocation: &RuntimeSubagentInvocation) -> bool {
+    invocation.agent_controller.is_some()
+        && invocation.request.context == RoleContextPolicy::Fresh
+        && invocation.request.isolation == SubagentIsolation::None
+        && !matches!(invocation.request.subagent_type, SubagentType::Custom(_))
+        && !invocation
+            .request
+            .resume_from
+            .as_deref()
+            .is_some_and(|selector| {
+                ChildAgentCoordinator::new(invocation.task_registry.clone())
+                    .and_then(|coordinator| coordinator.prepared(selector))
+                    .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
+            })
+}
+
 fn run_subagent_worker(
     invocation: RuntimeSubagentInvocation,
     lifecycle: RuntimeSessionLifecycle,
     started_task: RuntimeTaskLifecycle,
     cancel: CancelToken,
+    threaded: bool,
 ) -> RuntimeSubagentCallOutput {
-    let resumes_custom = invocation
-        .request
-        .resume_from
-        .as_deref()
-        .is_some_and(|selector| {
-            ChildAgentCoordinator::new(invocation.task_registry.clone())
-                .and_then(|coordinator| coordinator.prepared(selector))
-                .is_ok_and(|source| source.compatibility.frozen_agent.is_some())
-        });
-    if invocation.agent_controller.is_some()
-        && invocation.request.context == RoleContextPolicy::Fresh
-        && invocation.request.isolation == SubagentIsolation::None
-        && !matches!(invocation.request.subagent_type, SubagentType::Custom(_))
-        && !resumes_custom
-    {
+    if threaded {
         return run_threaded_agent_worker(invocation, lifecycle, started_task, cancel);
     }
     let RuntimeSubagentInvocation {

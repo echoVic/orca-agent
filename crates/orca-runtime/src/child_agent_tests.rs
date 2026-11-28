@@ -2574,6 +2574,187 @@ fn a_hosted_fork_without_a_usable_prefix_says_why_it_started_fresh() {
     assert!(!child.contains("Earlier parent evidence."));
 }
 
+#[test]
+fn task_stop_stops_a_hosted_fork_child() {
+    assert_hosted_fork_stop(false);
+}
+
+#[test]
+fn stopping_a_hosted_fork_does_not_cancel_its_parent_or_siblings() {
+    assert_hosted_fork_stop(true);
+}
+
+fn assert_hosted_fork_stop(with_sibling: bool) {
+    use crate::agent_controller::AgentController;
+    use crate::runtime_host::RuntimeHost;
+    use crate::runtime_subagent_call::RuntimeSubagentInvocation;
+    use crate::runtime_tool_actor::RuntimeToolActorContext;
+    use crate::runtime_tool_call::RuntimeToolCallRuntime;
+    use crate::subagent::create_subagent_request;
+    use crate::tasks::TaskRegistry;
+    use orca_core::conversation::ProviderForkPrefix;
+    use orca_core::task_types::TaskStatus;
+    use std::time::{Duration, Instant};
+
+    let cwd = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let _home = crate::history::redirect_test_orca_home(home.path());
+    let registry = TaskRegistry::new("hosted-fork-stop".into());
+    let parent = registry.create_main_session("fork parent".into());
+    registry.mark_running(&parent.id).unwrap();
+    let parent_cancel = registry.get(&parent.id).unwrap().control.cancel;
+    let mut config = config(Some(FLASH_MODEL));
+    config.cwd = Some(cwd.path().to_path_buf());
+    config.provider = ProviderKind::DeepSeek;
+    let endpoint = "http://127.0.0.1:0";
+    config.base_url = Some(endpoint.into());
+    let prefix_ref = registry
+        .continuation_store()
+        .unwrap()
+        .store_fork_prefix(ProviderForkPrefix {
+            model: FLASH_MODEL.into(),
+            endpoint: endpoint.into(),
+            reasoning_effort: config.reasoning_effort,
+            messages: vec![r#"{"role":"user","content":"Earlier parent evidence."}"#.into()],
+            tools: vec![],
+            estimated_tokens: 5,
+            system_messages: vec![],
+            redacted: false,
+        })
+        .unwrap();
+
+    let host = RuntimeHost::start().unwrap();
+    let thread = host.start_thread(config.clone(), "Fork parent").unwrap();
+    let controller = Arc::new(AgentController::new(
+        host.handle(),
+        thread.thread_id().into(),
+        thread.thread_id().into(),
+        0,
+    ));
+    let runtime = RuntimeToolCallRuntime::for_normal_execution();
+    let mut batch = runtime.start_subagent_batch(
+        &parent_cancel,
+        &registry,
+        config.subagents.limits,
+        None,
+        Some(&parent.id),
+    );
+    let batch_size = if with_sibling { 2 } else { 1 };
+    for (index, name) in ["stop-target", "sibling"]
+        .into_iter()
+        .take(batch_size)
+        .enumerate()
+    {
+        let mut tool_request = fork_tool_request(Some("fork"));
+        tool_request.id = name.into();
+        let mut request = create_subagent_request(&tool_request);
+        request.description = name.into();
+        request.prompt = name.into();
+        request.fork_prefix_ref = Some(prefix_ref);
+        let invocation = RuntimeSubagentInvocation::snapshot(
+            tool_request,
+            request,
+            &config,
+            cwd.path(),
+            &ProjectInstructions::default(),
+            &MemoryBlock::default(),
+            &McpRegistry::default(),
+            &HookRunner::default(),
+            None,
+            1,
+            |_, request, runtime, _| {
+                assert!(request.fork_prefix.is_some());
+                std::fs::write(runtime.cwd.join(&request.prompt), [])?;
+                let release_sibling = runtime.cwd.join("release-sibling");
+                let is_target = request.prompt == "stop-target";
+                let deadline = Instant::now() + Duration::from_secs(if is_target { 3 } else { 10 });
+                while !runtime.cancel.is_cancelled() && (is_target || !release_sibling.exists()) {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::other("fork did not observe the stop or release"));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(ChildAgentResult {
+                    status: if runtime.cancel.is_cancelled() {
+                        RunStatus::Cancelled
+                    } else {
+                        RunStatus::Success
+                    },
+                    final_message: Some("fork finished".into()),
+                    error: None,
+                    budget_usage: None,
+                })
+            },
+            None,
+            None,
+            &registry,
+            Some(&parent.id),
+            Some(Arc::clone(&controller)),
+            "fork-stop-batch".into(),
+            batch_size as u32,
+        );
+        let admission = batch.admit(index, invocation, |_| Ok(()));
+        assert!(admission.immediate.is_none());
+        assert!(admission.event_error.is_none());
+    }
+
+    let wait_for = |condition: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for a fork");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let target = cwd.path().join("stop-target");
+    wait_for(&|| target.exists() && (!with_sibling || cwd.path().join("sibling").exists()));
+    let task_id = registry
+        .list()
+        .into_iter()
+        .find(|task| task.description == "stop-target")
+        .unwrap()
+        .id;
+    let stop = RuntimeToolActorContext::new("fork-parent").execute_task_stop_tool(
+        &ToolRequest {
+            id: "stop-fork".into(),
+            name: ToolName::TaskStop,
+            action: ActionKind::Write,
+            target: None,
+            raw_arguments: Some(serde_json::json!({"task_id": task_id}).to_string()),
+        },
+        &registry,
+    );
+    assert_eq!(stop.status, ToolStatus::Completed, "{:?}", stop.error);
+    wait_for(&|| !registry.get(&task_id).unwrap().status.is_active());
+    std::fs::write(cwd.path().join("release-sibling"), []).unwrap();
+    let (mut outputs, event_error) = batch.finish(&mut |_, _, _, _| Ok(()));
+    host.shutdown().unwrap();
+
+    assert!(event_error.is_none());
+    outputs.sort_by_key(|(index, _)| *index);
+    let stopped = &outputs[0].1;
+    assert_eq!(
+        stopped.status,
+        RunStatus::Cancelled,
+        "{:?}",
+        stopped.event_error
+    );
+    assert_eq!(registry.get(&task_id).unwrap().status, TaskStatus::Stopped);
+    if with_sibling {
+        let sibling = &outputs[1].1;
+        assert_eq!(
+            sibling.status,
+            RunStatus::Success,
+            "{:?}",
+            sibling.event_error
+        );
+        assert!(!parent_cancel.is_cancelled());
+        assert_eq!(
+            registry.get(&parent.id).unwrap().status,
+            TaskStatus::Running
+        );
+    }
+}
+
 fn assert_hosted_fork_inherits(parent: &[u8], child: &[u8]) {
     let parent = recorded_wire_messages(parent);
     let child = recorded_wire_messages(child);
