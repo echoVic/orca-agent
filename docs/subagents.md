@@ -104,10 +104,11 @@ of its own, instead of as a separate `orca subagent-worker` process. It ends
 when the TUI quits. `orca exec` is unchanged: its subagents are detached
 workers that finish after it exits. The app server and ACP are unchanged too.
 
-Four kinds of subagent run as before, as a separate process that finishes in
+Five kinds of subagent run as before, as a separate process that finishes in
 the background after the TUI quits and may ask for a permission on its row:
 those started with `"isolation": "worktree"`, custom agent types, those under
-a finite parent budget, and those continued with `resume_from`. The rest of
+a finite parent budget, those continued with `resume_from`, and those started
+with `"context": "fork"` when the parent's history could be used. The rest of
 this section is about the others.
 
 Main normally waits for the subagents it starts before ending its turn.

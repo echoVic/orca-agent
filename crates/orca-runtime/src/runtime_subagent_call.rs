@@ -1678,12 +1678,17 @@ pub(crate) fn child_qualifies_for_thread(
         && request.isolation == SubagentIsolation::None
         && !matches!(request.subagent_type, SubagentType::Custom(_))
         && request.resume_from.is_none()
+        && !has_accepted_fork(request)
+}
+
+fn has_accepted_fork(request: &SubagentRequest) -> bool {
+    request.captured_fork_prefix.is_some() || request.fork_prefix_ref.is_some()
 }
 
 /// Whether a worker runs `invocation` through the agent controller, on a
 /// hosted thread, rather than within the call that started it: there is a
 /// controller to host it, and the child has no isolation, is not a custom
-/// agent and does not continue one.
+/// agent, does not continue a custom agent, and does not inherit a fork prefix.
 fn runs_through_the_controller(invocation: &RuntimeSubagentInvocation) -> bool {
     let resumes_custom = invocation
         .request
@@ -1698,6 +1703,7 @@ fn runs_through_the_controller(invocation: &RuntimeSubagentInvocation) -> bool {
         && invocation.request.isolation == SubagentIsolation::None
         && !matches!(invocation.request.subagent_type, SubagentType::Custom(_))
         && !resumes_custom
+        && !has_accepted_fork(&invocation.request)
 }
 
 /// Whether the worker that runs `invocation` gives the child's turn a

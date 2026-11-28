@@ -4331,6 +4331,155 @@ done
         }
     }
 
+    #[derive(Debug)]
+    struct ForkPlacementIngress {
+        fence: crate::runtime_surface::SurfaceOperationFence,
+        started: std::sync::mpsc::Sender<SubagentActivityEvent>,
+    }
+
+    impl RuntimeSubagentActivityIngress for ForkPlacementIngress {
+        fn owner(&self) -> SubagentActivityOwner {
+            SubagentActivityOwner::Generation {
+                operation_id: self.fence.operation_id.clone(),
+            }
+        }
+
+        fn parent_fence(&self) -> Option<crate::runtime_surface::SurfaceOperationFence> {
+            Some(self.fence.clone())
+        }
+
+        fn commit_activity(&self, event: SubagentActivityEvent) -> io::Result<()> {
+            assert!(matches!(
+                event.payload,
+                SubagentActivityPayload::Started { .. }
+            ));
+            self.started.send(event).unwrap();
+            Err(io::Error::other("fixture stops before starting a worker"))
+        }
+    }
+
+    #[test]
+    fn accepted_async_fork_uses_the_detached_launcher_under_a_keeping_host() {
+        use crate::runtime_surface::{
+            SurfaceGenerationId, SurfaceOperationFence, SurfaceOperationId, SurfaceThreadId,
+            ThreadOwnerEpoch,
+        };
+        use orca_core::conversation::{
+            CapturedProviderMessage, CapturedProviderRequest, Conversation,
+        };
+
+        let cwd = tempfile::tempdir().unwrap();
+        let registry_dir = tempfile::tempdir().unwrap();
+        let host = crate::runtime_host::RuntimeHost::start().unwrap();
+        let controller = Arc::new(parent_controller(&host.handle(), "fork-placement", true));
+        let mut config = config_in(cwd.path(), SubagentConfig::default());
+        config.provider = ProviderKind::DeepSeek;
+        let endpoint = "https://fixture.invalid";
+        config.base_url = Some(endpoint.into());
+        let parent = Conversation::new();
+        let inherited = r#"{"role":"user","content":"completed parent history"}"#;
+        parent.record_provider_request(CapturedProviderRequest {
+            source_messages: vec![],
+            summary: Default::default(),
+            model: orca_core::model::PRO_MODEL.into(),
+            endpoint: endpoint.into(),
+            reasoning_effort: config.reasoning_effort,
+            messages: vec![CapturedProviderMessage {
+                json: serde_json::value::RawValue::from_string(inherited.into()).unwrap(),
+                estimated_tokens: 5,
+                has_images: false,
+                has_tool_images: false,
+            }],
+            tools: vec![],
+            fork_cut: Ok(1),
+            fork_turn_id: None,
+            fork_system_messages: vec![],
+        });
+
+        for (scenario, context, conversation) in [
+            ("accepted", "fork", Some(&parent)),
+            ("plain", "fresh", Some(&parent)),
+            ("fallback", "fork", None),
+        ] {
+            let registry =
+                TaskRegistry::new_persistent(scenario.into(), registry_dir.path().to_owned())
+                    .unwrap();
+            let request = tool_types::ToolRequest {
+                raw_arguments: Some(
+                    serde_json::json!({"description":scenario,"prompt":"do the task","mode":"async","context":context})
+                        .to_string(),
+                ),
+                ..subagent_request(scenario)
+            };
+            let (started, events) = std::sync::mpsc::channel();
+            let ingress = Arc::new(ForkPlacementIngress {
+                fence: SurfaceOperationFence {
+                    thread_id: SurfaceThreadId::try_from_bytes(*uuid::Uuid::now_v7().as_bytes())
+                        .unwrap(),
+                    thread_owner_epoch: ThreadOwnerEpoch::new(1),
+                    operation_id: SurfaceOperationId::try_from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    )
+                    .unwrap(),
+                    generation_id: SurfaceGenerationId::new(1),
+                },
+                started,
+            });
+            let (result, _) = super::execute_subagent_tool_with_activity_ingress(
+                None,
+                &config,
+                cwd.path(),
+                &mut EventFactory::new(scenario.into()),
+                &mut EventSink::new(Vec::new(), OutputFormat::Jsonl),
+                &request,
+                0,
+                &ProjectInstructions::default(),
+                &MemoryBlock::default(),
+                &McpRegistry::default(),
+                &HookRunner::default(),
+                false,
+                &mut CostTracker::new(None),
+                &CancelToken::new(),
+                &registry,
+                None,
+                None,
+                silent_child_executor::<io::Sink>,
+                None,
+                Some(ingress),
+                Some(controller.clone()),
+                &mut None,
+                None,
+                conversation,
+            )
+            .unwrap();
+            let event = events
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|error| {
+                    panic!("no Started for {scenario}: {error}; {:?}", result.error)
+                });
+            let task = settled_task(&registry, event.task_id.as_str());
+            assert_eq!(
+                matches!(event.owner, SubagentActivityOwner::DetachedTask { .. }),
+                scenario == "accepted",
+                "{scenario}: {:?}",
+                event.owner,
+            );
+            if scenario == "accepted" {
+                let store = registry.continuation_store().unwrap();
+                let records = store.list_parent_records().unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].latest_task_id, task.id);
+                let prefix = store
+                    .load_fork_prefix(records[0].fork_prefix_ref.unwrap())
+                    .unwrap();
+                assert_eq!(prefix.messages, [inherited]);
+            } else if scenario == "fallback" {
+                assert!(result.output.as_deref().unwrap().contains("Started fresh."));
+            }
+        }
+        host.shutdown().unwrap();
+    }
+
     /// Submits an async child of `controller`'s parent as the model's
     /// `subagent` call does, and gives back its task id.
     fn submit_async_child(
