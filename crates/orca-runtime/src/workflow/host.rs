@@ -422,6 +422,7 @@ impl WorkflowHost {
             // that exits or stops reading cannot hold up cancellation.
             let input = Arc::clone(&stdin);
             let (locked, ready) = mpsc::sync_channel(0);
+            let (written, startup_finished) = mpsc::sync_channel(1);
             scope.spawn(move || {
                 if let Ok(mut input) = input.lock() {
                     let _ = locked.send(());
@@ -429,6 +430,7 @@ impl WorkflowHost {
                         .write_all(WORKFLOW_HOST_MODULE)
                         .and_then(|()| input.write_all(script));
                 }
+                let _ = written.send(());
             });
             ready
                 .recv()
@@ -557,6 +559,15 @@ impl WorkflowHost {
                     if is_terminal {
                         on_abort();
                         abort_workers.store(true, Ordering::Release);
+                        if startup_finished
+                            .recv_timeout(WORKFLOW_HOST_EXIT_GRACE)
+                            .is_err()
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "workflow host did not finish reading its startup input",
+                            ));
+                        }
                         return Ok(());
                     }
                 }
@@ -1716,7 +1727,7 @@ printf '{"type":"workflow_completed","result":{"ok":true}}\n'
         permissions.set_mode(0o755);
         std::fs::set_permissions(&node, permissions).expect("chmod lingering node");
         let script = temp.path().join("unused.js");
-        std::fs::write(&script, "export default null;").expect("write workflow");
+        std::fs::write(&script, " ".repeat(2 * 1024 * 1024)).expect("write workflow");
 
         unsafe {
             env::set_var("ORCA_NODE_PATH", &node);
