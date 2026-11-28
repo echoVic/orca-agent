@@ -439,6 +439,13 @@
       "process-ownership-plan"
     ],
     [
+      "readonly-turn-test-workspace-alias",
+      "crates/orca-runtime/src/tool_turn.rs",
+      "unix_std_api",
+      1,
+      "windows-test-portability"
+    ],
+    [
       "workflow-resume-test-linked-files",
       "crates/orca-runtime/src/workflow/runner.rs",
       "unix_std_api",

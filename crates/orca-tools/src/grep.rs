@@ -109,7 +109,7 @@ fn execute_search(
             .into_iter()
             .any(|path| {
                 path.strip_prefix(&workspace.root)
-                    .is_ok_and(|relative| relative.iter().any(|part| is_git_directory(part)))
+                    .is_ok_and(|relative| relative.iter().any(is_git_directory))
             })
     {
         return render_search(request, GrepPageCollector::new(0, 0, 0), max_bytes);
@@ -130,7 +130,7 @@ fn execute_search(
             } else {
                 workspace.path.strip_prefix(cwd).unwrap_or(&workspace.path)
             };
-            let mut search = || match open_directory(&workspace.root, &workspace.canonical) {
+            let search = || match open_directory(&workspace.root, &workspace.canonical) {
                 Ok(directory) if !stop() => {
                     let reads = IgnoreReads::new(&stop);
                     let global = global_excludes(&reads);
@@ -1138,7 +1138,7 @@ mod tests {
         let workspace = crate::workspace_tempdir().unwrap();
         let path = workspace.path().join("notes.txt");
         fs::write(&path, "needle").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
         if fs::File::open(&path).is_ok() {
             return;
         }

@@ -2159,35 +2159,55 @@ impl Tool for BuiltinTool {
     }
 
     fn execute(&self, request: &ToolRequest, ctx: &ToolContext<'_>) -> ToolResult {
+        let workspace = ctx.workspace_read_root;
+        let standalone_root;
+        let read_root = match self.executor {
+            BuiltinExecutor::ReadFile
+            | BuiltinExecutor::ReadDocument
+            | BuiltinExecutor::Glob
+            | BuiltinExecutor::Grep
+                if workspace.is_none() =>
+            {
+                standalone_root = match ctx.cwd.canonicalize() {
+                    Ok(root) => root,
+                    Err(error) => {
+                        return ToolResult::failed(
+                            request,
+                            format!("cannot resolve workspace: {error}"),
+                            None,
+                        );
+                    }
+                };
+                standalone_root.as_path()
+            }
+            _ => workspace.unwrap_or(ctx.cwd),
+        };
         match self.executor {
             BuiltinExecutor::ReadFile => read_file::execute_in_session(
                 request,
-                ctx.workspace_read_root.unwrap_or(ctx.cwd),
+                read_root,
                 ctx.max_output_bytes(),
                 ctx.spill_dir,
                 || ctx.is_cancelled(),
             ),
             BuiltinExecutor::ReadDocument => read_document::execute_or_cancel(
                 request,
-                ctx.workspace_read_root.unwrap_or(ctx.cwd),
+                read_root,
                 ctx.max_output_bytes(),
                 ctx.deepseek_web.as_ref(),
                 || ctx.is_cancelled(),
             ),
-            BuiltinExecutor::Glob if request.name.as_str() == "list_files" => list_files::execute(
-                request,
-                ctx.workspace_read_root.unwrap_or(ctx.cwd),
-                ctx.max_output_bytes(),
-            ),
-            BuiltinExecutor::Glob => glob::execute_or_cancel(
-                request,
-                ctx.workspace_read_root.unwrap_or(ctx.cwd),
-                ctx.max_output_bytes(),
-                || ctx.is_cancelled(),
-            ),
+            BuiltinExecutor::Glob if request.name.as_str() == "list_files" => {
+                list_files::execute(request, read_root, ctx.max_output_bytes())
+            }
+            BuiltinExecutor::Glob => {
+                glob::execute_or_cancel(request, read_root, ctx.max_output_bytes(), || {
+                    ctx.is_cancelled()
+                })
+            }
             BuiltinExecutor::Grep => grep::execute_in_session(
                 request,
-                ctx.workspace_read_root.unwrap_or(ctx.cwd),
+                read_root,
                 ctx.max_output_bytes(),
                 ctx.spill_dir,
                 || ctx.is_cancelled(),

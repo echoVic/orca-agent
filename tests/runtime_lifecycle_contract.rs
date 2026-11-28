@@ -164,7 +164,8 @@ fn reported_session_triggers_soft_compaction() {
         raw_arguments: Some(read_arguments.to_string()),
     };
 
-    let read_result = orca_tools::read_file::execute(&read_request, cwd.path(), 100_000);
+    let read_result =
+        orca_tools::read_file::execute(&read_request, &cwd.path().canonicalize().unwrap(), 100_000);
     let read_output = read_result.output.as_deref().expect("read output");
     let read_lines = read_output.lines().collect::<Vec<_>>();
     assert_eq!(read_lines.len(), 70);

@@ -7148,6 +7148,7 @@ while IFS= read -r line; do
             crate::runtime_readonly_tool_turn::RuntimeReadonlyBatchContext {
                 spill_directory: None,
                 cwd: dir.path(),
+                workspace_read_root: None,
                 events: &mut events,
                 sink: &mut sink,
                 tool_requests: &requests,

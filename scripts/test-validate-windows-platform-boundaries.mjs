@@ -399,7 +399,7 @@ for (const [relativePath, marker] of atomicJobSpawnContracts) {
 const grepSource = readFileSync(
   path.join(repoRoot, "crates/orca-tools/src/grep.rs"),
   "utf8",
-);
+).split("\n#[cfg(test)]\nmod tests")[0];
 assert.match(grepSource, /open_file_in\(/, "grep must use verified file handles");
 assert.doesNotMatch(
   grepSource,

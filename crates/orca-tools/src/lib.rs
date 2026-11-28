@@ -409,6 +409,9 @@ fn resolve_workspace_path_inner(
         }
         Err(error) => return Err(resolve_error(error)),
     };
+    #[cfg(windows)]
+    let canonical = windows_path_in_workspace(&root, &canonical, target)
+        .map_err(|_| format!("path escapes workspace via symlink: {target}"))?;
     let relative = canonical
         .strip_prefix(&root)
         .map_err(|_| format!("path escapes workspace via symlink: {target}"))?;
